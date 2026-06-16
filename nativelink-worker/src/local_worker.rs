@@ -3071,11 +3071,6 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             //    already enqueued so the locality_map will
                                             //    be populated before this ExecuteResult is
                                             //    forwarded to the client.
-                                            //
-                                            //    The server's inner_execution_response()
-                                            //    also re-registers the result's top-level
-                                            //    output digests as a redundant safety net
-                                            //    (worker_api_server.rs:518).
                                             let action_stage = ActionStage::Completed(action_result.clone());
                                             // #36 Phase 6 §6 Phase 0 probe P-WORKER-BOUNDARY:
                                             // capture op_id_n BEFORE move into ExecuteResult so we
