@@ -26,16 +26,34 @@
 //! upload and the AC-result write.  The cell reports ONLY the wall-clock
 //! latency of that call (criterion-style p50/p99 over `iters` samples).
 //!
+//! Each sample is made self-contained: at the head of every timed body the
+//! cell drains the PRIOR iteration's detached slow-write tail to quiescence
+//! (`drain_slow_writes`).  `upload_results()` fires stdout/stderr +
+//! Tree/Directory proto writes via `FastSlowStore::update_oneshot`, which
+//! spawns the slow-tier write DETACHED (not awaited by `upload_results`); the
+//! drain prevents those 3 ms-sleep tasks from bleeding into the NEXT sample's
+//! window.  `measure()` has no out-of-window teardown slot, so the drain sits
+//! at the body head, but in the common case the map is already empty (the
+//! detached writes finished during the prior, longer upload) so the drain is
+//! a near-zero, bounded settle — not part of the measured upload cost.
+//!
 //! This cell does NOT decompose the Phase-1/Phase-2 sequential gap or count
 //! individual `has()` calls.  An earlier revision tried to, via a slow-store
 //! wrapper that recorded a "first-update" timestamp and a single-key-`has()`
 //! counter; that instrumentation was structurally wrong and was removed:
-//!   - The Phase-1 gap is `batch_start - upload_start`, two `Instant`s that
-//!     are local variables inside the *private* `inner_upload_results`
-//!     (running_actions_manager.rs:3797, :3982).  Exposing them to the bench
-//!     would require a production observability hook on the worker's hottest
-//!     upload path — a change a Tier-3 cadre would (correctly) block for a
-//!     bench.  Measuring that gap is left to a separate follow-up.
+//!   - The FINE Phase-1 gap is `batch_start - upload_start`, two `Instant`s
+//!     that are local variables inside the *private* `inner_upload_results`
+//!     (running_actions_manager.rs:3797, :3982); that specific split is not
+//!     exposed.  Note the COARSE output-upload window IS already free to
+//!     read — `output_upload_start_timestamp` (running_actions_manager.rs
+//!     :3804) → `output_upload_completed_timestamp` (:4329), reduced to
+//!     `output_upload_ms` (:4436), are persisted into `ExecutionMetadata`
+//!     and returned by `get_finished_result`.  Exposing the FINE split needs
+//!     only a `#[cfg(test)]`-gated timing sink threaded through the
+//!     already-injected `Callbacks` (NOT a production-behaviour hot-path
+//!     hook), so the honest reason it is deferred is OUT OF SCOPE for this
+//!     bench fix-up, not "impossible / a Tier-3 cadre would block it".
+//!     Measuring that gap is left to a separate follow-up.
 //!   - The single-key-`has()` count was pinned at 0 by construction, not by
 //!     any code path: directory Tree/Directory protos upload via
 //!     `serialize_and_upload_message` → `update_oneshot` (ac_utils.rs:163),
@@ -50,16 +68,43 @@
 //! configurable `rpc_latency` before delegating each `has`/`update`, so the
 //! wall-clock cell reflects the remote round-trip cost.
 //!
+//! **How the injected latency differentiates the cells (precise):**
+//!   - `no_latency` (0 ms) vs `rpc3ms` (3 ms): the differentiating cost is
+//!     the ONE batch `has_with_results()` call, which `inner_upload_results`
+//!     awaits INLINE (running_actions_manager.rs:3983) — so its 3 ms lands
+//!     reliably IN the timed window — plus the foreground output-file
+//!     `update` legs (`update_with_whole_file` + `join!`, also awaited
+//!     in-window).  These are the latency-differentiated, reproducible part.
+//!   - The stdout/stderr + Tree/Directory proto uploads go via
+//!     `update_oneshot`'s DETACHED spawn (fast_slow_store.rs:5785); their
+//!     3 ms does NOT reliably fall in the measured upload's window.  Each
+//!     timed body therefore drains the PRIOR iteration's detached tail to
+//!     quiescence first (see `drain_slow_writes`), so that latency is
+//!     deliberately excluded from the sample rather than bleeding into it.
+//!   - `no_latency` vs `f2_mode`: BOTH set `rpc_latency = 0 ms`.  They are
+//!     differentiated by the fast-store WRITE PATH, not by injected latency —
+//!     F2 routes output uploads to the local `FilesystemStore`
+//!     (`deferred_output_uploads_enabled = true`) and never touches the slow
+//!     tier; the non-F2 `no_latency` cell still exercises the FastSlowStore
+//!     has()/update() shape with the latency dialed to zero.
+//!
 //! **Latency model:**
 //! - `rpc_latency = Duration::ZERO`: no injected delay.  Models the local
 //!   fast-store path (F2 mode: `cas_store = FilesystemStore`, `has()` is an
 //!   in-process EvictingMap lookup).  Also used for the noise-floor cell.
 //! - `rpc_latency = Duration::from_millis(3)`: 3 ms per RPC call.  Models the
 //!   non-F2 (synchronous / production-default) path where the slow tier is
-//!   the remote GrpcStore.  3 ms is the order-of-magnitude p50 RTT observed
-//!   for the GrpcStore → remote-CAS leg on buildcache/banjo.  This constant is a
-//!   *modelling choice*, not a committed measurement; the bench cells are
-//!   relative anchors, not absolute latency claims.  Asserted by
+//!   the remote GrpcStore.  3 ms is a deliberate order-of-magnitude MODELLING
+//!   choice for the per-call `has()`/`update()` round-trip — NOT a committed
+//!   or repo-traceable measurement.  For calibration the repo's own figures
+//!   are: bare wire RTT ~0.2 ms; remote slow-store *write*-leg p50 ≈ 152 ms /
+//!   p99 ≈ 720 ms (n=140, running_actions_manager.rs:3823, F2 design).  The
+//!   modelled 3 ms is a small mid-point chosen to keep cells fast while still
+//!   making the remote round-trip structure visible against the
+//!   nanosecond-latency `MemoryStore`; it models the lightweight `has()` RTT,
+//!   NOT the heavy multi-hundred-ms `update()` write leg, so it does not
+//!   conflict with that 152 ms figure (different operation).  The bench cells
+//!   are relative anchors, not absolute latency claims.  Asserted by
 //!   `u1_rpc3ms_cells_use_3ms`.
 //!
 //! **F2 mode modelling:**
@@ -94,9 +139,16 @@
 //! visible.  The other cells show how total latency scales with N and
 //! whether F2 mode eliminates the remote-has overhead.
 //!
-//! **Baseline discipline:** the cell is new; collect TWO back-to-back runs
-//! on the same SHA to establish the noise floor before attributing future
-//! deltas.  Kernel page-cache effects and ZFS ARC warming affect cold runs.
+//! **Baseline discipline:** the timed-window STRUCTURE is code-proven (the
+//! `measure()` closure wraps `upload_results()` only; staging is pre-iter;
+//! see `u1_stage_one_action_materializes_outputs_before_timed_window`), but
+//! the cell's NUMBERS are NOT yet a collected baseline — no U1 run has been
+//! recorded.  Do not cite any U1 p50/p99 as a baseline until TWO back-to-back
+//! runs on the same SHA establish the noise floor.  In particular the
+//! 100-file cell's p99 stability at `iters = 20` is asserted by reasoning
+//! (5 iters gave a first-sample outlier), not yet demonstrated by a two-run
+//! variance check.  Kernel page-cache effects and ZFS ARC warming affect
+//! cold runs.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -139,10 +191,12 @@ use crate::scenarios::{RunOpts, measure};
 //
 // A thin `StoreDriver` wrapper around a `MemoryStore` (the inner store) that
 // injects a configurable `tokio::time::sleep(rpc_latency)` at the entry of
-// every `has_with_results` and `update` call.  The sleep models a realistic
-// CAS RPC round-trip (GrpcStore → remote CAS, p50 order-of-millis), so the
-// wall-clock `upload_results()` timing reflects remote-tier cost instead of
-// nanosecond MemoryStore latency.
+// every `has_with_results` and `update` call.  The sleep models the
+// order-of-millis `has()` RTT of a CAS RPC round-trip (GrpcStore → remote
+// CAS) as a deliberate MODELLING choice (see the module-level "Latency
+// model" doc; not a repo-traceable measurement), so the wall-clock
+// `upload_results()` timing reflects remote-tier round-trip structure
+// instead of nanosecond MemoryStore latency.
 //
 // This wrapper records NO metrics: it is a pure latency shim.  The data is
 // actually stored in the inner `MemoryStore`, so uploads succeed and
@@ -256,7 +310,8 @@ impl StoreDriver for LatencyInjectingStore {
         // `FastSlowStore`'s #367 listener routes to its quiet `debug!`
         // (expected-rejection) branch instead of the loud `warn!` it fires
         // when a store reports `supports_removal_callbacks() == false` yet
-        // ACCEPTS the registration (fast_slow_store.rs:771).
+        // ACCEPTS the registration (the `(false, Ok)` arm's `warn!` macro at
+        // fast_slow_store.rs:779).
         Err(make_err!(
             Code::FailedPrecondition,
             "LatencyInjectingStore is bench-only and fires no removal callbacks"
@@ -315,8 +370,9 @@ struct U1Cell {
 ///
 /// - `no_latency` cell: noise floor.  No injected delay; measures
 ///   file-I/O + hash + MemoryStore costs without RPC structure.
-/// - `rpc3ms` cells: 3 ms per call models the GrpcStore → remote CAS p50
-///   RTT order-of-magnitude (a modelling choice, not a committed number).
+/// - `rpc3ms` cells: 3 ms per call is an order-of-magnitude MODELLING choice
+///   for the GrpcStore → remote CAS `has()` round-trip (not a committed or
+///   repo-traceable number; see the module-level "Latency model" doc).
 /// - `f2_mode`: deferred uploads enabled; no injected latency on has()
 ///   (F2 fast-store path is local, sub-ms).
 /// - `dir_outputs`: output_directories variant; the worker walks the tree
@@ -438,6 +494,72 @@ async fn build_bench_stores(
     )?;
     Ok(cas)
 }
+
+/// Wait for the `FastSlowStore`'s background slow-write map to drain to
+/// empty, bounded by `deadline`.  Returns the residual in-flight count
+/// (0 = fully quiesced).
+///
+/// **Why this exists (the inter-iteration bleed):** `inner_upload_results`
+/// uploads stdout/stderr and (for dir cells) the Tree/Directory protos via
+/// `update_oneshot` (running_actions_manager.rs:4262,4281,4092,4147).
+/// `FastSlowStore::update_oneshot` writes the fast tier synchronously, then
+/// spawns the slow-tier write **detached** (fast_slow_store.rs:5785) — NOT
+/// awaited by `upload_results()`.  Each detached task hits the
+/// `LatencyInjectingStore` (via the trait-default `update_oneshot` →
+/// `update`, store_trait.rs:1078) and sleeps `rpc_latency` (3 ms).  Because
+/// `measure()` starts the next sample's timer the instant `body().await`
+/// returns (mod.rs:200-202), without this drain each non-F2 iteration would
+/// leave ≥2 detached 3 ms-sleep tasks running when the NEXT sample's timer
+/// starts; their wakeups + MemoryStore writes would land inside the next
+/// sample's window — an uncontrolled, scheduler-/core-count-dependent bleed
+/// (the same async-spawn nondeterminism that disqualified the prior N1
+/// metric, smaller amplitude).  Draining to quiescence before the measured
+/// upload makes each sample self-contained and reproducible.
+///
+/// **Lost-wakeup safety:** `in_flight_empty_notify` fires `notify_waiters()`
+/// (fast_slow_store.rs:5918) which wakes only currently-registered waiters
+/// and stores no permit.  We therefore arm the `notified()` future
+/// (`pin!` + `enable()`) BEFORE reading the count, mirroring the production
+/// `FastSlowStore::flush_slow_writes` pattern (fast_slow_store.rs:2360-2362)
+/// — otherwise a completion racing the count read is silently dropped.
+///
+/// This is NOT `flush_slow_writes`: that primitive sets `shutting_down=true`
+/// permanently, fencing out every later iteration's slow-write spawn, which
+/// would change what subsequent samples measure.  This helper only waits.
+///
+/// The chunked-dispatch map (`chunked_in_flight_digests`) is feature-gated
+/// (`chunked_fast_slow`) and never populated in this bench composition (no
+/// `BazelChunkedDispatcherImpl`), so the legacy `in_flight_slow_write_count`
+/// is the complete quiescence predicate here.
+async fn drain_slow_writes(cas_store: &FastSlowStore, deadline: Duration) -> usize {
+    let empty_notify = cas_store.in_flight_empty_notify_handle();
+    let stop_at = tokio::time::Instant::now() + deadline;
+    loop {
+        // Arm the subscription BEFORE checking the count (lost-wakeup-safe).
+        let notified = empty_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let pending = cas_store.in_flight_slow_write_count();
+        if pending == 0 {
+            return 0;
+        }
+        match tokio::time::timeout_at(stop_at, notified).await {
+            Ok(()) => continue,
+            // Deadline exceeded: a 3 ms-sleep tail cannot legitimately take
+            // seconds, so a non-zero residual here is a bench bug (or a
+            // wedged store), surfaced rather than silently mismeasured.
+            Err(_) => return cas_store.in_flight_slow_write_count(),
+        }
+    }
+}
+
+/// Bound for [`drain_slow_writes`] inside the timed body.  The injected
+/// latency is 3 ms and the detached writes start during the (longer) upload,
+/// so in the common case the map is ALREADY empty when the next body begins
+/// and the drain returns immediately.  5 s is orders of magnitude above any
+/// legitimate 3 ms tail; reaching it means a hang, which the cell surfaces
+/// as a residual-count panic rather than a silently inflated sample.
+const SLOW_WRITE_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Monotonic bench clock: advances by 1 second per call so action metadata
 /// timestamps are deterministic and never clash between iterations.
@@ -735,7 +857,7 @@ async fn run_cell(
             "description": if cell.rpc_latency.is_zero() {
                 "zero (local store / F2 mode)"
             } else {
-                "3ms injected per has()/update() call (models GrpcStore remote CAS p50 RTT order-of-magnitude)"
+                "3ms injected per has()/update() call (order-of-magnitude modelling choice for GrpcStore remote CAS has() RTT; not a measured number)"
             }
         }),
     );
@@ -762,6 +884,7 @@ async fn run_cell(
 
     let result = {
         let post_cleanup = post_cleanup.clone();
+        let drain_store = cas_store.clone();
         measure(
             "U1",
             &scenario_name,
@@ -777,8 +900,23 @@ async fn run_cell(
                     .next()
                     .expect("U1: staged Vec exhausted — pre-stage count must equal iters");
                 let post_cleanup = post_cleanup.clone();
+                let drain_store = drain_store.clone();
 
                 async move {
+                    // Drain the PRIOR iteration's detached slow-write tail to
+                    // quiescence before the measured upload, so this sample is
+                    // self-contained (no cross-iteration bleed).  `measure()`
+                    // has no out-of-window teardown slot, so the drain sits at
+                    // the head of the timed body; in the common case the map is
+                    // already empty (the 3 ms detached writes finished during
+                    // the prior, longer upload) and this returns immediately.
+                    let residual = drain_slow_writes(&drain_store, SLOW_WRITE_DRAIN_DEADLINE).await;
+                    assert_eq!(
+                        residual, 0,
+                        "U1: slow-write map did not drain within {SLOW_WRITE_DRAIN_DEADLINE:?} \
+                         — a 3 ms detached tail cannot legitimately take seconds; the cell \
+                         would mismeasure with prior-iteration bleed",
+                    );
                     let uploaded = ready
                         .action
                         .upload_results()
@@ -847,6 +985,7 @@ pub async fn run(opts: &RunOpts, temp_dir_base: Option<&PathBuf>) -> Vec<Benchma
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenarios::digest_via_default_hasher;
 
     /// `make_file_content` must produce distinct bytes for distinct
     /// (iter, idx) pairs.  A collision means two files hash to the same
@@ -988,6 +1127,79 @@ mod tests {
                 cell.label
             );
         }
+    }
+
+    /// **Inter-iteration drain contract (the load-bearing reproducibility
+    /// guarantee).**
+    ///
+    /// `inner_upload_results` uploads stdout/stderr + Tree/Directory protos
+    /// via `update_oneshot`, and `FastSlowStore::update_oneshot` spawns the
+    /// slow-tier write DETACHED (fast_slow_store.rs:5785) — not awaited by
+    /// `upload_results()`.  With a non-zero injected latency each detached
+    /// task sleeps before completing, so without a drain those tasks bleed
+    /// across iteration boundaries into the next sample's timed window.
+    /// `drain_slow_writes` MUST wait for the slow-write map to reach 0 so
+    /// each sample is self-contained.
+    ///
+    /// This test drives one detached slow write directly through the bench
+    /// `FastSlowStore` (3 ms injected latency, so the spawned task is
+    /// provably mid-flight when `update_oneshot` returns), asserts the
+    /// in-flight count is non-zero, then asserts `drain_slow_writes` returns
+    /// 0 and the count is genuinely drained — all under a `tokio::time::
+    /// timeout` deadlock detector.
+    ///
+    /// **Mutation:** replace the `notified` await in `drain_slow_writes`'s
+    /// loop body with `core::future::ready(())` (never actually wait, just
+    /// re-spin until the deadline) — the drain returns the residual count
+    /// instead of 0 and this test MUST fail with its bespoke
+    /// "drain_slow_writes MUST quiesce the in-flight map" message.  (A
+    /// faster mutation: delete the loop's `if pending == 0 { return 0 }`
+    /// guard's companion wait so it busy-spins; either way the map never
+    /// observably reaches 0 within the detached task's own completion.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn u1_drain_slow_writes_quiesces_in_flight_map() {
+        let root = tempfile::TempDir::new().expect("test tempdir");
+        // 3 ms latency guarantees the detached slow write is still sleeping
+        // when update_oneshot returns, so the pre-drain count is non-zero.
+        let cas_store = build_bench_stores(&root.path().join("store"), Duration::from_millis(3))
+            .await
+            .expect("build_bench_stores must succeed");
+
+        let data = make_file_content(0, 0, 4_096);
+        let digest = digest_via_default_hasher(&data[..]);
+
+        // FastSlowStore::update_oneshot inserts into in_flight_slow_writes
+        // synchronously, then spawns the detached slow write and returns Ok.
+        cas_store
+            .update_oneshot(digest, data)
+            .await
+            .expect("update_oneshot must succeed (fast tier write)");
+
+        // The detached slow-write task is mid-sleep: the map MUST be non-empty.
+        assert!(
+            cas_store.in_flight_slow_write_count() >= 1,
+            "precondition: FastSlowStore::update_oneshot MUST leave a detached \
+             slow write pinned in the in-flight map (the bleed this drain fixes)"
+        );
+
+        let residual = tokio::time::timeout(
+            Duration::from_secs(10),
+            drain_slow_writes(&cas_store, SLOW_WRITE_DRAIN_DEADLINE),
+        )
+        .await
+        .expect("drain_slow_writes must not hang — inter-iteration drain deadlock");
+
+        assert_eq!(
+            residual, 0,
+            "drain_slow_writes MUST quiesce the in-flight map (return 0) — a \
+             non-zero residual means the detached slow-write tail would bleed \
+             into the next sample's timed window"
+        );
+        assert_eq!(
+            cas_store.in_flight_slow_write_count(),
+            0,
+            "after drain_slow_writes returns 0 the in-flight map MUST be empty"
+        );
     }
 
     /// **Timed-window discipline (the load-bearing harness contract).**
