@@ -389,6 +389,13 @@ required-features = ["test-utils", "chunked_fast_slow"]
 name = "store_remove_test"
 required-features = ["test-utils"]
 
+# CCS Phase 1 kill-switch: disable_completeness_check flag, worker-fetch goal
+# test (Test A §7), flag-behavior test (Test B, both directions), and
+# wps_cas_and_peer_notfound_total render-test (Test C / §3.3 observability).
+[[test]]
+name = "ccs_phase1_kill_switch_test"
+required-features = ["test-utils"]
+
 # #12 H4 invariant phase 3/3: CCS pending-registry consult.
 # Tests the rescue path (missing-from-CAS + registry-live → present),
 # dead-endpoint direction (no rescue), composite invariant (no delete on

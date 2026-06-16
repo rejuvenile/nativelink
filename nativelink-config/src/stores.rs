@@ -1027,6 +1027,29 @@ pub struct CompletenessCheckingSpec {
     /// When a request is made, the results are decoded and all output digests/files are verified
     /// to exist in this CAS store before returning success.
     pub cas_store: StoreSpec,
+
+    /// When `true`, the completeness check is skipped entirely on every
+    /// `GetActionResult` / `has_with_results` — `CompletenessCheckingStore`
+    /// becomes a transparent pass-through to the underlying `backend` store.
+    ///
+    /// **Phase 1 kill-switch (CCS-drop Option A).** Default: `false` (check active).
+    ///
+    /// Operators flip this to `true` for the soak period before the full CCS
+    /// removal (Phase 2). With `true`:
+    ///   - No AC-decode-for-verification.
+    ///   - No per-referenced-digest `has_with_results` against the CAS.
+    ///   - No Tree-proto fetch+decode for output directories.
+    ///   - No `consult_pending_registry` call.
+    ///
+    /// Stale AC entries (referencing evicted CAS blobs) are served rather than
+    /// filtered; Bazel handles re-execution via
+    /// `--experimental_remote_cache_eviction_retries`. The worker-fetch path
+    /// (`WorkerProxyStore` + `BlobLocalityMap`) is unaffected — it is
+    /// AC-chain-independent and already serves fresh outputs.
+    ///
+    /// Roll back: set to `false` (no binary redeploy required).
+    #[serde(default)]
+    pub disable_completeness_check: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, Copy)]

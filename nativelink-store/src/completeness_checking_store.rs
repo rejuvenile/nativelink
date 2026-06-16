@@ -141,6 +141,16 @@ pub struct CompletenessCheckingStore {
     cas_store: Store,
     ac_store: Store,
 
+    /// Phase-1 kill-switch (CCS-drop Option A). When `true`, all completeness
+    /// checks are skipped and `CompletenessCheckingStore` acts as a transparent
+    /// pass-through to `ac_store` for every `get_part` / `has_with_results` /
+    /// `remove` call. Set once at construction; never mutated at runtime.
+    ///
+    /// Operators flip `disable_completeness_check: true` in config for the soak
+    /// period; Phase 2 removes CCS entirely (after the soak confirms safety).
+    /// Default: `false` (existing behavior, check active).
+    disable_completeness_check: bool,
+
     #[metric(help = "Incomplete entries hit in CompletenessCheckingStore")]
     incomplete_entries_counter: CounterWithTime,
     #[metric(help = "Complete entries hit in CompletenessCheckingStore")]
@@ -195,6 +205,33 @@ impl CompletenessCheckingStore {
         Self::new_with_pending_registry(ac_store, cas_store, None, None)
     }
 
+    /// Phase-1 kill-switch constructor (CCS-drop Option A). `disable` maps
+    /// directly from `CompletenessCheckingSpec::disable_completeness_check`.
+    ///
+    /// When `disable = true` the store is a transparent pass-through:
+    /// `get_part` / `has_with_results` / `remove` delegate straight to
+    /// `ac_store` without decoding any AC entry or querying `cas_store`.
+    ///
+    /// When `disable = false` this is equivalent to calling `Self::new`.
+    pub fn new_with_disable_flag(
+        ac_store: Store,
+        cas_store: Store,
+        disable: bool,
+    ) -> Arc<Self> {
+        let rescues_raw = Arc::new(AtomicU64::new(0));
+        Arc::new(Self {
+            cas_store,
+            ac_store,
+            disable_completeness_check: disable,
+            incomplete_entries_counter: CounterWithTime::default(),
+            complete_entries_counter: CounterWithTime::default(),
+            pending_output_locality_registry: OnceLock::new(),
+            liveness_checker: OnceLock::new(),
+            ccs_pending_registry_rescues_total: CounterWithTime::default(),
+            pending_registry_rescues_raw: rescues_raw,
+        })
+    }
+
     /// Construct with optional `pending_output_locality_registry` and
     /// `liveness_checker` (H4 phase 3 consult). Called from `nativelink.rs`
     /// after the store chain is built, mirroring the `AcServer`
@@ -212,6 +249,7 @@ impl CompletenessCheckingStore {
         let store = Arc::new(Self {
             cas_store,
             ac_store,
+            disable_completeness_check: false,
             incomplete_entries_counter: CounterWithTime::default(),
             complete_entries_counter: CounterWithTime::default(),
             pending_output_locality_registry: OnceLock::new(),
@@ -775,6 +813,12 @@ impl StoreDriver for CompletenessCheckingStore {
         keys: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
+        // Phase-1 kill-switch: skip the completeness check entirely and
+        // delegate straight to the backing AC store. CCS is a transparent
+        // pass-through when `disable_completeness_check = true`.
+        if self.disable_completeness_check {
+            return self.ac_store.has_with_results(keys, results).await;
+        }
         self.inner_has_with_results(keys, results).await
     }
 
@@ -794,6 +838,17 @@ impl StoreDriver for CompletenessCheckingStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // Phase-1 kill-switch: skip all completeness-check machinery
+        // (AC-decode, CAS has_with_results, Tree-proto fetches,
+        // consult_pending_registry) and delegate straight to `ac_store`.
+        // CCS is a transparent pass-through when `disable_completeness_check = true`.
+        if self.disable_completeness_check {
+            return self
+                .ac_store
+                .get_part(key, writer, offset, length)
+                .await;
+        }
+
         // Fetch the AC entry once, verify CAS completeness, and serve
         // the already-fetched bytes — avoiding a redundant second read.
         let store_data = self

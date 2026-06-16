@@ -96,9 +96,10 @@ pub fn store_factory<'a>(
             StoreSpec::OntapS3ExistenceCache(spec) => {
                 OntapS3ExistenceCache::new(spec, SystemTime::now).await?
             }
-            StoreSpec::CompletenessChecking(spec) => CompletenessCheckingStore::new(
+            StoreSpec::CompletenessChecking(spec) => CompletenessCheckingStore::new_with_disable_flag(
                 store_factory(&spec.backend, store_manager, None).await?,
                 store_factory(&spec.cas_store, store_manager, None).await?,
+                spec.disable_completeness_check,
             ),
             StoreSpec::FastSlow(spec) => FastSlowStore::new_validated(
                 spec,

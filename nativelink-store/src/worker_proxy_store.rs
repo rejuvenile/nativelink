@@ -156,6 +156,22 @@ pub struct WorkerProxyStore {
     /// without journal grep. Observed 4 events / 7 d in production
     /// pre-counter (Phase 5 audit `2026-06-04`).
     worker_proxy_peer_fetch_notfound_total: CounterWithTime,
+    /// (CCS-drop §3.3 / §8 Q4) Replacement for `ccs_incomplete_entries_counter`
+    /// when `disable_completeness_check = true` removes CCS's stale-AC signal.
+    ///
+    /// Incremented in `get_part_sequential` when BOTH the inner store AND all
+    /// worker peers return NotFound — the stale-AC symptom: Bazel received a
+    /// cache-hit AC entry but the referenced blob is gone from both server CAS
+    /// and every known worker. Each increment is one Bazel-visible NotFound
+    /// that will trigger an eviction-retry re-execution.
+    ///
+    /// **Non-zero rate → stale AC entries accumulating.** Sustained rate
+    /// growth → AC TTL / cap needs adjustment (§8 Q1). Zero for hours after
+    /// enabling `disable_completeness_check` → CCS removal is safe from a
+    /// stale-AC perspective (no new accumulation).
+    ///
+    /// Published under: `<store_key>_wps_cas_and_peer_notfound_total_counter`.
+    wps_cas_and_peer_notfound_total: CounterWithTime,
     /// #130 — singleflight/dedup map for concurrent same-digest peer
     /// fetches. Collapses the "N callers, same digest, ms apart" cohort
     /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
@@ -437,6 +453,16 @@ impl MetricsComponent for WorkerProxyStore {
              Phase 5 BlobsAvailable; lets future preflights read rate \
              without journal grep"
         );
+        publish!(
+            "wps_cas_and_peer_notfound_total",
+            &self.wps_cas_and_peer_notfound_total,
+            MetricKind::Counter,
+            "CCS-drop §3.3 stale-AC signal: incremented in get_part_sequential when \
+             BOTH the inner CAS store AND all worker peers return NotFound — the \
+             stale-AC symptom (Bazel received a cache-hit AC entry but the blob is \
+             gone from server CAS and all known workers). Non-zero rate → stale AC \
+             entries accumulating; sustained growth → AC TTL/cap needs adjustment."
+        );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
         // outside the lock so we never hold it across the macro's tracing
@@ -695,6 +721,7 @@ impl WorkerProxyStore {
             cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
             worker_proxy_peer_fetch_notfound_total: CounterWithTime::default(),
+            wps_cas_and_peer_notfound_total: CounterWithTime::default(),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -726,6 +753,7 @@ impl WorkerProxyStore {
             cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
             worker_proxy_peer_fetch_notfound_total: CounterWithTime::default(),
+            wps_cas_and_peer_notfound_total: CounterWithTime::default(),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -2883,6 +2911,14 @@ impl WorkerProxyStore {
         }
 
         let digest = key.borrow().into_digest();
+        // CCS-drop §3.3 stale-AC signal: both the inner CAS and all workers
+        // returned NotFound. This is the stale-AC symptom — Bazel received a
+        // cache-hit AC entry referencing this blob but the blob is genuinely
+        // gone from every source. Increment the operator-facing counter so
+        // stale-AC accumulation is observable even when CCS's own
+        // `ccs_incomplete_entries_counter` is unavailable (e.g. during the
+        // soak with `disable_completeness_check = true`).
+        self.wps_cas_and_peer_notfound_total.inc();
         let err = Error::not_found_with_detail(
             format!("Blob {digest:?} not found in inner store or any worker"),
             make_precondition_failure_any(digest),
