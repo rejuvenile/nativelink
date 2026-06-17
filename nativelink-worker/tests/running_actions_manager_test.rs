@@ -7917,4 +7917,861 @@ exit 1
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // N3: F2 (deferred_output_uploads_enabled) skips the Phase 1 batch
+    // has_with_results RPC (empty for novel outputs; prior-present digests dedup
+    // via emplace_file) while preserving individual-has() suppression.
+    //
+    // In F2 mode `inner_upload_results` writes outputs to the local fast store
+    // (FilesystemStore in production). The Phase 1 batch has_with_results query
+    // checks whether the JUST-PRODUCED output-file digests already exist in
+    // that fast store — for NOVEL outputs (the common case) they do not, so the
+    // batch returns empty and delivers ZERO skips. (A prior action's identical
+    // digest CAN still be present — see the rare-case test below.) The batch's
+    // ONLY load-bearing side effect was populating `batch_checked`, which
+    // suppresses the per-file individual has() inside upload_file
+    // (`if !batch_checked.contains(&digest)`).
+    //
+    // N3 skips the RPC but STILL populates `batch_checked` from the prehashed
+    // digests directly (and leaves `known_existing` empty), so downstream
+    // behavior is IDENTICAL minus one RPC: individual has() is still suppressed
+    // and every fresh file still uploads.
+    //
+    // The NON-F2 path is unchanged — there the batch hits the remote CAS (slow
+    // tier) and delivers REAL skips, so it must still run.
+    //
+    // To observe the fast-store has() calls in F2 mode the counter must sit at
+    // the FAST tier (F2 queries `cas_store.fast_store()`), unlike the N2 tests
+    // which place `HasCountingStore` at the slow tier (non-F2 queries the slow
+    // tier). But `RunningActionsManagerImpl::new` downcasts `fast_store()` to a
+    // concrete `FilesystemStore` (hardlink/pin on the action sandbox), so the
+    // fast tier MUST be a real FilesystemStore — a raw `MemoryStore` wrapper
+    // fails the downcast with "Expected FilesystemStore store for .fast_store()".
+    // `CountingFsStore` therefore WRAPS a real FilesystemStore: it counts
+    // `has_with_results` calls and returns the inner FilesystemStore from
+    // `inner_store()` so the production downcast still succeeds.
+    // -----------------------------------------------------------------------
+
+    /// Counting wrapper around a real `FilesystemStore` for the FAST tier.
+    ///
+    /// Counts `has_with_results` invocations (single-key vs multi-key, same
+    /// convention as `HasCountingStore`) while delegating everything to the
+    /// inner FilesystemStore. `inner_store()` returns the FilesystemStore so
+    /// the `RunningActionsManagerImpl::new` downcast to `FilesystemStore`
+    /// (required for hardlink/pin) succeeds, and the default
+    /// `update_with_whole_file` delegates straight to the FilesystemStore
+    /// (which is `optimized_for(FileUpdates)`).
+    struct CountingFsStore {
+        inner: Arc<FilesystemStore>,
+        /// `has_with_results` calls with exactly one key — individual per-file
+        /// has() RPCs from upload_file's fallback path.
+        single_has_count: AtomicUsize,
+        /// Total keys across all multi-key `has_with_results` calls — the
+        /// Phase 1 batch calls.
+        batch_has_key_count: AtomicUsize,
+    }
+
+    impl CountingFsStore {
+        fn new(inner: Arc<FilesystemStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                single_has_count: AtomicUsize::new(0),
+                batch_has_key_count: AtomicUsize::new(0),
+            })
+        }
+
+        fn single_has_count(&self) -> usize {
+            self.single_has_count.load(Ordering::SeqCst)
+        }
+
+        fn batch_has_key_count(&self) -> usize {
+            self.batch_has_key_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MetricsComponent for CountingFsStore {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait]
+    impl StoreDriver for CountingFsStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            keys: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            if keys.len() == 1 {
+                self.single_has_count.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.batch_has_key_count
+                    .fetch_add(keys.len(), Ordering::SeqCst);
+            }
+            Pin::new(self.inner.as_ref())
+                .has_with_results(keys, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            reader: DropCloserReadHalf,
+            size_info: UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(key, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .get_part(key, writer, offset, length)
+                .await
+        }
+
+        // Return the inner FilesystemStore so the production downcast in
+        // RunningActionsManagerImpl::new finds a concrete FilesystemStore, and
+        // the default update_with_whole_file delegates the real file write to
+        // it (FilesystemStore is optimized_for(FileUpdates)).
+        fn inner_store(&self, _key: Option<StoreKey<'_>>) -> &dyn StoreDriver {
+            self.inner.as_ref()
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+
+        fn optimized_for(&self, optimization: StoreOptimizations) -> bool {
+            // Mirror the inner FilesystemStore so callers route file uploads
+            // through update_with_whole_file (which delegates to the inner FS).
+            StoreDriver::optimized_for(self.inner.as_ref(), optimization)
+        }
+    }
+
+    default_health_status_indicator!(CountingFsStore);
+
+    /// Build a `FastSlowStore` with a real `FilesystemStore` (wrapped in
+    /// `CountingFsStore`) as the FAST tier so F2-mode
+    /// (`deferred_output_uploads_enabled`) has()/has_with_results calls — which
+    /// target the fast store — are counted while the production downcast to a
+    /// concrete FilesystemStore still succeeds.
+    async fn setup_stores_with_counting_fast() -> Result<
+        (
+            Arc<CountingFsStore>,
+            Arc<MemoryStore>,
+            Arc<FastSlowStore>,
+            Arc<MemoryStore>,
+        ),
+        Error,
+    > {
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path_counting_fast"),
+            temp_path: make_temp_path("temp_path_counting_fast"),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let fs_store = FilesystemStore::new(&fast_config).await?;
+        let counting_fast_store = CountingFsStore::new(fs_store);
+        let slow_store = MemoryStore::new(&Default::default());
+        let ac_store = MemoryStore::new(&Default::default());
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(Default::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            Store::new(counting_fast_store.clone()),
+            Store::new(slow_store.clone()),
+        );
+        Ok((counting_fast_store, slow_store, cas_store, ac_store))
+    }
+
+    /// N3: in F2 mode the Phase 1 batch `has_with_results` RPC is skipped
+    /// (it is always empty for fresh outputs on the local fast store), but
+    /// `batch_checked` is still populated so the per-file individual `has()`
+    /// inside `upload_file` stays suppressed and every file still uploads.
+    ///
+    /// Action produces 3 top-level output files. With `CountingFsStore` (a
+    /// real FilesystemStore plus has()-counters) at the FAST tier (the store F2
+    /// writes/queries), after `upload_results()`:
+    ///   (a) `batch_has_key_count == 0` — the multi-key batch RPC was skipped.
+    ///   (b) `single_has_count == 0`    — `batch_checked` suppression holds; no
+    ///       individual per-file has() RPC fired (NO N×has regression).
+    ///   (c) all 3 output blobs are present in the fast store (still uploaded).
+    ///
+    /// Against unchanged (pre-N3) source this fails at (a): the batch RPC runs,
+    /// so `batch_has_key_count == 3`, not 0 — the right reason (batch not yet
+    /// skipped).
+    ///
+    /// Mutation-verify: drop the F2 `batch_checked` population (so `checked`
+    /// stays empty in F2). Then every file falls into upload_file's
+    /// `!batch_checked.contains(&digest)` branch → individual has() → assertion
+    /// (b) fails with "N3 regressed to per-file has() — batch_checked not
+    /// populated in F2".
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn n3_f2_skips_batch_has_but_suppresses_individual_has()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "n3_f2_test_worker";
+        const OUTPUT_FILE_COUNT: usize = 3;
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (counting_fast_store, _slow_store, cas_store, ac_store) =
+            setup_stores_with_counting_fast().await?;
+
+        let root_action_directory = make_temp_path("root_action_directory_n3_f2");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                // F2 kill-switch ON: outputs written to the fast store only;
+                // Phase 1 batch has() is the always-empty RPC N3 removes.
+                deferred_output_uploads_enabled: true,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Action: three top-level output FILES (no directories) — each is
+        // prehashed via prehash_single_file and would, pre-N3, be submitted to
+        // the Phase 1 batch has_with_results call.
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'alpha' > a.txt && \
+                 printf 'bravo' > b.txt && \
+                 printf 'charlie' > c.txt"
+                    .to_string(),
+            ],
+            output_paths: vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Blake3.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        // Snapshot AFTER execute so only upload_results()'s own calls count.
+        let single_before = counting_fast_store.single_has_count();
+        let batch_before = counting_fast_store.batch_has_key_count();
+
+        executed.upload_results().await?;
+
+        let new_single = counting_fast_store.single_has_count() - single_before;
+        let new_batch_keys = counting_fast_store.batch_has_key_count() - batch_before;
+
+        // (a) Batch has_with_results RPC skipped in F2 — zero batch keys.
+        assert_eq!(
+            new_batch_keys, 0,
+            "N3 invariant violated: F2 mode must skip the always-empty Phase 1 \
+             batch has_with_results RPC; got {new_batch_keys} batch keys — \
+             the batch RPC is still firing on the fast store",
+        );
+
+        // (b) batch_checked suppression holds — NO individual per-file has().
+        // This is the anti-regression assertion: skipping the batch WITHOUT
+        // populating batch_checked would push every file into upload_file's
+        // individual-has() fallback (N×has, worse than today).
+        assert_eq!(
+            new_single, 0,
+            "N3 regressed to per-file has() — batch_checked not populated in F2; \
+             got {new_single} individual has() RPC calls (expected 0): skipping \
+             the batch left batch_checked empty so upload_file fell back to N×has()",
+        );
+
+        // (c) All 3 output blobs still uploaded to the fast store.
+        let action_result = running_action_impl.clone().get_finished_result().await?;
+        assert_eq!(
+            action_result.output_files.len(),
+            OUTPUT_FILE_COUNT,
+            "N3: all {OUTPUT_FILE_COUNT} output files must still be produced",
+        );
+        for output_file in &action_result.output_files {
+            let key: StoreKey<'_> = output_file.digest.into();
+            let present = tokio::time::timeout(
+                Duration::from_secs(5),
+                Pin::new(counting_fast_store.as_ref()).has(key),
+            )
+            .await
+            .expect("fast-store has() must not hang — FilesystemStore index contract")?;
+            assert!(
+                present.is_some(),
+                "N3: output blob {:?} must be present in the fast store after \
+                 upload_results — file was not uploaded",
+                output_file.digest,
+            );
+        }
+
+        running_action_impl.cleanup().await?;
+        Ok(())
+    }
+
+    /// N3 non-regression: the NON-F2 (synchronous) path MUST still run the
+    /// Phase 1 batch `has_with_results` RPC. There the batch hits the remote
+    /// CAS (the slow tier in the FastSlowStore) and delivers REAL upload skips,
+    /// so N3 must NOT touch it.
+    ///
+    /// With `HasCountingStore` at the SLOW tier and `deferred_output_uploads_enabled
+    /// = false`, after `upload_results()` for 3 top-level output files:
+    ///   `batch_has_key_count >= 3` — the batch RPC still fires and covers the
+    ///   3 output-file digests.
+    ///
+    /// Mutation-verify: gate the batch on `!deferred` AND extend that skip to
+    /// the non-F2 arm (i.e. skip the batch unconditionally) → `batch_has_key_count`
+    /// drops to 0 and this test fails with "N3 over-reached: non-F2 batch
+    /// has_with_results was skipped — remote-CAS skips lost".
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn n3_non_f2_still_runs_batch_has()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "n3_non_f2_test_worker";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, counting_store, cas_store, ac_store) =
+            setup_stores_with_counting_slow().await?;
+
+        let root_action_directory = make_temp_path("root_action_directory_n3_non_f2");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                // NON-F2: synchronous path — batch has() hits the remote CAS
+                // (slow tier) and delivers real skips, so it must still run.
+                deferred_output_uploads_enabled: false,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'alpha' > a.txt && \
+                 printf 'bravo' > b.txt && \
+                 printf 'charlie' > c.txt"
+                    .to_string(),
+            ],
+            output_paths: vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Blake3.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        let batch_before = counting_store.batch_has_key_count();
+
+        executed.upload_results().await?;
+
+        let new_batch_keys = counting_store.batch_has_key_count() - batch_before;
+
+        // The batch must still fire and cover the 3 output-file digests.
+        assert!(
+            new_batch_keys >= 3,
+            "N3 over-reached: non-F2 batch has_with_results was skipped — \
+             remote-CAS skips lost; got {new_batch_keys} batch keys (expected ≥3). \
+             N3 must only skip the batch in F2 mode.",
+        );
+
+        running_action_impl.cleanup().await?;
+        Ok(())
+    }
+
+    // N3 rare-case: in F2, a prior action's identical output digest is ALREADY
+    // present in the local fast FilesystemStore. N3 leaves `known_existing`
+    // empty, so upload_file does NOT skip the upload via the `known_existing`
+    // gate (upload_file:2482); it proceeds to upload-then-dedup. The duplicate
+    // write is absorbed by the FilesystemStore `emplace_file` content_is_immutable
+    // short-circuit (filesystem_store.rs:1274-1280): when the key already exists
+    // and the store is immutable, emplace_file returns Ok BEFORE the rename, so
+    // NO second rename / NO duplicate file write occurs and the action still
+    // succeeds. This is the config-contingent dedup path the green N3 tests skip
+    // (they use FilesystemSpec::default() → content_is_immutable: false + novel
+    // outputs, so emplace always renames). The deployed worker config sets
+    // `content_is_immutable: true` on the fast tier (worker.json5:68), so this
+    // test pins the PRODUCTION precondition that makes the rare-case dedup free.
+    //
+    // Observability seam: the inner FilesystemStore is built with a custom
+    // `rename_fn` that counts invocations. `emplace_file` calls rename exactly
+    // once per write that reaches the rename (filesystem_store.rs:1333); the
+    // dedup short-circuit returns before it. So the rename count is a direct
+    // observable for "no second rename / no duplicate write".
+
+    /// Module-level rename counter for the immutable-dedup test. `rename_fn` is
+    /// a bare `fn` pointer (no closure capture), so the counter must be a
+    /// `static`. Only the immutable-dedup test installs this `rename_fn`, and
+    /// the whole `tests` module is `#[serial]` (file top), so no other test runs
+    /// concurrently to perturb the count.
+    static IMMUTABLE_DEDUP_RENAME_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_rename_fn(from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> Result<(), std::io::Error> {
+        IMMUTABLE_DEDUP_RENAME_COUNT.fetch_add(1, Ordering::SeqCst);
+        std::fs::rename(from, to)
+    }
+
+    /// Build a `FastSlowStore` whose FAST tier is a real `FilesystemStore` with
+    /// `content_is_immutable: true` (matching deployed `worker.json5:68`) and a
+    /// rename-counting `rename_fn`, so the F2 upload-then-dedup path can be
+    /// observed via the rename count. Mirrors `setup_stores_with_counting_fast`
+    /// otherwise (CountingFsStore wrapper for the production downcast).
+    async fn setup_stores_with_immutable_counting_fast() -> Result<
+        (
+            Arc<CountingFsStore>,
+            Arc<FastSlowStore>,
+            Arc<MemoryStore>,
+        ),
+        Error,
+    > {
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path_immutable_fast"),
+            temp_path: make_temp_path("temp_path_immutable_fast"),
+            eviction_policy: None,
+            // The PRODUCTION precondition: deployed worker.json5:68 sets this
+            // true on the fast tier. With it false (the schema default) the
+            // emplace dedup at filesystem_store.rs:1274 never fires and the
+            // rare-case duplicate write re-renames — exactly the regression
+            // this test guards.
+            content_is_immutable: true,
+            ..Default::default()
+        };
+        let fs_store = FilesystemStore::new_with_timeout_and_rename_fn(
+            &fast_config,
+            counting_rename_fn,
+        )
+        .await?;
+        let counting_fast_store = CountingFsStore::new(fs_store);
+        let slow_store = MemoryStore::new(&Default::default());
+        let ac_store = MemoryStore::new(&Default::default());
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(Default::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            Store::new(counting_fast_store.clone()),
+            Store::new(slow_store.clone()),
+        );
+        Ok((counting_fast_store, cas_store, ac_store))
+    }
+
+    /// N3 rare-case dedup: when a prior action's identical output digest is
+    /// already in the fast store, the second F2 `upload_results()` absorbs the
+    /// duplicate write via the `content_is_immutable` emplace short-circuit —
+    /// NO second rename, and the action still succeeds.
+    ///
+    /// Two runs of the SAME action (identical output content ⇒ identical
+    /// digests) against the SAME fast FilesystemStore:
+    ///   Run 1 (novel): each output emplaces + renames → 3 renames recorded.
+    ///   Run 2 (prior-present): each digest is already in the fast store's
+    ///     evicting_map, so emplace_file returns Ok before the rename →
+    ///     ZERO additional renames, yet all 3 outputs still report present.
+    ///
+    /// Asserts:
+    ///   (a) run 1 performed ≥ OUTPUT_FILE_COUNT renames (outputs were novel);
+    ///   (b) run 2 performed ZERO additional renames (dedup absorbed the
+    ///       duplicate write — no second rename / no duplicate file write);
+    ///   (c) run 2's action result still lists all OUTPUT_FILE_COUNT outputs,
+    ///       all present in the fast store (the action still succeeds).
+    ///
+    /// Mutation-verify: flip the fast tier's `content_is_immutable` to false
+    /// (or comment out the emplace dedup at filesystem_store.rs:1274-1280).
+    /// Then run 2 re-renames every output and assertion (b) red-fails with
+    /// "N3 rare-case regression: prior-present digest was re-written".
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn n3_f2_prior_present_digest_dedups_no_second_rename()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "n3_immutable_dedup_worker";
+        const OUTPUT_FILE_COUNT: usize = 3;
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        // Reset the module-level rename counter (the static persists across
+        // tests in one process; the `tests` module is #[serial] so no other
+        // test perturbs it during this run).
+        IMMUTABLE_DEDUP_RENAME_COUNT.store(0, Ordering::SeqCst);
+
+        let (counting_fast_store, cas_store, ac_store) =
+            setup_stores_with_immutable_counting_fast().await?;
+
+        let root_action_directory =
+            make_temp_path("root_action_directory_n3_immutable_dedup");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                // F2 ON: outputs written to the fast store; in F2 known_existing
+                // is left empty so a prior-present digest takes upload-then-dedup.
+                deferred_output_uploads_enabled: true,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Deterministic output content so both runs produce identical digests.
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'alpha' > a.txt && \
+                 printf 'bravo' > b.txt && \
+                 printf 'charlie' > c.txt"
+                    .to_string(),
+            ],
+            output_paths: vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+
+        // Run the same action twice; each run gets its own operation id /
+        // sandbox but produces byte-identical outputs ⇒ identical digests.
+        let run_once = async |run_label: &str| -> Result<Vec<DigestInfo>, Error> {
+            let execute_request = ExecuteRequest {
+                action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Blake3.into(),
+                ..Default::default()
+            };
+            let operation_id = OperationId::default().to_string();
+            let running_action_impl = running_actions_manager
+                .create_and_add_action(
+                    WORKER_ID.to_string(),
+                    StartExecute {
+                        execute_request: Some(execute_request),
+                        operation_id,
+                        queued_timestamp: None,
+                        platform: action.platform.clone(),
+                        worker_id: WORKER_ID.to_string(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    },
+                )
+                .await
+                .err_tip(|| format!("create_and_add_action failed for {run_label}"))?;
+            let prepared = running_action_impl.clone().prepare_action().await?;
+            let executed = prepared.execute().await?;
+            executed.upload_results().await?;
+            let action_result = running_action_impl.clone().get_finished_result().await?;
+            let digests: Vec<DigestInfo> = action_result
+                .output_files
+                .iter()
+                .map(|f| f.digest)
+                .collect();
+            running_action_impl.cleanup().await?;
+            Ok(digests)
+        };
+
+        // Run 1: novel outputs — emplace renames each into place.
+        let run1_digests = run_once("run1").await?;
+        let renames_after_run1 = IMMUTABLE_DEDUP_RENAME_COUNT.load(Ordering::SeqCst);
+
+        // (a) Run 1 must have actually renamed the novel outputs into place,
+        // otherwise run 2's "no second rename" is vacuous (nothing was ever
+        // present to dedup against).
+        assert!(
+            renames_after_run1 >= OUTPUT_FILE_COUNT,
+            "N3 rare-case test setup invalid: run 1 performed only \
+             {renames_after_run1} renames (expected ≥{OUTPUT_FILE_COUNT}); the \
+             novel outputs were not emplaced, so the dedup precondition (digest \
+             already present) is not established",
+        );
+
+        // Run 2: identical outputs — every digest is now ALREADY present in the
+        // fast store, so the F2 upload-then-dedup path must absorb each write.
+        let run2_digests = run_once("run2").await?;
+        let renames_after_run2 = IMMUTABLE_DEDUP_RENAME_COUNT.load(Ordering::SeqCst);
+        let renames_during_run2 = renames_after_run2 - renames_after_run1;
+
+        // Sanity: both runs produced the same output digests (so run 2 really
+        // re-uploads the SAME digests run 1 emplaced — the prior-present case).
+        assert_eq!(
+            run1_digests, run2_digests,
+            "N3 rare-case test invalid: the two runs produced different output \
+             digests, so run 2 is not exercising the prior-present dedup path",
+        );
+
+        // (b) THE CONTRACT: run 2 performed ZERO additional renames — the
+        // content_is_immutable emplace short-circuit absorbed every duplicate
+        // write. With content_is_immutable false (or the dedup removed) each
+        // prior-present digest re-renames and this fails.
+        assert_eq!(
+            renames_during_run2, 0,
+            "N3 rare-case regression: prior-present digest was re-written — run 2 \
+             performed {renames_during_run2} renames (expected 0). The F2 \
+             upload-then-dedup path did NOT absorb the duplicate write; the \
+             content_is_immutable emplace short-circuit \
+             (filesystem_store.rs:1274-1280) did not fire. This is the \
+             production precondition (worker.json5:68 content_is_immutable=true) \
+             that makes the rare-case dedup free",
+        );
+
+        // (c) The action still succeeds — all outputs present in the fast store
+        // after the deduped run.
+        assert_eq!(
+            run2_digests.len(),
+            OUTPUT_FILE_COUNT,
+            "N3 rare-case: run 2 must still produce all {OUTPUT_FILE_COUNT} \
+             outputs after the dedup",
+        );
+        for digest in &run2_digests {
+            let key: StoreKey<'_> = (*digest).into();
+            let present = tokio::time::timeout(
+                Duration::from_secs(5),
+                Pin::new(counting_fast_store.as_ref()).has(key),
+            )
+            .await
+            .expect("fast-store has() must not hang — FilesystemStore index contract")?;
+            assert!(
+                present.is_some(),
+                "N3 rare-case: output blob {digest:?} must be present in the fast \
+                 store after the deduped run 2",
+            );
+        }
+
+        Ok(())
+    }
+
 }

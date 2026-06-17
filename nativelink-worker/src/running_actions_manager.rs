@@ -4127,33 +4127,75 @@ impl RunningActionImpl {
             // UNBOUNDED-OK: same bound as all_digests/path_digests above;
             // contains one DigestInfo (40 bytes) per unique output file in the action.
             let mut checked: HashSet<DigestInfo> = HashSet::new();
+            // #N3: In deferred mode (F2) `cas_store` is the local FilesystemStore.
+            // The batch has_with_results queries digests for files JUST produced
+            // in work_directory — for a NOVEL output (the common case) the digest
+            // is not in that store yet, so the batch returns empty and delivers
+            // ZERO skips (pure RPC overhead). The batch's only load-bearing side
+            // effect is populating `batch_checked`, which suppresses the per-file
+            // individual has() inside upload_file
+            // (`if !batch_checked.contains(&digest)`). So skip the batch RPC but
+            // STILL populate `checked` from all prehashed digests; leave
+            // `existing` empty. Downstream is then identical (individual has()
+            // still suppressed, all files upload) minus one RPC.
+            //
+            // The rare case — a prior action produced an identical output digest
+            // that is still in the persistent fast store, today caught by the
+            // batch as a `known_existing` skip — becomes upload-then-dedup with
+            // the same outcome and NO duplicate write. The duplicate write is
+            // absorbed by the FilesystemStore `emplace_file` short-circuit
+            // (filesystem_store.rs:1274-1280): when the key already exists AND
+            // the store is immutable, emplace_file returns Ok BEFORE the rename.
+            // F2 PRECONDITION: that short-circuit is gated on
+            // `content_is_immutable: true`, set on the fast tier in the deployed
+            // worker config (worker.json5:68). The FilesystemStore TYPE is
+            // enforced by the constructor downcast; `content_is_immutable: true`
+            // is what makes this rare-case dedup free, and is enforced only by
+            // config. In the NON-deferred path `cas_store` is the full
+            // FastSlowStore, so the batch hits the remote CAS (slow tier) and
+            // delivers REAL skips — keep it.
             if !all_digests.is_empty() {
-                let store_keys: Vec<StoreKey<'_>> = all_digests.iter()
-                    .map(|d| StoreKey::from(*d))
-                    .collect();
-                let mut results = vec![None; store_keys.len()];
-                let batch_start = std::time::Instant::now();
-                if let Err(e) = cas_store.has_with_results(&store_keys, &mut results).await {
-                    warn!(
-                        ?e,
-                        "batch has_with_results failed, falling back to individual checks"
-                    );
-                } else {
-                    for (digest, result) in all_digests.iter().zip(results.iter()) {
-                        // All digests in the batch are "checked" — upload_file
-                        // skips the individual has() for these.
+                if self.running_actions_manager.deferred_output_uploads_enabled {
+                    // #N3: skip the fast-store batch has() (empty for novel
+                    // outputs; prior-present digests dedup via emplace_file);
+                    // mark every prehashed digest checked so upload_file
+                    // suppresses the individual has() and uploads directly.
+                    for digest in &all_digests {
                         checked.insert(*digest);
-                        if result.is_some() {
-                            existing.insert(*digest);
-                        }
                     }
                     debug!(
                         total_digests = all_digests.len(),
-                        already_existing = existing.len(),
-                        batch_ms = batch_start.elapsed().as_millis() as u64,
                         hash_ms = hash_start.elapsed().as_millis() as u64,
-                        "upload_results: batch has() check completed"
+                        "upload_results: deferred mode, skipping fast-store batch has() check (empty for novel outputs; prior-present digests dedup via emplace_file)"
                     );
+                } else {
+                    let store_keys: Vec<StoreKey<'_>> = all_digests.iter()
+                        .map(|d| StoreKey::from(*d))
+                        .collect();
+                    let mut results = vec![None; store_keys.len()];
+                    let batch_start = std::time::Instant::now();
+                    if let Err(e) = cas_store.has_with_results(&store_keys, &mut results).await {
+                        warn!(
+                            ?e,
+                            "batch has_with_results failed, falling back to individual checks"
+                        );
+                    } else {
+                        for (digest, result) in all_digests.iter().zip(results.iter()) {
+                            // All digests in the batch are "checked" — upload_file
+                            // skips the individual has() for these.
+                            checked.insert(*digest);
+                            if result.is_some() {
+                                existing.insert(*digest);
+                            }
+                        }
+                        debug!(
+                            total_digests = all_digests.len(),
+                            already_existing = existing.len(),
+                            batch_ms = batch_start.elapsed().as_millis() as u64,
+                            hash_ms = hash_start.elapsed().as_millis() as u64,
+                            "upload_results: batch has() check completed"
+                        );
+                    }
                 }
             }
 
