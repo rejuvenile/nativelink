@@ -756,6 +756,13 @@ const DEFAULT_ENDPOINT_TIMEOUT_S: f32 = 5.;
 /// `execution_response` / `complete` / `blobs_available` send hang
 /// indefinitely and the bidi stream never errors, so `inner.run` never
 /// returns and the reconnect loop (`run`, `:~4450`) never fires.
+///
+/// `pub` (unlike the two HTTP/2 consts below) ONLY because the keepalive
+/// regression test reads it back via tonic's `Endpoint::get_tcp_keepalive`
+/// getter — tonic 0.14.5 exposes a getter for TCP keepalive but NONE for the
+/// HTTP/2 params, so those two consts stay private and are unit-unverifiable
+/// (see `worker_api_endpoint_keepalive_test.rs`). Do NOT widen the HTTP/2
+/// consts to `pub` to "match" — there is no test that can read them.
 pub const WORKER_API_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// HTTP/2 keepalive ping interval for the WorkerApi control-plane

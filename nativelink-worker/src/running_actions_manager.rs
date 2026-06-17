@@ -3164,6 +3164,20 @@ impl RunningActionImpl {
         &self.running_actions_manager.metrics
     }
 
+    /// Test-only: set `cancelled` WITHOUT firing `kill_notify`. Production
+    /// kills go through `kill_operation`, which sets `cancelled` AND stores
+    /// a `kill_notify` permit. This setter isolates the `upload_results`
+    /// kill-arm FAST PATH (`if !cancelled` at the top of `kill_fut`): with a
+    /// stored permit, the `notified().await` would resolve immediately even
+    /// if the fast-path check were removed, masking a regression. Setting
+    /// `cancelled` alone lets a test prove the durable-flag check (not the
+    /// notify permit) is what preempts an upload for an action that was
+    /// already cancelled before `upload_results` first polled.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_cancelled_for_test(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
     /// #O3/O13: cache a Tree proto just written to CAS so the publish-side
     /// readers can skip the storage-layer re-decode. Per-action scope —
     /// entries are dropped automatically when this `RunningActionImpl`
@@ -4597,8 +4611,27 @@ impl RunningAction for RunningActionImpl {
         // upload tail. The oneshot `kill_channel` is already consumed by
         // `inner_execute`, so once the child has exited the only kill
         // signal is `cancelled` (+ its `kill_notify` wakeup edge), which
-        // this arm awaits. Returns `Aborted` so the action propagates to
-        // cleanup instead of hanging until `max_upload_timeout`.
+        // this arm awaits. On kill it abandons the stalled upload and
+        // returns `Ok(self)` carrying a terminal `ActionResult{error:
+        // Aborted}` — the SAME shape the normal pipeline produces for a
+        // kill-during-execute (#1899). This routes the publish closure's
+        // Ok arm → `ExecuteResponse(Completed{Aborted})` to the scheduler,
+        // which is TERMINAL (`ActionStage::is_finished()`).
+        //
+        // M1 (cadre fix-up #2): returning `Err(Aborted)` instead would take
+        // the publish closure's Err arm → `InternalError(Aborted)` →
+        // `UpdateOperationType::UpdateWithError`. The scheduler's
+        // `inner_update_operation` (`simple_scheduler_state_manager.rs:837-859`)
+        // does NOT treat `Code::Aborted` as terminal: it is neither
+        // `ResourceExhausted` (backpressure) nor `FailedPrecondition`
+        // (missing inputs), so `attempts += 1` then `ActionStage::Queued`
+        // while `attempts <= max_job_retries` — RE-QUEUEING the killed action
+        // for a spurious re-execution (the scheduler-side kill path
+        // `cancel_operation_internal` only sends `KillOperationRequest`; it
+        // never marks the awaited-action finished, so the already-completed
+        // guard does not save us). The Ok-arm `Completed{Aborted}` carries an
+        // `ActionResult`, so `is_finished()` is true and the op lands
+        // terminally with no retry.
         let kill_fut = async move {
             // Fast path: a kill that landed before this future is first
             // polled (e.g. during execute) already set `cancelled`. Without
@@ -4608,11 +4641,26 @@ impl RunningAction for RunningActionImpl {
             if !kill_action.cancelled.load(Ordering::Acquire) {
                 kill_action.kill_notify.notified().await;
             }
-            make_err!(
-                Code::Aborted,
-                "upload_results aborted by kill for operation {:?}",
-                kill_action.operation_id,
-            )
+            // Synthesize the terminal result the abandoned upload never got
+            // to write. Carry the `Aborted` error that `kill_operation` /
+            // `inner_execute`'s kill arm recorded in `state.error`; if (in a
+            // race) `state.error` is unset, stamp a fresh `Aborted` so the
+            // result always classifies as a killed action.
+            {
+                let mut state = kill_action.state.lock();
+                let error = state.error.take().unwrap_or_else(|| {
+                    make_err!(
+                        Code::Aborted,
+                        "upload_results aborted by kill for operation {:?}",
+                        kill_action.operation_id,
+                    )
+                });
+                state.action_result = Some(ActionResult {
+                    error: Some(error),
+                    ..ActionResult::default()
+                });
+            }
+            Ok(kill_action)
         };
 
         let stall_warned = AtomicBool::new(false);
@@ -4640,14 +4688,21 @@ impl RunningAction for RunningActionImpl {
                 // `biased`: poll the upload FIRST every wakeup. The kill arm
                 // therefore wins ONLY when the upload is still Pending
                 // (genuinely in-flight) — a kill that races a near-complete
-                // upload lets the upload finish, preserving the established
-                // kill-during-execute shape (`Ok(ActionResult{error: Aborted})`
-                // produced by the normal pipeline; #1899). This makes the kill
-                // arm a preemption of a STALLED/slow upload, not a result-shape
-                // change for the fast path.
+                // upload lets the upload finish. BOTH outcomes carry the
+                // SAME terminal shape: `Ok(Arc<Self>)` whose `action_result`
+                // holds `error: Aborted` (the upload path stamps it from
+                // `state.error`; the kill arm synthesizes it). So whether the
+                // upload completes-with-Aborted or the kill arm preempts a
+                // stalled upload, `get_finished_result` → publish-closure Ok
+                // arm → `ExecuteResponse(Completed{Aborted})` is identical and
+                // matches #1899's kill-during-execute. M1 (cadre fix-up #2):
+                // the kill arm is a preemption of a STALLED upload that
+                // PRESERVES the terminal wire shape — not a switch to the
+                // Err-arm `InternalError(Aborted)` (which the scheduler would
+                // re-queue; see the `kill_fut` doc-comment above).
                 biased;
                 result = &mut upload_fut => result,
-                killed = &mut kill_fut => Err(killed),
+                killed = &mut kill_fut => killed,
                 () = &mut stall_warn_fut => unreachable!(),
             }
         })

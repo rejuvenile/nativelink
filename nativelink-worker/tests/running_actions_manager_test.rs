@@ -6977,22 +6977,22 @@ exit 1
         // in-flight on the blocked slow store (deferred OFF).
         let task = tokio::spawn(async move { executed.upload_results().await });
 
-        // Confirm the upload is genuinely in-flight: the slow store's
-        // `update` was entered (count exceeds the setup baseline) and the
-        // task has not finished. Real-timer sleep between checks avoids
-        // current-thread timer starvation.
-        tokio::time::timeout(ENTERED_DEADLINE, async {
-            loop {
-                if slow_store.update_attempts_count() > before_count {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect(
-            "fixture invariant: upload_results must enter the slow store \
-             before the kill — synchronous upload path not reached",
+        // Confirm the upload is genuinely in-flight: await the fixture's
+        // `entered` Notify, which `BlockingFakeSlowStore::update` fires the
+        // moment it enters and starts blocking. This is a deterministic
+        // synchronization edge (vs a timer poll); `notify_one` stores a
+        // permit if the slow store entered before we subscribe, so the await
+        // resolves regardless of ordering.
+        tokio::time::timeout(ENTERED_DEADLINE, slow_store.entered.notified())
+            .await
+            .expect(
+                "fixture invariant: upload_results must enter the slow store \
+                 before the kill — synchronous upload path not reached",
+            );
+        // `update` was entered at least once past the setup baseline.
+        assert!(
+            slow_store.update_attempts_count() > before_count,
+            "fixture invariant: slow-store update must have been entered"
         );
         assert!(
             !task.is_finished(),
@@ -7016,14 +7016,230 @@ exit 1
             )
             .expect("upload_results task join error");
 
-        let err = upload_outcome.expect_err(
-            "Gap 2: a killed upload must return an error, not Ok — the kill \
-             arm must abort the in-flight upload",
+        // M1 (cadre fix-up #2): the kill arm must produce the SAME terminal
+        // shape as #1899's kill-during-execute — `Ok(self)` carrying a
+        // terminal `ActionResult{error: Aborted}` — NOT `Err(Aborted)`.
+        // `upload_results` returns `Arc<RunningActionImpl>`; the real
+        // `get_finished_result()` (the exact seam the publish closure uses)
+        // then yields the embedded `ActionResult`, which routes the Ok-arm
+        // `ExecuteResponse(Completed{Aborted})` to the scheduler. The Err-arm
+        // `InternalError(Aborted)` is RE-QUEUED by
+        // `simple_scheduler_state_manager.rs:837-859` (Aborted is neither
+        // ResourceExhausted nor FailedPrecondition, so attempts++ then
+        // `ActionStage::Queued` while attempts <= max_job_retries), causing a
+        // spurious re-execution of a killed action. The Ok-arm
+        // `Completed{Aborted}` is terminal (`ActionStage::is_finished()`), so
+        // it is not retried. The publish-closure wire shape is asserted by
+        // the seam test
+        // `killed_upload_tail_publishes_execute_response_not_internal_error`
+        // in `kill_upload_tail_publish_seam_test.rs`.
+        let killed_action = upload_outcome.expect(
+            "Gap 2 / M1: a killed upload-tail must return Ok(self) carrying a \
+             terminal ActionResult{error: Aborted} (the #1899 Ok-arm shape), \
+             NOT Err — the Err-arm InternalError(Aborted) is re-queued by the \
+             scheduler as a spurious re-execution",
+        );
+        // Drive the real `get_finished_result()` seam — the same call the
+        // publish pipeline (`.and_then(RunningAction::get_finished_result)`)
+        // makes — to extract the synthesized terminal ActionResult.
+        let action_result = killed_action.get_finished_result().await.expect(
+            "M1: the kill arm must synthesize a terminal action_result so \
+             get_finished_result yields Ok(ActionResult{error: Aborted}) — \
+             an Err here means the killed upload produced no terminal result",
+        );
+        let err = action_result.error.expect(
+            "M1: the killed upload-tail ActionResult must carry error: Aborted",
         );
         assert_eq!(
             err.code,
             Code::Aborted,
-            "Gap 2: a kill during the upload tail must abort with Code::Aborted \
+            "Gap 2 / M1: a kill during the upload tail must carry Code::Aborted \
+             in the terminal ActionResult (got {err:?})",
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // testing-czar MAJOR (cadre fix-up #2): the `kill_fut` durable-flag
+    // FAST PATH (`if !kill_action.cancelled.load(Acquire)`) is the
+    // belt-and-suspenders guard for an action that was ALREADY cancelled
+    // before `upload_results` first polls — e.g. a kill landed during
+    // `execute` (child exited, `inner_execute` set `cancelled=true`), and the
+    // pipeline drives the already-cancelled action straight into
+    // `upload_results`. In that case the fast-path must preempt the upload
+    // IMMEDIATELY, BEFORE it ever touches the slow store, without relying on
+    // a post-start `kill_notify` wakeup.
+    //
+    // This test sets `cancelled=true` directly (`set_cancelled_for_test`,
+    // which does NOT fire `kill_notify` — exactly UNLIKE `kill_operation`,
+    // which stores a permit) BEFORE spawning `upload_results`. It then
+    // asserts the upload returns the terminal `Ok(ActionResult{error:
+    // Aborted})` shape immediately AND never entered the slow store
+    // (`update_attempts_count() == 0`).
+    //
+    // Mutation: change `if !kill_action.cancelled.load(...)` to `if false`
+    // in `upload_results`. The kill arm then ALWAYS awaits
+    // `kill_notify.notified()`; because no `kill_operation` was called there
+    // is no stored permit, so the notify never fires, the `biased` select
+    // polls `upload_fut` first, the upload enters the blocked slow store, and
+    // the `ABORT_DEADLINE` timeout fires with the bespoke message below.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn kill_fut_fast_path_aborts_precancelled_upload()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "kill_fast_path_worker";
+        // A pre-cancelled upload must abort within this bound WITHOUT ever
+        // entering the slow store. Far below the 600s max_upload_timeout.
+        const ABORT_DEADLINE: Duration = Duration::from_secs(5);
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_fast_store, slow_store, cas_store, ac_store) =
+            setup_stores_with_blocking_slow().await?;
+        let root_action_directory = make_temp_path("root_action_directory_kill_fast_path");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+                RunningActionsManagerArgs {
+                    root_action_directory,
+                    execution_configuration: ExecutionConfiguration::default(),
+                    cas_store: cas_store.clone(),
+                    ac_store: Some(Store::new(ac_store.clone())),
+                    ac_mirror_target: None,
+                    historical_store: Store::new(cas_store.clone()),
+                    upload_action_result_config:
+                        &nativelink_config::cas_server::UploadActionResultConfig {
+                            upload_ac_results_strategy:
+                                nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                            ..Default::default()
+                        },
+                    max_action_timeout: Duration::MAX,
+                    max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                    timeout_handled_externally: false,
+                    directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
+                    cas_endpoint: String::new(),
+                    // Synchronous upload path: upload_results blocks on the
+                    // slow store unless the kill fast-path preempts it.
+                    deferred_output_uploads_enabled: false,
+                },
+                Callbacks {
+                    now_fn: test_monotonic_clock,
+                    sleep_fn: |_duration| Box::pin(future::pending()),
+                },
+            )?);
+
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'fast-path-content' > ./out.txt".to_string(),
+            ],
+            output_paths: vec!["out.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            _fast_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            _fast_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            _fast_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let running_action_impl = running_actions_manager
+            .clone()
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        // Pre-cancel BEFORE upload_results starts — no kill_notify permit is
+        // stored (unlike kill_operation). The only thing that can preempt the
+        // upload is the fast-path durable-flag check.
+        executed.set_cancelled_for_test();
+
+        let before_count = slow_store.update_attempts_count();
+        assert_eq!(
+            before_count, 0,
+            "fixture invariant: no slow-store update before upload_results starts"
+        );
+
+        let upload_outcome = tokio::time::timeout(ABORT_DEADLINE, async move {
+            executed.upload_results().await
+        })
+        .await
+        .expect(
+            "kill_fut fast-path: a pre-cancelled action must abort upload_results \
+             via the durable `cancelled` flag WITHOUT a post-start kill_notify — \
+             the upload entered the blocked slow store, so the `if !cancelled` \
+             fast-path check is missing from kill_fut",
+        );
+
+        // The fast-path preempts BEFORE the upload touches the slow store.
+        assert_eq!(
+            slow_store.update_attempts_count(),
+            0,
+            "kill_fut fast-path: a pre-cancelled upload must be preempted before \
+             entering the slow store (update_attempts must stay 0)"
+        );
+
+        let killed_action = upload_outcome.expect(
+            "kill_fut fast-path: a pre-cancelled upload must return Ok(self) \
+             carrying a terminal ActionResult{error: Aborted}, NOT Err",
+        );
+        let action_result = killed_action.get_finished_result().await.expect(
+            "kill_fut fast-path: the synthesized terminal action_result must let \
+             get_finished_result yield Ok(ActionResult{error: Aborted})",
+        );
+        let err = action_result.error.expect(
+            "kill_fut fast-path: the pre-cancelled ActionResult must carry error: Aborted",
+        );
+        assert_eq!(
+            err.code,
+            Code::Aborted,
+            "kill_fut fast-path: a pre-cancelled upload must abort with Code::Aborted \
              (got {err:?})",
         );
 
