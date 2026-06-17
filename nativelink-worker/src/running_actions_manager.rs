@@ -143,6 +143,138 @@ pub fn install_batch_read_test_gate() -> std::sync::Arc<BatchReadTestGate> {
     gate
 }
 
+// CAPPED AT 32: process-wide limit on concurrent action-cleanup directory
+// deletes (`do_cleanup` -> `bounded_remove_dir_all` -> `fs::remove_dir_all`).
+// Justification: `remove_dir_all` runs on the tokio blocking pool (sized to
+// 1024 threads at `src/bin/nativelink.rs:2783` `.max_blocking_threads(1024)`,
+// SHARED with hashing + sync-fs on the upload/download data path). Recursive
+// deletes are slow and, worse, go uninterruptible D-state — the isotope wedge
+// dump (2026-06-16, `nativelink-stall-1781634296551.txt`) caught 157
+// blocking-pool threads simultaneously stuck in `remove_dir_all_recursive`
+// (~15% of the 1024 pool consumed by deletes alone) starving the data plane
+// (see `.claude/audits/isotope-cleanup-fanout-evidence-2026-06-16.md`). 32
+// bounds delete occupancy to ~3% of the 1024 pool, leaving ~992 threads for
+// hashing/fs; far below the observed 157. Worker action concurrency is itself
+// UNCAPPED (`max_inflight_tasks` default 0 = unbounded), so this cap, NOT an
+// action count, is what bounds delete occupancy. Acquired INSIDE the spawned
+// cleanup task (not in `RunningActionImpl::drop`, which is sync and must not
+// block): `drop` only spawns; the spawned task awaits the permit before
+// deleting. Over-cap behavior: queued cleanups park on a cheap async
+// permit-wait (a few Arcs + a PathBuf + the directory-cache pin guard — NO
+// blocking-pool thread) and drain in 32-wide waves as permits free; a
+// >32-simultaneous-completion burst DOES queue at the semaphore — that is the
+// intended throttle, holding no blocking thread. Blocking-pool delete
+// occupancy is the bounded resource. Cleanups EVENTUALLY drain provided the
+// underlying deletes return; ≥32 simultaneously wedged D-state deletes hold
+// their permits until the kernel calls return and head-of-line-block
+// subsequent cleanups — the intended trade (data-plane protection over cleanup
+// liveness; a D-state syscall is uninterruptible, so no timeout could free it
+// anyway). Falsification: T
+// `concurrent_deletes_never_exceed_cap_and_all_complete` drives M = 3×cap
+// concurrent deletes through an injected counting hook; observed max must
+// equal cap and all M must complete within the deadlock-detector window.
+pub const CLEANUP_DELETE_INFLIGHT_CAP: usize = 32;
+
+/// Process-singleton semaphore bounding concurrent action-cleanup directory
+/// deletes at [`CLEANUP_DELETE_INFLIGHT_CAP`]. Process-level (not per-worker)
+/// because the resource it protects — the tokio blocking pool — is itself
+/// process-global, and `do_cleanup` is a free function reached from two call
+/// sites (the `RunningActionImpl::drop` background spawn and the normal
+/// `cleanup` future) that share no per-worker handle to thread an
+/// `Arc<Semaphore>` through. See the `CLEANUP_DELETE_INFLIGHT_CAP` rationale.
+static CLEANUP_DELETE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(CLEANUP_DELETE_INFLIGHT_CAP));
+
+/// Test-only injectable delete hook. When installed, [`bounded_remove_dir_all`]
+/// routes the delete through this closure (still under the real semaphore
+/// permit) instead of touching the filesystem, letting a test observe the
+/// max concurrent-delete count. Mirrors the `BATCH_READ_TEST_GATE` seam:
+/// `LazyLock<Mutex<Option<..>>>`, single slot, absent from production builds.
+#[cfg(feature = "test-utils")]
+#[expect(clippy::type_complexity, reason = "test-only injected async delete fn")]
+// UNBOUNDED-OK: single Arc slot, one per process in test; cfg-gated out of prod.
+static CLEANUP_DELETE_TEST_HOOK: std::sync::LazyLock<
+    parking_lot::Mutex<
+        Option<
+            std::sync::Arc<
+                dyn Fn(
+                        std::path::PathBuf,
+                    ) -> core::pin::Pin<
+                        Box<dyn core::future::Future<Output = Result<(), Error>> + Send>,
+                    > + Send
+                    + Sync,
+            >,
+        >,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+/// Install a delete hook so the next [`bounded_remove_dir_all`] calls route
+/// through `hook` (under the real semaphore) instead of `fs::remove_dir_all`.
+/// Only available with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+#[expect(clippy::type_complexity, reason = "test-only injected async delete fn")]
+pub fn install_cleanup_delete_test_hook(
+    hook: std::sync::Arc<
+        dyn Fn(
+                std::path::PathBuf,
+            )
+                -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), Error>> + Send>>
+            + Send
+            + Sync,
+    >,
+) {
+    *CLEANUP_DELETE_TEST_HOOK.lock() = Some(hook);
+}
+
+/// Remove the installed delete hook so subsequent deletes hit the real
+/// filesystem path again. Only available with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+pub fn take_cleanup_delete_test_hook() {
+    *CLEANUP_DELETE_TEST_HOOK.lock() = None;
+}
+
+/// Bounded directory delete used by `do_cleanup`. Acquires a permit on the
+/// process-singleton [`CLEANUP_DELETE_SEMAPHORE`] BEFORE running the blocking
+/// `fs::remove_dir_all`, so a mass-drop cleanup burst cannot saturate the
+/// shared tokio blocking pool (see [`CLEANUP_DELETE_INFLIGHT_CAP`]). The
+/// permit is held for the duration of the delete (including the single retry)
+/// and released when this future returns. Retains the existing one-retry on
+/// transient failure (macOS Spotlight/Finder ENOTEMPTY races).
+///
+/// MUST be called from inside an already-spawned async task, never from the
+/// synchronous `RunningActionImpl::drop` body — `drop` spawns the task; the
+/// permit is awaited inside it.
+async fn bounded_remove_dir_all(action_directory: &str) -> Result<(), Error> {
+    // `acquire()` only errors if the semaphore is closed; we never close it,
+    // so this cannot fail in practice. err_tip preserves the contract surface.
+    let _permit = CLEANUP_DELETE_SEMAPHORE
+        .acquire()
+        .await
+        .err_tip(|| "cleanup-delete semaphore closed")?;
+
+    #[cfg(feature = "test-utils")]
+    {
+        // Snapshot+drop the lock before awaiting (never hold a sync Mutex
+        // across .await). The hook runs under the permit we just acquired.
+        let hook = CLEANUP_DELETE_TEST_HOOK.lock().clone();
+        if let Some(hook) = hook {
+            return hook(std::path::PathBuf::from(action_directory)).await;
+        }
+    }
+
+    match fs::remove_dir_all(action_directory).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // On macOS, Spotlight/Finder can momentarily recreate files
+            // (e.g. .DS_Store) during deletion, causing ENOTEMPTY. A short
+            // delay and single retry is sufficient.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            fs::remove_dir_all(action_directory).await
+        }
+    }
+    .err_tip(|| format!("Could not remove working directory {action_directory}"))
+}
+
 /// For simplicity we use a fixed exit code for cases when our program is terminated
 /// due to a signal.
 const EXIT_CODE_FOR_SIGNAL: i32 = 9;
@@ -2930,27 +3062,14 @@ async fn do_cleanup(
                 "do_cleanup: could not remove direct-use work symlink (may not exist)",
             );
         }
-        // Now remove the rest of the action directory normally.
-        match fs::remove_dir_all(action_directory).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                fs::remove_dir_all(action_directory).await
-            }
-        }
-        .err_tip(|| format!("Could not remove working directory {action_directory}"))
+        // Now remove the rest of the action directory normally. Bounded by
+        // CLEANUP_DELETE_SEMAPHORE so a mass-drop burst can't saturate the
+        // blocking pool; the one-retry lives inside the helper.
+        bounded_remove_dir_all(action_directory).await
     } else {
-        match fs::remove_dir_all(action_directory).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // On macOS, Spotlight/Finder can momentarily recreate files
-                // (e.g. .DS_Store) during deletion, causing ENOTEMPTY. A
-                // short delay and single retry is sufficient.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                fs::remove_dir_all(action_directory).await
-            }
-        }
-        .err_tip(|| format!("Could not remove working directory {action_directory}"))
+        // Bounded delete (see CLEANUP_DELETE_INFLIGHT_CAP). The macOS
+        // Spotlight/Finder ENOTEMPTY one-retry now lives in the helper.
+        bounded_remove_dir_all(action_directory).await
     };
 
     // Explicit drop after the work-symlink + action-directory removals.
@@ -7724,5 +7843,159 @@ mod cleanup_action_real_method_remove_and_wake_tests {
                  was not delivered",
             )
             .expect("watch sender must still be alive after cleanup_action");
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod cleanup_delete_concurrency_cap_tests {
+    //! Isotope Bug 2: concurrent cleanup deletes on a worker must be BOUNDED.
+    //!
+    //! `do_cleanup` runs `fs::remove_dir_all` on the tokio blocking pool. On a
+    //! mass-drop burst the per-action `RunningActionImpl::drop` background spawn
+    //! fanned out into **157 blocking-pool threads in uninterruptible D-state**
+    //! inside `remove_dir_all_recursive` (isotope wedge dump 2026-06-16, ~15% of
+    //! the 1024-thread pool — see
+    //! `.claude/audits/isotope-cleanup-fanout-evidence-2026-06-16.md`), starving
+    //! the pool shared with hashing/sync-fs on the upload/download data path.
+    //!
+    //! The fix bounds concurrent deletes with the process-singleton
+    //! `CLEANUP_DELETE_SEMAPHORE` (cap `CLEANUP_DELETE_INFLIGHT_CAP`) acquired
+    //! INSIDE `bounded_remove_dir_all` before the blocking delete. This test
+    //! drives a burst of M >> cap concurrent `bounded_remove_dir_all` calls
+    //! through an injected counting delete hook and asserts:
+    //!   1. observed max concurrent deletes never exceeds the cap, AND
+    //!   2. all M calls eventually complete within a deadlock-detector timeout.
+    //!
+    //! No sleep-as-synchronization: the driver spins on a real atomic in-flight
+    //! gauge until it observes the cap saturate, then releases the parked first
+    //! wave via a `Notify` fuse — so the max-concurrency observation is real,
+    //! not a timing artifact; `tokio::time::timeout` is only the deadlock
+    //! detector, never a synchronizer.
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    use super::{
+        CLEANUP_DELETE_INFLIGHT_CAP, bounded_remove_dir_all,
+        install_cleanup_delete_test_hook, take_cleanup_delete_test_hook,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deletes_never_exceed_cap_and_all_complete() {
+        let cap = CLEANUP_DELETE_INFLIGHT_CAP;
+        // Launch strictly more tasks than the cap so the bound is load-bearing.
+        let total = cap * 3;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        // `release` gates the FIRST wave: every hook awaits it. The driver
+        // notifies it (permanently, via a fuse flag) only AFTER observing the
+        // in-flight gauge saturate at `cap` — proving the bound is actually
+        // reached before any hook is allowed to return. Once released, every
+        // subsequent wave's hooks see the fuse already tripped and return
+        // immediately, so the remaining (total - cap) tasks drain in cap-sized
+        // waves as permits free. NOT sleep-as-sync: the driver spin observes a
+        // real atomic gauge; `release` is an explicit wakeup.
+        let release = Arc::new(Notify::new());
+        let released = Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+        let hook = {
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            let release = release.clone();
+            let released = released.clone();
+            Arc::new(move |_path: std::path::PathBuf| {
+                let in_flight = in_flight.clone();
+                let max_seen = max_seen.clone();
+                let release = release.clone();
+                let released = released.clone();
+                Box::pin(async move {
+                    let now = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                    max_seen.fetch_max(now, Ordering::AcqRel);
+                    // First wave parks here until the driver confirms the cap is
+                    // saturated; later waves observe the fuse already tripped and
+                    // fall straight through. Subscribe before checking the fuse
+                    // to avoid a lost-wakeup window.
+                    let notified = release.notified();
+                    if !released.load(Ordering::Acquire) {
+                        notified.await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                    Ok(())
+                }) as core::pin::Pin<Box<dyn core::future::Future<Output = Result<(), nativelink_error::Error>> + Send>>
+            })
+        };
+        install_cleanup_delete_test_hook(hook);
+
+        let mut handles = Vec::with_capacity(total);
+        for i in 0..total {
+            let completed = completed.clone();
+            handles.push(tokio::spawn(async move {
+                bounded_remove_dir_all(&format!("/tmp/isotope2-fake-{i}"))
+                    .await
+                    .expect("bounded_remove_dir_all hook returns Ok");
+                completed.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+
+        // Wait for the first wave to SATURATE the cap, then release. If the
+        // semaphore bounded correctly, in_flight rises to exactly `cap` and
+        // stays there (no permit for a (cap+1)th hook). If the bound were
+        // broken, in_flight would climb past `cap` and the max assertion below
+        // fires. The timeout is a DEADLOCK DETECTOR for "never reached cap".
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if in_flight.load(Ordering::Acquire) >= cap {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "cleanup-delete cap DEADLOCK: the in-flight delete gauge never reached `cap` — \
+             the CLEANUP_DELETE_SEMAPHORE permit was not acquired before the delete, so the \
+             bounded wave never saturated",
+        );
+        // Fuse + wake: trip the flag first so any hook that subscribes after
+        // this point sees it, then wake everyone already parked.
+        released.store(true, Ordering::Release);
+        release.notify_waiters();
+
+        // All M tasks must drain.
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(10), h)
+                .await
+                .expect(
+                    "cleanup-delete cap DEADLOCK: a bounded_remove_dir_all task did not \
+                     complete within the window — bounded deletes must EVENTUALLY all finish \
+                     (the semaphore must not leak permits or deadlock the drain)",
+                )
+                .expect("bounded_remove_dir_all task panicked");
+        }
+
+        assert_eq!(
+            completed.load(Ordering::Acquire),
+            total,
+            "all {total} bounded deletes must complete — bound must not drop work",
+        );
+        let observed_max = max_seen.load(Ordering::Acquire);
+        assert!(
+            observed_max <= cap,
+            "concurrent deletes ({observed_max}) exceeded CLEANUP_DELETE_INFLIGHT_CAP ({cap}) \
+             — the CLEANUP_DELETE_SEMAPHORE did not bound blocking-pool delete fan-out; a \
+             mass-drop burst can saturate the pool (157-thread D-state regression)",
+        );
+        assert_eq!(
+            observed_max, cap,
+            "expected the bounded wave to SATURATE the cap (observed_max {observed_max} != cap \
+             {cap}); a max below cap means the test never actually exercised the bound",
+        );
+
+        // Clean up the process-global hook so sibling tests are unaffected.
+        take_cleanup_delete_test_hook();
     }
 }
