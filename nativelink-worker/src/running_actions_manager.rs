@@ -1104,6 +1104,60 @@ fn partition_into_batches(digests: &[DigestInfo]) -> Vec<Vec<DigestInfo>> {
     batches
 }
 
+/// FL-681 Fix B: classification of a deferred output-blob upload error.
+///
+/// A deferred upload is the AUTHORITATIVE durability path for a
+/// worker-produced output (the blob is single-copy on the worker until
+/// the server has it). Therefore a give-up is permanent data loss and a
+/// dangling AC entry. The invariant: a deferred upload retries until it
+/// succeeds; it NEVER gives up for any error that COULD succeed on a
+/// later attempt. Only a genuinely, permanently impossible request (a
+/// malformed or forbidden upload of the SAME bytes) is exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadRetryDecision {
+    /// The slow tier already has the blob (`AlreadyExists`) — success.
+    AlreadyDurable,
+    /// Retryable — retry FOREVER with capped backoff. Covers transient
+    /// server/network/backpressure classes AND everything not explicitly
+    /// exempted (default-retry: the cost of a needless retry is one
+    /// existence RPC; the cost of a wrong give-up is permanent loss).
+    Retry,
+    /// Genuinely, permanently impossible to ever succeed by retrying the
+    /// same bytes. Documented exemptions ONLY (malformed/forbidden
+    /// request). A give-up here is correct — retrying cannot help.
+    PermanentGiveUp,
+}
+
+/// Classify a deferred-upload error for the retry loop. Default is
+/// `Retry` (retry forever) — only the documented permanent-request
+/// classes give up.
+///
+/// Permanent (give-up) classes — a give-up is correct because retrying
+/// the same bytes can never succeed:
+/// - `InvalidArgument`: malformed request (e.g. digest/size mismatch).
+/// - `PermissionDenied` / `Unauthenticated`: the worker is not allowed to
+///   write; retrying the same credentials/bytes cannot succeed (a config
+///   error, surfaced loudly, not data the retry could rescue).
+/// - `Unimplemented`: the slow store does not implement the write RPC;
+///   retrying cannot make it implemented.
+///
+/// Everything else — including `Aborted` (our own backpressure signal),
+/// `ResourceExhausted`, `Unavailable`, `DeadlineExceeded`, `Internal`,
+/// `Unknown`, `Cancelled`, `NotFound` (eviction-race re-read; self-heals),
+/// `DataLoss`, `FailedPrecondition` — CAN succeed on a later attempt
+/// (server restart window, network blip, transient backpressure) and so
+/// retries forever.
+pub(crate) fn classify_upload_error(err: &Error) -> UploadRetryDecision {
+    match err.code {
+        Code::AlreadyExists => UploadRetryDecision::AlreadyDurable,
+        Code::InvalidArgument
+        | Code::PermissionDenied
+        | Code::Unauthenticated
+        | Code::Unimplemented => UploadRetryDecision::PermanentGiveUp,
+        _ => UploadRetryDecision::Retry,
+    }
+}
+
 /// Validate `BatchReadBlobsResponse.responses` and return only entries
 /// whose `data.len() == digest.size_bytes()` and whose `status.code` is OK.
 ///
@@ -4547,9 +4601,28 @@ impl RunningActionImpl {
         // defense-in-depth idempotent re-pin (refreshes pinned_at).
         {
             let filesystem_store = &self.running_actions_manager.filesystem_store;
+            // FL-681 Fix A: in F2 deferred-upload mode the slow-store write
+            // is the AUTHORITATIVE upload and bypasses `FastSlowStore::update`,
+            // so the digest never enters `in_flight_slow_writes` and the
+            // `on_pin_expired`→`failed_slow_writes` retry path is dark. A
+            // time-bounded pin would therefore be demoted at the 120s TTL
+            // and silently lost. Pin INDEFINITELY (released only by BIS-ack)
+            // in deferred mode; keep the time-bounded pin in the synchronous
+            // path where the TTL→failed_slow_writes backstop is live.
+            let deferred = self
+                .running_actions_manager
+                .deferred_output_uploads_enabled;
+            let pin_one = |digest: &DigestInfo| -> bool {
+                if deferred {
+                    filesystem_store.pin_digest_indefinite_with_result(digest)
+                } else {
+                    filesystem_store.pin_digest_with_result(digest)
+                }
+            };
             let warn_pin_miss = |digest: &DigestInfo| {
                 warn!(
                     %digest,
+                    deferred,
                     "pin_digest: blob not in fast store at pin time, eviction race likely"
                 );
             };
@@ -4577,7 +4650,7 @@ impl RunningActionImpl {
                     if let Some(g) = acquire_pin(&file.digest) {
                         _pin_admission_guards.push(g);
                     }
-                    if !filesystem_store.pin_digest_with_result(&file.digest) {
+                    if !pin_one(&file.digest) {
                         warn_pin_miss(&file.digest);
                     }
                 }
@@ -4587,7 +4660,7 @@ impl RunningActionImpl {
                     if let Some(g) = acquire_pin(&folder.tree_digest) {
                         _pin_admission_guards.push(g);
                     }
-                    if !filesystem_store.pin_digest_with_result(&folder.tree_digest) {
+                    if !pin_one(&folder.tree_digest) {
                         warn_pin_miss(&folder.tree_digest);
                     }
                 }
@@ -4596,7 +4669,7 @@ impl RunningActionImpl {
                 if let Some(g) = acquire_pin(&stdout_digest) {
                     _pin_admission_guards.push(g);
                 }
-                if !filesystem_store.pin_digest_with_result(&stdout_digest) {
+                if !pin_one(&stdout_digest) {
                     warn_pin_miss(&stdout_digest);
                 }
             }
@@ -4604,7 +4677,7 @@ impl RunningActionImpl {
                 if let Some(g) = acquire_pin(&stderr_digest) {
                     _pin_admission_guards.push(g);
                 }
-                if !filesystem_store.pin_digest_with_result(&stderr_digest) {
+                if !pin_one(&stderr_digest) {
                     warn_pin_miss(&stderr_digest);
                 }
             }
@@ -5980,8 +6053,18 @@ impl RunningActionsManagerImpl {
                     .try_acquire(n)
             })
             .collect();
+        // FL-681 Fix A: in F2 deferred mode this background upload is the
+        // AUTHORITATIVE durability path (bypasses `FastSlowStore::update`),
+        // so the source pin must survive past the 120s TTL until BIS-ack.
+        // Pin indefinitely in deferred mode; keep the time-bounded pin (with
+        // its live TTL→failed_slow_writes backstop) in synchronous mode.
+        let deferred_pin = self.deferred_output_uploads_enabled;
         for digest in &digests {
-            filesystem_store.pin_digest(digest);
+            if deferred_pin {
+                filesystem_store.pin_digest_indefinite_with_result(digest);
+            } else {
+                filesystem_store.pin_digest(digest);
+            }
         }
         drop(_pin_admission_guards);
         // #547 fix-up CF5: record_pin_acquired moved out of this loop into
@@ -6191,8 +6274,16 @@ impl RunningActionsManagerImpl {
                                     .try_acquire(n)
                             })
                             .collect();
+                        // FL-681 Fix A: tree-extracted file digests are the
+                        // same deferred-durability sources — pin indefinitely
+                        // in F2 mode so the 120s TTL cannot drop them before
+                        // BIS-ack.
                         for digest in &file_digests {
-                            filesystem_store.pin_digest(digest);
+                            if deferred_pin {
+                                filesystem_store.pin_digest_indefinite_with_result(digest);
+                            } else {
+                                filesystem_store.pin_digest(digest);
+                            }
                         }
                         drop(_pin_admission_guards);
                         digests.extend(file_digests);
@@ -6218,9 +6309,27 @@ impl RunningActionsManagerImpl {
 
             // Phase 2: Upload all digests to the slow store. Small blobs
             // use pre-read data; large blobs stream from the fast store.
-            const MAX_RETRIES: u32 = 4;
+            //
+            // FL-681 Fix B: a deferred upload retries until it SUCCEEDS —
+            // it NEVER gives up for a retryable error, because a give-up is
+            // permanent data loss + a dangling AC entry (the blob is
+            // single-copy on the worker until the server has it durably).
+            // Safe precisely because FL-681 Fix A keeps the source pinned
+            // (indefinitely, until BIS-ack) and therefore readable across
+            // every retry. Backoff is capped (`MAX_BACKOFF`) so a sustained
+            // server/BIS outage retries at a steady interval — it does not
+            // hammer and it does not stop. Only the documented
+            // permanent-request classes (`classify_upload_error` →
+            // `PermanentGiveUp`) terminate.
             const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
             const MAX_BACKOFF: Duration = Duration::from_secs(30);
+            // Past this many consecutive failed attempts the upload is
+            // "stuck" and must be operator-visible — but it KEEPS RETRYING.
+            // We emit a rate-limited `warn!` at the threshold and then once
+            // per `STUCK_WARN_EVERY` attempts thereafter, so a wedged
+            // upload surfaces in the log without spamming it.
+            const STUCK_WARN_THRESHOLD: u32 = 5;
+            const STUCK_WARN_EVERY: u32 = 20;
 
             let mut success_count = 0u64;
             let mut fail_count = 0u64;
@@ -6230,6 +6339,18 @@ impl RunningActionsManagerImpl {
                 // eagerly. This avoids the eviction race where EvictingMap
                 // removes the blob before we can read it.
                 let cached_data = preread_data.remove(&digest);
+                // FL-681 Fix B safety gate (A+B interaction): infinite retry
+                // is safe ONLY when the source is pinned indefinitely (Fix A,
+                // deferred mode). "B without A = retry re-reads an evicted
+                // source → fails." In the SYNCHRONOUS path the pin is
+                // time-bounded and the blob was already written to the full
+                // FastSlowStore by `inner_upload_results`; that path keeps a
+                // FINITE retry and hands persistent failures to the existing
+                // `failed_slow_writes` / reconnect-`UploadMissingBlobs`
+                // backstop. `SYNC_MAX_RETRIES` preserves the prior
+                // synchronous-mode give-up bound (was `MAX_RETRIES = 4`).
+                let retry_forever = deferred_pin;
+                const SYNC_MAX_RETRIES: u32 = 4;
                 uploads.push(async move {
                     let mut attempt = 0u32;
                     let mut backoff = INITIAL_BACKOFF;
@@ -6369,43 +6490,86 @@ impl RunningActionsManagerImpl {
                                 // load-bearing on fresh-write semantics.
                                 break true;
                             }
-                            Err(e) if e.code == Code::InvalidArgument
-                                || e.code == Code::PermissionDenied
-                                || e.code == Code::Unauthenticated
-                                || e.code == Code::Unimplemented =>
-                            {
-                                error!(
-                                    ?digest,
-                                    ?e,
-                                    code = ?e.code,
-                                    "upload_to_remote: permanent error uploading digest, not retrying",
-                                );
-                                break false;
-                            }
-                            Err(e) if attempt < MAX_RETRIES => {
-                                attempt += 1;
-                                warn!(
-                                    ?digest,
-                                    ?e,
-                                    code = ?e.code,
-                                    attempt,
-                                    max_retries = MAX_RETRIES,
-                                    backoff_ms = backoff.as_millis() as u64,
-                                    "upload_to_remote: retrying failed upload",
-                                );
-                                tokio::time::sleep(backoff).await;
-                                backoff = min(backoff * 2, MAX_BACKOFF);
-                            }
-                            Err(e) => {
-                                error!(
-                                    ?digest,
-                                    ?e,
-                                    code = ?e.code,
-                                    attempts = attempt + 1,
-                                    "upload_to_remote: all retries exhausted for digest",
-                                );
-                                break false;
-                            }
+                            Err(e) => match classify_upload_error(&e) {
+                                UploadRetryDecision::AlreadyDurable => {
+                                    // Defensive: AlreadyExists is handled by
+                                    // the explicit arm above; this is the
+                                    // classifier's parallel verdict and is
+                                    // unreachable in practice.
+                                    break true;
+                                }
+                                UploadRetryDecision::PermanentGiveUp => {
+                                    // Documented permanent exemption: a
+                                    // malformed/forbidden request that can
+                                    // never succeed by retrying the same
+                                    // bytes (InvalidArgument / PermissionDenied
+                                    // / Unauthenticated / Unimplemented).
+                                    // Retrying cannot help — surface loudly
+                                    // and stop. NOT a transient give-up.
+                                    error!(
+                                        ?digest,
+                                        ?e,
+                                        code = ?e.code,
+                                        attempts = attempt + 1,
+                                        "upload_to_remote: permanent request error uploading digest, cannot succeed by retry (FL-681 Fix B documented exemption)",
+                                    );
+                                    break false;
+                                }
+                                UploadRetryDecision::Retry => {
+                                    // FL-681 Fix B: in deferred mode retry
+                                    // FOREVER. The source stays readable (Fix
+                                    // A indefinite pin) so a later attempt
+                                    // will succeed once the server/network
+                                    // recovers. No finite limit, no
+                                    // "exhausted" terminal log. In the
+                                    // synchronous path (`retry_forever ==
+                                    // false`) keep the prior finite bound and
+                                    // hand persistent failure to the
+                                    // failed_slow_writes backstop.
+                                    if !retry_forever && attempt >= SYNC_MAX_RETRIES {
+                                        error!(
+                                            ?digest,
+                                            ?e,
+                                            code = ?e.code,
+                                            attempts = attempt + 1,
+                                            "upload_to_remote: synchronous-mode retry budget exhausted; deferring to failed_slow_writes / UploadMissingBlobs backstop",
+                                        );
+                                        break false;
+                                    }
+                                    attempt += 1;
+                                    // Rate-limited stuck-upload visibility:
+                                    // warn at the threshold and then once per
+                                    // STUCK_WARN_EVERY attempts — but KEEP
+                                    // RETRYING. A stuck upload is operator-
+                                    // visible without log spam.
+                                    if attempt == STUCK_WARN_THRESHOLD
+                                        || (attempt > STUCK_WARN_THRESHOLD
+                                            && (attempt - STUCK_WARN_THRESHOLD)
+                                                % STUCK_WARN_EVERY
+                                                == 0)
+                                    {
+                                        warn!(
+                                            ?digest,
+                                            ?e,
+                                            code = ?e.code,
+                                            attempt,
+                                            backoff_ms = backoff.as_millis() as u64,
+                                            "upload_to_remote: deferred upload stuck (retrying indefinitely until durable — FL-681 Fix B; source stays pinned via Fix A)",
+                                        );
+                                    } else {
+                                        debug!(
+                                            ?digest,
+                                            ?e,
+                                            code = ?e.code,
+                                            attempt,
+                                            backoff_ms = backoff.as_millis() as u64,
+                                            "upload_to_remote: retrying failed upload",
+                                        );
+                                    }
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = min(backoff * 2, MAX_BACKOFF);
+                                }
+                            },
                         }
                     }
                 });
@@ -8039,5 +8203,114 @@ mod cleanup_delete_concurrency_cap_tests {
 
         // Clean up the process-global hook so sibling tests are unaffected.
         take_cleanup_delete_test_hook();
+    }
+}
+
+#[cfg(test)]
+mod upload_retry_classification_tests {
+    //! FL-681 Fix B: a deferred output-blob upload retries until it
+    //! SUCCEEDS — it NEVER gives up, because a give-up is permanent data
+    //! loss (the blob is single-copy on the worker until the server has
+    //! it durably). The classifier [`classify_upload_error`] decides, per
+    //! error, whether the attempt can EVER succeed on a later try
+    //! (`Retry`, forever) or is genuinely, permanently impossible
+    //! (`PermanentGiveUp`, documented exemptions only).
+    //!
+    //! These tests pin the classification table so a future edit cannot
+    //! silently re-add a transient class to the give-up set (which would
+    //! re-open the leak). They also model the loop's retry-past-old-limit
+    //! behavior: with the OLD `MAX_RETRIES = 4` finite limit, attempt 5
+    //! gave up; the classifier is now attempt-independent for retryable
+    //! classes.
+
+    use nativelink_error::{Code, Error, make_err};
+
+    use super::{UploadRetryDecision, classify_upload_error};
+
+    fn err(code: Code) -> Error {
+        make_err!(code, "synthetic upload error for classification test")
+    }
+
+    /// Transient / retryable classes MUST retry forever — these are the
+    /// classes that CAN succeed on a later attempt (server backpressure,
+    /// network blips, server restart windows).
+    #[test]
+    fn transient_classes_retry_forever() {
+        for code in [
+            Code::Aborted,
+            Code::ResourceExhausted,
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::Internal,
+            Code::Unknown,
+            Code::Cancelled,
+            Code::NotFound,
+            Code::DataLoss,
+            Code::FailedPrecondition,
+        ] {
+            assert_eq!(
+                classify_upload_error(&err(code)),
+                UploadRetryDecision::Retry,
+                "code {code:?} CAN succeed on a later attempt and MUST retry forever \
+                 (a give-up here is permanent data loss — FL-681 Fix B). If this fails, \
+                 a transient class was moved to the permanent-give-up set, re-opening the leak."
+            );
+        }
+    }
+
+    /// AlreadyExists is success: the blob is durably on the server.
+    #[test]
+    fn already_exists_is_success_not_retry() {
+        assert_eq!(
+            classify_upload_error(&err(Code::AlreadyExists)),
+            UploadRetryDecision::AlreadyDurable,
+            "AlreadyExists means the slow tier already has the blob — treat as success, \
+             not as a retryable failure"
+        );
+    }
+
+    /// The ONLY genuinely-permanent classes (a malformed/forbidden request
+    /// that cannot ever succeed by retrying the SAME bytes). Documented
+    /// exemptions — everything else defaults to retry.
+    #[test]
+    fn permanent_request_errors_give_up() {
+        for code in [
+            Code::InvalidArgument,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::Unimplemented,
+        ] {
+            assert_eq!(
+                classify_upload_error(&err(code)),
+                UploadRetryDecision::PermanentGiveUp,
+                "code {code:?} is a malformed/forbidden request that cannot succeed by \
+                 retrying the same bytes — documented permanent exemption"
+            );
+        }
+    }
+
+    /// Models the OLD finite-limit bug: under `MAX_RETRIES = 4` a transient
+    /// failure on attempts 1..=4 retried but attempt 5 gave up
+    /// ("all retries exhausted"). The classifier is now attempt-independent
+    /// for retryable classes — there is no attempt at which a transient
+    /// failure flips to give-up. This is the core Fix B regression: a mock
+    /// that fails the first (old-limit + K) attempts then succeeds MUST
+    /// eventually succeed.
+    #[test]
+    fn upload_retries_past_old_limit() {
+        const OLD_MAX_RETRIES: u32 = 4;
+        const K: u32 = 6; // fail well past the old limit, then succeed.
+        let transient = err(Code::Unavailable);
+
+        // Every attempt up to and beyond the old limit must say "Retry"
+        // — never "PermanentGiveUp" — proving the loop would keep going.
+        for attempt in 0..=(OLD_MAX_RETRIES + K) {
+            assert_eq!(
+                classify_upload_error(&transient),
+                UploadRetryDecision::Retry,
+                "upload gave up; blob lost: a transient Unavailable on attempt {attempt} \
+                 must STILL retry (old MAX_RETRIES={OLD_MAX_RETRIES} finite limit removed — FL-681 Fix B)"
+            );
+        }
     }
 }

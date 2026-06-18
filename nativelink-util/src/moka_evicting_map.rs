@@ -61,6 +61,16 @@ struct PinnedEntry<T> {
     data: T,
     pinned_at: Instant,
     size: u64,
+    /// FL-681 Fix A: when `true`, this pin is held UNTIL the server's
+    /// BlobsInStableStorage ack (`unpin_key`) and is EXEMPT from the
+    /// `PIN_TIMEOUT_SECS` sweep in [`MokaEvictingMap::expire_stale_pins`].
+    /// Worker-local F2 deferred-output blobs set this so their
+    /// anti-eviction pin is released ONLY by BIS-ack — never by the 120s
+    /// TTL — mirroring how in-memory mirror blobs are pinned indefinitely
+    /// (the mirror-TTL sweeper was removed in `local_worker.rs` for the
+    /// same data-loss reason). A normal (time-bounded) pin sets this
+    /// `false` and keeps the TTL backstop.
+    indefinite: bool,
 }
 
 /// An eviction event captured by the moka listener and sent to the
@@ -125,8 +135,26 @@ pub struct MokaEvictingMap<
     pinned: Arc<DashMap<K, PinnedEntry<T>>>,
     /// Total bytes currently pinned.
     pinned_bytes: AtomicU64,
+    /// FL-681 Fix A: subset of `pinned_bytes` held by INDEFINITE
+    /// (pinned-until-BIS-ack) pins. Tracked separately so the indefinite
+    /// cap can be enforced without coupling to the time-bounded pin set.
+    /// `indefinite_pinned_bytes <= pinned_bytes` always.
+    indefinite_pinned_bytes: AtomicU64,
     /// 25% of max_bytes — ceiling for pinned data.
     pin_cap: u64,
+    // CAPPED AT indefinite_pin_cap: FL-681 Fix A. An indefinite pin holds
+    // a worker-local F2 output blob un-evictable until BIS-ack; under a
+    // sustained server/BIS outage the set of pending-BIS pinned blobs
+    // would otherwise grow without bound (no TTL releases it). This is the
+    // measured cap on `indefinite_pinned_bytes`. Over-cap behavior is
+    // BACKPRESSURE, never drop: `pin_key_indefinite` REFUSES (returns
+    // `false`); the caller leaves the blob as a normal TTL-evictable pin
+    // and retries the durability upload, so the source stays readable and
+    // no blob is lost. Defaults to `pin_cap` (indefinite pins can never
+    // exceed the total pin budget); `0` means "fall back to pin_cap".
+    // Mirrors the `FastSlowStore::slow_writes_in_flight_max_bytes` cap +
+    // typed-backpressure pattern.
+    indefinite_pin_cap: u64,
     /// Optional BTreeSet index for range queries. Shared with the
     /// eviction listener for cleanup on eviction.
     btree: Arc<RwLock<Option<BTreeSet<K>>>>,
@@ -238,6 +266,9 @@ where
         // composite invariant: `pinned_bytes <= pin_cap`).
         let pinned_bytes: u64 = self.pinned_bytes.load(Ordering::Relaxed);
         let pinned_count: u64 = self.pinned.len() as u64;
+        // FL-681 Fix A: indefinite (pinned-until-BIS-ack) subset gauge.
+        let indefinite_pinned_bytes: u64 =
+            self.indefinite_pinned_bytes.load(Ordering::Relaxed);
 
         // Pinned-bytes gauge — load-bearing for #332 prophylactic pin-cap
         // headroom falsifiability. If this exceeds `pin_cap` in
@@ -260,6 +291,18 @@ where
             &pinned_count,
             nativelink_metric::MetricKind::Default,
             "Number of currently-pinned entries (companion to pinned_bytes)."
+        );
+        nativelink_metric::publish!(
+            "indefinite_pinned_bytes",
+            &indefinite_pinned_bytes,
+            nativelink_metric::MetricKind::Default,
+            "FL-681 Fix A: bytes held by INDEFINITE (pinned-until-BIS-ack) pins — worker-local F2 deferred-output blobs exempt from the 120s TTL sweep. Subset of pinned_bytes; capped by indefinite_pin_cap with backpressure over-cap. A sustained rise tracks pending-BIS durability backlog under a server/BIS outage."
+        );
+        nativelink_metric::publish!(
+            "indefinite_pin_cap",
+            &self.indefinite_pin_cap,
+            nativelink_metric::MetricKind::Default,
+            "FL-681 Fix A: configured cap on indefinite_pinned_bytes. Over-cap behavior is backpressure (pin_key_indefinite refuses; caller retries — never drops). Defaults to pin_cap when configured 0."
         );
         nativelink_metric::publish!(
             "entry_count",
@@ -338,6 +381,23 @@ where
     }
 
     pub fn with_anchor(config: &EvictionPolicy, anchor_time: I) -> Self {
+        // Default the indefinite-pin cap to `pin_cap` (25% of max_bytes):
+        // indefinite pins are a subset of all pins and can never exceed
+        // the total pin budget. `0` is interpreted below as "use pin_cap".
+        Self::with_anchor_and_indefinite_cap(config, anchor_time, 0)
+    }
+
+    /// FL-681 Fix A constructor variant: same as [`Self::with_anchor`]
+    /// but with an explicit cap on INDEFINITE (pinned-until-BIS-ack)
+    /// bytes. `indefinite_pin_cap_bytes == 0` falls back to the normal
+    /// `pin_cap` (25% of `max_bytes`). The cap is enforced at
+    /// [`Self::pin_key_indefinite`] / [`Self::pin_keys_indefinite`] with
+    /// BACKPRESSURE (refuse, never drop) over-cap semantics.
+    pub fn with_anchor_and_indefinite_cap(
+        config: &EvictionPolicy,
+        anchor_time: I,
+        indefinite_pin_cap_bytes: u64,
+    ) -> Self {
         let max_bytes = config.max_bytes as u64;
         let max_count = config.max_count;
         let max_seconds = config.max_seconds;
@@ -457,12 +517,22 @@ where
 
         let cache = builder.build();
         let pin_cap = (max_bytes as f64 * PIN_CAP_FRACTION) as u64;
+        // FL-681 Fix A: an explicit `0` indefinite cap means "use the
+        // total pin_cap" so indefinite pins can never exceed the overall
+        // pin budget; a non-zero value is the operator-tuned cap.
+        let indefinite_pin_cap = if indefinite_pin_cap_bytes == 0 {
+            pin_cap
+        } else {
+            indefinite_pin_cap_bytes
+        };
 
         Self {
             cache,
             pinned,
             pinned_bytes: AtomicU64::new(0),
+            indefinite_pinned_bytes: AtomicU64::new(0),
             pin_cap,
+            indefinite_pin_cap,
             btree,
             pending_evictions,
             eviction_tx,
@@ -665,9 +735,19 @@ where
 
         // If key is pinned, replace in pinned map directly.
         if self.has_pinned() && self.pinned.contains_key(key.borrow()) {
+            // FL-681 Fix A: preserve the existing pin's `indefinite` flag
+            // across a re-insert of the same key. A fresh write of a digest
+            // that is currently pinned-until-BIS-ack MUST NOT silently
+            // demote it to time-bounded (that would re-open the TTL leak).
+            let mut was_indefinite = false;
             let old = self.pinned.remove(key.borrow()).map(|(_, entry)| {
                 self.pinned_bytes
                     .fetch_sub(entry.size, Ordering::Relaxed);
+                if entry.indefinite {
+                    was_indefinite = true;
+                    self.indefinite_pinned_bytes
+                        .fetch_sub(entry.size, Ordering::Relaxed);
+                }
                 entry.data
             });
             self.pinned.insert(
@@ -676,9 +756,14 @@ where
                     data: data.clone(),
                     pinned_at: Instant::now(),
                     size,
+                    indefinite: was_indefinite,
                 },
             );
             self.pinned_bytes.fetch_add(size, Ordering::Relaxed);
+            if was_indefinite {
+                self.indefinite_pinned_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+            }
             self.fire_on_insert_callbacks(&key, size);
             if old.is_some() {
                 self.replaced_bytes.add(size);
@@ -816,9 +901,19 @@ where
 
         // If key is pinned, replace in pinned map directly.
         if self.has_pinned() && self.pinned.contains_key(key.borrow()) {
+            // FL-681 Fix A: preserve the existing pin's `indefinite` flag
+            // across a re-insert of the same key. A fresh write of a digest
+            // that is currently pinned-until-BIS-ack MUST NOT silently
+            // demote it to time-bounded (that would re-open the TTL leak).
+            let mut was_indefinite = false;
             let old = self.pinned.remove(key.borrow()).map(|(_, entry)| {
                 self.pinned_bytes
                     .fetch_sub(entry.size, Ordering::Relaxed);
+                if entry.indefinite {
+                    was_indefinite = true;
+                    self.indefinite_pinned_bytes
+                        .fetch_sub(entry.size, Ordering::Relaxed);
+                }
                 entry.data
             });
             self.pinned.insert(
@@ -827,9 +922,14 @@ where
                     data: data.clone(),
                     pinned_at: Instant::now(),
                     size,
+                    indefinite: was_indefinite,
                 },
             );
             self.pinned_bytes.fetch_add(size, Ordering::Relaxed);
+            if was_indefinite {
+                self.indefinite_pinned_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+            }
             self.fire_on_insert_callbacks(&key, size);
             if old.is_some() {
                 self.replaced_bytes.add(size);
@@ -984,11 +1084,52 @@ where
     // ---------------------------------------------------------------
 
     pub fn pin_key(&self, key: K) -> bool {
+        self.pin_key_with_mode(key, false)
+    }
+
+    /// FL-681 Fix A: pin `key` INDEFINITELY — held until BIS-ack
+    /// (`unpin_key`), EXEMPT from the `PIN_TIMEOUT_SECS` sweep. Used by
+    /// worker-local F2 deferred-output uploads so the source blob stays
+    /// un-evictable until the server confirms durability, never dropping
+    /// it at the 120s TTL. Subject to the `indefinite_pin_cap` (returns
+    /// `false` over-cap as BACKPRESSURE — the caller must retry, not
+    /// drop). Refreshing an already-pinned key UPGRADES it to indefinite.
+    pub fn pin_key_indefinite(&self, key: K) -> bool {
+        self.pin_key_with_mode(key, true)
+    }
+
+    /// Shared pin core for [`Self::pin_key`] / [`Self::pin_key_indefinite`].
+    /// `indefinite=true` exempts the entry from the TTL sweep and enforces
+    /// the indefinite-pin cap.
+    fn pin_key_with_mode(&self, key: K, indefinite: bool) -> bool {
         let q: &Q = key.borrow();
 
-        // Already pinned — refresh pin time.
+        // Already pinned — refresh pin time. If this call requests an
+        // indefinite pin and the existing entry is time-bounded, UPGRADE
+        // it to indefinite (subject to the indefinite cap). An upgrade is
+        // never a downgrade: an already-indefinite pin stays indefinite.
         if let Some(mut entry) = self.pinned.get_mut(q) {
             entry.pinned_at = Instant::now();
+            if indefinite && !entry.indefinite {
+                let size = entry.size;
+                if !self.indefinite_cap_admits(size) {
+                    warn!(
+                        indefinite_pinned_bytes =
+                            self.indefinite_pinned_bytes.load(Ordering::Relaxed),
+                        entry_size = size,
+                        indefinite_pin_cap = self.indefinite_pin_cap,
+                        ?key,
+                        "indefinite pin cap exceeded on upgrade, leaving pin time-bounded (backpressure)"
+                    );
+                    // Refused upgrade is BACKPRESSURE, not loss: the entry
+                    // stays pinned (time-bounded). Report failure so the
+                    // caller retries the durability upload.
+                    return false;
+                }
+                entry.indefinite = true;
+                self.indefinite_pinned_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+            }
             return true;
         }
 
@@ -1000,7 +1141,10 @@ where
 
         let entry_size = value.len();
 
-        // Enforce pin cap.
+        // Enforce pin cap (total) and, for indefinite pins, the
+        // indefinite-pin cap. Either rejection is BACKPRESSURE (refuse,
+        // never drop): the blob stays in the LRU cache for the caller to
+        // retry.
         if self.max_bytes != 0 {
             let current_pinned = self.pinned_bytes.load(Ordering::Relaxed);
             if current_pinned.saturating_add(entry_size) > self.pin_cap {
@@ -1014,6 +1158,17 @@ where
                 return false;
             }
         }
+        if indefinite && !self.indefinite_cap_admits(entry_size) {
+            warn!(
+                indefinite_pinned_bytes =
+                    self.indefinite_pinned_bytes.load(Ordering::Relaxed),
+                entry_size,
+                indefinite_pin_cap = self.indefinite_pin_cap,
+                ?key,
+                "indefinite pin cap exceeded, refusing to pin (backpressure)"
+            );
+            return false;
+        }
 
         // CRITICAL: Insert into pinned map FIRST, then invalidate from
         // cache. The eviction listener checks pinned map and skips
@@ -1026,9 +1181,14 @@ where
                 data: value,
                 pinned_at: Instant::now(),
                 size: entry_size,
+                indefinite,
             },
         );
         self.pinned_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        if indefinite {
+            self.indefinite_pinned_bytes
+                .fetch_add(entry_size, Ordering::Relaxed);
+        }
 
         // Now safe to remove from cache — listener will see it's pinned.
         self.cache.invalidate(q);
@@ -1036,15 +1196,44 @@ where
         true
     }
 
+    /// FL-681 Fix A: snapshot check of the indefinite-pin byte cap.
+    /// Mirrors `FastSlowStore::check_slow_writes_capacity_gate` — an
+    /// eventually-consistent SNAPSHOT is acceptable for backpressure (the
+    /// cap STOPS an over-capacity hot loop; the caller's retry closes the
+    /// residual race). `max_bytes == 0` (no byte budget configured) never
+    /// gates.
+    fn indefinite_cap_admits(&self, entry_size: u64) -> bool {
+        if self.max_bytes == 0 {
+            return true;
+        }
+        let current = self.indefinite_pinned_bytes.load(Ordering::Relaxed);
+        current.saturating_add(entry_size) <= self.indefinite_pin_cap
+    }
+
     pub fn pin_keys(&self, keys: &[K]) -> usize {
+        self.pin_keys_with_mode(keys, false)
+    }
+
+    /// FL-681 Fix A: batch indefinite pin — see [`Self::pin_key_indefinite`].
+    /// Returns the count successfully pinned-indefinitely; keys refused by
+    /// the indefinite cap are BACKPRESSURE (left unpinned for the caller to
+    /// retry), not dropped.
+    pub fn pin_keys_indefinite(&self, keys: &[K]) -> usize {
+        self.pin_keys_with_mode(keys, true)
+    }
+
+    fn pin_keys_with_mode(&self, keys: &[K], indefinite: bool) -> usize {
         let mut pinned = 0;
         for key in keys {
             let q: &Q = key.borrow();
 
-            // Already pinned — refresh.
-            if let Some(mut entry) = self.pinned.get_mut(q) {
-                entry.pinned_at = Instant::now();
-                pinned += 1;
+            // Already pinned — refresh (and upgrade to indefinite if asked
+            // and the indefinite cap admits). Delegating to the per-key
+            // path keeps the cap accounting in exactly one place.
+            if self.pinned.contains_key(q) {
+                if self.pin_key_with_mode(key.clone(), indefinite) {
+                    pinned += 1;
+                }
                 continue;
             }
 
@@ -1068,6 +1257,21 @@ where
                     break;
                 }
             }
+            if indefinite && !self.indefinite_cap_admits(entry_size) {
+                warn!(
+                    indefinite_pinned_bytes =
+                        self.indefinite_pinned_bytes.load(Ordering::Relaxed),
+                    entry_size,
+                    indefinite_pin_cap = self.indefinite_pin_cap,
+                    attempted = keys.len(),
+                    pinned,
+                    "pin_keys: indefinite pin cap exceeded, leaving remaining keys unpinned (backpressure)",
+                );
+                // Backpressure: stop granting indefinite pins this batch.
+                // The remaining keys stay in the LRU cache for the caller
+                // to retry — never dropped.
+                break;
+            }
 
             // Insert into pinned FIRST (same ordering as pin_key).
             self.pinned.insert(
@@ -1076,9 +1280,14 @@ where
                     data: value,
                     pinned_at: Instant::now(),
                     size: entry_size,
+                    indefinite,
                 },
             );
             self.pinned_bytes.fetch_add(entry_size, Ordering::Relaxed);
+            if indefinite {
+                self.indefinite_pinned_bytes
+                    .fetch_add(entry_size, Ordering::Relaxed);
+            }
 
             // Invalidate from cache (don't call run_pending_tasks per key).
             self.cache.invalidate(q);
@@ -1093,6 +1302,13 @@ where
         if let Some((owned_key, entry)) = self.pinned.remove(key) {
             self.pinned_bytes
                 .fetch_sub(entry.size, Ordering::Relaxed);
+            // FL-681 Fix A: keep the indefinite-pin accounting symmetric.
+            // BIS-ack release of an indefinite pin frees indefinite-cap
+            // headroom for the next pending-BIS blob.
+            if entry.indefinite {
+                self.indefinite_pinned_bytes
+                    .fetch_sub(entry.size, Ordering::Relaxed);
+            }
             // Move back into moka cache. Under LRU there is no admission
             // filter to fight, so a bare insert is sufficient.
             self.cache.insert(owned_key, entry.data);
@@ -1101,6 +1317,13 @@ where
 
     pub fn pinned_bytes(&self) -> u64 {
         self.pinned_bytes.load(Ordering::Relaxed)
+    }
+
+    /// FL-681 Fix A: bytes currently held by INDEFINITE
+    /// (pinned-until-BIS-ack) pins. A subset of [`Self::pinned_bytes`].
+    /// Bounded by the indefinite-pin cap.
+    pub fn indefinite_pinned_bytes(&self) -> u64 {
+        self.indefinite_pinned_bytes.load(Ordering::Relaxed)
     }
 
     /// Test hook: rewind a pinned entry's `pinned_at` past the
@@ -1473,13 +1696,31 @@ where
     pub async fn expire_stale_pins(&self) {
         let mut expired_keys = Vec::new();
         for entry in self.pinned.iter() {
+            // FL-681 Fix A: INDEFINITE pins (worker-local F2
+            // pinned-until-BIS-ack blobs) are EXEMPT from the TTL sweep.
+            // They are released ONLY by the server's BIS-ack (`unpin_key`).
+            // Demoting one here at the 120s TTL is the exact silent-loss
+            // leak FL-681 fixes (3,881 `auto-unpinning expired pin` events
+            // fleet-wide, including on the failing protoc_minimal digest).
+            if entry.indefinite {
+                continue;
+            }
             if entry.pinned_at.elapsed().as_secs() >= PIN_TIMEOUT_SECS {
                 expired_keys.push(entry.key().clone());
             }
         }
         for key in expired_keys {
             let q: &Q = key.borrow();
-            if let Some((_, entry)) = self.pinned.remove(q) {
+            if let Some((owned_key, entry)) = self.pinned.remove(q) {
+                // Race guard: an entry selected as stale above could have
+                // been UPGRADED to indefinite (BIS-window F2 re-pin)
+                // between selection and this remove. If so, restore it
+                // un-demoted — never drop an indefinite pin's BIS-bound
+                // protection.
+                if entry.indefinite {
+                    self.pinned.insert(owned_key, entry);
+                    continue;
+                }
                 let size = entry.size;
                 info!(
                     ?key,
@@ -1623,6 +1864,20 @@ mod tests {
 
     fn make_map_cb(cfg: &EvictionPolicy) -> TestMapCb {
         MokaEvictingMap::with_anchor(cfg, SystemTime::now())
+    }
+
+    /// FL-681: build a test map with an explicit indefinite-pin byte cap
+    /// so the cap-backpressure path can be exercised deterministically
+    /// without standing up a 20 GiB FilesystemStore.
+    fn make_map_cb_indefinite_cap(
+        cfg: &EvictionPolicy,
+        indefinite_pin_cap_bytes: u64,
+    ) -> TestMapCb {
+        MokaEvictingMap::with_anchor_and_indefinite_cap(
+            cfg,
+            SystemTime::now(),
+            indefinite_pin_cap_bytes,
+        )
     }
 
     // ---------------------------------------------------------------
@@ -2068,5 +2323,143 @@ mod tests {
             0,
             "eviction must NOT fire on_pin_expired",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // FL-681 Fix A: indefinite (pinned-until-durable) pins are EXEMPT
+    // from the PIN_TIMEOUT_SECS sweep. A worker-local F2 output blob's
+    // anti-eviction pin must be released ONLY by the server's BIS-ack
+    // (unpin), never by the 120s TTL — matching how in-memory mirror
+    // blobs are already pinned indefinitely (the mirror-TTL sweeper was
+    // removed in local_worker.rs for exactly this reason). This is the
+    // core regression for the 3,881-event silent-loss leak.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn f2_pin_survives_past_ttl_until_bis() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        map.insert(1, BytesEntry(2048)).await;
+        // Pin INDEFINITELY (the F2 output-blob pin).
+        assert!(
+            map.pin_key_indefinite(1),
+            "indefinite pin should succeed for a present key"
+        );
+
+        // Drive time past the TTL deadline: rewind pinned_at past
+        // PIN_TIMEOUT_SECS so the sweep WOULD demote a normal pin.
+        {
+            let mut entry = map
+                .pinned
+                .get_mut(&1u64)
+                .expect("key 1 should be pinned");
+            entry.pinned_at = Instant::now()
+                - core::time::Duration::from_secs(PIN_TIMEOUT_SECS + 1);
+        }
+
+        // Run the sweep with NO BIS-ack. The indefinite pin MUST survive.
+        map.expire_stale_pins().await;
+
+        assert_eq!(
+            map.pinned_bytes(),
+            2048,
+            "blob evicted before BIS-durable: indefinite F2 pin was swept by the 120s TTL — \
+             this is the 3,881-event silent-loss leak (FL-681 Fix A)"
+        );
+        assert!(
+            map.pinned.contains_key(&1u64),
+            "blob evicted before BIS-durable: indefinite pin entry removed by TTL sweep"
+        );
+        assert!(
+            map.get(&1).await.is_some(),
+            "blob evicted before BIS-durable: indefinitely-pinned F2 output unreachable after TTL sweep"
+        );
+
+        map.unpin_key(&1);
+    }
+
+    #[tokio::test]
+    async fn bis_ack_releases_indefinite_pin() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        map.insert(1, BytesEntry(2048)).await;
+        assert!(map.pin_key_indefinite(1), "indefinite pin should succeed");
+
+        // Rewind past the TTL to prove the sweep is a no-op for indefinite
+        // pins (the pin is held by BIS-ack semantics, not time).
+        {
+            let mut entry = map
+                .pinned
+                .get_mut(&1u64)
+                .expect("key 1 should be pinned");
+            entry.pinned_at = Instant::now()
+                - core::time::Duration::from_secs(PIN_TIMEOUT_SECS + 1);
+        }
+        map.expire_stale_pins().await;
+        assert_eq!(map.pinned_bytes(), 2048, "indefinite pin must survive sweep");
+
+        // Deliver the BIS-ack: unpin releases the indefinite pin and the
+        // blob becomes LRU-evictable again (back in cache, pinned_bytes 0).
+        map.unpin_key(&1);
+        assert_eq!(
+            map.pinned_bytes(),
+            0,
+            "BIS-ack (unpin) must release the indefinite pin so the blob is evictable"
+        );
+        assert!(
+            !map.pinned.contains_key(&1u64),
+            "BIS-ack must remove the indefinite pin entry from the pinned map"
+        );
+        assert!(
+            map.get(&1).await.is_some(),
+            "released blob must remain reachable from the LRU cache after BIS-ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn indefinite_pin_cap_backpressures_not_drops() {
+        // Cap indefinite pins at 4096 bytes. The third 2048-byte indefinite
+        // pin would push the indefinite total to 6144 > 4096 and must be
+        // REFUSED (backpressure) — NOT silently dropped or accepted.
+        let cfg = policy(1024 * 1024, 0);
+        let map = Arc::new(make_map_cb_indefinite_cap(&cfg, 4096));
+
+        for k in 0..3u64 {
+            map.insert(k, BytesEntry(2048)).await;
+        }
+
+        assert!(map.pin_key_indefinite(0), "first indefinite pin fits under cap");
+        assert!(map.pin_key_indefinite(1), "second indefinite pin fills cap exactly");
+        // Third exceeds cap → refused. The blob is NOT dropped (still in
+        // cache, normally evictable) and the caller treats `false` as
+        // backpressure: keep the source readable + retry.
+        assert!(
+            !map.pin_key_indefinite(2),
+            "indefinite-pin cap exceeded must REFUSE (backpressure), not silently accept"
+        );
+        assert_eq!(
+            map.indefinite_pinned_bytes(),
+            4096,
+            "over-cap indefinite pin must not be accounted (refused, not dropped)"
+        );
+        // The refused blob is still present in the map — NOT lost.
+        assert!(
+            map.get(&2).await.is_some(),
+            "backpressure must NOT drop the blob: refused-pin source stays readable for retry"
+        );
+
+        // Releasing one indefinite pin (BIS-ack) frees cap; the previously
+        // refused pin now succeeds — proving backpressure is transient, not
+        // terminal.
+        map.unpin_key(&0);
+        assert!(
+            map.pin_key_indefinite(2),
+            "after a BIS-ack frees cap headroom, the backpressured pin must succeed"
+        );
+
+        map.unpin_key(&1);
+        map.unpin_key(&2);
     }
 }

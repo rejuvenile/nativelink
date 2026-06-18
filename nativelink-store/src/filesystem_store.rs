@@ -1090,6 +1090,25 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.pin_key(StoreKeyBorrow::from(key))
     }
 
+    /// FL-681 Fix A: pin a digest INDEFINITELY — held until the server's
+    /// BlobsInStableStorage ack (`unpin_digest`), EXEMPT from the
+    /// `PIN_TIMEOUT_SECS` (120s) sweep. Used by worker-local F2
+    /// deferred-output uploads so an output blob's anti-eviction pin is
+    /// released ONLY by BIS-durability, never by the TTL — closing the
+    /// 3,881-event silent-loss leak where the deferred-upload digest
+    /// (absent from `in_flight_slow_writes` because F2 bypasses
+    /// `FastSlowStore::update`) was demoted at 120s and lost.
+    ///
+    /// Returns `false` when the blob is absent (eviction race) OR when the
+    /// indefinite-pin byte cap is exhausted — the latter is BACKPRESSURE:
+    /// the caller MUST keep the source readable and retry the durability
+    /// upload, never drop the blob.
+    pub fn pin_digest_indefinite_with_result(&self, digest: &DigestInfo) -> bool {
+        let key: StoreKey<'static> = (*digest).into();
+        self.evicting_map
+            .pin_key_indefinite(StoreKeyBorrow::from(key))
+    }
+
     /// Unpin a digest, allowing eviction again.
     pub fn unpin_digest(&self, digest: &DigestInfo) {
         let key: StoreKey<'static> = (*digest).into();
