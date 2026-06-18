@@ -209,6 +209,15 @@ pub type BazelChunkedDispatcherArc = Arc<dyn BazelChunkedDispatcher>;
 /// changing the chunk size would change the wire-stable contract for
 /// `BackpressureSignal` permit weighting AND for the on-disk sparse
 /// file layout.
+///
+/// FL-681 (intentionally NOT exposed as operator config): `CHUNK_SIZE`
+/// is the wire chunk unit. The worker (chunk producer) and the server
+/// (chunk consumer) MUST agree on it byte-for-byte — a per-deployment
+/// config field would let a misconfigured pair disagree and corrupt the
+/// sparse-file offsets / the permit-weight accounting. Changing it is a
+/// wire-format change requiring protocol negotiation, NOT a config knob
+/// (#413 Option B — a `CHUNK_SIZE` bump as a wire-format change — was
+/// explicitly rejected for this reason).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Maximum blob size eligible for the worker-side chunked-write path.

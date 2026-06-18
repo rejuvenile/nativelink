@@ -1795,6 +1795,24 @@ pub async fn preconditions_met<H: BuildHasher + Sync>(
     }
 }
 
+/// FL-681: resolve the configured `LocalWorkerConfig.max_concurrent_uploads`
+/// to the effective per-call upload fan-out cap fed to `Semaphore::new`
+/// in `handle_upload_missing_blobs`.
+///
+/// `0` is the "unset" sentinel: an absent config field deserializes to
+/// `0`, which resolves to the historical hardcoded
+/// `o11_probes::MAX_CONCURRENT_UPLOADS` (32) so existing deployed
+/// configs keep their fan-out cap. Any non-zero value passes through
+/// verbatim.
+#[must_use]
+pub fn effective_max_concurrent_uploads(configured: usize) -> usize {
+    if configured == 0 {
+        ::nativelink_util::o11_probes::MAX_CONCURRENT_UPLOADS
+    } else {
+        configured
+    }
+}
+
 impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorkerImpl<'a, T, U> {
     fn new(
         config: &'a LocalWorkerConfig,
@@ -1829,9 +1847,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
     /// Upload blobs requested by the server's UploadMissingBlobs message.
     /// Reads from the local fast store and writes to the slow store (server CAS).
+    ///
+    /// `max_concurrent_uploads` is the per-call fan-out cap (already
+    /// resolved from `LocalWorkerConfig.max_concurrent_uploads` via
+    /// [`effective_max_concurrent_uploads`] by the caller, so the `0`
+    /// sentinel is never seen here).
     async fn handle_upload_missing_blobs(
         running_actions_manager: &Arc<U>,
         digests: Vec<DigestInfo>,
+        max_concurrent_uploads: usize,
     ) {
         let Some(cas_store) = running_actions_manager.get_cas_store() else {
             warn!("UploadMissingBlobs: no CAS store available, ignoring");
@@ -1883,18 +1907,24 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             "UploadMissingBlobs: uploading blobs to server"
         );
 
-        // #85 P1 (2026-06-08): per-call `Semaphore::new(MAX_CONCURRENT_UPLOADS)`
-        // (pre-#85 semantics, restored). The
-        // `handle_upload_missing_blobs` call has two spawn sites
-        // (`:2520` reconnect retry + `:2777` server-driven push) that
-        // CAN overlap, so a process-singleton would narrow the effective
-        // cap from N×32 → 32 — that is an architectural change requiring
-        // explicit sign-off. The observation-only counters in
-        // `upload_inflight_counters()` SUM across all concurrent calls so
-        // the aggregate inflight + waiters is still scrapeable.
-        let upload_sem = Arc::new(Semaphore::new(
-            ::nativelink_util::o11_probes::MAX_CONCURRENT_UPLOADS,
-        ));
+        // #85 P1 (2026-06-08): per-call `Semaphore::new(...)` (pre-#85
+        // semantics, restored). The `handle_upload_missing_blobs` call
+        // has two spawn sites (`:2520` reconnect retry + `:2777`
+        // server-driven push) that CAN overlap, so a process-singleton
+        // would narrow the effective cap from N×cap → cap — that is an
+        // architectural change requiring explicit sign-off. The
+        // observation-only counters in `upload_inflight_counters()` SUM
+        // across all concurrent calls so the aggregate inflight +
+        // waiters is still scrapeable.
+        //
+        // FL-681: the permit count is operator-tunable via
+        // `LocalWorkerConfig.max_concurrent_uploads`; `max_concurrent_uploads`
+        // here is the already-resolved value (defaults to
+        // `MAX_CONCURRENT_UPLOADS = 32` when unset).
+        // CAPPED AT max_concurrent_uploads: per-call upload fan-out is
+        // bounded by this many concurrent in-flight uploads; over-cap
+        // uploads await a permit (bounded backpressure, never buffered).
+        let upload_sem = Arc::new(Semaphore::new(max_concurrent_uploads));
         let upload_counters =
             ::nativelink_util::o11_probes::upload_inflight_counters();
 
@@ -2580,8 +2610,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     // slow store, which is meaningless for a remote GrpcStore.
                     #[allow(clippy::disallowed_methods)]
                     cas_store.fast_store().pin_digests(&failed);
+                    let max_concurrent_uploads =
+                        effective_max_concurrent_uploads(self.config.max_concurrent_uploads);
                     tokio::spawn(async move {
-                        Self::handle_upload_missing_blobs(&ram, failed).await;
+                        Self::handle_upload_missing_blobs(&ram, failed, max_concurrent_uploads)
+                            .await;
                         info!(count, "reconnect: failed upload retry complete");
                     });
                 }
@@ -2837,8 +2870,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 "UploadMissingBlobs: server requests blob backfill"
                             );
                             let ram = self.running_actions_manager.clone();
+                            let max_concurrent_uploads = effective_max_concurrent_uploads(
+                                self.config.max_concurrent_uploads,
+                            );
                             tokio::spawn(async move {
-                                Self::handle_upload_missing_blobs(&ram, digests).await;
+                                Self::handle_upload_missing_blobs(
+                                    &ram,
+                                    digests,
+                                    max_concurrent_uploads,
+                                )
+                                .await;
                             });
                         }
                         Update::BatchWriteSmallBlobs(batch) => {

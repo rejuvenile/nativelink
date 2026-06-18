@@ -942,6 +942,24 @@ pub struct LocalWorkerConfig {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_inflight_tasks: u64,
 
+    /// FL-681: per-call cap on concurrent blob uploads the worker fans
+    /// out to the server in `handle_upload_missing_blobs` (the path that
+    /// pushes locally-held blobs back to the CAS, e.g. on reconnect
+    /// retry or a server-driven `UploadMissingBlobs` backfill). The
+    /// worker constructs a `Semaphore` with this many permits per call;
+    /// each in-flight upload holds one permit.
+    ///
+    /// Throughput trade-off: a higher cap lets more blobs upload in
+    /// parallel (higher worker→server throughput when many blobs are
+    /// missing) at the cost of more concurrent streams and memory/CPU on
+    /// both the worker and the receiving server. A lower cap reduces
+    /// peak load but serializes the backfill. The cap is PER-CALL: two
+    /// overlapping invocations can together run up to `2 × cap` uploads.
+    ///
+    /// Default: 0 (uses the built-in default of 32).
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub max_concurrent_uploads: usize,
+
     /// If timeout is handled in `entrypoint` or another wrapper script.
     /// If set to true `NativeLink` will not honor the timeout the action requested
     /// and instead will always force kill the action after `max_action_timeout`
