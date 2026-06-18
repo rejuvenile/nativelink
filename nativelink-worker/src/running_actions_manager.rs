@@ -4626,62 +4626,22 @@ impl RunningActionImpl {
                     "pin_digest: blob not in fast store at pin time, eviction race likely"
                 );
             };
-            // #549 Phase 2 (BUILD + OBSERVE): account each immediately-
-            // post-upload output digest's bytes against the worker pin
-            // budget. Guards drop at end of this block (observation-only
-            // mode); Phase 4 (#551) will hold across the upload-pin
-            // lifetime. The acquire is best-effort: under the 128 GiB
-            // default cap rejections should be zero in production today,
-            // but a None return does NOT block the underlying pin call
-            // (gate is in observation-only mode).
-            let acquire_pin = |digest: &DigestInfo| {
-                let n = usize::try_from(digest.size_bytes()).ok()?;
-                ::nativelink_store::worker_pin_budget::worker_pin_budget_singleton()
-                    .try_acquire(n)
-            };
-            // Phase 4 perf hint (#549 fix-up cosmetic): preallocate the
-            // exact guard count to avoid `Vec` regrowth as up to
-            // `output_files + output_folders + stdout + stderr` guards
-            // are pushed below.
-            let mut _pin_admission_guards =
-                Vec::with_capacity(output_files.len() + output_folders.len() + 2);
             for file in &output_files {
-                if file.digest.size_bytes() > 0 {
-                    if let Some(g) = acquire_pin(&file.digest) {
-                        _pin_admission_guards.push(g);
-                    }
-                    if !pin_one(&file.digest) {
-                        warn_pin_miss(&file.digest);
-                    }
+                if file.digest.size_bytes() > 0 && !pin_one(&file.digest) {
+                    warn_pin_miss(&file.digest);
                 }
             }
             for folder in &output_folders {
-                if folder.tree_digest.size_bytes() > 0 {
-                    if let Some(g) = acquire_pin(&folder.tree_digest) {
-                        _pin_admission_guards.push(g);
-                    }
-                    if !pin_one(&folder.tree_digest) {
-                        warn_pin_miss(&folder.tree_digest);
-                    }
+                if folder.tree_digest.size_bytes() > 0 && !pin_one(&folder.tree_digest) {
+                    warn_pin_miss(&folder.tree_digest);
                 }
             }
-            if stdout_digest.size_bytes() > 0 {
-                if let Some(g) = acquire_pin(&stdout_digest) {
-                    _pin_admission_guards.push(g);
-                }
-                if !pin_one(&stdout_digest) {
-                    warn_pin_miss(&stdout_digest);
-                }
+            if stdout_digest.size_bytes() > 0 && !pin_one(&stdout_digest) {
+                warn_pin_miss(&stdout_digest);
             }
-            if stderr_digest.size_bytes() > 0 {
-                if let Some(g) = acquire_pin(&stderr_digest) {
-                    _pin_admission_guards.push(g);
-                }
-                if !pin_one(&stderr_digest) {
-                    warn_pin_miss(&stderr_digest);
-                }
+            if stderr_digest.size_bytes() > 0 && !pin_one(&stderr_digest) {
+                warn_pin_miss(&stderr_digest);
             }
-            drop(_pin_admission_guards);
         }
 
         {
@@ -6038,21 +5998,6 @@ impl RunningActionsManagerImpl {
 
         // Pin output digests to prevent eviction during background upload.
         let filesystem_store = self.filesystem_store.clone();
-        // #549 Phase 2 (BUILD + OBSERVE): account each digest's bytes
-        // against the process-wide `WorkerPinBudget`. Guards drop at end
-        // of scope below (observation-only mode); Phase 4 (#551) will
-        // hold guards across the upload-pin lifetime. The 128 GiB
-        // default cap is well above the 64 GiB worst-case observed
-        // per-worker pin set (2026-05-21 10-worker scrape) so
-        // rejections should be zero in production today.
-        let _pin_admission_guards: Vec<_> = digests
-            .iter()
-            .filter_map(|d| {
-                let n = usize::try_from(d.size_bytes()).ok()?;
-                ::nativelink_store::worker_pin_budget::worker_pin_budget_singleton()
-                    .try_acquire(n)
-            })
-            .collect();
         // FL-681 Fix A: in F2 deferred mode this background upload is the
         // AUTHORITATIVE durability path (bypasses `FastSlowStore::update`),
         // so the source pin must survive past the 120s TTL until BIS-ack.
@@ -6066,7 +6011,6 @@ impl RunningActionsManagerImpl {
                 filesystem_store.pin_digest(digest);
             }
         }
-        drop(_pin_admission_guards);
         // #547 fix-up CF5: record_pin_acquired moved out of this loop into
         // the per-digest upload `Ok(())` arm (see `:5000-5005` below).
         // Rationale: the previous unconditional acquire at this pre-upload
@@ -6261,19 +6205,6 @@ impl RunningActionsManagerImpl {
                         // documents this drift inline so operators
                         // sizing Phase 2 caps know the gauge is
                         // approximate-upward.
-                        // #549 Phase 2 (BUILD + OBSERVE): account each
-                        // tree-extracted file digest's bytes against the
-                        // worker pin budget. Guards drop at end of scope
-                        // (observation-only mode); Phase 4 (#551) will hold
-                        // across the upload-pin lifetime.
-                        let _pin_admission_guards: Vec<_> = file_digests
-                            .iter()
-                            .filter_map(|d| {
-                                let n = usize::try_from(d.size_bytes()).ok()?;
-                                ::nativelink_store::worker_pin_budget::worker_pin_budget_singleton()
-                                    .try_acquire(n)
-                            })
-                            .collect();
                         // FL-681 Fix A: tree-extracted file digests are the
                         // same deferred-durability sources — pin indefinitely
                         // in F2 mode so the 120s TTL cannot drop them before
@@ -6285,7 +6216,6 @@ impl RunningActionsManagerImpl {
                                 filesystem_store.pin_digest(digest);
                             }
                         }
-                        drop(_pin_admission_guards);
                         digests.extend(file_digests);
                     }
                     Err(e) => {

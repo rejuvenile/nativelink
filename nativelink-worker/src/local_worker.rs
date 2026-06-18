@@ -2578,29 +2578,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     // that is the store whose eviction we are guarding against;
                     // pinning through the wrapper would also forward to the
                     // slow store, which is meaningless for a remote GrpcStore.
-                    //
-                    // #549 Phase 2 (BUILD + OBSERVE): account each digest's
-                    // bytes against the process-wide `WorkerPinBudget` before
-                    // the pin call. Guards are dropped immediately at the end
-                    // of this block (observation-only mode); Phase 4 (#551)
-                    // will hold guards across the BIS-ack window. Per-digest
-                    // bytes are summed into `worker_pin_admission_bytes_total`
-                    // + `worker_pin_inflight_admission_bytes`. The 128 GiB
-                    // default cap (`DEFAULT_WORKER_PIN_BUDGET_BYTES`) is far
-                    // above the 64 GiB worst-case observed per-worker pin set
-                    // (2026-05-21 10-worker scrape), so rejections should be
-                    // zero in production today.
-                    let _pin_admission_guards: Vec<_> = failed
-                        .iter()
-                        .filter_map(|d| {
-                            let n = usize::try_from(d.size_bytes()).ok()?;
-                            ::nativelink_store::worker_pin_budget::worker_pin_budget_singleton()
-                                .try_acquire(n)
-                        })
-                        .collect();
                     #[allow(clippy::disallowed_methods)]
                     cas_store.fast_store().pin_digests(&failed);
-                    drop(_pin_admission_guards);
                     tokio::spawn(async move {
                         Self::handle_upload_missing_blobs(&ram, failed).await;
                         info!(count, "reconnect: failed upload retry complete");

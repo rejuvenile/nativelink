@@ -2618,21 +2618,8 @@ impl DirectoryCache {
                             // is the eviction tier we are guarding against,
                             // and the FastSlowStore wrapper would also forward
                             // the pin to the slow GrpcStore where it is a no-op.
-                            //
-                            // #549 Phase 2 (BUILD + OBSERVE): account this
-                            // digest's bytes against the process-wide
-                            // `WorkerPinBudget`. Guard drops at end of scope
-                            // (observation-only mode); Phase 4 (#551) will
-                            // hold across the pin lifetime.
-                            let _pin_admission_guard = usize::try_from(digest.size_bytes())
-                                .ok()
-                                .and_then(|n| {
-                                    ::nativelink_store::worker_pin_budget::worker_pin_budget_singleton()
-                                        .try_acquire(n)
-                                });
                             #[allow(clippy::disallowed_methods)]
                             fss.fast_store().pin_digests(&[digest]);
-                            drop(_pin_admission_guard);
                             Ok::<(), Error>(())
                         });
                     }
