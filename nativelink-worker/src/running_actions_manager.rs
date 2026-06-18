@@ -1158,6 +1158,306 @@ pub(crate) fn classify_upload_error(err: &Error) -> UploadRetryDecision {
     }
 }
 
+/// FL-681 Q1: which side of a deferred upload attempt failed, used to
+/// size the inter-attempt backoff.
+///
+/// The retry loop reads the output blob from the worker's OWN fast store
+/// and writes it to the REMOTE slow store. These two sides fail for
+/// categorically different reasons and want categorically different
+/// backoffs:
+///
+/// - [`UploadFailureSide::ReadLocal`] — the re-read from the worker's own
+///   fast store failed (an eviction race between completion and this
+///   background task: `cas_store.get*` returns `NotFound`, or the streaming
+///   read drops the channel without commit → the synthesized
+///   `Internal "buf_channel: writer dropped without commit"`). This is a
+///   same-host disk/index race that self-heals on the very next read once
+///   the source is re-pinned (Q2). A second-scale backoff here is pure
+///   wasted latency — the prod symptom was ~15 s of backoff per output
+///   blob (`INITIAL_BACKOFF`=1s ×2 ×4) before a re-read that would have
+///   succeeded in milliseconds.
+/// - [`UploadFailureSide::RemoteWrite`] — the gRPC write to the remote slow
+///   store failed (`Unavailable`/`DeadlineExceeded`/`ResourceExhausted`,
+///   server restart window, network blip). Recovery is genuinely
+///   second-scale (server has to come back / backpressure has to drain), so
+///   the existing 1 s→cap ramp is correct here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadFailureSide {
+    /// Re-read from the worker's own fast store failed (eviction race).
+    ReadLocal,
+    /// Write to the remote slow store failed (genuine remote transient).
+    RemoteWrite,
+}
+
+/// Worker-local read-side backoff floor (Q1). A same-host fast-store
+/// re-read that lost an eviction race self-heals on the next read once the
+/// source is re-pinned (Q2), so the only thing the backoff must do is yield
+/// to the eviction sweep + re-pin — tens of milliseconds, not seconds. The
+/// jitter spreads concurrent re-reads so a burst of evicted outputs does not
+/// re-read in lockstep.
+const READ_LOCAL_BACKOFF_MIN: Duration = Duration::from_millis(50);
+const READ_LOCAL_BACKOFF_MAX: Duration = Duration::from_millis(100);
+
+/// FL-681 Q1: compute the next sleep before a retry, by failure side.
+///
+/// `ReadLocal` returns a short jittered floor in
+/// `[READ_LOCAL_BACKOFF_MIN, READ_LOCAL_BACKOFF_MAX]` — independent of
+/// `remote_backoff` (the read race does not need the remote ramp). The
+/// `jitter` argument is a single byte mapped uniformly across the span; the
+/// production caller derives it from the digest hash XOR the attempt so a
+/// burst of distinct evicted outputs spreads its re-reads instead of
+/// re-reading in lockstep (no RNG dependency, deterministic in tests).
+///
+/// `RemoteWrite` returns the caller's current `remote_backoff` unchanged —
+/// the existing 1 s→`MAX_BACKOFF` ramp owned by the loop. This keeps the
+/// remote ramp's state (doubling) in the loop and leaves it untouched, so a
+/// sustained remote outage still backs off at the slow remote interval.
+fn next_retry_backoff(
+    side: UploadFailureSide,
+    remote_backoff: Duration,
+    jitter: u8,
+) -> Duration {
+    match side {
+        UploadFailureSide::ReadLocal => {
+            let span = READ_LOCAL_BACKOFF_MAX.saturating_sub(READ_LOCAL_BACKOFF_MIN);
+            // Map jitter byte 0..=255 across the span (inclusive at both
+            // ends): jitter * span / 255.
+            let extra = span
+                .checked_mul(u32::from(jitter))
+                .map_or(span, |scaled| scaled / 255);
+            READ_LOCAL_BACKOFF_MIN + extra
+        }
+        UploadFailureSide::RemoteWrite => remote_backoff,
+    }
+}
+
+/// FL-681 Q2: how the retry loop must re-assert the source pin before its
+/// next read attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepinMode {
+    /// Do not re-pin (the source was not lost — e.g. a remote-write failure,
+    /// or a give-up).
+    None,
+    /// Re-pin via the indefinite-until-BIS path (deferred mode). MUST be the
+    /// same path FL-681 Fix A added (`pin_digest_indefinite_with_result`) so
+    /// the re-pin is released only by the BIS-ack, never by a fresh 120s TTL.
+    Indefinite,
+    /// Re-pin via the time-bounded path (synchronous mode), matching the
+    /// schedule-time pin whose 120s-TTL→`failed_slow_writes` backstop is live.
+    TimeBounded,
+}
+
+/// FL-681 Q1+Q2: the action the retry loop takes after a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryStep {
+    /// `true` = stop retrying (permanent give-up, or synchronous-mode budget
+    /// exhausted). `false` = retry after re-pinning + sleeping.
+    pub give_up: bool,
+    /// How to re-assert the source pin before the next read (Q2). Only a
+    /// worker-local read race needs a re-pin; a remote-write failure did not
+    /// lose the source.
+    pub repin: RepinMode,
+}
+
+/// FL-681 Q1+Q2: decide what the retry loop does after one failed attempt,
+/// given the error's give-up classification, which side failed, the pin
+/// mode, and the attempt counter.
+///
+/// This is the loop's whole retry-control decision, factored out so the two
+/// load-bearing contracts are unit-testable without standing up a worker:
+///
+/// - **Re-pin contract (Q2):** a retryable worker-local read race
+///   (`ReadLocal`) re-asserts the source pin via the SAME mode the
+///   schedule-time pin used (`Indefinite` in deferred mode, `TimeBounded`
+///   in synchronous mode) BEFORE the next read — otherwise the retry
+///   re-runs the same eviction race. A `RemoteWrite` failure never re-pins
+///   (the source was not lost).
+/// - **Give-up contract (Fix B):** retryable classes retry FOREVER in
+///   deferred mode (`retry_forever == true`); in synchronous mode they keep
+///   the prior finite `SYNC_MAX_RETRIES` bound. Permanent-request classes
+///   give up regardless of mode.
+///
+/// `already_durable` (the classifier's `AlreadyDurable` parallel verdict)
+/// is treated as success-stop with no re-pin.
+const fn plan_retry_step(
+    decision: UploadRetryDecision,
+    side: UploadFailureSide,
+    deferred_pin: bool,
+    attempt: u32,
+    sync_max_retries: u32,
+) -> RetryStep {
+    match decision {
+        UploadRetryDecision::AlreadyDurable | UploadRetryDecision::PermanentGiveUp => {
+            RetryStep { give_up: true, repin: RepinMode::None }
+        }
+        UploadRetryDecision::Retry => {
+            // Synchronous mode keeps the prior finite give-up bound.
+            if !deferred_pin && attempt >= sync_max_retries {
+                return RetryStep { give_up: true, repin: RepinMode::None };
+            }
+            let repin = match side {
+                UploadFailureSide::ReadLocal => {
+                    if deferred_pin {
+                        RepinMode::Indefinite
+                    } else {
+                        RepinMode::TimeBounded
+                    }
+                }
+                UploadFailureSide::RemoteWrite => RepinMode::None,
+            };
+            RetryStep { give_up: false, repin }
+        }
+    }
+}
+
+/// FL-681 Q1+Q2: per-digest retry control for the deferred upload loop.
+///
+/// Owns the `attempt` counter and the `remote_backoff` ramp so the loop
+/// body stays a thin caller: it computes one attempt result and hands a
+/// failure here, which decides give-up vs retry, executes the planned
+/// re-pin (Q2) via the injected `repin_fn`, sleeps the side-sized backoff
+/// (Q1), and advances the remote ramp only on a remote-write failure.
+///
+/// The `repin_fn` injection is the test seam: production passes a closure
+/// that calls `FilesystemStore::pin_digest_indefinite_with_result` /
+/// `pin_digest`; tests pass a recording closure so the re-pin contract (mode
+/// + that it fires BEFORE the next read) is asserted deterministically, and
+/// the backoff timing is measured under `tokio::time::pause`.
+struct DeferredUploadRetry {
+    attempt: u32,
+    /// The remote-transient ramp (1 s → `max_backoff`). Advanced ONLY on a
+    /// `RemoteWrite` failure so an interleaved read race never inflates it.
+    remote_backoff: Duration,
+}
+
+impl DeferredUploadRetry {
+    const fn new(initial_remote_backoff: Duration) -> Self {
+        Self { attempt: 0, remote_backoff: initial_remote_backoff }
+    }
+
+    /// Handle one failed attempt. Returns `Some(success_flag)` to STOP the
+    /// loop (the bool is the loop's terminal `break` value: `false` =
+    /// give-up, never `true` here) or `None` to CONTINUE retrying (after
+    /// this call has already re-pinned + slept).
+    ///
+    /// `repin_fn` executes the planned re-pin; it is called BEFORE the sleep
+    /// (and therefore before the next read), which is the Q2 contract.
+    // The parameters are the loop's per-digest invariants (error, side,
+    // digest, pin mode, the two bounds) plus the re-pin injection seam; each
+    // is load-bearing and grouping them into a struct would only move the
+    // argument list without reducing it.
+    #[allow(clippy::too_many_arguments)]
+    async fn after_failure(
+        &mut self,
+        e: &Error,
+        side: UploadFailureSide,
+        digest: DigestInfo,
+        deferred_pin: bool,
+        sync_max_retries: u32,
+        max_backoff: Duration,
+        mut repin_fn: impl FnMut(RepinMode),
+    ) -> Option<bool> {
+        let decision = classify_upload_error(e);
+        let step = plan_retry_step(decision, side, deferred_pin, self.attempt, sync_max_retries);
+        if step.give_up {
+            match decision {
+                // Defensive: AlreadyExists is handled by the explicit
+                // success arm in the loop; the classifier's parallel verdict
+                // is unreachable here. Treat as success-stop.
+                UploadRetryDecision::AlreadyDurable => return Some(true),
+                UploadRetryDecision::PermanentGiveUp => {
+                    error!(
+                        ?digest,
+                        ?e,
+                        code = ?e.code,
+                        attempts = self.attempt + 1,
+                        "upload_to_remote: permanent request error uploading digest, cannot succeed by retry (FL-681 Fix B documented exemption)",
+                    );
+                    return Some(false);
+                }
+                UploadRetryDecision::Retry => {
+                    // Synchronous-mode finite budget exhausted — hand
+                    // persistent failure to the failed_slow_writes /
+                    // reconnect-UploadMissingBlobs backstop. (Deferred mode
+                    // never reaches here: retry_forever.)
+                    error!(
+                        ?digest,
+                        ?e,
+                        code = ?e.code,
+                        attempts = self.attempt + 1,
+                        "upload_to_remote: synchronous-mode retry budget exhausted; deferring to failed_slow_writes / UploadMissingBlobs backstop",
+                    );
+                    return Some(false);
+                }
+            }
+        }
+        // Retryable: FL-681 Fix B retries FOREVER in deferred mode (the
+        // source stays readable via the indefinite pin / the re-pin below),
+        // so a later attempt succeeds once the server/network recovers.
+        self.attempt += 1;
+        // FL-681 Q2: re-assert the source pin BEFORE the next re-read on a
+        // worker-local read race. The pin was taken once at schedule time,
+        // but the retry re-reads via `cas_store.get*` — without re-pinning,
+        // the retry re-runs the SAME eviction race. The planner chose the
+        // mode: `Indefinite` reuses the indefinite-until-BIS path FL-681 Fix
+        // A added (released only by the BIS-ack unpin, never by a fresh 120s
+        // TTL); `TimeBounded` matches the synchronous schedule-time pin;
+        // `RemoteWrite` failures plan `None` (the source was not lost).
+        repin_fn(step.repin);
+        // FL-681 Q1: size the sleep by failure side. A worker-local read
+        // race (ReadLocal) self-heals on the next read once re-pinned, so it
+        // waits only a short jittered floor (~50-100 ms) — the prod tail was
+        // ~15 s of pure 1 s-ramp backoff per evicted output. A genuine remote
+        // transient (RemoteWrite) keeps the existing 1 s→max ramp.
+        // Jitter source: digest's first hash byte XOR the attempt's low byte
+        // (`to_le_bytes()[0]` is an explicit non-truncating low-byte take).
+        let jitter = digest.packed_hash()[0] ^ self.attempt.to_le_bytes()[0];
+        let sleep_for = next_retry_backoff(side, self.remote_backoff, jitter);
+        // Rate-limited stuck-upload visibility: warn at the threshold and
+        // then once per STUCK_WARN_EVERY attempts — but KEEP RETRYING.
+        if self.attempt == STUCK_WARN_THRESHOLD
+            || (self.attempt > STUCK_WARN_THRESHOLD
+                && (self.attempt - STUCK_WARN_THRESHOLD).is_multiple_of(STUCK_WARN_EVERY))
+        {
+            warn!(
+                ?digest,
+                ?e,
+                code = ?e.code,
+                attempt = self.attempt,
+                ?side,
+                backoff_ms = sleep_for.as_millis() as u64,
+                "upload_to_remote: deferred upload stuck (retrying indefinitely until durable — FL-681 Fix B; source stays pinned via Fix A)",
+            );
+        } else {
+            debug!(
+                ?digest,
+                ?e,
+                code = ?e.code,
+                attempt = self.attempt,
+                ?side,
+                backoff_ms = sleep_for.as_millis() as u64,
+                "upload_to_remote: retrying failed upload",
+            );
+        }
+        tokio::time::sleep(sleep_for).await;
+        // Only the remote ramp advances; a read race must not push the
+        // remote ramp up (it would punish a later genuine remote transient
+        // with an inflated first wait).
+        if side == UploadFailureSide::RemoteWrite {
+            self.remote_backoff = min(self.remote_backoff * 2, max_backoff);
+        }
+        None
+    }
+}
+
+/// Per-attempt threshold past which a stuck deferred upload becomes
+/// operator-visible via a rate-limited `warn!` (then once per
+/// [`STUCK_WARN_EVERY`] attempts). Module-level so [`DeferredUploadRetry`]
+/// and the loop share one definition.
+const STUCK_WARN_THRESHOLD: u32 = 5;
+/// Cadence of the stuck-upload `warn!` past [`STUCK_WARN_THRESHOLD`].
+const STUCK_WARN_EVERY: u32 = 20;
+
 /// Validate `BatchReadBlobsResponse.responses` and return only entries
 /// whose `data.len() == digest.size_bytes()` and whose `status.code` is OK.
 ///
@@ -6253,13 +6553,9 @@ impl RunningActionsManagerImpl {
             // `PermanentGiveUp`) terminate.
             const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
             const MAX_BACKOFF: Duration = Duration::from_secs(30);
-            // Past this many consecutive failed attempts the upload is
-            // "stuck" and must be operator-visible — but it KEEPS RETRYING.
-            // We emit a rate-limited `warn!` at the threshold and then once
-            // per `STUCK_WARN_EVERY` attempts thereafter, so a wedged
-            // upload surfaces in the log without spamming it.
-            const STUCK_WARN_THRESHOLD: u32 = 5;
-            const STUCK_WARN_EVERY: u32 = 20;
+            // (Stuck-upload `warn!` cadence lives in the module-level
+            // `STUCK_WARN_THRESHOLD` / `STUCK_WARN_EVERY` consts, shared with
+            // `DeferredUploadRetry`.)
 
             let mut success_count = 0u64;
             let mut fail_count = 0u64;
@@ -6269,6 +6565,10 @@ impl RunningActionsManagerImpl {
                 // eagerly. This avoids the eviction race where EvictingMap
                 // removes the blob before we can read it.
                 let cached_data = preread_data.remove(&digest);
+                // FL-681 Q2: each per-digest retry future needs the fast
+                // store to re-assert the pin before a read-side retry
+                // (cheap Arc clone; the store itself is shared).
+                let filesystem_store = filesystem_store.clone();
                 // FL-681 Fix B safety gate (A+B interaction): infinite retry
                 // is safe ONLY when the source is pinned indefinitely (Fix A,
                 // deferred mode). "B without A = retry re-reads an evicted
@@ -6279,24 +6579,46 @@ impl RunningActionsManagerImpl {
                 // `failed_slow_writes` / reconnect-`UploadMissingBlobs`
                 // backstop. `SYNC_MAX_RETRIES` preserves the prior
                 // synchronous-mode give-up bound (was `MAX_RETRIES = 4`).
-                let retry_forever = deferred_pin;
+                // `deferred_pin` IS the retry-forever switch: the planner
+                // (`plan_retry_step`) treats `deferred_pin == true` as
+                // retry-forever and `false` as the finite `SYNC_MAX_RETRIES`
+                // bound.
                 const SYNC_MAX_RETRIES: u32 = 4;
                 uploads.push(async move {
-                    let mut attempt = 0u32;
-                    let mut backoff = INITIAL_BACKOFF;
+                    // FL-681 Q1+Q2: the retry controller owns the attempt
+                    // counter + the remote ramp and performs the re-pin +
+                    // side-sized backoff (`DeferredUploadRetry`).
+                    let mut retry = DeferredUploadRetry::new(INITIAL_BACKOFF);
                     loop {
-                        let result = if let Some(ref data) = cached_data {
+                        // FL-681 Q1: the attempt result is tagged with WHICH
+                        // side failed (`UploadFailureSide`) so the retry can
+                        // (a) re-pin the source on a worker-local read race
+                        // before re-reading (Q2) and (b) size the backoff by
+                        // side — a same-host re-read race wants a ~50-100 ms
+                        // floor, not the 1 s remote ramp.
+                        let result: Result<(), (Error, UploadFailureSide)> = if let Some(ref data) = cached_data {
                             // Data was pre-read -- upload directly without
-                            // touching the fast store.
-                            slow_store.update_oneshot(digest, data.clone()).await
+                            // touching the fast store. The only failure here
+                            // is the remote write (no fast-store read).
+                            slow_store
+                                .update_oneshot(digest, data.clone())
+                                .await
+                                .map_err(|e| (e, UploadFailureSide::RemoteWrite))
                         } else if digest.size_bytes() <= BATCH_THRESHOLD {
                             // Small blob that wasn't pre-read (e.g. pre-read
                             // failed). Read through cas_store so an eviction
                             // race self-heals via the slow-store fallback in
                             // FastSlowStore::get_part.
                             match cas_store_ref.get_part_unchunked(digest, 0, None).await {
-                                Ok(data) => slow_store.update_oneshot(digest, data).await,
-                                Err(e) => Err(e),
+                                Ok(data) => slow_store
+                                    .update_oneshot(digest, data)
+                                    .await
+                                    .map_err(|e| (e, UploadFailureSide::RemoteWrite)),
+                                // Read-side failure: the source was not
+                                // readable from the worker's own fast store
+                                // (eviction race). Tag ReadLocal so the retry
+                                // re-pins + uses the short backoff.
+                                Err(e) => Err((e, UploadFailureSide::ReadLocal)),
                             }
                         } else {
                             let (tx, rx) = make_buf_channel_pair();
@@ -6370,8 +6692,24 @@ impl RunningActionsManagerImpl {
                             // (e.g. server already had the blob and closed early).
                             if write_res.is_ok() {
                                 Ok(())
+                            } else if read_res.is_err() {
+                                // Read-side failure (eviction race): the
+                                // worker's own fast store could not produce
+                                // the bytes — `get` returned NotFound and the
+                                // dropped channel synthesized
+                                // `Internal "buf_channel: writer dropped
+                                // without commit"`. Tag ReadLocal so the retry
+                                // re-pins the source (Q2) and uses the short
+                                // backoff (Q1) instead of the 1 s remote ramp.
+                                // `read_res.merge(write_res)` preserves the
+                                // read code as the primary (merge keeps
+                                // `self.code`) plus the write context.
+                                Err((read_res.merge(write_res).unwrap_err(), UploadFailureSide::ReadLocal))
                             } else {
-                                read_res.merge(write_res)
+                                // Only the remote write failed (read was Ok):
+                                // a genuine remote transient — keep the remote
+                                // ramp.
+                                Err((write_res.unwrap_err(), UploadFailureSide::RemoteWrite))
                             }
                         };
                         match result {
@@ -6400,7 +6738,7 @@ impl RunningActionsManagerImpl {
                                     .record_pin_acquired(digest.size_bytes());
                                 break true;
                             }
-                            Err(e) if e.code == Code::AlreadyExists => {
+                            Err((e, _side)) if e.code == Code::AlreadyExists => {
                                 // #547 fix-up CF2 (perf-optimizer N4): do
                                 // NOT record_tonic_ok here. AlreadyExists
                                 // means the slow tier short-circuits
@@ -6420,86 +6758,43 @@ impl RunningActionsManagerImpl {
                                 // load-bearing on fresh-write semantics.
                                 break true;
                             }
-                            Err(e) => match classify_upload_error(&e) {
-                                UploadRetryDecision::AlreadyDurable => {
-                                    // Defensive: AlreadyExists is handled by
-                                    // the explicit arm above; this is the
-                                    // classifier's parallel verdict and is
-                                    // unreachable in practice.
-                                    break true;
+                            Err((e, side)) => {
+                                // FL-681 Q1+Q2: hand the failure to the retry
+                                // controller. It classifies give-up vs retry,
+                                // re-pins the source BEFORE the next read on a
+                                // worker-local read race (Q2 — via the closure
+                                // below, using the SAME indefinite-until-BIS
+                                // path in deferred mode / time-bounded in
+                                // synchronous mode), sleeps the side-sized
+                                // backoff (Q1 — short floor for a read race,
+                                // the 1 s→cap ramp for a remote transient), and
+                                // advances the remote ramp only on a remote
+                                // failure. `Some(flag)` = STOP (give-up);
+                                // `None` = CONTINUE (already re-pinned + slept).
+                                let outcome = retry
+                                    .after_failure(
+                                        &e,
+                                        side,
+                                        digest,
+                                        deferred_pin,
+                                        SYNC_MAX_RETRIES,
+                                        MAX_BACKOFF,
+                                        |mode| match mode {
+                                            RepinMode::Indefinite => {
+                                                filesystem_store
+                                                    .pin_digest_indefinite_with_result(&digest);
+                                            }
+                                            RepinMode::TimeBounded => {
+                                                filesystem_store.pin_digest(&digest);
+                                            }
+                                            RepinMode::None => {}
+                                        },
+                                    )
+                                    .await;
+                                if let Some(flag) = outcome {
+                                    break flag;
                                 }
-                                UploadRetryDecision::PermanentGiveUp => {
-                                    // Documented permanent exemption: a
-                                    // malformed/forbidden request that can
-                                    // never succeed by retrying the same
-                                    // bytes (InvalidArgument / PermissionDenied
-                                    // / Unauthenticated / Unimplemented).
-                                    // Retrying cannot help — surface loudly
-                                    // and stop. NOT a transient give-up.
-                                    error!(
-                                        ?digest,
-                                        ?e,
-                                        code = ?e.code,
-                                        attempts = attempt + 1,
-                                        "upload_to_remote: permanent request error uploading digest, cannot succeed by retry (FL-681 Fix B documented exemption)",
-                                    );
-                                    break false;
-                                }
-                                UploadRetryDecision::Retry => {
-                                    // FL-681 Fix B: in deferred mode retry
-                                    // FOREVER. The source stays readable (Fix
-                                    // A indefinite pin) so a later attempt
-                                    // will succeed once the server/network
-                                    // recovers. No finite limit, no
-                                    // "exhausted" terminal log. In the
-                                    // synchronous path (`retry_forever ==
-                                    // false`) keep the prior finite bound and
-                                    // hand persistent failure to the
-                                    // failed_slow_writes backstop.
-                                    if !retry_forever && attempt >= SYNC_MAX_RETRIES {
-                                        error!(
-                                            ?digest,
-                                            ?e,
-                                            code = ?e.code,
-                                            attempts = attempt + 1,
-                                            "upload_to_remote: synchronous-mode retry budget exhausted; deferring to failed_slow_writes / UploadMissingBlobs backstop",
-                                        );
-                                        break false;
-                                    }
-                                    attempt += 1;
-                                    // Rate-limited stuck-upload visibility:
-                                    // warn at the threshold and then once per
-                                    // STUCK_WARN_EVERY attempts — but KEEP
-                                    // RETRYING. A stuck upload is operator-
-                                    // visible without log spam.
-                                    if attempt == STUCK_WARN_THRESHOLD
-                                        || (attempt > STUCK_WARN_THRESHOLD
-                                            && (attempt - STUCK_WARN_THRESHOLD)
-                                                % STUCK_WARN_EVERY
-                                                == 0)
-                                    {
-                                        warn!(
-                                            ?digest,
-                                            ?e,
-                                            code = ?e.code,
-                                            attempt,
-                                            backoff_ms = backoff.as_millis() as u64,
-                                            "upload_to_remote: deferred upload stuck (retrying indefinitely until durable — FL-681 Fix B; source stays pinned via Fix A)",
-                                        );
-                                    } else {
-                                        debug!(
-                                            ?digest,
-                                            ?e,
-                                            code = ?e.code,
-                                            attempt,
-                                            backoff_ms = backoff.as_millis() as u64,
-                                            "upload_to_remote: retrying failed upload",
-                                        );
-                                    }
-                                    tokio::time::sleep(backoff).await;
-                                    backoff = min(backoff * 2, MAX_BACKOFF);
-                                }
-                            },
+                            }
                         }
                     }
                 });
@@ -8153,9 +8448,20 @@ mod upload_retry_classification_tests {
     //! gave up; the classifier is now attempt-independent for retryable
     //! classes.
 
+    use core::time::Duration;
+
     use nativelink_error::{Code, Error, make_err};
 
-    use super::{UploadRetryDecision, classify_upload_error};
+    use super::{
+        READ_LOCAL_BACKOFF_MAX, READ_LOCAL_BACKOFF_MIN, RepinMode, UploadFailureSide,
+        UploadRetryDecision, classify_upload_error, next_retry_backoff, plan_retry_step,
+    };
+
+    /// Mirrors the loop's remote ramp start so the assertions read against the
+    /// real production constant, not a magic number.
+    const REMOTE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    /// The loop's synchronous-mode finite give-up bound.
+    const SYNC_MAX_RETRIES: u32 = 4;
 
     fn err(code: Code) -> Error {
         make_err!(code, "synthetic upload error for classification test")
@@ -8242,5 +8548,362 @@ mod upload_retry_classification_tests {
                  must STILL retry (old MAX_RETRIES={OLD_MAX_RETRIES} finite limit removed — FL-681 Fix B)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // FL-681 Q2: re-pin before re-read on a worker-local eviction race.
+    // -----------------------------------------------------------------
+
+    /// Q2 (root cause): the retry loop re-reads the output from the worker's
+    /// OWN fast store; on a read-side eviction race (`ReadLocal`) it MUST
+    /// re-assert the source pin BEFORE the next read, using the SAME
+    /// indefinite-until-BIS path FL-681 Fix A added — otherwise the retry
+    /// re-runs the same eviction race the pin should have prevented. A
+    /// remote-write failure did NOT lose the source, so it must NOT re-pin.
+    #[test]
+    fn upload_repins_before_reread_on_eviction_race() {
+        // Deferred mode (production F2): a retryable read-side eviction race
+        // must re-pin INDEFINITELY (the BIS-released path), never via a fresh
+        // 120s TTL pin.
+        let read_race = err(Code::Internal); // "writer dropped without commit"
+        let step = plan_retry_step(
+            classify_upload_error(&read_race),
+            UploadFailureSide::ReadLocal,
+            /* deferred_pin */ true,
+            /* attempt */ 0,
+            SYNC_MAX_RETRIES,
+        );
+        assert!(
+            !step.give_up,
+            "retry re-read raced the same eviction the pin should have prevented: a read-side \
+             eviction race is retryable (FL-681 Fix B) — the loop must NOT give up"
+        );
+        assert_eq!(
+            step.repin,
+            RepinMode::Indefinite,
+            "retry re-read raced the same eviction the pin should have prevented: a worker-local \
+             read-side race must RE-PIN via the indefinite-until-BIS path (FL-681 Fix A) before \
+             the next read, so the re-read does not hit the same evicted source"
+        );
+
+        // NotFound is the other read-side eviction-race code (small-blob and
+        // streaming re-read) — same contract.
+        let not_found_step = plan_retry_step(
+            classify_upload_error(&err(Code::NotFound)),
+            UploadFailureSide::ReadLocal,
+            true,
+            0,
+            SYNC_MAX_RETRIES,
+        );
+        assert_eq!(
+            not_found_step.repin,
+            RepinMode::Indefinite,
+            "retry re-read raced the same eviction the pin should have prevented: a NotFound \
+             read-side race must RE-PIN indefinitely before the next read"
+        );
+
+        // Remote-write failure: the source was never lost, so the loop must
+        // NOT re-pin (re-pinning a still-pinned digest is harmless but the
+        // contract is that only a lost source triggers a re-pin).
+        let remote_step = plan_retry_step(
+            classify_upload_error(&err(Code::Unavailable)),
+            UploadFailureSide::RemoteWrite,
+            true,
+            0,
+            SYNC_MAX_RETRIES,
+        );
+        assert_eq!(
+            remote_step.repin,
+            RepinMode::None,
+            "a remote-write failure did not lose the worker-local source — it must NOT re-pin"
+        );
+
+        // Synchronous mode re-pins via the TIME-BOUNDED path (matching the
+        // schedule-time pin), not the indefinite path.
+        let sync_step = plan_retry_step(
+            classify_upload_error(&read_race),
+            UploadFailureSide::ReadLocal,
+            /* deferred_pin */ false,
+            0,
+            SYNC_MAX_RETRIES,
+        );
+        assert_eq!(
+            sync_step.repin,
+            RepinMode::TimeBounded,
+            "synchronous-mode read race must re-pin via the time-bounded path (matching the \
+             schedule-time pin whose failed_slow_writes backstop is live), not the indefinite path"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // FL-681 Q1: right-size the backoff by error class.
+    // -----------------------------------------------------------------
+
+    /// Q1 (tail): the worker-local read-side class waits a SHORT floor
+    /// (~50-100 ms), not the 1 s remote ramp — a same-host disk re-read does
+    /// not need second-scale backoff. The prod tail was ~15 s of pure 1 s-ramp
+    /// backoff (INITIAL_BACKOFF=1s ×2 ×4) per evicted output. A genuine remote
+    /// `Unavailable` still uses the ≥1 s ramp.
+    #[test]
+    fn read_side_failure_uses_short_backoff() {
+        // The read-side class waits within [50ms, 100ms] for EVERY jitter
+        // byte — never the 1 s remote ramp. (~15 s tail eliminated.)
+        for jitter in [0u8, 1, 64, 127, 200, 255] {
+            let wait = next_retry_backoff(
+                UploadFailureSide::ReadLocal,
+                /* current remote ramp */ REMOTE_INITIAL_BACKOFF,
+                jitter,
+            );
+            assert!(
+                wait >= READ_LOCAL_BACKOFF_MIN && wait <= READ_LOCAL_BACKOFF_MAX,
+                "~15 s tail: a worker-local read-side re-read race waited {wait:?} (jitter \
+                 {jitter}) — it MUST wait a short floor in \
+                 [{READ_LOCAL_BACKOFF_MIN:?}, {READ_LOCAL_BACKOFF_MAX:?}], NOT the 1 s remote \
+                 ramp; routing the read race through the 1 s floor re-creates the ~15 s tail"
+            );
+            assert!(
+                wait < REMOTE_INITIAL_BACKOFF,
+                "~15 s tail: a worker-local read race waited {wait:?} ≥ the 1 s remote ramp \
+                 (jitter {jitter}); the read-side class must be sub-second"
+            );
+        }
+
+        // The jitter spreads re-reads across the [min,max] span: the two
+        // endpoints differ, proving the floor is jittered (a burst of distinct
+        // evicted outputs does not re-read in lockstep).
+        let low = next_retry_backoff(UploadFailureSide::ReadLocal, REMOTE_INITIAL_BACKOFF, 0);
+        let high = next_retry_backoff(UploadFailureSide::ReadLocal, REMOTE_INITIAL_BACKOFF, 255);
+        assert_eq!(
+            low, READ_LOCAL_BACKOFF_MIN,
+            "jitter 0 must map to the floor minimum {READ_LOCAL_BACKOFF_MIN:?}"
+        );
+        assert_eq!(
+            high, READ_LOCAL_BACKOFF_MAX,
+            "jitter 255 must map to the floor maximum {READ_LOCAL_BACKOFF_MAX:?}"
+        );
+        assert!(
+            high > low,
+            "the read-side backoff must be jittered across [{READ_LOCAL_BACKOFF_MIN:?}, \
+             {READ_LOCAL_BACKOFF_MAX:?}] so a burst of evicted outputs spreads its re-reads"
+        );
+
+        // The remote class is untouched: it returns the caller's current ramp
+        // (≥ 1 s) verbatim, so a genuine remote transient still backs off at
+        // the slow remote interval and ramps toward the cap.
+        for ramp in [
+            REMOTE_INITIAL_BACKOFF,
+            REMOTE_INITIAL_BACKOFF * 2,
+            Duration::from_secs(30),
+        ] {
+            let wait = next_retry_backoff(UploadFailureSide::RemoteWrite, ramp, 200);
+            assert_eq!(
+                wait, ramp,
+                "a genuine remote transient must keep the existing 1 s→cap ramp ({ramp:?}); \
+                 the read-side short floor must NOT leak into the remote class"
+            );
+            assert!(
+                wait >= REMOTE_INITIAL_BACKOFF,
+                "remote transient backoff {wait:?} dropped below the 1 s remote floor — the \
+                 remote ramp must stay second-scale"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_upload_retry_loop_tests {
+    //! FL-681 Q1+Q2: drive the REAL retry controller
+    //! ([`DeferredUploadRetry::after_failure`]) — the exact code the per-digest
+    //! upload loop runs after a failed attempt — and assert the two
+    //! load-bearing contracts the inline loop now delegates to it:
+    //!
+    //!   Q2 (re-pin): on a worker-local read-side eviction race the controller
+    //!   re-asserts the source pin BEFORE it sleeps (and therefore before the
+    //!   loop's next read), via the SAME indefinite-until-BIS path FL-681 Fix A
+    //!   added in deferred mode. The re-pin is observed through a recording
+    //!   closure (the production closure calls
+    //!   `FilesystemStore::pin_digest_indefinite_with_result`).
+    //!
+    //!   Q1 (backoff): the read-side class waits a short floor (~50-100 ms),
+    //!   measured under `tokio::time::pause` so the assertion is on the actual
+    //!   virtual-time sleep the loop performed — while a genuine remote
+    //!   `Unavailable` still waits the ≥1 s ramp. No sleep-as-synchronization:
+    //!   paused time only advances when the awaited `tokio::time::sleep`
+    //!   yields, so the measured elapsed IS the backoff.
+
+    use core::cell::RefCell;
+    use core::time::Duration;
+
+    use nativelink_error::{Code, Error, make_err};
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::common::DigestInfo;
+
+    use super::{DeferredUploadRetry, RepinMode, UploadFailureSide};
+
+    const VALID_HASH: &str =
+        "0123456789abcdef000000000000000000010000000000000123456789abcdef";
+    /// The loop's remote ramp start (`INITIAL_BACKOFF`) and cap (`MAX_BACKOFF`)
+    /// and synchronous-mode finite bound — mirrored so assertions read against
+    /// the production constants.
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    const SYNC_MAX_RETRIES: u32 = 4;
+
+    fn digest() -> DigestInfo {
+        DigestInfo::try_new(VALID_HASH, 13 * 1024 * 1024).unwrap()
+    }
+
+    fn err(code: Code, msg: &str) -> Error {
+        make_err!(code, "{}", msg)
+    }
+
+    /// Q2: a read-side eviction race (`ReadLocal`) on attempt 0 must RE-PIN —
+    /// via the indefinite-until-BIS path in deferred (production) mode —
+    /// before the controller returns to the loop for the next read. The recorded
+    /// re-pin mode proves the loop would re-read a re-pinned (un-evicted) source.
+    ///
+    /// MUTATION (remove the re-pin): in `after_failure`, delete the
+    /// `repin_fn(step.repin);` call (or change the `ReadLocal` arm of
+    /// `plan_retry_step` to `RepinMode::None`). `repins` stays empty and this
+    /// test fails with the bespoke message below.
+    #[nativelink_test(flavor = "current_thread", start_paused = true)]
+    async fn upload_repins_before_reread_on_eviction_race() {
+        let repins: RefCell<Vec<RepinMode>> = RefCell::new(Vec::new());
+        let mut retry = DeferredUploadRetry::new(INITIAL_BACKOFF);
+
+        // Attempt 0: the worker's own fast-store re-read lost the eviction race
+        // (the streaming WriteHalfGuard synthesizes this Internal error).
+        let read_race = err(Code::Internal, "buf_channel: writer dropped without commit");
+        let outcome = retry
+            .after_failure(
+                &read_race,
+                UploadFailureSide::ReadLocal,
+                digest(),
+                /* deferred_pin */ true,
+                SYNC_MAX_RETRIES,
+                MAX_BACKOFF,
+                |mode| repins.borrow_mut().push(mode),
+            )
+            .await;
+
+        assert_eq!(
+            outcome, None,
+            "retry re-read raced the same eviction the pin should have prevented: a read-side \
+             eviction race is retryable (FL-681 Fix B) — the controller must CONTINUE the loop, \
+             not give up"
+        );
+        assert_eq!(
+            repins.borrow().as_slice(),
+            &[RepinMode::Indefinite],
+            "retry re-read raced the same eviction the pin should have prevented: before the next \
+             read the controller MUST re-assert the source pin exactly once via the \
+             indefinite-until-BIS path (FL-681 Fix A), so the re-read does not hit the same \
+             evicted source"
+        );
+    }
+
+    /// Q1: the read-side class waits a SHORT floor (~50-100 ms), NOT the 1 s
+    /// remote ramp; a genuine remote `Unavailable` still waits ≥1 s. Measured
+    /// under paused time so the elapsed IS the actual backoff the loop slept.
+    ///
+    /// MUTATION (route read-side through the 1 s floor): change the `ReadLocal`
+    /// arm of `next_retry_backoff` to return `remote_backoff` (the 1 s ramp).
+    /// The read-side elapsed jumps to ≥1 s and this test fails with the bespoke
+    /// ~15 s-tail message.
+    #[nativelink_test(flavor = "current_thread", start_paused = true)]
+    async fn read_side_failure_uses_short_backoff() {
+        // --- read-side class: short floor ---
+        let mut read_retry = DeferredUploadRetry::new(INITIAL_BACKOFF);
+        let read_race = err(Code::Internal, "buf_channel: writer dropped without commit");
+        let start = tokio::time::Instant::now();
+        let outcome = read_retry
+            .after_failure(
+                &read_race,
+                UploadFailureSide::ReadLocal,
+                digest(),
+                true,
+                SYNC_MAX_RETRIES,
+                MAX_BACKOFF,
+                |_mode| {},
+            )
+            .await;
+        let read_elapsed = start.elapsed();
+        assert_eq!(outcome, None, "a read-side race must continue retrying, not give up");
+        assert!(
+            read_elapsed < INITIAL_BACKOFF,
+            "~15 s tail: a worker-local read-side re-read race slept {read_elapsed:?} \
+             (≥ the 1 s remote ramp) — it MUST wait a short sub-second floor (~50-100 ms); \
+             routing the read race through the 1 s floor re-creates the ~15 s tail \
+             (INITIAL_BACKOFF=1s ×2 ×4)"
+        );
+        assert!(
+            read_elapsed >= Duration::from_millis(50)
+                && read_elapsed <= Duration::from_millis(100),
+            "~15 s tail: the read-side floor slept {read_elapsed:?}, outside the expected \
+             [50ms, 100ms] window"
+        );
+
+        // --- remote class: ≥1 s ramp, untouched ---
+        let mut remote_retry = DeferredUploadRetry::new(INITIAL_BACKOFF);
+        let unavailable = err(Code::Unavailable, "slow store unavailable");
+        let start = tokio::time::Instant::now();
+        let outcome = remote_retry
+            .after_failure(
+                &unavailable,
+                UploadFailureSide::RemoteWrite,
+                digest(),
+                true,
+                SYNC_MAX_RETRIES,
+                MAX_BACKOFF,
+                |_mode| {},
+            )
+            .await;
+        let remote_elapsed = start.elapsed();
+        assert_eq!(outcome, None, "a remote transient must continue retrying forever (Fix B)");
+        assert!(
+            remote_elapsed >= INITIAL_BACKOFF,
+            "a genuine remote Unavailable slept {remote_elapsed:?} (< the 1 s remote ramp) — the \
+             remote class must keep the second-scale 1 s→cap ramp; the read-side short floor must \
+             NOT leak into the remote class"
+        );
+    }
+
+    /// The remote ramp doubles ONLY on remote failures and is NOT reset/inflated
+    /// by an interleaved read race — proving the two classes share no ramp state
+    /// in a way that would punish a later genuine remote transient.
+    #[nativelink_test(flavor = "current_thread", start_paused = true)]
+    async fn remote_ramp_unaffected_by_interleaved_read_race() {
+        let mut retry = DeferredUploadRetry::new(INITIAL_BACKOFF);
+        let unavailable = err(Code::Unavailable, "slow store unavailable");
+        let read_race = err(Code::NotFound, "evicted from fast store");
+
+        // First remote failure: sleeps 1 s, then ramps to 2 s.
+        let start = tokio::time::Instant::now();
+        retry
+            .after_failure(&unavailable, UploadFailureSide::RemoteWrite, digest(), true,
+                SYNC_MAX_RETRIES, MAX_BACKOFF, |_| {})
+            .await;
+        assert_eq!(start.elapsed(), INITIAL_BACKOFF, "first remote failure sleeps the 1 s floor");
+
+        // Interleaved read race: short floor, must NOT touch the remote ramp.
+        retry
+            .after_failure(&read_race, UploadFailureSide::ReadLocal, digest(), true,
+                SYNC_MAX_RETRIES, MAX_BACKOFF, |_| {})
+            .await;
+
+        // Next remote failure: ramp must be 2 s (doubled once), NOT reset to 1 s
+        // and NOT inflated to 4 s by the read race.
+        let start = tokio::time::Instant::now();
+        retry
+            .after_failure(&unavailable, UploadFailureSide::RemoteWrite, digest(), true,
+                SYNC_MAX_RETRIES, MAX_BACKOFF, |_| {})
+            .await;
+        assert_eq!(
+            start.elapsed(),
+            INITIAL_BACKOFF * 2,
+            "the remote ramp must advance ONLY on remote failures: after one remote failure the \
+             next remote wait is 2 s — an interleaved read race must neither reset it to 1 s nor \
+             inflate it"
+        );
     }
 }

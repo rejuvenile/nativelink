@@ -76,6 +76,18 @@ socket2 = { version = "0.5", default-features = false, optional = true }
 nativelink-macro = { path = "../nativelink-macro" }
 async-trait = { version = "0.1.88", default-features = false }
 fail = { version = "0.5", features = ["failpoints"] }
+# Layered on top of the regular tokio dep to add the `test-util` feature
+# (gates `tokio::time::pause` / `start_paused`). Required by the FL-681
+# deferred-upload retry-backoff tests in `running_actions_manager.rs` to
+# measure the read-side vs remote-write backoff without wall-clock waits.
+tokio = { version = "1.44.1", features = [
+  "fs",
+  "io-util",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "test-util",
+], default-features = false }
 
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 hyper = { version = "1.6.0", default-features = false }
