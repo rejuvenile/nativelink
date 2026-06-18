@@ -698,6 +698,23 @@ pub struct FilesystemSpec {
     /// `max_concurrent_large_reads`. Default: 4 MiB.
     #[serde(default = "default_large_read_threshold")]
     pub large_read_threshold_bytes: u64,
+
+    /// FL-681: byte budget for F2 output blobs pinned-until-BIS-durable in
+    /// the worker's local fast store. These "indefinite" pins are exempt
+    /// from the 120s pin TTL and are released only by the server's
+    /// `BlobsInStableStorage` ack, so they must be bounded independently.
+    /// This caps the bytes that may be held in the pending-BIS indefinite-
+    /// pin set; over-cap is BACKPRESSURE (a new indefinite pin is refused,
+    /// the blob keeps its normal 120s TTL pin and the upload retry loop
+    /// keeps retrying), never a drop — no blob is lost.
+    /// A value of 0 (the default) falls back to the eviction map's `pin_cap`
+    /// (25% of the eviction policy's `max_bytes`), so existing configs are
+    /// unchanged. Indefinite pins are a subset of all pins, so a configured
+    /// value above `pin_cap` is allowed but cannot exceed the total pin
+    /// budget in practice.
+    /// Default: 0 (use `pin_cap`).
+    #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    pub pending_bis_pin_max_bytes: u64,
 }
 
 fn default_large_read_threshold() -> u64 {
@@ -718,6 +735,7 @@ impl Default for FilesystemSpec {
             fadvise_dontneed: false,
             max_concurrent_large_reads: 0,
             large_read_threshold_bytes: 4 * 1024 * 1024,
+            pending_bis_pin_max_bytes: 0,
         }
     }
 }

@@ -1932,3 +1932,153 @@ async fn startup_over_cap_content_path_drained_to_cap() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// FL-681 follow-up: the `pending_bis_pin_max_bytes` config field plumbs
+/// through `FilesystemStore::new` to the eviction map's
+/// `indefinite_pin_cap`. With an EXPLICIT small value, indefinite pins
+/// (the F2 pinned-until-BIS-ack pins) are capped at exactly that value —
+/// NOT at the much larger default `pin_cap` (25% of `max_bytes`).
+///
+/// This is the load-bearing plumbing assertion: `max_bytes = 1 MiB` makes
+/// `pin_cap = 256 KiB`, so the total-pin check never fires for our tiny
+/// blobs; the ONLY thing that can refuse the third 2048-byte indefinite
+/// pin is the explicit `pending_bis_pin_max_bytes = 4096` reaching the
+/// constructor. If the config value were dropped on the way down (the
+/// mutation below), the cap would default to `pin_cap = 256 KiB` and the
+/// third pin would WRONGLY succeed.
+///
+/// Mutation (Change 1 plumbing): in `filesystem_store.rs`, revert the
+/// `with_anchor_and_indefinite_cap(eviction_policy, now, <field>)` call to
+/// `with_anchor(eviction_policy, now)` (which always passes `0`). This
+/// test must red-fail at the bespoke "explicit pending_bis_pin_max_bytes
+/// must cap indefinite pins" assertion: the third pin would return `true`
+/// because the cap silently reverted to `pin_cap`.
+#[nativelink_test]
+async fn pending_bis_pin_max_bytes_caps_indefinite_pins() -> Result<(), Error> {
+    const BLOB_SIZE: usize = 2048;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            // pin_cap = 25% × 1 MiB = 256 KiB — far above 3×2048 so the
+            // TOTAL pin check never fires; only the explicit indefinite
+            // cap can refuse a pin.
+            max_bytes: 1024 * 1024,
+            ..Default::default()
+        }),
+        // EXPLICIT indefinite-pin cap: fits exactly two 2048-byte blobs.
+        pending_bis_pin_max_bytes: 4096,
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    let d0 = make_distinct_blob(&store, 0, BLOB_SIZE).await?;
+    let d1 = make_distinct_blob(&store, 1, BLOB_SIZE).await?;
+    let d2 = make_distinct_blob(&store, 2, BLOB_SIZE).await?;
+
+    assert!(
+        store.pin_digest_indefinite_with_result(&d0),
+        "first indefinite pin (2048 ≤ 4096) must fit under the explicit cap"
+    );
+    assert!(
+        store.pin_digest_indefinite_with_result(&d1),
+        "second indefinite pin (4096 ≤ 4096) must fill the explicit cap exactly"
+    );
+    assert!(
+        !store.pin_digest_indefinite_with_result(&d2),
+        "explicit pending_bis_pin_max_bytes must cap indefinite pins: the third \
+         2048-byte indefinite pin (total 6144 > 4096) must be REFUSED \
+         (backpressure). If this returns true, the config value never reached the \
+         eviction map constructor and the cap silently reverted to pin_cap (256 KiB)."
+    );
+
+    Ok(())
+}
+
+/// FL-681 follow-up backward-compat: when `pending_bis_pin_max_bytes` is
+/// UNSET (0, the default), the indefinite-pin cap falls back to the
+/// eviction map's `pin_cap` (25% of `max_bytes`). Existing configs (which
+/// never set this field) therefore behave EXACTLY as they did before the
+/// field existed: indefinite pins share the normal total pin budget.
+///
+/// `max_bytes = 16 KiB` → `pin_cap = 4096`. With the field unset, the
+/// indefinite cap resolves to `pin_cap = 4096`, so the first 2048-byte
+/// indefinite pin fits and the third (total 6144) is refused. This proves
+/// `0` resolves to a NON-ZERO, `pin_cap`-derived value — existing configs
+/// (which never set the field) keep their pre-field behavior.
+///
+/// Mutation (default fallback): in `moka_evicting_map.rs`
+/// `with_anchor_and_indefinite_cap`, delete the `if indefinite_pin_cap_bytes
+/// == 0 { pin_cap }` branch so the `0` default is used VERBATIM as the cap
+/// (`let indefinite_pin_cap = indefinite_pin_cap_bytes;`). The
+/// `indefinite_cap_admits` check then becomes `current + size <= 0`, which
+/// refuses EVERY indefinite pin (size > 0). This test red-fails at the
+/// bespoke "unset pending_bis_pin_max_bytes must fall back to pin_cap (not
+/// be used verbatim as 0)" assertion on the FIRST pin — verified
+/// 2026-06-18 (`/tmp/fl681-followup-mutation-fallback2.log`). (A
+/// `0 => u64::MAX` mutation is NOT a valid falsification here: the separate
+/// total-`pin_cap` gate at `pin_key_with_mode` would still refuse the third
+/// pin, masking the change — the verbatim-0 mutation is the one that
+/// isolates the fallback.)
+#[nativelink_test]
+async fn pending_bis_pin_unset_falls_back_to_pin_cap() -> Result<(), Error> {
+    const BLOB_SIZE: usize = 2048;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            // pin_cap = 25% × 16 KiB = 4096 — exactly two 2048-byte blobs.
+            max_bytes: 16 * 1024,
+            ..Default::default()
+        }),
+        // UNSET: 0 must fall back to pin_cap (= 4096 here).
+        pending_bis_pin_max_bytes: 0,
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    let d0 = make_distinct_blob(&store, 0, BLOB_SIZE).await?;
+    let d1 = make_distinct_blob(&store, 1, BLOB_SIZE).await?;
+    let d2 = make_distinct_blob(&store, 2, BLOB_SIZE).await?;
+
+    assert!(
+        store.pin_digest_indefinite_with_result(&d0),
+        "unset pending_bis_pin_max_bytes must fall back to pin_cap (not be used \
+         verbatim as 0): the first 2048-byte indefinite pin must fit under \
+         pin_cap (4096). If this is false, the 0 default was used verbatim as \
+         the cap and refuses every indefinite pin — backward-compat broken."
+    );
+    assert!(
+        store.pin_digest_indefinite_with_result(&d1),
+        "second indefinite pin (4096 ≤ pin_cap 4096) must fill pin_cap exactly"
+    );
+    assert!(
+        !store.pin_digest_indefinite_with_result(&d2),
+        "unset pending_bis_pin_max_bytes (fallback = pin_cap 4096): the third \
+         2048-byte indefinite pin (total 6144 > 4096) must be REFUSED \
+         (backpressure)."
+    );
+
+    Ok(())
+}
+
+/// FL-681 follow-up helper: write a distinct content-addressed blob of
+/// `size` bytes (first byte = `idx`) through the store so it lands in the
+/// eviction map and can be pinned. Returns its digest.
+async fn make_distinct_blob(
+    store: &FilesystemStore<FileEntryImpl>,
+    idx: u8,
+    size: usize,
+) -> Result<DigestInfo, Error> {
+    let mut data = make_random_data(size);
+    data[0] = idx;
+    let hash: [u8; 32] = Sha256::digest(&data).into();
+    let digest = DigestInfo::new(hash, size as u64);
+    store
+        .update_oneshot(digest, Bytes::from(data))
+        .await
+        .err_tip(|| "writing pinnable blob in FL-681 follow-up test")?;
+    Ok(digest)
+}

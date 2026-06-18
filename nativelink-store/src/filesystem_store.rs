@@ -966,7 +966,16 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
         let empty_policy = nativelink_config::stores::EvictionPolicy::default();
         let eviction_policy = spec.eviction_policy.as_ref().unwrap_or(&empty_policy);
-        let evicting_map = Arc::new(MokaEvictingMap::with_anchor(eviction_policy, now));
+        // FL-681: plumb the operator-tunable indefinite-pin byte budget
+        // (F2 output blobs pinned-until-BIS-durable) down to the eviction
+        // map's `indefinite_pin_cap`. `0` (the default) falls back to
+        // `pin_cap` inside the constructor, so existing configs are
+        // unchanged.
+        let evicting_map = Arc::new(MokaEvictingMap::with_anchor_and_indefinite_cap(
+            eviction_policy,
+            now,
+            spec.pending_bis_pin_max_bytes,
+        ));
 
         // Create temp and content directories and the s and d subdirectories.
 
