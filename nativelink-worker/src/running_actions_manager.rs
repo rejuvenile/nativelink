@@ -59,7 +59,7 @@ use nativelink_store::ac_utils::{
 };
 use nativelink_store::cas_utils::is_zero_digest;
 use nativelink_store::fast_slow_store::FastSlowStore;
-use nativelink_store::filesystem_store::{FileEntry, FilesystemStore};
+use nativelink_store::filesystem_store::{FileEntry, FilesystemStore, IndefinitePinOutcome};
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::action_messages::{
@@ -4914,7 +4914,27 @@ impl RunningActionImpl {
                 .deferred_output_uploads_enabled;
             let pin_one = |digest: &DigestInfo| -> bool {
                 if deferred {
-                    filesystem_store.pin_digest_indefinite_with_result(digest)
+                    // FL-681 MAJOR-1b: on an indefinite cap-refusal, fall
+                    // back to a TIME-BOUNDED pin so the F2 output is never
+                    // left fully evictable (the saturated-cap loss class).
+                    // The fallback warns separately; `true` here means SOME
+                    // pin was taken (indefinite OR time-bounded), so the
+                    // generic "blob not in fast store" warn fires only on a
+                    // genuine eviction-race `Refused`.
+                    match filesystem_store.pin_digest_indefinite_or_time_bounded(digest) {
+                        IndefinitePinOutcome::Indefinite => true,
+                        IndefinitePinOutcome::TimeBoundedFallback => {
+                            warn!(
+                                %digest,
+                                "FL-681 MAJOR-1b: indefinite-pin cap exhausted at F2 schedule \
+                                 time; took a TIME-BOUNDED fallback pin (pre-FL-681 ~120s floor, \
+                                 NOT held-until-BIS). Sustained-outage loss window is open — \
+                                 see indefinite_pin_cap headroom",
+                            );
+                            true
+                        }
+                        IndefinitePinOutcome::Refused => false,
+                    }
                 } else {
                     filesystem_store.pin_digest_with_result(digest)
                 }
@@ -6306,7 +6326,19 @@ impl RunningActionsManagerImpl {
         let deferred_pin = self.deferred_output_uploads_enabled;
         for digest in &digests {
             if deferred_pin {
-                filesystem_store.pin_digest_indefinite_with_result(digest);
+                // FL-681 MAJOR-1b: fall back to a time-bounded pin on
+                // indefinite cap-refusal so the F2 output is never left
+                // fully evictable (the saturated-cap loss class).
+                if filesystem_store.pin_digest_indefinite_or_time_bounded(digest)
+                    == IndefinitePinOutcome::TimeBoundedFallback
+                {
+                    warn!(
+                        %digest,
+                        "FL-681 MAJOR-1b: indefinite-pin cap exhausted scheduling F2 upload; \
+                         took a TIME-BOUNDED fallback pin (pre-FL-681 ~120s floor, NOT \
+                         held-until-BIS) — sustained-outage loss window is open",
+                    );
+                }
             } else {
                 filesystem_store.pin_digest(digest);
             }
@@ -6511,7 +6543,20 @@ impl RunningActionsManagerImpl {
                         // BIS-ack.
                         for digest in &file_digests {
                             if deferred_pin {
-                                filesystem_store.pin_digest_indefinite_with_result(digest);
+                                // FL-681 MAJOR-1b: time-bounded fallback on
+                                // indefinite cap-refusal — never leave the
+                                // F2 output fully evictable.
+                                if filesystem_store
+                                    .pin_digest_indefinite_or_time_bounded(digest)
+                                    == IndefinitePinOutcome::TimeBoundedFallback
+                                {
+                                    warn!(
+                                        %digest,
+                                        "FL-681 MAJOR-1b: indefinite-pin cap exhausted pinning \
+                                         tree-extracted F2 output; took a TIME-BOUNDED fallback \
+                                         pin (pre-FL-681 ~120s floor, NOT held-until-BIS)",
+                                    );
+                                }
                             } else {
                                 filesystem_store.pin_digest(digest);
                             }
@@ -6781,8 +6826,14 @@ impl RunningActionsManagerImpl {
                                         MAX_BACKOFF,
                                         |mode| match mode {
                                             RepinMode::Indefinite => {
-                                                filesystem_store
-                                                    .pin_digest_indefinite_with_result(&digest);
+                                                // FL-681 MAJOR-1b: the
+                                                // re-pin before a read-race
+                                                // retry must also fall back
+                                                // to time-bounded on cap
+                                                // refusal — never leave the
+                                                // re-read source unprotected.
+                                                let _ = filesystem_store
+                                                    .pin_digest_indefinite_or_time_bounded(&digest);
                                             }
                                             RepinMode::TimeBounded => {
                                                 filesystem_store.pin_digest(&digest);

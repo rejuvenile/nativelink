@@ -33,7 +33,7 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::filesystem_store::{
     DIGEST_FOLDER, EncodedFilePath, FileEntry, FileEntryImpl, FileType, FilesystemStore,
-    STR_FOLDER, digest_content_path, key_from_file,
+    IndefinitePinOutcome, STR_FOLDER, digest_content_path, key_from_file,
 };
 use nativelink_util::buf_channel::{make_buf_channel_pair, make_buf_channel_pair_with_size};
 use nativelink_util::common::{DigestInfo, fs};
@@ -2059,6 +2059,215 @@ async fn pending_bis_pin_unset_falls_back_to_pin_cap() -> Result<(), Error> {
         "unset pending_bis_pin_max_bytes (fallback = pin_cap 4096): the third \
          2048-byte indefinite pin (total 6144 > 4096) must be REFUSED \
          (backpressure)."
+    );
+
+    Ok(())
+}
+
+/// FL-681 fix-up (MAJOR-2): the BIS-release seam at the production
+/// FilesystemStore type. An F2 output blob is pinned INDEFINITELY (held
+/// until the server's BlobsInStableStorage ack). The release MUST depend
+/// ONLY on the BIS-ack (`unpin_digest`, the primitive the worker's BIS-ack
+/// handler calls at `local_worker.rs` after decoding a `BlobsInStableStorageChunk`),
+/// NEVER on the 120s TTL sweep.
+///
+/// This is the seam distributed-systems-reviewer + red-team flagged as
+/// having ZERO coverage: for an already-present output (server returns OK
+/// without writing → no BIS emitted from the write path), the indefinite
+/// pin's release comes from the delta `BlobsAvailable → mark_stable → BIS`
+/// path. The MISSED-tick recoverability of that delivery path is a
+/// documented residual (self-heals on worker reconnect — the reconnect
+/// full snapshot at `get_all_entries_with_timestamps` includes pinned
+/// entries; bounded by `indefinite_pin_cap`; see the FL-681 design doc
+/// MAJOR-2 section). What this test pins is the RELEASE CONTRACT itself:
+/// whenever the BIS-ack DOES arrive (via any delivery path), `unpin_digest`
+/// releases the indefinite pin and frees BOTH `pinned_bytes` and
+/// `indefinite_pinned_bytes` so the next pending-BIS blob gets cap headroom.
+///
+/// Mutation: in `moka_evicting_map.rs` `unpin_key`, comment out the
+/// `if entry.indefinite { ...fetch_sub... }` decrement. This test must
+/// red-fail at the bespoke "BIS-ack did not free indefinite-cap headroom"
+/// assertion (the pin would release the total but leak the indefinite
+/// accounting — the exact MAJOR-1a class on the release side).
+#[nativelink_test]
+async fn bis_ack_releases_indefinite_f2_pin_independent_of_ttl() -> Result<(), Error> {
+    const BLOB_SIZE: usize = 2048;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 1024 * 1024,
+            ..Default::default()
+        }),
+        // Explicit small indefinite cap so we can prove the BIS-ack frees
+        // headroom: with the cap at 4096, a third pin is refused until an
+        // ack releases one.
+        pending_bis_pin_max_bytes: 4096,
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    let d0 = make_distinct_blob(&store, 0, BLOB_SIZE).await?;
+    let d1 = make_distinct_blob(&store, 1, BLOB_SIZE).await?;
+    let d2 = make_distinct_blob(&store, 2, BLOB_SIZE).await?;
+
+    // The F2 output pins (indefinite, until BIS-ack).
+    assert!(
+        store.pin_digest_indefinite_with_result(&d0),
+        "first F2 indefinite pin must succeed"
+    );
+    assert!(
+        store.pin_digest_indefinite_with_result(&d1),
+        "second F2 indefinite pin fills the indefinite cap exactly"
+    );
+    assert_eq!(
+        store.indefinite_pinned_bytes(),
+        4096,
+        "two indefinite F2 pins must account for exactly 4096 bytes"
+    );
+
+    // Drive the TTL sweep past the 120s deadline with NO BIS-ack. The
+    // indefinite pins MUST survive — release is decoupled from the TTL.
+    assert!(
+        store.test_force_pin_expired(&d0),
+        "d0 must be pinned so its deadline can be rewound"
+    );
+    assert!(
+        store.test_force_pin_expired(&d1),
+        "d1 must be pinned so its deadline can be rewound"
+    );
+    store.test_expire_stale_pins().await;
+    assert_eq!(
+        store.indefinite_pinned_bytes(),
+        4096,
+        "release-seam violation: the 120s TTL sweep released an F2 indefinite pin — \
+         the indefinite pin must be released ONLY by the BIS-ack, never by the TTL \
+         (this is the 3,881-event silent-loss leak)"
+    );
+
+    // A third pin is still refused (cap full) — proving the pins are held.
+    assert!(
+        !store.pin_digest_indefinite_with_result(&d2),
+        "third indefinite pin must be refused while the cap is full of un-acked pins"
+    );
+
+    // Deliver the BIS-ack for d0 (the `unpin_digest` primitive the worker's
+    // BIS-ack handler calls). This MUST release the indefinite pin AND free
+    // its indefinite-cap headroom.
+    store.unpin_digest(&d0);
+    assert_eq!(
+        store.indefinite_pinned_bytes(),
+        2048,
+        "BIS-ack did not free indefinite-cap headroom: unpin_digest released the pin \
+         but leaked the indefinite_pinned_bytes accounting — the next pending-BIS blob \
+         is wrongly refused a pin and falls back to the 120s TTL"
+    );
+
+    // With headroom freed by the ack, the previously-refused pin now fits —
+    // proving the release seam actually reclaims cap capacity end-to-end.
+    assert!(
+        store.pin_digest_indefinite_with_result(&d2),
+        "after the BIS-ack freed cap headroom, the backpressured F2 output must pin"
+    );
+
+    Ok(())
+}
+
+/// FL-681 fix-up (MAJOR-1b): a cap-refused fresh F2 output pin MUST fall
+/// back to a TIME-BOUNDED pin, NOT be left fully evictable.
+///
+/// The pre-fix behavior: when the indefinite cap was exhausted,
+/// `pin_digest_indefinite_with_result` returned `false` and inserted NO
+/// pin — the F2 output was fully LRU-evictable, the exact loss class under
+/// a sustained outage (cap-saturated + evicted + not-yet-durable).
+///
+/// `pin_digest_indefinite_or_time_bounded` closes the "no pin at all" gap:
+/// on cap refusal it takes a time-bounded `pin_key` (counts against the
+/// total `pin_cap`, NOT the indefinite cap, so it admits while the
+/// indefinite cap is full). After the fallback, `pinned_bytes` includes the
+/// blob but `indefinite_pinned_bytes` does NOT — proving it is a
+/// time-bounded (not indefinite) pin and the indefinite cap was not
+/// exceeded.
+///
+/// This is a MITIGATION (pre-FL-681 ~120s floor), not durability closure —
+/// see the helper doc-comment. The test pins the floor: the cap-refused
+/// output is protected, not abandoned.
+///
+/// Mutation: in `filesystem_store.rs`
+/// `pin_digest_indefinite_or_time_bounded`, replace the
+/// `self.pin_digest_with_result(digest)` fallback branch with `false` (i.e.
+/// revert to the old "leave it evictable" behavior). This test must
+/// red-fail at the bespoke "cap-refused F2 output left fully evictable"
+/// assertion: `pinned_bytes` would stay at the 2 indefinite pins (4096)
+/// instead of growing to include the time-bounded fallback.
+#[nativelink_test]
+async fn cap_refused_f2_pin_falls_back_to_time_bounded_not_evictable() -> Result<(), Error> {
+    const BLOB_SIZE: usize = 2048;
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            // pin_cap = 25% × 1 MiB = 256 KiB — far above our blobs, so the
+            // TOTAL pin check never refuses a time-bounded fallback.
+            max_bytes: 1024 * 1024,
+            ..Default::default()
+        }),
+        // Indefinite cap fits exactly two 2048-byte blobs.
+        pending_bis_pin_max_bytes: 4096,
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    let d0 = make_distinct_blob(&store, 0, BLOB_SIZE).await?;
+    let d1 = make_distinct_blob(&store, 1, BLOB_SIZE).await?;
+    let d2 = make_distinct_blob(&store, 2, BLOB_SIZE).await?;
+
+    // Saturate the indefinite cap with two F2 output pins.
+    assert_eq!(
+        store.pin_digest_indefinite_or_time_bounded(&d0),
+        IndefinitePinOutcome::Indefinite,
+        "first F2 output should get a full indefinite pin (cap not yet saturated)"
+    );
+    assert_eq!(
+        store.pin_digest_indefinite_or_time_bounded(&d1),
+        IndefinitePinOutcome::Indefinite,
+        "second F2 output should get a full indefinite pin (fills cap exactly)"
+    );
+    assert_eq!(
+        store.indefinite_pinned_bytes(),
+        4096,
+        "two indefinite pins fill the 4096-byte cap"
+    );
+    assert_eq!(store.pinned_bytes(), 4096, "all pinned bytes are indefinite so far");
+
+    // A third F2 output arrives while the indefinite cap is SATURATED. It
+    // MUST NOT be left fully evictable — the fallback takes a time-bounded
+    // pin instead.
+    assert_eq!(
+        store.pin_digest_indefinite_or_time_bounded(&d2),
+        IndefinitePinOutcome::TimeBoundedFallback,
+        "cap-saturated F2 output must fall back to a TIME-BOUNDED pin, not be refused outright"
+    );
+
+    // The fallback pin protects the blob: total pinned bytes grew to include
+    // d2 (6144), but the indefinite accounting did NOT (still 4096) — so the
+    // blob is a time-bounded pin, not left fully evictable and not wrongly
+    // counted against the indefinite cap.
+    assert_eq!(
+        store.indefinite_pinned_bytes(),
+        4096,
+        "the time-bounded fallback must NOT be counted against the indefinite cap \
+         (it would corrupt the BIS-pin backlog gauge)"
+    );
+    assert_eq!(
+        store.pinned_bytes(),
+        6144,
+        "cap-refused F2 output left fully evictable: the time-bounded fallback pin was \
+         not taken, so the blob is unprotected and lost under cap-saturation + eviction \
+         + not-yet-durable (the FL-681 loss class). Expected pinned_bytes to include the \
+         fallback (6144), got the two indefinite pins only."
     );
 
     Ok(())

@@ -24,11 +24,18 @@
 //! identically.
 //!
 //! These tests pin the exact integer fed to `Semaphore::new`. The
-//! semaphore's permit count IS `effective_max_concurrent_uploads(cfg)`,
-//! so asserting the resolver is asserting the semaphore.
+//! resolver tests below assert `effective_max_concurrent_uploads`, and
+//! `resolved_cap_reaches_semaphore_permit_count` crosses the
+//! resolver → `Semaphore` seam via the single
+//! [`upload_fanout_semaphore`] constructor that
+//! `handle_upload_missing_blobs` uses — so a `Semaphore::new(32)` hardcode
+//! mutation inside that constructor is caught (the resolver test alone
+//! would NOT catch it).
 
 use nativelink_util::o11_probes::MAX_CONCURRENT_UPLOADS;
-use nativelink_worker::local_worker::effective_max_concurrent_uploads;
+use nativelink_worker::local_worker::{
+    effective_max_concurrent_uploads, upload_fanout_semaphore,
+};
 
 /// Backward-compat: the `0` sentinel (what every config that does not
 /// set the field deserializes to) resolves to the historical hardcoded
@@ -74,5 +81,49 @@ fn explicit_override_takes_effect() {
         "FL-681: max_concurrent_uploads=1 MUST resolve to 1, not the \
          default — the resolver must not treat small non-zero values as \
          unset"
+    );
+}
+
+/// FL-681 fix-up (substance over form): cross the resolver → `Semaphore`
+/// seam. `handle_upload_missing_blobs` builds its throttle ONLY via
+/// `upload_fanout_semaphore`, so the semaphore's `available_permits()`
+/// after construction IS the resolved fan-out cap. The earlier resolver-
+/// only tests would pass even if the production code did
+/// `Semaphore::new(32)` (ignoring the resolved value); this test fails
+/// that mutation because it observes the permit count the production
+/// constructor actually produces for an explicit override AND the unset
+/// default.
+///
+/// Mutation: inside `upload_fanout_semaphore`, replace
+/// `Semaphore::new(max_concurrent_uploads)` with `Semaphore::new(32)`.
+/// This test must red-fail at the explicit-override assertion (128 ≠ 32)
+/// with its bespoke "resolved cap did not reach the semaphore" message.
+#[test]
+fn resolved_cap_reaches_semaphore_permit_count() {
+    // Explicit operator override must reach the semaphore verbatim.
+    let explicit = effective_max_concurrent_uploads(128);
+    assert_eq!(
+        upload_fanout_semaphore(explicit).available_permits(),
+        128,
+        "FL-681: resolved cap did not reach the semaphore — \
+         handle_upload_missing_blobs constructed Semaphore with a count other \
+         than effective_max_concurrent_uploads(128)=128 (a hardcode mutation)"
+    );
+
+    // Unset sentinel (0) must reach the semaphore as the default 32.
+    let unset = effective_max_concurrent_uploads(0);
+    assert_eq!(
+        upload_fanout_semaphore(unset).available_permits(),
+        MAX_CONCURRENT_UPLOADS,
+        "FL-681: unset max_concurrent_uploads (=0) did not reach the semaphore \
+         as the default MAX_CONCURRENT_UPLOADS={MAX_CONCURRENT_UPLOADS} permits"
+    );
+
+    // A small explicit value must NOT be widened to the default.
+    assert_eq!(
+        upload_fanout_semaphore(effective_max_concurrent_uploads(1)).available_permits(),
+        1,
+        "FL-681: max_concurrent_uploads=1 must produce a 1-permit semaphore, \
+         not the default — the resolved small value did not reach the semaphore"
     );
 }

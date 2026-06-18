@@ -881,6 +881,24 @@ async fn prune_temp_path(temp_path: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// FL-681 Fix A fix-up (MAJOR-1b): outcome of
+/// [`FilesystemStore::pin_digest_indefinite_or_time_bounded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndefinitePinOutcome {
+    /// The indefinite (held-until-BIS-ack) pin was taken — full protection.
+    Indefinite,
+    /// The indefinite cap was exhausted; a TIME-BOUNDED pin was taken
+    /// instead (counts against `pin_cap`, not the indefinite cap). The
+    /// blob is protected for ~120s — the pre-FL-681 floor — NOT held until
+    /// BIS-ack. Under a sustained (>120s) outage the blob can still be
+    /// lost; see the helper's doc-comment for the honest scope.
+    TimeBoundedFallback,
+    /// Neither pin could be taken (blob absent from the eviction map — an
+    /// eviction race; the blob is already gone). The retry loop's slow-tier
+    /// re-read self-heals if the source survives.
+    Refused,
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     #[metric]
@@ -1118,6 +1136,48 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             .pin_key_indefinite(StoreKeyBorrow::from(key))
     }
 
+    /// FL-681 Fix A fix-up (MAJOR-1b): pin a digest INDEFINITELY, falling
+    /// back to a TIME-BOUNDED pin when the indefinite cap is exhausted.
+    ///
+    /// The fresh-pin indefinite cap-refusal previously left the blob FULLY
+    /// LRU-evictable (no pin at all) — strictly weaker than a time-bounded
+    /// pin and the exact FL-681 loss class under a sustained outage
+    /// (cap-saturated + evicted + not-yet-durable). This helper closes the
+    /// "no pin at all" gap: on cap refusal it takes a time-bounded
+    /// `pin_key` (which counts against the TOTAL `pin_cap`, NOT the
+    /// indefinite cap, so it admits even when the indefinite cap is full),
+    /// restoring the pre-FL-681 ~120s synchronous protection window.
+    ///
+    /// HONEST SCOPE: this is a MITIGATION, not a durability close-out. Under
+    /// a remote outage longer than `PIN_TIMEOUT_SECS` (120s) the
+    /// retry-forever loop's `RemoteWrite` failures do NOT re-pin (the source
+    /// was not lost), so the time-bounded pin's TTL eventually expires
+    /// unrefreshed and the blob can still be lost — the same floor the
+    /// synchronous path always had. The TRUE close-out is admission-side
+    /// gating (don't admit an action whose outputs exceed pending-BIS-pin
+    /// headroom), tracked as an FL-681 follow-up. This helper strictly
+    /// improves on "fully evictable on cap-refusal" without claiming to
+    /// eliminate the saturated-cap loss window.
+    ///
+    /// Returns the outcome so the caller can log + meter accurately.
+    pub fn pin_digest_indefinite_or_time_bounded(
+        &self,
+        digest: &DigestInfo,
+    ) -> IndefinitePinOutcome {
+        if self.pin_digest_indefinite_with_result(digest) {
+            return IndefinitePinOutcome::Indefinite;
+        }
+        // Indefinite cap exhausted (or eviction race). Try a time-bounded
+        // pin so the blob is NOT left fully evictable. `pin_key` counts
+        // against the total `pin_cap`, not the indefinite cap, so it can
+        // still admit while the indefinite cap is saturated.
+        if self.pin_digest_with_result(digest) {
+            IndefinitePinOutcome::TimeBoundedFallback
+        } else {
+            IndefinitePinOutcome::Refused
+        }
+    }
+
     /// Unpin a digest, allowing eviction again.
     pub fn unpin_digest(&self, digest: &DigestInfo) {
         let key: StoreKey<'static> = (*digest).into();
@@ -1133,6 +1193,26 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     #[doc(hidden)]
     pub async fn test_expire_stale_pins(&self) {
         self.evicting_map.expire_stale_pins().await;
+    }
+
+    /// FL-681 Fix A fix-up: bytes currently held by INDEFINITE
+    /// (pinned-until-BIS-ack) pins. Doc-hidden test observability — lets
+    /// the BIS-release-seam test assert that the BIS-ack `unpin_digest`
+    /// frees the indefinite accounting at the production FilesystemStore
+    /// type (not just the bare eviction map).
+    #[doc(hidden)]
+    pub fn indefinite_pinned_bytes(&self) -> u64 {
+        self.evicting_map.indefinite_pinned_bytes()
+    }
+
+    /// FL-681 Fix A fix-up: total bytes held by ALL pins (time-bounded +
+    /// indefinite). Doc-hidden test observability — the MAJOR-1b test
+    /// asserts a cap-refused F2 output still holds a (time-bounded) pin,
+    /// i.e. `pinned_bytes > indefinite_pinned_bytes`, rather than being
+    /// left fully evictable.
+    #[doc(hidden)]
+    pub fn pinned_bytes(&self) -> u64 {
+        self.evicting_map.pinned_bytes()
     }
 
     /// Test hook: force a pinned digest's deadline past

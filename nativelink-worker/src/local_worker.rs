@@ -1813,6 +1813,20 @@ pub fn effective_max_concurrent_uploads(configured: usize) -> usize {
     }
 }
 
+/// FL-681 fix-up: the single point that turns the resolved per-call
+/// fan-out cap into the upload throttle semaphore. `handle_upload_missing_blobs`
+/// constructs its semaphore ONLY through this function, so the
+/// `Semaphore::new(N)` permit count is provably the resolved
+/// `max_concurrent_uploads` and not a hardcoded constant. The fan-out
+/// config test asserts `upload_fanout_semaphore(effective_max_concurrent_uploads(cfg))`
+/// has exactly the expected `available_permits()` — crossing the
+/// resolver → Semaphore seam, which a `Semaphore::new(32)` hardcode
+/// mutation inside this function would fail.
+#[must_use]
+pub fn upload_fanout_semaphore(max_concurrent_uploads: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(max_concurrent_uploads))
+}
+
 impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorkerImpl<'a, T, U> {
     fn new(
         config: &'a LocalWorkerConfig,
@@ -1924,7 +1938,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // CAPPED AT max_concurrent_uploads: per-call upload fan-out is
         // bounded by this many concurrent in-flight uploads; over-cap
         // uploads await a permit (bounded backpressure, never buffered).
-        let upload_sem = Arc::new(Semaphore::new(max_concurrent_uploads));
+        // Constructed via `upload_fanout_semaphore` (the single
+        // resolver→Semaphore seam) so the permit count is provably the
+        // resolved config value, not a hardcode (FL-681 fix-up).
+        let upload_sem = upload_fanout_semaphore(max_concurrent_uploads);
         let upload_counters =
             ::nativelink_util::o11_probes::upload_inflight_counters();
 

@@ -391,8 +391,8 @@ where
     /// but with an explicit cap on INDEFINITE (pinned-until-BIS-ack)
     /// bytes. `indefinite_pin_cap_bytes == 0` falls back to the normal
     /// `pin_cap` (25% of `max_bytes`). The cap is enforced at
-    /// [`Self::pin_key_indefinite`] / [`Self::pin_keys_indefinite`] with
-    /// BACKPRESSURE (refuse, never drop) over-cap semantics.
+    /// [`Self::pin_key_indefinite`] with BACKPRESSURE (refuse, never drop)
+    /// over-cap semantics.
     pub fn with_anchor_and_indefinite_cap(
         config: &EvictionPolicy,
         anchor_time: I,
@@ -959,6 +959,20 @@ where
             if let Some((_, entry)) = self.pinned.remove(key) {
                 self.pinned_bytes
                     .fetch_sub(entry.size, Ordering::Relaxed);
+                // FL-681 Fix A fix-up (MAJOR-1a): keep the indefinite-pin
+                // accounting symmetric on the explicit-remove path, exactly
+                // as `unpin_key` does. `remove()` is reachable on an
+                // indefinite-pinned (F2 output) key via
+                // `FilesystemStore::remove_entry_for_digest` and the
+                // stale/zero-byte-file eviction sites. Without this
+                // decrement, `indefinite_pinned_bytes` leaks monotonically
+                // upward, the `indefinite_pin_cap` saturates, and every new
+                // F2 output falls back to a time-bounded pin — re-opening the
+                // exact 120s-TTL silent-loss leak FL-681 fixes.
+                if entry.indefinite {
+                    self.indefinite_pinned_bytes
+                        .fetch_sub(entry.size, Ordering::Relaxed);
+                }
                 self.update_btree_remove(key);
 
                 // Fire callbacks + unref in background.
@@ -1211,27 +1225,14 @@ where
     }
 
     pub fn pin_keys(&self, keys: &[K]) -> usize {
-        self.pin_keys_with_mode(keys, false)
-    }
-
-    /// FL-681 Fix A: batch indefinite pin — see [`Self::pin_key_indefinite`].
-    /// Returns the count successfully pinned-indefinitely; keys refused by
-    /// the indefinite cap are BACKPRESSURE (left unpinned for the caller to
-    /// retry), not dropped.
-    pub fn pin_keys_indefinite(&self, keys: &[K]) -> usize {
-        self.pin_keys_with_mode(keys, true)
-    }
-
-    fn pin_keys_with_mode(&self, keys: &[K], indefinite: bool) -> usize {
         let mut pinned = 0;
         for key in keys {
             let q: &Q = key.borrow();
 
-            // Already pinned — refresh (and upgrade to indefinite if asked
-            // and the indefinite cap admits). Delegating to the per-key
-            // path keeps the cap accounting in exactly one place.
+            // Already pinned — refresh. Delegating to the per-key path keeps
+            // the pin accounting in exactly one place.
             if self.pinned.contains_key(q) {
-                if self.pin_key_with_mode(key.clone(), indefinite) {
+                if self.pin_key(key.clone()) {
                     pinned += 1;
                 }
                 continue;
@@ -1257,21 +1258,6 @@ where
                     break;
                 }
             }
-            if indefinite && !self.indefinite_cap_admits(entry_size) {
-                warn!(
-                    indefinite_pinned_bytes =
-                        self.indefinite_pinned_bytes.load(Ordering::Relaxed),
-                    entry_size,
-                    indefinite_pin_cap = self.indefinite_pin_cap,
-                    attempted = keys.len(),
-                    pinned,
-                    "pin_keys: indefinite pin cap exceeded, leaving remaining keys unpinned (backpressure)",
-                );
-                // Backpressure: stop granting indefinite pins this batch.
-                // The remaining keys stay in the LRU cache for the caller
-                // to retry — never dropped.
-                break;
-            }
 
             // Insert into pinned FIRST (same ordering as pin_key).
             self.pinned.insert(
@@ -1280,14 +1266,10 @@ where
                     data: value,
                     pinned_at: Instant::now(),
                     size: entry_size,
-                    indefinite,
+                    indefinite: false,
                 },
             );
             self.pinned_bytes.fetch_add(entry_size, Ordering::Relaxed);
-            if indefinite {
-                self.indefinite_pinned_bytes
-                    .fetch_add(entry_size, Ordering::Relaxed);
-            }
 
             // Invalidate from cache (don't call run_pending_tasks per key).
             self.cache.invalidate(q);
@@ -2461,5 +2443,92 @@ mod tests {
 
         map.unpin_key(&1);
         map.unpin_key(&2);
+    }
+
+    // FL-681 Fix A fix-up (MAJOR-1a): the explicit-remove path
+    // (`remove()` / `remove_if()`) must keep the indefinite-pin accounting
+    // symmetric, exactly as `unpin_key`. `remove()` is reachable on an
+    // indefinite-pinned (F2 output) key via
+    // `FilesystemStore::remove_entry_for_digest` + stale/zero-byte
+    // eviction. If `remove()` decrements only `pinned_bytes` and not
+    // `indefinite_pinned_bytes`, the indefinite total leaks monotonically
+    // upward, the cap saturates, and every new F2 output silently falls
+    // back to a time-bounded pin — re-opening the 120s-TTL leak.
+    #[tokio::test]
+    async fn remove_of_indefinite_pin_restores_indefinite_bytes() {
+        // Cap indefinite pins at 4096 bytes so a leak is observable: after
+        // removing the first indefinite key, a third 2048-byte indefinite
+        // pin must fit (proving the cap headroom was reclaimed).
+        let cfg = policy(1024 * 1024, 0);
+        let map = Arc::new(make_map_cb_indefinite_cap(&cfg, 4096));
+
+        for k in 0..3u64 {
+            map.insert(k, BytesEntry(2048)).await;
+        }
+        assert!(map.pin_key_indefinite(0), "first indefinite pin fits under cap");
+        assert!(map.pin_key_indefinite(1), "second indefinite pin fills cap exactly");
+        assert_eq!(
+            map.indefinite_pinned_bytes(),
+            4096,
+            "two 2048-byte indefinite pins should account for exactly 4096 bytes"
+        );
+
+        // Explicitly remove an indefinite-pinned key (the
+        // `remove_entry_for_digest` / stale-eviction path). This MUST
+        // decrement `indefinite_pinned_bytes`, not just `pinned_bytes`.
+        assert!(
+            map.remove(&0u64).await,
+            "remove() of a pinned key should report it was removed"
+        );
+        assert_eq!(
+            map.indefinite_pinned_bytes(),
+            2048,
+            "indefinite_pinned_bytes leak: remove() of an indefinite-pinned key did not free \
+             its indefinite-cap headroom — the cap will saturate and re-open the 120s-TTL leak"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            2048,
+            "remove() must also decrement the total pinned_bytes for the removed entry"
+        );
+
+        // Falsification: the leaked headroom must be REUSABLE. With the cap
+        // at 4096 and only key 1 (2048) still indefinitely pinned, a fresh
+        // 2048-byte indefinite pin of key 2 must now fit. If remove() leaked
+        // the indefinite accounting, the cap would still read 4096 and this
+        // pin would be wrongly refused.
+        assert!(
+            map.pin_key_indefinite(2),
+            "indefinite_pinned_bytes leak: cap headroom freed by remove() was not reusable — \
+             a new F2 output is refused an indefinite pin and falls back to the 120s TTL"
+        );
+
+        map.unpin_key(&1);
+        map.unpin_key(&2);
+    }
+
+    // FL-681 Fix A fix-up (MAJOR-1a) sibling: `remove_if()` delegates to
+    // `remove()`, so the same indefinite-accounting symmetry must hold when
+    // the conditional removal predicate fires.
+    #[tokio::test]
+    async fn remove_if_of_indefinite_pin_restores_indefinite_bytes() {
+        let cfg = policy(1024 * 1024, 0);
+        let map = Arc::new(make_map_cb_indefinite_cap(&cfg, 4096));
+
+        map.insert(0u64, BytesEntry(2048)).await;
+        assert!(map.pin_key_indefinite(0), "indefinite pin should succeed");
+        assert_eq!(map.indefinite_pinned_bytes(), 2048);
+
+        // remove_if with a predicate that fires routes through remove().
+        assert!(
+            map.remove_if(&0u64, |_| true).await,
+            "remove_if() with a true predicate should remove the pinned key"
+        );
+        assert_eq!(
+            map.indefinite_pinned_bytes(),
+            0,
+            "indefinite_pinned_bytes leak via remove_if(): the conditional-remove path did not \
+             free indefinite-cap headroom"
+        );
     }
 }
