@@ -106,6 +106,19 @@ pub struct SchedulerMetrics {
     /// `bis_chunked_dispatch` — greppable from journald. See #231 to
     /// surface the counter through the metrics exporter.
     pub bis_replay_buffer_overflow_drops: AtomicU64,
+    /// (#sched-b1) Cumulative count of completions whose operation was
+    /// already removed from the worker's `running_action_infos` during
+    /// the B1 lock-free `update_operation` window (a legitimate
+    /// concurrent finalize — e.g. `ExecutionComplete` or eviction —
+    /// removed it). The completion's op-state was already committed by
+    /// (b), so the second critical section softens the missing-op case to
+    /// `Ok(())` instead of erroring. This is the EXPECTED post-unlock
+    /// race; a non-zero, slowly-growing value is benign. The paired
+    /// `warn!` (see `update_action`) is the operator-visible signal
+    /// (SchedulerMetrics has no exporter wired yet) and, unlike the old
+    /// `debug!`, SURVIVES `release_max_level_info` so the softened branch
+    /// is not invisible in the production binary.
+    pub update_action_op_already_finalized: AtomicU64,
 }
 
 /// Point-in-time intersection of an action's `file_digests` and the
@@ -468,6 +481,41 @@ impl BisResendBuffer {
     pub(crate) fn overflow_drops(&self) -> u64 {
         self.overflow_drops
     }
+}
+
+/// (#sched-b1) Outcome of `update_action`'s first critical section
+/// (`update_action_cs1`). The orchestrator (`ApiWorkerScheduler::update_action`)
+/// decides what to do after the lock is dropped based on this.
+enum Cs1Decision {
+    /// An early-return path completed entirely under the lock
+    /// (`ExecutionComplete`); the orchestrator returns `Ok(())`.
+    Done,
+    /// The op is not running on this worker. The orchestrator runs
+    /// `immediate_evict_worker` UNDER the still-held lock (FR-1) and
+    /// returns the merged error.
+    NotRunning(Error),
+    /// The op IS running; run `update_operation` lock-free, then (if
+    /// finished) the second critical section.
+    Proceed {
+        worker_state_manager: Arc<dyn WorkerStateManager>,
+        is_finished: bool,
+        due_to_backpressure: bool,
+        update: UpdateOperationType,
+    },
+}
+
+/// (#sched-b1) Outcome of `update_action`'s second critical section
+/// (`update_action_cs2`).
+enum Cs2Outcome {
+    /// Slot freed, flags applied, matcher notified — the normal finished path.
+    Completed,
+    /// The worker was removed during the lock-free window (§6.2) — benign.
+    WorkerGone,
+    /// The op was already finalized by a concurrent path during the
+    /// window (§6.3) — benign; the orchestrator warns + bumps the counter.
+    AlreadyFinalized,
+    /// `complete_action` returned a non-missing-op error — propagate.
+    Error(Error),
 }
 
 impl core::fmt::Debug for ApiWorkerSchedulerImpl {
@@ -1116,12 +1164,27 @@ impl ApiWorkerSchedulerImpl {
         }
     }
 
-    async fn update_action(
+    // (#sched-b1) First critical section of `update_action`. Runs under
+    // the worker-pool `inner` write lock with ZERO `.await` inside. It
+    // validates the worker/op, handles the two early-return paths
+    // (`ExecutionComplete`, op-not-running eviction), computes the Copy
+    // scalars (`is_finished`, `due_to_backpressure`), and clones the
+    // `worker_state_manager` Arc so the caller can run `update_operation`
+    // lock-free. See `ApiWorkerScheduler::update_action` for the
+    // orchestration and §3.1 of the B1 design.
+    //
+    // `immediate_evict_worker` is async, so the op-not-running branch is
+    // NOT handled here; it is signalled via `Cs1Decision::NotRunning` so
+    // the orchestrator can run the eviction UNDER the lock exactly as
+    // today (FR-1 — B1's only behavioral change is the happy completion
+    // path; the eviction-loop lock-across-await decouple is the
+    // `#sched-b1-evict-sibling` follow-up, out of scope here).
+    fn update_action_cs1(
         &mut self,
         worker_id: &WorkerId,
         operation_id: &OperationId,
         update: UpdateOperationType,
-    ) -> Result<(), Error> {
+    ) -> Result<Cs1Decision, Error> {
         let worker = self.workers.get_mut(worker_id).err_tip(|| {
             format!("Worker {worker_id} does not exist in SimpleScheduler::update_action")
         })?;
@@ -1138,7 +1201,7 @@ impl ApiWorkerSchedulerImpl {
                 worker.execution_complete(operation_id);
             }
             self.worker_change_notify.notify_one();
-            return Ok(());
+            return Ok(Cs1Decision::Done);
         }
 
         // Ensure the worker is supposed to be running the operation.
@@ -1147,8 +1210,9 @@ impl ApiWorkerSchedulerImpl {
                 Code::Internal,
                 "Operation {operation_id} should not be running on worker {worker_id} in SimpleScheduler::update_action"
             );
-            return Result::<(), _>::Err(err.clone())
-                .merge(self.immediate_evict_worker(worker_id, err, false).await);
+            // The eviction (async) is performed by the orchestrator under
+            // the same lock — see FR-1.
+            return Ok(Cs1Decision::NotRunning(err));
         }
 
         let (is_finished, due_to_backpressure) = match &update {
@@ -1164,43 +1228,63 @@ impl ApiWorkerSchedulerImpl {
             UpdateOperationType::ExecutionComplete => unreachable!(),
         };
 
-        // Update the operation in the worker state manager.
-        {
-            let update_operation_res = self
-                .worker_state_manager
-                .update_operation(operation_id, worker_id, update)
-                .await
-                .err_tip(|| "in update_operation on SimpleScheduler::update_action");
-            if let Err(err) = update_operation_res {
-                error!(
-                    %operation_id,
-                    ?worker_id,
-                    ?err,
-                    "Failed to update_operation on update_action"
-                );
-                return Err(err);
-            }
-        }
+        Ok(Cs1Decision::Proceed {
+            worker_state_manager: Arc::clone(&self.worker_state_manager),
+            is_finished,
+            due_to_backpressure,
+            update,
+        })
+    }
 
-        if !is_finished {
-            return Ok(());
-        }
-
-        // Clear this action from the current worker if finished.
-        let complete_action_res = {
-            // Note: We need to run this before dealing with backpressure logic.
-            let complete_action_res = worker.complete_action(operation_id).await;
-
-            if (due_to_backpressure || !worker.can_accept_work()) && worker.has_actions() {
-                worker.is_paused = true;
-                worker.paused_due_to_backpressure = due_to_backpressure;
-            }
-            complete_action_res
+    // (#sched-b1) Second critical section of `update_action`. Runs under
+    // the worker-pool `inner` write lock with ZERO `.await` inside, AFTER
+    // the lock-free `update_operation().await` committed the op-state.
+    // Frees the worker's slot and applies the pause/backpressure flags
+    // atomically, then notifies the matcher last (so it only observes a
+    // consistent post-completion worker state — R3). The worker may have
+    // been removed (disconnect/evict) while the lock was released, and
+    // the op may have been finalized by a concurrent path during the
+    // window (§6.3) — both are tolerated here as benign.
+    fn update_action_cs2(
+        &mut self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        due_to_backpressure: bool,
+    ) -> Cs2Outcome {
+        let Some(worker) = self.workers.get_mut(worker_id) else {
+            // §6.2 — worker removed during the lock-free window. Removal
+            // already drained its running_action_infos; the completion (b)
+            // was reported via the action-DB subscriber, not the worker
+            // pool. Nothing to free; benign.
+            self.worker_change_notify.notify_one();
+            return Cs2Outcome::WorkerGone;
         };
+
+        // §6.3 — typed/narrow softening (M-1): only the *op-absent*
+        // condition (a legitimate concurrent finalize removed it during
+        // the window) is benign. We detect it explicitly under this lock
+        // rather than swallowing every complete_action error, so any other
+        // (future) complete_action error shape still propagates.
+        if !worker.running_action_infos.contains_key(operation_id) {
+            return Cs2Outcome::AlreadyFinalized;
+        }
+
+        // complete_action's missing-op error is unreachable here (we just
+        // confirmed presence under the same lock); any other error
+        // propagates.
+        let complete_action_res = worker.complete_action(operation_id);
+
+        if (due_to_backpressure || !worker.can_accept_work()) && worker.has_actions() {
+            worker.is_paused = true;
+            worker.paused_due_to_backpressure = due_to_backpressure;
+        }
 
         self.worker_change_notify.notify_one();
 
-        complete_action_res
+        match complete_action_res {
+            Ok(()) => Cs2Outcome::Completed,
+            Err(err) => Cs2Outcome::Error(err),
+        }
     }
 
     /// Prepares a worker to run an action by mutating its state (reducing platform
@@ -4202,8 +4286,94 @@ impl WorkerScheduler for ApiWorkerScheduler {
         operation_id: &OperationId,
         update: UpdateOperationType,
     ) -> Result<(), Error> {
-        let mut inner = self.inner.write().await;
-        inner.update_action(worker_id, operation_id, update).await
+        // (#sched-b1) Two `.await`-free critical sections bracket one
+        // lock-free `update_operation().await`. The worker-pool `inner`
+        // write lock is NEVER held across that await (which retries with
+        // `tokio::time::sleep` on a version conflict), so a slow/retrying
+        // completion no longer serializes the 32 concurrent matchers.
+        // See `.claude/audits/sched-b1-worker-lock-decouple-design-2026-06-17.md`.
+
+        // ── critical section 1 (inner.write, NO .await inside) ──
+        let cs1 = {
+            let mut inner = self.inner.write().await;
+            let decision = inner.update_action_cs1(worker_id, operation_id, update);
+            match decision {
+                Ok(Cs1Decision::NotRunning(err)) => {
+                    // FR-1: the op-not-running eviction stays UNDER the
+                    // lock exactly as today (the cold error path). This is
+                    // the ONE place this method still awaits while holding
+                    // `inner`; B1 deliberately does not touch it (the
+                    // eviction-loop decouple is `#sched-b1-evict-sibling`).
+                    return Result::<(), _>::Err(err.clone()).merge(
+                        inner
+                            .immediate_evict_worker(worker_id, err, false)
+                            .await,
+                    );
+                }
+                other => other,
+            }
+            // inner (write lock) is dropped here for the Done / Proceed paths.
+        };
+
+        let (worker_state_manager, is_finished, due_to_backpressure, update) = match cs1 {
+            Ok(Cs1Decision::Done) => return Ok(()),
+            Ok(Cs1Decision::Proceed {
+                worker_state_manager,
+                is_finished,
+                due_to_backpressure,
+                update,
+            }) => (worker_state_manager, is_finished, due_to_backpressure, update),
+            Ok(Cs1Decision::NotRunning(_)) => unreachable!("handled under the lock above"),
+            Err(err) => return Err(err),
+        };
+
+        // ── lock-free await — (b) operation-state update; retries/sleeps
+        //    here with NO worker-pool lock held ──
+        worker_state_manager
+            .update_operation(operation_id, worker_id, update)
+            .await
+            .err_tip(|| "in update_operation on SimpleScheduler::update_action")
+            .map_err(|err| {
+                error!(
+                    %operation_id,
+                    ?worker_id,
+                    ?err,
+                    "Failed to update_operation on update_action"
+                );
+                err
+            })?;
+
+        if !is_finished {
+            return Ok(());
+        }
+
+        // ── critical section 2 (inner.write, NO .await inside) ──
+        let outcome = {
+            let mut inner = self.inner.write().await;
+            inner.update_action_cs2(worker_id, operation_id, due_to_backpressure)
+        };
+
+        match outcome {
+            Cs2Outcome::Completed | Cs2Outcome::WorkerGone => Ok(()),
+            Cs2Outcome::AlreadyFinalized => {
+                // §6.3 — benign post-unlock race: the op was finalized by a
+                // concurrent path during the window, after (b) already
+                // committed the authoritative op-state. `warn!` (survives
+                // `release_max_level_info`, unlike `debug!`) + a counter so
+                // the softened branch is observable in prod.
+                self.metrics
+                    .update_action_op_already_finalized
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    %operation_id,
+                    ?worker_id,
+                    "completion found operation already finalized on worker during the \
+                     lock-free update window; op-state already committed, softening to ok"
+                );
+                Ok(())
+            }
+            Cs2Outcome::Error(err) => Err(err),
+        }
     }
 
     async fn worker_keep_alive_received(
@@ -6612,6 +6782,452 @@ mod tests {
              (1..={delta}); a survivor with broadcast_id <= {delta} \
              means a NEWER chunk was dropped instead of an older one, \
              violating the drop-oldest contract. min_survived={min_survived}"
+        );
+    }
+}
+
+/// Scheduling B1 — proof that `update_action` no longer holds the
+/// worker-pool `inner` write lock across the retrying
+/// `worker_state_manager.update_operation().await`.
+///
+/// The single interleaving that matters (a completion parked mid-update
+/// while a matcher tries to reserve an independent worker) is driven
+/// deterministically with a barrier mock (NOT sleep — CLAUDE.md
+/// "no sleep-as-synchronization"); `tokio::time::timeout` is the
+/// deadlock/stall detector.
+#[cfg(test)]
+mod b1_lock_decouple_tests {
+    use core::sync::atomic::Ordering;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use nativelink_config::schedulers::WorkerAllocationStrategy;
+    use nativelink_error::{Code, Error};
+    use nativelink_macro::nativelink_test;
+    use nativelink_metric::{
+        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+    };
+    use nativelink_util::action_messages::{
+        ActionInfo, ActionResult, ActionStage, ActionUniqueKey, ActionUniqueQualifier,
+        OperationId, WorkerId,
+    };
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
+    use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
+    use parking_lot::Mutex as ParkingMutex;
+    use tokio::sync::{Notify, mpsc};
+
+    use super::{ApiWorkerScheduler, UpdateForWorker, Worker};
+    use crate::platform_property_manager::PlatformPropertyManager;
+    use crate::worker::ActionInfoWithProps;
+    use crate::worker_registry::WorkerRegistry;
+    use crate::worker_scheduler::WorkerScheduler;
+
+    /// `WorkerStateManager` whose `update_operation` PARKS on a barrier
+    /// until the test releases it. It records every call so the test can
+    /// assert the op-state transition happened, and fires an "entered"
+    /// notify so the test knows the worker-pool lock would be held *right
+    /// now* if the fix were absent.
+    #[derive(Debug)]
+    struct BarrierWorkerStateManager {
+        /// Fired once when `update_operation` is entered (task A parked).
+        entered: Arc<Notify>,
+        /// Awaited inside `update_operation`; the test releases it.
+        release: Arc<Notify>,
+        /// Records (operation_id, is_finished) of each update_operation call.
+        calls: ParkingMutex<Vec<(OperationId, bool)>>,
+    }
+
+    impl BarrierWorkerStateManager {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                calls: ParkingMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl MetricsComponent for BarrierWorkerStateManager {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl WorkerStateManager for BarrierWorkerStateManager {
+        async fn update_operation(
+            &self,
+            operation_id: &OperationId,
+            _worker_id: &WorkerId,
+            update: UpdateOperationType,
+        ) -> Result<(), Error> {
+            let is_finished = matches!(
+                &update,
+                UpdateOperationType::UpdateWithActionStage(s) if s.is_finished()
+            );
+            self.calls.lock().push((operation_id.clone(), is_finished));
+            // Signal that we have entered (lock would be held here if the
+            // fix were absent) BEFORE parking.
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    fn props_named(name: &str) -> PlatformProperties {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            PlatformPropertyValue::Exact(name.to_string()),
+        );
+        PlatformProperties { properties }
+    }
+
+    fn make_action_info_with_props(name: &str, seed: u8) -> ActionInfoWithProps {
+        ActionInfoWithProps {
+            inner: Arc::new(ActionInfo {
+                command_digest: DigestInfo::new([0u8; 32], 0),
+                input_root_digest: DigestInfo::new([0u8; 32], 0),
+                timeout: Duration::MAX,
+                platform_properties: HashMap::new(),
+                priority: 0,
+                load_timestamp: UNIX_EPOCH,
+                insert_timestamp: SystemTime::now(),
+                unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                    instance_name: "main".to_string(),
+                    digest_function: DigestHasherFunc::Sha256,
+                    digest: DigestInfo::new([seed; 32], 1),
+                }),
+            }),
+            platform_properties: props_named(name),
+        }
+    }
+
+    fn build_scheduler(wsm: Arc<BarrierWorkerStateManager>) -> Arc<ApiWorkerScheduler> {
+        ApiWorkerScheduler::new_with_locality_map(
+            wsm,
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+            None,
+        )
+    }
+
+    async fn add_worker_named(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+        max_inflight_tasks: u64,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(
+            WorkerId(name.to_string()),
+            props_named(name),
+            tx,
+            42,
+            max_inflight_tasks,
+        );
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
+    /// THE decouple proof. Task A's completion parks inside
+    /// `update_operation`; task B's `find_and_reserve_worker` for an
+    /// INDEPENDENT worker must complete while A is parked. If the
+    /// worker-pool lock were still held across (b), B would block on
+    /// `inner.write()` and the timeout would fire.
+    #[nativelink_test]
+    async fn update_action_does_not_block_concurrent_match() {
+        let wsm = BarrierWorkerStateManager::new();
+        let entered = wsm.entered.clone();
+        let release = wsm.release.clone();
+        let calls_view = Arc::clone(&wsm);
+        let scheduler = build_scheduler(wsm);
+
+        // Worker W (the one whose op completes) and an independent W2.
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+        let _rx_w2 = add_worker_named(&scheduler, "W2", 4).await;
+
+        // Reserve op_a on W via the real reservation path (production shape).
+        let op_a = OperationId::default();
+        let action_w = make_action_info_with_props("W", 0xa1);
+        let (reserved_worker, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named("W"), &op_a, &action_w, false)
+            .await
+            .expect("op_a must reserve worker W");
+        assert_eq!(reserved_worker, WorkerId("W".to_string()));
+
+        // Task A: complete op_a on W → parks inside update_operation (b).
+        let scheduler_a = Arc::clone(&scheduler);
+        let op_a_for_a = op_a.clone();
+        let task_a = tokio::spawn(async move {
+            scheduler_a
+                .update_action(
+                    &WorkerId("W".to_string()),
+                    &op_a_for_a,
+                    UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                        ActionResult::default(),
+                    )),
+                )
+                .await
+        });
+
+        // Wait until A is confirmed parked inside update_operation.
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("task A must enter update_operation (parked in (b))");
+
+        // Task B: reserve an INDEPENDENT worker W2 while A is parked.
+        // This must NOT block on the worker-pool lock.
+        let op_b = OperationId::default();
+        let action_w2 = make_action_info_with_props("W2", 0xb2);
+        let props_w2 = props_named("W2");
+        let reserve_b =
+            scheduler.find_and_reserve_worker(&props_w2, &op_b, &action_w2, false);
+        let b_result = tokio::time::timeout(Duration::from_secs(1), reserve_b)
+            .await
+            .expect(
+                "match must not block on a parked update_operation — B1 lock-decouple violated",
+            );
+        let (b_worker, _b_tx, _b_msg) =
+            b_result.expect("W2 must be reservable while W's completion is parked");
+        assert_eq!(b_worker, WorkerId("W2".to_string()));
+
+        // Release A and assert it completes Ok and the op-state advanced.
+        release.notify_one();
+        let a_result = tokio::time::timeout(Duration::from_secs(1), task_a)
+            .await
+            .expect("task A must finish after release")
+            .expect("task A join");
+        a_result.expect("op_a completion must return Ok");
+
+        // The op-state update was applied (mock recorded a finished update).
+        let calls = calls_view.calls.lock().clone();
+        assert!(
+            calls.iter().any(|(oid, finished)| *oid == op_a && *finished),
+            "update_operation must have been called with the finished op_a"
+        );
+
+        // W's slot for op_a is freed after completion (CS2 ran).
+        {
+            let inner = scheduler.inner.read().await;
+            let worker = inner
+                .workers
+                .peek(&WorkerId("W".to_string()))
+                .expect("worker W still present");
+            assert!(
+                !worker.running_action_infos.contains_key(&op_a),
+                "op_a slot must be freed on W after completion (CS2 complete_action)"
+            );
+        }
+    }
+
+    /// No-double-dispatch sub-assertion: during the §3.3 window (op_a
+    /// reserved on W, A parked after (b), slot NOT yet freed), a
+    /// concurrent matcher for a W-pinned op must NOT be able to reserve
+    /// W's only slot — it is still counted, so W looks busier-than-true
+    /// (the safe O1 direction). Under O2 (free slot before (b)) the slot
+    /// would appear free and the matcher could over-subscribe W.
+    #[nativelink_test]
+    async fn update_action_window_does_not_free_slot_for_double_dispatch() {
+        let wsm = BarrierWorkerStateManager::new();
+        let entered = wsm.entered.clone();
+        let release = wsm.release.clone();
+        let scheduler = build_scheduler(wsm);
+
+        // W has a SINGLE slot; once op_a is reserved it is full.
+        let _rx_w = add_worker_named(&scheduler, "W", 1).await;
+
+        let op_a = OperationId::default();
+        let action_w = make_action_info_with_props("W", 0xa1);
+        scheduler
+            .find_and_reserve_worker(&props_named("W"), &op_a, &action_w, false)
+            .await
+            .expect("op_a must reserve W's single slot");
+
+        // Task A: complete op_a → parks in (b) with the slot still held.
+        let scheduler_a = Arc::clone(&scheduler);
+        let op_a_for_a = op_a.clone();
+        let task_a = tokio::spawn(async move {
+            scheduler_a
+                .update_action(
+                    &WorkerId("W".to_string()),
+                    &op_a_for_a,
+                    UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                        ActionResult::default(),
+                    )),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("task A must enter update_operation (parked in (b))");
+
+        // During the window: a matcher for a W-pinned op MUST get None
+        // (W's only slot is still counted by op_a). If it reserved W, the
+        // slot was freed before (b) — the O2 double-book hazard.
+        let op_c = OperationId::default();
+        let action_c = make_action_info_with_props("W", 0xc3);
+        let window_reserve = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.find_and_reserve_worker(&props_named("W"), &op_c, &action_c, false),
+        )
+        .await
+        .expect("matcher must not block on the parked completion — B1 lock-decouple violated");
+        assert!(
+            window_reserve.is_none(),
+            "no-double-dispatch violated — W's slot was freed during the \
+             update window, letting a second action reserve W while op_a's \
+             completion is still in flight (O2 over-subscription hazard)"
+        );
+
+        // Release and let A finish cleanly.
+        release.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task_a)
+            .await
+            .expect("task A must finish after release");
+    }
+
+    /// §6.3 over-action cell (FR-2 / red-team REQ#3): (b) succeeds, then
+    /// the op is removed from W's `running_action_infos` during the
+    /// post-unlock window by a legitimate concurrent finalize. CS2's
+    /// re-lookup finds the op already gone; the softened branch must
+    /// return `Ok(())` (benign) AND bump the observability counter (so
+    /// the race is visible in the release binary where `debug!` is
+    /// compiled out).
+    #[nativelink_test]
+    async fn update_action_softens_already_finalized_op_with_counter() {
+        let wsm = BarrierWorkerStateManager::new();
+        let entered = wsm.entered.clone();
+        let release = wsm.release.clone();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        let op_a = OperationId::default();
+        let action_w = make_action_info_with_props("W", 0xa1);
+        scheduler
+            .find_and_reserve_worker(&props_named("W"), &op_a, &action_w, false)
+            .await
+            .expect("op_a must reserve W");
+
+        let counter_before = scheduler
+            .get_metrics()
+            .update_action_op_already_finalized
+            .load(Ordering::Relaxed);
+
+        // Task A: complete op_a → parks in (b).
+        let scheduler_a = Arc::clone(&scheduler);
+        let op_a_for_a = op_a.clone();
+        let task_a = tokio::spawn(async move {
+            scheduler_a
+                .update_action(
+                    &WorkerId("W".to_string()),
+                    &op_a_for_a,
+                    UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                        ActionResult::default(),
+                    )),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("task A must enter update_operation (parked in (b))");
+
+        // Simulate a legitimate concurrent finalize removing op_a from W's
+        // running set during the window (e.g. ExecutionComplete or evict).
+        {
+            let mut inner = scheduler.inner.write().await;
+            let worker = inner
+                .workers
+                .get_mut(&WorkerId("W".to_string()))
+                .expect("worker W present");
+            assert!(
+                worker.running_action_infos.remove(&op_a).is_some(),
+                "precondition: op_a was reserved on W"
+            );
+        }
+
+        // Release A: (b) returns Ok, CS2 finds op already gone → softened.
+        release.notify_one();
+        let a_result = tokio::time::timeout(Duration::from_secs(1), task_a)
+            .await
+            .expect("task A must finish after release")
+            .expect("task A join");
+        a_result.expect(
+            "already-finalized op in CS2 must be softened to Ok(()) — \
+             benign post-unlock race, not an error",
+        );
+
+        let counter_after = scheduler
+            .get_metrics()
+            .update_action_op_already_finalized
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            counter_after,
+            counter_before + 1,
+            "the softened already-finalized branch must bump its \
+             observability counter (warn!+counter, not debug!) so the \
+             race is visible in the release binary"
+        );
+    }
+
+    /// §6.3 companion (FR-2 / code-reviewer F3): a completion for an op
+    /// that is NOT running on the named worker must error in CS1 (the
+    /// op-not-running branch) BEFORE reaching the softened CS2 path,
+    /// proving the softening does NOT mask a genuine wrong-worker bug. The
+    /// end-to-end wrong-worker version-CAS rejection
+    /// (`simple_scheduler_state_manager.rs:694-715`) is covered by
+    /// `simple_scheduler_test::update_action_with_wrong_worker_id_errors_test`.
+    #[nativelink_test]
+    async fn update_action_unknown_op_errors_before_softening() {
+        let wsm = BarrierWorkerStateManager::new();
+        let release = wsm.release.clone();
+        let calls_view = Arc::clone(&wsm);
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        // No op reserved on W. Completing an unknown op must error in CS1
+        // (op-not-running) — it must NOT silently reach the softened CS2
+        // Ok(()) path, and update_operation must never be invoked.
+        release.notify_one(); // ensure the mock would not block if reached
+        let op_unknown = OperationId::default();
+        let res = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.update_action(
+                &WorkerId("W".to_string()),
+                &op_unknown,
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                    ActionResult::default(),
+                )),
+            ),
+        )
+        .await
+        .expect("update_action for unknown op must not hang");
+        let err = res.expect_err(
+            "completing an op the worker is not running must error (op-not-running), \
+             not be softened to Ok(())",
+        );
+        assert_eq!(
+            err.code,
+            Code::Internal,
+            "op-not-running must surface as Code::Internal, not a softened Ok"
+        );
+        assert!(
+            calls_view.calls.lock().is_empty(),
+            "update_operation must not run for an op the worker is not executing — \
+             the (b) lock-free await must be unreachable on the op-not-running path"
         );
     }
 }

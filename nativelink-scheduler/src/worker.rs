@@ -321,10 +321,14 @@ impl Worker {
         }
     }
 
-    pub(crate) async fn complete_action(
-        &mut self,
-        operation_id: &OperationId,
-    ) -> Result<(), Error> {
+    // (#sched-b1) Synchronous: the body has no `.await`. It is called
+    // from `ApiWorkerScheduler::update_action`'s second critical section,
+    // which holds the worker-pool `inner` write lock and MUST NOT suspend
+    // while held (the B1 lock-decouple invariant). The caller re-checks
+    // `running_action_infos` under the same lock before calling, so the
+    // missing-op error here is unreachable on the production path; it is
+    // retained only as a defensive contract for any direct caller.
+    pub(crate) fn complete_action(&mut self, operation_id: &OperationId) -> Result<(), Error> {
         let pending_action_info = self.running_action_infos.remove(operation_id).err_tip(|| {
             format!(
                 "Worker {} tried to complete operation {} that was not running",
