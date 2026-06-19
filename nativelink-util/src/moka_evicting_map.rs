@@ -1308,6 +1308,30 @@ where
         self.indefinite_pinned_bytes.load(Ordering::Relaxed)
     }
 
+    /// FL-681 Follow-up A (MAJOR-1b close-out): snapshot predicate for the
+    /// worker's admission-side gate. Returns `true` when the indefinite-pin
+    /// cap has NO headroom left for even a zero-byte blob — i.e. the next
+    /// fresh F2 output's `pin_key_indefinite` would be REFUSED. The worker's
+    /// action-acceptance path reads this and NAKs the new action with
+    /// `Code::ResourceExhausted` so the scheduler re-queues it (true producer
+    /// backpressure) instead of admitting an action whose output cannot be
+    /// pinned-until-durable.
+    ///
+    /// Same eventually-consistent snapshot shape as `indefinite_cap_admits`
+    /// (the cap STOPS an over-capacity hot loop; the scheduler's natural
+    /// re-queue closes the residual race). `max_bytes == 0` (no byte budget
+    /// configured) never gates — an uncapped store has no indefinite-pin cap
+    /// to saturate. "Saturated" means `indefinite_pinned_bytes >= cap`: at the
+    /// exact-full boundary the next real (>0-byte) F2 output's indefinite pin
+    /// is already refused, so the gate must fire there, not one blob later.
+    #[must_use]
+    pub fn indefinite_pin_saturated(&self) -> bool {
+        if self.max_bytes == 0 {
+            return false;
+        }
+        self.indefinite_pinned_bytes.load(Ordering::Relaxed) >= self.indefinite_pin_cap
+    }
+
     /// Test hook: rewind a pinned entry's `pinned_at` past the
     /// `PIN_TIMEOUT_SECS` deadline so the next `expire_stale_pins` sweep
     /// treats it as stale. Returns `true` if the key was pinned and was
@@ -2530,5 +2554,74 @@ mod tests {
             "indefinite_pinned_bytes leak via remove_if(): the conditional-remove path did not \
              free indefinite-cap headroom"
         );
+    }
+
+    // FL-681 Follow-up A (MAJOR-1b close-out): the admission-side gate reads
+    // `indefinite_pin_saturated()` to decide whether to NAK a new action with
+    // `ResourceExhausted`. The predicate is the snapshot mirror of
+    // `indefinite_cap_admits(0)`: TRUE when there is NO indefinite-cap headroom
+    // left for even a zero-byte blob, FALSE while any headroom remains.
+    #[tokio::test]
+    async fn indefinite_pin_saturated_tracks_cap_headroom() {
+        // Cap indefinite pins at 4096 bytes.
+        let cfg = policy(1024 * 1024, 0);
+        let map = Arc::new(make_map_cb_indefinite_cap(&cfg, 4096));
+
+        for k in 0..2u64 {
+            map.insert(k, BytesEntry(2048)).await;
+        }
+
+        // No indefinite pins yet → headroom exists → NOT saturated.
+        assert!(
+            !map.indefinite_pin_saturated(),
+            "empty indefinite-pin set must report headroom (not saturated)"
+        );
+
+        assert!(map.pin_key_indefinite(0), "first indefinite pin fits under cap");
+        // 2048 of 4096 used → still headroom → NOT saturated.
+        assert!(
+            !map.indefinite_pin_saturated(),
+            "indefinite_pin_saturated must be FALSE while indefinite-cap headroom remains — \
+             the admission gate would wrongly NAK actions and churn the scheduler"
+        );
+
+        assert!(map.pin_key_indefinite(1), "second indefinite pin fills cap exactly");
+        // 4096 of 4096 used → no headroom → SATURATED.
+        assert!(
+            map.indefinite_pin_saturated(),
+            "indefinite_pin_saturated must be TRUE once the indefinite cap is full — \
+             without it the admission gate never fires and fresh F2 outputs are lost"
+        );
+
+        // BIS-ack release of one pin reclaims headroom → de-saturates.
+        map.unpin_key(&0);
+        assert!(
+            !map.indefinite_pin_saturated(),
+            "indefinite_pin_saturated must clear once a BIS-ack frees cap headroom — \
+             the gate is transient backpressure, not a terminal stall"
+        );
+
+        map.unpin_key(&1);
+    }
+
+    // FL-681 Follow-up A: when no byte budget is configured (`max_bytes == 0`)
+    // the gate must NEVER fire — mirroring `indefinite_cap_admits`'s
+    // `max_bytes == 0 => admit` short-circuit. An uncapped store has no
+    // indefinite-pin cap to saturate.
+    #[tokio::test]
+    async fn indefinite_pin_saturated_never_fires_when_uncapped() {
+        // max_bytes == 0 ⇒ no byte budget ⇒ no cap to saturate.
+        let cfg = policy(0, 100);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        map.insert(0u64, BytesEntry(2048)).await;
+        assert!(map.pin_key_indefinite(0), "indefinite pin should succeed when uncapped");
+        assert!(
+            !map.indefinite_pin_saturated(),
+            "an uncapped store (max_bytes == 0) has no indefinite-pin cap and must never \
+             report saturated — gating it would wedge a store the cap does not govern"
+        );
+
+        map.unpin_key(&0);
     }
 }

@@ -1205,6 +1205,20 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.indefinite_pinned_bytes()
     }
 
+    /// FL-681 Follow-up A (MAJOR-1b close-out): `true` when the indefinite-pin
+    /// cap has no headroom for the next fresh F2 output — i.e. its
+    /// `pin_digest_indefinite_or_time_bounded` would fall back to a
+    /// time-bounded pin (the sustained-outage loss window). The worker's
+    /// action-acceptance path reads this and NAKs a new action with
+    /// `Code::ResourceExhausted` so the scheduler re-queues it (producer
+    /// backpressure) rather than admitting an output that cannot be
+    /// pinned-until-durable. Snapshot — eventually-consistent, no lock held
+    /// across the read. Never gates an uncapped store.
+    #[must_use]
+    pub fn indefinite_pin_saturated(&self) -> bool {
+        self.evicting_map.indefinite_pin_saturated()
+    }
+
     /// FL-681 Fix A fix-up: total bytes held by ALL pins (time-bounded +
     /// indefinite). Doc-hidden test observability — the MAJOR-1b test
     /// asserts a cap-refused F2 output still holds a (time-bounded) pin,

@@ -36,7 +36,7 @@ mod tests {
     use futures::prelude::*;
     use nativelink_config::cas_server::EnvironmentSource;
     use nativelink_config::stores::{
-        FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+        EvictionPolicy, FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
     };
     use nativelink_metric::{
         MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
@@ -138,6 +138,261 @@ mod tests {
             Store::new(slow_store.clone()),
         );
         Ok((fast_store, slow_store, cas_store, ac_store))
+    }
+
+    /// FL-681 Follow-up A: worker id used by the admission-gate tests.
+    const ADMISSION_GATE_WORKER_ID: &str = "fl681_admission_gate_worker";
+
+    /// FL-681 Follow-up A: build a CAS `FastSlowStore` whose fast tier is a
+    /// `FilesystemStore` with an explicit indefinite-pin byte cap
+    /// (`pending_bis_pin_max_bytes`) and a non-zero eviction `max_bytes` (so
+    /// the saturation gate is governed — `max_bytes == 0` never gates). Returns
+    /// the concrete `FilesystemStore` handle alongside so the test can drive
+    /// the indefinite-pin set directly to saturate the cap.
+    async fn setup_capped_stores(
+        indefinite_pin_cap_bytes: u64,
+        max_bytes: usize,
+    ) -> Result<(Arc<FilesystemStore>, Arc<FastSlowStore>, Arc<MemoryStore>), Error> {
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path"),
+            temp_path: make_temp_path("temp_path"),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes,
+                ..Default::default()
+            }),
+            pending_bis_pin_max_bytes: indefinite_pin_cap_bytes,
+            ..Default::default()
+        };
+        let slow_config = MemorySpec::default();
+        let fast_store = FilesystemStore::new(&fast_config).await?;
+        let slow_store = MemoryStore::new(&slow_config);
+        let ac_store = MemoryStore::new(&slow_config);
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(slow_config),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            Store::new(fast_store.clone()),
+            Store::new(slow_store.clone()),
+        );
+        Ok((fast_store, cas_store, ac_store))
+    }
+
+    /// FL-681 Follow-up A: construct a `RunningActionsManagerImpl` over a given
+    /// CAS store with the F2 deferred-output kill-switch in a chosen state.
+    /// Shared by the admission-gate tests so the large `RunningActionsManagerArgs`
+    /// shape is written once.
+    async fn build_running_actions_manager(
+        cas_store: Arc<FastSlowStore>,
+        ac_store: Arc<MemoryStore>,
+        deferred_output_uploads_enabled: bool,
+    ) -> Result<Arc<RunningActionsManagerImpl>, Error> {
+        fn test_now() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        Ok(Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store)),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                deferred_output_uploads_enabled,
+            },
+            Callbacks {
+                now_fn: test_now,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?))
+    }
+
+    /// FL-681 Follow-up A: build a minimal valid `StartExecute` whose Action /
+    /// Command / input-root protos are uploaded to `cas_store`, returning the
+    /// `StartExecute` ready to feed to `create_and_add_action`.
+    async fn make_start_execute(cas_store: &Arc<FastSlowStore>) -> Result<StartExecute, Error> {
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        Ok(StartExecute {
+            execute_request: Some(ExecuteRequest {
+                action_digest: Some(action_digest.into()),
+                ..Default::default()
+            }),
+            operation_id: OperationId::default().to_string(),
+            queued_timestamp: None,
+            platform: action.platform.clone(),
+            worker_id: ADMISSION_GATE_WORKER_ID.to_string(),
+            resolved_directories: Vec::new(),
+            resolved_directory_digests: Vec::new(),
+            missing_digests: Vec::new(),
+        })
+    }
+
+    /// FL-681 Follow-up A (MAJOR-1b true close-out): drive the fast store's
+    /// indefinite-pin set to exactly its `pending_bis_pin_max_bytes` cap so
+    /// `indefinite_pin_saturated()` reports `true`. Inserts a `cap`-byte blob
+    /// and pins it indefinitely. Returns the saturating digest.
+    async fn saturate_indefinite_pin_cap(
+        fast_store: &Arc<FilesystemStore>,
+        cap_bytes: u64,
+    ) -> Result<DigestInfo, Error> {
+        let payload = vec![0u8; cap_bytes as usize];
+        let digest = DigestInfo::try_new(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            cap_bytes,
+        )?;
+        fast_store
+            .as_pin()
+            .update_oneshot(digest.into(), payload.into())
+            .await?;
+        assert!(
+            fast_store.pin_digest_indefinite_with_result(&digest),
+            "saturating indefinite pin must succeed (the blob fills the cap exactly)"
+        );
+        assert!(
+            fast_store.indefinite_pin_saturated(),
+            "test precondition: indefinite-pin cap must read saturated after filling it"
+        );
+        Ok(digest)
+    }
+
+    // FL-681 Follow-up A (MAJOR-1b true close-out): when the F2 indefinite-pin
+    // cap is saturated, the worker's action-acceptance path MUST NAK a fresh
+    // action with `Code::ResourceExhausted` — producer backpressure that the
+    // scheduler re-queues (verified: simple_scheduler_state_manager.rs treats a
+    // worker ResourceExhausted as re-queue without consuming a retry attempt)
+    // — rather than admitting an action whose outputs cannot be pinned-until-
+    // BIS-durable (the accept-then-time-bound-then-lose residual).
+    //
+    // Composite invariant (admission/eviction/pin triangle):
+    //   gate-active ⇒ (indefinite-pin works AND BIS-ack release fires) OR the
+    //   time-bounded TTL fallback compensates.
+    // Here the gate (this NAK) fires when the indefinite-pin corner is
+    // saturated; the BIS-ack `unpin_digest` corner drains the cap to clear it.
+    #[nativelink_test]
+    async fn f2_admission_gate_naks_when_indefinite_pin_saturated()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const CAP: u64 = 4096;
+        let (fast_store, cas_store, ac_store) = setup_capped_stores(CAP, 1024 * 1024).await?;
+        let running_actions_manager =
+            build_running_actions_manager(cas_store.clone(), ac_store, true).await?;
+
+        saturate_indefinite_pin_cap(&fast_store, CAP).await?;
+
+        let start_execute = make_start_execute(&cas_store).await?;
+        let result = running_actions_manager
+            .create_and_add_action(ADMISSION_GATE_WORKER_ID.to_string(), start_execute)
+            .await;
+
+        let err = result.err().expect(
+            "saturated indefinite-pin cap must NAK the action — without the admission gate a fresh \
+             F2 output is admitted, executed, and then lost when its pin falls back to the 120s TTL",
+        );
+        assert_eq!(
+            err.code,
+            Code::ResourceExhausted,
+            "the admission NAK MUST carry Code::ResourceExhausted so the scheduler re-queues it as \
+             backpressure (any other code fails the action and churns instead of throttling): {err:?}"
+        );
+        Ok(())
+    }
+
+    // FL-681 Follow-up A: with indefinite-pin headroom, admission proceeds
+    // normally — the gate must not throttle a worker that can still durably
+    // hold new pending-BIS outputs.
+    #[nativelink_test]
+    async fn f2_admission_gate_admits_when_indefinite_pin_has_headroom()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const CAP: u64 = 4096;
+        let (fast_store, cas_store, ac_store) = setup_capped_stores(CAP, 1024 * 1024).await?;
+        let running_actions_manager =
+            build_running_actions_manager(cas_store.clone(), ac_store, true).await?;
+
+        assert!(
+            !fast_store.indefinite_pin_saturated(),
+            "test precondition: a fresh capped store must have indefinite-pin headroom"
+        );
+
+        let start_execute = make_start_execute(&cas_store).await?;
+        running_actions_manager
+            .create_and_add_action(ADMISSION_GATE_WORKER_ID.to_string(), start_execute)
+            .await
+            .expect(
+                "with indefinite-pin headroom the admission gate must NOT fire — gating a worker \
+                 that can still hold pending-BIS outputs needlessly churns the scheduler",
+            );
+        Ok(())
+    }
+
+    // FL-681 Follow-up A: the gate is F2-only. With deferred output uploads
+    // DISABLED (synchronous path), the worker takes NO indefinite pins, so a
+    // saturated indefinite-pin cap is irrelevant and the gate MUST stay inert
+    // — gating the synchronous path would refuse admission for a constraint it
+    // does not impose.
+    #[nativelink_test]
+    async fn f2_admission_gate_inert_when_deferred_uploads_disabled()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const CAP: u64 = 4096;
+        let (fast_store, cas_store, ac_store) = setup_capped_stores(CAP, 1024 * 1024).await?;
+        let running_actions_manager =
+            build_running_actions_manager(cas_store.clone(), ac_store, false).await?;
+
+        saturate_indefinite_pin_cap(&fast_store, CAP).await?;
+
+        let start_execute = make_start_execute(&cas_store).await?;
+        running_actions_manager
+            .create_and_add_action(ADMISSION_GATE_WORKER_ID.to_string(), start_execute)
+            .await
+            .expect(
+                "with deferred_output_uploads_enabled=false the synchronous path takes no \
+                 indefinite pins; a saturated indefinite-pin cap MUST NOT gate admission",
+            );
+        Ok(())
     }
 
     async fn run_action(action: Arc<RunningActionImpl>) -> Result<ActionResult, Error> {

@@ -7151,6 +7151,48 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         self.metrics
             .create_and_add_action
             .wrap(async move {
+                // FL-681 Follow-up A (MAJOR-1b true close-out): admission-side
+                // backpressure. In F2 deferred-output mode every output must
+                // obtain an INDEFINITE (held-until-BIS-ack) pin. By the time the
+                // four pin sites run, the action has already executed and its
+                // outputs are on local disk — too late to refuse. The only point
+                // where a refusal applies real backpressure to the producer (the
+                // scheduler dispatching actions to this worker) is BEFORE the
+                // action starts. When the indefinite-pin byte cap is saturated,
+                // a fresh output's indefinite pin would be REFUSED and fall back
+                // to a time-bounded pin that can expire-and-lose under a sustained
+                // outage. NAK the action with `Code::ResourceExhausted` so the
+                // scheduler re-queues it (verified: the worker→scheduler
+                // ResourceExhausted is treated as re-queue WITHOUT consuming a
+                // retry attempt, and pauses this worker, in
+                // `simple_scheduler_state_manager::inner_update_operation` +
+                // `api_worker_scheduler::update_action`). The cap drains as
+                // BIS-acks release pins (`unpin_digest`), then admission resumes.
+                //
+                // Snapshot check — synchronous, eventually-consistent, no lock
+                // held across an `.await`; mirrors the `slow_writes_in_flight`
+                // byte-budget gate. NOT an async↔sync trip-wire: try-and-NAK,
+                // never block-until-headroom on this control path.
+                //
+                // Composite invariant (admission/eviction/pin triangle):
+                //   gate-active ⇒ (indefinite pin works AND BIS-ack release
+                //   fires) OR the time-bounded TTL fallback compensates.
+                // The gate is the admission corner; the BIS-ack `unpin_digest`
+                // pin-release is the corner that drains the cap to clear it.
+                // Gate is F2-ONLY: the synchronous path takes no indefinite pins,
+                // so a saturated indefinite-pin cap is not a constraint it imposes
+                // and the gate stays inert there.
+                if self.deferred_output_uploads_enabled
+                    && self.filesystem_store.indefinite_pin_saturated()
+                {
+                    return Err(make_err!(
+                        Code::ResourceExhausted,
+                        "worker indefinite-pin cap saturated (pending-BIS durability backlog); \
+                         refusing new action so the scheduler re-queues it as backpressure — \
+                         admitting it would lose the output when its pin falls back to the 120s TTL"
+                    ));
+                }
+
                 // Peer hints used to ride inside `StartExecute.peer_hints` and
                 // get registered here. As of #98 (peer-hints chunking) hints
                 // arrive on a separate `Update::ChunkedMessage` stream owned
