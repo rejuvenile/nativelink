@@ -3229,19 +3229,31 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             mirror_max_bytes: 0,
                                                             pinned_mirror_entries: Vec::new(),
                                                             pinned_ac_mirror_entries: Vec::new(),
-                                                            // (FL-681) This one-shot
-                                                            // post-action delta notify has
-                                                            // no FilesystemStore handle in
-                                                            // scope; like `mirror_*_bytes`
-                                                            // above it reports the proto3
-                                                            // default. The periodic
-                                                            // heartbeat (which holds
-                                                            // `state.fs_store`) carries the
-                                                            // authoritative saturation
-                                                            // within ~6 s, and the
-                                                            // worker-side admission NAK is
-                                                            // the backstop in the interim.
-                                                            indefinite_pin_saturated: false,
+                                                            // (FL-681 re-saturation gate)
+                                                            // Carry the AUTHORITATIVE
+                                                            // indefinite-pin saturation on
+                                                            // this one-shot post-action
+                                                            // delta, read from the local CAS
+                                                            // FilesystemStore via the SAME
+                                                            // accessor the worker-side
+                                                            // admission gate uses
+                                                            // (`running_actions_manager.rs`
+                                                            // `create_and_add_action`). The
+                                                            // server applies this field
+                                                            // UNCONDITIONALLY, so a blanket
+                                                            // `false` here would clobber a
+                                                            // prior `true` the instant an
+                                                            // action completes — re-opening
+                                                            // the re-saturation spin until
+                                                            // the next heartbeat. The
+                                                            // periodic heartbeat carries the
+                                                            // same value as the routine
+                                                            // refresh (≤`BLOBS_AVAILABLE_MAX_INTERVAL_MS`
+                                                            // = 100 ms); the admission NAK
+                                                            // remains the backstop.
+                                                            indefinite_pin_saturated:
+                                                                running_actions_manager
+                                                                    .indefinite_pin_saturated(),
                                                         }
                                                     ).await {
                                                         // Failure to send BlobsAvailable

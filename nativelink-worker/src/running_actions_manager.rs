@@ -5362,6 +5362,18 @@ pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
         None
     }
 
+    /// (FL-681 re-saturation gate) Returns whether this worker's local CAS
+    /// `FilesystemStore` indefinite-pin cap is currently saturated. This is the
+    /// SAME value the worker-side admission gate checks in
+    /// `create_and_add_action` (both read `filesystem_store.indefinite_pin_saturated()`).
+    /// The post-action `BlobsAvailable` delta in `LocalWorkerImpl::run` reports
+    /// it so the scheduler's matcher does not clobber a prior `true` to `false`
+    /// right after an action completes (re-opening the re-saturation spin until
+    /// the next heartbeat). Default no-op returns `false` for stubs.
+    fn indefinite_pin_saturated(&self) -> bool {
+        false
+    }
+
     /// Returns the digests of input root directories cached in the worker's
     /// directory cache. Returns an empty Vec if no directory cache is configured.
     fn cached_directory_digests(&self) -> impl Future<Output = Vec<DigestInfo>> + Send;
@@ -7404,6 +7416,15 @@ impl RunningActionsManager for RunningActionsManagerImpl {
 
     fn get_cas_store(&self) -> Option<Arc<FastSlowStore>> {
         Some(self.cas_store.clone())
+    }
+
+    #[inline]
+    fn indefinite_pin_saturated(&self) -> bool {
+        // Identical store + accessor as the admission gate above
+        // (`create_and_add_action`, `:7196`): one relaxed atomic load +
+        // compare, no lock, no await. Reporting it on the post-action delta
+        // keeps the scheduler's saturation flag honest between heartbeats.
+        self.filesystem_store.indefinite_pin_saturated()
     }
 
     #[inline]

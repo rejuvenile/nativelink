@@ -78,12 +78,15 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
 
     /// (FL-681 re-saturation gate) Updates whether the worker's local CAS
     /// FilesystemStore reported its indefinite-pin cap saturated. Carried on
-    /// the worker's periodic `BlobsAvailable` heartbeat (NOT KeepAlive — only
-    /// the BlobsAvailable path queries the FilesystemStore). When `true`, the
-    /// matcher skips this worker for new actions so a saturated-but-idle worker
-    /// is not re-dispatched into the worker-NAK → re-queue → re-dispatch spin.
-    /// Default impl is a no-op so schedulers that do not run a worker pool (or
-    /// do not care about F2 saturation) need not implement it.
+    /// every `BlobsAvailable` the worker sends (NOT KeepAlive — only the
+    /// BlobsAvailable path queries the FilesystemStore): both the periodic
+    /// heartbeat AND the one-shot post-action delta report the authoritative
+    /// value, so a saturated worker's flag is not clobbered to `false` the
+    /// instant an action completes. When `true`, the matcher skips this worker
+    /// for new actions so a saturated-but-idle worker is not re-dispatched into
+    /// the worker-NAK → re-queue → re-dispatch spin. Default impl is a no-op so
+    /// schedulers that do not run a worker pool (or do not care about F2
+    /// saturation) need not implement it.
     async fn update_worker_indefinite_pin_saturation(
         &self,
         _worker_id: &WorkerId,

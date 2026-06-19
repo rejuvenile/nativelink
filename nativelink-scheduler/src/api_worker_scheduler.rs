@@ -674,9 +674,10 @@ impl ApiWorkerSchedulerImpl {
             }
 
             // (FL-681 re-saturation gate) Skip an indefinite-pin-saturated
-            // worker on the LRU/MRU fallback path too (the cache-affinity tiers
-            // gate via `worker_is_viable`). See `worker_is_viable` for why this
-            // is separate from `can_accept_work()`.
+            // worker on this LRU/MRU fallback path (the cache-affinity tiers
+            // gate via `worker_is_viable`, which carries the same check). Kept
+            // SEPARATE from `can_accept_work()` so the `update_action` pause
+            // logic (which also calls `can_accept_work()`) is untouched.
             if w.indefinite_pin_saturated {
                 if full_worker_logging {
                     debug!(

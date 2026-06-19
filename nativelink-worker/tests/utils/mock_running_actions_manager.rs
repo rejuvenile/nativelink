@@ -60,6 +60,12 @@ pub(crate) struct MockRunningActionsManager {
     // and returns this Err in lieu of Ok. Allows T4 to drive the
     // error! log path inside the detached AC-write spawn body.
     cache_action_result_err: Mutex<Option<Error>>,
+
+    // (FL-681 re-saturation gate) value returned by the mocked
+    // `indefinite_pin_saturated()` trait method. Lets the post-action-delta
+    // regression test drive a still-saturated worker so it can assert the
+    // delta reports the real value instead of a hardcoded `false`.
+    indefinite_pin_saturated: std::sync::atomic::AtomicBool,
 }
 
 impl Default for MockRunningActionsManager {
@@ -87,6 +93,7 @@ impl MockRunningActionsManager {
             cache_action_result_gate: Mutex::new(None),
             cache_action_result_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_action_result_err: Mutex::new(None),
+            indefinite_pin_saturated: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -122,6 +129,15 @@ impl MockRunningActionsManager {
     pub(crate) async fn set_cache_action_result_err(&self, err: Option<Error>) {
         let mut slot = self.cache_action_result_err.lock().await;
         *slot = err;
+    }
+
+    /// (FL-681 re-saturation gate) Set the value the mocked
+    /// `indefinite_pin_saturated()` trait method returns. The post-action-delta
+    /// regression test sets `true` to model a still-saturated worker.
+    #[allow(dead_code, reason = "consumed by FL-681 post-action-delta test")]
+    pub(crate) fn set_indefinite_pin_saturated(&self, saturated: bool) {
+        self.indefinite_pin_saturated
+            .store(saturated, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -253,6 +269,11 @@ impl RunningActionsManager for MockRunningActionsManager {
 
     fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    fn indefinite_pin_saturated(&self) -> bool {
+        self.indefinite_pin_saturated
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn cached_directory_digests(&self) -> Vec<DigestInfo> {

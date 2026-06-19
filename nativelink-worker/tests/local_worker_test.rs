@@ -647,6 +647,170 @@ async fn worker_sends_blobs_available_before_execute_result_test() -> Result<(),
     Ok(())
 }
 
+/// (FL-681 re-saturation gate, MAJOR-D1) Over-action regression: a worker whose
+/// local CAS `FilesystemStore` indefinite-pin cap is STILL saturated when an
+/// action completes MUST report `indefinite_pin_saturated = true` on its
+/// post-action `BlobsAvailable` delta — NOT a hardcoded `false`.
+///
+/// The bug: `local_worker.rs` built the post-action delta with
+/// `indefinite_pin_saturated: false`. `worker_api_server.rs` applies the field
+/// UNCONDITIONALLY (correct — `false` is the drain signal), so that `false`
+/// CLOBBERED a prior `true` the moment an action finished — exactly the
+/// idle-saturated case the matcher gate targets — re-opening the
+/// re-NAK → re-queue → re-dispatch spin until the next heartbeat re-asserted
+/// `true` (≤`BLOBS_AVAILABLE_MAX_INTERVAL_MS` = 100 ms later).
+///
+/// Production composition: drives the real `LocalWorkerImpl::run` post-action
+/// path. The delta now reads the authoritative value via the
+/// `RunningActionsManager::indefinite_pin_saturated()` accessor — the SAME
+/// `Arc<FilesystemStore>` the worker-side admission gate reads in
+/// `create_and_add_action`. The mock RAM is driven saturated to model a worker
+/// still over cap at completion.
+///
+/// Mutation guidance: revert the fix-site to `indefinite_pin_saturated: false`
+/// in `local_worker.rs`; this test must fail with the bespoke message below.
+#[nativelink_test]
+async fn post_action_delta_reports_true_when_still_saturated() -> Result<(), Error> {
+    const ARBITRARY_LARGE_TIMEOUT: f32 = 10000.;
+    let local_worker_config = LocalWorkerConfig {
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(ARBITRARY_LARGE_TIMEOUT),
+            ..Default::default()
+        },
+        cas_server_port: Some(50082),
+        ..Default::default()
+    };
+    let mut test_context = setup_local_worker_with_config(local_worker_config).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    // Model a worker whose indefinite-pin cap is STILL saturated at completion.
+    // Set BEFORE the run loop processes the action so the value is visible when
+    // the post-action delta is built.
+    test_context
+        .actions_manager
+        .set_indefinite_pin_saturated(true);
+
+    {
+        let _props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+    }
+
+    let expected_worker_id = "saturated_delta_worker".to_string();
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    // Non-empty output digests so the post-action delta is actually sent.
+    let action_result = ActionResult {
+        output_files: vec![],
+        output_folders: vec![],
+        output_file_symlinks: vec![],
+        output_directory_symlinks: vec![],
+        exit_code: 0,
+        stdout_digest: DigestInfo::new([21u8; 32], 10),
+        stderr_digest: DigestInfo::new([22u8; 32], 10),
+        execution_metadata: ExecutionMetadata {
+            worker: expected_worker_id.clone(),
+            queued_timestamp: SystemTime::UNIX_EPOCH,
+            worker_start_timestamp: SystemTime::UNIX_EPOCH,
+            worker_completed_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_start_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_completed_timestamp: SystemTime::UNIX_EPOCH,
+            execution_start_timestamp: SystemTime::UNIX_EPOCH,
+            execution_completed_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_start_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_completed_timestamp: SystemTime::UNIX_EPOCH,
+        },
+        server_logs: HashMap::new(),
+        error: None,
+        message: String::new(),
+    };
+    let running_action = Arc::new(MockRunningAction::new());
+
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+
+    running_action
+        .simple_expect_get_finished_result(Ok(action_result.clone()))
+        .await?;
+
+    // Capture the post-action delta (first call on the ordered gRPC mock).
+    let notification = test_context.client.expect_blobs_available(Ok(())).await;
+
+    // THE assertion: the delta must carry the worker's REAL saturation, not a
+    // hardcoded `false`. A `false` here is the clobber that re-opens the spin.
+    assert!(
+        notification.indefinite_pin_saturated,
+        "post-action delta reported false while still saturated — re-saturation \
+         spin re-opened: the scheduler gate was cleared after action completion \
+         (worker_api_server applies this field unconditionally, so a `false` here \
+         overwrites the prior `true` until the next heartbeat re-asserts it)"
+    );
+
+    // Drain the ExecuteResult + cache_action_result so the test cleans up.
+    drop(test_context.client.expect_execution_response(Ok(())).await);
+    drop(
+        test_context
+            .actions_manager
+            .expect_cache_action_result()
+            .await,
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn new_local_worker_creates_work_directory_test() -> Result<(), Error> {
     let cas_store = Store::new(FastSlowStore::new(
