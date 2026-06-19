@@ -588,6 +588,237 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
     Ok(())
 }
 
+/// FL-681 re-saturation gate: a worker whose indefinite-pin cap is reported
+/// saturated MUST NOT be selected by the matcher for a new action — even when
+/// it has no other in-flight action (the regime the admission-NAK pause misses,
+/// because the scheduler's `update_action` pause is conditional on
+/// `worker.has_actions()`). Without the matcher gate, the re-queued action
+/// re-dispatches to the same saturated worker → re-NAK → an RPC-rate
+/// re-dispatch spin between scheduler and worker. With the gate, the action
+/// stays Queued until the worker reports headroom again.
+///
+/// This drives the production `SimpleScheduler` composition (matcher +
+/// worker pool + state manager), not the matcher in isolation, so the
+/// `update_worker_indefinite_pin_saturation` → `Worker` → `inner_find_and_reserve_worker`
+/// path is exercised end to end.
+#[nativelink_test]
+async fn indefinite_pin_saturated_worker_not_rematched_until_headroom_test()
+-> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    // Report the worker's indefinite-pin cap as saturated BEFORE any action is
+    // queued. This is the single-in-flight regime: the worker has ZERO actions
+    // in `running_action_infos` (its saturating backlog lives in the pin set),
+    // so the admission-NAK conditional pause would never fire — only the
+    // matcher gate keeps the worker undispatchable.
+    scheduler
+        .update_worker_indefinite_pin_saturation(&worker_id, true)
+        .await?;
+    tokio::task::yield_now().await;
+
+    let action_digest = DigestInfo::new([88u8; 32], 512);
+    let insert_timestamp = make_system_time(14);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    {
+        // The action MUST be parked in Queued: the only worker is saturated, so
+        // the matcher must skip it rather than dispatch → NAK → re-dispatch.
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Queued,
+            "FL-681 re-saturation spin: a saturated worker was selected by the \
+             matcher and the action was dispatched (expected Queued — the \
+             matcher must skip an indefinite-pin-saturated worker so it is not \
+             re-NAK-spun)"
+        );
+    }
+
+    // Worker drains below cap (a BIS-ack freed pin headroom) → reports
+    // not-saturated. The matcher must now select it and the action executes.
+    scheduler
+        .update_worker_indefinite_pin_saturation(&worker_id, false)
+        .await?;
+    tokio::task::yield_now().await;
+
+    {
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before second state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Executing,
+            "a worker reporting indefinite-pin headroom must be re-selectable \
+             by the matcher (action stuck in Queued after saturation cleared)"
+        );
+    }
+
+    // Sanity: the worker actually received the StartAction once unblocked —
+    // confirms the matcher SELECTED the worker (not merely that the state
+    // manager flipped to Executing).
+    match rx_from_worker
+        .recv()
+        .await
+        .expect("worker channel closed")
+        .update
+    {
+        Some(update_for_worker::Update::StartAction(_)) => {}
+        v => panic!("Expected StartAction after headroom restored, got: {v:?}"),
+    }
+
+    Ok(())
+}
+
+/// FL-681 re-saturation gate, cache-affinity path: the matcher has THREE
+/// eligibility predicates. The LRU/MRU fallback runs `worker_matches`; the
+/// directory-cache and subtree-coverage tiers run `worker_is_viable`. A worker
+/// that has the action's `input_root_digest` cached is selected by the
+/// `dir_cache_winner` tier through `worker_is_viable` — a SEPARATE code path
+/// from the fallback. This test drives that path (worker has the input_root in
+/// its directory cache) and asserts the saturation gate fires there too, so a
+/// saturated worker is not selected even when it is the cache-affinity winner.
+#[nativelink_test]
+async fn indefinite_pin_saturated_worker_skipped_on_cache_affinity_path_test()
+-> Result<(), Error> {
+    let worker_id = WorkerId("worker_id".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_from_worker = setup_new_worker_with_cas_endpoint(
+        &scheduler,
+        worker_id.clone(),
+        PlatformProperties::default(),
+        "worker:50081",
+    )
+    .await?;
+
+    // Give the worker the action's input_root in its directory cache so the
+    // `dir_cache_winner` tier (which evaluates `worker_is_viable`) would select
+    // it absent the saturation gate.
+    let input_root_digest = DigestInfo::new([55u8; 32], 4096);
+    let mut cached_dirs = std::collections::HashSet::new();
+    cached_dirs.insert(input_root_digest);
+    scheduler
+        .update_cached_directories(&worker_id, cached_dirs)
+        .await?;
+
+    // Report saturation BEFORE queueing the action (single-in-flight regime).
+    scheduler
+        .update_worker_indefinite_pin_saturation(&worker_id, true)
+        .await?;
+    tokio::task::yield_now().await;
+
+    let action_digest = DigestInfo::new([56u8; 32], 512);
+    let insert_timestamp = make_system_time(20);
+    let mut action_listener = setup_action_with_input_root(
+        &scheduler,
+        action_digest,
+        input_root_digest,
+        HashMap::new(),
+        insert_timestamp,
+    )
+    .await?;
+
+    {
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Queued,
+            "FL-681 re-saturation spin (cache-affinity path): a saturated worker \
+             was selected by the directory-cache tier (worker_is_viable) and the \
+             action was dispatched (expected Queued — the matcher must skip an \
+             indefinite-pin-saturated worker on EVERY selection tier)"
+        );
+    }
+
+    // Clear saturation → the cache-affinity winner is selectable again.
+    scheduler
+        .update_worker_indefinite_pin_saturation(&worker_id, false)
+        .await?;
+    tokio::task::yield_now().await;
+
+    {
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before second state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Executing,
+            "cache-affinity winner must be re-selectable once saturation clears"
+        );
+    }
+
+    // Confirm the worker received the dispatch (StartAction may interleave with
+    // a PeerHints ChunkedMessage on the cache-affinity path — accept either as
+    // the first message and require StartAction within a small drain budget).
+    let mut saw_start = false;
+    for _ in 0..4 {
+        match rx_from_worker
+            .recv()
+            .await
+            .expect("worker channel closed")
+            .update
+        {
+            Some(update_for_worker::Update::StartAction(_)) => {
+                saw_start = true;
+                break;
+            }
+            Some(_) => continue,
+            None => panic!("worker channel produced empty update"),
+        }
+    }
+    assert!(
+        saw_start,
+        "worker did not receive StartAction after saturation cleared"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn set_drain_worker_pauses_and_resumes_worker_test() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());

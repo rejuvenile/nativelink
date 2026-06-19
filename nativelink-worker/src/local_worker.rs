@@ -2358,7 +2358,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let load = get_cpu_load_pct();
         let p_load = get_p_core_load_pct();
         let e_load = get_e_core_load_pct();
-        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load}");
+        // (FL-681) Snapshot the local CAS FilesystemStore's indefinite-pin
+        // saturation at emit time. This is the SAME store the worker-side
+        // admission gate (`running_actions_manager.rs` `create_and_add_action`)
+        // checks; reporting it lets the scheduler's matcher skip a saturated
+        // worker proactively rather than re-NAK-spinning it. Cheap: one relaxed
+        // atomic load + compare, no lock, no await (`moka_evicting_map.rs`).
+        let indefinite_pin_saturated = state.fs_store.indefinite_pin_saturated();
+        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated}");
         let notification = BlobsAvailableNotification {
             worker_cas_endpoint: state.cas_endpoint.clone(),
             digests: Vec::new(),
@@ -2424,6 +2431,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // upload short-circuits to silently skip uploads of the
             // Action proto bytes.
             pinned_ac_mirror_entries,
+            // (FL-681) Snapshot taken above from the local CAS FilesystemStore.
+            indefinite_pin_saturated,
         };
 
         // (#99) If the notification's encoded estimate exceeds the
@@ -3220,6 +3229,19 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             mirror_max_bytes: 0,
                                                             pinned_mirror_entries: Vec::new(),
                                                             pinned_ac_mirror_entries: Vec::new(),
+                                                            // (FL-681) This one-shot
+                                                            // post-action delta notify has
+                                                            // no FilesystemStore handle in
+                                                            // scope; like `mirror_*_bytes`
+                                                            // above it reports the proto3
+                                                            // default. The periodic
+                                                            // heartbeat (which holds
+                                                            // `state.fs_store`) carries the
+                                                            // authoritative saturation
+                                                            // within ~6 s, and the
+                                                            // worker-side admission NAK is
+                                                            // the backstop in the interim.
+                                                            indefinite_pin_saturated: false,
                                                         }
                                                     ).await {
                                                         // Failure to send BlobsAvailable

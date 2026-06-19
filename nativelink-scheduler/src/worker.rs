@@ -131,6 +131,20 @@ pub struct Worker {
     #[metric(help = "E-core load percentage reported by the worker.")]
     pub e_core_load_pct: u32,
 
+    /// (FL-681 re-saturation gate) Whether the worker's local CAS
+    /// FilesystemStore reported its indefinite-pin cap saturated in its last
+    /// `BlobsAvailable` heartbeat. While `true`, the matcher
+    /// (`inner_find_and_reserve_worker`) skips this worker for new actions so a
+    /// saturated-but-idle worker is not re-dispatched into the worker-NAK →
+    /// re-queue → re-dispatch spin (the admission-gate pause at `update_action`
+    /// is conditional on the worker having OTHER in-flight actions, which a
+    /// saturated-but-idle worker does not). PROACTIVE matcher backpressure; the
+    /// worker-side admission NAK remains the last-resort backstop for the
+    /// report-staleness window between heartbeats. `false` for workers that
+    /// never report saturation (pre-FL-681 / uncapped stores).
+    #[metric(help = "If the worker's indefinite-pin cap is reported saturated.")]
+    pub indefinite_pin_saturated: bool,
+
     /// Digests of input root directories cached in the worker's directory cache.
     /// The scheduler gives routing preference to workers that already have the
     /// action's input_root_digest cached.
@@ -210,6 +224,7 @@ impl Worker {
             cpu_load_pct: 0,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            indefinite_pin_saturated: false,
             cached_directory_digests: HashSet::new(),
             cached_subtree_digests: HashSet::new(),
             metrics: Arc::new(Metrics {

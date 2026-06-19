@@ -1732,6 +1732,21 @@ impl WorkerConnection {
             }
         }
 
+        // (FL-681 re-saturation gate) Plumb the worker's indefinite-pin-cap
+        // saturation into the scheduler so the matcher skips a saturated worker.
+        // UNCONDITIONAL (unlike CPU load, which skips the `0 == unknown`
+        // sentinel): `false` is the load-bearing "drained, re-selectable" signal
+        // — gating it would leave a once-saturated worker permanently excluded.
+        // Idempotent on the scheduler side (a no-op when the value is unchanged).
+        let indefinite_pin_saturated = notification.indefinite_pin_saturated;
+        if let Err(err) = self
+            .scheduler
+            .update_worker_indefinite_pin_saturation(&self.worker_id, indefinite_pin_saturated)
+            .await
+        {
+            warn!(worker_id=?self.worker_id, ?err, indefinite_pin_saturated, "Failed to update worker indefinite-pin saturation");
+        }
+
         // Mirror capacity report (review #1): the worker advertises its
         // current `mirror_blobs` total bytes and configured cap on every
         // BlobsAvailable. Plumb them into the WorkerProxyStore picker

@@ -264,6 +264,25 @@ message BlobsAvailableNotification {
     /// channel before the read-side change, and (b) allow
     /// observability tooling to surface AC pin distribution per worker.
     repeated MirrorPinEntry pinned_ac_mirror_entries = 17;
+
+    /// (FL-681 re-saturation gate) True when the worker's local CAS
+    /// FilesystemStore indefinite-pin cap is saturated
+    /// (`indefinite_pinned_bytes >= indefinite_pin_cap`) — i.e. its
+    /// pending-BIS durability backlog has filled the cap and a new F2
+    /// action's output would be refused by the worker-side admission
+    /// gate (`running_actions_manager.rs` `create_and_add_action`).
+    ///
+    /// The scheduler stores this on the `Worker` and SKIPS the worker in
+    /// `inner_find_and_reserve_worker` while true, so a saturated-but-idle
+    /// worker is not re-matched into the worker-NAK → re-queue →
+    /// re-dispatch spin the admission gate alone produces (the gate's
+    /// pause is conditional on the worker having OTHER in-flight actions).
+    /// This is PROACTIVE matcher backpressure; the admission NAK remains
+    /// the last-resort backstop for the report-staleness window (a worker
+    /// can saturate between heartbeat ticks). `false` for pre-FL-681
+    /// workers / uncapped stores (proto3 default) — they are never gated,
+    /// matching the prior behavior.
+    bool indefinite_pin_saturated = 18;
 }
 
 /// One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
@@ -549,6 +568,11 @@ message BlobsAvailableChunk {
     repeated build.bazel.remote.execution.v2.Digest removed_subtree_digests = 20;
     /// Per-chunk slice of `BlobsAvailableNotification.pinned_mirror_digests`.
     repeated build.bazel.remote.execution.v2.Digest pinned_mirror_digests = 21;
+    /// (FL-681) Indefinite-pin-cap saturation — only meaningful on chunk 0;
+    /// subsequent chunks leave at proto3 default `false`. The accumulator
+    /// carries the chunk-0 value forward into the reassembled
+    /// `BlobsAvailableNotification.indefinite_pin_saturated` (field 18).
+    bool indefinite_pin_saturated = 22;
 }
 
 /// A streaming-message envelope shared across the cas→worker, scheduler→

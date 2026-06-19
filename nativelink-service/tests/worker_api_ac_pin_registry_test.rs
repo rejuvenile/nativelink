@@ -333,6 +333,7 @@ fn empty_ba(endpoint: &str) -> BlobsAvailableNotification {
         mirror_max_bytes: 0,
         pinned_mirror_entries: vec![],
         pinned_ac_mirror_entries: vec![],
+        indefinite_pin_saturated: false,
     }
 }
 

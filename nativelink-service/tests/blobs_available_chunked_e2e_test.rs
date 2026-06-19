@@ -272,6 +272,7 @@ fn build_notification(
         mirror_max_bytes: 65536,
         pinned_mirror_entries: vec![],
         pinned_ac_mirror_entries: vec![],
+        indefinite_pin_saturated: false,
     }
 }
 

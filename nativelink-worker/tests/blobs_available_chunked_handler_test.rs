@@ -306,6 +306,7 @@ async fn token_mismatch_mid_broadcast_only_second_commits() -> Result<(), Error>
         added_subtree_digests: Vec::new(),
         removed_subtree_digests: Vec::new(),
         pinned_mirror_digests: Vec::new(),
+        indefinite_pin_saturated: false,
     };
 
     // Second broadcast (token B): seq=0 (rebuild) + seq=1 terminal.
@@ -417,6 +418,7 @@ async fn sequence_gap_terminal_rejected_by_completeness_gate() -> Result<(), Err
         added_subtree_digests: Vec::new(),
         removed_subtree_digests: Vec::new(),
         pinned_mirror_digests: Vec::new(),
+        indefinite_pin_saturated: false,
     };
     // Skip sequence 1; seq 2 is terminal — completeness gate must
     // reject.

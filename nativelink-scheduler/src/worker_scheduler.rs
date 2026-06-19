@@ -76,6 +76,22 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
         e_core_load_pct: u32,
     ) -> Result<(), Error>;
 
+    /// (FL-681 re-saturation gate) Updates whether the worker's local CAS
+    /// FilesystemStore reported its indefinite-pin cap saturated. Carried on
+    /// the worker's periodic `BlobsAvailable` heartbeat (NOT KeepAlive — only
+    /// the BlobsAvailable path queries the FilesystemStore). When `true`, the
+    /// matcher skips this worker for new actions so a saturated-but-idle worker
+    /// is not re-dispatched into the worker-NAK → re-queue → re-dispatch spin.
+    /// Default impl is a no-op so schedulers that do not run a worker pool (or
+    /// do not care about F2 saturation) need not implement it.
+    async fn update_worker_indefinite_pin_saturation(
+        &self,
+        _worker_id: &WorkerId,
+        _indefinite_pin_saturated: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Updates the set of cached directory digests for a worker.
     /// The scheduler uses this to give routing preference to workers that
     /// already have the action's input_root_digest cached in their directory cache.

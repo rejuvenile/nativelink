@@ -673,6 +673,19 @@ impl ApiWorkerSchedulerImpl {
                 return false;
             }
 
+            // (FL-681 re-saturation gate) Skip an indefinite-pin-saturated
+            // worker on the LRU/MRU fallback path too (the cache-affinity tiers
+            // gate via `worker_is_viable`). See `worker_is_viable` for why this
+            // is separate from `can_accept_work()`.
+            if w.indefinite_pin_saturated {
+                if full_worker_logging {
+                    debug!(
+                        "Worker {worker_id} skipped: indefinite-pin cap saturated (FL-681 re-saturation gate)"
+                    );
+                }
+                return false;
+            }
+
             // Verify Minimum properties at runtime (their values are dynamic)
             if !platform_properties.is_satisfied_by(&w.platform_properties, full_worker_logging) {
                 return false;
@@ -803,7 +816,17 @@ impl ApiWorkerSchedulerImpl {
             let Some(w) = self.workers.0.peek(worker_id) else {
                 return false;
             };
-            if w.quarantined_at.is_some() || !w.can_accept_work() {
+            // (FL-681 re-saturation gate) Skip a worker whose indefinite-pin cap
+            // is reported saturated: a new F2 action would be NAKed by its
+            // admission gate, and the scheduler's conditional pause does not fire
+            // for a saturated-but-idle worker — so selecting it here re-arms the
+            // worker-NAK → re-queue → re-dispatch spin. Kept SEPARATE from
+            // `can_accept_work()` so the `update_action` pause logic (which also
+            // calls `can_accept_work()`) is untouched.
+            if w.quarantined_at.is_some()
+                || !w.can_accept_work()
+                || w.indefinite_pin_saturated
+            {
                 return false;
             }
             platform_properties.is_satisfied_by(&w.platform_properties, false)
@@ -2275,6 +2298,23 @@ impl ApiWorkerScheduler {
     pub async fn contains_worker_for_test(&self, worker_id: &WorkerId) -> bool {
         let inner = self.inner.read().await;
         inner.workers.contains(worker_id)
+    }
+
+    /// (FL-681) Reads a worker's reported indefinite-pin saturation flag.
+    /// Test-only — lets the server-handler seam test assert that a
+    /// `BlobsAvailable` carrying `indefinite_pin_saturated` reaches the
+    /// `Worker`. `None` when the worker is absent.
+    #[must_use]
+    pub async fn worker_indefinite_pin_saturated_for_test(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Option<bool> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .0
+            .peek(worker_id)
+            .map(|w| w.indefinite_pin_saturated)
     }
 
     /// A unit test function used to send the keep alive message to the worker from the server.
@@ -4389,6 +4429,41 @@ impl WorkerScheduler for ApiWorkerScheduler {
         worker.p_core_load_pct = p_core_load_pct;
         worker.e_core_load_pct = e_core_load_pct;
         debug!(%worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Worker load updated");
+        Ok(())
+    }
+
+    async fn update_worker_indefinite_pin_saturation(
+        &self,
+        worker_id: &WorkerId,
+        indefinite_pin_saturated: bool,
+    ) -> Result<(), Error> {
+        // peek_mut to avoid LRU promotion — a saturation report is telemetry,
+        // not work assignment, and must not reorder scheduling.
+        let mut inner = self.inner.write().await;
+        {
+            let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+                make_input_err!(
+                    "Worker not found in worker map in \
+                     update_worker_indefinite_pin_saturation() {}",
+                    worker_id
+                )
+            })?;
+            if worker.indefinite_pin_saturated != indefinite_pin_saturated {
+                debug!(
+                    %worker_id,
+                    indefinite_pin_saturated,
+                    "worker indefinite-pin saturation changed"
+                );
+            }
+            worker.indefinite_pin_saturated = indefinite_pin_saturated;
+        }
+        // A transition to NOT-saturated re-opens this worker to the matcher;
+        // wake the matcher so a queued action can be assigned without waiting
+        // for the next change tick (mirrors set_drain_worker's notify). Waking
+        // on saturation=true is harmless (the matcher just skips the worker).
+        if !indefinite_pin_saturated {
+            inner.worker_change_notify.notify_one();
+        }
         Ok(())
     }
 

@@ -133,6 +133,8 @@ struct HeaderScalars {
     e_core_load_pct: u32,
     mirror_used_bytes: u64,
     mirror_max_bytes: u64,
+    // (FL-681) Indefinite-pin-cap saturation, carried from chunk 0.
+    indefinite_pin_saturated: bool,
 }
 
 /// One in-flight broadcast's accumulated state.
@@ -244,6 +246,7 @@ impl BroadcastAccumulator {
                 e_core_load_pct: chunk.e_core_load_pct,
                 mirror_used_bytes: chunk.mirror_used_bytes,
                 mirror_max_bytes: chunk.mirror_max_bytes,
+                indefinite_pin_saturated: chunk.indefinite_pin_saturated,
             });
         }
 
@@ -802,6 +805,7 @@ impl BlobsAvailableAccumulator {
                     body.e_core_load_pct = headers.e_core_load_pct;
                     body.mirror_used_bytes = headers.mirror_used_bytes;
                     body.mirror_max_bytes = headers.mirror_max_bytes;
+                    body.indefinite_pin_saturated = headers.indefinite_pin_saturated;
                 }
                 body.is_full_snapshot = removed.is_full_snapshot;
                 Some(body)
@@ -892,6 +896,7 @@ mod tests {
             e_core_load_pct: 0,
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
+            indefinite_pin_saturated: false,
         }
     }
 
@@ -1352,9 +1357,13 @@ mod tests {
         c0.cpu_load_pct = 42;
         c0.mirror_used_bytes = 12345;
         c0.is_full_subtree_snapshot = true;
+        // (FL-681) Saturation rides chunk 0; the terminal chunk leaves it at
+        // the proto3 default `false` and MUST NOT clobber the carried value.
+        c0.indefinite_pin_saturated = true;
 
         let c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
-        // c1 has worker_cas_endpoint = "" and cpu_load_pct = 0 by helper.
+        // c1 has worker_cas_endpoint = "" and cpu_load_pct = 0 by helper, and
+        // indefinite_pin_saturated = false (proto3 default for the terminal).
 
         assert!(acc.merge_chunk(c0).is_none());
         let out = acc.merge_chunk(c1).expect("terminal commits");
@@ -1362,6 +1371,11 @@ mod tests {
         assert_eq!(out.mirror_used_bytes, 12345);
         assert!(out.is_full_subtree_snapshot);
         assert_eq!(out.worker_cas_endpoint, "grpc://w1:50081");
+        assert!(
+            out.indefinite_pin_saturated,
+            "FL-681: chunk-0 indefinite_pin_saturated=true was lost in chunked \
+             reassembly (the terminal chunk's default false clobbered it)"
+        );
     }
 
     /// Fix #3: terminal arriving without sequence=0 is rejected.

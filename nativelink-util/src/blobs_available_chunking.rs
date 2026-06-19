@@ -122,6 +122,7 @@ pub fn chunk_blobs_available(
         mirror_max_bytes,
         pinned_mirror_entries,
         pinned_ac_mirror_entries,
+        indefinite_pin_saturated,
     } = notification;
 
     // Fold legacy field 2 (`digests`) into `digest_infos` for backwards
@@ -169,6 +170,13 @@ pub fn chunk_blobs_available(
             e_core_load_pct: if sequence == 0 { e_core_load_pct } else { 0 },
             mirror_used_bytes: if sequence == 0 { mirror_used_bytes } else { 0 },
             mirror_max_bytes: if sequence == 0 { mirror_max_bytes } else { 0 },
+            // (FL-681) Saturation rides chunk 0 only; the accumulator carries
+            // it forward into the reassembled notification.
+            indefinite_pin_saturated: if sequence == 0 {
+                indefinite_pin_saturated
+            } else {
+                false
+            },
             digests: Vec::new(),
             cached_directory_digests: Vec::new(),
             pinned_mirror_entries: Vec::new(),
@@ -425,6 +433,33 @@ mod tests {
             assert_eq!(c.cpu_load_pct, 0);
             assert_eq!(c.mirror_used_bytes, 0);
             assert!(!c.is_full_subtree_snapshot);
+        }
+    }
+
+    #[test]
+    fn indefinite_pin_saturated_rides_chunk_zero_only() {
+        // (FL-681) Saturation is a chunk-0-only scalar (like cpu_load_pct):
+        // the accumulator carries chunk 0's value forward. Subsequent chunks
+        // MUST leave it at the proto3 default so a value isn't double-counted
+        // or contradicted across chunks.
+        let n = BlobsAvailableNotification {
+            indefinite_pin_saturated: true,
+            digest_infos: (0..10).map(bdi).collect(),
+            ..Default::default()
+        };
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 3)
+            .expect("multi-chunk must succeed");
+        assert!(chunks.len() >= 3, "need >1 chunk to test scalar placement");
+        assert!(
+            chunks[0].indefinite_pin_saturated,
+            "FL-681: chunk 0 must carry the saturation flag"
+        );
+        for c in &chunks[1..] {
+            assert!(
+                !c.indefinite_pin_saturated,
+                "FL-681: non-zero chunks must leave indefinite_pin_saturated at \
+                 the proto3 default (chunk-0-only scalar)"
+            );
         }
     }
 

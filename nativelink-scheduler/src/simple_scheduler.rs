@@ -1138,6 +1138,16 @@ impl WorkerScheduler for SimpleScheduler {
             .await
     }
 
+    async fn update_worker_indefinite_pin_saturation(
+        &self,
+        worker_id: &WorkerId,
+        indefinite_pin_saturated: bool,
+    ) -> Result<(), Error> {
+        self.worker_scheduler
+            .update_worker_indefinite_pin_saturation(worker_id, indefinite_pin_saturated)
+            .await
+    }
+
     async fn update_cached_directories(
         &self,
         worker_id: &WorkerId,

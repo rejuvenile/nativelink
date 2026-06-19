@@ -246,6 +246,12 @@ pub struct BlobsAvailableNotification {
     /// / structure with no CAS-side reader.
     #[prost(message, repeated, tag = "17")]
     pub pinned_ac_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
+    /// / (FL-681 re-saturation gate) True when the worker's local CAS
+    /// / FilesystemStore indefinite-pin cap is saturated. The scheduler
+    /// / stores this on the `Worker` and skips the worker in the matcher
+    /// / so a saturated-but-idle worker is not re-NAK-spun.
+    #[prost(bool, tag = "18")]
+    pub indefinite_pin_saturated: bool,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -499,6 +505,11 @@ pub struct BlobsAvailableChunk {
     pub pinned_mirror_digests: ::prost::alloc::vec::Vec<
         super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
     >,
+    /// / (FL-681) Indefinite-pin-cap saturation -- only meaningful on
+    /// / chunk 0; carried forward by the accumulator into the reassembled
+    /// / `BlobsAvailableNotification.indefinite_pin_saturated` (field 18).
+    #[prost(bool, tag = "22")]
+    pub indefinite_pin_saturated: bool,
 }
 /// / A streaming-message envelope shared across the cas->worker, scheduler->
 /// / worker, and worker->scheduler chunk producers. Exactly ONE of the

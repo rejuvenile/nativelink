@@ -917,6 +917,7 @@ pub async fn mirror_capacity_report_plumbed_to_picker_test()
             mirror_max_bytes: REPORTED_MAX,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -944,6 +945,129 @@ pub async fn mirror_capacity_report_plumbed_to_picker_test()
         (REPORTED_USED, REPORTED_MAX),
         "picker must see the exact bytes the worker reported"
     );
+
+    Ok(())
+}
+
+/// (FL-681 re-saturation gate) Server-handler seam: a `BlobsAvailable` carrying
+/// `indefinite_pin_saturated` must reach the scheduler's `Worker` via
+/// `inner_blobs_available` → `update_worker_indefinite_pin_saturation`. Both
+/// directions matter — `true` gates the worker, and `false` (the load-bearing
+/// "drained, re-selectable" signal) MUST clear the gate (unlike CPU load, the
+/// handler does NOT skip the `false`/`0` value).
+///
+/// Mutate-test guidance: comment out the
+/// `update_worker_indefinite_pin_saturation(...)` call in `worker_api_server.rs`
+/// (the unconditional block after the CPU-load update); this test must fail.
+#[nativelink_test]
+pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let test_context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
+    let worker_id = test_context.worker_id.clone();
+
+    // Pre-condition: a freshly-connected worker is not saturated.
+    assert_eq!(
+        test_context
+            .scheduler
+            .worker_indefinite_pin_saturated_for_test(&worker_id)
+            .await,
+        Some(false),
+        "fresh worker should report not-saturated"
+    );
+
+    // Worker reports its indefinite-pin cap saturated.
+    test_context
+        .worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: String::new(),
+            digests: vec![],
+            is_full_snapshot: false,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+            pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: true,
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
+
+    // Poll until the scheduler's Worker reflects saturation — bounded so a
+    // broken plumbing surfaces as a clean failure rather than a hang.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if test_context
+            .scheduler
+            .worker_indefinite_pin_saturated_for_test(&worker_id)
+            .await
+            == Some(true)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "indefinite_pin_saturated=true did not reach the scheduler Worker \
+             within 5s — `update_worker_indefinite_pin_saturation` plumbing is \
+             broken (FL-681 matcher gate would never engage)"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Worker drains below cap and reports not-saturated. The handler must
+    // propagate the `false` (it is NOT skipped as a sentinel) so the matcher
+    // gate clears — otherwise a once-saturated worker is excluded forever.
+    test_context
+        .worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: String::new(),
+            digests: vec![],
+            is_full_snapshot: false,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+            pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if test_context
+            .scheduler
+            .worker_indefinite_pin_saturated_for_test(&worker_id)
+            .await
+            == Some(false)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "indefinite_pin_saturated=false (drained) did not clear on the \
+             scheduler Worker within 5s — a once-saturated worker would stay \
+             excluded forever"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     Ok(())
 }
@@ -979,6 +1103,7 @@ pub async fn zero_mirror_max_does_not_record_capacity_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1034,6 +1159,7 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -1096,6 +1222,7 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1131,6 +1258,7 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1189,6 +1317,7 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1215,6 +1344,7 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1265,6 +1395,7 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1291,6 +1422,7 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1346,6 +1478,7 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1431,6 +1564,7 @@ pub async fn blobs_available_with_malformed_digests_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1485,6 +1619,7 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1650,6 +1785,7 @@ async fn send_blobs_and_wait(
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -2743,6 +2879,7 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
                 },
             ],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -2920,6 +3057,7 @@ pub async fn handle_blobs_available_a2_fold_merged_field13_and_field16_test()
                 },
             ],
             pinned_ac_mirror_entries: Vec::new(),
+            indefinite_pin_saturated: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
