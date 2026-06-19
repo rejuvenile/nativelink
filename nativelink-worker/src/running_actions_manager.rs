@@ -7164,9 +7164,19 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 // outage. NAK the action with `Code::ResourceExhausted` so the
                 // scheduler re-queues it (verified: the worker→scheduler
                 // ResourceExhausted is treated as re-queue WITHOUT consuming a
-                // retry attempt, and pauses this worker, in
-                // `simple_scheduler_state_manager::inner_update_operation` +
-                // `api_worker_scheduler::update_action`). The cap drains as
+                // retry attempt, in
+                // `simple_scheduler_state_manager::inner_update_operation`).
+                // CAVEAT (verified at `api_worker_scheduler::update_action`): the
+                // worker is paused ONLY if it `has_actions()` after the NAKed
+                // action is removed; the pending-BIS backlog lives in the PIN set,
+                // not `running_action_infos`, so a cap-saturated worker with no
+                // other in-flight action is NOT paused, and the re-queued action
+                // may re-dispatch here and re-NAK: a bounded RPC-rate spin, NO
+                // data loss, self-clearing as BIS-acks drain the cap.
+                // TODO(#fl681-resaturation-spin): matcher-side saturation gate or
+                // BIS-ack-driven unpause — see
+                // .claude/audits/fl681-resaturation-spin-2026-06-18.md.
+                // The cap drains as
                 // BIS-acks release pins (`unpin_digest`), then admission resumes.
                 //
                 // Snapshot check — synchronous, eventually-consistent, no lock
