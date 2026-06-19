@@ -171,6 +171,29 @@ impl MockWorkerApiClient {
         req
     }
 
+    /// FL-681 Follow-up B: non-blocking peek of the next enqueued call. Returns
+    /// `Some(notification)` if the next pending call is a `BlobsAvailable` (and
+    /// auto-acks it), `None` if the call channel is currently empty. Used by the
+    /// storm-prevention test to assert that a NON-heartbeat tick enqueued NO
+    /// `BlobsAvailable` at all. Panics if the next pending call is some other
+    /// variant (the test expects only BlobsAvailable or nothing).
+    #[allow(dead_code, reason = "exercised only by the FL-681 Follow-up B heartbeat test")]
+    pub(crate) fn try_next_blobs_available(&self) -> Option<BlobsAvailableNotification> {
+        let mut rx_call_lock = self.rx_call.try_lock()?;
+        match rx_call_lock.try_recv() {
+            Ok(WorkerClientApiCalls::BlobsAvailable(req)) => {
+                self.tx_resp
+                    .send(WorkerClientApiReturns::BlobsAvailable(Ok(())))
+                    .expect("Could not send response to mpsc");
+                Some(req)
+            }
+            Ok(other) => panic!(
+                "try_next_blobs_available expected BlobsAvailable or empty, got : {other:?}"
+            ),
+            Err(_) => None,
+        }
+    }
+
     /// (#97) Receive the next call as a BisAck. Used by the
     /// production-composition test that asserts the worker's
     /// `Update::ChunkedMessage(BlobsInStableStorageChunk)` dispatch

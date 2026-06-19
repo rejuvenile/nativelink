@@ -1332,6 +1332,24 @@ where
         self.indefinite_pinned_bytes.load(Ordering::Relaxed) >= self.indefinite_pin_cap
     }
 
+    /// FL-681 Follow-up B (MAJOR-2 robust close-out): enumerate the keys of the
+    /// INDEFINITE (pending-BIS-ack) pin subset. The worker re-advertises this
+    /// set in the periodic BlobsAvailable heartbeat so a CAS digest whose
+    /// `mark_stable` was missed (transient server existence-check failure) is
+    /// re-driven to BIS within a bounded number of heartbeat ticks, WITHOUT
+    /// waiting for a reconnect. Self-pruning: a BIS-ack `unpin_key` drops the
+    /// digest, so it falls out of the next enumeration automatically.
+    ///
+    /// Bounded by `indefinite_pin_cap` (the whole point of the cap). Cheap
+    /// DashMap iteration — no lock held across an `.await` by the caller.
+    pub fn indefinite_pinned_digests(&self) -> Vec<K> {
+        self.pinned
+            .iter()
+            .filter(|entry| entry.value().indefinite)
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Test hook: rewind a pinned entry's `pinned_at` past the
     /// `PIN_TIMEOUT_SECS` deadline so the next `expire_stale_pins` sweep
     /// treats it as stale. Returns `true` if the key was pinned and was
@@ -2599,6 +2617,47 @@ mod tests {
             !map.indefinite_pin_saturated(),
             "indefinite_pin_saturated must clear once a BIS-ack frees cap headroom — \
              the gate is transient backpressure, not a terminal stall"
+        );
+
+        map.unpin_key(&1);
+    }
+
+    // FL-681 Follow-up B (MAJOR-2 robust close-out): the worker re-advertises
+    // its pending-BIS CAS pin set on a periodic heartbeat. The enumeration MUST
+    // return EXACTLY the `indefinite == true` subset of the pinned map — a
+    // time-bounded pin is NOT pending-BIS and must be excluded, and an
+    // unpinned entry must drop out (self-pruning) so the heartbeat shrinks as
+    // BIS-acks land.
+    #[tokio::test]
+    async fn indefinite_pinned_digests_enumerates_only_indefinite_subset() {
+        let cfg = policy(1024 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        for k in 0..3u64 {
+            map.insert(k, BytesEntry(2048)).await;
+        }
+
+        // Mixed pin states: key 0 indefinite, key 1 time-bounded, key 2 unpinned.
+        assert!(map.pin_key_indefinite(0), "indefinite pin of key 0 should succeed");
+        assert!(map.pin_key(1), "time-bounded pin of key 1 should succeed");
+
+        let enumerated = map.indefinite_pinned_digests();
+        assert_eq!(
+            enumerated,
+            vec![0u64],
+            "indefinite_pinned_digests must return EXACTLY the indefinite subset — a \
+             time-bounded pin (key 1) is not pending-BIS and an unpinned key (key 2) must \
+             not be re-advertised, or the heartbeat would re-drive mark_stable for blobs that \
+             were never pending durability"
+        );
+
+        // BIS-ack releases key 0 → it must drop out of the next enumeration
+        // (self-pruning: the heartbeat shrinks as acks land).
+        map.unpin_key(&0);
+        assert!(
+            map.indefinite_pinned_digests().is_empty(),
+            "after a BIS-ack unpin, the released digest must NOT appear in the heartbeat set — \
+             the pending-BIS re-advertisement is self-pruning"
         );
 
         map.unpin_key(&1);

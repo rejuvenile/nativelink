@@ -1057,9 +1057,11 @@ pub(crate) fn apply_periodic_tick_memo_resets(
 ///     persists until the worker's local AC pin set drops below the
 ///     cap OR a separate over-cap design ships (tracked as #81).
 ///
-/// `pub(crate)` so the heartbeat coverage test (T7) can assert the
-/// value at the declaration site without re-deriving the cadence.
-pub(crate) const AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS: u64 = 60;
+/// `pub` so the heartbeat coverage test (T7) and the FL-681 Follow-up B
+/// pending-BIS re-advertisement test can assert the value at the declaration
+/// site and drive exactly one full heartbeat cycle without re-deriving the
+/// cadence.
+pub const AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS: u64 = 60;
 
 /// Counts how many AC-pin digests have been added (in `current` but not
 /// `last`) and removed (in `last` but not `current`). Pure function so
@@ -1100,6 +1102,49 @@ fn should_skip_blobs_available_tick(
         && removed_subtree_count == 0
         && pinned_mirror_count == 0
         && ac_pin_delta_empty
+}
+
+/// FL-681 Follow-up B (MAJOR-2 robust close-out): fold the worker's pending-BIS
+/// (indefinite-pinned) CAS digest set into the heartbeat tick's `digest_infos`.
+///
+/// On the periodic full-snapshot heartbeat (`AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS`,
+/// ~6s) the worker re-advertises every still-indefinitely-pinned CAS digest so
+/// the server re-runs `has_with_results` + `mark_stable` on the present subset.
+/// A digest whose `mark_stable` was missed (transient server existence-check
+/// failure) is thereby re-driven to BIS within a bounded number of ticks rather
+/// than waiting for the next reconnect. The server side is UNCHANGED — its
+/// existing `mark_stable`-on-present path absorbs the re-advertised set,
+/// idempotently.
+///
+/// Pure so the fold is unit-testable without the full
+/// `send_periodic_blobs_available` machinery. Digests already present in
+/// `digest_infos` (e.g. this tick also `added`/`touched` them) are NOT
+/// duplicated — the heartbeat only ADDS the still-pending pins the delta would
+/// otherwise omit. The set is bounded by `indefinite_pin_cap` and self-prunes
+/// as BIS-acks release pins (`indefinite_pinned_digests` shrinks accordingly).
+#[inline]
+fn merge_pending_bis_pins_into_digest_infos(
+    digest_infos: &mut Vec<BlobDigestInfo>,
+    pending_bis_digests: &[DigestInfo],
+) {
+    if pending_bis_digests.is_empty() {
+        return;
+    }
+    let mut already_present: HashSet<DigestInfo> = digest_infos
+        .iter()
+        .filter_map(|info| {
+            info.digest
+                .as_ref()
+                .and_then(|d| DigestInfo::try_from(d.clone()).ok())
+        })
+        .collect();
+    for digest in pending_bis_digests {
+        if already_present.insert(*digest) {
+            digest_infos.push(BlobDigestInfo {
+                digest: Some((*digest).into()),
+            });
+        }
+    }
 }
 
 /// Holds the FilesystemStore reference and change tracker needed for
@@ -2102,12 +2147,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // every Nth steady-state tick to bound divergence against
         // out-of-band server mutations (AcProxy NotFound, BIS-ack
         // sweep, cap-truncation). See [`apply_periodic_tick_memo_resets`].
-        match apply_periodic_tick_memo_resets(
+        let is_heartbeat_tick = match apply_periodic_tick_memo_resets(
             &state.last_sent_ac_pin_set,
             &state.ac_pin_full_snapshot_tick_counter,
             is_first,
         ) {
-            PeriodicTickMemoReset::None | PeriodicTickMemoReset::ReconnectClear => {}
+            PeriodicTickMemoReset::None | PeriodicTickMemoReset::ReconnectClear => false,
             PeriodicTickMemoReset::HeartbeatResync { tick } => {
                 // info! (not debug!) so the heartbeat fires-event survives the
                 // workspace's `release_max_level_info` pin on `tracing`
@@ -2121,8 +2166,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     "forced AC-pin full-snapshot heartbeat: clearing last-sent memo to bound \
                      server↔worker registry divergence"
                 );
+                true
             }
-        }
+        };
         let (digest_infos, evicted_digests, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
@@ -2187,6 +2233,24 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
             (infos, evicted_protos, mirror_added_protos)
         };
+
+        // FL-681 Follow-up B (MAJOR-2 robust close-out): on the periodic
+        // full-snapshot HEARTBEAT (every AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS,
+        // ~6s), re-advertise the worker's still-pending-BIS CAS pin set so a
+        // digest whose `mark_stable` was missed (transient server
+        // `has_with_results` failure) is re-driven to BIS within a bounded
+        // number of ticks — NOT only on reconnect. Folded into `digest_infos`
+        // (deduped); the server's existing `mark_stable`-on-present path absorbs
+        // it idempotently (no server change). Bounded by `indefinite_pin_cap`;
+        // self-pruning as BIS-acks release pins. NOT on every tick (storm risk —
+        // mirrors the AC-pin heartbeat's empty-tick-storm gate); NOT on
+        // `is_first` (the full snapshot already enumerates the whole store,
+        // including indefinite pins). Cheap DashMap snapshot — no `.await` held.
+        let mut digest_infos = digest_infos;
+        if is_heartbeat_tick && !is_first {
+            let pending_bis = state.fs_store.indefinite_pinned_digests();
+            merge_pending_bis_pins_into_digest_infos(&mut digest_infos, &pending_bis);
+        }
 
         // Collect subtree delta or full snapshot.
         let (
@@ -3503,6 +3567,33 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         }
         // Unreachable.
     }
+}
+
+/// FL-681 Follow-up B test seam: drive one
+/// [`LocalWorkerImpl::send_periodic_blobs_available`] tick from the integration
+/// test crate (where the `WorkerApiClientTrait` / `RunningActionsManager` mocks
+/// live), so the heartbeat CAS-pin re-advertisement wiring is exercised
+/// end-to-end without standing up the full worker `run` loop. Same module so it
+/// can reach the private associated fn; `pub` + the test-utils cfg so the
+/// integration crate can call it. `LocalWorkerImpl` itself stays private.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn send_periodic_blobs_available_for_test<
+    T: WorkerApiClientTrait + 'static,
+    U: RunningActionsManager,
+>(
+    grpc_client: &mut T,
+    state: &BlobsAvailableState,
+    running_actions_manager: &Arc<U>,
+    is_first: bool,
+) -> Result<(), Error> {
+    LocalWorkerImpl::<T, U>::send_periodic_blobs_available(
+        grpc_client,
+        state,
+        running_actions_manager,
+        is_first,
+    )
+    .await
 }
 
 type ConnectionFactory<T> = Box<dyn Fn() -> BoxFuture<'static, Result<T, Error>> + Send + Sync>;
@@ -5284,6 +5375,110 @@ mod tests {
             endpoint.ends_with(":40081"),
             "Expected endpoint to end with ':40081', got: {endpoint}"
         );
+    }
+
+    // FL-681 Follow-up B (MAJOR-2 robust close-out): the periodic heartbeat must
+    // re-advertise the worker's pending-BIS CAS pin set, sourced from the REAL
+    // FilesystemStore enumeration (`indefinite_pinned_digests`) and folded into
+    // `digest_infos` via the production fold helper. This is the exact seam
+    // MAJOR-2 flagged untested: a digest whose `mark_stable` was missed is
+    // re-driven to BIS on a HEARTBEAT tick (no reconnect needed).
+    //
+    // Production composition: real `FilesystemStore` (the worker's fast tier) +
+    // the real `indefinite_pinned_digests` enumeration + the real
+    // `merge_pending_bis_pins_into_digest_infos` fold. The only thing not driven
+    // here is the 60-tick counter, which `apply_periodic_tick_memo_resets`
+    // already gates and is covered by the AC-pin heartbeat tests; this test owns
+    // the NEW behavior — the CAS-pin fold itself.
+    #[tokio::test]
+    async fn pending_bis_cas_pins_fold_into_heartbeat_digest_infos() {
+        use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
+        use nativelink_store::filesystem_store::FilesystemStore;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "fl681_b_heartbeat_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let spec = FilesystemSpec {
+            content_path: tmp.join("content").to_string_lossy().into_owned(),
+            temp_path: tmp.join("temp").to_string_lossy().into_owned(),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fs_store: Arc<FilesystemStore> = FilesystemStore::new(&spec).await.unwrap();
+
+        // Write a CAS blob and pin it INDEFINITELY (the pending-BIS state: an F2
+        // output whose durability ack has not yet arrived).
+        let pending = DigestInfo::new([7u8; 32], 6);
+        Pin::new(fs_store.as_ref())
+            .update_oneshot(pending.into(), "hello!".into())
+            .await
+            .unwrap();
+        assert!(
+            fs_store.pin_digest_indefinite_with_result(&pending),
+            "indefinite pin of the pending-BIS digest should succeed"
+        );
+
+        // A normal DELTA tick that does NOT re-touch the pinned digest carries
+        // only an unrelated `added` digest — the pending-BIS digest is absent.
+        let unrelated = DigestInfo::new([8u8; 32], 3);
+        let mut delta_infos = vec![BlobDigestInfo {
+            digest: Some(unrelated.into()),
+        }];
+        let to_digest_set = |infos: &[BlobDigestInfo]| -> HashSet<DigestInfo> {
+            infos
+                .iter()
+                .filter_map(|i| {
+                    i.digest
+                        .as_ref()
+                        .and_then(|d| DigestInfo::try_from(d.clone()).ok())
+                })
+                .collect()
+        };
+        assert!(
+            !to_digest_set(&delta_infos).contains(&pending),
+            "precondition: a non-touching delta tick must NOT already carry the pending-BIS digest"
+        );
+
+        // HEARTBEAT tick: fold the real pending-BIS enumeration in.
+        let pending_bis = fs_store.indefinite_pinned_digests();
+        merge_pending_bis_pins_into_digest_infos(&mut delta_infos, &pending_bis);
+        let folded = to_digest_set(&delta_infos);
+        assert!(
+            folded.contains(&pending),
+            "heartbeat re-advertisement failed: the pending-BIS digest whose mark_stable was \
+             missed was NOT folded into digest_infos — it would never reach BIS until a reconnect"
+        );
+        assert!(
+            folded.contains(&unrelated),
+            "the fold must PRESERVE the tick's existing delta digests, not replace them"
+        );
+        // Dedup: re-folding the same set must not duplicate the entry.
+        let len_before = delta_infos.len();
+        merge_pending_bis_pins_into_digest_infos(&mut delta_infos, &pending_bis);
+        assert_eq!(
+            delta_infos.len(),
+            len_before,
+            "the fold must DEDUP — a pending-BIS digest already in digest_infos must not be \
+             re-appended, or the heartbeat payload grows unbounded on re-advertisement"
+        );
+
+        // Self-pruning: after a BIS-ack `unpin_digest`, the released digest must
+        // drop out of the enumeration so the NEXT heartbeat does not re-advertise it.
+        fs_store.unpin_digest(&pending);
+        assert!(
+            fs_store.indefinite_pinned_digests().is_empty(),
+            "after a BIS-ack unpin the released digest must drop out of the heartbeat set \
+             (self-pruning); otherwise the worker re-advertises an already-durable blob forever"
+        );
+
+        drop(tokio::fs::remove_dir_all(&tmp).await);
     }
 }
 

@@ -1219,6 +1219,25 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.indefinite_pin_saturated()
     }
 
+    /// FL-681 Follow-up B (MAJOR-2 robust close-out): enumerate the worker's
+    /// pending-BIS (indefinite-pinned) CAS digests. The worker folds these into
+    /// the periodic BlobsAvailable heartbeat's `digest_infos` so a digest whose
+    /// `mark_stable` was missed (transient server existence-check failure) is
+    /// re-driven to BIS within a bounded number of heartbeat ticks, without
+    /// waiting for a reconnect. String-keyed entries are skipped (mirrors
+    /// `get_all_digests_with_timestamps`). Bounded by the indefinite-pin cap;
+    /// self-pruning (a BIS-ack `unpin_digest` drops the digest from the set).
+    pub fn indefinite_pinned_digests(&self) -> Vec<DigestInfo> {
+        self.evicting_map
+            .indefinite_pinned_digests()
+            .into_iter()
+            .filter_map(|key_borrow| match StoreKey::from(key_borrow) {
+                StoreKey::Digest(digest) => Some(digest),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// FL-681 Fix A fix-up: total bytes held by ALL pins (time-bounded +
     /// indefinite). Doc-hidden test observability — the MAJOR-1b test
     /// asserts a cap-refused F2 output still holds a (time-bounded) pin,
