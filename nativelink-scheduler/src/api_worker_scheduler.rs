@@ -1266,6 +1266,11 @@ impl ApiWorkerSchedulerImpl {
         // rather than swallowing every complete_action error, so any other
         // (future) complete_action error shape still propagates.
         if !worker.running_action_infos.contains_key(operation_id) {
+            // A concurrent finalize removed the op (and freed its slot) during
+            // the lock-free window. Notify unconditionally — restoring the
+            // pre-B1 behaviour where every update_action exit woke the matcher —
+            // so the headroom that concurrent free created is never stranded.
+            self.worker_change_notify.notify_one();
             return Cs2Outcome::AlreadyFinalized;
         }
 
