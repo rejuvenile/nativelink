@@ -718,7 +718,7 @@ fn classify_retryable(err: &Error) -> RetryDecision {
 /// is the only producer — but a malformed wire is not catastrophic
 /// since we still cap at `MAX_RETRY_AFTER`).
 fn decode_retry_after(err: &Error) -> Duration {
-    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BACKPRESSURE_SIGNAL_TYPE_URL;
+    use nativelink_proto::type_urls::BACKPRESSURE_SIGNAL_TYPE_URL;
     for any in &err.details {
         if any.type_url != BACKPRESSURE_SIGNAL_TYPE_URL {
             continue;
@@ -782,7 +782,10 @@ impl PreparedChunk {
             digest: Some(digest.into()),
             chunk_offset: self.chunk_offset,
             chunk_bytes: self.chunk_bytes,
-            chunk_sha256: self.chunk_sha256.to_vec(),
+            // `WriteChunk.chunk_sha256` is `bytes::Bytes` (proto `bytes`
+            // mapped via `config.bytes(["."])`); copy the fixed 32-byte
+            // hash in directly.
+            chunk_sha256: Bytes::copy_from_slice(&self.chunk_sha256),
             finish_chunk: self.finish,
         }
     }

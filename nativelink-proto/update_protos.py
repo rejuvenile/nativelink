@@ -61,8 +61,8 @@ def update(proto_packages):
     for pkg in proto_packages:
         with open(repo_file_path(pkg), "wb") as outfile:
             outfile.write(expected_contents(pkg))
-    with open(_REPO_DIR + "/lib.rs", "wb") as outfile:
-        with open(_BAZEL_DIR + "/lib.rs", "rb") as infile:
+    with open(_REPO_DIR + "/modules.rs", "wb") as outfile:
+        with open(_BAZEL_DIR + "/modules.rs", "rb") as infile:
             outfile.write(infile.read())
 
 
@@ -85,16 +85,16 @@ def check(proto_packages):
             print("%s out of date" % dst)
             failed = True
 
-    # Now check the lib.rs file.
-    dst = _REPO_DIR + "/lib.rs"
+    # Now check the generated module-tree file.
+    dst = _REPO_DIR + "/modules.rs"
     try:
-        with open(_BAZEL_DIR + "/lib.rs", "rb") as infile:
+        with open(_BAZEL_DIR + "/modules.rs", "rb") as infile:
             expected = infile.read()
         with open(dst, "rb") as infile:
             actual = infile.read()
     except OSError as e:
         failed = True
-        print("Could not read package lib.rs: %s" % e)
+        print("Could not read package modules.rs: %s" % e)
     # Ignore differences between newlines on Unix and Windows.
     if expected.splitlines() == actual.splitlines():
         print("%s OK" % dst)

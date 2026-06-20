@@ -62,14 +62,14 @@ pub mod operation {
     }
 }
 /// The request message for [Operations.GetOperation][google.longrunning.Operations.GetOperation].
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetOperationRequest {
     /// The name of the operation resource.
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
 /// The request message for [Operations.ListOperations][google.longrunning.Operations.ListOperations].
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListOperationsRequest {
     /// The name of the operation's parent resource.
     #[prost(string, tag = "4")]
@@ -95,21 +95,21 @@ pub struct ListOperationsResponse {
     pub next_page_token: ::prost::alloc::string::String,
 }
 /// The request message for [Operations.CancelOperation][google.longrunning.Operations.CancelOperation].
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelOperationRequest {
     /// The name of the operation resource to be cancelled.
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
 /// The request message for [Operations.DeleteOperation][google.longrunning.Operations.DeleteOperation].
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteOperationRequest {
     /// The name of the operation resource to be deleted.
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
 /// The request message for [Operations.WaitOperation][google.longrunning.Operations.WaitOperation].
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WaitOperationRequest {
     /// The name of the operation resource to wait on.
     #[prost(string, tag = "1")]
@@ -131,7 +131,7 @@ pub struct WaitOperationRequest {
 ///        metadata_type: "LongRunningRecognizeMetadata"
 ///      };
 ///    }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OperationInfo {
     /// Required. The message name of the primary return type for this
     /// long-running operation.

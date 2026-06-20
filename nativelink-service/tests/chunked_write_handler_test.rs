@@ -44,8 +44,9 @@ use hyper::body::Frame;
 use nativelink_config::stores::FilesystemSpec;
 use nativelink_macro::nativelink_test;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, WriteChunk, backpressure_signal,
+    BackpressureSignal, WriteChunk, backpressure_signal,
 };
+use nativelink_proto::type_urls::BACKPRESSURE_SIGNAL_TYPE_URL;
 use nativelink_service::chunked_write_handler::{
     ChunkedWriteHandler, ChunkedWriteInFlight, wait_for_no_in_flight,
 };
@@ -154,7 +155,7 @@ fn make_chunk(
         digest: Some(digest.into()),
         chunk_offset,
         chunk_bytes: Bytes::copy_from_slice(chunk_bytes),
-        chunk_sha256: sha256(chunk_bytes).to_vec(),
+        chunk_sha256: sha256(chunk_bytes).to_vec().into(),
         finish_chunk: finish,
     }
 }
@@ -648,7 +649,7 @@ async fn handler_447_watchdog_fires_when_inflight_commit_wedges() {
     // Aborted+BackpressureSignal shape. Mirrors v1 commit-runner
     // (`chunked_write_handler.rs:2354-2358`) and #508 v2 awaiter
     // (`chunked_write_handler_v2.rs::v2_await_commit_result` post-#508).
-    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL;
+    use nativelink_proto::type_urls::WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL;
     use nativelink_store::chunked_signal::error_has_watchdog_timeout_signal;
     let err: nativelink_error::Error = status_b.into();
     // Producer-side seam: the discriminator MUST appear in details
@@ -907,7 +908,7 @@ async fn handler_per_chunk_sha256_mismatch_returns_invalid_argument() {
 
     let mut bad_chunk = make_chunk(digest, 0, &blob, true);
     // Lie about the per-chunk hash.
-    bad_chunk.chunk_sha256 = vec![0xffu8; 32];
+    bad_chunk.chunk_sha256 = vec![0xffu8; 32].into();
     tokio::time::timeout(Duration::from_secs(5), async {
         tx.send(frame_chunk(&bad_chunk)).await.unwrap();
         drop(tx);
@@ -1278,7 +1279,7 @@ async fn handler_zero_byte_blob_commits_with_single_finish_chunk() {
             digest: Some(digest.into()),
             chunk_offset: 0,
             chunk_bytes: Bytes::new(),
-            chunk_sha256: EMPTY_SHA256.to_vec(),
+            chunk_sha256: EMPTY_SHA256.to_vec().into(),
             finish_chunk: true,
         };
         tx.send(frame_chunk(&chunk))
@@ -1347,7 +1348,7 @@ async fn handler_zero_byte_blob_rejects_non_empty_digest_hash() {
         digest: Some(digest.into()),
         chunk_offset: 0,
         chunk_bytes: Bytes::new(),
-        chunk_sha256: EMPTY_SHA256.to_vec(),
+        chunk_sha256: EMPTY_SHA256.to_vec().into(),
         finish_chunk: true,
     };
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1400,7 +1401,7 @@ async fn handler_chunk_offset_not_multiple_of_chunk_size_returns_invalid_argumen
         digest: Some(digest.into()),
         chunk_offset: 1,
         chunk_bytes: Bytes::from(vec![0u8; CHUNK]),
-        chunk_sha256: sha256(&vec![0u8; CHUNK]).to_vec(),
+        chunk_sha256: sha256(&vec![0u8; CHUNK]).to_vec().into(),
         finish_chunk: false,
     };
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1450,7 +1451,7 @@ async fn handler_non_final_chunk_with_wrong_length_returns_invalid_argument() {
         digest: Some(digest.into()),
         chunk_offset: 0,
         chunk_bytes: Bytes::from(payload.clone()),
-        chunk_sha256: sha256(&payload).to_vec(),
+        chunk_sha256: sha256(&payload).to_vec().into(),
         finish_chunk: false,
     };
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1591,7 +1592,7 @@ async fn handler_final_chunk_total_length_mismatch_returns_invalid_argument() {
         digest: Some(digest.into()),
         chunk_offset: 0,
         chunk_bytes: Bytes::from(payload.clone()),
-        chunk_sha256: sha256(&payload).to_vec(),
+        chunk_sha256: sha256(&payload).to_vec().into(),
         finish_chunk: true,
     };
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -2135,7 +2136,7 @@ async fn handler_subsequent_chunk_parse_digest_err_eagerly_discards_partial() {
             digest: None,
             chunk_offset: CHUNK as u64,
             chunk_bytes: Bytes::copy_from_slice(&blob[CHUNK..2 * CHUNK]),
-            chunk_sha256: sha256(&blob[CHUNK..2 * CHUNK]).to_vec(),
+            chunk_sha256: sha256(&blob[CHUNK..2 * CHUNK]).to_vec().into(),
             finish_chunk: true,
         };
         tx.send(frame_chunk(&bad)).await.unwrap();
@@ -2223,7 +2224,7 @@ async fn handler_subsequent_chunk_admit_err_eagerly_discards_partial() {
         // Send chunk 1 with WRONG sha256 → admit_chunk's SHA-256
         // verify fails (line 511 path).
         let mut bad = make_chunk(digest, CHUNK as u64, &blob[CHUNK..2 * CHUNK], true);
-        bad.chunk_sha256 = vec![0xffu8; 32]; // intentionally wrong
+        bad.chunk_sha256 = vec![0xffu8; 32].into(); // intentionally wrong
         tx.send(frame_chunk(&bad)).await.unwrap();
         drop(tx);
     })
@@ -2346,7 +2347,7 @@ async fn handler_bounds_discard_partial_under_wedged_slow_tier() {
             digest: None,
             chunk_offset: CHUNK as u64,
             chunk_bytes: Bytes::copy_from_slice(&blob[CHUNK..2 * CHUNK]),
-            chunk_sha256: sha256(&blob[CHUNK..2 * CHUNK]).to_vec(),
+            chunk_sha256: sha256(&blob[CHUNK..2 * CHUNK]).to_vec().into(),
             finish_chunk: true,
         };
         tx.send(frame_chunk(&bad)).await.unwrap();

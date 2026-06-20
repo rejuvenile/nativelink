@@ -1266,7 +1266,7 @@ async fn v1_worker_dispatcher_dispatch_emits_wire_shape_log() {
         digest: Some(digest.into()),
         chunk_offset: 0,
         chunk_bytes: Bytes::from(blob),
-        chunk_sha256: vec![0u8; 32], // SHA not verified pre-dispatch
+        chunk_sha256: vec![0u8; 32].into(), // SHA not verified pre-dispatch
         finish_chunk: true,
     };
     let _ = tokio::time::timeout(
@@ -1333,7 +1333,7 @@ async fn v2_worker_dispatcher_dispatch_emits_wire_shape_log() {
         digest: Some(digest.into()),
         chunk_offset: 0,
         chunk_bytes: Bytes::from(blob),
-        chunk_sha256: vec![0u8; 32],
+        chunk_sha256: vec![0u8; 32].into(),
         finish_chunk: true,
     };
     let _ = tokio::time::timeout(

@@ -134,7 +134,7 @@ fn build_chunks(digest: DigestInfo, payload: &[u8]) -> Vec<WriteChunk> {
             digest: Some(digest.into()),
             chunk_offset: offset,
             chunk_bytes: Bytes::copy_from_slice(bytes),
-            chunk_sha256: sha256(bytes).to_vec(),
+            chunk_sha256: sha256(bytes).to_vec().into(),
             finish_chunk: is_last_iter,
         });
         offset += bytes.len() as u64;

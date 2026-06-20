@@ -484,7 +484,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             // Per-chunk SHA-256 verify before pwrite. Mismatch = rollback
             // the in-flight slot (no bit set), report InvalidArgument
             // to the client.
-            let chunk_sha256_arr: [u8; 32] = match chunk.chunk_sha256.as_slice().try_into() {
+            let chunk_sha256_arr: [u8; 32] = match chunk.chunk_sha256.as_ref().try_into() {
                 Ok(a) => a,
                 Err(_) => {
                     race_state.release_chunk_in_flight(writer_id, chunk_offset);

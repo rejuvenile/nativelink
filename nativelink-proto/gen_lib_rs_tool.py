@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generates a lib.rs file from input proto files."""
+"""Generates the proto module tree (genproto/modules.rs) from input proto files.
+
+The output is `include!`d by the hand-maintained crate root
+`nativelink-proto/src/lib.rs`. It contains ONLY the generated `pub mod` tree —
+the crate-level `#![allow(...)]` lints and any hand-maintained, non-generated
+items (e.g. `type_urls`) live in the hand-maintained crate root, which is
+NEVER touched by regeneration. This keeps `genproto/` 100% generated so that
+`bazel run nativelink-proto:update_protos` is idempotent.
+"""
 
 import argparse
 import os
@@ -35,25 +43,10 @@ _HEADER = """\
 // *** DO NOT MODIFY ***
 // This file is auto-generated. To update it, run:
 // `bazel run nativelink-proto:update_protos`
-
-#![allow(
-    unknown_lints,
-    unused_qualifications,
-    clippy::alloc_instead_of_core,
-    clippy::default_trait_access,
-    clippy::derive_partial_eq_without_eq,
-    clippy::doc_lazy_continuation,
-    clippy::doc_link_with_quotes,
-    clippy::doc_markdown,
-    clippy::doc_overindented_list_items,
-    clippy::large_enum_variant,
-    clippy::missing_const_for_fn,
-    clippy::similar_names,
-    clippy::std_instead_of_core,
-    clippy::use_self,
-    rustdoc::broken_intra_doc_links,
-    rustdoc::invalid_html_tags
-)]
+//
+// It is `include!`d by the hand-maintained crate root
+// `nativelink-proto/src/lib.rs`. Crate-level `#![allow(...)]` lints and
+// non-generated items live there, NOT here.
 """
 
 

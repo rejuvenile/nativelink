@@ -64,8 +64,9 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, backpressure_signal,
+    BackpressureSignal, backpressure_signal,
 };
+use nativelink_proto::type_urls::BACKPRESSURE_SIGNAL_TYPE_URL;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;

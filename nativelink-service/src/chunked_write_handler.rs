@@ -1602,7 +1602,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         } = chunk;
 
         // Step 1: per-chunk SHA-256 byte shape.
-        let chunk_sha256_arr: [u8; 32] = match chunk_sha256.as_slice().try_into() {
+        let chunk_sha256_arr: [u8; 32] = match chunk_sha256.as_ref().try_into() {
             Ok(a) => a,
             Err(_) => {
                 return Err(make_input_err!(
@@ -1726,7 +1726,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         }
 
         // (1) per-chunk SHA-256: must equal EMPTY_SHA256.
-        let chunk_sha256_arr: [u8; 32] = match first_chunk.chunk_sha256.as_slice().try_into() {
+        let chunk_sha256_arr: [u8; 32] = match first_chunk.chunk_sha256.as_ref().try_into() {
             Ok(a) => a,
             Err(_) => {
                 return Err(make_input_err!(

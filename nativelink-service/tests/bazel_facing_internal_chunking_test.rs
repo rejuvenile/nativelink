@@ -889,8 +889,9 @@ async fn chunk_budget_total_permits_is_4096() {
 #[nativelink_test]
 async fn pin_budget_cap_rejects_admission_with_pinned_bytes_exhausted_signal() {
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-        BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, backpressure_signal,
+        BackpressureSignal, backpressure_signal,
     };
+    use nativelink_proto::type_urls::BACKPRESSURE_SIGNAL_TYPE_URL;
     use prost::Message as _;
 
     const CHUNK: usize = 4 * 1024;

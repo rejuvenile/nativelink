@@ -221,6 +221,10 @@ async fn build_ac_filesystem_store(
         fadvise_dontneed: false,
         max_concurrent_large_reads: 0,
         large_read_threshold_bytes: 4 * 1024 * 1024,
+        // 0 = use `pin_cap` (FilesystemSpec default). The AC bench fixture
+        // has no indefinite-pin cap to exercise. Field added by #FL-681
+        // follow-up `b73a1f94`; this explicit literal predated it.
+        pending_bis_pin_max_bytes: 0,
     };
     let fs_arc: Arc<FilesystemStore> = FilesystemStore::new(&spec).await?;
     Ok((Store::new(fs_arc), temp_dir))

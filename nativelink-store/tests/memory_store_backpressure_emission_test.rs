@@ -51,8 +51,9 @@ use nativelink_config::stores::{EvictionPolicy, MemorySpec, StoreSpec, VerifySpe
 use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, backpressure_signal,
+    BackpressureSignal, backpressure_signal,
 };
+use nativelink_proto::type_urls::BACKPRESSURE_SIGNAL_TYPE_URL;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::common::DigestInfo;

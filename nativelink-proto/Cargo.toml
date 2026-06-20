@@ -6,7 +6,7 @@ version = "1.0.0"
 
 [lib]
 name = "nativelink_proto"
-path = "genproto/lib.rs"
+path = "src/lib.rs"
 
 [dependencies]
 derive_more = { version = "2.0.1", default-features = false, features = [

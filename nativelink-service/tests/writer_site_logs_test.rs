@@ -596,7 +596,7 @@ fn make_chunk(
         digest: Some(digest.into()),
         chunk_offset,
         chunk_bytes: Bytes::copy_from_slice(chunk_bytes),
-        chunk_sha256: sha256(chunk_bytes).to_vec(),
+        chunk_sha256: sha256(chunk_bytes).to_vec().into(),
         finish_chunk: finish,
     }
 }

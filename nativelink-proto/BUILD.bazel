@@ -81,6 +81,7 @@ genrule(
         "build/bazel/remote/asset/v1/remote_asset.proto",
         "build/bazel/remote/execution/v2/remote_execution.proto",
         "build/bazel/semver/semver.proto",
+        "com/github/trace_machina/nativelink/remote_execution/cas_extensions.proto",
         "com/github/trace_machina/nativelink/remote_execution/events.proto",
         "com/github/trace_machina/nativelink/remote_execution/worker_api.proto",
         "google/api/annotations.proto",
@@ -140,14 +141,22 @@ py_binary(
 genrule(
     name = "gen_lib_rs",
     srcs = [":gen_rs_protos"],
-    outs = ["lib.rs"],
+    outs = ["modules.rs"],
     cmd = "$(execpath :gen_lib_rs_tool) --rootdir $(RULEDIR) $(SRCS) > $@",
     tools = [":gen_lib_rs_tool"],
 )
 
 rust_library(
     name = "nativelink-proto",
-    srcs = glob(["genproto/*.rs"]),
+    # Hand-maintained crate root (`src/lib.rs`) `include!`s the generated module
+    # tree (`genproto/modules.rs`) and adds non-generated items (`type_urls`).
+    # The crate root + the generated `genproto/*.rs` are all srcs so the
+    # relative `include!`s resolve in the sandbox.
+    srcs = [
+        "src/lib.rs",
+        "src/type_urls.rs",
+    ] + glob(["genproto/*.rs"]),
+    crate_root = "src/lib.rs",
     tags = ["no-rustfmt"],
     visibility = ["//visibility:public"],
     deps = [

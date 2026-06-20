@@ -104,7 +104,7 @@ fn make_chunk(digest: DigestInfo, offset: u64, bytes: &[u8], finish: bool) -> Wr
         digest: Some(digest.into()),
         chunk_offset: offset,
         chunk_bytes: Bytes::copy_from_slice(bytes),
-        chunk_sha256: sha256(bytes).to_vec(),
+        chunk_sha256: sha256(bytes).to_vec().into(),
         finish_chunk: finish,
     }
 }

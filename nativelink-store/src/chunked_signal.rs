@@ -32,8 +32,10 @@
 
 use nativelink_error::Error;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
-    WatchdogTimeoutSignal, backpressure_signal, watchdog_timeout_signal,
+    BackpressureSignal, WatchdogTimeoutSignal, backpressure_signal, watchdog_timeout_signal,
+};
+use nativelink_proto::type_urls::{
+    BACKPRESSURE_SIGNAL_TYPE_URL, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
 };
 use prost::Message;
 
@@ -185,8 +187,10 @@ pub fn error_has_watchdog_timeout_signal(err: &Error) -> bool {
 mod tests {
     use nativelink_error::{Code, Error, make_err};
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-        BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
-        WatchdogTimeoutSignal, backpressure_signal, watchdog_timeout_signal,
+        BackpressureSignal, WatchdogTimeoutSignal, backpressure_signal, watchdog_timeout_signal,
+    };
+    use nativelink_proto::type_urls::{
+        BACKPRESSURE_SIGNAL_TYPE_URL, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
     };
     use prost::Message;
 

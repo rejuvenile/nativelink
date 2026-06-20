@@ -752,7 +752,7 @@ pub(crate) mod enabled {
         WriteChunk {
             digest: Some(digest.into()),
             chunk_offset: offset,
-            chunk_sha256: chunk_hash(&chunk_bytes).to_vec(),
+            chunk_sha256: chunk_hash(&chunk_bytes).to_vec().into(),
             chunk_bytes,
             finish_chunk: finish,
         }
