@@ -24,7 +24,8 @@ fn main() -> std::io::Result<()> {
     let paths = matches
         .get_many::<String>("inputs")
         .unwrap()
-        .collect::<Vec<&String>>();
+        .map(String::as_str)
+        .collect::<Vec<&str>>();
     let output_dir = PathBuf::from(matches.get_one::<String>("output_dir").unwrap());
 
     let mut config = Config::new();
@@ -48,8 +49,8 @@ fn main() -> std::io::Result<()> {
 
     config.skip_debug(structs_with_data_to_ignore.keys());
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .out_dir(output_dir)
-        .compile_protos_with_config(config, &paths, &["nativelink-proto"])?;
+        .compile_with_config(config, &paths, &["nativelink-proto"])?;
     Ok(())
 }

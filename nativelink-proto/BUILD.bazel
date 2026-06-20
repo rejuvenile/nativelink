@@ -35,7 +35,7 @@ rust_binary(
     deps = [
         "@crates//:clap",
         "@crates//:prost-build",
-        "@crates//:tonic-build",
+        "@crates//:tonic-prost-build",
     ],
 )
 
