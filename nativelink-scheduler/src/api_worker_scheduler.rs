@@ -1375,6 +1375,39 @@ impl ApiWorkerSchedulerImpl {
             dispatch_at_us = phase6_dispatch_at_us,
             "phase6 scheduler dispatching StartAction"
         );
+        // #queue-attrib: attribute the worker-reported `queue_ms`
+        // (running_actions_manager.rs Action-phase-timing). That figure lumps
+        // accept→worker-pickup into one number; we cannot tell scheduler-match
+        // time from StartExecute-delivery + worker-accept. This INFO line carves
+        // out the FIRST sub-interval: `match_latency_ms` = how long the action
+        // sat in the scheduler from Execute-accept (the server-stamped
+        // `insert_timestamp`, forwarded as `queued_timestamp` on StartExecute
+        // above) until a worker was assigned (this dispatch instant). The
+        // operator then derives delivery+accept = worker `queue_ms` −
+        // `match_latency_ms`.
+        //
+        // MUST be `info!`, not `debug!`: the release build pins
+        // `release_max_level_info`, so `debug!`/`trace!` are compiled out (the
+        // sibling `phase6_scheduler_dispatch` debug probe is invisible in prod
+        // for exactly this reason). Per-action emit (~0.44/s busy hour) — not a
+        // hot loop; both dispatch call sites (`inner_find_and_reserve_worker`
+        // and `worker_notify_run_action`) funnel through here, so one line
+        // covers every assignment. saturating_sub guards a clock that ran
+        // backwards (returns 0 rather than wrapping).
+        let queued_at_us = action_info
+            .inner
+            .insert_timestamp
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let match_latency_ms = phase6_dispatch_at_us.saturating_sub(queued_at_us) / 1000;
+        info!(
+            tag = "scheduler_dispatch_attribution",
+            %operation_id,
+            ?worker_id,
+            match_latency_ms,
+            "scheduler assigned action to worker; latency is the accept→worker-assigned interval"
+        );
         Some((tx, msg))
     }
 

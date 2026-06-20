@@ -4725,3 +4725,85 @@ async fn phase6_probe_p_sched_dispatch_fires_on_action_assignment() -> Result<()
 
     Ok(())
 }
+
+// #queue-attrib: the scheduler emits an INFO line at the moment it assigns
+// an action to a worker, carrying `match_latency_ms` = (dispatch wall-clock −
+// queued/insert timestamp). This is the accept→worker-assigned sub-interval of
+// the worker-side `queue_ms` (running_actions_manager.rs Action-phase-timing),
+// letting an operator split queue delay into scheduler-match vs delivery+accept.
+//
+// CRITICAL: this assertion checks the emit LEVEL, not just the message text.
+// `logs_contain` cannot distinguish `info!` from `debug!` (both fire under the
+// debug-profile test subscriber), which is exactly how the sibling
+// phase6_scheduler_dispatch probe silently became invisible in prod when a
+// log-demotion sweep flipped it info!→debug! on 2026-06-13 — a `release_max_level_info`
+// release build compiles `debug!` out entirely. `logs_assert` hands us the
+// level-prefixed formatted lines (tracing-test's FmtSubscriber sets
+// `.with_level(true)`), so we assert the line is INFO-level — the only level
+// that survives `release_max_level_info`.
+//
+// Mutation A: change `info!` → `debug!` at the new dispatch-attribution site in
+// api_worker_scheduler.rs. This test must red-fail with the bespoke
+// "match_latency_ms dispatch-attribution line not emitted at INFO" message,
+// because a DEBUG line is no longer at INFO level.
+// Mutation B: remove the `match_latency_ms` field. Same red-fail (field absent).
+#[nativelink_test]
+async fn dispatch_attribution_match_latency_emitted_at_info() -> Result<(), Error> {
+    let worker_id = WorkerId("dispatch_attrib_worker".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+    let action_digest = DigestInfo::new([9u8; 32], 512);
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    let insert_timestamp = make_system_time(1);
+    let _action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp)
+            .await
+            .unwrap();
+
+    // Draining StartAction guarantees the dispatch path (prepare_worker_run_action)
+    // ran — the attribution line is emitted on that same path.
+    let _msg_for_worker = rx_from_worker
+        .recv()
+        .await
+        .expect("worker must receive StartAction — dispatch-attribution line is on this path");
+
+    // Assert the attribution line fired AT INFO level. logs_assert gives us the
+    // level-prefixed formatted lines (`.with_level(true)`); a single line must
+    // carry both the INFO token and the structured `match_latency_ms=` field.
+    // Match the structured-field form (`match_latency_ms=`, no surrounding
+    // spaces) rather than the bare token so the assertion cannot be satisfied by
+    // a message string that merely mentions the field name — only the emitted
+    // structured field produces `match_latency_ms=<n>`.
+    logs_assert(|lines: &[&str]| {
+        if lines
+            .iter()
+            .any(|line| line.contains("INFO") && line.contains("match_latency_ms="))
+        {
+            Ok(())
+        } else {
+            Err(
+                "match_latency_ms dispatch-attribution line not emitted at INFO"
+                    .to_string(),
+            )
+        }
+    });
+
+    Ok(())
+}
