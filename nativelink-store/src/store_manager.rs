@@ -82,9 +82,14 @@ impl StoreManager {
         // BLOCK-1 fix (#335 follow-up): the previous local walker
         // descended `inner_store(None)`, which terminates at
         // `SizePartitioningStore` (its `inner_store(None)` returns
-        // `self`). For the production composition
-        // (`WorkerProxyStore` → `ExistenceCacheStore` → `VerifyStore` →
-        // `SizePartitioningStore` → `FastSlowStore`), the walker
+        // `self`). For the production composition (verified against
+        // `prod-server.json5:169-230`, SHA 139a0653: `cas_STORE` IS the
+        // `VerifyStore`, which wraps `cas_INNER = ExistenceCacheStore` —
+        // the prior version of this comment had Verify/ExistenceCache swapped)
+        // (`WorkerProxyStore` → `VerifyStore` → `ExistenceCacheStore(50M)` →
+        // `SizePartitioningStore(16384)` → {lower `SMALL_CAS_CACHED` =
+        // FSS{Memory→Redis}; upper `cas_FAST_SLOW_STORE` =
+        // FSS{Memory→Filesystem}}), the walker
         // returned `None` and `flush_slow_writes` silently logged
         // "no FastSlowStore registered; skipping" on every SIGTERM —
         // defeating the #210 graceful-shutdown fix. Migrate to the

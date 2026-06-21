@@ -42,7 +42,7 @@ use nativelink_proto::google::bytestream::{
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::small_blob_dispatcher::{SMALL_BLOB_THRESHOLD, SmallBlobDispatcher};
 use nativelink_store::store_manager::StoreManager;
-use nativelink_store::worker_proxy_store::WorkerProxyStore;
+use nativelink_store::worker_proxy_store::{WorkerProxyStore, ack_gate_budget_singleton};
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair_with_size,
 };
@@ -1991,6 +1991,95 @@ impl ByteStreamServer {
         })) as ReadStream)
     }
 
+    /// #FL-688 chunked-path ack-gate resolver. Given the tee mirror's
+    /// [`MirrorConfirmOutcome`] (and the now-durably-written, fast-tier-pinned
+    /// blob), decide whether the ≥2-replica invariant holds and the write may
+    /// ack:
+    ///
+    ///   - `Confirmed` → Ok (a worker holds the 2nd replica).
+    ///   - `NoPeers`   → await the slow-tier write
+    ///     ([`WorkerProxyStore::confirm_via_slow_store`]); degraded fallback,
+    ///     normal-path slow write stays async.
+    ///   - `Failed`    → RE-DRIVE: read the blob back from the just-written,
+    ///     pinned fast-tier copy and run the backpressure-safe in-hand
+    ///     [`WorkerProxyStore::ack_gated_write`] equivalent
+    ///     ([`WorkerProxyStore::mirror_and_confirm_data`]). If that ALSO
+    ///     reports `NoPeers`, await the slow tier; if it Fails, refuse the ack.
+    ///
+    /// The re-drive reads the blob into memory under an [`AckGateBudget`]
+    /// permit (BACKPRESSURE if the budget is full) so the re-drive cannot grow
+    /// in-flight memory without bound. Re-drive only fires on the rare tee
+    /// miss (no permit / stream error / backpressure chunk-drop), not the
+    /// steady-state confirmed path.
+    async fn confirm_chunked_replica(
+        &self,
+        instance_info: &InstanceInfo,
+        digest: DigestInfo,
+        expected_size: u64,
+        outcome: nativelink_store::worker_proxy_store::MirrorConfirmOutcome,
+    ) -> Result<(), Error> {
+        use nativelink_store::worker_proxy_store::MirrorConfirmOutcome;
+        let store = &instance_info.store;
+        // WorkerProxyStore is the OUTERMOST driver (see `has_proxy` above);
+        // `as_store_driver()` returns it, while `Store::downcast_ref` would
+        // delegate past it via `inner_store()`.
+        let Some(proxy) = store
+            .as_store_driver()
+            .as_any()
+            .downcast_ref::<WorkerProxyStore>()
+        else {
+            // No proxy in this composition — nothing to gate on. (has_proxy
+            // gated tee creation, so this is only reachable in test/edge
+            // compositions; treat as satisfied.)
+            return Ok(());
+        };
+        match outcome {
+            MirrorConfirmOutcome::Confirmed => Ok(()),
+            MirrorConfirmOutcome::NoPeers => proxy
+                .confirm_via_slow_store(
+                    digest,
+                    store
+                        .get_part_unchunked(digest, 0, None)
+                        .await
+                        .err_tip(|| {
+                            "confirm_chunked_replica: read-back for no-peer \
+                             slow-tier confirmation failed"
+                        })?,
+                )
+                .await
+                .err_tip(|| {
+                    "confirm_chunked_replica: no worker peers and slow-tier \
+                     confirmation failed — refusing to ack with <2 replicas"
+                }),
+            MirrorConfirmOutcome::Failed(_) => {
+                // RE-DRIVE from the pinned fast-tier copy. Bound the read-back
+                // bytes with the ack-gate budget (backpressure).
+                let size = usize::try_from(expected_size).unwrap_or(usize::MAX);
+                let _ack_permit = ack_gate_budget_singleton().acquire(size).await;
+                let data = store
+                    .get_part_unchunked(digest, 0, None)
+                    .await
+                    .err_tip(|| {
+                        "confirm_chunked_replica: read-back for mirror re-drive failed"
+                    })?;
+                match proxy.mirror_and_confirm_data(digest, data.clone()).await {
+                    MirrorConfirmOutcome::Confirmed => Ok(()),
+                    MirrorConfirmOutcome::NoPeers => proxy
+                        .confirm_via_slow_store(digest, data)
+                        .await
+                        .err_tip(|| {
+                            "confirm_chunked_replica: re-drive found no peers \
+                             and slow-tier confirmation failed"
+                        }),
+                    MirrorConfirmOutcome::Failed(e) => Err(e).err_tip(|| {
+                        "confirm_chunked_replica: mirror re-drive could not \
+                         confirm a 2nd replica — refusing to ack with <2 replicas"
+                    }),
+                }
+            }
+        }
+    }
+
     // We instrument tracing here as well as below because `stream` has a hash on it
     // that is extracted from the first stream message. If we only implemented it below
     // we would not have the hash available to us.
@@ -2288,6 +2377,11 @@ impl ByteStreamServer {
                 .as_any()
                 .downcast_ref::<WorkerProxyStore>()
                 .is_some();
+        // #FL-688: the tee task now RETURNS its confirmation outcome (was
+        // fire-and-forget `()`), and the handler AWAITS it to gate the write
+        // response on local-Ok AND ≥1-mirror-Ok. The tee still runs
+        // CONCURRENTLY with the store write (target ack latency =
+        // max(local, mirror)); only the RESULT is now joined, not dropped.
         let (mut mirror_tx_opt, mirror_handle) = if has_proxy {
             let (mtx, mrx) = make_buf_channel_pair_with_size(16);
             let store_clone = instance_info.store.clone();
@@ -2297,9 +2391,11 @@ impl ByteStreamServer {
                     .as_any()
                     .downcast_ref::<WorkerProxyStore>()
                 else {
-                    return;
+                    // No proxy (shouldn't happen — has_proxy gated this) —
+                    // treat as no-peer so the handler awaits the slow tier.
+                    return nativelink_store::worker_proxy_store::MirrorConfirmOutcome::NoPeers;
                 };
-                proxy.mirror_blob_via_stream(digest, mrx).await;
+                proxy.mirror_via_stream_and_confirm(digest, mrx).await
             });
             (Some(mtx), Some(handle))
         } else {
@@ -2560,12 +2656,48 @@ impl ByteStreamServer {
             }
         }
 
-        // Propagate the result after streaming blob cleanup.
+        // Propagate the result after streaming blob cleanup. `write_result`
+        // Ok ⇒ the LOCAL store write (fast tier + pin) succeeded — half of the
+        // ≥2-replica invariant.
         write_result?;
 
-        // Fire-and-forget: drop the mirror handle without awaiting it.
-        // The mirror task runs to completion (or failure) in the background.
-        drop(mirror_handle);
+        // #FL-688 HARD ≥2-replica ACK-GATE (chunked path): the local write is
+        // Ok; now require the 2nd replica before acking. AWAIT the tee mirror
+        // task's confirmation (it ran CONCURRENTLY with the store write above,
+        // so this adds latency only when the mirror is slower than the store
+        // write — target ack latency = max(local, mirror)).
+        if let Some(handle) = mirror_handle {
+            // No per-RPC timeout (internal RPC; keepalive liveness). The tee
+            // task always resolves: the store write finished, so the tee
+            // producer sent EOF/error and the consumer returns.
+            //
+            // #FL-688 keepalive coupling (distributed-systems-reviewer MAJOR,
+            // SHA 139a0653): the chunked ack TAIL (this await + the
+            // `confirm_chunked_replica` below) is now bounded by the
+            // mirror-RPC's transport keepalive (h2 30s / QUIC 5s), NOT by the
+            // local write — an app-hung worker that accepts the mirror stream
+            // and then stalls keeps this await parked until keepalive tears the
+            // connection. (This is the accepted FLP/app-hung-worker wedge risk,
+            // tracked as FL-690.) The enclosing `StallGuard`'s `progress_handle`
+            // is NOT bumped during this await (only the per-chunk recv loop
+            // bumps it), so a stall here trips the stall_detector's
+            // diagnostic-only stack dump after `DEFAULT_STALL_THRESHOLD` (30s).
+            // That dump is diagnostic only (`stall_detector` never aborts the
+            // write), so this is a documentation note, not a behavior change.
+            let outcome = handle.await.unwrap_or_else(|join_err| {
+                // A panicked/aborted tee task cannot confirm a replica; treat
+                // as Failed so we re-drive from the stored copy rather than
+                // ack with <2 replicas.
+                nativelink_store::worker_proxy_store::MirrorConfirmOutcome::Failed(make_err!(
+                    Code::Internal,
+                    "mirror tee task join error: {join_err}"
+                ))
+            });
+            // Resolve the gate. The blob is now durably written to (and pinned
+            // in) the fast tier, so re-drive/no-peer paths can read it back.
+            self.confirm_chunked_replica(instance_info, digest, expected_size, outcome)
+                .await?;
+        }
 
         // Close our guard and consider the stream no longer active.
         active_stream_guard.graceful_finish();
@@ -2745,10 +2877,44 @@ impl ByteStreamServer {
 
         // Direct update without channel overhead
         let store = instance_info.store.clone();
-        store
-            .update_oneshot(digest, final_data.clone())
-            .await
-            .err_tip(|| "Error in update_oneshot")?;
+
+        // #FL-688 HARD ≥2-replica ack-gate (oneshot path). Mirror/worker
+        // writes are themselves the 2nd-replica push and must NOT be gated
+        // (gating would deadlock + loop); they keep the plain write path.
+        let oneshot_size = usize::try_from(bytes_received).unwrap_or(usize::MAX);
+        let proxy_ref = if is_mirror || is_worker {
+            None
+        } else {
+            // WorkerProxyStore is the OUTERMOST driver; reach it via
+            // `as_store_driver()` (NOT `Store::downcast_ref`, which delegates
+            // through `inner_store()` PAST the proxy).
+            store
+                .as_store_driver()
+                .as_any()
+                .downcast_ref::<WorkerProxyStore>()
+        };
+        if let Some(proxy) = proxy_ref {
+            // Acquire a global byte-budget permit (BACKPRESSURE if the budget
+            // is full — never silent buffering) bounding concurrent ack-gated
+            // in-flight memory, then drive the local write CONCURRENTLY with
+            // the 2nd-replica confirmation and gate the ack on local-Ok AND the
+            // confirmation. SMALL blobs (≤ SMALL_BLOB_THRESHOLD) confirm via
+            // the SLOW TIER (Redis SMALL_CAS_CACHED; dispatcher handles worker
+            // read-locality); LARGE blobs confirm via the worker mirror.
+            // `_ack_permit` releases when this scope ends.
+            let confirm_via_slow_tier = bytes_received <= SMALL_BLOB_THRESHOLD as u64;
+            let _ack_permit = ack_gate_budget_singleton().acquire(oneshot_size).await;
+            let local_write = store.update_oneshot(digest, final_data.clone());
+            proxy
+                .ack_gated_write(digest, mirror_data.clone(), confirm_via_slow_tier, local_write)
+                .await
+                .err_tip(|| "Error in ack-gated update_oneshot")?;
+        } else {
+            store
+                .update_oneshot(digest, final_data.clone())
+                .await
+                .err_tip(|| "Error in update_oneshot")?;
+        }
 
         // Register streaming blob for read-while-write AFTER the store write
         // succeeds. Registering before the write would let readers see data
@@ -2819,14 +2985,12 @@ impl ByteStreamServer {
             false
         };
 
-        // Mirror to a random worker using the cloned data — no re-read needed.
-        // Skip mirroring for worker uploads and mirror writes — workers already
-        // have the blob, and mirror writes should not be re-mirrored.
-        // Item F: also skip when the dispatcher already fanned out the
-        // same bytes to every worker (small blobs are durable via Redis;
-        // the random-single mirror would just duplicate bytes already
-        // pushed by the dispatcher).
-        if !is_worker && !is_mirror && !dispatched {
+        // #FL-688: the random-single mirror is now subsumed by the ack-gated
+        // `mirror_and_confirm_data` above whenever a WorkerProxyStore is
+        // present (proxy_ref.is_some()). It survives ONLY for the no-proxy
+        // fallback composition (and never for mirror/worker writes or when the
+        // dispatcher already fanned the same small bytes to every worker).
+        if !is_worker && !is_mirror && !dispatched && proxy_ref.is_none() {
             mirror_blob_to_worker(&store, digest, Some(mirror_data));
         }
 

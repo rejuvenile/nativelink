@@ -71,6 +71,7 @@ use nativelink_util::store_trait::{StoreDriver, StoreKey};
 
 use crate::existence_cache_store::ExistenceCacheStore;
 use crate::fast_slow_store::FastSlowStore;
+use crate::size_partitioning_store::SizePartitioningStore;
 use crate::verify_store::VerifyStore;
 
 /// A digest with `size_bytes == u64::MAX` used to descend
@@ -133,4 +134,50 @@ pub fn find_fast_slow_via_chain(store: &dyn StoreDriver) -> Option<&FastSlowStor
         return None;
     }
     find_fast_slow_via_chain(inner)
+}
+
+/// #FL-688: read the live `SizePartitioning` threshold for the CAS chain
+/// starting at `store`, descending the same wrappers as
+/// [`find_fast_slow_via_chain`].
+///
+/// The no-peer degraded ack-gate path needs to route a blob's confirming
+/// slow-tier write to the SAME `SizePartitioning` arm that reads will route
+/// to — otherwise the 2nd replica lands where no read looks (the lower arm is
+/// Redis-backed, the upper is `FilesystemStore`-backed in production). Rather
+/// than hardcode the production `16384` (config-driven, may drift), this reads
+/// the store's own `partition_size()`.
+///
+/// Returns `None` when the chain has no `SizePartitioningStore` (e.g. a flat
+/// test composition), in which case the caller routes through the single FSS
+/// the chain DOES expose. `SizePartitioningStore::inner_store(None)` returns
+/// `self`, so it is found by direct downcast, not delegation.
+#[must_use]
+pub fn find_partition_size(store: &dyn StoreDriver) -> Option<u64> {
+    if let Some(sp) = store.as_any().downcast_ref::<SizePartitioningStore>() {
+        return Some(sp.partition_size());
+    }
+    if let Some(ecs) = store
+        .as_any()
+        .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
+    {
+        // `Store::inner_store(None)` returns the wrapped driver (these typed
+        // accessors hand back a `&Store`; the `None` key steps one layer in).
+        return find_partition_size(ecs.inner_store().inner_store(None::<StoreKey<'_>>));
+    }
+    if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
+        return find_partition_size(vs.inner_store().inner_store(None::<StoreKey<'_>>));
+    }
+    // Generic single-step delegation (e.g. WorkerProxyStore). Use a
+    // size-agnostic `None` key: we are looking for the partition store
+    // itself, not descending one of its arms. The ptr-eq guard stops at any
+    // wrapper that shadows `inner_store` to return `self` and is NOT a
+    // SizePartitioningStore.
+    let inner = store.inner_store(None);
+    if core::ptr::eq(
+        inner as *const dyn StoreDriver,
+        store as *const dyn StoreDriver,
+    ) {
+        return None;
+    }
+    find_partition_size(inner)
 }

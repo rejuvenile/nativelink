@@ -372,6 +372,191 @@ const MIRROR_FAILURE_WINDOW: Duration = Duration::from_secs(10);
 /// How long to skip a quarantined endpoint before retrying it.
 const MIRROR_QUARANTINE_DURATION: Duration = Duration::from_secs(30);
 
+/// #FL-688: outcome of [`WorkerProxyStore::mirror_and_confirm_data`] — the
+/// HARD ≥2-replica ack-gate driver. Distinguishes the three design cases so
+/// the SERVICE handler (not the store) can decide how to gate the gRPC ack:
+///
+/// | Variant     | Meaning                                  | Handler action                       |
+/// |-------------|------------------------------------------|--------------------------------------|
+/// | `Confirmed` | ≥1 worker mirror confirmed `Ok`          | ack iff local store write also `Ok`  |
+/// | `NoPeers`   | `all_endpoints()` empty (no workers)     | await the slow-tier write, then ack  |
+/// | `Failed(e)` | peers exist but every attempt failed     | surface `e` — do NOT ack (<2 replicas)|
+///
+/// `Failed` carries the last underlying error so the handler can map it to a
+/// gRPC status. Saturation is NOT a `Failed`: under saturation the driver
+/// backpressures (blocks for a per-worker permit) rather than returning, so a
+/// `Failed` only fires when peers exist and a real, non-permit failure
+/// (NotFound/Internal/Unavailable/cap-exceeded after retry) was hit on every
+/// eligible endpoint.
+#[derive(Debug)]
+pub enum MirrorConfirmOutcome {
+    /// At least one worker confirmed the mirror write `Ok`.
+    Confirmed,
+    /// No worker peers are known — the handler must fall back to the
+    /// degraded no-peer path (await the slow-tier write).
+    NoPeers,
+    /// Peers exist but no endpoint confirmed the mirror; the handler must
+    /// surface this rather than ack a write with fewer than 2 replicas.
+    Failed(Error),
+}
+
+/// #FL-688 default global byte budget for concurrent ack-gated CAS writes.
+///
+/// 2 GiB. Sizing — the budget bounds in-flight `Bytes` across TWO distinct
+/// ack-gate paths with DIFFERENT per-blob memory profiles (the prior doc
+/// claimed a single 64 MiB-per-blob bound; that is wrong — see assumption-auditor
+/// + distributed-systems-reviewer, SHA 139a0653):
+///   1. **Oneshot / batch path** (≤ 64 MiB per blob): the oneshot gate at
+///      `bytestream_server.rs:3370` routes `expected_size <= 64 * 1024 * 1024`
+///      to `inner_write_oneshot`; the batch handler acquires the full
+///      `digest.size_bytes()` bounded by REAPI `MAX_BATCH_TOTAL_SIZE` (~3.5 MiB
+///      per RPC). On THIS path the full `Bytes` is held under one permit, so the
+///      "2 GiB / 64 MiB ≈ 32 concurrent max-size blobs" arithmetic holds *for
+///      this path only*.
+///   2. **Chunked re-drive path** (NO 64 MiB ceiling): blobs > 64 MiB fall
+///      THROUGH the `:3370` gate to the chunked `inner_write`, which has no size
+///      cap. On the rare `Failed` tee-miss, `confirm_chunked_replica`
+///      (`bytestream_server.rs:2058`) does `acquire(expected_size)` for the WHOLE
+///      blob, clamped to `capacity_bytes` (`AckGateBudget::acquire`). A single
+///      multi-GiB re-drive therefore holds the ENTIRE budget — worst-case
+///      concurrency at the cap is **1 blob, not 32**. It does not deadlock (the
+///      clamp serves a >2 GiB request from the whole pool) and it is bounded (the
+///      over-cap acquire blocks). A follow-up (#FL-689) tracks streaming the
+///      re-drive instead of buffering the whole blob under one permit.
+///   - 2 GiB matches the established server-side mirror memory budget
+///     (`fast_slow_store::DEFAULT_MIRROR_BLOBS_MAX_BYTES = 2 GiB`). NOTE: these
+///     are two INDEPENDENT pools (this ack-gate semaphore + `mirror_blobs_max_bytes`),
+///     so worst-case server in-flight is ADDITIVE (~4 GiB across both), not a
+///     shared 2 GiB.
+///   - Both pools sit under the live `cas_FAST_SLOW_STORE.fast` MemoryStore budget
+///     (`prod-server.json5`: `max_bytes = 16 GB`, ~11.5 GB effective after the
+///     `evict_bytes` headroom), leaving room for the fast tier + pin budget. (The
+///     prior "8 GiB MemoryStore / 2026-03-25 OOM tuning" figure was stale — the
+///     fast tier was re-tuned 48 GB → 16 GB on 2026-05-12.)
+///
+/// Over-cap behaviour is BACKPRESSURE, never silent buffering or drop: a write
+/// that cannot reserve its bytes BLOCKS on `acquire_many_owned().await` at the
+/// gate, which stalls the gRPC handler and propagates h2 stream flow-control
+/// back to the client. Blocking here is safe precisely because the budget is
+/// BOUNDED — the 2026-05-08 67 GB OOM (`FastSlowStore::in_flight_slow_writes`)
+/// was an UNBOUNDED in-flight map; a bounded blocking wait cannot grow without
+/// bound. (This is the design's stated "block for a permit, then mirror, then
+/// ack — NEVER drop, NEVER early-ack".)
+pub const DEFAULT_ACK_GATE_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// `tokio::sync::Semaphore::MAX_PERMITS` is `usize::MAX >> 3`; a 2 GiB
+/// byte-budget (one permit = one byte) is far inside that bound. Documented
+/// for clarity; mirrors the identical assertion in `chunked/pin_budget.rs`.
+const _: () = assert!(DEFAULT_ACK_GATE_BUDGET_BYTES < (usize::MAX >> 3));
+
+/// #FL-688 global per-process byte budget bounding the in-flight memory held
+/// by concurrent ack-gated CAS writes.
+///
+/// Wraps a `tokio::sync::Semaphore` whose total permits = byte cap (one permit
+/// = one byte). Each ack-gated write acquires `blob_size` permits BEFORE it
+/// pins the blob's `Bytes` for the concurrent (local-write ‖ worker-mirror)
+/// join, and releases them (permit `Drop`) once the ack is built.
+///
+/// Acquisition is `acquire_many_owned().await` — BLOCKING, not `try_acquire` —
+/// because the design mandates backpressure (block then ack), never drop or
+/// early-ack. A bounded blocking wait is the mechanism that turns over-cap into
+/// h2 client backpressure (see [`DEFAULT_ACK_GATE_BUDGET_BYTES`]). Contrast
+/// `chunked/pin_budget.rs`, which uses `try_acquire`+reject because ITS caller
+/// already holds upstream-blocking state when it asks; here the handler asks at
+/// the START of the write, so blocking simply stalls intake.
+#[derive(Debug)]
+pub struct AckGateBudget {
+    /// `Arc` so every successful acquire mints an `OwnedSemaphorePermit`
+    /// (which holds its own `Arc` to the underlying semaphore).
+    sem: Arc<tokio::sync::Semaphore>,
+    /// Total bytes available at construction; used to derive the
+    /// `ack_gate_inflight_bytes` gauge from live `available_permits()`.
+    capacity_bytes: usize,
+    /// Cumulative count of acquisitions that had to wait for headroom (the
+    /// backpressure signal). Incremented when an acquire could not be
+    /// satisfied immediately; published as `ack_gate_backpressure_waits_total`.
+    backpressure_waits_total: AtomicU64,
+}
+
+impl AckGateBudget {
+    /// Construct a fresh ack-gate budget with `capacity_bytes` permits.
+    /// Production wiring uses [`ack_gate_budget_singleton`].
+    #[must_use]
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(capacity_bytes)),
+            capacity_bytes,
+            backpressure_waits_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserve `n_bytes` of ack-gate headroom, BLOCKING until available.
+    /// Returns an `OwnedSemaphorePermit` representing exactly `n_bytes`;
+    /// `Drop` releases the bytes back to the pool.
+    ///
+    /// `n_bytes` is clamped to the total capacity: a single blob larger than
+    /// the whole budget (REACHABLE on the chunked re-drive path, which has no
+    /// 64 MiB ceiling — `confirm_chunked_replica` acquires the whole
+    /// `expected_size`) reserves the entire budget rather than deadlocking on an
+    /// unsatisfiable request. When the request cannot be served immediately
+    /// the `backpressure_waits_total` counter is bumped — that non-zero rate
+    /// is the operator's "ack-gate is applying backpressure" signal.
+    ///
+    /// `n_bytes == 0` returns a no-op permit (zero-length blobs are filtered
+    /// upstream, so this is purely defensive).
+    pub async fn acquire(&self, n_bytes: usize) -> tokio::sync::OwnedSemaphorePermit {
+        let want = u32::try_from(n_bytes.min(self.capacity_bytes)).unwrap_or(u32::MAX);
+        // Fast path: enough headroom right now (no wait, no counter bump).
+        if let Ok(permit) = Arc::clone(&self.sem).try_acquire_many_owned(want) {
+            return permit;
+        }
+        self.backpressure_waits_total.fetch_add(1, Ordering::Relaxed);
+        // BACKPRESSURE: block for headroom. The semaphore is never closed,
+        // so this acquire cannot error — `expect` documents the invariant.
+        Arc::clone(&self.sem)
+            .acquire_many_owned(want)
+            .await
+            .expect("ack-gate semaphore is never closed")
+    }
+
+    /// Bytes currently available (cap minus held permits). Race-prone vs
+    /// concurrent acquire; observability + tests only.
+    #[must_use]
+    pub fn available_bytes(&self) -> usize {
+        self.sem.available_permits()
+    }
+
+    /// Total cap in bytes. Pinned at construction.
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    /// Cumulative count of acquisitions that had to wait for headroom.
+    #[must_use]
+    pub fn backpressure_waits_total(&self) -> u64 {
+        self.backpressure_waits_total.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for AckGateBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_ACK_GATE_BUDGET_BYTES)
+    }
+}
+
+/// Process-wide ack-gate budget singleton. `OnceLock` for the same reason as
+/// `chunked::pin_budget`: the budget is a process-global resource and the
+/// service handlers (CAS batch, ByteStream oneshot/chunked) all gate against
+/// the same pool.
+static ACK_GATE_BUDGET_SINGLETON: OnceLock<AckGateBudget> = OnceLock::new();
+
+/// Returns the process-wide [`AckGateBudget`] singleton, initialising it on
+/// first call with [`DEFAULT_ACK_GATE_BUDGET_BYTES`].
+pub fn ack_gate_budget_singleton() -> &'static AckGateBudget {
+    ACK_GATE_BUDGET_SINGLETON.get_or_init(AckGateBudget::default)
+}
+
 impl core::fmt::Debug for WorkerProxyStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WorkerProxyStore")
@@ -3652,6 +3837,319 @@ impl WorkerProxyStore {
         }
     }
 
+    /// #FL-688: HARD ≥2-replica ack-gate driver — mirror the in-hand `data`
+    /// to a worker and CONFIRM the write before returning.
+    ///
+    /// Unlike the fire-and-forget [`Self::mirror_blob_to_random_worker`], this:
+    ///   1. Returns a typed [`MirrorConfirmOutcome`] the SERVICE handler gates
+    ///      the gRPC ack on (`Confirmed` ⇒ ack iff local-Ok; `NoPeers` ⇒ await
+    ///      slow tier; `Failed` ⇒ surface, do NOT ack with <2 replicas).
+    ///   2. BACKPRESSURES on the per-worker permit (`acquire().await`, NOT the
+    ///      `try_acquire`-drop at the fire-and-forget paths) — under saturation
+    ///      it blocks for a permit, then mirrors; it NEVER drops, NEVER
+    ///      early-acks (operator directive).
+    ///   3. Retries across EVERY eligible endpoint (not just two) until one
+    ///      confirms or all are exhausted; mirrors `Bytes` (O(1) clone per
+    ///      attempt) so retry is always possible from the in-hand data.
+    ///   4. Applies NO per-RPC timeout (internal RPC; keepalive liveness).
+    ///
+    /// Saturation (a peer's `try_acquire` would fail) is handled by BLOCKING on
+    /// `permits.acquire().await` for the FIRST eligible endpoint, while still
+    /// preferring a different endpoint that has a permit available right now —
+    /// so a single busy worker cannot stall the ack when another is free, but
+    /// when EVERY worker is busy the handler blocks (backpressure) rather than
+    /// dropping the replica.
+    pub async fn mirror_and_confirm_data(
+        &self,
+        digest: DigestInfo,
+        data: Bytes,
+    ) -> MirrorConfirmOutcome {
+        let endpoints = self.locality_map.read().all_endpoints();
+        if endpoints.is_empty() {
+            return MirrorConfirmOutcome::NoPeers;
+        }
+        if data.is_empty() {
+            // Zero-length blobs carry no durability value; treat as already
+            // satisfied so the handler acks on local-Ok alone. (Callers also
+            // filter size==0 upstream; defensive.)
+            return MirrorConfirmOutcome::Confirmed;
+        }
+
+        self.mirror_total_attempted.fetch_add(1, Ordering::Relaxed);
+        let blob_size = data.len() as u64;
+        // Track endpoints we've already failed against so retry walks forward
+        // across the whole fleet instead of re-hammering one peer.
+        let mut last_failure: Option<Error> = None;
+        let mut excluded: Vec<Arc<str>> = Vec::new();
+
+        // One pass per endpoint: pick the next eligible peer (excluding ones
+        // we've already failed against), backpressure on its permit, mirror,
+        // confirm. `pick_mirror_endpoint` returns `None` only when no eligible
+        // peer remains — at which point every peer either failed or is
+        // saturated-and-excluded, so we stop.
+        loop {
+            // `pick_mirror_endpoint` takes a single `exclude`; we maintain a
+            // growing excluded set by re-filtering the endpoint list.
+            let candidates: Vec<Arc<str>> = endpoints
+                .iter()
+                .filter(|ep| !excluded.iter().any(|x| x == *ep))
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                break;
+            }
+            let Some((endpoint, permits)) =
+                self.pick_mirror_endpoint(&candidates, None, blob_size)
+            else {
+                // Every remaining candidate is quarantined (and the degraded
+                // fallback in pick_* still returned None) — nothing left.
+                self.mirror_dropped_quarantined
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            };
+
+            // BACKPRESSURE, not drop: block for a permit. No per-RPC timeout
+            // (keepalive liveness). While we wait here we hold ONE blob's
+            // `Bytes` — bounded by the global `AckGateBudget` the handler
+            // acquired before calling us, so this wait cannot grow unbounded.
+            let _permit = permits.acquire().await.expect(
+                "per-worker mirror semaphore is never closed — \
+                 acquire cannot error",
+            );
+
+            let Some(store) = self.get_or_create_connection(&endpoint).await else {
+                warn!(
+                    %digest,
+                    endpoint = endpoint.as_ref(),
+                    "mirror_and_confirm: failed to connect to worker"
+                );
+                self.record_mirror_failure(&endpoint, MirrorFailureKind::DefinitiveUnreachable);
+                last_failure = Some(make_err!(
+                    Code::Unavailable,
+                    "mirror_and_confirm: could not connect to worker {endpoint}"
+                ));
+                excluded.push(endpoint);
+                continue;
+            };
+
+            let size_bytes = data.len();
+            let data_clone = data.clone();
+            let result = IS_MIRROR_REQUEST
+                .scope(true, async {
+                    if size_bytes > Self::MIRROR_CHUNK_THRESHOLD {
+                        let (mut tx, rx) = make_buf_channel_pair();
+                        let chunk_size = Self::MIRROR_CHUNK_SIZE;
+                        tokio::spawn(async move {
+                            let mut offset = 0;
+                            while offset < data_clone.len() {
+                                let end = (offset + chunk_size).min(data_clone.len());
+                                let chunk = data_clone.slice(offset..end);
+                                if tx.send(chunk).await.is_err() {
+                                    return;
+                                }
+                                offset = end;
+                            }
+                            drop(tx.send_eof());
+                        });
+                        let key: StoreKey<'_> = digest.into();
+                        store
+                            .update(key, rx, UploadSizeInfo::ExactSize(size_bytes as u64))
+                            .await
+                    } else {
+                        store.update_oneshot(digest, data_clone).await
+                    }
+                })
+                .await;
+
+            match result {
+                Ok(()) => {
+                    self.record_mirror_success(&endpoint);
+                    self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        "mirror_and_confirm: blob confirmed on worker (≥2 replicas)"
+                    );
+                    return MirrorConfirmOutcome::Confirmed;
+                }
+                Err(e) => {
+                    self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
+                    warn!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        ?e,
+                        "mirror_and_confirm: worker mirror failed, trying next endpoint"
+                    );
+                    last_failure = Some(e);
+                    excluded.push(endpoint);
+                }
+            }
+        }
+
+        // Peers existed but none confirmed. Surface the last failure so the
+        // handler does NOT ack a write with fewer than 2 replicas.
+        MirrorConfirmOutcome::Failed(last_failure.unwrap_or_else(|| {
+            make_err!(
+                Code::Unavailable,
+                "mirror_and_confirm: no eligible worker confirmed the mirror \
+                 (all peers quarantined or saturated)"
+            )
+        }))
+    }
+
+    /// #FL-688 no-peer degraded path: when no worker peers exist, the 2nd
+    /// replica must be the slow tier (disk/Redis), so the handler AWAITS the
+    /// slow-store write before acking. This drives the slow tier of the
+    /// correct `SizePartitioning` arm for the blob's size and awaits ONLY that
+    /// write — the steady-state (peers present) slow write stays ASYNC.
+    ///
+    /// Arm selection mirrors production `cas_INNER`
+    /// (`SizePartitioning(16 KiB)`):
+    ///   - blob > 16 KiB → upper arm (`FilesystemStore` slow tier) via
+    ///     [`wrapper_walker::find_fast_slow_via_chain`];
+    ///   - blob ≤ 16 KiB → lower arm (`Redis` slow tier) via
+    ///     [`small_blob_dispatcher::find_fast_slow_for_pin`].
+    ///
+    /// NO fsync / sync_data — ZFS `tank` has `sync=disabled`; durability on
+    /// this path is page-cache + the slow tier's own ack. Returns `Ok` once
+    /// the slow-tier `update_oneshot` resolves `Ok`; `Err` (or "no FSS in
+    /// this composition") propagates so the handler can refuse the ack.
+    pub async fn confirm_via_slow_store(
+        &self,
+        digest: DigestInfo,
+        data: Bytes,
+    ) -> Result<(), Error> {
+        let driver = self.inner.as_store_driver();
+        // Route to the SAME SizePartitioning arm reads will route to. The
+        // boundary is `size_bytes < partition_size` → lower arm (see
+        // `SizePartitioningStore::eligible`). Read the live threshold; if the
+        // chain has no partition store, the small-key walker and large-key
+        // walker resolve to the same single FSS, so either selection works.
+        let lower_arm = crate::wrapper_walker::find_partition_size(driver)
+            .is_some_and(|partition_size| digest.size_bytes() < partition_size);
+        let fss = if lower_arm {
+            crate::small_blob_dispatcher::find_fast_slow_for_pin(driver)
+        } else {
+            crate::wrapper_walker::find_fast_slow_via_chain(driver)
+        };
+        let Some(fss) = fss else {
+            // No FastSlowStore in this composition (a flat single-tier store,
+            // e.g. a bare MemoryStore in a test/edge wiring). There is NO 2nd
+            // tier to await — the single store the local write already
+            // populated is the only durable copy this composition can offer.
+            // Failing here would protect nothing (there is no slow tier to
+            // wait for) and would break valid single-tier compositions, so we
+            // ack on the single replica. The PRODUCTION CAS chain always wraps
+            // a FastSlowStore, so this degraded branch never fires there;
+            // warn so an operator notices a misconfigured single-tier CAS.
+            warn!(
+                %digest,
+                "confirm_via_slow_store: no FastSlowStore in CAS composition — \
+                 no 2nd tier to confirm; acking on the single local replica \
+                 (production CAS always wraps a FastSlowStore — check wiring)"
+            );
+            return Ok(());
+        };
+        // Await ONLY the slow-tier write. `slow_store_handle()` is the FSS's
+        // slow `Store`; `update_oneshot` resolves Ok when the slow tier
+        // (FilesystemStore page-cache write OR Redis SET) acks. No fsync.
+        fss.slow_store_handle()
+            .update_oneshot(digest, data)
+            .await
+            .err_tip(|| "confirm_via_slow_store: slow-tier write failed")
+    }
+
+    /// #FL-688 ack-gate ORCHESTRATOR for the in-hand-`Bytes` paths (CAS batch
+    /// + ByteStream oneshot). Drives the local store write CONCURRENTLY with
+    /// the 2nd-replica confirmation and returns `Ok(())` ONLY when the HARD
+    /// ≥2-replica invariant holds.
+    ///
+    /// `confirm_via_slow_tier` selects WHERE the confirmed 2nd replica lives:
+    ///
+    ///   - `false` (LARGE blobs, > `SMALL_BLOB_THRESHOLD`): confirm via the
+    ///     WORKER MIRROR. Normal (peers): local `Ok` AND ≥1 mirror `Confirmed`;
+    ///     no peers: local `Ok` AND slow-tier `Ok`.
+    ///   - `true` (SMALL blobs, ≤ `SMALL_BLOB_THRESHOLD`): confirm directly via
+    ///     the SLOW TIER (production small-blob durable replica is Redis
+    ///     `SMALL_CAS_CACHED`; worker read-locality is handled separately,
+    ///     fire-and-forget, by the `SmallBlobDispatcher`). This DECOUPLES
+    ///     small-blob acks from worker reachability — the design's stated
+    ///     "small blobs are durable via Redis SMALL_CAS_CACHED".
+    ///
+    /// In BOTH modes: local `Ok` AND confirmed 2nd replica, else `Err` (refuse
+    /// to ack; never <2 replicas).
+    ///
+    /// CONCURRENCY (operator hard requirement): the caller-supplied
+    /// `local_write` future and the 2nd-replica confirmation are polled
+    /// together under a single `tokio::join!`, so target ack latency is
+    /// `max(local, confirm)`, NOT `local + confirm`. The slow-tier no-peer
+    /// await (large-blob mode) happens only AFTER the join AND only when there
+    /// are zero peers (a degraded path) — it never makes the normal-path slow
+    /// write synchronous (anti-#203).
+    ///
+    /// MEMORY BOUND (mandatory, anti-2026-05-08-OOM): the `data` `Bytes` is
+    /// pinned for the join window; the caller MUST hold an [`AckGateBudget`]
+    /// permit sized to `data.len()` for the duration of this call so that
+    /// concurrent ack-gated writes cannot grow in-flight memory without bound.
+    /// This method does not acquire the permit itself (the handler acquires it
+    /// before reading the blob into memory, so backpressure applies at intake).
+    ///
+    /// `local_write` is a future the caller builds from the OUTER (wrapped)
+    /// store's `update_oneshot` so it runs the real production write path; it
+    /// is passed in (not re-derived here) to avoid re-entrancy ambiguity.
+    pub async fn ack_gated_write<F>(
+        &self,
+        digest: DigestInfo,
+        data: Bytes,
+        confirm_via_slow_tier: bool,
+        local_write: F,
+    ) -> Result<(), Error>
+    where
+        F: core::future::Future<Output = Result<(), Error>>,
+    {
+        if confirm_via_slow_tier {
+            // SMALL blob: confirm the 2nd replica on the slow tier (Redis),
+            // CONCURRENTLY with the local write. No worker-mirror dependency.
+            let (local_res, slow_res) = tokio::join!(
+                local_write,
+                self.confirm_via_slow_store(digest, data.clone())
+            );
+            local_res.err_tip(|| "ack_gated_write: local store write failed")?;
+            return slow_res.err_tip(|| {
+                "ack_gated_write: small-blob slow-tier confirmation failed — \
+                 refusing to ack with <2 replicas"
+            });
+        }
+
+        // LARGE blob: drive local write ‖ worker mirror concurrently. `join!`
+        // polls both to completion; neither blocks the other's progress.
+        let (local_res, mirror_outcome) =
+            tokio::join!(local_write, self.mirror_and_confirm_data(digest, data.clone()));
+
+        // Local write MUST succeed regardless of replica source.
+        local_res.err_tip(|| "ack_gated_write: local store write failed")?;
+
+        match mirror_outcome {
+            MirrorConfirmOutcome::Confirmed => Ok(()),
+            MirrorConfirmOutcome::NoPeers => {
+                // Degraded: no worker 2nd replica exists. Await the slow tier
+                // so the ack still rests on ≥2 replicas (memory + disk/Redis).
+                self.confirm_via_slow_store(digest, data)
+                    .await
+                    .err_tip(|| {
+                        "ack_gated_write: no worker peers and slow-tier \
+                         confirmation failed — refusing to ack with <2 replicas"
+                    })
+            }
+            MirrorConfirmOutcome::Failed(e) => Err(e).err_tip(|| {
+                "ack_gated_write: worker mirror could not confirm a 2nd \
+                 replica — refusing to ack with <2 replicas"
+            }),
+        }
+    }
+
     /// Mirror a blob to a random connected worker via a streaming channel.
     /// The caller provides a `DropCloserReadHalf` that produces the blob data.
     /// Fire-and-forget semantics: errors are logged but do not propagate.
@@ -3764,6 +4262,123 @@ impl WorkerProxyStore {
                         "mirror_stream: failed to stream blob to worker"
                     );
                 }
+            }
+        }
+    }
+
+    /// #FL-688 CONFIRMING variant of [`Self::mirror_blob_via_stream`] for the
+    /// chunked ByteStream ack-gate. Same single-attempt streaming semantics
+    /// (the reader is consumed once, so NO retry and NO permit-blocking — the
+    /// reader buffers up to 72 MiB and pinning it while queueing is the OOM
+    /// trap), but it RETURNS a [`MirrorConfirmOutcome`] the handler gates the
+    /// write response on instead of swallowing the result:
+    ///
+    ///   - `Confirmed` — one worker accepted the streamed blob.
+    ///   - `NoPeers`   — no workers; handler awaits the slow tier.
+    ///   - `Failed(e)` — peers existed but the single streaming attempt did
+    ///     not confirm (no permit, connect fail, or stream error, INCLUDING a
+    ///     tee-backpressure chunk-drop). The handler RE-DRIVES the mirror from
+    ///     the just-written, pinned fast-tier copy via
+    ///     [`Self::mirror_and_confirm_data`] (which backpressures safely
+    ///     because it sources in-hand `Bytes`, not the live reader). This is
+    ///     the dispatch's "re-drive from the just-written fast-tier copy"
+    ///     option — chosen over consuming-reader retry because the reader's
+    ///     bytes are gone.
+    ///
+    /// The reader is ALWAYS drained/consumed before return so the tee producer
+    /// never wedges.
+    pub async fn mirror_via_stream_and_confirm(
+        &self,
+        digest: DigestInfo,
+        reader: DropCloserReadHalf,
+    ) -> MirrorConfirmOutcome {
+        let endpoints = self.locality_map.read().all_endpoints();
+        if endpoints.is_empty() {
+            drop(reader); // no workers — let the tee producer finish
+            return MirrorConfirmOutcome::NoPeers;
+        }
+
+        self.mirror_total_attempted.fetch_add(1, Ordering::Relaxed);
+        let blob_size = digest.size_bytes();
+        let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, None, blob_size)
+        else {
+            self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
+            drop(reader);
+            return MirrorConfirmOutcome::Failed(make_err!(
+                Code::Unavailable,
+                "mirror_via_stream_and_confirm: no eligible (non-quarantined) \
+                 worker for the streamed blob"
+            ));
+        };
+        // NO permit-blocking on the streaming path (72 MiB reader buffer OOM
+        // trap). `try_acquire`; on miss, surface Failed so the handler
+        // re-drives from the stored copy (which is permit-safe).
+        let _permit = match permits.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                self.mirror_dropped_no_permit.fetch_add(1, Ordering::Relaxed);
+                drop(reader);
+                return MirrorConfirmOutcome::Failed(make_err!(
+                    Code::ResourceExhausted,
+                    "mirror_via_stream_and_confirm: worker {endpoint} mirror \
+                     permits busy; handler will re-drive from stored copy"
+                ));
+            }
+        };
+
+        let Some(store) = self.get_or_create_connection(&endpoint).await else {
+            self.record_mirror_failure(&endpoint, MirrorFailureKind::DefinitiveUnreachable);
+            drop(reader);
+            return MirrorConfirmOutcome::Failed(make_err!(
+                Code::Unavailable,
+                "mirror_via_stream_and_confirm: failed to connect to worker {endpoint}"
+            ));
+        };
+
+        let size_bytes = digest.size_bytes();
+        let key: StoreKey<'_> = digest.into();
+        let result = IS_MIRROR_REQUEST
+            .scope(true, async {
+                store
+                    .update(key, reader, UploadSizeInfo::ExactSize(size_bytes))
+                    .await
+            })
+            .await;
+
+        match result {
+            Ok(()) => {
+                self.record_mirror_success(&endpoint);
+                self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    %digest,
+                    size_bytes,
+                    endpoint = endpoint.as_ref(),
+                    "mirror_via_stream_and_confirm: blob confirmed on worker (≥2 replicas)"
+                );
+                MirrorConfirmOutcome::Confirmed
+            }
+            Err(e) => {
+                self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
+                if is_mirror_tee_backpressure_error(&e) {
+                    debug!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        ?e,
+                        "mirror_via_stream_and_confirm: tee backpressure dropped \
+                         chunks; handler will re-drive from stored copy"
+                    );
+                } else {
+                    warn!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        ?e,
+                        "mirror_via_stream_and_confirm: streaming mirror failed; \
+                         handler will re-drive from stored copy"
+                    );
+                }
+                MirrorConfirmOutcome::Failed(e)
             }
         }
     }
@@ -5764,6 +6379,507 @@ mod tests {
              healthy peer)"
         );
 
+        Ok(())
+    }
+
+    // ===============================================================
+    // #FL-688: HARD ≥2-replica ack-gate — mirror_and_confirm_data,
+    //          AckGateBudget backpressure, no-peer classification,
+    //          cross-endpoint retry. (Service-layer ack-gate +
+    //          concurrency tests live in nativelink-service/tests.)
+    // ===============================================================
+
+    /// Fake worker store whose `update`/`update_oneshot` always FAILS with a
+    /// non-saturation, non-connection error — drives the cross-endpoint retry
+    /// path in `mirror_and_confirm_data`.
+    #[derive(MetricsComponent, Default)]
+    struct AlwaysFailPeer {
+        // `#[derive(MetricsComponent)]` needs at least one field to generate
+        // the trait impl (matches the `PartialThenErrorPeer` fixture above).
+        _marker: (),
+    }
+
+    #[async_trait]
+    impl StoreDriver for AlwaysFailPeer {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            _keys: &[StoreKey<'_>],
+            _results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn update(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            mut rx: DropCloserReadHalf,
+            _size: UploadSizeInfo,
+        ) -> Result<(), Error> {
+            // Drain so the producer's send/EOF doesn't wedge, then fail.
+            let _ = rx.drain().await;
+            Err(make_err!(
+                Code::Internal,
+                "AlwaysFailPeer: simulated worker mirror failure"
+            ))
+        }
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            _writer: &mut DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::Unimplemented, "no get_part"))
+        }
+        fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+            self
+        }
+        fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::Unimplemented, "no callbacks"))
+        }
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    #[async_trait]
+    impl HealthStatusIndicator for AlwaysFailPeer {
+        fn get_name(&self) -> &'static str {
+            "AlwaysFailPeer"
+        }
+        async fn check_health(
+            &self,
+            namespace: std::borrow::Cow<'static, str>,
+        ) -> HealthStatus {
+            StoreDriver::check_health(Pin::new(self), namespace).await
+        }
+    }
+
+    /// Fake worker store that sleeps `delay` then writes `Ok` into a real
+    /// MemoryStore — models a healthy-but-slow worker so the concurrency test
+    /// can assert ack latency ≈ max(local, mirror), not local + mirror.
+    #[derive(MetricsComponent)]
+    struct SlowOkPeer {
+        #[metric(group = "backing")]
+        backing: Store,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl StoreDriver for SlowOkPeer {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            keys: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            self.backing.as_store_driver_pin().has_with_results(keys, results).await
+        }
+        async fn update(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            rx: DropCloserReadHalf,
+            size: UploadSizeInfo,
+        ) -> Result<(), Error> {
+            tokio::time::sleep(self.delay).await;
+            self.backing.as_store_driver_pin().update(key, rx, size).await
+        }
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            self.backing
+                .as_store_driver_pin()
+                .get_part(key, writer, offset, length)
+                .await
+        }
+        fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+            self
+        }
+        fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::Unimplemented, "no callbacks"))
+        }
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    #[async_trait]
+    impl HealthStatusIndicator for SlowOkPeer {
+        fn get_name(&self) -> &'static str {
+            "SlowOkPeer"
+        }
+        async fn check_health(
+            &self,
+            namespace: std::borrow::Cow<'static, str>,
+        ) -> HealthStatus {
+            StoreDriver::check_health(Pin::new(self), namespace).await
+        }
+    }
+
+    /// CONCURRENCY (operator hard requirement): `ack_gated_write` drives the
+    /// local store write and the worker mirror in PARALLEL, so total ack
+    /// latency ≈ max(local, mirror), NOT local + mirror. With a ~300ms slow
+    /// local write AND a ~300ms slow mirror, a CONCURRENT join completes in
+    /// ~300ms; a SEQUENTIAL drive would take ~600ms. We assert the elapsed is
+    /// closer to max than to sum.
+    ///
+    /// Mutation: replace the `tokio::join!` in `ack_gated_write` with a
+    /// sequential `local.await; mirror.await` → elapsed ≈ sum → this test
+    /// red-fails on the `< SUM_FLOOR` bound.
+    #[nativelink_test]
+    async fn test_ack_gated_write_runs_local_and_mirror_concurrently()
+        -> Result<(), Error>
+    {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+
+        let value = b"concurrency-timed blob";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Slow worker peer: ~300ms before its write resolves Ok.
+        let peer_backing = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let slow_peer = Store::new(Arc::new(SlowOkPeer {
+            backing: peer_backing,
+            delay: Duration::from_millis(300),
+        }));
+        let endpoint = "grpc://slow-peer:50071";
+        proxy.inject_worker_connection(endpoint, slow_peer);
+        locality_map.write().register_blobs(endpoint, &[digest]);
+
+        // Slow LOCAL write: a future that sleeps ~300ms then writes to inner.
+        let local_inner = inner.clone();
+        let local_write = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            local_inner
+                .update_oneshot(digest, Bytes::from_static(value))
+                .await
+        };
+
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            // confirm_via_slow_tier = false: large-blob worker-mirror path
+            // (the concurrency contract under test is local ‖ mirror).
+            proxy.ack_gated_write(digest, Bytes::from_static(value), false, local_write),
+        )
+        .await
+        .expect("ack_gated_write must not hang")?;
+        let elapsed = start.elapsed();
+        let _ = res;
+
+        // SUM would be ~600ms; MAX is ~300ms. Floor of 480ms cleanly separates
+        // the two regimes with margin for scheduling jitter on either side.
+        const SUM_FLOOR: Duration = Duration::from_millis(480);
+        assert!(
+            elapsed < SUM_FLOOR,
+            "ack_gated_write must run the local write and the worker mirror \
+             CONCURRENTLY (target ack latency = max(local, mirror) ≈ 300ms, \
+             NOT local + mirror ≈ 600ms). Observed {elapsed:?} ≥ {SUM_FLOOR:?} \
+             — the two were SEQUENCED, not joined."
+        );
+        Ok(())
+    }
+
+    /// `AckGateBudget`: a request that fits returns immediately (no wait, no
+    /// counter bump); a request that exceeds available bytes BLOCKS until a
+    /// prior permit drops, then succeeds — and bumps the backpressure counter.
+    /// This is the bounded-backpressure mechanism that replaces the unbounded
+    /// in-flight buffer (anti-2026-05-08-OOM).
+    #[nativelink_test]
+    async fn test_ack_gate_budget_backpressures_when_full() -> Result<(), Error> {
+        use tokio::sync::oneshot;
+
+        let budget = Arc::new(AckGateBudget::new(100));
+        // First acquire takes 80 of 100 — fits, no wait.
+        let p1 = budget.acquire(80).await;
+        assert_eq!(budget.available_bytes(), 20);
+        assert_eq!(
+            budget.backpressure_waits_total(),
+            0,
+            "fitting acquire must NOT count as backpressure"
+        );
+
+        // Second acquire wants 80 but only 20 available — must BLOCK.
+        // The waiter fires `acquired_tx` the instant its acquire RESOLVES.
+        // A non-blocking (mutated) acquire resolves immediately and the
+        // signal arrives before we release `p1`; a correct blocking acquire
+        // CANNOT signal until `p1` drops. Holding a permit it must NOT yet
+        // have is the precise contract violation.
+        let budget2 = Arc::clone(&budget);
+        let (acquired_tx, mut acquired_rx) = oneshot::channel::<()>();
+        let waiter = tokio::spawn(async move {
+            let permit = budget2.acquire(80).await;
+            let _ = acquired_tx.send(());
+            // Hold the permit until the test drops the channel sender side
+            // signal — keep it alive a moment so `available_bytes` reflects
+            // the real reservation when checked post-release.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(permit);
+        });
+
+        // The counter bump happens synchronously inside acquire() before the
+        // suspend, so it is observable via a bounded yield loop (no sleep).
+        let mut bumped = false;
+        for _ in 0..100 {
+            if budget.backpressure_waits_total() >= 1 {
+                bumped = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            bumped,
+            "ack-gate backpressure counter must record the blocked acquire \
+             (over-cap acquire must BLOCK, not drop or early-return)"
+        );
+
+        // CORE CONTRACT: the waiter must NOT have acquired yet — its acquire
+        // is parked because the budget is full. Spin the runtime hard; a
+        // correct blocking acquire still cannot resolve while `p1` is held.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            acquired_rx.try_recv().is_err(),
+            "over-cap acquire must remain BLOCKED while the budget is full — \
+             NEVER drop, NEVER early-ack (the waiter signalled acquisition of \
+             a permit it cannot legally hold)"
+        );
+
+        // Release p1 → 100 available → the waiter unblocks and signals.
+        drop(p1);
+        tokio::time::timeout(Duration::from_secs(5), acquired_rx)
+            .await
+            .expect(
+                "waiter must acquire within 5s after the budget frees — \
+                 ack-gate backpressure must RELEASE on permit drop",
+            )
+            .expect("acquired signal must arrive (waiter did not panic)");
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter task must finish within 5s after acquiring")
+            .expect("waiter task must not panic");
+
+        Ok(())
+    }
+
+    /// Literal value-pin for `DEFAULT_ACK_GATE_BUDGET_BYTES` (#FL-688
+    /// numeric-constant rule, assumption-auditor gap #8, SHA 139a0653).
+    ///
+    /// The only other compile-time check on this constant is the semaphore-max
+    /// sanity bound `assert!(DEFAULT_ACK_GATE_BUDGET_BYTES < (usize::MAX >> 3))`,
+    /// which a stealth revert of `2 *` → `1 *` (or any value below the bound)
+    /// passes SILENTLY. This pins the exact 2 GiB so such a revert red-fails.
+    ///
+    /// Mutation: change the declaration to any value other than
+    /// `2 * 1024 * 1024 * 1024` → this assertion red-fails with the bespoke
+    /// message below. (Cf. Incident 2026-05-12: `DEFAULT_PIN_BUDGET_BYTES`
+    /// doc-claimed 4→8 GiB while the constant stayed 4 GiB; six reviewers
+    /// trusted the doc-comment.)
+    #[test]
+    fn default_ack_gate_budget_bytes_is_exactly_2_gib() {
+        assert_eq!(
+            DEFAULT_ACK_GATE_BUDGET_BYTES,
+            2 * 1024 * 1024 * 1024,
+            "DEFAULT_ACK_GATE_BUDGET_BYTES must be exactly 2 GiB at the \
+             declaration line (worker_proxy_store.rs) — a doc-comment or commit \
+             message claiming 2 GiB is NOT authoritative; only this literal-pin \
+             is (mutation: any other value here red-fails this assertion)"
+        );
+    }
+
+    /// No-peer classification: `mirror_and_confirm_data` returns `NoPeers`
+    /// when the locality map has no endpoints, so the handler knows to take
+    /// the degraded slow-tier-await path instead of acking on local-only.
+    #[nativelink_test]
+    async fn test_mirror_and_confirm_returns_no_peers_when_empty() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        let value = b"no-peer blob";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.mirror_and_confirm_data(digest, Bytes::from_static(value)),
+        )
+        .await
+        .expect("mirror_and_confirm must not hang when there are no peers");
+
+        assert!(
+            matches!(outcome, MirrorConfirmOutcome::NoPeers),
+            "empty locality must classify as NoPeers (degraded slow-tier \
+             fallback) — got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Ack-gate confirmation: with ONE healthy peer, `mirror_and_confirm_data`
+    /// returns `Confirmed` only after the peer's store actually holds the blob
+    /// (≥2 replicas). The peer is a real MemoryStore so confirmation implies
+    /// the bytes landed.
+    #[nativelink_test]
+    async fn test_mirror_and_confirm_confirms_after_peer_holds_blob()
+        -> Result<(), Error>
+    {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map.clone());
+
+        let value = b"confirm me on a worker";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let endpoint = "grpc://peer:50071";
+        proxy.inject_worker_connection(endpoint, peer_store.clone());
+        locality_map.write().register_blobs(endpoint, &[digest]);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.mirror_and_confirm_data(digest, Bytes::from_static(value)),
+        )
+        .await
+        .expect("mirror_and_confirm must not hang against a healthy peer");
+
+        assert!(
+            matches!(outcome, MirrorConfirmOutcome::Confirmed),
+            "a healthy peer must yield Confirmed — got {outcome:?}"
+        );
+        // The bytes must actually be on the peer (the 2nd replica is real).
+        let on_peer = peer_store.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(
+            on_peer.as_ref(),
+            value,
+            "Confirmed must mean the 2nd replica's bytes physically landed \
+             on the worker — not a bare Ok"
+        );
+        Ok(())
+    }
+
+    /// Cross-endpoint retry: the FIRST peer always fails; a SECOND healthy
+    /// peer holds the blob. `mirror_and_confirm_data` must walk forward to the
+    /// second endpoint and return `Confirmed` — a single bad worker must not
+    /// fail the ack when another can take the replica.
+    #[nativelink_test]
+    async fn test_mirror_and_confirm_retries_to_second_endpoint()
+        -> Result<(), Error>
+    {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map.clone());
+
+        let value = b"retry to the healthy peer";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Endpoint A: always fails.
+        let bad = Store::new(Arc::new(AlwaysFailPeer::default()));
+        let endpoint_a = "grpc://bad-peer:50071";
+        proxy.inject_worker_connection(endpoint_a, bad);
+
+        // Endpoint B: healthy MemoryStore.
+        let good = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let endpoint_b = "grpc://good-peer:50071";
+        proxy.inject_worker_connection(endpoint_b, good.clone());
+
+        locality_map
+            .write()
+            .register_blobs(endpoint_a, &[digest]);
+        locality_map
+            .write()
+            .register_blobs(endpoint_b, &[digest]);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.mirror_and_confirm_data(digest, Bytes::from_static(value)),
+        )
+        .await
+        .expect("mirror_and_confirm must not hang while retrying endpoints");
+
+        assert!(
+            matches!(outcome, MirrorConfirmOutcome::Confirmed),
+            "must retry past the failing endpoint to the healthy one and \
+             Confirm — got {outcome:?}"
+        );
+        let on_good = good.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(
+            on_good.as_ref(),
+            value,
+            "the confirmed replica must be on the healthy second endpoint"
+        );
+        Ok(())
+    }
+
+    /// All peers fail (no healthy endpoint) → `Failed`, NOT `Confirmed` and
+    /// NOT `NoPeers`. The handler must surface this and refuse to ack a write
+    /// with fewer than 2 replicas.
+    #[nativelink_test]
+    async fn test_mirror_and_confirm_failed_when_all_peers_fail()
+        -> Result<(), Error>
+    {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map.clone());
+
+        let value = b"all peers are down";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        let bad_a = Store::new(Arc::new(AlwaysFailPeer::default()));
+        let bad_b = Store::new(Arc::new(AlwaysFailPeer::default()));
+        proxy.inject_worker_connection("grpc://bad-a:50071", bad_a);
+        proxy.inject_worker_connection("grpc://bad-b:50071", bad_b);
+        locality_map
+            .write()
+            .register_blobs("grpc://bad-a:50071", &[digest]);
+        locality_map
+            .write()
+            .register_blobs("grpc://bad-b:50071", &[digest]);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.mirror_and_confirm_data(digest, Bytes::from_static(value)),
+        )
+        .await
+        .expect("mirror_and_confirm must not hang when all peers fail");
+
+        assert!(
+            matches!(outcome, MirrorConfirmOutcome::Failed(_)),
+            "all-peers-fail must yield Failed (refuse to ack <2 replicas) — \
+             got {outcome:?}"
+        );
         Ok(())
     }
 }

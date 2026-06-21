@@ -40,7 +40,7 @@ use nativelink_store::ac_utils::batch_get_and_decode_digest;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::small_blob_dispatcher::{SMALL_BLOB_THRESHOLD, SmallBlobDispatcher};
 use nativelink_store::store_manager::StoreManager;
-use nativelink_store::worker_proxy_store::WorkerProxyStore;
+use nativelink_store::worker_proxy_store::{WorkerProxyStore, ack_gate_budget_singleton};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::evicting_map::LenEntry;
@@ -450,12 +450,66 @@ impl CasServer {
                 // Clone data for mirroring (Bytes clone is O(1) refcount bump).
                 let mirror_data = request_data.clone();
                 let upload_start = std::time::Instant::now();
-                let result = IS_MIRROR_REQUEST.scope(is_mirror, async {
+
+                // #FL-688: is this a mirror/worker write that must NOT be
+                // ack-gated? Mirror/worker writes ARE themselves the 2nd
+                // replica push — gating them would deadlock (a mirror waiting
+                // on its own mirror) and loop. They keep the plain write path.
+                let proxy_ref = if is_mirror || is_worker {
+                    None
+                } else {
+                    // The WorkerProxyStore is the OUTERMOST driver; reach it via
+                    // `as_store_driver()` (NOT `Store::downcast_ref`, which calls
+                    // `inner_store()` and delegates PAST the proxy).
                     store_ref
-                        .update_oneshot(digest_info, request_data)
+                        .as_store_driver()
+                        .as_any()
+                        .downcast_ref::<WorkerProxyStore>()
+                };
+
+                let result = if let Some(proxy) = proxy_ref {
+                    // #FL-688 HARD ≥2-replica ack-gate. Acquire a global
+                    // byte-budget permit (BACKPRESSURE if the budget is full —
+                    // never silent buffering) so concurrent ack-gated writes
+                    // cannot grow in-flight memory without bound, then drive
+                    // the local write CONCURRENTLY with the 2nd-replica
+                    // confirmation and gate the ack on local-Ok AND the
+                    // confirmation. `_ack_permit` releases at the end of this
+                    // blob's future.
+                    //
+                    // SMALL blobs (≤ SMALL_BLOB_THRESHOLD) confirm via the SLOW
+                    // TIER (production durable replica = Redis SMALL_CAS_CACHED;
+                    // the SmallBlobDispatcher handles worker read-locality
+                    // separately). LARGE blobs confirm via the worker mirror.
+                    let confirm_via_slow_tier = size_bytes <= SMALL_BLOB_THRESHOLD;
+                    let _ack_permit = ack_gate_budget_singleton()
+                        .acquire(size_bytes)
+                        .await;
+                    let local_write = IS_MIRROR_REQUEST.scope(is_mirror, async {
+                        store_ref
+                            .update_oneshot(digest_info, request_data)
+                            .await
+                            .err_tip(|| "Error writing to store")
+                    });
+                    proxy
+                        .ack_gated_write(
+                            digest_info,
+                            mirror_data.clone(),
+                            confirm_via_slow_tier,
+                            local_write,
+                        )
                         .await
-                        .err_tip(|| "Error writing to store")
-                }).await;
+                } else {
+                    // No WorkerProxyStore in this composition (or a
+                    // mirror/worker write): preserve the plain write path.
+                    IS_MIRROR_REQUEST.scope(is_mirror, async {
+                        store_ref
+                            .update_oneshot(digest_info, request_data)
+                            .await
+                            .err_tip(|| "Error writing to store")
+                    }).await
+                };
+
                 match &result {
                     Ok(()) => {
                         let elapsed = upload_start.elapsed();
@@ -464,14 +518,13 @@ impl CasServer {
                             size_bytes,
                             elapsed_ms = elapsed.as_millis() as u64,
                             throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes as u64, elapsed)),
+                            ack_gated = proxy_ref.is_some(),
                             "BatchUpdateBlobs: CAS write completed",
                         );
                         // #168 producer-side: fan out small CAS blobs
                         // to every connected worker via the dispatcher.
-                        // Sits ALONGSIDE (or — for small + dispatcher
-                        // enabled — REPLACES) the random-single-worker
-                        // mirror below (item F). Skip for `is_mirror`
-                        // AND `is_worker` to avoid feedback loops:
+                        // Sits ALONGSIDE the ack-gate mirror above. Skip for
+                        // `is_mirror` AND `is_worker` to avoid feedback loops:
                         //   - is_mirror: server-to-worker mirror push
                         //     re-arrived via cas_server (rare).
                         //   - is_worker: worker uploaded action results
@@ -483,7 +536,12 @@ impl CasServer {
                         //
                         // Fire-and-forget — do not .await; see
                         // `SmallBlobDispatcher::schedule_dispatch_to_all_workers` doc.
-                        let dispatched = if !is_mirror
+                        // #FL-688: the random-single mirror is now subsumed by
+                        // the ack-gated `mirror_and_confirm_data` above
+                        // (proxy_ref.is_some()); only the dispatcher fan-out
+                        // (proactive read-locality to EVERY worker, distinct
+                        // from the single ack-gating replica) remains here.
+                        if !is_mirror
                             && !is_worker
                             && size_bytes <= SMALL_BLOB_THRESHOLD
                         {
@@ -493,23 +551,16 @@ impl CasServer {
                                     digest_info,
                                     mirror_data.clone(),
                                 );
-                                true
-                            } else {
-                                false
                             }
-                        } else {
-                            false
-                        };
-                        // Mirror to a random worker for OOM redundancy.
-                        // Skip for mirror writes (avoid feedback loops)
-                        // AND skip when the dispatcher already fanned
-                        // out the same bytes to every worker (item F:
-                        // dispatcher subsumes the random-mirror for
-                        // small blobs; small blobs are durable via
-                        // Redis SMALL_CAS_CACHED, mirror exists for
-                        // read-locality which the dispatcher already
-                        // provides on every worker).
-                        if !is_mirror && !dispatched {
+                        }
+                        // #FL-688: when there is NO WorkerProxyStore in the
+                        // composition (proxy_ref is None for a non-mirror,
+                        // non-worker write), fall back to the pre-FL-688
+                        // fire-and-forget random mirror so test/edge
+                        // compositions still get read-locality redundancy.
+                        // With a proxy present, the ack-gate already placed
+                        // (and confirmed) the single mirror replica.
+                        if !is_mirror && !is_worker && proxy_ref.is_none() {
                             mirror_blob_to_worker_with_data(store_ref, digest_info, mirror_data);
                         }
                     }
