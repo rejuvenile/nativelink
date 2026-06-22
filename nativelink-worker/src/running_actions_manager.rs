@@ -2830,28 +2830,11 @@ async fn prehash_single_file(
     let file = fs::open_file(&full_path, 0)
         .await
         .err_tip(|| format!("Could not open file {full_path:?} for pre-hash"))?;
-    let (digest, hashed_file) = hasher
+    let (digest, _file) = hasher
         .hasher()
         .digest_for_file(&full_path, file, Some(file_size))
         .await
         .err_tip(|| format!("Failed to pre-hash {full_path:?}"))?;
-    // TEMP PROBE (#FL-688 path-rebind confirmation) — REVERT after capture
-    // fstat the OPEN fd that was actually hashed (immune to a post-hash
-    // path rebind) and record (ino, mtime_ns) keyed by the prehash digest.
-    // The store seam (FilesystemStore::emplace_file) later stats the file
-    // renamed into the CAS under this same digest and compares. Cheap: one
-    // fstat on an already-open fd, no extra read/hash, no hot-loop alloc
-    // beyond the small carried record.
-    if let Ok(meta) = hashed_file.as_std().metadata() {
-        let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-        nativelink_util::pathrebind_probe::record_hash(
-            digest,
-            meta.ino(),
-            mtime_ns,
-            &full_path,
-        );
-    }
-    drop(hashed_file);
     Ok(Some((full_path, digest)))
 }
 

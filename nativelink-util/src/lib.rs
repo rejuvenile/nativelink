@@ -41,8 +41,6 @@ pub mod metrics_utils;
 pub mod o11_probes;
 pub mod operation_state_manager;
 pub mod origin_event;
-// TEMP PROBE (#FL-688 path-rebind confirmation) — REVERT after capture
-pub mod pathrebind_probe;
 pub mod origin_event_publisher;
 pub mod phase0_metrics;
 pub mod platform_properties;
