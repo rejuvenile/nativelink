@@ -63,6 +63,7 @@ use nativelink_util::store_trait::{
 };
 use nativelink_util::task::JoinHandleDropGuard;
 use nativelink_util::{background_spawn, spawn};
+use tokio::sync::watch;
 use tonic::codec::{Codec, CompressionEncoding};
 use tonic::{Request, Response, Streaming};
 use tonic_prost::ProstCodec;
@@ -366,6 +367,132 @@ impl StoreDriver for DelayedSlowStore {
 impl HealthStatusIndicator for DelayedSlowStore {
     fn get_name(&self) -> &'static str {
         "DelayedSlowStore"
+    }
+    async fn check_health(&self, namespace: std::borrow::Cow<'static, str>) -> HealthStatus {
+        StoreDriver::check_health(core::pin::Pin::new(self), namespace).await
+    }
+}
+
+/// CAUSAL gate fake (replaces the wall-clock `DelayedSlowStore` for the two
+/// small-blob-via-ByteStream ack-gate tests). Its `update` BLOCKS — not on a
+/// timer, but on a test-controlled `watch` "release" latch — so the test can
+/// assert the ack ORDERING (ack-AFTER-mirror-confirm) instead of a timing
+/// floor. Both latches are `watch` channels (latching, no lost-wakeup, robust
+/// to N concurrent `update` callers — the no-peer composition drives the slow
+/// store BOTH via the FastSlowStore's detached async write AND via the awaited
+/// `confirm_via_slow_store`):
+///
+///   - `entered_tx.send_replace(true)` on the FIRST line of `update` PROVES the
+///     gate was actually CONSTRUCTED and the mirror/slow `update` reached
+///     (pins gate PRESENCE — refutes a `mirror_handle = None` gate-SKIP, the
+///     exact false-fail the prior wall-clock floor could not tell apart from a
+///     real regression — review-pair-a MAJOR-NEW / red-team interaction-effects,
+///     SHA 1c917655).
+///   - `update` then AWAITS `release_rx.wait_for(|v| *v)` before delegating the
+///     write to the real backing store and returning. So the `update`'s RETURN
+///     (and therefore the ack that AWAITs it) cannot happen until the TEST
+///     flips `release`. This is the causal ordering edge: ack ⇐ release ⇐ test.
+///
+/// Why `watch` not `Notify`: `watch` latches the value, so a `wait_for`/`changed`
+/// that registers AFTER the `send_replace` still observes it (no sleep-as-
+/// synchronization race), and a single `release` send unblocks every concurrent
+/// `update` caller.
+#[derive(MetricsComponent)]
+struct GatedMirrorStore {
+    #[metric(group = "backing")]
+    backing: Store,
+    /// Set to `true` on the first line of every `update` (gate reached).
+    entered_tx: watch::Sender<bool>,
+    /// `update` blocks until the test flips this to `true` (gate released).
+    release_rx: watch::Receiver<bool>,
+}
+
+impl GatedMirrorStore {
+    /// Returns the store plus the test handles: a receiver that latches `true`
+    /// once `update` is entered, and a sender that releases the gate.
+    fn new(backing: Store) -> (Arc<Self>, watch::Receiver<bool>, watch::Sender<bool>) {
+        let (entered_tx, entered_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
+        (
+            Arc::new(Self {
+                backing,
+                entered_tx,
+                release_rx,
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+}
+
+#[async_trait]
+impl StoreDriver for GatedMirrorStore {
+    async fn has_with_results(
+        self: core::pin::Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.backing.as_store_driver_pin().has_with_results(keys, results).await
+    }
+    async fn update(
+        self: core::pin::Pin<&Self>,
+        key: StoreKey<'_>,
+        rx: DropCloserReadHalf,
+        size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Signal gate-reached (latching) BEFORE blocking, so the test's
+        // `wait_for(entered)` resolves even if it registers after this line.
+        let _ = self.entered_tx.send_replace(true);
+        // Block until the test releases the gate — NO timer. `wait_for` latches
+        // on the watched value, so a release sent before this registers is
+        // still observed.
+        let mut release = self.release_rx.clone();
+        release
+            .wait_for(|released| *released)
+            .await
+            .expect("GatedMirrorStore release sender dropped before the gate was released");
+        // Now drain + land the bytes into the real backing store.
+        self.backing.as_store_driver_pin().update(key, rx, size).await
+    }
+    async fn get_part(
+        self: core::pin::Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        self.backing.as_store_driver_pin().get_part(key, writer, offset, length).await
+    }
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Err(make_err!(Code::Unimplemented, "no callbacks"))
+    }
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+#[async_trait]
+impl HealthStatusIndicator for GatedMirrorStore {
+    fn get_name(&self) -> &'static str {
+        "GatedMirrorStore"
     }
     async fn check_health(&self, namespace: std::borrow::Cow<'static, str>) -> HealthStatus {
         StoreDriver::check_health(core::pin::Pin::new(self), namespace).await
@@ -780,26 +907,37 @@ async fn chunked_ack_gate_refuses_when_only_worker_fails()
 /// with a healthy worker lands its 2nd replica ON THE WORKER.
 ///
 /// (The accepted gap — no Redis-confirm + no SmallBlobDispatcher fan-out on this
-/// path — is tracked in #FL-689; see the commit's Behavior-changes section.)
+/// path — is tracked in #FL-691; see the commit's Behavior-changes section.)
+///
+/// CAUSAL assertion (review-pair-a MAJOR-NEW / red-team, SHA 1c917655 — replaces
+/// the prior wall-clock latency floor, which was sleep-as-synchronization and
+/// red-failed once on the GREEN tree under load when the ack-gate block was
+/// skipped at +112µs `mirror_handle = None`): the worker peer's `update` BLOCKS
+/// on a test-controlled `release` latch ([`GatedMirrorStore`]). The test asserts
+/// the ack ORDERING, not elapsed time —
+///   1. the gate is REACHED (peer `update` entered) — pins the gate's PRESENCE,
+///      so a `mirror_handle = None` skip can no longer masquerade as "fast ack";
+///   2. while the gate is HELD CLOSED, the RPC is still PENDING — the ack has
+///      NOT fired (the load-bearing causal edge: ack ⇐ mirror-confirm ⇐ release);
+///   3. only AFTER the test releases the gate does the RPC ack, with the 2nd
+///      replica physically on the worker.
+/// This is load-robust by construction: scheduling jitter can only keep the RPC
+/// MORE pending while the gate is closed, never falsely complete it — the
+/// opposite of the latency floor, which a slow scheduler could trip both ways.
 ///
 /// Mutation: revert `inner_write`'s `confirm_chunked_replica(...).await?` to
-/// fire-and-forget `drop(mirror_handle)` → the RPC acks WITHOUT awaiting the
-/// worker-mirror confirm → returns in ~0ms (the latency-floor assertion fails)
-/// AND the still-in-flight slow mirror has not yet landed on the worker (the
-/// peer-holds-blob assertion fails).
-///
-/// The worker peer is wrapped in a `DelayedSlowStore` (its `update` SLEEPS
-/// `MIRROR_DELAY`) so the await-gate's effect is observable by TIMING: with the
-/// gate the RPC cannot return until the mirror's slow `update` resolves; a
-/// fire-and-forget (mutated) gate returns immediately while that write is still
-/// in flight — deterministically empty peer at read-back. (Without the delay the
-/// in-process tee can populate a plain MemoryStore peer before the read-back,
-/// masking the mutation.)
+/// fire-and-forget `drop(mirror_handle)` → the ack no longer AWAITs the tee
+/// task's worker-mirror confirm, so the RPC completes while the gate is still
+/// closed → step 2's `select!` resolves on the RPC arm → bespoke CAUSAL red-fail
+/// "ack fired before the mirror confirm signalled".
 #[nativelink_test]
 async fn chunked_small_blob_bytestream_gates_on_worker_mirror()
 -> Result<(), Box<dyn core::error::Error>> {
-    const MIRROR_DELAY: Duration = Duration::from_millis(400);
-    const LATENCY_FLOOR: Duration = Duration::from_millis(250);
+    // Bound for "the ack has NOT fired while the gate is closed". NOT a latency
+    // floor: the SAFE direction (more load ⇒ ack even less likely to have fired
+    // ⇒ never a false-fail). The mutated/skipped ack fires on the local
+    // in-memory write (~112µs observed), far below this.
+    const GATE_HOLD: Duration = Duration::from_millis(200);
 
     let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
     let (manager, proxy) = make_manager_fast_slow(slow.clone());
@@ -811,45 +949,67 @@ async fn chunked_small_blob_bytestream_gates_on_worker_mirror()
     let data = Bytes::from(vec![0x5au8; 4096]);
     let digest = DigestInfo::try_new(HASH1, data.len()).expect("valid digest");
 
-    // The peer's `update` (the mirror write target) sleeps MIRROR_DELAY before
-    // landing the blob into the real backing MemoryStore.
+    // The peer's `update` (the worker-mirror write target) BLOCKS on `release`
+    // until the test flips it, then lands the blob into the real backing store.
     let peer_backing = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let peer = Store::new(Arc::new(DelayedSlowStore {
-        backing: peer_backing.clone(),
-        delay: MIRROR_DELAY,
-    }));
-    register_worker(&proxy, "grpc://healthy:50071", peer, digest);
+    let (peer, mut entered_rx, release_tx) = GatedMirrorStore::new(peer_backing.clone());
+    register_worker(&proxy, "grpc://healthy:50071", Store::new(peer), digest);
 
-    let start = std::time::Instant::now();
-    let response = tokio::time::timeout(DEADLOCK_DETECTOR, drive_oneshot_write(bs_server, data.clone()))
+    let mut handle = drive_oneshot_write(bs_server, data.clone());
+
+    // STEP 1 — the gate must be REACHED before the ack fires. If the RPC acks
+    // here (before the peer `update` is even entered), the worker-mirror gate
+    // was skipped entirely (`mirror_handle = None`) — a real sole-replica ack.
+    tokio::time::timeout(DEADLOCK_DETECTOR, async {
+        tokio::select! {
+            biased;
+            res = &mut handle => panic!(
+                "ack fired before the worker-mirror gate was even reached — the \
+                 chunked ack-gate block was SKIPPED (mirror_handle = None → \
+                 sole-replica ack). RPC result: {res:?}"
+            ),
+            r = entered_rx.wait_for(|reached| *reached) => {
+                r.expect("GatedMirrorStore entered sender dropped");
+            }
+        }
+    })
+    .await
+    .expect("worker-mirror update must be reached (gate present) — deadlock detector");
+
+    // STEP 2 — LOAD-BEARING CAUSAL EDGE: with the gate still CLOSED, the ack
+    // MUST NOT fire. A non-awaited (mutated) gate acks here on the local write
+    // alone; the correct gate keeps the RPC pending until `release`.
+    tokio::select! {
+        biased;
+        res = &mut handle => panic!(
+            "ack fired before the mirror confirm signalled — the chunked path did \
+             NOT await the worker-mirror confirm (mutation: confirm_chunked_replica \
+             .await? reverted to fire-and-forget drop(mirror_handle)). RPC result: \
+             {res:?}"
+        ),
+        () = tokio::time::sleep(GATE_HOLD) => { /* correct: ack gated, still pending */ }
+    }
+
+    // STEP 3 — release the gate; now the ack MUST fire and succeed.
+    release_tx
+        .send(true)
+        .expect("GatedMirrorStore release receiver dropped before release");
+    let response = tokio::time::timeout(DEADLOCK_DETECTOR, handle)
         .await
-        .expect("small-blob chunked write must not hang against a healthy worker")
+        .expect("small-blob chunked write must ack once the worker mirror is released")
         .expect("join")
         .err_tip(|| "write RPC")?
         .into_inner();
-    let elapsed = start.elapsed();
     assert_eq!(response.committed_size, data.len() as i64, "small-blob chunked write must ack");
 
-    // (1) The ack WAITED for the (slow) worker-mirror confirm — proving the
-    // chunked path gates a small blob on the WORKER MIRROR, not Redis.
-    assert!(
-        elapsed >= LATENCY_FLOOR,
-        "small (≤16 KiB) ByteStream Write takes the chunked path, which gates on \
-         a WORKER-MIRROR confirm — the ack MUST await the (slow ~{MIRROR_DELAY:?}) \
-         mirror write; observed {elapsed:?} < {LATENCY_FLOOR:?} means it did NOT \
-         (mutation: revert confirm_chunked_replica.await? to fire-and-forget \
-         drop(mirror_handle))"
-    );
-    // (2) The 2nd replica physically landed on the WORKER MIRROR before the ack
-    // — NOT decoupled to the slow tier (the behavior the false oneshot→Redis
-    // premise hid).
+    // The 2nd replica physically landed on the WORKER MIRROR (not decoupled to
+    // the slow tier — the behavior the false oneshot→Redis premise hid).
     let on_peer = peer_backing.get_part_unchunked(digest, 0, None).await?;
     assert_eq!(
         on_peer.as_ref(),
         data.as_ref(),
         "small-blob chunked ByteStream Write MUST place its 2nd replica on the \
-         WORKER before acking (mutation: fire-and-forget drop(mirror_handle) → \
-         peer empty at read-back)"
+         WORKER before acking"
     );
     Ok(())
 }
@@ -865,56 +1025,90 @@ async fn chunked_small_blob_bytestream_gates_on_worker_mirror()
 /// `chunked_small_blob_bytestream_gates_on_worker_mirror` (peers-present) to
 /// cover BOTH 2nd-replica destinations for the path the false premise hid.
 ///
-/// The slow tier is wrapped in `DelayedSlowStore` (its `update` SLEEPS
-/// `SLOW_DELAY`). The load-bearing assertion is the LATENCY FLOOR: the RPC
-/// cannot return until the AWAITED `confirm_via_slow_store` write resolves. A
-/// landing assertion alone is NOT mutation-resistant here — the FastSlowStore's
-/// pre-existing DETACHED async slow write also eventually lands the blob on the
-/// same slow store, so "blob present" does not prove the ack waited for it. The
-/// detached write does NOT delay the RPC; only the awaited confirm does.
+/// CAUSAL assertion (review-pair-a MAJOR-NEW / red-team, SHA 1c917655 — replaces
+/// the prior wall-clock latency floor): the slow tier is a [`GatedMirrorStore`]
+/// whose `update` BLOCKS on a test-controlled `release` latch. The FastSlowStore
+/// drives that slow store TWICE — once via its pre-existing DETACHED async slow
+/// write (fire-and-forget) and once via the AWAITED `confirm_via_slow_store`;
+/// the `watch` release latch unblocks both, but only the AWAITED one gates the
+/// ack. The test asserts ack ORDERING, not elapsed time —
+///   1. the slow-tier `update` is REACHED (gate present);
+///   2. while the gate is HELD CLOSED, the RPC is still PENDING (the awaited
+///      `confirm_via_slow_store` has not resolved → no ack);
+///   3. only AFTER release does the RPC ack, with the 2nd replica on the slow
+///      tier.
+/// A landing assertion alone is NOT mutation-resistant here (the detached async
+/// write also eventually lands the blob, so "blob present" never proved the ack
+/// waited) — the closed-gate PENDING edge is what proves causality.
 ///
 /// Mutation: make `confirm_chunked_replica`'s `NoPeers` arm return `Ok(())`
-/// without `confirm_via_slow_store` → the RPC returns in ~0ms (only the detached
-/// FSS async write carries the delay) → the latency-floor assertion red-fails.
+/// without `confirm_via_slow_store` → the ack no longer AWAITs the slow tier, so
+/// the RPC completes while the gate is still closed (only the detached
+/// fire-and-forget write is blocked) → step 2's `select!` resolves on the RPC
+/// arm → bespoke CAUSAL red-fail "ack fired before the slow-tier confirm
+/// signalled".
 #[nativelink_test]
 async fn chunked_small_blob_bytestream_no_peer_lands_on_slow_tier()
 -> Result<(), Box<dyn core::error::Error>> {
-    const SLOW_DELAY: Duration = Duration::from_millis(400);
-    const LATENCY_FLOOR: Duration = Duration::from_millis(250);
+    // Bound for "the ack has NOT fired while the gate is closed" — SAFE
+    // direction only (see the peers-present test); NOT a latency floor.
+    const GATE_HOLD: Duration = Duration::from_millis(200);
 
     let slow_backing = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let slow = Store::new(Arc::new(DelayedSlowStore {
-        backing: slow_backing.clone(),
-        delay: SLOW_DELAY,
-    }));
+    let (slow, mut entered_rx, release_tx) = GatedMirrorStore::new(slow_backing.clone());
     // No workers registered → `mirror_and_confirm_data` returns NoPeers → the
     // chunked handler reads back the pinned copy and confirms via the slow tier.
-    let (manager, _proxy) = make_manager_fast_slow(slow);
+    let (manager, _proxy) = make_manager_fast_slow(Store::new(slow));
     let bs_server = make_bytestream_server(manager.as_ref())?;
 
     let data = Bytes::from(vec![0x6bu8; 4096]);
     let digest = DigestInfo::try_new(HASH1, data.len()).expect("valid digest");
 
-    let start = std::time::Instant::now();
-    let response = tokio::time::timeout(DEADLOCK_DETECTOR, drive_oneshot_write(bs_server, data.clone()))
+    let mut handle = drive_oneshot_write(bs_server, data.clone());
+
+    // STEP 1 — the slow-tier `update` must be REACHED before the ack fires.
+    tokio::time::timeout(DEADLOCK_DETECTOR, async {
+        tokio::select! {
+            biased;
+            res = &mut handle => panic!(
+                "ack fired before the slow-tier gate was even reached — the no-peer \
+                 confirm_via_slow_store was SKIPPED (sole-replica ack). RPC result: \
+                 {res:?}"
+            ),
+            r = entered_rx.wait_for(|reached| *reached) => {
+                r.expect("GatedMirrorStore entered sender dropped");
+            }
+        }
+    })
+    .await
+    .expect("slow-tier update must be reached (gate present) — deadlock detector");
+
+    // STEP 2 — LOAD-BEARING CAUSAL EDGE: with the gate still CLOSED, the ack
+    // MUST NOT fire. The awaited `confirm_via_slow_store` keeps the RPC pending;
+    // a mutated NoPeers→Ok arm acks here on the local write alone.
+    tokio::select! {
+        biased;
+        res = &mut handle => panic!(
+            "ack fired before the slow-tier confirm signalled — the no-peer arm did \
+             NOT await confirm_via_slow_store (mutation: NoPeers arm returns Ok \
+             without confirm_via_slow_store). RPC result: {res:?}"
+        ),
+        () = tokio::time::sleep(GATE_HOLD) => { /* correct: ack gated, still pending */ }
+    }
+
+    // STEP 3 — release the gate; now the ack MUST fire and succeed.
+    release_tx
+        .send(true)
+        .expect("GatedMirrorStore release receiver dropped before release");
+    let response = tokio::time::timeout(DEADLOCK_DETECTOR, handle)
         .await
-        .expect("small-blob chunked write must complete on the no-peer slow path")
+        .expect("no-peer small-blob chunked write must ack once the slow tier is released")
         .expect("join")
         .err_tip(|| "write RPC")?
         .into_inner();
-    let elapsed = start.elapsed();
     assert_eq!(response.committed_size, data.len() as i64, "no-peer small-blob chunked write must ack");
 
-    // (1) LOAD-BEARING: the ack AWAITED the slow-tier confirm before returning.
-    assert!(
-        elapsed >= LATENCY_FLOOR,
-        "no-peer small (≤16 KiB) ByteStream Write MUST AWAIT the slow-tier write \
-         before acking (slow tier ~{SLOW_DELAY:?}); observed {elapsed:?} < \
-         {LATENCY_FLOOR:?} means the NoPeers arm did NOT confirm the 2nd replica \
-         on the slow tier (mutation: NoPeers arm returns Ok without \
-         confirm_via_slow_store)"
-    );
-    // (2) Durability floor: the 2nd replica physically reached the slow tier
+    // Durability floor: the 2nd replica physically reached the slow tier
     // (production: Redis SMALL_CAS_CACHED).
     let on_slow = slow_backing.get_part_unchunked(digest, 0, None).await?;
     assert_eq!(

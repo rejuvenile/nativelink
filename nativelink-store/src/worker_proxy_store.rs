@@ -421,7 +421,7 @@ pub enum MirrorConfirmOutcome {
 ///      multi-GiB re-drive therefore holds the ENTIRE budget — worst-case
 ///      concurrency at the cap is **1 blob, not 32**. It does not deadlock (the
 ///      clamp serves a >2 GiB request from the whole pool) and it is bounded (the
-///      over-cap acquire blocks). A follow-up (#FL-689) tracks streaming the
+///      over-cap acquire blocks). A follow-up (#FL-691) tracks streaming the
 ///      re-drive instead of buffering the whole blob under one permit.
 ///   - 2 GiB matches the established server-side mirror memory budget
 ///     (`fast_slow_store::DEFAULT_MIRROR_BLOBS_MAX_BYTES = 2 GiB`). NOTE: these
