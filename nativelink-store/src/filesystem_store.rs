@@ -1469,7 +1469,12 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             let from_clone = from_path.clone();
             let to_clone = final_path_owned.clone();
             let rename_start = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(move || -> Result<(u128, u128), Error> {
+            // TEMP PROBE (#FL-688 path-rebind confirmation) — REVERT after capture
+            // store-side (ino, mtime_ns) of the file renamed into the CAS final
+            // path, captured INSIDE spawn_blocking (keeps the stat off the async
+            // runtime, consistent with the rename/chmod syscalls here).
+            type ProbeStoreStat = Option<(u64, i64)>;
+            let result = tokio::task::spawn_blocking(move || -> Result<(u128, u128, ProbeStoreStat), Error> {
                 let rename_syscall_start = std::time::Instant::now();
                 (rename_fn)(&from_clone, &to_clone)?;
                 let rename_syscall_ms = rename_syscall_start.elapsed().as_millis();
@@ -1492,7 +1497,20 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 {
                     chmod_ms = 0;
                 }
-                Ok((rename_syscall_ms, chmod_ms))
+                // TEMP PROBE (#FL-688 path-rebind confirmation) — REVERT after capture
+                // stat the final CAS path (set_permissions changes ctime, not
+                // mtime, and rename preserves mtime, so this mtime is the stored
+                // content's mtime). On Err, leave None — the probe just skips.
+                #[cfg(target_family = "unix")]
+                let probe_store_stat: ProbeStoreStat = {
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::metadata(&to_clone).ok().map(|m| {
+                        (m.ino(), m.mtime() * 1_000_000_000 + m.mtime_nsec())
+                    })
+                };
+                #[cfg(not(target_family = "unix"))]
+                let probe_store_stat: ProbeStoreStat = None;
+                Ok((rename_syscall_ms, chmod_ms, probe_store_stat))
             })
             .await
             .map_err(|e| make_err!(Code::Internal, "Rename task join error: {e:?}"))
@@ -1500,7 +1518,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             let rename_total_ms = rename_start.elapsed().as_millis();
 
             match &result {
-                Ok((rename_syscall_ms, chmod_ms)) => {
+                Ok((rename_syscall_ms, chmod_ms, probe_store_stat)) => {
                     let emplace_total_ms = emplace_timer.elapsed().as_millis();
                     if emplace_total_ms > 100 {
                         warn!(
@@ -1513,6 +1531,35 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                             chmod_ms,
                             "emplace_file slow (>100ms)"
                         );
+                    }
+                    // TEMP PROBE (#FL-688 path-rebind confirmation) — REVERT after capture
+                    // Correlate the just-stored file's (ino, mtime_ns) against the
+                    // (ino, mtime_ns) of the fd hashed at Phase-1 prehash for this
+                    // same digest. A mismatch means the content-addressed path was
+                    // rebound (different inode/mtime) between hash and store —
+                    // confirming the "hash-by-path / store-by-path, no inode pin"
+                    // defect. CAS keys only (Str keys never carry a prehash record).
+                    if let (StoreKey::Digest(probe_digest), Some((store_ino, store_mtime_ns))) =
+                        (key.borrow(), probe_store_stat)
+                    {
+                        if let Some(mismatch) =
+                            nativelink_util::pathrebind_probe::correlate_store(
+                                &probe_digest,
+                                *store_ino,
+                                *store_mtime_ns,
+                            )
+                        {
+                            error!(
+                                digest = %probe_digest,
+                                hash_ino = mismatch.hash_ino,
+                                hash_mtime_ns = mismatch.hash_mtime_ns,
+                                store_ino = *store_ino,
+                                store_mtime_ns = *store_mtime_ns,
+                                hash_path = %mismatch.hash_path,
+                                stored_path = ?final_path_owned,
+                                "PATHREBIND-PROBE: stored inode/mtime differs from hashed — content-addressing path-rebind"
+                            );
+                        }
                     }
                     encoded_file_path.path_type = PathType::Content;
                     encoded_file_path.key = key;
