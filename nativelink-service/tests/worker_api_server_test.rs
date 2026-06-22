@@ -918,6 +918,8 @@ pub async fn mirror_capacity_report_plumbed_to_picker_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -997,6 +999,8 @@ pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test(
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: true,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1046,6 +1050,8 @@ pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test(
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1104,6 +1110,8 @@ pub async fn zero_mirror_max_does_not_record_capacity_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1160,6 +1168,8 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -1223,6 +1233,8 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1259,6 +1271,8 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1318,6 +1332,8 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1345,6 +1361,8 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1396,6 +1414,8 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1423,6 +1443,8 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1479,6 +1501,8 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1565,6 +1589,8 @@ pub async fn blobs_available_with_malformed_digests_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1620,6 +1646,8 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1786,6 +1814,8 @@ async fn send_blobs_and_wait(
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -2880,6 +2910,8 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
             ],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -3058,6 +3090,8 @@ pub async fn handle_blobs_available_a2_fold_merged_field13_and_field16_test()
             ],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;

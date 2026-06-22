@@ -135,6 +135,12 @@ struct HeaderScalars {
     mirror_max_bytes: u64,
     // (FL-681) Indefinite-pin-cap saturation, carried from chunk 0.
     indefinite_pin_saturated: bool,
+    // Host swap/page-out pressure, carried from chunk 0. Decode-only:
+    // reassembled into the notification but NOT consumed server-side yet
+    // (no logging / metric / alert / admission — deferred steps 3+4 of
+    // the swap-pressure instrumentation).
+    swap_used_bytes: u64,
+    pageouts_per_sec: u32,
 }
 
 /// One in-flight broadcast's accumulated state.
@@ -247,6 +253,8 @@ impl BroadcastAccumulator {
                 mirror_used_bytes: chunk.mirror_used_bytes,
                 mirror_max_bytes: chunk.mirror_max_bytes,
                 indefinite_pin_saturated: chunk.indefinite_pin_saturated,
+                swap_used_bytes: chunk.swap_used_bytes,
+                pageouts_per_sec: chunk.pageouts_per_sec,
             });
         }
 
@@ -806,6 +814,8 @@ impl BlobsAvailableAccumulator {
                     body.mirror_used_bytes = headers.mirror_used_bytes;
                     body.mirror_max_bytes = headers.mirror_max_bytes;
                     body.indefinite_pin_saturated = headers.indefinite_pin_saturated;
+                    body.swap_used_bytes = headers.swap_used_bytes;
+                    body.pageouts_per_sec = headers.pageouts_per_sec;
                 }
                 body.is_full_snapshot = removed.is_full_snapshot;
                 Some(body)
@@ -897,6 +907,8 @@ mod tests {
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }
     }
 
@@ -1375,6 +1387,48 @@ mod tests {
             out.indefinite_pin_saturated,
             "FL-681: chunk-0 indefinite_pin_saturated=true was lost in chunked \
              reassembly (the terminal chunk's default false clobbered it)"
+        );
+    }
+
+    /// Swap/page-out pressure scalars ride chunk 0 and the accumulator
+    /// MUST carry them forward into the reassembled notification — the
+    /// terminal chunk leaves them at the proto3 default 0, so without the
+    /// carry-forward copy the values are silently lost in chunked
+    /// reassembly (exactly the half-applied-header bug class the FL-681
+    /// `indefinite_pin_saturated` carry guards against).
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): comment out the two
+    /// `body.swap_used_bytes = headers.swap_used_bytes;` /
+    /// `body.pageouts_per_sec = headers.pageouts_per_sec;` lines in the
+    /// terminal-commit arm of `merge_chunk`. This test red-fails with the
+    /// bespoke "lost in chunked reassembly" message below.
+    #[test]
+    fn swap_pressure_scalars_carried_forward_from_chunk_zero() {
+        let acc = BlobsAvailableAccumulator::new();
+        // Chunk 0 carries the swap scalars; chunk 1 (terminal) leaves
+        // them at proto3 default 0 per the wire contract.
+        let mut c0 = chunk(1, 0, false, 99, vec![bdi(1)]);
+        c0.swap_used_bytes = 9_876_543_210;
+        c0.pageouts_per_sec = 4242;
+
+        // Terminal chunk: swap scalars default 0 (helper). If the
+        // accumulator failed to carry chunk-0's values, the terminal's
+        // 0 would win and these assertions would see 0.
+        let c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
+
+        assert!(acc.merge_chunk(c0).is_none());
+        let out = acc.merge_chunk(c1).expect("terminal commits");
+        assert_eq!(
+            out.swap_used_bytes, 9_876_543_210,
+            "chunk-0 swap_used_bytes was lost in chunked reassembly (the \
+             terminal chunk's default 0 clobbered the carried value — \
+             accumulator carry-forward missing)"
+        );
+        assert_eq!(
+            out.pageouts_per_sec, 4242,
+            "chunk-0 pageouts_per_sec was lost in chunked reassembly (the \
+             terminal chunk's default 0 clobbered the carried value — \
+             accumulator carry-forward missing)"
         );
     }
 

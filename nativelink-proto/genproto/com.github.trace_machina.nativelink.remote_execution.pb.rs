@@ -271,6 +271,38 @@ pub struct BlobsAvailableNotification {
     /// / matching the prior behavior.
     #[prost(bool, tag = "18")]
     pub indefinite_pin_saturated: bool,
+    /// / Host swap-used bytes at heartbeat-emit time. macOS reads
+    /// / `sysctl vm.swapusage` (`xsw_usage.xsu_used`); Linux reads
+    /// / `/proc/meminfo` (`SwapTotal - SwapFree`). This is ABSOLUTE swap
+    /// / occupancy, which LINGERS after memory pressure subsides, so it is
+    /// / a coarse signal only; the `pageouts_per_sec` RATE field below is
+    /// / the load-bearing dynamic-pressure indicator. `0` means either
+    /// / "no swap in use" or "sampler unavailable" (indistinguishable on
+    /// / the wire, matching the `cpu_load_pct = 0` unknown convention).
+    /// / The 16 GB Mac workers oversubscribe RAM invisibly under the
+    /// / count-only admission gate (`worker.rs` `can_accept_work`); this
+    /// / surfaces the missing memory signal.
+    /// /
+    /// / DECODE-ONLY on the server today: carried on the wire and
+    /// / reassembled through the chunked path, but NO server-side logging /
+    /// / metric / alert / admission logic consumes it yet (deferred
+    /// / steps 3+4 of the swap-pressure instrumentation).
+    #[prost(uint64, tag = "19")]
+    pub swap_used_bytes: u64,
+    /// / Host page-out RATE in pages/sec, computed worker-side as the delta
+    /// / of the cumulative page-out counter between FIXED-interval sampler
+    /// / ticks (NOT between heartbeats, whose cadence varies 100 ms to 6 s).
+    /// / macOS reads mach `host_statistics64(HOST_VM_INFO64)` `pageouts`;
+    /// / Linux reads `/proc/vmstat` `pswpout`. This is the load-bearing
+    /// / swap-pressure signal: a non-zero rate means the host is ACTIVELY
+    /// / paging anonymous memory to disk right now (the thing that makes a
+    /// / swapping Mac slow), whereas `swap_used_bytes` can stay high long
+    /// / after pressure ends. `0` means "no recent page-outs" or "sampler
+    /// / unavailable".
+    /// /
+    /// / DECODE-ONLY on the server today (see `swap_used_bytes`).
+    #[prost(uint32, tag = "20")]
+    pub pageouts_per_sec: u32,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -626,6 +658,18 @@ pub struct BlobsAvailableChunk {
     /// / `BlobsAvailableNotification.indefinite_pin_saturated` (field 18).
     #[prost(bool, tag = "22")]
     pub indefinite_pin_saturated: bool,
+    /// / Host swap-used bytes — only meaningful on chunk 0; subsequent
+    /// / chunks leave at proto3 default `0`. The accumulator carries the
+    /// / chunk-0 value forward into the reassembled
+    /// / `BlobsAvailableNotification.swap_used_bytes` (field 19).
+    #[prost(uint64, tag = "23")]
+    pub swap_used_bytes: u64,
+    /// / Host page-out rate (pages/sec) — only meaningful on chunk 0;
+    /// / subsequent chunks leave at proto3 default `0`. The accumulator
+    /// / carries the chunk-0 value forward into the reassembled
+    /// / `BlobsAvailableNotification.pageouts_per_sec` (field 20).
+    #[prost(uint32, tag = "24")]
+    pub pageouts_per_sec: u32,
 }
 /// / A streaming-message envelope shared across the cas→worker, scheduler→
 /// / worker, and worker→scheduler chunk producers. Exactly ONE of the

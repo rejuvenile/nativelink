@@ -394,6 +394,8 @@ async fn send_blobs_available(
             pinned_mirror_entries: vec![],
             pinned_ac_mirror_entries: Vec::new(),
             indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            pageouts_per_sec: 0,
         }))
         .await
         .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))

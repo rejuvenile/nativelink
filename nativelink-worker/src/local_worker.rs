@@ -279,9 +279,181 @@ mod cpu_impl {
     }
 }
 
+/// Platform-specific host swap/page-out sampling. Mirrors `cpu_impl`:
+/// the macOS path reads `sysctl vm.swapusage` + mach
+/// `host_statistics64(HOST_VM_INFO64)`; the Linux path reads
+/// `/proc/meminfo` + `/proc/vmstat`; everything else is a no-op. Each
+/// call is a couple of syscalls (no per-tick `vm_stat` fork); the
+/// dedicated sampler thread reads them on the existing 100 ms cadence
+/// and stores the derived values into atomics the heartbeat reads.
+#[cfg(target_os = "linux")]
+mod mem_impl {
+    /// Host swap currently in use, in bytes. `/proc/meminfo` reports
+    /// `SwapTotal`/`SwapFree` in KiB; used = (total - free) * 1024.
+    pub(super) fn read_swap_used_bytes() -> Option<u64> {
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut total_kib: Option<u64> = None;
+        let mut free_kib: Option<u64> = None;
+        for line in contents.lines() {
+            if let Some(rest) = line.strip_prefix("SwapTotal:") {
+                total_kib = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+                free_kib = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            }
+        }
+        let (total, free) = (total_kib?, free_kib?);
+        Some(total.saturating_sub(free).saturating_mul(1024))
+    }
+
+    /// Cumulative count of pages swapped OUT since boot. `/proc/vmstat`
+    /// `pswpout` is the anonymous-page swap-out counter (the direct
+    /// analog of the mach `pageouts`/`swapouts` counters). Monotonic
+    /// until reboot; the sampler turns it into a per-second rate.
+    pub(super) fn read_pageouts_cumulative() -> Option<u64> {
+        let contents = std::fs::read_to_string("/proc/vmstat").ok()?;
+        for line in contents.lines() {
+            if let Some(rest) = line.strip_prefix("pswpout ") {
+                return rest.trim().parse().ok();
+            }
+        }
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mem_impl {
+    // `sysctl vm.swapusage` returns a `struct xsw_usage`. Layout from
+    // <sys/sysctl.h>; we read `xsu_used` (bytes). repr(C) so the field
+    // offsets match the kernel ABI.
+    #[repr(C)]
+    struct XswUsage {
+        xsu_total: u64,
+        xsu_avail: u64,
+        xsu_used: u64,
+        xsu_pagesize: u32,
+        xsu_encrypted: u8,
+    }
+
+    // mach `host_statistics64(HOST_VM_INFO64)` fills a
+    // `vm_statistics64_data_t`. We only read `pageouts` (the cumulative
+    // page-out counter). The struct is declared in full (repr(C),
+    // matching <mach/vm_statistics.h>) so the `pageouts` field lands at
+    // the correct offset; unused fields are named with leading `_`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct VmStatistics64 {
+        free_count: u32,
+        active_count: u32,
+        inactive_count: u32,
+        wire_count: u32,
+        zero_fill_count: u64,
+        reactivations: u64,
+        pageins: u64,
+        pageouts: u64,
+        faults: u64,
+        cow_faults: u64,
+        lookups: u64,
+        hits: u64,
+        purges: u64,
+        purgeable_count: u32,
+        speculative_count: u32,
+        decompressions: u64,
+        compressions: u64,
+        swapins: u64,
+        swapouts: u64,
+        phys_footprint: u64,
+        min_faults: u64,
+        cow_faults_2: u64,
+        internal_page_count: u32,
+        external_page_count: u32,
+        total_uncompressed_pages_in_compressor: u64,
+    }
+
+    // HOST_VM_INFO64 flavor + its count in `integer_t` (u32) units.
+    const HOST_VM_INFO64: i32 = 4;
+    // `HOST_VM_INFO64_COUNT` = size_of::<vm_statistics64_data_t>() / size_of::<integer_t>().
+    const HOST_VM_INFO64_COUNT: u32 =
+        (core::mem::size_of::<VmStatistics64>() / core::mem::size_of::<u32>()) as u32;
+
+    unsafe extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_statistics64(
+            host_priv: u32,
+            flavor: i32,
+            host_info_out: *mut u32,
+            host_info_out_cnt: *mut u32,
+        ) -> i32;
+    }
+
+    /// Host swap currently in use, in bytes, via `sysctl vm.swapusage`.
+    pub(super) fn read_swap_used_bytes() -> Option<u64> {
+        use std::ffi::CString;
+        let cname = CString::new("vm.swapusage").ok()?;
+        let mut usage = XswUsage {
+            xsu_total: 0,
+            xsu_avail: 0,
+            xsu_used: 0,
+            xsu_pagesize: 0,
+            xsu_encrypted: 0,
+        };
+        let mut len = core::mem::size_of::<XswUsage>();
+        // SAFETY: sysctlbyname is a stable POSIX API on macOS; `usage`
+        // is a correctly-sized repr(C) buffer matching `struct xsw_usage`.
+        let ret = unsafe {
+            libc::sysctlbyname(
+                cname.as_ptr(),
+                &raw mut usage as *mut _,
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 { Some(usage.xsu_used) } else { None }
+    }
+
+    /// Cumulative page-outs since boot, via mach
+    /// `host_statistics64(HOST_VM_INFO64)`. Returns the `pageouts`
+    /// counter (monotonic until reboot); the sampler derives a rate.
+    pub(super) fn read_pageouts_cumulative() -> Option<u64> {
+        let mut stats = VmStatistics64::default();
+        let mut count = HOST_VM_INFO64_COUNT;
+        // SAFETY: host_statistics64 is a stable macOS kernel API. We pass
+        // a correctly-sized repr(C) buffer and the matching element count;
+        // the kernel writes `count` u32 words into it. We check the rc.
+        let ret = unsafe {
+            host_statistics64(
+                mach_host_self(),
+                HOST_VM_INFO64,
+                &raw mut stats as *mut u32,
+                &mut count,
+            )
+        };
+        if ret == 0 { Some(stats.pageouts) } else { None }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod mem_impl {
+    pub(super) fn read_swap_used_bytes() -> Option<u64> {
+        None
+    }
+    pub(super) fn read_pageouts_cumulative() -> Option<u64> {
+        None
+    }
+}
+
 static CPU_PCT: AtomicU32 = AtomicU32::new(0);
 static P_CORE_PCT: AtomicU32 = AtomicU32::new(0);
 static E_CORE_PCT: AtomicU32 = AtomicU32::new(0);
+/// Host swap-used bytes, refreshed by the sampler thread every 100 ms.
+/// `0` = no swap in use OR sampler unavailable (indistinguishable, per
+/// the `cpu_load_pct = 0` unknown convention).
+static SWAP_USED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Host page-out RATE in pages/sec, derived by the sampler thread from
+/// the delta of the cumulative page-out counter across its fixed 100 ms
+/// ticks. This is the load-bearing swap-pressure signal (active paging),
+/// vs `SWAP_USED_BYTES` which lingers after pressure subsides.
+static PAGEOUTS_PER_SEC: AtomicU32 = AtomicU32::new(0);
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Starts a dedicated OS thread that samples system-wide CPU utilization
@@ -316,6 +488,68 @@ fn compute_pct(prev: &cpu_impl::CpuTimes, curr: &cpu_impl::CpuTimes) -> u32 {
     }
 }
 
+/// Derive the page-out RATE (pages/sec) from two cumulative-counter
+/// samples and the wall-clock interval between them.
+///
+/// The cumulative page-out counter is monotonic until reboot. A counter
+/// reset (reboot mid-process, or a kernel that wrapped) shows up as
+/// `curr < prev`; we clamp that to `0` rather than report a garbage
+/// spike. A non-positive `elapsed_secs` (clock didn't advance) also
+/// yields `0`. The result saturates into `u32` so a pathological burst
+/// can't overflow the wire field.
+fn compute_pageout_rate(prev_count: u64, curr_count: u64, elapsed_secs: f64) -> u32 {
+    if elapsed_secs <= 0.0 {
+        return 0;
+    }
+    // saturating_sub clamps a counter reset (curr < prev) to 0.
+    let delta = curr_count.saturating_sub(prev_count);
+    let rate = (delta as f64 / elapsed_secs).round();
+    if rate <= 0.0 {
+        0
+    } else if rate >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        rate as u32
+    }
+}
+
+/// Sample host swap/page-out pressure on the sampler thread's fixed
+/// cadence and publish into the atomics the heartbeat reads. `prev`
+/// carries the last cumulative page-out sample + the `Instant` it was
+/// taken so the rate uses the REAL elapsed interval (robust to sampler
+/// scheduling jitter), not an assumed 100 ms. Returns the new
+/// `(cumulative_pageouts, sampled_at)` to thread into the next tick;
+/// `None` cumulative means the sampler was unavailable this tick (rate
+/// published as `0`).
+fn sample_mem_pressure(prev: Option<(u64, Instant)>) -> Option<(u64, Instant)> {
+    // swap-used is an absolute gauge — publish whatever we read (0 if
+    // unavailable), no prev-state needed.
+    SWAP_USED_BYTES.store(
+        mem_impl::read_swap_used_bytes().unwrap_or(0),
+        Ordering::Relaxed,
+    );
+
+    let now = Instant::now();
+    let Some(curr_count) = mem_impl::read_pageouts_cumulative() else {
+        // Counter unreadable this tick: report no pressure and drop the
+        // prev anchor so the next successful read doesn't compute a rate
+        // across an unknown-length gap.
+        PAGEOUTS_PER_SEC.store(0, Ordering::Relaxed);
+        return None;
+    };
+    if let Some((prev_count, prev_at)) = prev {
+        let elapsed = now.duration_since(prev_at).as_secs_f64();
+        PAGEOUTS_PER_SEC.store(
+            compute_pageout_rate(prev_count, curr_count, elapsed),
+            Ordering::Relaxed,
+        );
+    } else {
+        // First sample: no interval to rate against yet.
+        PAGEOUTS_PER_SEC.store(0, Ordering::Relaxed);
+    }
+    Some((curr_count, now))
+}
+
 fn cpu_sample_loop() {
     // Monitoring thread — downgrade to UTILITY QoS so it doesn't
     // compete with real work for P-cores.
@@ -340,8 +574,13 @@ fn cpu_sample_loop() {
     // Fallback: aggregate-only sampling (Linux, non-macOS, or Intel Mac
     // where host_processor_info failed).
     let mut prev = cpu_impl::read_cpu_times();
+    let mut prev_mem: Option<(u64, Instant)> = None;
     loop {
         std::thread::sleep(Duration::from_millis(100));
+        // Sample host swap/page-out on the same fixed cadence as CPU so
+        // the page-out rate has a stable denominator (the heartbeat
+        // cadence varies 100 ms-6 s and would make the rate noisy).
+        prev_mem = sample_mem_pressure(prev_mem);
         let curr = cpu_impl::read_cpu_times();
         match (&prev, &curr) {
             (Some(p), Some(c)) => {
@@ -356,8 +595,12 @@ fn cpu_sample_loop() {
 #[cfg(target_os = "macos")]
 fn per_type_sample_loop(initial: cpu_impl::PerTypeCpuTimes) {
     let mut prev = initial;
+    let mut prev_mem: Option<(u64, Instant)> = None;
     loop {
         std::thread::sleep(Duration::from_millis(100));
+        // Sample host swap/page-out FIRST so it keeps publishing even on
+        // ticks where the CPU read fails and `continue`s below.
+        prev_mem = sample_mem_pressure(prev_mem);
         let Some(curr) = cpu_impl::read_per_type_cpu_times() else {
             CPU_PCT.store(0, Ordering::Relaxed);
             P_CORE_PCT.store(0, Ordering::Relaxed);
@@ -402,6 +645,22 @@ fn get_p_core_load_pct() -> u32 {
 /// 100 on CPUs without E-cores (all cores are P-cores).
 fn get_e_core_load_pct() -> u32 {
     E_CORE_PCT.load(Ordering::Relaxed)
+}
+
+/// Returns host swap-used bytes sampled by the dedicated sampler thread.
+/// `0` means no swap in use OR sampler unavailable. Absolute gauge —
+/// pair with [`get_pageouts_per_sec`] (the dynamic-pressure signal).
+fn get_swap_used_bytes() -> u64 {
+    SWAP_USED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Returns the host page-out RATE (pages/sec), derived by the sampler
+/// thread from the delta of the cumulative page-out counter across its
+/// fixed 100 ms ticks. Non-zero ⇒ the host is actively paging anonymous
+/// memory to disk (the load-bearing swap-pressure signal). `0` ⇒ no
+/// recent page-outs or sampler unavailable.
+fn get_pageouts_per_sec() -> u32 {
+    PAGEOUTS_PER_SEC.load(Ordering::Relaxed)
 }
 
 /// Build the advertised gRPC endpoint for peer blob sharing.
@@ -2365,7 +2624,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // worker proactively rather than re-NAK-spinning it. Cheap: one relaxed
         // atomic load + compare, no lock, no await (`moka_evicting_map.rs`).
         let indefinite_pin_saturated = state.fs_store.indefinite_pin_saturated();
-        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated}");
+        // Host swap/page-out pressure, read from the sampler-thread atomics
+        // (same cheap relaxed-load pattern as cpu_load_pct). The page-out
+        // RATE is the load-bearing signal; swap-used is the coarse gauge.
+        let swap_used_bytes = get_swap_used_bytes();
+        let pageouts_per_sec = get_pageouts_per_sec();
+        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} pageouts_per_sec={pageouts_per_sec}");
         let notification = BlobsAvailableNotification {
             worker_cas_endpoint: state.cas_endpoint.clone(),
             digests: Vec::new(),
@@ -2433,6 +2697,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             pinned_ac_mirror_entries,
             // (FL-681) Snapshot taken above from the local CAS FilesystemStore.
             indefinite_pin_saturated,
+            // Host swap/page-out pressure (read above). Periodic heartbeat
+            // carries the authoritative sampler values.
+            swap_used_bytes,
+            pageouts_per_sec,
         };
 
         // (#99) If the notification's encoded estimate exceeds the
@@ -3254,6 +3522,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             indefinite_pin_saturated:
                                                                 running_actions_manager
                                                                     .indefinite_pin_saturated(),
+                                                            // Host swap/page-out pressure read
+                                                            // from the process-global sampler
+                                                            // atomics. Unlike mirror_*_bytes
+                                                            // (which need a CAS-FSS handle not
+                                                            // in scope here, hence 0), the
+                                                            // sampler is global, so this
+                                                            // one-shot delta reports the
+                                                            // AUTHORITATIVE current value.
+                                                            swap_used_bytes: get_swap_used_bytes(),
+                                                            pageouts_per_sec: get_pageouts_per_sec(),
                                                         }
                                                     ).await {
                                                         // Failure to send BlobsAvailable
@@ -4773,6 +5051,7 @@ impl Metrics {
 mod tests {
     use nativelink_util::common::DigestInfo;
     use nativelink_util::store_trait::StoreKey;
+    use serial_test::serial;
 
     use super::*;
 
@@ -5513,6 +5792,112 @@ mod tests {
         );
 
         drop(tokio::fs::remove_dir_all(&tmp).await);
+    }
+
+    /// The page-out RATE is the load-bearing swap-pressure signal: it is
+    /// the DELTA of the cumulative page-out counter divided by the REAL
+    /// elapsed interval. This proves the delta-rate arithmetic that the
+    /// sampler thread runs every tick.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): in `compute_pageout_rate`,
+    /// replace `curr_count.saturating_sub(prev_count)` with `curr_count`
+    /// (report the ABSOLUTE counter instead of the delta). This test
+    /// red-fails at the steady-rate assertion with the bespoke message
+    /// naming the delta-not-absolute contract.
+    #[test]
+    fn compute_pageout_rate_is_delta_over_interval() {
+        // 1000 pages over 2 s ⇒ 500 pages/sec.
+        assert_eq!(
+            compute_pageout_rate(10_000, 11_000, 2.0),
+            500,
+            "page-out rate must be (curr - prev) / elapsed = 1000/2 = 500; a \
+             non-500 value means the sampler reported the ABSOLUTE cumulative \
+             counter instead of the per-interval DELTA (the lingering-counter bug)"
+        );
+        // No change in counter ⇒ no pressure.
+        assert_eq!(
+            compute_pageout_rate(11_000, 11_000, 1.0),
+            0,
+            "a flat cumulative counter must report zero page-out rate"
+        );
+        // Counter reset (reboot / wrap): curr < prev ⇒ clamp to 0, never
+        // a garbage negative-turned-huge spike.
+        assert_eq!(
+            compute_pageout_rate(11_000, 5, 1.0),
+            0,
+            "a counter reset (curr < prev) must clamp to 0, not report a \
+             spurious spike from the underflow"
+        );
+        // Non-advancing clock ⇒ 0 (avoid divide-by-zero garbage).
+        assert_eq!(
+            compute_pageout_rate(10_000, 11_000, 0.0),
+            0,
+            "a non-advancing wall clock must yield 0, not a divide-by-zero"
+        );
+    }
+
+    /// The heartbeat reads host swap/page-out via the process-global
+    /// sampler atomics (`get_swap_used_bytes` / `get_pageouts_per_sec`),
+    /// exactly like `get_cpu_load_pct`. This fakes a sampler tick by
+    /// storing into the atomics and asserts the reader observes it — the
+    /// path the periodic + post-action heartbeat build sites use.
+    ///
+    /// Mutation step: change `get_pageouts_per_sec` to read `CPU_PCT`
+    /// instead of `PAGEOUTS_PER_SEC` (wrong static). This test red-fails
+    /// because the faked page-out value is not observed.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: this test and
+    /// `sample_mem_pressure_first_tick_publishes_zero_rate` both mutate the
+    /// process-global `SWAP_USED_BYTES` / `PAGEOUTS_PER_SEC` statics. Under
+    /// the default multi-threaded test runner the other test's poison store
+    /// (`PAGEOUTS_PER_SEC = 99_999`) races this read; serializing the two
+    /// removes the cross-test interleave (no production-path change).
+    #[test]
+    #[serial(swap_sampler_atomics)]
+    fn heartbeat_reads_swap_pressure_from_sampler_atomics() {
+        // Fake a sampler tick.
+        SWAP_USED_BYTES.store(7_654_321, Ordering::Relaxed);
+        PAGEOUTS_PER_SEC.store(1337, Ordering::Relaxed);
+        assert_eq!(
+            get_swap_used_bytes(),
+            7_654_321,
+            "heartbeat must read swap_used_bytes from the SWAP_USED_BYTES \
+             sampler atomic"
+        );
+        assert_eq!(
+            get_pageouts_per_sec(),
+            1337,
+            "heartbeat must read pageouts_per_sec from the PAGEOUTS_PER_SEC \
+             sampler atomic"
+        );
+    }
+
+    /// `sample_mem_pressure` is the per-tick sampler step. On the FIRST
+    /// call there is no prior anchor, so the rate must publish 0 (no
+    /// interval to rate against) while still returning the cumulative
+    /// anchor for the next tick. This guards against a first-tick spike
+    /// where the absolute counter would be mistaken for a one-tick delta.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: shares the process-global
+    /// `PAGEOUTS_PER_SEC` static with
+    /// `heartbeat_reads_swap_pressure_from_sampler_atomics`; serialized so
+    /// the poison store below cannot race that test's read.
+    #[test]
+    #[serial(swap_sampler_atomics)]
+    fn sample_mem_pressure_first_tick_publishes_zero_rate() {
+        PAGEOUTS_PER_SEC.store(99_999, Ordering::Relaxed); // poison
+        let anchor = sample_mem_pressure(None);
+        assert_eq!(
+            get_pageouts_per_sec(),
+            0,
+            "first sampler tick has no prior interval; rate must be 0, not \
+             the absolute counter mistaken for a one-tick delta"
+        );
+        // On Linux/macOS the cumulative read succeeds and returns an
+        // anchor; on unsupported targets it is None. Either way the rate
+        // was published as 0 above. We don't assert the anchor's presence
+        // because the no-op `mem_impl` legitimately returns None.
+        let _ = anchor;
     }
 }
 
