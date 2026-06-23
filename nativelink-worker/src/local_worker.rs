@@ -417,9 +417,18 @@ mod mem_impl {
     pub(super) fn read_pageouts_cumulative() -> Option<u64> {
         let mut stats = VmStatistics64::default();
         let mut count = HOST_VM_INFO64_COUNT;
-        // SAFETY: host_statistics64 is a stable macOS kernel API. We pass
-        // a correctly-sized repr(C) buffer and the matching element count;
-        // the kernel writes `count` u32 words into it. We check the rc.
+        // SAFETY: host_statistics64 is a stable macOS kernel API. `stats`
+        // is a repr(C) buffer whose size (HOST_VM_INFO64_COUNT = 40 u32
+        // words / 160 bytes) is >= the running kernel's HOST_VM_INFO64
+        // revision size, and `count` is initialized to that word count.
+        // The kernel does NOT write our `count` words: host.c `vm_stats`
+        // clamps to its OWN revision (REV0=24 / REV1=38 / REV2=40 words),
+        // writes only that many fields, never overruns past its revision
+        // size (a larger caller buffer is left untouched), and overwrites
+        // *count with the words actually written. `pageouts` is a REV0
+        // field (word 10 / offset 40), so it is always written on
+        // KERN_SUCCESS regardless of the kernel's revision. We read
+        // `pageouts` only when ret == 0 (KERN_SUCCESS).
         let ret = unsafe {
             host_statistics64(
                 mach_host_self(),

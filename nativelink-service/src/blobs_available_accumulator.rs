@@ -1669,4 +1669,105 @@ mod tests {
              meaning new_with_drop_counts forked the Arc"
         );
     }
+
+    /// (#28) End-to-end producer→accumulator seam test for the swap
+    /// pressure scalars. The per-half unit tests prove placement
+    /// (`swap_fields_ride_chunk_zero_only` in the chunker) and reassembly
+    /// from HAND-BUILT chunks (`swap_pressure_scalars_carried_forward_
+    /// from_chunk_zero`); neither crosses the producer→accumulator seam
+    /// with the REAL chunker output. This closes that gap:
+    ///
+    ///   producer  — `nativelink_util::blobs_available_chunking::
+    ///               chunk_blobs_available` (the real worker-side chunker,
+    ///               splits the notification, writes the swap scalars on
+    ///               chunk 0 only).
+    ///   accumulator — `BlobsAvailableAccumulator::merge_chunk` (the real
+    ///               server reassembly, carries chunk-0's header scalars
+    ///               forward into the terminal-commit notification).
+    ///
+    /// The input is sized to force MULTIPLE chunks (`max_per_chunk = 3`
+    /// over 10 digests → ≥4 chunks) so the carry-forward is genuinely
+    /// exercised: the terminal chunk leaves the swap scalars at proto3
+    /// default 0, and only the carry-forward arm can resurrect chunk-0's
+    /// non-zero values into the reassembled notification.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): comment out the two
+    /// `body.swap_used_bytes = headers.swap_used_bytes;` /
+    /// `body.pageouts_per_sec = headers.pageouts_per_sec;` lines in the
+    /// terminal-commit arm of `merge_chunk` (currently at lines 817-818):
+    /// this test red-fails with the bespoke "did not survive the real
+    /// chunker→accumulator round-trip" message below, NOT a generic
+    /// is_none/0 assert that another bug could also trip.
+    #[test]
+    fn swap_pressure_survives_real_chunker_to_accumulator_roundtrip() {
+        use nativelink_util::blobs_available_chunking::chunk_blobs_available;
+
+        const SWAP_USED: u64 = 7_654_321_098;
+        const PAGEOUTS: u32 = 31337;
+        const BROADCAST_ID: u64 = 4242;
+        const TOKEN: u64 = 0xCAFEF00D;
+
+        let notification = BlobsAvailableNotification {
+            // Non-zero swap pressure on the INPUT notification — the
+            // signal that must survive the full chunk→reassemble path.
+            swap_used_bytes: SWAP_USED,
+            pageouts_per_sec: PAGEOUTS,
+            // 10 digests at 3-per-chunk forces ≥4 chunks, so the swap
+            // scalars (chunk-0-only) must be carried forward across a
+            // terminal chunk that zeroes them.
+            digest_infos: (0..10).map(bdi).collect(),
+            ..Default::default()
+        };
+
+        let chunks =
+            chunk_blobs_available(notification, BROADCAST_ID, TOKEN, String::new(), 3)
+                .expect("real chunker must split the 10-digest notification");
+        assert!(
+            chunks.len() >= 4,
+            "test premise: input must force a multi-chunk broadcast so the \
+             carry-forward is actually exercised; saw {} chunk(s)",
+            chunks.len()
+        );
+        // Sanity: the producer writes the swap scalars on chunk 0 only —
+        // the terminal chunk MUST present default 0, so a missing
+        // carry-forward in the accumulator would surface as 0 below.
+        assert_eq!(chunks[0].swap_used_bytes, SWAP_USED);
+        assert_eq!(chunks[0].pageouts_per_sec, PAGEOUTS);
+        let terminal = chunks.last().expect("at least one chunk");
+        assert!(terminal.is_last, "last chunk must be terminal");
+        assert_eq!(
+            terminal.swap_used_bytes, 0,
+            "wire contract: terminal (non-zero sequence) chunk leaves \
+             swap_used_bytes at the proto3 default 0"
+        );
+        assert_eq!(terminal.pageouts_per_sec, 0);
+
+        // Drive the REAL accumulator with the REAL chunker output.
+        let acc = BlobsAvailableAccumulator::new();
+        let mut reassembled = None;
+        for chunk in chunks {
+            if let Some(notification) = acc.merge_chunk(chunk) {
+                reassembled = Some(notification);
+            }
+        }
+        let reassembled = reassembled.expect(
+            "terminal chunk must commit the reassembled notification through \
+             the real chunker→accumulator seam",
+        );
+
+        assert_eq!(
+            reassembled.swap_used_bytes, SWAP_USED,
+            "swap_used_bytes did not survive the real chunker→accumulator \
+             round-trip — the terminal chunk's default 0 clobbered chunk-0's \
+             carried value (accumulator carry-forward at blobs_available_\
+             accumulator.rs:817 missing)"
+        );
+        assert_eq!(
+            reassembled.pageouts_per_sec, PAGEOUTS,
+            "pageouts_per_sec did not survive the real chunker→accumulator \
+             round-trip — the terminal chunk's default 0 clobbered chunk-0's \
+             carried value (accumulator carry-forward at blobs_available_\
+             accumulator.rs:818 missing)"
+        );
+    }
 }
