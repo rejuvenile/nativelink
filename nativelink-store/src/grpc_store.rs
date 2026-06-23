@@ -230,6 +230,139 @@ fn looks_like_latched_pool(err: &Error, elapsed_ms: u64) -> bool {
             .any(|m| m.contains("buffered service"))
 }
 
+/// #FU QUIC read-failure diagnostic: which side of the latch-vs-backpressure
+/// split a failed QUIC read attempt falls on. The split is the SAME
+/// `LATCHED_POOL_INSTANT_FAIL_MS` (50 ms) boundary `looks_like_latched_pool`
+/// uses to classify a latch, so the two buckets answer the discriminator
+/// directly: a tight `Instant` cluster (`elapsed ≤ 50 ms`, mostly ≤5 ms)
+/// confirms a genuine instant latch; a `Slow` skew (`elapsed > 50 ms`,
+/// near the timeout bound) confirms live backpressure the ≤50 ms gate is
+/// mis-classifying. Pure so it is unit-testable without a transport.
+///
+/// Gated on `quic`: there is no QUIC transport (and so no diagnostic) in
+/// the no-quic build; gating keeps that build warning-free.
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicReadFailBucket {
+    /// `elapsed_ms <= LATCHED_POOL_INSTANT_FAIL_MS` — instant-fail shape.
+    Instant,
+    /// `elapsed_ms > LATCHED_POOL_INSTANT_FAIL_MS` — slow / backpressure shape.
+    Slow,
+}
+
+/// Split a failed QUIC read attempt's elapsed time on the same 50 ms
+/// boundary the latch classifier uses. `<=` goes to `Instant` so the
+/// bucket boundary matches `looks_like_latched_pool` (which classifies a
+/// latch only when `elapsed_ms <= LATCHED_POOL_INSTANT_FAIL_MS`).
+#[cfg(feature = "quic")]
+fn quic_read_fail_bucket(elapsed_ms: u64) -> QuicReadFailBucket {
+    if elapsed_ms <= LATCHED_POOL_INSTANT_FAIL_MS {
+        QuicReadFailBucket::Instant
+    } else {
+        QuicReadFailBucket::Slow
+    }
+}
+
+/// Transport-variant discriminant for the QUIC read-failure diagnostic's
+/// leg-gating predicate. Mirrors the three `Transport` variants but is a
+/// plain `Copy` enum so `quic_read_leg` is unit-testable without standing
+/// up a real `Transport` (whose arms hold non-`Copy` channel handles).
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadTransportKind {
+    /// `Transport::Tcp` — TCP-only; no QUIC leg ever.
+    Tcp,
+    /// `Transport::Quic` — QUIC-only; every read traverses QUIC.
+    Quic,
+    /// `Transport::Dual` — TCP + QUIC; the leg depends on `prefer_tcp`.
+    Dual,
+}
+
+/// Resolve which leg a failed read attempt ACTUALLY traversed, returning
+/// `Some(transport_kind_tag)` iff it went over QUIC, else `None`.
+///
+/// The call site picks the leg via `read_internal(_, prefer_tcp)`
+/// (`grpc_store.rs:read_internal`): single-stream passes `prefer_tcp =
+/// false`, parallel passes `prefer_tcp = true`. Under `Dual`, `prefer_tcp
+/// = true` routes over the TCP `ConnectionManager` (`read_internal` dual
+/// arm) — so a parallel-chunk failure under `Dual` is a TCP-leg failure
+/// that MUST NOT be counted by this QUIC probe (it would pollute the
+/// `instant`:`slow` ratio the latch-vs-backpressure discriminator reads).
+/// So a read went over QUIC iff `kind == Quic` OR (`kind == Dual` AND
+/// `!prefer_tcp`).
+///
+/// The returned tag is the PRECISE leg, never the ambiguous `"dual"` for a
+/// counted event: `"quic"` for the QUIC-only transport, `"dual/quic"` for
+/// the QUIC leg of the Dual transport (matching `read_internal`'s own
+/// `transport = "dual/quic"` trace label). Pure so it is unit-testable.
+#[cfg(feature = "quic")]
+fn quic_read_leg(kind: ReadTransportKind, prefer_tcp: bool) -> Option<&'static str> {
+    match kind {
+        // No QUIC leg exists under the TCP-only transport.
+        ReadTransportKind::Tcp => None,
+        // QUIC-only: every read traverses QUIC regardless of `prefer_tcp`.
+        ReadTransportKind::Quic => Some("quic"),
+        // Dual: `prefer_tcp = false` (single-stream) routes over QUIC;
+        // `prefer_tcp = true` (parallel) routes over TCP — not counted.
+        ReadTransportKind::Dual if !prefer_tcp => Some("dual/quic"),
+        ReadTransportKind::Dual => None,
+    }
+}
+
+/// Rate-limit minimum interval between diagnostic `warn!` emits: ~1/sec.
+/// The 2026-06-23 burst was 46k lines; this gate bounds a recurrence to
+/// roughly one emit per second per process while a `suppressed_since_last`
+/// count preserves the true volume in each emitted line.
+#[cfg(feature = "quic")]
+const QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS: u64 = 1_000_000_000;
+
+/// Pure rate-limit gate over a monotonic-nanos clock. Returns `true` iff
+/// this caller should emit, else `false` (suppress). `now_nanos` is
+/// `Instant`-derived (NTP-safe monotonic — a wall-clock backward step
+/// cannot wedge the gate).
+///
+/// The first call after process start sees `last_emit_nanos == 0` (the
+/// `AtomicU64` initial value) and ALWAYS emits — even when `now_nanos` is
+/// itself `< min_interval` (a QUIC read failure in the first second after
+/// `QUIC_DIAG_EPOCH` init), so the very first diagnostic event of an
+/// incident is never silently dropped. A real emit publishes a non-zero
+/// `now_nanos` (the gate never publishes 0 after a true emit because the
+/// epoch's first observable elapsed value is non-zero in practice; even if
+/// it were 0, that only costs one extra emit, never a lost suppression).
+///
+/// Extracted as a pure function so the gate logic is unit-testable without
+/// standing up a transport or racing a real clock: two events
+/// `< min_interval` apart yield exactly one emit + one suppression.
+#[cfg(feature = "quic")]
+fn quic_read_fail_should_emit(
+    now_nanos: u64,
+    last_emit_nanos: u64,
+    min_interval_nanos: u64,
+) -> bool {
+    if last_emit_nanos == 0 {
+        return true; // never emitted — always allow the first line.
+    }
+    // `saturating_sub`: `now_nanos` is monotonic-derived so it should be
+    // >= last_emit, but a concurrent updater could publish a slightly
+    // later value between our load and this compare; saturating to 0 then
+    // suppresses (0 < min_interval), which is the safe direction.
+    now_nanos.saturating_sub(last_emit_nanos) >= min_interval_nanos
+}
+
+/// Process-start monotonic reference. `Instant` is not a `u64`, so the
+/// rate-limit gate stores nanoseconds elapsed since this epoch in an
+/// `AtomicU64`. Captured once at first use; monotonic and NTP-immune.
+#[cfg(feature = "quic")]
+static QUIC_DIAG_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Monotonic nanoseconds since `QUIC_DIAG_EPOCH`, saturating at `u64::MAX`
+/// (≈584 years — unreachable). Sole clock source for the rate-limit gate.
+#[cfg(feature = "quic")]
+fn quic_diag_now_nanos() -> u64 {
+    u64::try_from(QUIC_DIAG_EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Pure-function classifier for `get_part_parallel`'s per-chunk attempt
 /// loop. Encapsulated so it can be unit-tested without standing up a
 /// real gRPC bytestream server. Inputs:
@@ -299,6 +432,42 @@ pub struct GrpcStore {
     parallel_chunk_retries_succeeded: AtomicU64,
     #[metric(help = "Per-chunk retries in get_part_parallel that exhausted retries and failed")]
     parallel_chunk_retries_failed: AtomicU64,
+    /// #FU QUIC read-failure diagnostic (observability-only). Split on
+    /// `LATCHED_POOL_INSTANT_FAIL_MS` (50 ms): a read RPC failure that
+    /// ACTUALLY traversed the QUIC leg increments exactly one of these.
+    /// Only genuine-QUIC read failures are counted — a read went over QUIC
+    /// iff `transport == Quic` OR (`transport == Dual` AND `!prefer_tcp`)
+    /// (see `quic_read_leg`); under `Dual` the parallel chunk path routes
+    /// over TCP (`prefer_tcp = true`), and those TCP-leg failures are NOT
+    /// counted here (counting them would pollute the ratio with TCP
+    /// failures). The RATIO is the discriminator — a high `instant`:`slow`
+    /// ratio confirms a genuine instant latch (Finding A); a `slow`-heavy
+    /// skew confirms live backpressure the ≤50 ms latch gate is
+    /// mis-classifying (Finding B). Cheap atomics.
+    /// CAPPED AT 1: single monotonically-increasing u64 each; no bounding needed.
+    /// Gated on `quic`: no QUIC transport exists in the no-quic build.
+    #[cfg(feature = "quic")]
+    #[metric(
+        help = "Genuine-QUIC-leg read RPC failures with elapsed <= 50ms (instant-fail / candidate latch)"
+    )]
+    quic_read_instant_fail: AtomicU64,
+    /// See `quic_read_instant_fail` — genuine-QUIC-leg read failures only
+    /// (TCP-leg failures are not counted). CAPPED AT 1: single u64; no bounding needed.
+    #[cfg(feature = "quic")]
+    #[metric(
+        help = "Genuine-QUIC-leg read RPC failures with elapsed > 50ms (slow / backpressure-shaped)"
+    )]
+    quic_read_slow_fail: AtomicU64,
+    /// #FU rate-limit gate for the diagnostic `warn!`: monotonic nanos
+    /// (since `QUIC_DIAG_EPOCH`) of the last emit. NOT a metric — internal
+    /// gate state. Zero = never emitted. CAPPED AT 1: single u64.
+    #[cfg(feature = "quic")]
+    quic_read_fail_log_last_emit_nanos: AtomicU64,
+    /// #FU count of diagnostic events suppressed by the rate-limit gate
+    /// since the last emitted line; reset to 0 on each emit and carried in
+    /// that line as `suppressed_since_last`. CAPPED AT 1: single u64.
+    #[cfg(feature = "quic")]
+    quic_read_fail_log_suppressed: AtomicU64,
     /// #212 Phase 2.4 runtime kill-switch for the worker→server
     /// chunked-write path. Default OFF — even with the
     /// `chunked_fast_slow` feature compiled in, blobs continue to take
@@ -476,6 +645,14 @@ impl GrpcStore {
             connection_acquire_timeout_ms: spec.connection_acquire_timeout_ms,
             parallel_chunk_retries_succeeded: AtomicU64::new(0),
             parallel_chunk_retries_failed: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_instant_fail: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_slow_fail: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_fail_log_last_emit_nanos: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_fail_log_suppressed: AtomicU64::new(0),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_writes_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
@@ -669,6 +846,114 @@ impl GrpcStore {
             #[cfg(feature = "quic")]
             Transport::Dual { tcp, .. } => tcp.evict_idle_channel(None, reason),
         }
+    }
+
+    /// #FU QUIC read-failure diagnostic (observability-only — NO behavior
+    /// change). Records one failed read RPC for the latch-vs-backpressure
+    /// discriminator. ONLY failures that ACTUALLY traversed the QUIC leg are
+    /// in scope (TCP read failures are a different signature); every other
+    /// leg is a no-op early-return.
+    ///
+    /// The caller passes the `prefer_tcp` it handed to `read_internal` so
+    /// this method can resolve the leg that was actually used: single-stream
+    /// passes `prefer_tcp = false` (→ QUIC under Dual, QUIC under Quic-only);
+    /// parallel passes `prefer_tcp = true` (→ TCP under Dual, but QUIC under
+    /// the Quic-only transport). A read went over QUIC iff `transport ==
+    /// Quic` OR (`transport == Dual` AND `!prefer_tcp`) — see `quic_read_leg`.
+    /// Crucially, under `Dual` the parallel path routes over TCP, so those
+    /// failures are NOT counted here (counting them would pollute the
+    /// `instant`:`slow` ratio with TCP failures). For a genuine QUIC-leg
+    /// failure:
+    ///
+    /// 1. Increment exactly one split counter on the same
+    ///    `LATCHED_POOL_INSTANT_FAIL_MS` (50 ms) boundary the latch
+    ///    classifier uses — the `instant`:`slow` ratio IS the discriminator.
+    /// 2. Emit a rate-limited (`~1/s`, monotonic-nanos gate) `warn!`
+    ///    carrying `elapsed_ms`, the PRECISE `transport_kind` (`"quic"` for
+    ///    the Quic-only transport, `"dual/quic"` for the Dual single-stream
+    ///    leg — never the ambiguous `"dual"` for a counted event),
+    ///    `latch_classified` (the `looks_like_latched_pool` result the live
+    ///    retry path already computed), `code`, an 80-char `msg_head`, and
+    ///    `suppressed_since_last` so a recurrence cannot reproduce the
+    ///    46k-line 2026-06-23 burst yet the true volume is preserved.
+    ///
+    /// `warn!` (not `debug!`/`trace!`) because the prod binary compiles
+    /// out sub-`info` levels under `release_max_level_info`. This method
+    /// performs no retry/eviction/abort/routing side effect; it is purely
+    /// additive observation called AFTER the live classifier at each site.
+    ///
+    /// Without the `quic` feature there is no QUIC transport, so the whole
+    /// method is a no-op (keeps the call sites in `get_part_*` unconditional
+    /// and warning-free in the no-quic build).
+    #[cfg(not(feature = "quic"))]
+    fn record_quic_read_fail(&self, _err: &Error, _elapsed_ms: u64, _prefer_tcp: bool) {}
+
+    #[cfg(feature = "quic")]
+    fn record_quic_read_fail(&self, err: &Error, elapsed_ms: u64, prefer_tcp: bool) {
+        let kind = match &self.transport {
+            Transport::Tcp(_) => ReadTransportKind::Tcp,
+            Transport::Quic(_) => ReadTransportKind::Quic,
+            Transport::Dual { .. } => ReadTransportKind::Dual,
+        };
+        // Count + log ONLY if this read actually went over the QUIC leg.
+        // TCP-leg failures (TCP transport, or Dual + prefer_tcp) are simply
+        // not observed by this probe. The tag is the precise leg.
+        let Some(transport_kind) = quic_read_leg(kind, prefer_tcp) else {
+            return;
+        };
+
+        match quic_read_fail_bucket(elapsed_ms) {
+            QuicReadFailBucket::Instant => {
+                self.quic_read_instant_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            QuicReadFailBucket::Slow => {
+                self.quic_read_slow_fail.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Rate-limit the warn! (monotonic-nanos gate). Suppressed events
+        // still count so the emitted line carries true volume.
+        let now_nanos = quic_diag_now_nanos();
+        let last_emit = self.quic_read_fail_log_last_emit_nanos.load(Ordering::Relaxed);
+        if !quic_read_fail_should_emit(now_nanos, last_emit, QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS) {
+            self.quic_read_fail_log_suppressed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Single-flight the emit: only the winner of the CAS publishes its
+        // timestamp and prints; concurrent callers fall back to suppressed.
+        if self
+            .quic_read_fail_log_last_emit_nanos
+            .compare_exchange(last_emit, now_nanos, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            self.quic_read_fail_log_suppressed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let suppressed_since_last = self.quic_read_fail_log_suppressed.swap(0, Ordering::Relaxed);
+
+        // Truncate the first message to 80 chars (same pattern as
+        // `evict_pool_on_transport_err`) to bound line width.
+        let msg_head: &str = err
+            .messages
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<no_message>");
+        let msg_head_short: String = msg_head.chars().take(80).collect();
+        let latch_classified = looks_like_latched_pool(err, elapsed_ms);
+        warn!(
+            elapsed_ms,
+            transport_kind,
+            latch_classified,
+            code = ?err.code,
+            %msg_head_short,
+            suppressed_since_last,
+            instant_fail_total = self.quic_read_instant_fail.load(Ordering::Relaxed),
+            slow_fail_total = self.quic_read_slow_fail.load(Ordering::Relaxed),
+            "GrpcStore QUIC read-failure diagnostic (#FU latch-vs-backpressure): \
+             tight elapsed cluster <=5ms confirms genuine instant latch; \
+             spread near the timeout bound confirms live backpressure the \
+             50ms latch gate is mis-classifying",
+        );
     }
 
     /// Creates a CAS client with zstd compression configured if enabled.
@@ -2149,6 +2434,12 @@ impl GrpcStore {
                             // QUIC transport) — use legacy any-channel eviction.
                             self.evict_pool_on_transport_err(&err);
                         }
+                        // #FU QUIC read-failure diagnostic (observability-only):
+                        // record the latch-vs-backpressure split. `prefer_tcp =
+                        // false` here (single-stream), so under Dual this read
+                        // went over QUIC; counted only on the genuine QUIC leg.
+                        // No control-flow effect — reuses `attempt_elapsed_ms`.
+                        self.record_quic_read_fail(&err, attempt_elapsed_ms, false);
                         // #2 Fix-C: if every attempt is an instant-fail
                         // latched-pool hit, abort retries early so FSS
                         // run_producer writes terminal immediately and readers
@@ -2597,6 +2888,16 @@ impl GrpcStore {
                                                     let attempt_elapsed_ms =
                                                         post_conn.elapsed().as_millis() as u64;
                                                     self.evict_pool_on_transport_err(&err);
+                                                    // #FU QUIC read-failure diagnostic
+                                                    // (observability-only): record the
+                                                    // latch-vs-backpressure split.
+                                                    // `prefer_tcp = true` here (parallel),
+                                                    // so under Dual this read went over
+                                                    // TCP and is NOT counted as a QUIC
+                                                    // read; under Quic-only it IS counted.
+                                                    // No control-flow effect — reuses
+                                                    // `attempt_elapsed_ms`.
+                                                    self.record_quic_read_fail(&err, attempt_elapsed_ms, true);
                                                     if looks_like_latched_pool(&err, attempt_elapsed_ms) {
                                                         // Atomic add; another chunk racing here may
                                                         // also increment — first one to reach the
@@ -3504,6 +3805,11 @@ default_health_status_indicator!(GrpcStore);
 mod tests {
     use nativelink_error::{Code, Error, make_err};
 
+    #[cfg(feature = "quic")]
+    use super::{
+        QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS, QuicReadFailBucket, ReadTransportKind,
+        quic_read_fail_bucket, quic_read_fail_should_emit, quic_read_leg,
+    };
     use super::{
         ChunkAttemptOutcome, LATCHED_POOL_ABORT_THRESHOLD, LATCHED_POOL_INSTANT_FAIL_MS,
         classify_chunk_attempt, looks_like_dead_channel, looks_like_latched_pool,
@@ -3861,6 +4167,183 @@ mod tests {
              values > 2 would delay Fix-C abort against a fully-latched pool. \
              Changing this constant requires updating the doc-comment reasoning \
              AND re-verifying Fix-A's single-evict assumption (#2 Fix-C)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #FU QUIC read-failure diagnostic: bucket-split + rate-limit gate.
+    //
+    // These pure functions are the discriminator's primary signal. The
+    // bucket boundary MUST match `looks_like_latched_pool`'s 50ms gate so
+    // the `instant`:`slow` ratio answers the latch-vs-backpressure question
+    // directly; the rate-limit gate MUST bound a recurrence below the 46k
+    // line 2026-06-23 burst while emitting at least one line per second.
+    // -----------------------------------------------------------------------
+
+    /// The bucket boundary is the SAME 50ms threshold the latch classifier
+    /// uses: `elapsed <= 50` is `Instant`, `> 50` is `Slow`. The `<=`
+    /// inclusivity matches `looks_like_latched_pool` (which classifies a
+    /// latch only when `elapsed_ms <= LATCHED_POOL_INSTANT_FAIL_MS`), so a
+    /// failure the classifier calls a latch always lands in `Instant`.
+    ///
+    /// **Mutation step:** change the comparison at `quic_read_fail_bucket`
+    /// from `<=` to `<` (or flip the arms). This test red-fails with the
+    /// bespoke "bucket boundary must match looks_like_latched_pool's 50ms
+    /// gate exactly" message at the boundary value 50.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_read_fail_bucket_splits_on_latch_threshold() {
+        assert_eq!(
+            quic_read_fail_bucket(0),
+            QuicReadFailBucket::Instant,
+            "0ms must bucket Instant — the genuine instant-latch shape (<=5ms)"
+        );
+        assert_eq!(
+            quic_read_fail_bucket(LATCHED_POOL_INSTANT_FAIL_MS - 1),
+            QuicReadFailBucket::Instant,
+            "just below the 50ms boundary must bucket Instant"
+        );
+        assert_eq!(
+            quic_read_fail_bucket(LATCHED_POOL_INSTANT_FAIL_MS),
+            QuicReadFailBucket::Instant,
+            "bucket boundary must match looks_like_latched_pool's 50ms gate \
+             exactly: elapsed == LATCHED_POOL_INSTANT_FAIL_MS is the LAST value \
+             the latch classifier still calls a latch (it returns false only \
+             when elapsed > threshold), so it MUST bucket Instant — a `<` here \
+             would split the boundary value into Slow and skew the discriminator"
+        );
+        assert_eq!(
+            quic_read_fail_bucket(LATCHED_POOL_INSTANT_FAIL_MS + 1),
+            QuicReadFailBucket::Slow,
+            "just above the 50ms boundary must bucket Slow — the backpressure shape"
+        );
+        assert_eq!(
+            quic_read_fail_bucket(5000),
+            QuicReadFailBucket::Slow,
+            "near-timeout-bound elapsed must bucket Slow (Finding B backpressure)"
+        );
+    }
+
+    /// Rate-limit gate: two events `< min_interval` apart yield exactly one
+    /// emit; the second is suppressed. An event `>= min_interval` after the
+    /// last emit is allowed. First-ever event (`last_emit == 0`) always
+    /// emits. This bounds a recurrence to ~1 line/sec.
+    ///
+    /// **Mutation step:** change `>=` to `>` (or `<` the whole comparison)
+    /// at `quic_read_fail_should_emit`. The within-interval suppression
+    /// assertion red-fails with "second event within 1s must be suppressed".
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_read_fail_rate_limit_gate_suppresses_within_interval() {
+        let min = QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS;
+
+        // First-ever event (last_emit == 0) always emits.
+        assert!(
+            quic_read_fail_should_emit(1_000, 0, min),
+            "first-ever event (last_emit == 0) must emit"
+        );
+
+        // Two events < min apart: the first emits and publishes `now`; the
+        // second (only 1ms = 1_000_000ns later) must be suppressed.
+        let first_now = 10 * min; // arbitrary monotonic point well past epoch
+        assert!(
+            quic_read_fail_should_emit(first_now, 0, min),
+            "first of a burst must emit"
+        );
+        let second_now = first_now + 1_000_000; // +1ms, far below the 1s interval
+        assert!(
+            !quic_read_fail_should_emit(second_now, first_now, min),
+            "second event within 1s must be suppressed — gate publishes the \
+             first emit's timestamp and the +1ms delta is below the 1s interval; \
+             without suppression a recurrence reproduces the 46k-line burst"
+        );
+
+        // An event exactly `min` after the last emit is allowed (boundary).
+        assert!(
+            quic_read_fail_should_emit(first_now + min, first_now, min),
+            "an event exactly min_interval after the last emit must emit \
+             (>= boundary) — the gate must not stall at exactly 1s"
+        );
+        // An event 1ns before `min` is still suppressed.
+        assert!(
+            !quic_read_fail_should_emit(first_now + min - 1, first_now, min),
+            "an event 1ns before min_interval must still be suppressed"
+        );
+    }
+
+    /// Leg-gating predicate: the QUIC diagnostic must count + log ONLY read
+    /// failures that ACTUALLY traversed the QUIC leg. The routing each call
+    /// site selects (`read_internal(_, prefer_tcp)`) determines the leg:
+    ///   - single-stream passes `prefer_tcp = false` → QUIC under Dual,
+    ///     QUIC under Quic-only;
+    ///   - parallel passes `prefer_tcp = true` → TCP under Dual (NOT a QUIC
+    ///     read — must not pollute the counters), but QUIC under Quic-only.
+    /// So a read went over QUIC iff `kind == Quic` OR (`kind == Dual` AND
+    /// `!prefer_tcp`). `quic_read_leg` returns `Some(leg)` exactly then, and
+    /// the `leg` string is the PRECISE transport actually used so the warn!
+    /// never tags a counted event as the ambiguous `"dual"`: `"quic"` for the
+    /// Quic-only transport, `"dual/quic"` for the Dual single-stream leg.
+    ///
+    /// **Mutation step:** flip the `!prefer_tcp` condition at `quic_read_leg`
+    /// (the Dual arm guard `if !prefer_tcp` → `if prefer_tcp`). The flip
+    /// inverts the Dual arm entirely — `Dual + prefer_tcp=false` (genuinely
+    /// over QUIC) now wrongly returns `None`, and `Dual + prefer_tcp=true`
+    /// (over TCP) now wrongly returns `Some("dual/quic")`. Both directions
+    /// are asserted below; the first-failing assertion red-fails with the
+    /// bespoke "Dual + prefer_tcp=false (single-stream) routes over QUIC —
+    /// must count, tagged \"dual/quic\"" message (verified `left: None,
+    /// right: Some("dual/quic")`). Either direction failing proves the
+    /// parallel chunk path's TCP failures would re-pollute the instant:slow
+    /// ratio the discriminator depends on.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_read_leg_gates_on_actual_transport_leg() {
+        // Quic-only transport: BOTH prefer values go over QUIC (there is no
+        // TCP leg to fall back to). Tag is the precise `"quic"`.
+        assert_eq!(
+            quic_read_leg(ReadTransportKind::Quic, false),
+            Some("quic"),
+            "Quic-only + prefer_tcp=false (single-stream) must count as a QUIC \
+             read tagged \"quic\""
+        );
+        assert_eq!(
+            quic_read_leg(ReadTransportKind::Quic, true),
+            Some("quic"),
+            "Quic-only + prefer_tcp=true (parallel) still goes over QUIC — there \
+             is no TCP leg under the Quic-only transport — must count, tagged \"quic\""
+        );
+
+        // Dual + prefer_tcp=false (single-stream): routes over the QUIC leg.
+        // Precise tag `"dual/quic"`, never the ambiguous `"dual"`.
+        assert_eq!(
+            quic_read_leg(ReadTransportKind::Dual, false),
+            Some("dual/quic"),
+            "Dual + prefer_tcp=false (single-stream) routes over QUIC — must count, \
+             tagged \"dual/quic\" (NEVER the ambiguous \"dual\" for a counted event)"
+        );
+
+        // Dual + prefer_tcp=true (parallel chunk): routes over the TCP leg.
+        // This is the bug the fix closes — these TCP failures must NOT be
+        // counted by the QUIC probe.
+        assert_eq!(
+            quic_read_leg(ReadTransportKind::Dual, true),
+            None,
+            "Dual + prefer_tcp=true routes over TCP — must NOT count as a QUIC \
+             read: the parallel chunk site passes prefer_tcp=true, so under the \
+             Dual transport its failures are TCP-leg failures that would pollute \
+             the instant:slow ratio the latch-vs-backpressure discriminator needs"
+        );
+
+        // Tcp-only transport: never a QUIC read, regardless of prefer.
+        assert_eq!(
+            quic_read_leg(ReadTransportKind::Tcp, false),
+            None,
+            "Tcp-only + prefer_tcp=false must NOT count — there is no QUIC leg"
+        );
+        assert_eq!(
+            quic_read_leg(ReadTransportKind::Tcp, true),
+            None,
+            "Tcp-only + prefer_tcp=true must NOT count — there is no QUIC leg"
         );
     }
 }
