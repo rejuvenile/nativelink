@@ -416,6 +416,211 @@ pub static V2_AWAITER_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
 pub static AWAIT_INFLIGHT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
     std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
 
+// ---------------------------------------------------------------------------
+// FL-688 chunked-write-reject diagnostic: rate-limit gate.
+//
+// Observability-only. The ~30 s worker backfill loop re-drives the same ~9
+// stuck digests forever; an un-gated `warn!` per reject would reproduce the
+// 46k-line spam class the `65bbb9f6`/`77a4afe0` demotions retired. This gate
+// matches the EXACT idiom shipped for the QUIC read-failure diagnostic in
+// `3aa8be38` (`grpc_store.rs` `quic_read_fail_should_emit`): a pure
+// monotonic-nanos predicate over an `AtomicU64` last-emit, single-flighted by
+// a CAS, carrying a `suppressed_since_last` count so the emitted line
+// preserves the true reject volume. Each probe site owns its own gate so a
+// burst at one site does not silence another.
+// ---------------------------------------------------------------------------
+
+/// Minimum interval between diagnostic `warn!` emits per site: ~1/sec. Bounds
+/// a recurrence to roughly one emit per second per process per site while
+/// `suppressed_since_last` preserves true volume in each emitted line.
+const CHUNKED_REJECT_LOG_MIN_INTERVAL_NANOS: u64 = 1_000_000_000;
+
+/// Process-start monotonic reference for the reject diagnostic's rate-limit
+/// gate. `Instant` is not a `u64`, so the gate stores nanoseconds elapsed
+/// since this epoch in an `AtomicU64`. Captured once at first use; monotonic
+/// and NTP-immune (a wall-clock backward step cannot wedge the gate).
+static CHUNKED_REJECT_DIAG_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Monotonic nanoseconds since `CHUNKED_REJECT_DIAG_EPOCH`, saturating at
+/// `u64::MAX` (≈584 years — unreachable). Sole clock source for the gate.
+fn chunked_reject_diag_now_nanos() -> u64 {
+    u64::try_from(CHUNKED_REJECT_DIAG_EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Pure rate-limit gate over a monotonic-nanos clock. Returns `true` iff this
+/// caller should emit, else `false` (suppress). `now_nanos` is
+/// `Instant`-derived (monotonic). The first call after process start sees
+/// `last_emit_nanos == 0` (the `AtomicU64` initial value) and ALWAYS emits,
+/// so the very first diagnostic event of an incident is never dropped.
+/// `saturating_sub` keeps a concurrent later-published value from wrapping —
+/// it suppresses (0 < min_interval), the safe direction. Extracted as a pure
+/// fn so the gate is unit-testable without a clock race: two events
+/// `< min_interval` apart yield exactly one emit + one suppression.
+fn chunked_reject_should_emit(
+    now_nanos: u64,
+    last_emit_nanos: u64,
+    min_interval_nanos: u64,
+) -> bool {
+    if last_emit_nanos == 0 {
+        return true; // never emitted — always allow the first line.
+    }
+    now_nanos.saturating_sub(last_emit_nanos) >= min_interval_nanos
+}
+
+/// Per-site rate-limit gate state for the reject diagnostic. Holds the
+/// last-emit monotonic-nanos timestamp and the count of events suppressed
+/// since the last emitted line. Internal gate state — NOT a metric (the
+/// operator-visible counts are the `#[metric]` split counters on
+/// `ChunkedWriteHandlerMetrics`).
+/// CAPPED AT 1: two single `AtomicU64`s; no buffer, no bounding needed.
+#[derive(Debug, Default)]
+struct RejectRateLimitGate {
+    last_emit_nanos: AtomicU64,
+    suppressed_since_last: AtomicU64,
+}
+
+impl RejectRateLimitGate {
+    /// Decide whether to emit now. On emit, returns `Some(suppressed)` (the
+    /// count of events suppressed since the last emit, reset to 0); on
+    /// suppress, increments the suppressed counter and returns `None`.
+    /// Single-flights the emit via a CAS so concurrent callers within the
+    /// same window fall back to suppressed (mirrors the QUIC idiom).
+    fn should_emit_now(&self) -> Option<u64> {
+        let now_nanos = chunked_reject_diag_now_nanos();
+        let last_emit = self.last_emit_nanos.load(Ordering::Relaxed);
+        if !chunked_reject_should_emit(
+            now_nanos,
+            last_emit,
+            CHUNKED_REJECT_LOG_MIN_INTERVAL_NANOS,
+        ) {
+            self.suppressed_since_last.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // Only the winner of the CAS publishes its timestamp and emits;
+        // concurrent callers fall back to suppressed.
+        if self
+            .last_emit_nanos
+            .compare_exchange(last_emit, now_nanos, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            self.suppressed_since_last.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(self.suppressed_since_last.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// Rate-limit gate for probe site (a): `dispatch_bazel_facing_internal_chunking`
+/// pre-probe rejects (early-dedup bounded-drain failure).
+static CHUNKED_REJECT_PRE_PROBE_GATE: std::sync::LazyLock<RejectRateLimitGate> =
+    std::sync::LazyLock::new(RejectRateLimitGate::default);
+
+/// Rate-limit gate for probe site (b): `build_bazel_chunk_stream` first-recv
+/// rejects (offset-0 + midstream). One gate covers both buckets so a steady
+/// offset-0 loop does not also silence a rare midstream event in the same
+/// second — both carry their bucket tag in the emitted line.
+static CHUNKED_REJECT_AT_RECV_GATE: std::sync::LazyLock<RejectRateLimitGate> =
+    std::sync::LazyLock::new(RejectRateLimitGate::default);
+
+/// FL-688 chunked-write-reject diagnostic, site (b) (observability-only — NO
+/// behavior change). Records ONE `reader.recv()` Err in
+/// `build_bazel_chunk_stream`. Bumps the offset-0 bucket when the producer
+/// dropped before any chunk's bytes were consumed (`bytes_received == 0`) and
+/// the midstream bucket otherwise — the offset0:midstream ratio discriminates
+/// "worker sends nothing" from "worker drops partway". Emits a rate-limited
+/// `warn!` (survives `release_max_level_info`) tagging the digest +
+/// bytes/chunks received + an 80-char message head, so the stuck loop is
+/// attributable from logs alone. Caller continues to yield the Err exactly as
+/// before; this is purely additive observation.
+fn record_chunked_reject_at_recv(
+    metrics: &ChunkedWriteHandlerMetrics,
+    digest: DigestInfo,
+    bytes_received: u64,
+    chunks_received: u64,
+    err: &Error,
+) {
+    let at_offset0 = bytes_received == 0;
+    if at_offset0 {
+        metrics.chunked_reject_at_offset0.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.chunked_reject_midstream.fetch_add(1, Ordering::Relaxed);
+    }
+    let Some(suppressed_since_last) = CHUNKED_REJECT_AT_RECV_GATE.should_emit_now() else {
+        return;
+    };
+    // Truncate the first message to 80 chars (same pattern as the QUIC
+    // diagnostic) to bound line width.
+    let msg_head: &str = err
+        .messages
+        .first()
+        .map(String::as_str)
+        .unwrap_or("<no_message>");
+    let msg_head_short: String = msg_head.chars().take(80).collect();
+    let reject_branch = if at_offset0 {
+        "offset0"
+    } else {
+        "midstream"
+    };
+    warn!(
+        target: "nativelink_service::chunked_write_handler",
+        %digest,
+        writer_path = "bazel_facing_internal_chunking",
+        wire_shape = "v1",
+        reject_branch,
+        bytes_received,
+        chunks_received,
+        code = ?err.code,
+        %msg_head_short,
+        suppressed_since_last,
+        offset0_total = metrics.chunked_reject_at_offset0.load(Ordering::Relaxed),
+        midstream_total = metrics.chunked_reject_midstream.load(Ordering::Relaxed),
+        "FL-688 chunked-write-reject diagnostic (site b: build_bazel_chunk_stream \
+         first reader.recv() Err): the producer was dropped before commit. \
+         offset0 = worker sent zero chunks; midstream = dropped after >=1 chunk. \
+         This is the per-digest attribution the stuck-backfill loop lacked",
+    );
+}
+
+/// FL-688 chunked-write-reject diagnostic, site (a) (observability-only — NO
+/// behavior change). Records ONE reject that fired in
+/// `dispatch_bazel_facing_internal_chunking` BEFORE the #394/#413
+/// producer-arrival probe arms (e.g. the early-dedup bounded-drain failure).
+/// Bumps `chunked_reject_pre_probe` + emits a rate-limited `warn!` tagging the
+/// digest + the branch. Caller continues to return the Err exactly as before.
+fn record_chunked_reject_pre_probe(
+    metrics: &ChunkedWriteHandlerMetrics,
+    digest: DigestInfo,
+    reject_branch: &'static str,
+    err: &Error,
+) {
+    metrics.chunked_reject_pre_probe.fetch_add(1, Ordering::Relaxed);
+    let Some(suppressed_since_last) = CHUNKED_REJECT_PRE_PROBE_GATE.should_emit_now() else {
+        return;
+    };
+    let msg_head: &str = err
+        .messages
+        .first()
+        .map(String::as_str)
+        .unwrap_or("<no_message>");
+    let msg_head_short: String = msg_head.chars().take(80).collect();
+    warn!(
+        target: "nativelink_service::chunked_write_handler",
+        %digest,
+        writer_path = "bazel_facing_internal_chunking",
+        wire_shape = "v1",
+        reject_branch,
+        code = ?err.code,
+        %msg_head_short,
+        suppressed_since_last,
+        pre_probe_total = metrics.chunked_reject_pre_probe.load(Ordering::Relaxed),
+        "FL-688 chunked-write-reject diagnostic (site a: \
+         dispatch_bazel_facing_internal_chunking pre-probe reject): the reject \
+         fired before the #394/#413 producer-arrival probe armed, so the \
+         per-digest log path was never reached — this tags the digest + branch",
+    );
+}
+
 /// In-flight map: `DigestInfo` → live driver + sender. The sender is
 /// held here (not by the spawned driver) so multiple concurrent stream
 /// admissions for the SAME digest can re-use the same driver task and
@@ -618,6 +823,40 @@ pub struct ChunkedWriteHandlerMetrics {
                 (commit-runner cancellation/panic OR slow-tier wedge; ≥60s session)"
     )]
     pub chunked_race_state_force_removed_total: AtomicU64,
+    /// FL-688 chunked-write-reject diagnostic (observability-only). The
+    /// ~9 stuck large CAS blobs loop forever on the Bazel-facing
+    /// internal-chunking backfill, failing in ~100–660 ms with
+    /// `"buf_channel: writer dropped without commit : bazel-facing
+    /// internal-chunking: reader.recv()"`, while the server logged
+    /// NOTHING per-digest (the reject returns the Status before the
+    /// per-digest log path). These three split counters localize the
+    /// reject; their RATIO is the discriminator for the single open fork
+    /// (is the stream dropped worker-side or server-side, and if
+    /// server-side, before any chunk or partway through?). Bumped once
+    /// per reject at the site that observes it; the paired rate-limited
+    /// `warn!` carries the digest + branch. Cheap atomics.
+    /// CAPPED AT 1: single monotonically-increasing u64 each; no bounding
+    /// needed — observation-only counters, never a buffer.
+    #[metric(
+        help = "FL-688: chunked-write rejects in dispatch_bazel_facing_internal_chunking BEFORE the #394/#413 producer-arrival probe arms (e.g. early-dedup bounded-drain failure)"
+    )]
+    pub chunked_reject_pre_probe: AtomicU64,
+    /// See `chunked_reject_pre_probe`. Bumped when `build_bazel_chunk_stream`'s
+    /// FIRST `reader.recv()` errors with ZERO bytes consumed (the producer
+    /// sent no chunk at all — the FL-688 offset-0 signature).
+    /// CAPPED AT 1: single u64; no bounding needed.
+    #[metric(
+        help = "FL-688: chunked-write rejects where the producer's first reader.recv() errored at offset 0 (worker sent zero chunks)"
+    )]
+    pub chunked_reject_at_offset0: AtomicU64,
+    /// See `chunked_reject_pre_probe`. Bumped when `build_bazel_chunk_stream`'s
+    /// `reader.recv()` errors AFTER ≥1 byte was already consumed (the
+    /// producer dropped partway through the blob).
+    /// CAPPED AT 1: single u64; no bounding needed.
+    #[metric(
+        help = "FL-688: chunked-write rejects where the producer dropped mid-stream after ≥1 chunk's bytes were consumed"
+    )]
+    pub chunked_reject_midstream: AtomicU64,
 }
 
 /// Server-side handler for the `WriteChunked` RPC. Holds the
@@ -4829,6 +5068,19 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
             // declared — malicious / buggy claim). Surface the error
             // rather than swallow it — the upstream gRPC stream needs
             // to see Err to terminate cleanly.
+            //
+            // FL-688 chunked-write-reject diagnostic (site a,
+            // observability-only): this reject fires BEFORE
+            // `dispatch_chunks_to_driver` arms the #394/#413
+            // producer-arrival probe, so the per-digest log path is
+            // never reached. Tag the digest + branch. No control-flow
+            // change — the Err is returned exactly as before.
+            record_chunked_reject_pre_probe(
+                &metrics,
+                digest,
+                "early_dedup_bounded_drain",
+                &err,
+            );
             return Err(err.append(
                 "bazel-facing internal-chunking early-dedup: bounded-drain failed after \
                  short-circuit (digest already indexed; producer stalled, errored, or \
@@ -4869,7 +5121,8 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
         });
     }
 
-    let chunks_stream = build_bazel_chunk_stream(reader, chunk_size, digest);
+    let chunks_stream =
+        build_bazel_chunk_stream(reader, chunk_size, digest, Arc::clone(&metrics));
     dispatch_chunks_to_driver(
         filesystem_store,
         in_flight,
@@ -4897,22 +5150,35 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
 /// On `reader.recv()` Err: yields a single Err and terminates.
 /// On EOF before declared bytes consumed: yields an Err describing the
 /// short read.
+///
+/// `metrics` is consumed by the FL-688 chunked-write-reject diagnostic
+/// (observability-only): on the FIRST `reader.recv()` Err, it bumps the
+/// offset-0-vs-midstream split counter + emits a rate-limited `warn!`
+/// tagging the digest + bytes/chunks received. No control-flow effect — the
+/// Err is yielded exactly as before; the only added behavior is the counter
+/// bump + the rate-limited log.
 fn build_bazel_chunk_stream(
     reader: DropCloserReadHalf,
     chunk_size: usize,
     digest: DigestInfo,
+    metrics: Arc<ChunkedWriteHandlerMetrics>,
 ) -> Pin<Box<dyn Stream<Item = Result<PreparedChunk, Error>> + Send>> {
     use bytes::BytesMut;
 
     /// State machine driven by `futures::stream::unfold`. Carries the
-    /// reader, an accumulator buffer, and progress counters; emits one
-    /// `PreparedChunk` per polled iteration until `Done`.
+    /// reader, an accumulator buffer, progress counters, and the
+    /// FL-688 diagnostic `metrics` handle; emits one `PreparedChunk` per
+    /// polled iteration until `Done`. `metrics` travels with the state so
+    /// the per-iteration `unfold` `FnMut` closure does not move-capture it
+    /// (the closure is called once per chunk and an `Arc` is not `Copy`);
+    /// this also avoids a per-chunk `Arc::clone` on the hot path.
     enum State {
         Active {
             reader: DropCloserReadHalf,
             buf: BytesMut,
             chunk_offset: u64,
             bytes_consumed: u64,
+            metrics: Arc<ChunkedWriteHandlerMetrics>,
         },
         Done,
     }
@@ -4923,6 +5189,7 @@ fn build_bazel_chunk_stream(
         buf: BytesMut::with_capacity(chunk_size),
         chunk_offset: 0,
         bytes_consumed: 0,
+        metrics,
     };
 
     let stream = futures::stream::unfold(initial, move |state| async move {
@@ -4931,6 +5198,7 @@ fn build_bazel_chunk_stream(
             mut buf,
             chunk_offset,
             bytes_consumed,
+            metrics,
         } = state
         else {
             return None;
@@ -4945,6 +5213,29 @@ fn build_bazel_chunk_stream(
                 Ok(b) if b.is_empty() => break true,
                 Ok(b) => buf.extend_from_slice(&b),
                 Err(err) => {
+                    // FL-688 chunked-write-reject diagnostic (site b,
+                    // observability-only): the producer dropped mid-recv.
+                    // This is the EXACT stuck-loop signature (the appended
+                    // marker below is what the production failure carries).
+                    // `bytes_consumed` counts bytes from prior full chunks;
+                    // `buf` holds the partial bytes of the current chunk.
+                    // `chunks_received = chunk_offset / chunk_size` (each
+                    // emitted chunk advanced `chunk_offset` by `chunk_size`).
+                    // No control-flow change — the Err is yielded exactly as
+                    // before.
+                    let bytes_received = bytes_consumed + buf.len() as u64;
+                    let chunks_received = if chunk_size == 0 {
+                        0
+                    } else {
+                        chunk_offset / chunk_size as u64
+                    };
+                    record_chunked_reject_at_recv(
+                        &metrics,
+                        digest,
+                        bytes_received,
+                        chunks_received,
+                        &err,
+                    );
                     return Some((
                         Err(err
                             .append("bazel-facing internal-chunking: reader.recv()")),
@@ -5045,6 +5336,7 @@ fn build_bazel_chunk_stream(
             buf,
             chunk_offset: chunk_offset.saturating_add(chunk_size as u64),
             bytes_consumed: new_consumed,
+            metrics,
         };
         Some((Ok(item), next_state))
     });

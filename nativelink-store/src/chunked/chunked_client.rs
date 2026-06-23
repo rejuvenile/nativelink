@@ -190,6 +190,108 @@ impl<T> WorkerApiWriteChunkedDispatcher<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FL-688 chunked-write-reject diagnostic, site (c): worker-side dispatch.
+//
+// Observability-only. The ~9 stuck large CAS blobs re-drive
+// `worker_dispatch_v1` forever; the worker logs the dispatch ATTEMPT
+// (`info!` at `dispatch`) but NOT the per-attempt failure discriminator —
+// so from the worker's logs alone you cannot tell whether the stream died
+// worker-side (the channel-acquire never produced a transport: stuck client
+// state) or the RPC reached the server and the server returned the error.
+// This probe tags the failing attempt with that discriminator. It is the
+// worker-side half of the open fork the server-side sites (a)/(b) answer.
+//
+// Rate-limited via the SAME pure monotonic-nanos gate idiom shipped for the
+// QUIC read-failure diagnostic in `3aa8be38` so the ~30 s loop cannot
+// reproduce a log-volume incident; `suppressed_since_last` preserves volume.
+// ---------------------------------------------------------------------------
+
+/// Minimum interval between site-(c) diagnostic `warn!` emits: ~1/sec.
+const CHUNKED_CLIENT_REJECT_LOG_MIN_INTERVAL_NANOS: u64 = 1_000_000_000;
+
+/// Process-start monotonic reference for the site-(c) rate-limit gate.
+static CHUNKED_CLIENT_REJECT_DIAG_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Monotonic nanoseconds since `CHUNKED_CLIENT_REJECT_DIAG_EPOCH`, saturating
+/// at `u64::MAX` (≈584 years — unreachable). Sole clock source for the gate.
+fn chunked_client_reject_now_nanos() -> u64 {
+    u64::try_from(CHUNKED_CLIENT_REJECT_DIAG_EPOCH.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Last-emit monotonic-nanos for the site-(c) gate. Zero = never emitted.
+/// CAPPED AT 1: single `AtomicU64`; internal gate state, not a buffer.
+static CHUNKED_CLIENT_REJECT_LAST_EMIT_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Count of site-(c) events suppressed since the last emit; carried in the
+/// next emitted line and reset to 0. CAPPED AT 1: single `AtomicU64`.
+static CHUNKED_CLIENT_REJECT_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Pure rate-limit gate (mirrors `quic_read_fail_should_emit` in
+/// `3aa8be38`). Returns `true` iff this caller should emit. First call after
+/// process start (`last_emit_nanos == 0`) always emits. `saturating_sub`
+/// keeps a concurrent later-published value from wrapping. Pure so it is
+/// unit-testable without a clock race.
+fn chunked_client_reject_should_emit(
+    now_nanos: u64,
+    last_emit_nanos: u64,
+    min_interval_nanos: u64,
+) -> bool {
+    if last_emit_nanos == 0 {
+        return true;
+    }
+    now_nanos.saturating_sub(last_emit_nanos) >= min_interval_nanos
+}
+
+/// FL-688 chunked-write-reject diagnostic, site (c) (observability-only — NO
+/// behavior change). Emits a rate-limited `warn!` for one failed dispatch
+/// attempt, tagging the digest + the `reject_origin` discriminator
+/// (`channel_acquire` = worker-side, the RPC never reached the server;
+/// `rpc_returned_error` = the RPC reached the transport and surfaced an
+/// error). Single-flighted by a CAS so concurrent attempts within the same
+/// window fall back to suppressed. No control-flow effect — the caller
+/// continues to propagate the error exactly as before.
+fn record_chunked_client_reject(digest_str: &str, reject_origin: &'static str, err: &Error) {
+    let now_nanos = chunked_client_reject_now_nanos();
+    let last_emit = CHUNKED_CLIENT_REJECT_LAST_EMIT_NANOS.load(Ordering::Relaxed);
+    if !chunked_client_reject_should_emit(
+        now_nanos,
+        last_emit,
+        CHUNKED_CLIENT_REJECT_LOG_MIN_INTERVAL_NANOS,
+    ) {
+        CHUNKED_CLIENT_REJECT_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if CHUNKED_CLIENT_REJECT_LAST_EMIT_NANOS
+        .compare_exchange(last_emit, now_nanos, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        CHUNKED_CLIENT_REJECT_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let suppressed_since_last = CHUNKED_CLIENT_REJECT_SUPPRESSED.swap(0, Ordering::Relaxed);
+    let msg_head: &str = err
+        .messages
+        .first()
+        .map(String::as_str)
+        .unwrap_or("<no_message>");
+    let msg_head_short: String = msg_head.chars().take(80).collect();
+    warn!(
+        target: "nativelink_store::chunked::chunked_client",
+        writer_path = "worker_dispatch_v1",
+        wire_shape = "v1",
+        digest = %digest_str,
+        reject_origin,
+        code = ?err.code,
+        %msg_head_short,
+        suppressed_since_last,
+        "FL-688 chunked-write-reject diagnostic (site c: worker dispatch attempt \
+         failed): reject_origin = channel_acquire means the RPC never reached the \
+         server (worker-side / stuck client state); rpc_returned_error means the \
+         RPC reached the transport and the error came back from there",
+    );
+}
+
 impl<T> WriteChunkedDispatcher for WorkerApiWriteChunkedDispatcher<T>
 where
     T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
@@ -219,8 +321,22 @@ where
             chunk_count,
             "WriteChunked dispatch attempt",
         );
+        // FL-688 site (c): the diagnostic needs the digest inside the async
+        // closure (where the failure legs are), so keep an owned copy.
+        let diag_digest = digest_str;
         Box::pin(async move {
-            let channel = factory().await?;
+            // FL-688 chunked-write-reject diagnostic (site c, observability-
+            // only): a `factory()` failure means the transport was never
+            // acquired — the RPC NEVER reached the server (worker-side /
+            // stuck client state). Tag it before propagating. No control-flow
+            // change — the `?` propagates exactly as before.
+            let channel = match factory().await {
+                Ok(c) => c,
+                Err(err) => {
+                    record_chunked_client_reject(&diag_digest, "channel_acquire", &err);
+                    return Err(err);
+                }
+            };
             let stream = tokio_stream::iter(chunks);
             // #212 v4.5: route via CasExtensions (CAS-endpoint
             // listener) rather than WorkerApi (worker_api-endpoint
@@ -233,7 +349,15 @@ where
                 .await
                 .map_err(|status| {
                     let err: Error = status.into();
-                    err.append("CasExtensions/WriteChunked RPC failed".to_string())
+                    // FL-688 site (c): the RPC reached the transport and the
+                    // error came back from there (server Status or mid-RPC
+                    // transport error) — distinct from the channel_acquire
+                    // (worker-side) leg above. Tag before appending +
+                    // propagating. No control-flow change.
+                    let err =
+                        err.append("CasExtensions/WriteChunked RPC failed".to_string());
+                    record_chunked_client_reject(&diag_digest, "rpc_returned_error", &err);
+                    err
                 })?;
             Ok(response.into_inner())
         })
@@ -1288,6 +1412,48 @@ mod tests {
              as Abort — a V2-enabled worker hitting a server without the \
              WriteChunkedV2 handler must fail loud, not retry-storm or \
              hang. There is no fallback to the V1 dispatcher by design."
+        );
+    }
+
+    /// FL-688 site (c) rate-limit gate (pure fn). The first event after
+    /// process start (`last_emit == 0`) MUST always emit so the first
+    /// reject of an incident is never dropped; two events `< min_interval`
+    /// apart MUST yield exactly one emit + one suppression so the ~30 s
+    /// worker backfill loop cannot reproduce the 46k-line spam class.
+    ///
+    /// **Mutation step:** flip the `last_emit_nanos == 0` guard to
+    /// `last_emit_nanos != 0` (or change the `>=` to `<`). This test
+    /// red-fails with the bespoke boundary message — the gate would then
+    /// drop the first line of an incident OR emit every line of the loop.
+    #[test]
+    fn chunked_client_reject_gate_emits_first_then_rate_limits() {
+        const MIN: u64 = CHUNKED_CLIENT_REJECT_LOG_MIN_INTERVAL_NANOS;
+        assert!(
+            chunked_client_reject_should_emit(0, 0, MIN),
+            "first event (last_emit == 0) MUST emit even at now == 0 — the \
+             very first reject of an incident is never silently dropped",
+        );
+        assert!(
+            chunked_client_reject_should_emit(5, 0, MIN),
+            "first event MUST emit regardless of elapsed (last_emit == 0)",
+        );
+        assert!(
+            !chunked_client_reject_should_emit(MIN - 1, 1, MIN),
+            "a second event < min_interval after the last emit MUST be \
+             suppressed — without this the ~30s loop reproduces the \
+             46k-line spam class",
+        );
+        assert!(
+            chunked_client_reject_should_emit(1 + MIN, 1, MIN),
+            "an event exactly min_interval after the last emit MUST emit \
+             (boundary is inclusive via >=: now - last == MIN)",
+        );
+        // saturating_sub safety: a concurrently-published later last_emit
+        // must suppress (saturate to 0 < min_interval), never wrap.
+        assert!(
+            !chunked_client_reject_should_emit(10, 1_000_000, MIN),
+            "now < last_emit (concurrent later publish) MUST suppress via \
+             saturating_sub, NOT wrap to a huge positive delta",
         );
     }
 }

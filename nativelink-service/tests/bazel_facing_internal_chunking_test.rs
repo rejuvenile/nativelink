@@ -1635,3 +1635,135 @@ async fn dispatch_bazel_facing_dedup_drain_per_recv_timeout_fires_on_stalled_pro
         err.messages.first().map(String::as_str).unwrap_or(""),
     );
 }
+
+// -----------------------------------------------------------------------------
+// FL-688 chunked-write-reject diagnostic (observability-only).
+//
+// The ~9 stuck large CAS blobs fail on the Bazel-facing internal-chunking
+// path with `"buf_channel: writer dropped without commit : bazel-facing
+// internal-chunking: reader.recv()"` — the producer (the FastSlowStore::update
+// tee write-half) is dropped before sending any bytes, so the FIRST
+// `reader.recv()` in `build_bazel_chunk_stream` returns the buf_channel
+// "writer dropped without commit" error at offset 0. The reject path used to
+// return the Status with NO digest-tagged log, so the stuck loop was
+// un-diagnosable. The diagnostic at the first-recv site tags the digest +
+// offset-0-vs-midstream and bumps a split counter so the
+// offset0:midstream:pre_probe ratio settles the open fork (worker sends
+// nothing vs. drops partway vs. server rejects before the probe arms).
+// -----------------------------------------------------------------------------
+
+/// Producer dropped at offset 0 (tx dropped WITHOUT sending bytes and WITHOUT
+/// EOF) → the first `reader.recv()` in `build_bazel_chunk_stream` returns
+/// `"buf_channel: writer dropped without commit"`, which the chunker appends
+/// `"bazel-facing internal-chunking: reader.recv()"` to (the EXACT FL-688
+/// failure signature). The diagnostic MUST:
+///   1. bump `chunked_reject_at_offset0` exactly once (worker-sent-zero-chunks
+///      bucket), NOT `chunked_reject_midstream`,
+///   2. emit a `warn!` (survives `release_max_level_info`) carrying the digest
+///      so a journal scan can attribute the stuck loop to this branch.
+///
+/// **Mutation step:** comment out the `chunked_reject_at_offset0.fetch_add`
+/// in `build_bazel_chunk_stream`'s `reader.recv()` Err arm (or the whole
+/// `record_chunked_reject_at_recv` call). This test then red-fails with the
+/// bespoke "FL-688: offset-0 reject counter MUST increment on a producer
+/// dropped before any chunk" message (counter stays 0).
+#[nativelink_test]
+async fn chunked_reject_diagnostic_counts_offset0_drop_and_logs_digest() {
+    const CHUNK: usize = 4 * 1024;
+    // Declared size is one full chunk; the producer never sends a byte, so
+    // the reject lands at offset 0 (bytes_consumed == 0, buf empty).
+    const SIZE: usize = CHUNK;
+
+    let blob = vec![0x42u8; SIZE];
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+    // Display format (`%digest`) is what the production `warn!` emits; the
+    // captured tracing line carries it as `digest=<hash>-<size>`.
+    let digest_disc = format!("{digest}");
+
+    let (fs_store, _content_path) = make_filesystem_store().await;
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Producer dropped at offset 0: build the pair, then drop tx WITHOUT
+    // sending bytes and WITHOUT EOF. WriteHalfGuard::Drop synthesizes
+    // `Code::Internal "buf_channel: writer dropped without commit"`, which
+    // the next `reader.recv()` observes — exactly the FL-688 signature.
+    let (tx, producer_rx) = make_buf_channel_pair_with_size(128);
+    drop(tx);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatch_bazel_facing_internal_chunking(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            budget,
+            None, // pin_budget
+            None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel,
+            None, // stable_digests_sink
+            None, // failed_commit_sink
+            Arc::clone(&metrics),
+            CHUNK,
+            digest,
+            producer_rx,
+            None, // async_result_relay
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — a producer dropped at offset 0 MUST surface the \
+         reader.recv() Err promptly, NOT hang the dispatch task",
+    );
+
+    let err = result.expect_err(
+        "dispatch MUST return Err when the producer is dropped before any \
+         chunk (the FL-688 writer-dropped-without-commit signature)",
+    );
+    let joined = err.messages.join(" : ");
+    assert!(
+        joined.contains("bazel-facing internal-chunking: reader.recv()"),
+        "FL-688: the offset-0 reject MUST carry the bazel-facing reader.recv() \
+         marker (the exact production failure signature); got: {joined}",
+    );
+
+    // Load-bearing: the offset-0 bucket MUST tick exactly once and the
+    // midstream bucket MUST stay zero (the producer sent ZERO chunks).
+    use core::sync::atomic::Ordering;
+    assert_eq!(
+        metrics.chunked_reject_at_offset0.load(Ordering::Relaxed),
+        1,
+        "FL-688: offset-0 reject counter MUST increment on a producer dropped \
+         before any chunk — without the `chunked_reject_at_offset0.fetch_add` \
+         in build_bazel_chunk_stream's reader.recv() Err arm, the stuck loop \
+         is invisible per-digest (the diagnostic's whole purpose)",
+    );
+    assert_eq!(
+        metrics.chunked_reject_midstream.load(Ordering::Relaxed),
+        0,
+        "FL-688: a producer that sent ZERO chunks MUST NOT count as a \
+         midstream drop — the offset0:midstream split IS the discriminator \
+         between 'worker sends nothing' and 'worker drops partway'",
+    );
+
+    // The `warn!` MUST carry the digest so a journal scan attributes the
+    // stuck loop to this branch. `release_max_level_info` keeps `warn!`.
+    let raw = String::from_utf8(
+        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
+    )
+    .expect("tracing-test global buffer must be valid UTF-8");
+    let warn_line = raw
+        .lines()
+        .find(|l| {
+            l.contains("chunked-write-reject diagnostic")
+                && l.contains(&digest_disc)
+        });
+    assert!(
+        warn_line.is_some(),
+        "FL-688: the offset-0 reject MUST emit a warn! carrying the digest \
+         {digest_disc} so the stuck loop is attributable from logs alone. \
+         Mutation hint: deleted the `warn!(... \"chunked-write-reject \
+         diagnostic\")` in build_bazel_chunk_stream's reader.recv() Err arm. \
+         tracing-test global_buf:\n{raw}",
+    );
+}
