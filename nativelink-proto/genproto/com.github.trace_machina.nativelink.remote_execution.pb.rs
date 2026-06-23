@@ -283,26 +283,41 @@ pub struct BlobsAvailableNotification {
     /// / count-only admission gate (`worker.rs` `can_accept_work`); this
     /// / surfaces the missing memory signal.
     /// /
-    /// / DECODE-ONLY on the server today: carried on the wire and
-    /// / reassembled through the chunked path, but NO server-side logging /
-    /// / metric / alert / admission logic consumes it yet (deferred
-    /// / steps 3+4 of the swap-pressure instrumentation).
+    /// / OBSERVABILITY signal: the #37 gate keys off the worker-local atomic
+    /// / (the rate's EWMA), not this wire field; this is surfaced for
+    /// / operator tuning/visibility (per-worker swap occupancy).
     #[prost(uint64, tag = "19")]
     pub swap_used_bytes: u64,
-    /// / Host page-out RATE in pages/sec, computed worker-side as the delta
-    /// / of the cumulative page-out counter between FIXED-interval sampler
-    /// / ticks (NOT between heartbeats, whose cadence varies 100 ms to 6 s).
-    /// / macOS reads mach `host_statistics64(HOST_VM_INFO64)` `pageouts`;
-    /// / Linux reads `/proc/vmstat` `pswpout`. This is the load-bearing
-    /// / swap-pressure signal: a non-zero rate means the host is ACTIVELY
-    /// / paging anonymous memory to disk right now (the thing that makes a
-    /// / swapping Mac slow), whereas `swap_used_bytes` can stay high long
-    /// / after pressure ends. `0` means "no recent page-outs" or "sampler
-    /// / unavailable".
+    /// / Host swap-pressure RATE in events/sec, computed worker-side as the
+    /// / delta of the cumulative swap-pressure counter between FIXED-interval
+    /// / sampler ticks (NOT between heartbeats, whose cadence varies 100 ms
+    /// / to 6 s). macOS reads mach `host_statistics64(HOST_VM_INFO64)`
+    /// / `compressions` (the EARLIEST Apple-Silicon swap-pressure signal —
+    /// / the compressor fires before disk swap; `pageouts` is the WRONG,
+    /// / file-backed counter, see design §0); Linux reads `/proc/vmstat`
+    /// / `pswpout` (the anonymous-swap-out counter). A non-zero rate means
+    /// / the host is ACTIVELY compressing/swapping anonymous memory right now
+    /// / (the thing that makes a swapping Mac slow), whereas `swap_used_bytes`
+    /// / can stay high long after pressure ends. `0` means "no recent
+    /// / pressure" or "sampler unavailable".
     /// /
-    /// / DECODE-ONLY on the server today (see `swap_used_bytes`).
+    /// / OBSERVABILITY signal (per-worker pressure rate for operator tuning);
+    /// / the #37 gate keys off the worker-local EWMA, not this wire field.
     #[prost(uint32, tag = "20")]
-    pub pageouts_per_sec: u32,
+    pub swap_pressure_rate_per_sec: u32,
+    /// / (#37) Coarse 1-bit swap-pressure verdict — `true` when the worker's
+    /// / local fast-attack/slow-release EWMA of the swap-pressure rate has
+    /// / crossed the gate threshold AND the sample is fresh. ADVISORY ONLY:
+    /// / the matcher uses it for a PROACTIVE skip (mirrors
+    /// / `indefinite_pin_saturated`) so a pressured worker is not selected
+    /// / and then forced to NAK. The SAFETY-CRITICAL enforcing decision (the
+    /// / worker-side StartAction NAK) reads the worker's OWN in-process
+    /// / atomic, never this wire boolean, so the authoritative gate never
+    /// / crosses the worker→server trust boundary (design §2). `false` for
+    /// / workers that never report pressure (pre-#37 / gate disabled /
+    /// / sampler stale → fail-open).
+    #[prost(bool, tag = "21")]
+    pub swap_pressured: bool,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -664,12 +679,18 @@ pub struct BlobsAvailableChunk {
     /// / `BlobsAvailableNotification.swap_used_bytes` (field 19).
     #[prost(uint64, tag = "23")]
     pub swap_used_bytes: u64,
-    /// / Host page-out rate (pages/sec) — only meaningful on chunk 0;
+    /// / Host swap-pressure rate (events/sec) — only meaningful on chunk 0;
     /// / subsequent chunks leave at proto3 default `0`. The accumulator
     /// / carries the chunk-0 value forward into the reassembled
-    /// / `BlobsAvailableNotification.pageouts_per_sec` (field 20).
+    /// / `BlobsAvailableNotification.swap_pressure_rate_per_sec` (field 20).
     #[prost(uint32, tag = "24")]
-    pub pageouts_per_sec: u32,
+    pub swap_pressure_rate_per_sec: u32,
+    /// / (#37) Coarse swap-pressure verdict — only meaningful on chunk 0;
+    /// / subsequent chunks leave at proto3 default `false`. The accumulator
+    /// / carries the chunk-0 value forward into the reassembled
+    /// / `BlobsAvailableNotification.swap_pressured` (field 21).
+    #[prost(bool, tag = "25")]
+    pub swap_pressured: bool,
 }
 /// / A streaming-message envelope shared across the cas→worker, scheduler→
 /// / worker, and worker→scheduler chunk producers. Exactly ONE of the

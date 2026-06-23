@@ -274,7 +274,8 @@ fn build_notification(
         pinned_ac_mirror_entries: vec![],
         indefinite_pin_saturated: false,
         swap_used_bytes: 0,
-        pageouts_per_sec: 0,
+        swap_pressure_rate_per_sec: 0,
+        swap_pressured: false,
     }
 }
 

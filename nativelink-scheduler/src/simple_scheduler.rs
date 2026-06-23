@@ -1148,6 +1148,17 @@ impl WorkerScheduler for SimpleScheduler {
             .await
     }
 
+    async fn update_worker_swap_pressure(
+        &self,
+        worker_id: &WorkerId,
+        swap_pressured: bool,
+        swap_pressure_rate_per_sec: u32,
+    ) -> Result<(), Error> {
+        self.worker_scheduler
+            .update_worker_swap_pressure(worker_id, swap_pressured, swap_pressure_rate_per_sec)
+            .await
+    }
+
     async fn update_cached_directories(
         &self,
         worker_id: &WorkerId,

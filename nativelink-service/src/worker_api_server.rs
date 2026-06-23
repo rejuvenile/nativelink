@@ -1747,6 +1747,24 @@ impl WorkerConnection {
             warn!(worker_id=?self.worker_id, ?err, indefinite_pin_saturated, "Failed to update worker indefinite-pin saturation");
         }
 
+        // (#37 swap-pressure gate) Plumb the worker's coarse swap-pressure
+        // verdict + rate to the matcher (proactive skip / fleet fail-open
+        // ranking). Carried on BOTH the periodic heartbeat and the one-shot
+        // post-action delta (like indefinite_pin_saturated) so a pressured
+        // worker's flag is not clobbered the instant an action completes.
+        // Unconditional plumb of the real boolean (never inferred from a
+        // missing value) — a fully-dark worker is handled by the keepalive/
+        // quarantine path, not the swap path (§3a rule 3).
+        let swap_pressured = notification.swap_pressured;
+        let swap_pressure_rate_per_sec = notification.swap_pressure_rate_per_sec;
+        if let Err(err) = self
+            .scheduler
+            .update_worker_swap_pressure(&self.worker_id, swap_pressured, swap_pressure_rate_per_sec)
+            .await
+        {
+            warn!(worker_id=?self.worker_id, ?err, swap_pressured, swap_pressure_rate_per_sec, "Failed to update worker swap pressure");
+        }
+
         // Mirror capacity report (review #1): the worker advertises its
         // current `mirror_blobs` total bytes and configured cap on every
         // BlobsAvailable. Plumb them into the WorkerProxyStore picker

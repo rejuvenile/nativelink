@@ -735,12 +735,50 @@ impl ApiWorkerSchedulerImpl {
                 return false;
             }
 
+            // (#37 swap-pressure gate) Proactively skip a swap-pressured
+            // worker — mirrors the FL-681 skip above. ADVISORY: the
+            // worker-side StartAction NAK is the authoritative gate; this
+            // avoids the wasted dispatch round-trip (and the idle-worker
+            // spin) for a worker we already know is pressured. When EVERY
+            // candidate is swap-gated, the fleet fail-open below
+            // (`best_swap_gated`) re-admits the least-pressured one rather
+            // than wedging — so this skip never causes a deadlock.
+            if w.swap_pressured {
+                if full_worker_logging {
+                    debug!(
+                        "Worker {worker_id} skipped: host swap pressure (#37 swap gate)"
+                    );
+                }
+                return false;
+            }
+
             // Verify Minimum properties at runtime (their values are dynamic)
             if !platform_properties.is_satisfied_by(&w.platform_properties, full_worker_logging) {
                 return false;
             }
 
             true
+        };
+
+        // (#37 fleet fail-open, §5 case 3a) A worker that passes EVERY
+        // viability check EXCEPT the swap-pressure skip. Used ONLY when the
+        // normal `viable` set is empty for this capability class, to avoid
+        // a whole-fleet wedge when every candidate is swap-gated: rather
+        // than place nothing (the OS pager only relieves pressure if
+        // SOMETHING completes, but nothing is running), the matcher
+        // degrades to placing on the LEAST-pressured gated worker. This is
+        // NET-NEW (the cache-affinity `best_overloaded` fallback runs on
+        // `worker_is_viable`-passing workers and STRUCTURALLY excludes
+        // swap-gated ones, so it cannot serve here). The worker-local
+        // time-bounded fail-open is the load-bearing backstop; this is the
+        // proactive optimization that picks the least-bad target.
+        let worker_matches_ignoring_swap = |pair: &(&WorkerId, &Worker)| -> bool {
+            let (_, w) = pair;
+            // Same as `worker_matches` minus the swap-pressure skip.
+            !w.quarantined_at.is_some()
+                && w.can_accept_work()
+                && !w.indefinite_pin_saturated
+                && platform_properties.is_satisfied_by(&w.platform_properties, false)
         };
 
         // Now check constraints on filtered candidates.
@@ -770,7 +808,7 @@ impl ApiWorkerSchedulerImpl {
         // Pick the lightest-loaded worker among viable candidates.
         // Workers with score == u64::MAX (unknown) are sorted last.
         // Falls back to LRU/MRU order when no workers have reported load.
-        let worker_id = if viable.iter().any(|(_, score)| *score < u64::MAX) {
+        let mut worker_id = if viable.iter().any(|(_, score)| *score < u64::MAX) {
             viable
                 .iter()
                 .min_by_key(|(_, score)| *score)
@@ -778,6 +816,40 @@ impl ApiWorkerSchedulerImpl {
         } else {
             viable.first().map(|(id, _)| id.clone())
         };
+
+        // (#37 fleet fail-open, §5 case 3a) Nothing viable: if there ARE
+        // otherwise-viable candidates that were excluded ONLY by the swap
+        // skip, place on the LEAST-pressured one (lowest reported rate,
+        // LRU-order tie-break) instead of wedging the capability class. The
+        // worker-local time-bounded fail-open still backstops a stale
+        // server view; this just avoids the wasted queue-stall when the
+        // server already knows every candidate is gated.
+        if worker_id.is_none() {
+            let workers_iter = self.workers.iter();
+            let least_pressured = match self.allocation_strategy {
+                WorkerAllocationStrategy::LeastRecentlyUsed => workers_iter
+                    .rev()
+                    .filter(|(wid, _)| candidates.contains(wid))
+                    .filter(|pair| pair.1.swap_pressured)
+                    .filter(|pair| worker_matches_ignoring_swap(pair))
+                    .min_by_key(|(_, w)| w.swap_pressure_rate_per_sec)
+                    .map(|(_, w)| w.id.clone()),
+                WorkerAllocationStrategy::MostRecentlyUsed => workers_iter
+                    .filter(|(wid, _)| candidates.contains(wid))
+                    .filter(|pair| pair.1.swap_pressured)
+                    .filter(|pair| worker_matches_ignoring_swap(pair))
+                    .min_by_key(|(_, w)| w.swap_pressure_rate_per_sec)
+                    .map(|(_, w)| w.id.clone()),
+            };
+            if let Some(ref wid) = least_pressured {
+                warn!(
+                    worker_id = %wid,
+                    "fleet fail-open: every candidate worker is swap-gated; placing on the \
+                     least-pressured one to avoid a capability-class wedge (#37 §5 case 3a)"
+                );
+            }
+            worker_id = least_pressured;
+        }
 
         // Log load-aware selection decision.
         if let Some(ref wid) = worker_id {
@@ -872,9 +944,18 @@ impl ApiWorkerSchedulerImpl {
             // worker-NAK → re-queue → re-dispatch spin. Kept SEPARATE from
             // `can_accept_work()` so the `update_action` pause logic (which also
             // calls `can_accept_work()`) is untouched.
+            //
+            // (#37 swap gate) Swap-pressured workers are likewise excluded
+            // from the cache-affinity tiers: a new action would be NAKed by
+            // the worker-local gate, so a cache hit on a pressured worker is
+            // a wasted dispatch. The all-gated case does NOT wedge here —
+            // the cache-affinity tiers fall through to
+            // `inner_find_worker_for_action`'s LRU/MRU path, which carries
+            // the fleet fail-open (least-pressured placement).
             if w.quarantined_at.is_some()
                 || !w.can_accept_work()
                 || w.indefinite_pin_saturated
+                || w.swap_pressured
             {
                 return false;
             }
@@ -4676,6 +4757,46 @@ impl WorkerScheduler for ApiWorkerScheduler {
         Ok(())
     }
 
+    async fn update_worker_swap_pressure(
+        &self,
+        worker_id: &WorkerId,
+        swap_pressured: bool,
+        swap_pressure_rate_per_sec: u32,
+    ) -> Result<(), Error> {
+        // peek_mut to avoid LRU promotion — a pressure report is telemetry,
+        // not work assignment, and must not reorder scheduling (mirrors
+        // update_worker_indefinite_pin_saturation).
+        let mut inner = self.inner.write().await;
+        {
+            let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+                make_input_err!(
+                    "Worker not found in worker map in \
+                     update_worker_swap_pressure() {}",
+                    worker_id
+                )
+            })?;
+            if worker.swap_pressured != swap_pressured {
+                debug!(
+                    %worker_id,
+                    swap_pressured,
+                    swap_pressure_rate_per_sec,
+                    "worker swap pressure changed"
+                );
+            }
+            worker.swap_pressured = swap_pressured;
+            worker.swap_pressure_rate_per_sec = swap_pressure_rate_per_sec;
+        }
+        // A transition to NOT-pressured re-opens this worker to the matcher;
+        // wake the matcher so a queued action can be assigned without waiting
+        // for the next change tick. LEVEL-triggered (fires whenever the new
+        // value is not-pressured, matching the indefinite-pin path); waking
+        // on pressured=true is harmless (the matcher just skips the worker).
+        if !swap_pressured {
+            inner.worker_change_notify.notify_one();
+        }
+        Ok(())
+    }
+
     async fn update_cached_directories(
         &self,
         worker_id: &WorkerId,
@@ -6977,6 +7098,145 @@ mod b1_lock_decouple_tests {
         );
         scheduler.add_worker(worker).await.expect("add_worker");
         rx
+    }
+
+    /// All workers in this pool share the SAME capability property
+    /// (`pool=swap`) so a single action matches every one of them — the
+    /// shape needed to test the #37 fleet fail-open (every candidate
+    /// gated).
+    fn props_pool() -> PlatformProperties {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "pool".to_string(),
+            PlatformPropertyValue::Exact("swap".to_string()),
+        );
+        PlatformProperties { properties }
+    }
+
+    async fn add_worker_in_pool(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(WorkerId(name.to_string()), props_pool(), tx, 42, 0);
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
+    /// (#37) COMPOSITE regression test (design §5). Composes the scheduler
+    /// matcher (admission corner) + the swap-pressure ingest path + the
+    /// fleet fail-open, in production composition, with TWO corners of the
+    /// admission/eviction/pin triangle degraded and the third compensating:
+    ///
+    ///   - EVICTION degraded: no action ever completes (none are started),
+    ///     so the OS pager frees no RSS — pressure cannot decay that way.
+    ///   - PIN/TTL degraded: every worker is held `swap_pressured=true` and
+    ///     the rate never falls — the EWMA-clears path never fires.
+    ///   - THIRD CORNER COMPENSATES: the NET-NEW fleet fail-open (§5 case
+    ///     3a) re-admits the LEAST-pressured otherwise-viable worker instead
+    ///     of returning `None`, so the capability class makes progress
+    ///     rather than wedging.
+    ///
+    /// Composite invariant: `gate ⇒ fleet-not-fully-gated` — a globally
+    /// swap-pressured fleet degrades to slower (least-pressured) placement,
+    /// NOT a deadlock.
+    ///
+    /// Falsification mutation (MUST red-fail, design §5): delete the
+    /// `best_swap_gated` fail-open arm in `inner_find_worker_for_action`
+    /// (the `if worker_id.is_none() { ... least_pressured ... }` block) so a
+    /// fully-gated fleet returns `None`. This test then red-fails with the
+    /// bespoke "composite invariant violated" message below. Because the
+    /// fail-open is NET-NEW (not an inherited `best_overloaded` clone), the
+    /// mutation deletes real new code: a green test after deleting it would
+    /// mean the gate ships a wedge.
+    #[nativelink_test]
+    async fn swap_gate_fleet_failopen_places_least_pressured_when_all_gated() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        // Three workers in one capability class, all swap-pressured at
+        // DIFFERENT rates (so "least-pressured" is well-defined).
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool(&scheduler, "WC").await;
+
+        // PIN/TTL degraded: gate every worker; the rate never decays.
+        // WB is the LEAST pressured (lowest rate) → the fail-open target.
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WB".to_string()), true, 10_000)
+            .await
+            .expect("mark WB pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WC".to_string()), true, 30_000)
+            .await
+            .expect("mark WC pressured");
+
+        // EVICTION degraded: no action has been started/completed, so no
+        // RSS is freed. With every candidate gated, the normal `viable`
+        // set is EMPTY; only the fleet fail-open can place the action.
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang");
+
+        let chosen = chosen.expect(
+            "composite invariant violated: swap gate active fleet-wide with no \
+             compensating fail-open → wedge (the matcher returned None instead \
+             of degrading to least-pressured placement)",
+        );
+        assert_eq!(
+            chosen,
+            WorkerId("WB".to_string()),
+            "fleet fail-open must place on the LEAST-pressured gated worker \
+             (WB @ 10k), not WA @ 50k / WC @ 30k"
+        );
+    }
+
+    /// (#37) Asymmetric coverage of the proactive skip: when AT LEAST ONE
+    /// worker is NOT swap-pressured, the matcher MUST prefer it over the
+    /// gated ones — the fail-open must NOT fire when a healthy worker
+    /// exists (over-action direction). Guards against a fail-open that
+    /// places on a gated worker even though a clean one was available.
+    ///
+    /// Falsification mutation: remove the `if w.swap_pressured { return
+    /// false }` skip in `worker_matches` — a gated worker would then be
+    /// `viable` and could win, and this test red-fails because the chosen
+    /// worker is gated.
+    #[nativelink_test]
+    async fn swap_gate_prefers_unpressured_when_one_exists() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+
+        // WA gated (high pressure), WB healthy.
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WB".to_string()), false, 0)
+            .await
+            .expect("mark WB healthy");
+
+        let chosen = scheduler
+            .find_worker_for_action(&props_pool(), false)
+            .await
+            .expect("a healthy worker exists; matcher must place");
+        assert_eq!(
+            chosen,
+            WorkerId("WB".to_string()),
+            "the matcher must PROACTIVELY skip the swap-pressured worker (WA) \
+             and place on the healthy one (WB); the fail-open must NOT fire \
+             while a clean worker exists"
+        );
     }
 
     /// THE decouple proof. Task A's completion parks inside

@@ -306,10 +306,12 @@ mod mem_impl {
     }
 
     /// Cumulative count of pages swapped OUT since boot. `/proc/vmstat`
-    /// `pswpout` is the anonymous-page swap-out counter (the direct
-    /// analog of the mach `pageouts`/`swapouts` counters). Monotonic
-    /// until reboot; the sampler turns it into a per-second rate.
-    pub(super) fn read_pageouts_cumulative() -> Option<u64> {
+    /// `pswpout` is the anonymous-page swap-out counter — the CORRECT
+    /// Linux swap-pressure signal (the semantic analog of the mach
+    /// `compressions`/`swapouts` counters #37 reads on macOS, NOT the
+    /// file-backed `pageouts` daemon counter). Monotonic until reboot; the
+    /// sampler turns it into a per-second rate.
+    pub(super) fn read_swap_pressure_cumulative() -> Option<u64> {
         let contents = std::fs::read_to_string("/proc/vmstat").ok()?;
         for line in contents.lines() {
             if let Some(rest) = line.strip_prefix("pswpout ") {
@@ -322,6 +324,11 @@ mod mem_impl {
 
 #[cfg(target_os = "macos")]
 mod mem_impl {
+    use libc::{
+        host_statistics64, integer_t, mach_host_self, mach_msg_type_number_t, vm_statistics64,
+        HOST_VM_INFO64, HOST_VM_INFO64_COUNT,
+    };
+
     // `sysctl vm.swapusage` returns a `struct xsw_usage`. Layout from
     // <sys/sysctl.h>; we read `xsu_used` (bytes). repr(C) so the field
     // offsets match the kernel ABI.
@@ -332,57 +339,6 @@ mod mem_impl {
         xsu_used: u64,
         xsu_pagesize: u32,
         xsu_encrypted: u8,
-    }
-
-    // mach `host_statistics64(HOST_VM_INFO64)` fills a
-    // `vm_statistics64_data_t`. We only read `pageouts` (the cumulative
-    // page-out counter). The struct is declared in full (repr(C),
-    // matching <mach/vm_statistics.h>) so the `pageouts` field lands at
-    // the correct offset; unused fields are named with leading `_`.
-    #[repr(C)]
-    #[derive(Default)]
-    struct VmStatistics64 {
-        free_count: u32,
-        active_count: u32,
-        inactive_count: u32,
-        wire_count: u32,
-        zero_fill_count: u64,
-        reactivations: u64,
-        pageins: u64,
-        pageouts: u64,
-        faults: u64,
-        cow_faults: u64,
-        lookups: u64,
-        hits: u64,
-        purges: u64,
-        purgeable_count: u32,
-        speculative_count: u32,
-        decompressions: u64,
-        compressions: u64,
-        swapins: u64,
-        swapouts: u64,
-        phys_footprint: u64,
-        min_faults: u64,
-        cow_faults_2: u64,
-        internal_page_count: u32,
-        external_page_count: u32,
-        total_uncompressed_pages_in_compressor: u64,
-    }
-
-    // HOST_VM_INFO64 flavor + its count in `integer_t` (u32) units.
-    const HOST_VM_INFO64: i32 = 4;
-    // `HOST_VM_INFO64_COUNT` = size_of::<vm_statistics64_data_t>() / size_of::<integer_t>().
-    const HOST_VM_INFO64_COUNT: u32 =
-        (core::mem::size_of::<VmStatistics64>() / core::mem::size_of::<u32>()) as u32;
-
-    unsafe extern "C" {
-        fn mach_host_self() -> u32;
-        fn host_statistics64(
-            host_priv: u32,
-            flavor: i32,
-            host_info_out: *mut u32,
-            host_info_out_cnt: *mut u32,
-        ) -> i32;
     }
 
     /// Host swap currently in use, in bytes, via `sysctl vm.swapusage`.
@@ -411,33 +367,80 @@ mod mem_impl {
         if ret == 0 { Some(usage.xsu_used) } else { None }
     }
 
-    /// Cumulative page-outs since boot, via mach
-    /// `host_statistics64(HOST_VM_INFO64)`. Returns the `pageouts`
-    /// counter (monotonic until reboot); the sampler derives a rate.
-    pub(super) fn read_pageouts_cumulative() -> Option<u64> {
-        let mut stats = VmStatistics64::default();
-        let mut count = HOST_VM_INFO64_COUNT;
+    /// Cumulative swap-pressure counter since boot, via mach
+    /// `host_statistics64(HOST_VM_INFO64)`. Returns `compressions` (the
+    /// EARLIEST Apple-Silicon swap-pressure signal: under memory pressure
+    /// the XNU pager COMPRESSES anonymous pages first, then swaps the
+    /// compressed pool to disk only later). Monotonic until reboot; the
+    /// sampler derives a per-second rate.
+    ///
+    /// `pageouts` (the field #28 originally read) is the pageout-daemon
+    /// FILE-backed dirty-page write counter — empirically 20–500x smaller
+    /// than `compressions`/`swapouts` even on an actively-swapping Apple
+    /// Silicon worker, and DECOUPLED from anonymous-swap pressure. See
+    /// memory `macos-pageouts-not-swap-signal` (vm_stat measured on the M4
+    /// fleet) and the #37 design §0. The §4 falsifying probe FINALIZES
+    /// `compressions` vs `swapouts`; until it runs, `compressions` is the
+    /// design's leading candidate (earliest signal, cross-checked against
+    /// `vm.swapusage`-growth).
+    pub(super) fn read_swap_pressure_cumulative() -> Option<u64> {
+        // Use libc's own `vm_statistics64` (`#[repr(packed(8))]`) rather
+        // than a hand-rolled struct: `compressions` sits DEEP in the
+        // struct (well past `pageouts`@40), so a hand-rolled copy that
+        // diverges in the tail (as #28's did at `phys_footprint`) cannot
+        // even reach it at the correct offset. libc tracks the upstream
+        // ABI, so a future field shift is a noticed crate bump, not a
+        // silent offset slide.
+        let mut stats = vm_statistics64 {
+            free_count: 0,
+            active_count: 0,
+            inactive_count: 0,
+            wire_count: 0,
+            zero_fill_count: 0,
+            reactivations: 0,
+            pageins: 0,
+            pageouts: 0,
+            faults: 0,
+            cow_faults: 0,
+            lookups: 0,
+            hits: 0,
+            purges: 0,
+            purgeable_count: 0,
+            speculative_count: 0,
+            decompressions: 0,
+            compressions: 0,
+            swapins: 0,
+            swapouts: 0,
+            compressor_page_count: 0,
+            throttled_count: 0,
+            external_page_count: 0,
+            internal_page_count: 0,
+            total_uncompressed_pages_in_compressor: 0,
+        };
+        let mut count: mach_msg_type_number_t = HOST_VM_INFO64_COUNT;
         // SAFETY: host_statistics64 is a stable macOS kernel API. `stats`
-        // is a repr(C) buffer whose size (HOST_VM_INFO64_COUNT = 40 u32
-        // words / 160 bytes) is >= the running kernel's HOST_VM_INFO64
-        // revision size, and `count` is initialized to that word count.
-        // The kernel does NOT write our `count` words: host.c `vm_stats`
-        // clamps to its OWN revision (REV0=24 / REV1=38 / REV2=40 words),
+        // is libc's `vm_statistics64` (`#[repr(packed(8))]`) whose size
+        // (HOST_VM_INFO64_COUNT words) is >= the running kernel's
+        // HOST_VM_INFO64 revision size, and `count` is initialized to that
+        // word count. The kernel does NOT write our full `count` words:
+        // host.c `vm_stats` clamps to its OWN revision (REV0/REV1/REV2),
         // writes only that many fields, never overruns past its revision
         // size (a larger caller buffer is left untouched), and overwrites
-        // *count with the words actually written. `pageouts` is a REV0
-        // field (word 10 / offset 40), so it is always written on
-        // KERN_SUCCESS regardless of the kernel's revision. We read
-        // `pageouts` only when ret == 0 (KERN_SUCCESS).
+        // `*count` with the words actually written. `compressions` is a
+        // REV1 field, present on every Apple Silicon kernel, so it is
+        // written on KERN_SUCCESS. We read it only when ret == 0.
         let ret = unsafe {
             host_statistics64(
                 mach_host_self(),
                 HOST_VM_INFO64,
-                &raw mut stats as *mut u32,
+                std::ptr::addr_of_mut!(stats).cast::<integer_t>(),
                 &mut count,
             )
         };
-        if ret == 0 { Some(stats.pageouts) } else { None }
+        // `compressions` is a packed field; copy it to a local before
+        // returning to avoid taking a reference into the packed struct.
+        let compressions = stats.compressions;
+        if ret == 0 { Some(compressions) } else { None }
     }
 }
 
@@ -446,7 +449,7 @@ mod mem_impl {
     pub(super) fn read_swap_used_bytes() -> Option<u64> {
         None
     }
-    pub(super) fn read_pageouts_cumulative() -> Option<u64> {
+    pub(super) fn read_swap_pressure_cumulative() -> Option<u64> {
         None
     }
 }
@@ -456,14 +459,96 @@ static P_CORE_PCT: AtomicU32 = AtomicU32::new(0);
 static E_CORE_PCT: AtomicU32 = AtomicU32::new(0);
 /// Host swap-used bytes, refreshed by the sampler thread every 100 ms.
 /// `0` = no swap in use OR sampler unavailable (indistinguishable, per
-/// the `cpu_load_pct = 0` unknown convention).
+/// the `cpu_load_pct = 0` unknown convention). Observability only — the
+/// gate keys off the RATE below, not this lingering LEVEL gauge.
 static SWAP_USED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Host page-out RATE in pages/sec, derived by the sampler thread from
-/// the delta of the cumulative page-out counter across its fixed 100 ms
-/// ticks. This is the load-bearing swap-pressure signal (active paging),
-/// vs `SWAP_USED_BYTES` which lingers after pressure subsides.
-static PAGEOUTS_PER_SEC: AtomicU32 = AtomicU32::new(0);
+/// Host swap-pressure RATE in events/sec, derived by the sampler thread
+/// from the delta of the cumulative swap-pressure counter
+/// (`compressions` on macOS / `pswpout` on Linux — NOT `pageouts`, see
+/// `mem_impl::read_swap_pressure_cumulative`) across its fixed 100 ms
+/// ticks. This is the raw windowed rate carried on the wire for
+/// observability; the GATE keys off the EWMA of this rate (fast-attack /
+/// slow-release), not the raw value, so a single spike does not stick.
+static SWAP_PRESSURE_RATE: AtomicU32 = AtomicU32::new(0);
+/// (#37) Monotonic nanoseconds (since `PROCESS_START`) at which the
+/// swap sampler last published a value. The worker-local gate reads this
+/// to detect a wedged/dead sampler: if the most recent sample is older
+/// than `SWAP_SAMPLE_MAX_AGE`, the gate's pressure state is UNKNOWN and
+/// it FAILS OPEN (§3a rule 2 / §5 case 4). NET-NEW — the CPU sampler has
+/// no age atomic to inherit. Monotonic source so an NTP step cannot
+/// spuriously trip or suppress the fail-open. `0` = never sampled yet.
+static LAST_SAMPLE_INSTANT: AtomicU64 = AtomicU64::new(0);
+/// (#37) Coarse 1-bit gate verdict published by the sampler: `true` when
+/// the EWMA swap-pressure estimate crosses `SWAP_PRESSURE_GATE_RATE` AND
+/// the sample is fresh. Mirrors `indefinite_pin_saturated`: the heartbeat
+/// carries it (advisory matcher hint) and the worker-local StartAction
+/// NAK reads it (authoritative gate — the local atomic, never the wire
+/// boolean, is the safety-critical decision). `false` when fresh-and-low,
+/// stale (fail-open), or sampler-unavailable.
+static SWAP_PRESSURED: AtomicBool = AtomicBool::new(false);
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Process-start anchor for the monotonic `LAST_SAMPLE_INSTANT` atomic.
+/// `Instant` is not `Copy`-into-an-atomic, so the sampler stores
+/// `now.duration_since(*PROCESS_START)` nanos and the gate compares
+/// against the same anchor. Both ends use `Instant` (CLOCK_MONOTONIC),
+/// never wall-clock.
+static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// (#37) EWMA gate-trip threshold on the swap-pressure rate
+/// (events/sec). PROVISIONAL — MUST be finalized from the §4 falsifying
+/// probe (which picks `compressions` vs `swapouts`) AND a separate soak
+/// that characterizes the baseline-rate distribution under normal
+/// multi-action load (a busy-but-healthy worker has a nonzero noisy
+/// baseline the idle probe never reveals). Until both run, the gate is
+/// held DISABLED via `SWAP_GATE_ENABLED` so a guessed threshold cannot
+/// false-trip a healthy worker in production. See design §6.2 and §4.
+const SWAP_PRESSURE_GATE_RATE: u32 = 10_000;
+
+/// (#37) Master enable for the worker-local swap admission gate and its
+/// proactive heartbeat boolean. Held `false` until the §4 probe finalizes
+/// the counter and a soak sets `SWAP_PRESSURE_GATE_RATE`: with the
+/// threshold unproven, enabling the gate risks false-tripping a healthy
+/// worker (a strictly worse regression than the invisible oversubscription
+/// it guards). The sampler still publishes the rate + swap-used for
+/// observability while disabled; only the gate verdict (`SWAP_PRESSURED`)
+/// and the NAK are suppressed. Flip to `true` once the constants are set.
+const SWAP_GATE_ENABLED: bool = false;
+
+/// (#37) EWMA smoothing weight applied to each fresh rate sample
+/// (fast-ATTACK). A high weight on RISING samples means a post-action
+/// peak (§3b) trips the estimate quickly; the slow-release below keeps it
+/// from sticking. `estimate += ATTACK * (sample - estimate)` when sample
+/// rises. PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+const SWAP_EWMA_ATTACK: f64 = 0.5;
+
+/// (#37) EWMA smoothing weight applied when the fresh sample is BELOW the
+/// running estimate (slow-RELEASE). Small weight ⇒ the estimate decays
+/// slowly, so a single completed heavy action whose post-action peak
+/// tripped the gate cannot trip-then-immediately-clear-then-retrip
+/// (security S-MED-2: the release MUST outlast the post-action RSS-reclaim
+/// time). PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+const SWAP_EWMA_RELEASE: f64 = 0.05;
+
+/// (#37) Time-bounded fleet fail-open window (§5 case 3b). A worker that
+/// has been NAKing new work under swap pressure with NO in-flight actions
+/// for longer than this accepts ONE action regardless of pressure, so an
+/// all-idle all-pressured fleet (e.g. a memory leak unrelated to actions
+/// — pressure never decays because nothing completes) cannot deadlock.
+/// This is the load-bearing anti-wedge clause: it works with a stale
+/// server view and needs no fleet-global state. MUST exceed the typical
+/// transient-pressure duration so it does not defeat the gate on ordinary
+/// spikes. PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+const SWAP_FAIL_OPEN_AFTER: Duration = Duration::from_secs(30);
+
+/// (#37) Max age of the most recent swap sample before the gate treats
+/// its state as UNKNOWN and fails OPEN (§3a rule 2 / §5 case 4). MUST be
+/// strictly GREATER than the worst-case legitimate sampler stall (a GC /
+/// scheduler-starvation pause under the very pressure being measured) and
+/// strictly LESS than the time for an un-gated worker to OOM (security
+/// S-MED-1). At the 100 ms sampler cadence, 2 s = 20 missed ticks.
+/// PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+const SWAP_SAMPLE_MAX_AGE: Duration = Duration::from_secs(2);
 
 /// Starts a dedicated OS thread that samples system-wide CPU utilization
 /// every 100ms. Idempotent — only the first call spawns the thread.
@@ -497,16 +582,16 @@ fn compute_pct(prev: &cpu_impl::CpuTimes, curr: &cpu_impl::CpuTimes) -> u32 {
     }
 }
 
-/// Derive the page-out RATE (pages/sec) from two cumulative-counter
+/// Derive the swap-pressure RATE (events/sec) from two cumulative-counter
 /// samples and the wall-clock interval between them.
 ///
-/// The cumulative page-out counter is monotonic until reboot. A counter
-/// reset (reboot mid-process, or a kernel that wrapped) shows up as
-/// `curr < prev`; we clamp that to `0` rather than report a garbage
+/// The cumulative swap-pressure counter is monotonic until reboot. A
+/// counter reset (reboot mid-process, or a kernel that wrapped) shows up
+/// as `curr < prev`; we clamp that to `0` rather than report a garbage
 /// spike. A non-positive `elapsed_secs` (clock didn't advance) also
 /// yields `0`. The result saturates into `u32` so a pathological burst
 /// can't overflow the wire field.
-fn compute_pageout_rate(prev_count: u64, curr_count: u64, elapsed_secs: f64) -> u32 {
+fn compute_swap_pressure_rate(prev_count: u64, curr_count: u64, elapsed_secs: f64) -> u32 {
     if elapsed_secs <= 0.0 {
         return 0;
     }
@@ -522,15 +607,50 @@ fn compute_pageout_rate(prev_count: u64, curr_count: u64, elapsed_secs: f64) -> 
     }
 }
 
-/// Sample host swap/page-out pressure on the sampler thread's fixed
-/// cadence and publish into the atomics the heartbeat reads. `prev`
-/// carries the last cumulative page-out sample + the `Instant` it was
-/// taken so the rate uses the REAL elapsed interval (robust to sampler
-/// scheduling jitter), not an assumed 100 ms. Returns the new
-/// `(cumulative_pageouts, sampled_at)` to thread into the next tick;
-/// `None` cumulative means the sampler was unavailable this tick (rate
-/// published as `0`).
-fn sample_mem_pressure(prev: Option<(u64, Instant)>) -> Option<(u64, Instant)> {
+/// Update the fast-attack / slow-release EWMA of the swap-pressure rate
+/// (§3b). RISING samples are folded in with the large `SWAP_EWMA_ATTACK`
+/// weight (a post-action peak trips the estimate fast); FALLING samples
+/// use the small `SWAP_EWMA_RELEASE` weight (the estimate decays slowly,
+/// so a one-action spike cannot retrip on the next tick — the steady-state
+/// oscillation guard). Pure function of (prev_estimate, sample) so it is
+/// unit-testable in isolation.
+fn update_swap_ewma(prev_estimate: f64, sample: f64) -> f64 {
+    let weight = if sample >= prev_estimate {
+        SWAP_EWMA_ATTACK
+    } else {
+        SWAP_EWMA_RELEASE
+    };
+    prev_estimate + weight * (sample - prev_estimate)
+}
+
+/// Per-tick swap-sampler state threaded through the sampler loop. `prev`
+/// is the last cumulative counter + the `Instant` it was read (so the
+/// rate uses the REAL elapsed interval, robust to sampler jitter, not an
+/// assumed 100 ms). `ewma` is the running fast-attack/slow-release
+/// estimate that the GATE keys off.
+#[derive(Clone, Copy)]
+struct SwapSamplerState {
+    prev: Option<(u64, Instant)>,
+    ewma: f64,
+}
+
+impl SwapSamplerState {
+    const fn new() -> Self {
+        Self {
+            prev: None,
+            ewma: 0.0,
+        }
+    }
+}
+
+/// Sample host swap pressure on the sampler thread's fixed cadence and
+/// publish into the atomics the heartbeat + the worker-local gate read.
+/// Updates: `SWAP_USED_BYTES` (level gauge, observability),
+/// `SWAP_PRESSURE_RATE` (raw windowed rate, wire/observability),
+/// `LAST_SAMPLE_INSTANT` (sample-age liveness for the fail-open), and
+/// `SWAP_PRESSURED` (the EWMA-derived gate verdict). Returns the new
+/// `SwapSamplerState` to thread into the next tick.
+fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     // swap-used is an absolute gauge — publish whatever we read (0 if
     // unavailable), no prev-state needed.
     SWAP_USED_BYTES.store(
@@ -539,24 +659,50 @@ fn sample_mem_pressure(prev: Option<(u64, Instant)>) -> Option<(u64, Instant)> {
     );
 
     let now = Instant::now();
-    let Some(curr_count) = mem_impl::read_pageouts_cumulative() else {
+    // Publish the sample-age anchor on EVERY successful tick (BEFORE the
+    // counter read can early-return) so the gate's fail-open sees a live
+    // sampler even on ticks where the swap counter itself is unreadable.
+    // Stored as monotonic nanos since PROCESS_START — never wall-clock.
+    let since_start = now.duration_since(*PROCESS_START).as_nanos();
+    LAST_SAMPLE_INSTANT.store(
+        u64::try_from(since_start).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+
+    let Some(curr_count) = mem_impl::read_swap_pressure_cumulative() else {
         // Counter unreadable this tick: report no pressure and drop the
         // prev anchor so the next successful read doesn't compute a rate
-        // across an unknown-length gap.
-        PAGEOUTS_PER_SEC.store(0, Ordering::Relaxed);
-        return None;
+        // across an unknown-length gap. The EWMA is left intact (it will
+        // decay on the next readable tick); the gate verdict is cleared so
+        // an unreadable counter never holds the gate tripped.
+        SWAP_PRESSURE_RATE.store(0, Ordering::Relaxed);
+        SWAP_PRESSURED.store(false, Ordering::Relaxed);
+        return SwapSamplerState {
+            prev: None,
+            ewma: state.ewma,
+        };
     };
-    if let Some((prev_count, prev_at)) = prev {
+
+    let rate = if let Some((prev_count, prev_at)) = state.prev {
         let elapsed = now.duration_since(prev_at).as_secs_f64();
-        PAGEOUTS_PER_SEC.store(
-            compute_pageout_rate(prev_count, curr_count, elapsed),
-            Ordering::Relaxed,
-        );
+        compute_swap_pressure_rate(prev_count, curr_count, elapsed)
     } else {
         // First sample: no interval to rate against yet.
-        PAGEOUTS_PER_SEC.store(0, Ordering::Relaxed);
+        0
+    };
+    SWAP_PRESSURE_RATE.store(rate, Ordering::Relaxed);
+
+    let ewma = update_swap_ewma(state.ewma, f64::from(rate));
+    // Publish the gate verdict from the SMOOTHED estimate, never the raw
+    // sample (§3b). Held false entirely while the gate is disabled so the
+    // proactive matcher skip never fires on an unproven threshold.
+    let pressured = SWAP_GATE_ENABLED && ewma >= f64::from(SWAP_PRESSURE_GATE_RATE);
+    SWAP_PRESSURED.store(pressured, Ordering::Relaxed);
+
+    SwapSamplerState {
+        prev: Some((curr_count, now)),
+        ewma,
     }
-    Some((curr_count, now))
 }
 
 fn cpu_sample_loop() {
@@ -583,13 +729,13 @@ fn cpu_sample_loop() {
     // Fallback: aggregate-only sampling (Linux, non-macOS, or Intel Mac
     // where host_processor_info failed).
     let mut prev = cpu_impl::read_cpu_times();
-    let mut prev_mem: Option<(u64, Instant)> = None;
+    let mut mem_state = SwapSamplerState::new();
     loop {
         std::thread::sleep(Duration::from_millis(100));
-        // Sample host swap/page-out on the same fixed cadence as CPU so
-        // the page-out rate has a stable denominator (the heartbeat
+        // Sample host swap pressure on the same fixed cadence as CPU so
+        // the pressure rate has a stable denominator (the heartbeat
         // cadence varies 100 ms-6 s and would make the rate noisy).
-        prev_mem = sample_mem_pressure(prev_mem);
+        mem_state = sample_mem_pressure(mem_state);
         let curr = cpu_impl::read_cpu_times();
         match (&prev, &curr) {
             (Some(p), Some(c)) => {
@@ -604,12 +750,12 @@ fn cpu_sample_loop() {
 #[cfg(target_os = "macos")]
 fn per_type_sample_loop(initial: cpu_impl::PerTypeCpuTimes) {
     let mut prev = initial;
-    let mut prev_mem: Option<(u64, Instant)> = None;
+    let mut mem_state = SwapSamplerState::new();
     loop {
         std::thread::sleep(Duration::from_millis(100));
-        // Sample host swap/page-out FIRST so it keeps publishing even on
+        // Sample host swap pressure FIRST so it keeps publishing even on
         // ticks where the CPU read fails and `continue`s below.
-        prev_mem = sample_mem_pressure(prev_mem);
+        mem_state = sample_mem_pressure(mem_state);
         let Some(curr) = cpu_impl::read_per_type_cpu_times() else {
             CPU_PCT.store(0, Ordering::Relaxed);
             P_CORE_PCT.store(0, Ordering::Relaxed);
@@ -657,19 +803,143 @@ fn get_e_core_load_pct() -> u32 {
 }
 
 /// Returns host swap-used bytes sampled by the dedicated sampler thread.
-/// `0` means no swap in use OR sampler unavailable. Absolute gauge —
-/// pair with [`get_pageouts_per_sec`] (the dynamic-pressure signal).
+/// `0` means no swap in use OR sampler unavailable. Absolute LEVEL gauge
+/// (observability) — pair with [`get_swap_pressure_rate_per_sec`] (the
+/// dynamic-pressure signal the gate keys off).
 fn get_swap_used_bytes() -> u64 {
     SWAP_USED_BYTES.load(Ordering::Relaxed)
 }
 
-/// Returns the host page-out RATE (pages/sec), derived by the sampler
-/// thread from the delta of the cumulative page-out counter across its
-/// fixed 100 ms ticks. Non-zero ⇒ the host is actively paging anonymous
-/// memory to disk (the load-bearing swap-pressure signal). `0` ⇒ no
-/// recent page-outs or sampler unavailable.
-fn get_pageouts_per_sec() -> u32 {
-    PAGEOUTS_PER_SEC.load(Ordering::Relaxed)
+/// Returns the host swap-pressure RATE (events/sec), derived by the
+/// sampler thread from the delta of the cumulative swap-pressure counter
+/// (`compressions`/`pswpout`, NOT `pageouts`) across its fixed 100 ms
+/// ticks. Non-zero ⇒ the host is actively compressing/swapping anonymous
+/// memory right now (the load-bearing swap-pressure signal). `0` ⇒ no
+/// recent pressure or sampler unavailable. This is the raw windowed rate
+/// carried on the wire for observability; the GATE uses
+/// [`swap_gate_pressured`], which reads the EWMA-derived verdict with a
+/// sample-age fail-open.
+fn get_swap_pressure_rate_per_sec() -> u32 {
+    SWAP_PRESSURE_RATE.load(Ordering::Relaxed)
+}
+
+/// (#37) Pure swap-gate verdict — the sample-age fail-open logic, factored
+/// out of [`swap_gate_pressured`] so it is unit-testable with `enabled =
+/// true` independent of the `SWAP_GATE_ENABLED` compile-time flag (which
+/// short-circuits the production wrapper to `false`).
+///
+/// Returns `Some(true)` only when the gate is enabled, the most recent
+/// sample is FRESH, and the sampler published a pressured verdict. FAILS
+/// OPEN (`false`) when disabled, never-sampled (`last_nanos == 0`), or
+/// STALE (`age > SWAP_SAMPLE_MAX_AGE`). `stale` is returned separately so
+/// the caller can emit the `warn!` only on the real wedged-sampler path
+/// (this function stays allocation/log-free for testability). All time
+/// inputs are monotonic nanos since `PROCESS_START`.
+fn swap_gate_verdict(
+    enabled: bool,
+    pressured: bool,
+    last_nanos: u64,
+    now_since_start: Duration,
+    max_age: Duration,
+) -> (bool /* pressured */, bool /* stale */) {
+    if !enabled {
+        return (false, false);
+    }
+    if last_nanos == 0 {
+        // Sampler has never published a value — UNKNOWN, fail open.
+        return (false, false);
+    }
+    let age = now_since_start.saturating_sub(Duration::from_nanos(last_nanos));
+    if age > max_age {
+        // Stale sample: the sampler is wedged/dead. UNKNOWN → fail open.
+        return (false, true);
+    }
+    (pressured, false)
+}
+
+/// (#37) Authoritative worker-local swap-gate decision. Returns `true`
+/// only when the gate is ENABLED, the most recent swap sample is FRESH
+/// (within `SWAP_SAMPLE_MAX_AGE`), and the sampler published a pressured
+/// verdict (EWMA over threshold). FAILS OPEN — returns `false` — when the
+/// sampler is wedged/dead (stale or never-published `LAST_SAMPLE_INSTANT`)
+/// so a dead pressure sampler never wedges the worker into refusing all
+/// work (§3a rule 2 / §5 case 4). Reads ONLY in-process atomics on a
+/// monotonic clock; never the wire boolean (the safety-critical decision
+/// never crosses the worker→server trust boundary, design §2 S-LOW-2).
+fn swap_gate_pressured() -> bool {
+    let (pressured, stale) = swap_gate_verdict(
+        SWAP_GATE_ENABLED,
+        SWAP_PRESSURED.load(Ordering::Relaxed),
+        LAST_SAMPLE_INSTANT.load(Ordering::Relaxed),
+        Instant::now().duration_since(*PROCESS_START),
+        SWAP_SAMPLE_MAX_AGE,
+    );
+    if stale {
+        // The count-only gate + memory_kb admission remain the only bounds
+        // (both still active) rather than gating all work forever.
+        warn!(
+            "stale swap sample: swap sampler appears wedged/dead, failing the swap gate OPEN"
+        );
+    }
+    pressured
+}
+
+/// (#37) The three outcomes of the worker-local swap-gate evaluation on a
+/// `StartAction`. Pure-function output of [`swap_gate_decision`] so the
+/// admission/fail-open/hysteresis logic is unit-testable without the full
+/// `LocalWorker::run` loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapGateDecision {
+    /// Accept the action normally (not pressured, or hysteresis latch
+    /// already holds — a prior fail-open action is still draining).
+    Accept,
+    /// Accept via the time-bounded fleet fail-open (§5 case 3b): the
+    /// worker has been idle-gating past `SWAP_FAIL_OPEN_AFTER`. Caller
+    /// MUST set the hysteresis latch so re-gating is suppressed until the
+    /// accepted action completes.
+    AcceptFailOpen,
+    /// Refuse the action with `ResourceExhausted` (sustained swap pressure
+    /// with either in-flight work draining or before the fail-open window).
+    Nak,
+}
+
+/// Pure swap-gate admission decision (§ Option A + §5 case 3b + hysteresis).
+///
+/// - Not pressured ⇒ `Accept`.
+/// - Hysteresis `latched` (a fail-open action is still in flight) ⇒
+///   `Accept` — suppress re-gating until it completes (monotonic progress,
+///   security S §5-3b).
+/// - Pressured with in-flight work ⇒ `Nak`: the worker is draining, and
+///   `update_action_cs2`'s `has_actions()` pause re-selects it correctly,
+///   so refusing new work here does NOT arm the idle spin.
+/// - Pressured + IDLE (no in-flight work): `Nak` until the worker has been
+///   idle-gating for `SWAP_FAIL_OPEN_AFTER`, then `AcceptFailOpen` — so an
+///   all-idle all-pressured fleet cannot deadlock (the load-bearing
+///   anti-wedge clause). `first_idle_gated_at` is the anchor the caller
+///   threads across ticks.
+fn swap_gate_decision(
+    pressured: bool,
+    in_flight: u64,
+    latched: bool,
+    first_idle_gated_at: Option<Instant>,
+    now: Instant,
+) -> SwapGateDecision {
+    if !pressured || latched {
+        return SwapGateDecision::Accept;
+    }
+    if in_flight > 0 {
+        // Draining: refuse new work; the server-side has_actions() pause
+        // (update_action_cs2) handles re-selection without spinning.
+        return SwapGateDecision::Nak;
+    }
+    // Pressured AND idle: the time-bounded fail-open is the only thing that
+    // un-wedges an all-idle all-pressured fleet.
+    match first_idle_gated_at {
+        Some(since) if now.duration_since(since) >= SWAP_FAIL_OPEN_AFTER => {
+            SwapGateDecision::AcceptFailOpen
+        }
+        _ => SwapGateDecision::Nak,
+    }
 }
 
 /// Build the advertised gRPC endpoint for peer blob sharing.
@@ -2633,12 +2903,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // worker proactively rather than re-NAK-spinning it. Cheap: one relaxed
         // atomic load + compare, no lock, no await (`moka_evicting_map.rs`).
         let indefinite_pin_saturated = state.fs_store.indefinite_pin_saturated();
-        // Host swap/page-out pressure, read from the sampler-thread atomics
-        // (same cheap relaxed-load pattern as cpu_load_pct). The page-out
-        // RATE is the load-bearing signal; swap-used is the coarse gauge.
+        // Host swap pressure, read from the sampler-thread atomics (same
+        // cheap relaxed-load pattern as cpu_load_pct). The pressure RATE is
+        // the observability signal; swap-used is the coarse LEVEL gauge.
+        // `swap_pressured` is the coarse 1-bit gate verdict the matcher
+        // uses for a PROACTIVE skip (advisory only — the authoritative NAK
+        // reads the local atomic, not this wire boolean, design §2).
         let swap_used_bytes = get_swap_used_bytes();
-        let pageouts_per_sec = get_pageouts_per_sec();
-        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} pageouts_per_sec={pageouts_per_sec}");
+        let swap_pressure_rate_per_sec = get_swap_pressure_rate_per_sec();
+        let swap_pressured = swap_gate_pressured();
+        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} swap_pressure_rate_per_sec={swap_pressure_rate_per_sec} swap_pressured={swap_pressured}");
         let notification = BlobsAvailableNotification {
             worker_cas_endpoint: state.cas_endpoint.clone(),
             digests: Vec::new(),
@@ -2706,10 +2980,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             pinned_ac_mirror_entries,
             // (FL-681) Snapshot taken above from the local CAS FilesystemStore.
             indefinite_pin_saturated,
-            // Host swap/page-out pressure (read above). Periodic heartbeat
-            // carries the authoritative sampler values.
+            // Host swap pressure (read above). Periodic heartbeat carries
+            // the authoritative sampler values + the coarse gate verdict.
             swap_used_bytes,
-            pageouts_per_sec,
+            swap_pressure_rate_per_sec,
+            swap_pressured,
         };
 
         // (#99) If the notification's encoded estimate exceeds the
@@ -3004,6 +3279,19 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // Set to true when shutting down, this stops any new StartAction.
         let mut shutting_down = false;
 
+        // (#37) Worker-local swap-gate state, main-loop-local (the gate
+        // decision happens synchronously on each StartAction). `since`
+        // anchors the time-bounded fleet fail-open (§5 case 3b): a worker
+        // that has been NAKing with NO in-flight work for longer than
+        // `SWAP_FAIL_OPEN_AFTER` accepts ONE action so an all-idle
+        // all-pressured fleet (e.g. a non-action memory leak) cannot wedge.
+        // `latched` is the hysteresis latch (§5 case 3b / security): once
+        // the fail-open accepts an action, re-gating is suppressed until
+        // that action completes (in-flight returns to 0), guaranteeing
+        // monotonic progress instead of accept→re-gate oscillation.
+        let mut swap_first_idle_gated_at: Option<Instant> = None;
+        let mut swap_fail_open_latched = false;
+
         loop {
             select! {
                 maybe_update = update_for_worker_stream.next() => if !shutting_down || maybe_update.is_some() {
@@ -3287,6 +3575,71 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 continue;
                             }
 
+                            // (#37) Worker-local swap admission gate. AUTHORITATIVE
+                            // (reads the in-process atomic, never the wire boolean —
+                            // design §2 trust boundary). ADDITIVE to the existing
+                            // count-only + memory_kb admission: the reactive backstop
+                            // for RSS-estimation error. Fails OPEN on a stale/dead
+                            // sampler (inside `swap_gate_pressured`) and via the
+                            // time-bounded fleet fail-open below.
+                            let in_flight = actions_in_flight.load(Ordering::Acquire);
+                            // Hysteresis latch self-clears once the fail-open action
+                            // has drained (in-flight back to 0), re-arming the gate.
+                            if swap_fail_open_latched && in_flight == 0 {
+                                swap_fail_open_latched = false;
+                                swap_first_idle_gated_at = None;
+                            }
+                            let pressured = swap_gate_pressured();
+                            let now = Instant::now();
+                            match swap_gate_decision(
+                                pressured,
+                                in_flight,
+                                swap_fail_open_latched,
+                                swap_first_idle_gated_at,
+                                now,
+                            ) {
+                                SwapGateDecision::Nak => {
+                                    if swap_first_idle_gated_at.is_none() && in_flight == 0 {
+                                        // Start the fail-open clock on the first
+                                        // idle-gated NAK.
+                                        swap_first_idle_gated_at = Some(now);
+                                    }
+                                    warn!(
+                                        swap_pressure_rate_per_sec = get_swap_pressure_rate_per_sec(),
+                                        in_flight,
+                                        "worker NAKing action: sustained host swap pressure (additive backstop to memory_kb admission)"
+                                    );
+                                    if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
+                                        self.grpc_client.clone().execution_response(
+                                            ExecuteResult{
+                                                instance_name,
+                                                operation_id: start_execute.operation_id,
+                                                result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker under swap pressure").into())),
+                                            }
+                                        ).await?;
+                                    }
+                                    continue;
+                                }
+                                SwapGateDecision::AcceptFailOpen => {
+                                    // Time-bounded fleet fail-open fired: accept ONE
+                                    // action and latch so re-gating is suppressed
+                                    // until it drains (monotonic progress).
+                                    swap_fail_open_latched = true;
+                                    warn!(
+                                        swap_pressure_rate_per_sec = get_swap_pressure_rate_per_sec(),
+                                        fail_open_after_secs = SWAP_FAIL_OPEN_AFTER.as_secs(),
+                                        "worker swap gate FAILING OPEN: idle+pressured past the fail-open window, accepting one action to avoid a fleet wedge"
+                                    );
+                                }
+                                SwapGateDecision::Accept => {
+                                    // Not pressured (or latched): clear the idle clock
+                                    // so a future pressure episode starts fresh.
+                                    if !pressured {
+                                        swap_first_idle_gated_at = None;
+                                    }
+                                }
+                            }
+
                             self.metrics.start_actions_received.inc();
 
                             let execute_request = start_execute.execute_request.as_ref();
@@ -3531,16 +3884,23 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             indefinite_pin_saturated:
                                                                 running_actions_manager
                                                                     .indefinite_pin_saturated(),
-                                                            // Host swap/page-out pressure read
-                                                            // from the process-global sampler
-                                                            // atomics. Unlike mirror_*_bytes
-                                                            // (which need a CAS-FSS handle not
-                                                            // in scope here, hence 0), the
-                                                            // sampler is global, so this
-                                                            // one-shot delta reports the
-                                                            // AUTHORITATIVE current value.
+                                                            // Host swap pressure read from the
+                                                            // process-global sampler atomics.
+                                                            // Unlike mirror_*_bytes (which need a
+                                                            // CAS-FSS handle not in scope here,
+                                                            // hence 0), the sampler is global, so
+                                                            // this one-shot delta reports the
+                                                            // AUTHORITATIVE current value. The
+                                                            // post-action sample is a PEAK (RSS
+                                                            // not yet reclaimed); `swap_pressured`
+                                                            // comes from the EWMA verdict
+                                                            // (`swap_gate_pressured`), never the
+                                                            // raw peak, so one heavy action cannot
+                                                            // look like sustained pressure (§3b).
                                                             swap_used_bytes: get_swap_used_bytes(),
-                                                            pageouts_per_sec: get_pageouts_per_sec(),
+                                                            swap_pressure_rate_per_sec:
+                                                                get_swap_pressure_rate_per_sec(),
+                                                            swap_pressured: swap_gate_pressured(),
                                                         }
                                                     ).await {
                                                         // Failure to send BlobsAvailable
@@ -5803,70 +6163,71 @@ mod tests {
         drop(tokio::fs::remove_dir_all(&tmp).await);
     }
 
-    /// The page-out RATE is the load-bearing swap-pressure signal: it is
-    /// the DELTA of the cumulative page-out counter divided by the REAL
-    /// elapsed interval. This proves the delta-rate arithmetic that the
-    /// sampler thread runs every tick.
+    /// The swap-pressure RATE is the load-bearing dynamic signal: it is
+    /// the DELTA of the cumulative swap-pressure counter
+    /// (`compressions`/`pswpout`) divided by the REAL elapsed interval.
+    /// This proves the delta-rate arithmetic that the sampler thread runs
+    /// every tick.
     ///
-    /// Mutation step (CLAUDE.md TDD #5): in `compute_pageout_rate`,
+    /// Mutation step (CLAUDE.md TDD #5): in `compute_swap_pressure_rate`,
     /// replace `curr_count.saturating_sub(prev_count)` with `curr_count`
     /// (report the ABSOLUTE counter instead of the delta). This test
     /// red-fails at the steady-rate assertion with the bespoke message
     /// naming the delta-not-absolute contract.
     #[test]
-    fn compute_pageout_rate_is_delta_over_interval() {
-        // 1000 pages over 2 s ⇒ 500 pages/sec.
+    fn compute_swap_pressure_rate_is_delta_over_interval() {
+        // 1000 events over 2 s ⇒ 500 events/sec.
         assert_eq!(
-            compute_pageout_rate(10_000, 11_000, 2.0),
+            compute_swap_pressure_rate(10_000, 11_000, 2.0),
             500,
-            "page-out rate must be (curr - prev) / elapsed = 1000/2 = 500; a \
+            "swap-pressure rate must be (curr - prev) / elapsed = 1000/2 = 500; a \
              non-500 value means the sampler reported the ABSOLUTE cumulative \
              counter instead of the per-interval DELTA (the lingering-counter bug)"
         );
         // No change in counter ⇒ no pressure.
         assert_eq!(
-            compute_pageout_rate(11_000, 11_000, 1.0),
+            compute_swap_pressure_rate(11_000, 11_000, 1.0),
             0,
-            "a flat cumulative counter must report zero page-out rate"
+            "a flat cumulative counter must report zero swap-pressure rate"
         );
         // Counter reset (reboot / wrap): curr < prev ⇒ clamp to 0, never
         // a garbage negative-turned-huge spike.
         assert_eq!(
-            compute_pageout_rate(11_000, 5, 1.0),
+            compute_swap_pressure_rate(11_000, 5, 1.0),
             0,
             "a counter reset (curr < prev) must clamp to 0, not report a \
              spurious spike from the underflow"
         );
         // Non-advancing clock ⇒ 0 (avoid divide-by-zero garbage).
         assert_eq!(
-            compute_pageout_rate(10_000, 11_000, 0.0),
+            compute_swap_pressure_rate(10_000, 11_000, 0.0),
             0,
             "a non-advancing wall clock must yield 0, not a divide-by-zero"
         );
     }
 
-    /// The heartbeat reads host swap/page-out via the process-global
-    /// sampler atomics (`get_swap_used_bytes` / `get_pageouts_per_sec`),
+    /// The heartbeat reads host swap pressure via the process-global
+    /// sampler atomics (`get_swap_used_bytes` / `get_swap_pressure_rate_per_sec`),
     /// exactly like `get_cpu_load_pct`. This fakes a sampler tick by
     /// storing into the atomics and asserts the reader observes it — the
     /// path the periodic + post-action heartbeat build sites use.
     ///
-    /// Mutation step: change `get_pageouts_per_sec` to read `CPU_PCT`
-    /// instead of `PAGEOUTS_PER_SEC` (wrong static). This test red-fails
-    /// because the faked page-out value is not observed.
+    /// Mutation step: change `get_swap_pressure_rate_per_sec` to read
+    /// `CPU_PCT` instead of `SWAP_PRESSURE_RATE` (wrong static). This test
+    /// red-fails because the faked rate value is not observed.
     ///
     /// `#[serial(swap_sampler_atomics)]`: this test and
     /// `sample_mem_pressure_first_tick_publishes_zero_rate` both mutate the
-    /// process-global `SWAP_USED_BYTES` / `PAGEOUTS_PER_SEC` statics. Under
+    /// process-global `SWAP_USED_BYTES` / `SWAP_PRESSURE_RATE` statics. Under
     /// the default multi-threaded test runner the other test's poison store
-    /// (`PAGEOUTS_PER_SEC = 99_999`) races this read; serializing the two
+    /// (`SWAP_PRESSURE_RATE = 99_999`) races this read; serializing the two
     /// removes the cross-test interleave (no production-path change).
     #[test]
     #[serial(swap_sampler_atomics)]
     fn heartbeat_reads_swap_pressure_from_sampler_atomics() {
         // Fake a sampler tick.
         SWAP_USED_BYTES.store(7_654_321, Ordering::Relaxed);
-        PAGEOUTS_PER_SEC.store(1337, Ordering::Relaxed);
+        SWAP_PRESSURE_RATE.store(1337, Ordering::Relaxed);
         assert_eq!(
             get_swap_used_bytes(),
             7_654_321,
@@ -5874,10 +6235,10 @@ mod tests {
              sampler atomic"
         );
         assert_eq!(
-            get_pageouts_per_sec(),
+            get_swap_pressure_rate_per_sec(),
             1337,
-            "heartbeat must read pageouts_per_sec from the PAGEOUTS_PER_SEC \
-             sampler atomic"
+            "heartbeat must read swap_pressure_rate_per_sec from the \
+             SWAP_PRESSURE_RATE sampler atomic"
         );
     }
 
@@ -5888,16 +6249,16 @@ mod tests {
     /// where the absolute counter would be mistaken for a one-tick delta.
     ///
     /// `#[serial(swap_sampler_atomics)]`: shares the process-global
-    /// `PAGEOUTS_PER_SEC` static with
+    /// `SWAP_PRESSURE_RATE` static with
     /// `heartbeat_reads_swap_pressure_from_sampler_atomics`; serialized so
     /// the poison store below cannot race that test's read.
     #[test]
     #[serial(swap_sampler_atomics)]
     fn sample_mem_pressure_first_tick_publishes_zero_rate() {
-        PAGEOUTS_PER_SEC.store(99_999, Ordering::Relaxed); // poison
-        let anchor = sample_mem_pressure(None);
+        SWAP_PRESSURE_RATE.store(99_999, Ordering::Relaxed); // poison
+        let next = sample_mem_pressure(SwapSamplerState::new());
         assert_eq!(
-            get_pageouts_per_sec(),
+            get_swap_pressure_rate_per_sec(),
             0,
             "first sampler tick has no prior interval; rate must be 0, not \
              the absolute counter mistaken for a one-tick delta"
@@ -5906,7 +6267,154 @@ mod tests {
         // anchor; on unsupported targets it is None. Either way the rate
         // was published as 0 above. We don't assert the anchor's presence
         // because the no-op `mem_impl` legitimately returns None.
-        let _ = anchor;
+        let _ = next;
+    }
+
+    /// (#37) The EWMA the gate keys off is fast-ATTACK / slow-RELEASE
+    /// (§3b): a rising sample folds in with the large attack weight (a
+    /// post-action peak trips the estimate fast), a falling sample with
+    /// the small release weight (the estimate decays slowly so one spike
+    /// cannot retrip on the next tick — the steady-state oscillation
+    /// guard).
+    ///
+    /// Mutation step: swap the attack/release selection (use RELEASE on
+    /// rising, ATTACK on falling). The attack assertion red-fails: a 0→N
+    /// step would barely move the estimate instead of jumping it.
+    #[test]
+    fn swap_ewma_is_fast_attack_slow_release() {
+        // Rising from 0 toward 10_000 uses the ATTACK weight (0.5):
+        // 0 + 0.5*(10000-0) = 5000.
+        let attacked = update_swap_ewma(0.0, 10_000.0);
+        assert!(
+            (attacked - 5_000.0).abs() < 1e-6,
+            "rising sample must use the fast-ATTACK weight (estimate should \
+             jump toward the peak); got {attacked}, expected 5000"
+        );
+        // Falling from 10_000 toward 0 uses the RELEASE weight (0.05):
+        // 10000 + 0.05*(0-10000) = 9500 — barely moves (slow release).
+        let released = update_swap_ewma(10_000.0, 0.0);
+        assert!(
+            (released - 9_500.0).abs() < 1e-6,
+            "falling sample must use the slow-RELEASE weight (estimate should \
+             decay slowly so one completed action cannot retrip the gate); \
+             got {released}, expected 9500"
+        );
+        assert!(
+            released > attacked,
+            "slow-release must hold the estimate HIGHER after a drop than \
+             fast-attack lifts it from idle — the asymmetry IS the hysteresis"
+        );
+    }
+
+    /// (#37) The gate MUST fail OPEN when the sampler is wedged/dead: a
+    /// STALE `LAST_SAMPLE_INSTANT` means UNKNOWN, and the gate must NOT
+    /// report pressured (else a dead sampler wedges the worker into
+    /// refusing all work forever — §3a rule 2 / §5 case 4). Drives the
+    /// pure `swap_gate_verdict` with `enabled = true` so the age check is
+    /// exercised regardless of the `SWAP_GATE_ENABLED` ship flag.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): delete the
+    /// `if age > max_age { return (false, true) }` arm in
+    /// `swap_gate_verdict` (let a stale sample fall through to the
+    /// pressured value). The STALE assertion below red-fails with its
+    /// bespoke "stale swap sample must fail open" message.
+    #[test]
+    fn swap_gate_fails_open_on_stale_sample() {
+        let max_age = Duration::from_secs(2);
+        // FRESH + pressured ⇒ gate reports pressured (baseline).
+        let (p, stale) = swap_gate_verdict(
+            true,
+            true,
+            Duration::from_secs(10).as_nanos() as u64,
+            Duration::from_secs(10) + Duration::from_millis(100),
+            max_age,
+        );
+        assert!(p && !stale, "fresh pressured sample must gate (control)");
+
+        // STALE + pressured ⇒ MUST fail open (not gate), and flag stale.
+        let (p_stale, is_stale) = swap_gate_verdict(
+            true,
+            true, // the value atomic says "pressured"
+            Duration::from_secs(1).as_nanos() as u64, // last sample at t=1s
+            Duration::from_secs(10), // now at t=10s ⇒ age 9s > 2s max
+            max_age,
+        );
+        assert!(
+            !p_stale,
+            "stale swap sample must fail open: a wedged/dead sampler must NOT \
+             report pressured, or the worker refuses all work forever"
+        );
+        assert!(
+            is_stale,
+            "the stale path must be flagged so the wedged-sampler warn! fires"
+        );
+
+        // Never-sampled (0) ⇒ UNKNOWN ⇒ fail open.
+        let (p0, _) = swap_gate_verdict(true, true, 0, Duration::from_secs(10), max_age);
+        assert!(
+            !p0,
+            "never-sampled (LAST_SAMPLE_INSTANT == 0) must fail open (UNKNOWN)"
+        );
+
+        // Disabled ⇒ always fail open regardless of value/age.
+        let (pd, _) = swap_gate_verdict(false, true, 1, Duration::from_secs(10), max_age);
+        assert!(!pd, "disabled gate must always fail open");
+    }
+
+    /// (#37) The pure swap-gate decision: not-pressured accepts; pressured
+    /// with in-flight work NAKs (the worker drains; `has_actions()` pause
+    /// re-selects it); pressured+idle NAKs UNTIL the fail-open window, then
+    /// fails open exactly once; a held latch keeps accepting (hysteresis).
+    ///
+    /// Mutation step: in `swap_gate_decision`, remove the
+    /// `now.duration_since(since) >= SWAP_FAIL_OPEN_AFTER` arm (always
+    /// return `Nak` for idle+pressured). The fail-open assertion red-fails
+    /// with the bespoke wedge message — proving the time-bounded fail-open
+    /// (3b) is load-bearing, not decorative.
+    #[test]
+    fn swap_gate_decision_admits_failopen_and_hysteresis() {
+        let t0 = Instant::now();
+        // Not pressured ⇒ Accept regardless of anything else.
+        assert_eq!(
+            swap_gate_decision(false, 0, false, None, t0),
+            SwapGateDecision::Accept,
+            "an unpressured worker must accept work"
+        );
+        // Pressured WITH in-flight work ⇒ Nak (drain; server re-selects).
+        assert_eq!(
+            swap_gate_decision(true, 2, false, None, t0),
+            SwapGateDecision::Nak,
+            "a pressured worker WITH in-flight work must NAK new work (it is \
+             draining; the has_actions() pause handles re-selection)"
+        );
+        // Pressured + idle, BEFORE the fail-open window ⇒ Nak.
+        assert_eq!(
+            swap_gate_decision(true, 0, false, Some(t0), t0 + Duration::from_secs(1)),
+            SwapGateDecision::Nak,
+            "a pressured idle worker must NAK before the fail-open window"
+        );
+        // Pressured + idle, PAST the fail-open window ⇒ AcceptFailOpen.
+        assert_eq!(
+            swap_gate_decision(
+                true,
+                0,
+                false,
+                Some(t0),
+                t0 + SWAP_FAIL_OPEN_AFTER + Duration::from_secs(1),
+            ),
+            SwapGateDecision::AcceptFailOpen,
+            "composite invariant violated: a pressured idle worker past the \
+             fail-open window must FAIL OPEN and accept one action, else an \
+             all-idle all-pressured fleet wedges with no compensating fail-open"
+        );
+        // Hysteresis latch held ⇒ Accept (the fail-open action is still
+        // draining; do not re-gate its follow-on work).
+        assert_eq!(
+            swap_gate_decision(true, 1, true, Some(t0), t0 + Duration::from_secs(1)),
+            SwapGateDecision::Accept,
+            "while the hysteresis latch holds, a pressured worker must keep \
+             accepting so the accepted action makes monotonic progress"
+        );
     }
 }
 

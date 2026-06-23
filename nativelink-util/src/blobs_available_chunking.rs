@@ -124,7 +124,8 @@ pub fn chunk_blobs_available(
         pinned_ac_mirror_entries,
         indefinite_pin_saturated,
         swap_used_bytes,
-        pageouts_per_sec,
+        swap_pressure_rate_per_sec,
+        swap_pressured,
     } = notification;
 
     // Fold legacy field 2 (`digests`) into `digest_infos` for backwards
@@ -179,11 +180,16 @@ pub fn chunk_blobs_available(
             } else {
                 false
             },
-            // Host swap/page-out pressure: chunk-0-only scalars (like
-            // cpu_load_pct); the accumulator carries chunk 0's value
-            // forward into the reassembled notification.
+            // Host swap pressure: chunk-0-only scalars (like cpu_load_pct);
+            // the accumulator carries chunk 0's value forward into the
+            // reassembled notification.
             swap_used_bytes: if sequence == 0 { swap_used_bytes } else { 0 },
-            pageouts_per_sec: if sequence == 0 { pageouts_per_sec } else { 0 },
+            swap_pressure_rate_per_sec: if sequence == 0 {
+                swap_pressure_rate_per_sec
+            } else {
+                0
+            },
+            swap_pressured: if sequence == 0 { swap_pressured } else { false },
             digests: Vec::new(),
             cached_directory_digests: Vec::new(),
             pinned_mirror_entries: Vec::new(),
@@ -472,13 +478,15 @@ mod tests {
 
     #[test]
     fn swap_fields_ride_chunk_zero_only() {
-        // swap_used_bytes + pageouts_per_sec are chunk-0-only scalars
-        // (like cpu_load_pct): the accumulator carries chunk 0's value
-        // forward. Subsequent chunks MUST leave them at the proto3 default
-        // 0 so a value isn't double-counted or contradicted across chunks.
+        // swap_used_bytes + swap_pressure_rate_per_sec + swap_pressured are
+        // chunk-0-only scalars (like cpu_load_pct): the accumulator carries
+        // chunk 0's value forward. Subsequent chunks MUST leave them at the
+        // proto3 default so a value isn't double-counted or contradicted
+        // across chunks.
         let n = BlobsAvailableNotification {
             swap_used_bytes: 9_876_543_210,
-            pageouts_per_sec: 4242,
+            swap_pressure_rate_per_sec: 4242,
+            swap_pressured: true,
             digest_infos: (0..10).map(bdi).collect(),
             ..Default::default()
         };
@@ -490,8 +498,12 @@ mod tests {
             "chunk 0 must carry swap_used_bytes"
         );
         assert_eq!(
-            chunks[0].pageouts_per_sec, 4242,
-            "chunk 0 must carry pageouts_per_sec"
+            chunks[0].swap_pressure_rate_per_sec, 4242,
+            "chunk 0 must carry swap_pressure_rate_per_sec"
+        );
+        assert!(
+            chunks[0].swap_pressured,
+            "chunk 0 must carry swap_pressured"
         );
         for c in &chunks[1..] {
             assert_eq!(
@@ -500,9 +512,14 @@ mod tests {
                  default (chunk-0-only scalar)"
             );
             assert_eq!(
-                c.pageouts_per_sec, 0,
-                "non-zero chunks must leave pageouts_per_sec at the proto3 \
-                 default (chunk-0-only scalar)"
+                c.swap_pressure_rate_per_sec, 0,
+                "non-zero chunks must leave swap_pressure_rate_per_sec at the \
+                 proto3 default (chunk-0-only scalar)"
+            );
+            assert!(
+                !c.swap_pressured,
+                "non-zero chunks must leave swap_pressured at the proto3 \
+                 default false (chunk-0-only scalar)"
             );
         }
     }
