@@ -38,7 +38,7 @@ name = "transport_bench"
 harness = false
 
 [features]
-default = ["io-uring"]
+default = ["io-uring", "quic"]
 chunked_fast_slow = ["nativelink-store/chunked_fast_slow", "nativelink-service/chunked_fast_slow"]
 io-uring = ["nativelink-util/io-uring", "nativelink-store/io-uring"]
 nix = ["nativelink-worker/nix"]
