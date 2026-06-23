@@ -857,6 +857,40 @@ pub struct ChunkedWriteHandlerMetrics {
         help = "FL-688: chunked-write rejects where the producer dropped mid-stream after ≥1 chunk's bytes were consumed"
     )]
     pub chunked_reject_midstream: AtomicU64,
+    /// #40: count of v1 race-state registry entries force-removed after a
+    /// published commit *failure* (F-A). Distinct from
+    /// `chunked_race_state_force_removed_total` (which counts the v2
+    /// commit-watchdog wedge path): this fires on the FAST failure path
+    /// (a transient bazel-facing dispatch Err, e.g. CDN-tee cache-fan-out
+    /// abandonment), NOT a ≥60 s wedge. Each fire is a poisoned-slot
+    /// reopen that lets the next writer re-claim Owner and re-write a blob
+    /// that never became durable. Operationally this tracks the FL-688
+    /// stale-Err immortality being broken; a non-zero rate co-located with
+    /// cache-fan-out-abandonment warnings is the expected steady state
+    /// under that transient. Keeping it separate avoids polluting the
+    /// "should stay at 0" wedge canary above.
+    #[metric(
+        help = "v1: race-state registry entries force-removed after a published commit FAILURE \
+                (#40 F-A — reopens the Owner door so a transient dispatch Err is retryable, \
+                 NOT a ≥60s wedge)"
+    )]
+    pub chunked_race_state_failed_publish_removed_total: AtomicU64,
+    /// #40: count of v1 race-state registry entries force-removed because a
+    /// sticky published *Ok* short-circuit referenced a blob that is NOT
+    /// indexed (F-B existence-gate). Distinct from
+    /// `chunked_race_state_failed_publish_removed_total` (a transient
+    /// FAILURE) and `chunked_race_state_force_removed_total` (a ≥60 s
+    /// wedge): this fires when a previously-committed blob was evicted (or
+    /// a phantom-Ok slipped through) and a fresh writer correctly re-claims
+    /// Owner to re-write it. A healthy cluster with adequate cache headroom
+    /// should see this stay near 0; a non-zero rate means committed blobs
+    /// are being evicted while a re-upload is still in flight.
+    #[metric(
+        help = "v1: race-state registry entries force-removed because a sticky published Ok \
+                referenced a NOT-indexed (evicted/phantom) blob (#40 F-B existence-gate — \
+                the writer re-claims Owner and re-writes)"
+    )]
+    pub chunked_race_state_evicted_success_reopened_total: AtomicU64,
 }
 
 /// Server-side handler for the `WriteChunked` RPC. Holds the
@@ -1376,13 +1410,18 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // concurrent v2 writer that arrives after our `publish_commit_result`
         // can never observe a fresh race-state — see comment block
         // below near the publish + cleanup site for full rationale.
-        let (race_state, _race_writer_guard, attach_outcome) = self
-            .filesystem_store
-            .race_state_for_digest_and_attach_single_stream(
+        // #40 F-B: existence-gate a success short-circuit (see the helper
+        // doc). `writer_id` is rebound to the effective identity so the
+        // owner-guard below tracks the writer the helper actually attached.
+        let (race_state, _race_writer_guard, attach_outcome, writer_id) =
+            race_attach_single_stream_existence_gated(
+                &self.filesystem_store,
                 &digest,
                 chunk_size_u32,
                 writer_id,
-            );
+                &self.metrics,
+            )
+            .await;
         let single_stream_owner_guard = match attach_outcome {
             nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome::Owner => {
                 Some(nativelink_store::chunked::chunked_race_state::SingleStreamOwnerGuard::new(
@@ -1718,11 +1757,34 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         if let Some(g) = single_stream_owner_guard {
             g.relinquish();
         }
+        // #40 F-A: on a published commit FAILURE, force-remove the
+        // poisoned registry slot (same rationale as the
+        // `BazelChunkedDispatcher::dispatch` Owner-Err arm). Without this
+        // a transient Err is immortal (publish is no-overwrite +
+        // `commit_done_flag` is sticky + v1 never calls
+        // `try_remove_if_unused`), and every later v1 WriteChunked for
+        // this digest peeks the stale Err and fails forever. Scoped to the
+        // FAILURE slot only: nothing was committed and no `.partial` was
+        // renamed away, so a fresh Owner re-writing is corruption-safe —
+        // the #494/#497 SUCCESS-stays-sticky guard is preserved (the `Ok`
+        // branch below is untouched). `force_remove` (unconditional), NOT
+        // `try_remove_if_unused`: the publishing Owner still holds its own
+        // `_race_writer_guard` here (drops at fn-end), so a count-gated
+        // remove would be a guaranteed no-op.
+        if commit_result.is_err() {
+            let _ = self
+                .filesystem_store
+                .chunked_race_registry()
+                .force_remove(&stream_digest);
+            self.metrics
+                .chunked_race_state_failed_publish_removed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         // Hold race_writer_guard until function return scope (drop at
         // end). Same race-window rationale as `BazelChunkedDispatcher::dispatch`:
-        // we do NOT call `try_remove_if_unused` here. A concurrent v2
-        // writer that arrives after our publish but before our remove
-        // would observe `attached_writer_count=0`, we would remove the
+        // on the SUCCESS path we do NOT call `try_remove_if_unused` here. A
+        // concurrent v2 writer that arrives after our publish but before our
+        // remove would observe `attached_writer_count=0`, we would remove the
         // entry, and the v2 writer's next `race_state_for_digest_and_attach`
         // would mint a FRESH state — missing `commit_done_flag = true`,
         // admitting chunks, and failing at commit_to_holding. The entry
@@ -4213,6 +4275,97 @@ fn next_v1_writer_id() -> nativelink_store::chunked::chunked_race_state::WriterI
     )
 }
 
+/// #40 F-B: attach as the v1 single-stream owner, but existence-gate a
+/// **success** short-circuit. `try_attach_single_stream_writer` returns
+/// `AwaitCommit` when `commit_done_flag` is set; for a published *Ok* that
+/// is only correct while the committed blob is actually present in the
+/// store. If the blob has since been evicted (or a phantom-Ok slipped
+/// through), honoring the sticky Ok would wrongly short-circuit the writer
+/// to "already committed" for an ABSENT blob — the reads would later
+/// NotFound. So: when the attach yields `AwaitCommit` and the published
+/// result is `Ok` and the blob is NOT indexed, force-remove the stale slot
+/// and re-attach ONCE (now Owner on a fresh `ChunkRaceState`) so the writer
+/// re-writes.
+///
+/// Bounded to ONE reopen: after the single `force_remove` + re-attach, we
+/// return whatever the second attach yields verbatim (Owner if we won the
+/// race, AwaitCommit if another writer claimed Owner / published in the
+/// gap). No unbounded retry loop — a concurrent writer that re-claimed
+/// Owner is itself re-writing, so yielding to it is correct.
+///
+/// Scoped to the **Ok** short-circuit only:
+///   - A published *Err* short-circuit is handled by F-A's force-remove at
+///     the publish site (the slot is already gone before the next writer
+///     attaches), so this gate observes `peek == Some(Ok)` or `None`.
+///   - A `None` peek means a genuinely-active Owner (no result yet) — NOT
+///     a stale success; we do NOT reopen (that would split-brain a live
+///     Owner). We yield via the original AwaitCommit.
+///   - A present (indexed) blob means the Ok is durable — the #494/#497
+///     guard requires we still yield to it; we do NOT reopen.
+///
+/// Returns the (possibly fresh) `WriterId` so the caller uses the correct
+/// identity for its `SingleStreamOwnerGuard`.
+async fn race_attach_single_stream_existence_gated<Fe: FileEntry>(
+    filesystem_store: &Arc<FilesystemStore<Fe>>,
+    digest: &DigestInfo,
+    chunk_size_u32: u32,
+    writer_id: nativelink_store::chunked::chunked_race_state::WriterId,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
+) -> (
+    Arc<nativelink_store::chunked::chunked_race_state::ChunkRaceState>,
+    nativelink_store::chunked::chunked_race_state::RaceWriterGuard,
+    nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome,
+    nativelink_store::chunked::chunked_race_state::WriterId,
+) {
+    use nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome;
+
+    let (race_state, race_writer_guard, attach_outcome) = filesystem_store
+        .race_state_for_digest_and_attach_single_stream(digest, chunk_size_u32, writer_id);
+
+    // Only a SUCCESS short-circuit is existence-gated. A success
+    // short-circuit is exactly: AwaitCommit + a published Ok.
+    if matches!(attach_outcome, SingleStreamAttachOutcome::AwaitCommit { .. })
+        && matches!(race_state.peek_commit_result(), Some(Ok(_)))
+        && filesystem_store.has_indexed_digest(digest).await.is_none()
+    {
+        warn!(
+            ?digest,
+            "#40 F-B: published commit_done_flag=Ok for a digest that is NOT \
+             indexed (evicted or phantom-Ok); force-removing the stale \
+             race-state slot so this writer re-claims Owner and re-writes",
+        );
+        // Drop our attachment to the stale state BEFORE removing the slot
+        // so we don't leave a dangling attached_writer_count on an
+        // about-to-be-orphaned Arc (the Arc itself stays alive until we
+        // drop `race_state`/`race_writer_guard`; force_remove only clears
+        // the registry slot). `force_remove` (unconditional) mirrors F-A:
+        // a count-gated remove could no-op if a sibling AwaitCommit writer
+        // is still attached to the stale state.
+        drop(race_writer_guard);
+        drop(race_state);
+        let _ = filesystem_store
+            .chunked_race_registry()
+            .force_remove(digest);
+        metrics
+            .chunked_race_state_evicted_success_reopened_total
+            .fetch_add(1, Ordering::Relaxed);
+        // Re-attach ONCE with a fresh writer identity. Whatever this
+        // second attach yields is returned verbatim (Owner if we won;
+        // AwaitCommit if a concurrent writer minted a fresh state + claimed
+        // Owner — in which case yielding to it is correct, it is re-writing).
+        let fresh_writer_id = next_v1_writer_id();
+        let (race_state2, race_writer_guard2, attach_outcome2) = filesystem_store
+            .race_state_for_digest_and_attach_single_stream(
+                digest,
+                chunk_size_u32,
+                fresh_writer_id,
+            );
+        return (race_state2, race_writer_guard2, attach_outcome2, fresh_writer_id);
+    }
+
+    (race_state, race_writer_guard, attach_outcome, writer_id)
+}
+
 #[async_trait::async_trait]
 impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
     for BazelChunkedDispatcherImpl<Fe>
@@ -4248,13 +4401,22 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
         // concurrent v2 writer that arrives after our `publish_commit_result`
         // can never observe a fresh race-state — see the comment at the
         // publish site below for full rationale.
-        let (race_state, _race_writer_guard, attach_outcome) = self
-            .filesystem_store
-            .race_state_for_digest_and_attach_single_stream(
+        //
+        // #40 F-B: existence-gate a success short-circuit — if the attach
+        // yields AwaitCommit on a published Ok for an EVICTED blob, the
+        // helper force-removes the stale slot and re-attaches (claiming
+        // Owner) so this dispatch re-writes instead of yielding to a
+        // non-durable success. `writer_id` is rebound to the effective
+        // identity the helper attached with.
+        let (race_state, _race_writer_guard, attach_outcome, writer_id) =
+            race_attach_single_stream_existence_gated(
+                &self.filesystem_store,
                 &digest,
                 chunk_size_u32,
                 writer_id,
-            );
+                &self.metrics,
+            )
+            .await;
 
         match attach_outcome {
             SingleStreamAttachOutcome::AwaitCommit { reason } => {
@@ -4463,6 +4625,18 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                         let race_state_for_publish = Arc::clone(&race_state);
                         let owner_guard_for_publish = owner_guard;
                         let dig_for_publish = digest;
+                        // #40 F-A: capture the store + metrics so the
+                        // deferred publish can force-remove a poisoned slot
+                        // when the ASYNC commit (not just synchronous
+                        // admission) fails — e.g. a slow-tier commit Err or
+                        // SHA-256 mismatch surfaced via the relay. This is the
+                        // third v1 Err-publish site (the design doc named only
+                        // the synchronous Owner-Err arm + the worker path);
+                        // without it an AsyncCommit failure would leave the
+                        // poisoned slot resident exactly like the synchronous
+                        // case.
+                        let fs_for_publish = Arc::clone(&self.filesystem_store);
+                        let metrics_for_publish = Arc::clone(&self.metrics);
                         let inflight_set_for_reaper = inflight_guard_opt.map(|g| g.disarm());
                         tokio::spawn(async move {
                             // MAJOR-F: await the actual commit_result from
@@ -4489,6 +4663,7 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                             let publish_outcome = real_outcome.map(|c| RaceCommitResult {
                                 committed_size: c.committed_size,
                             });
+                            let publish_failed = publish_outcome.is_err();
                             // Publish the REAL outcome to siblings. On
                             // Ok, sibling v2 writers in AwaitCommit
                             // observe success. On Err, they observe the
@@ -4500,6 +4675,26 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                             // Explicit relinquish so SingleStreamOwnerGuard::Drop
                             // does NOT publish a synthetic Cancelled.
                             owner_guard_for_publish.relinquish();
+                            // #40 F-A (deferred-publish Err arm): if the ASYNC
+                            // commit failed, force-remove the poisoned slot so
+                            // a backfill re-claims Owner. Unlike the synchronous
+                            // Owner-Err arm, the publishing Owner's
+                            // `_race_writer_guard` has ALREADY dropped (the
+                            // dispatch fn returned Ok before spawning this task),
+                            // so an in-flight sibling AwaitCommit writer may be
+                            // the only thing pinning the entry; `force_remove`
+                            // (unconditional) still only clears the registry
+                            // SLOT — the sibling reads THIS term's Err via its
+                            // pinned `commit_result` Arc. Scoped to FAILURE only
+                            // (Ok stays sticky + existence-gated).
+                            if publish_failed {
+                                let _ = fs_for_publish
+                                    .chunked_race_registry()
+                                    .force_remove(&dig_for_publish);
+                                metrics_for_publish
+                                    .chunked_race_state_failed_publish_removed_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             // Then handle the inflight_set bookkeeping
                             // (mirrors the prior reaper). The reaper
                             // independently removes from `in_flight`;
@@ -4570,6 +4765,55 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                         // Synchronous publish + relinquish on Err.
                         race_state.publish_commit_result(Err(err.clone()));
                         owner_guard.relinquish();
+                        // #40 F-A: a v1 publish_commit_result(Err) must NOT
+                        // leave the registry entry resident — `publish` is
+                        // no-overwrite + `commit_done_flag` is sticky + v1
+                        // paths never call `try_remove_if_unused`, so a
+                        // resident Err-slot is IMMORTAL: every later v1
+                        // WriteChunked for this digest attaches, sees
+                        // `commit_done_flag`, returns AwaitCommit, peeks the
+                        // stale Err, and fails forever (the FL-688
+                        // infinite-re-upload loop; e.g. a transient CDN-tee
+                        // cache-fan-out abandonment dropped this producer and
+                        // synthesized the bazel-facing Err). Force-remove the
+                        // poisoned slot so the next arrival mints a fresh
+                        // `ChunkRaceState` (`commit_done_flag=false`), claims
+                        // Owner, and actually re-writes.
+                        //
+                        // **Scoped to FAILURE only — preserves the #494/#497
+                        // guard.** Nothing was committed and no `.partial` was
+                        // renamed away on this failed term, so re-claiming
+                        // Owner is corruption-safe (there is no winning commit
+                        // to race). The SUCCESS path (`Ok` publish on the
+                        // deferred reaper task) is untouched: it stays sticky
+                        // (and is existence-gated by F-B), so a late writer
+                        // after a DURABLE commit still yields to the Ok rather
+                        // than pwriting into a renamed-away `.partial`.
+                        //
+                        // **`force_remove` (unconditional), NOT
+                        // `try_remove_if_unused`.** At this inline publish site
+                        // the publishing Owner still holds its own
+                        // `_race_writer_guard` (attach at the dispatch entry,
+                        // drops at fn-end), so `attached_writer_count >= 1` and
+                        // a count-gated `try_remove_if_unused` would be a
+                        // guaranteed no-op — it would NOT fix the bug.
+                        // Unconditional removal is split-brain-safe in the v1
+                        // single-stream case: while a v1 Owner is held no other
+                        // writer can pwrite (v1/v2 contenders get AwaitCommit /
+                        // AlreadyHave), and any in-flight AwaitCommit sibling
+                        // observes THIS term's Err via the `commit_result` Arc
+                        // it already pins (so it is neither stranded nor served
+                        // a fresh state) — only the registry SLOT is cleared
+                        // for future arrivals. Mirrors the v2 watchdog
+                        // `force_remove` precedent
+                        // (`chunked_write_handler_v2.rs:830`).
+                        let _ = self
+                            .filesystem_store
+                            .chunked_race_registry()
+                            .force_remove(&digest);
+                        self.metrics
+                            .chunked_race_state_failed_publish_removed_total
+                            .fetch_add(1, Ordering::Relaxed);
                         Err(err)
                     }
                 }

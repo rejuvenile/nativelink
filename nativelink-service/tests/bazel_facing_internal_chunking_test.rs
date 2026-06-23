@@ -58,7 +58,7 @@ use nativelink_store::chunked::{
     enable_bazel_facing_internal_chunking,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
-use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+use nativelink_store::filesystem_store::{FileEntry, FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::buf_channel::make_buf_channel_pair_with_size;
 use nativelink_util::common::DigestInfo;
@@ -1766,4 +1766,398 @@ async fn chunked_reject_diagnostic_counts_offset0_drop_and_logs_digest() {
          diagnostic\")` in build_bazel_chunk_stream's reader.recv() Err arm. \
          tracing-test global_buf:\n{raw}",
     );
+}
+
+// -----------------------------------------------------------------------------
+// #40: chunked #497 race-state stale-commit — F-A + F-B regression tests
+//
+// Root cause (see
+// `.claude/audits/chunked-497-race-state-stale-commit-rootcause-fix-2026-06-23.md`):
+// a transient CDN-tee cache-fan-out abandonment drops the Bazel dispatch
+// producer → the dispatcher's `reader.recv()` errors → the chunk stream
+// yields the "bazel-facing internal-chunking: reader.recv()" Err →
+// `BazelChunkedDispatcherImpl::dispatch`'s synchronous Owner-Err arm
+// (`chunked_write_handler.rs:4332`) publishes that Err into the shared
+// per-digest `ChunkRaceState`. `publish_commit_result` is no-overwrite +
+// `commit_done_flag` is sticky + the v1 paths never removed the registry
+// entry → the poisoned `Err` is replayed verbatim to every subsequent v1
+// WriteChunked attempt FOREVER (each attaches, sees `commit_done_flag`,
+// returns AwaitCommit, peeks the stale Err, fails ~80–810 ms).
+//
+// Seams crossed by these tests (per `.claude/rules/testing-contracts.md`
+// identify-the-seam discipline): producer error (`tx.send_error`,
+// mirroring `CACHE_FANOUT_ABANDONED_MARKER`) → `build_bazel_chunk_stream`
+// `reader.recv()` Err synthesizer → `dispatch_chunks_to_driver` inline
+// admit-loop Err return → `BazelChunkedDispatcherImpl::dispatch` Owner-Err
+// arm → `publish_commit_result(Err)` → `commit_done_flag` →
+// `ChunkRaceRegistry` slot lifecycle → the next `dispatch`'s
+// `try_attach_single_stream_writer` short-circuit.
+// -----------------------------------------------------------------------------
+
+/// Drive `BazelChunkedDispatcherImpl::dispatch` with a producer that
+/// streams K<N bytes then surfaces an error (mirroring the live
+/// cache-fan-out abandonment that drops the Bazel dispatch producer).
+/// Returns the dispatch result.
+async fn drive_dispatch_with_aborted_producer<Fe: FileEntry>(
+    dispatcher: &BazelChunkedDispatcherImpl<Fe>,
+    digest: DigestInfo,
+    partial_bytes: Bytes,
+) -> Result<u64, nativelink_error::Error> {
+    let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+    let send_task = tokio::spawn(async move {
+        if !partial_bytes.is_empty() {
+            // Send a partial prefix so the producer-drop happens
+            // mid-stream (bytes_sent < declared), exactly like the live
+            // journal's `bytes_sent=34297680 of 62303904`. The send may
+            // race the dispatch consuming-then-erroring; either way the
+            // subsequent send_error is the poison signal under test.
+            drop(tx.send(partial_bytes).await);
+        }
+        // Mirror `CACHE_FANOUT_ABANDONED_MARKER` (Code::Aborted) — the
+        // exact terminal signal the cache fan-out sends before dropping
+        // its sender. The reader's `recv()` surfaces this, and
+        // `build_bazel_chunk_stream` appends "bazel-facing
+        // internal-chunking: reader.recv()" to it.
+        tx.send_error(nativelink_error::make_err!(
+            nativelink_error::Code::Aborted,
+            "test cache-fan-out abandonment (CACHE_FANOUT_ABANDONED_MARKER analogue)"
+        ));
+        // tx drops here.
+    });
+    let res = <BazelChunkedDispatcherImpl<Fe> as BazelChunkedDispatcher>::dispatch(
+        dispatcher, digest, rx,
+    )
+    .await;
+    drop(send_task.await);
+    res
+}
+
+/// Drive `BazelChunkedDispatcherImpl::dispatch` with a complete,
+/// hash-matching blob (a clean backfill upload). Returns the dispatch
+/// result. The blob lands on the slow tier on the AsyncCommit reaper's
+/// task; callers poll `wait_for_cas_file` to observe durability.
+async fn drive_dispatch_with_full_blob<Fe: FileEntry>(
+    dispatcher: &BazelChunkedDispatcherImpl<Fe>,
+    digest: DigestInfo,
+    blob: Bytes,
+) -> Result<u64, nativelink_error::Error> {
+    let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+    let send_task = tokio::spawn(async move {
+        tx.send(blob).await.expect("full-blob send must succeed");
+        tx.send_eof().expect("full-blob send_eof must succeed");
+    });
+    let res = <BazelChunkedDispatcherImpl<Fe> as BazelChunkedDispatcher>::dispatch(
+        dispatcher, digest, rx,
+    )
+    .await;
+    drop(send_task.await);
+    res
+}
+
+/// **F-A (the load-bearing regression).** A v1 Bazel dispatch whose
+/// producer is abandoned mid-stream publishes a transient bazel-facing
+/// `Err` into the per-digest race-state. WITHOUT F-A the registry entry
+/// is immortal (`commit_done_flag=true`, no-overwrite, never removed on
+/// v1 paths) and every later v1 WriteChunked for the SAME digest attaches,
+/// sees `commit_done_flag`, returns AwaitCommit, peeks the stale Err, and
+/// fails forever. WITH F-A, the failed publish force-removes the entry so
+/// the next writer mints a fresh `ChunkRaceState`, claims Owner, and
+/// actually re-writes the blob.
+///
+/// Production composition: real `FilesystemStore` + real
+/// `ChunkRaceRegistry` (shared via `fs_store.chunked_race_registry()`) +
+/// real `BazelChunkedDispatcherImpl`. The `dispatch` trait method is the
+/// exact production seam `FastSlowStore::update` routes Bazel writes
+/// through.
+///
+/// Mutation step (TDD step 5): delete F-A's `force_remove` after the
+/// Err publish in the Owner-Err arm (`chunked_write_handler.rs:4332`) —
+/// the registry entry survives poisoned, the second dispatch observes
+/// AwaitCommit + the stale Err, and the
+/// `.expect("stale failed-publish must not block backfill re-write …")`
+/// below red-fails (the second dispatch returns the bazel-facing Err
+/// instead of succeeding).
+#[nativelink_test]
+async fn chunked_race_state_failed_publish_reopens_owner_for_backfill() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 3;
+    const SIZE: usize = N * CHUNK;
+
+    let blob: Vec<u8> = (0..SIZE).map(|i| (i * 13 + 7) as u8).collect();
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, content_path) = make_filesystem_store().await;
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let dispatcher = BazelChunkedDispatcherImpl::new_with_state_for_test(
+        Arc::clone(&fs_store),
+        Arc::clone(&in_flight),
+        budget,
+        CHUNK,
+    );
+
+    // ---- Step 1: poison the race-state via an abandoned producer. ----
+    // Send the first chunk's bytes, then surface the abandonment error.
+    let partial = Bytes::copy_from_slice(&blob[..CHUNK]);
+    let poison_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_dispatch_with_aborted_producer(&dispatcher, digest, partial),
+    )
+    .await
+    .expect("must not deadlock — abandoned-producer dispatch must return promptly with Err");
+    let poison_err = poison_res.expect_err(
+        "abandoned-producer dispatch MUST return Err (the bazel-facing \
+         reader.recv() failure) — this is the poison event",
+    );
+    assert!(
+        poison_err
+            .messages
+            .iter()
+            .any(|m| m.contains("bazel-facing internal-chunking: reader.recv()")),
+        "the poison Err MUST carry the bazel-facing reader.recv() suffix \
+         (proves the seam from build_bazel_chunk_stream → dispatch Err arm \
+         was crossed); got {:?}",
+        poison_err.messages,
+    );
+
+    // ---- Step 2: with F-A, the registry slot is GONE. ----
+    // (Mutation of F-A leaves the entry resident with a poisoned
+    // commit_done_flag; this assertion red-fails first.)
+    assert!(
+        fs_store.chunked_race_registry().get(&digest).is_none(),
+        "F-A: after a v1 publish_commit_result(Err), the race-state \
+         registry entry MUST be force-removed so the next writer mints a \
+         fresh state — a resident entry here means the poisoned \
+         commit_done_flag=true(Err) is still immortal (the FL-688 \
+         infinite-re-upload-loop bug)",
+    );
+
+    // ---- Step 3: a fresh backfill WriteChunked for the SAME digest ----
+    // MUST claim Owner and actually re-write the blob (NOT loop on
+    // AwaitCommit peeking the stale Err).
+    let backfill_size = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_dispatch_with_full_blob(&dispatcher, digest, Bytes::from(blob.clone())),
+    )
+    .await
+    .expect("must not deadlock — backfill dispatch must complete in 5s")
+    .expect(
+        "stale failed-publish must not block backfill re-write — F-A force-remove \
+         (without F-A the second dispatch attaches, sees commit_done_flag=true, \
+          returns AwaitCommit, and peeks the stale bazel-facing Err forever)",
+    );
+    assert_eq!(
+        backfill_size, SIZE as u64,
+        "backfill dispatch must report the declared size on AsyncCommit Ok",
+    );
+
+    // ---- Step 4: the blob actually LANDS on the slow tier. ----
+    // (Index-visibility contract: the AsyncCommit reaper renames into the
+    // canonical CAS path. Without the re-write, no file appears.)
+    let on_disk = wait_for_cas_file(&content_path, &digest, Duration::from_secs(5))
+        .await
+        .expect(
+            "F-A: backfill re-write MUST land the canonical CAS file — \
+             if the poisoned entry blocked Owner, the driver never ran and \
+             no file appears (the blob stays permanently absent, exactly the \
+             FL-688 live symptom)",
+        );
+    assert_eq!(
+        on_disk, SIZE as u64,
+        "post-backfill, the canonical CAS file MUST have the declared length",
+    );
+}
+
+/// **F-B (defense-in-depth against a stale *Ok*).** A published
+/// `commit_done_flag=Ok` short-circuit is honored ONLY while the blob is
+/// actually present in the store. If the blob was evicted after a
+/// successful commit, the sticky Ok must NOT false-short-circuit a fresh
+/// writer to "already committed"; the writer must re-claim Owner and
+/// re-write.
+///
+/// We exercise the gate directly at its seam:
+/// `FilesystemStore::has_indexed_digest` is the existence primitive F-B
+/// consults. The test composes a real race-state with a published Ok,
+/// asserts the digest is ABSENT from the store, and drives a fresh
+/// dispatch; with F-B the absent-blob success is reopened and the writer
+/// re-writes (the CAS file lands), instead of returning a phantom Ok for
+/// a non-existent blob.
+///
+/// Mutation step: remove F-B's existence-gate (let `commit_done_flag=Ok`
+/// short-circuit unconditionally in `try_attach_single_stream_writer`) —
+/// the fresh dispatch returns Ok WITHOUT re-writing, `wait_for_cas_file`
+/// Elapsed, and the bespoke expect below red-fails.
+#[nativelink_test]
+async fn chunked_race_state_evicted_success_reopens_owner_for_rewrite() {
+    use nativelink_store::chunked::chunked_race_state::{
+        RaceCommitResult, SingleStreamAttachOutcome, WriterId,
+    };
+
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const SIZE: usize = N * CHUNK;
+
+    let blob: Vec<u8> = (0..SIZE).map(|i| (i * 5 + 1) as u8).collect();
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, content_path) = make_filesystem_store().await;
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let dispatcher = BazelChunkedDispatcherImpl::new_with_state_for_test(
+        Arc::clone(&fs_store),
+        Arc::clone(&in_flight),
+        budget,
+        CHUNK,
+    );
+
+    // Manufacture a sticky published-Ok race-state for a digest the store
+    // does NOT have (simulating: committed once, then evicted; the
+    // registry entry outlived the blob).
+    let chunk_size_u32 = u32::try_from(CHUNK).unwrap();
+    let (race_state, _guard, outcome) = fs_store
+        .race_state_for_digest_and_attach_single_stream(
+            &digest,
+            chunk_size_u32,
+            WriterId(9_999),
+        );
+    assert_eq!(
+        outcome,
+        SingleStreamAttachOutcome::Owner,
+        "test setup: first attach for an unseen digest must be Owner",
+    );
+    race_state.publish_commit_result(Ok(RaceCommitResult {
+        committed_size: SIZE as u64,
+    }));
+    // Drop our setup guard so the only thing pinning the entry is the
+    // sticky published-Ok state itself.
+    drop(_guard);
+
+    // Precondition: the blob is genuinely absent from the store (eviction
+    // simulation). If this ever returns Some, the test setup is wrong.
+    assert!(
+        fs_store.has_indexed_digest(&digest).await.is_none(),
+        "test precondition: the evicted blob must be ABSENT from the store \
+         (has_indexed_digest must be None) so F-B's existence-gate is the \
+         thing under test",
+    );
+
+    // A fresh dispatch for the same digest. With F-B, the sticky Ok is
+    // existence-gated → absent → the writer re-claims Owner and re-writes.
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_dispatch_with_full_blob(&dispatcher, digest, Bytes::from(blob.clone())),
+    )
+    .await
+    .expect("must not deadlock — evicted-success re-dispatch must complete in 5s")
+    .expect(
+        "F-B: a sticky commit_done_flag=Ok for an EVICTED blob must NOT \
+         false-short-circuit — the writer must re-claim Owner and re-write \
+         (an Err here means the gate let the dispatch fail or the writer \
+          parked on a stale state)",
+    );
+    assert_eq!(res, SIZE as u64, "re-dispatch must report declared size");
+
+    let on_disk = wait_for_cas_file(&content_path, &digest, Duration::from_secs(5))
+        .await
+        .expect(
+            "F-B: evicted-success re-write MUST land the canonical CAS file — \
+             if the sticky Ok short-circuited unconditionally, the driver \
+             never ran and the evicted blob stays permanently absent",
+        );
+    assert_eq!(
+        on_disk, SIZE as u64,
+        "post-re-write, the canonical CAS file MUST have the declared length",
+    );
+}
+
+/// **#494 sparse-zero guard (the over-action direction — MUST NOT
+/// regress).** A published, DURABLE *Ok* (blob actually indexed) MUST
+/// still short-circuit a late writer to that Ok — the late writer must
+/// NOT re-claim Owner and pwrite into a renamed-away `.partial`. F-A is
+/// scoped to the FAILURE slot precisely so this success path stays
+/// sticky.
+///
+/// Mutation step: widen F-A to force-remove on Ok too (or drop the
+/// `commit_done_flag` Ok short-circuit in
+/// `try_attach_single_stream_writer`) — the late writer re-claims Owner
+/// instead of yielding to the durable Ok, and the
+/// `SingleStreamAttachOutcome::AwaitCommit` assertion below red-fails
+/// (returns Owner). This proves F-A did NOT over-reopen the success path
+/// (the #494 corruption direction).
+#[nativelink_test]
+async fn chunked_race_state_durable_success_still_yields_late_writer() {
+    use nativelink_store::chunked::chunked_race_state::{
+        RaceCommitResult, SingleStreamAttachOutcome, WriterId,
+    };
+
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const SIZE: usize = N * CHUNK;
+
+    let blob: Vec<u8> = (0..SIZE).map(|i| (i * 3 + 2) as u8).collect();
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, _content_path) = make_filesystem_store().await;
+    let chunk_size_u32 = u32::try_from(CHUNK).unwrap();
+
+    // Make the blob genuinely DURABLE in the store first (the success
+    // path's precondition: a published Ok corresponds to a present blob).
+    let seed_key: nativelink_util::store_trait::StoreKey<'static> =
+        nativelink_util::store_trait::StoreKey::Digest(digest);
+    fs_store
+        .as_pin()
+        .update_oneshot(seed_key, Bytes::from(blob.clone()))
+        .await
+        .expect("seed: store must accept the durable blob");
+    assert!(
+        fs_store.has_indexed_digest(&digest).await.is_some(),
+        "seed precondition: the durable blob must be indexed",
+    );
+
+    // First writer attaches Owner and publishes a durable Ok.
+    let (race_state, owner_guard, first_outcome) = fs_store
+        .race_state_for_digest_and_attach_single_stream(
+            &digest,
+            chunk_size_u32,
+            WriterId(1),
+        );
+    assert_eq!(
+        first_outcome,
+        SingleStreamAttachOutcome::Owner,
+        "first attach must be Owner",
+    );
+    race_state.publish_commit_result(Ok(RaceCommitResult {
+        committed_size: SIZE as u64,
+    }));
+    // Production shape: the Owner RELEASES its single_stream_owner slot
+    // after publishing (mirrors `SingleStreamOwnerGuard::relinquish` at
+    // the end of the v1 write path). This is load-bearing for the
+    // mutation: with the slot cleared, the ONLY thing that yields the late
+    // writer is the `commit_done_flag` success short-circuit in
+    // `try_attach_single_stream_writer`. A mutation that removes that
+    // short-circuit (the #494 sparse-zero guard) makes the late writer
+    // claim Owner and this test red-fails. If the slot were left held, the
+    // `single_stream_owner.is_some()` check would MASK the mutation.
+    race_state.clear_single_stream_owner_if_owned(WriterId(1));
+
+    // A LATE writer attaches AFTER the durable Ok publish + owner-slot
+    // release. It MUST get AwaitCommit (yield to the published Ok), NOT
+    // Owner. The entry is still pinned by `owner_guard`'s paired
+    // RaceWriterGuard, mirroring production where the publishing Owner's
+    // `_race_writer_guard` holds to fn-end.
+    let (_late_state, _late_guard, late_outcome) = fs_store
+        .race_state_for_digest_and_attach_single_stream(
+            &digest,
+            chunk_size_u32,
+            WriterId(2),
+        );
+    assert!(
+        matches!(late_outcome, SingleStreamAttachOutcome::AwaitCommit { .. }),
+        "#494 guard: a late writer arriving after a DURABLE published Ok MUST \
+         yield via AwaitCommit (propagate the durable Ok), NOT re-claim Owner \
+         and re-write into a renamed-away .partial (sparse-zero corruption \
+         direction). got {late_outcome:?}",
+    );
+
+    drop(owner_guard);
 }
