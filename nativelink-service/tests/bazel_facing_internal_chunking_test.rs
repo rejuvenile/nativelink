@@ -1854,6 +1854,44 @@ async fn drive_dispatch_with_full_blob<Fe: FileEntry>(
     res
 }
 
+/// Drive `BazelChunkedDispatcherImpl::dispatch` with a COMPLETE,
+/// EOF-terminated stream whose bytes hash to a DIFFERENT digest than
+/// `declared_digest`. This is the POST-ADMISSION failure lever for the
+/// deferred AsyncCommit Err arm (`chunked_write_handler.rs:4451-4458`):
+/// every per-chunk SHA-256 the dispatcher computes itself is honest, so
+/// admission succeeds and `dispatch` returns `Ok(committed_size)` at
+/// admission time. The chunked driver then assembles the blob, computes
+/// the end-to-end SHA-256, finds it does NOT match `declared_digest`, and
+/// fails the commit — the failure surfaces on the deferred reaper task
+/// via the `commit_relay` oneshot, NOT synchronously. This is the SAME
+/// lever the `async_commit_digest_mismatch_blocks_canonical_cas_landing`
+/// FastSlowStore test uses, driven directly at the dispatch seam so the
+/// deferred-arm `force_remove` is in scope.
+///
+/// Returns the dispatch result (Ok at admission; the commit failure is
+/// observed later via the registry-slot removal + a subsequent re-claim).
+async fn drive_dispatch_with_complete_but_mismatched_blob<Fe: FileEntry>(
+    dispatcher: &BazelChunkedDispatcherImpl<Fe>,
+    declared_digest: DigestInfo,
+    mismatched_bytes: Bytes,
+) -> Result<u64, nativelink_error::Error> {
+    let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+    let send_task = tokio::spawn(async move {
+        tx.send(mismatched_bytes)
+            .await
+            .expect("mismatched-blob send must succeed");
+        tx.send_eof().expect("mismatched-blob send_eof must succeed");
+    });
+    let res = <BazelChunkedDispatcherImpl<Fe> as BazelChunkedDispatcher>::dispatch(
+        dispatcher,
+        declared_digest,
+        rx,
+    )
+    .await;
+    drop(send_task.await);
+    res
+}
+
 /// **F-A (the load-bearing regression).** A v1 Bazel dispatch whose
 /// producer is abandoned mid-stream publishes a transient bazel-facing
 /// `Err` into the per-digest race-state. WITHOUT F-A the registry entry
@@ -2160,4 +2198,177 @@ async fn chunked_race_state_durable_success_still_yields_late_writer() {
     );
 
     drop(owner_guard);
+}
+
+/// Bounded-poll until the per-digest race-state registry slot is REMOVED
+/// (`chunked_race_registry().get(digest)` returns `None`). The deferred
+/// AsyncCommit reaper publishes its Err + force-removes the slot on a
+/// SPAWNED task, so the removal is observed asynchronously; this loop
+/// yields (no sleep, per CLAUDE.md test discipline) inside a
+/// `tokio::time::timeout` deadlock detector. Returns `Ok(())` on removal,
+/// `Err(&str)` on timeout.
+async fn wait_for_registry_slot_removed<Fe: FileEntry>(
+    fs_store: &Arc<FilesystemStore<Fe>>,
+    digest: &DigestInfo,
+    timeout: Duration,
+) -> Result<(), &'static str> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if fs_store.chunked_race_registry().get(digest).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "race-state registry slot did not get removed within timeout")
+}
+
+/// **F-A deferred-arm coverage (the post-admission immortality gap).**
+///
+/// The synchronous Owner-Err arm (`chunked_write_handler.rs:4574`) and the
+/// worker path (`:1539`) handle PRE-commit / admission-time Err publishes.
+/// This test pins the THIRD v1 Err-publish site: the DEFERRED AsyncCommit
+/// reaper at `chunked_write_handler.rs:4451-4458`, which fires when the
+/// chunked driver returns a POST-ADMISSION commit failure (end-to-end
+/// SHA-256 mismatch / slow-tier pwrite Err / ≥60 s commit watchdog). In
+/// that flow `dispatch` returns `Ok(committed_size)` at admission and the
+/// failure surfaces LATER on the spawned reaper task via the
+/// `commit_relay` oneshot. WITHOUT the deferred-arm `force_remove`, the
+/// poisoned slot (sticky `commit_done_flag` carrying the commit Err) is
+/// immortal exactly like the synchronous case: every subsequent v1
+/// WriteChunked for the same digest attaches, sees `commit_done_flag`,
+/// returns AwaitCommit, peeks the stale Err, and fails forever.
+///
+/// Seams crossed (identify-the-seam discipline): complete EOF stream whose
+/// bytes hash to a different digest → `BazelChunkedDispatcherImpl::dispatch`
+/// AsyncCommit admission (returns Ok) → `dispatch_bazel_facing_internal_chunking`
+/// → ChunkedDriver e2e SHA-256 verify Err at commit → `commit_relay`
+/// oneshot → deferred reaper task → `publish_commit_result(Err)` +
+/// `chunked_race_registry().force_remove` (`:4453`) → the next dispatch's
+/// `race_state_for_digest_and_attach_single_stream` Owner re-claim.
+///
+/// Production composition: real `FilesystemStore` + real `ChunkRaceRegistry`
+/// (shared via `fs_store.chunked_race_registry()`) + real
+/// `BazelChunkedDispatcherImpl`, driven through the exact `dispatch` trait
+/// method `FastSlowStore::update` routes Bazel writes through.
+///
+/// Mutation step (TDD step 5): disable the deferred-arm `force_remove` at
+/// `chunked_write_handler.rs:4451-4458` (comment out the `if publish_failed
+/// { ... force_remove ... }` block) — the slot survives poisoned, the
+/// `wait_for_registry_slot_removed` poll Elapses (red-fails with the
+/// deferred-arm immortality message), and the subsequent backfill dispatch
+/// would AwaitCommit on the stale Err instead of re-claiming Owner.
+#[nativelink_test]
+async fn chunked_race_state_deferred_async_commit_failure_reopens_owner_for_backfill() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const SIZE: usize = N * CHUNK;
+
+    // The GOOD blob is what the digest is declared from; the LIES blob is
+    // the same length but different bytes, so per-chunk SHA-256 (computed
+    // by the dispatcher) is honest (admission succeeds) while the assembled
+    // end-to-end SHA-256 does NOT match the declared digest (commit fails
+    // on the deferred reaper). Mirrors the lies/expected construction in
+    // `async_commit_digest_mismatch_blocks_canonical_cas_landing`.
+    let good: Vec<u8> = (0..SIZE).map(|i| (i * 7 + 3) as u8).collect();
+    let lies: Vec<u8> = (0..SIZE).map(|i| 0x5au8.wrapping_add(i as u8)).collect();
+    let declared_digest = DigestInfo::new(sha256(&good), SIZE as u64);
+    // Sanity: the two byte patterns genuinely differ (otherwise the
+    // mismatch lever is a no-op and the test would falsely pass).
+    assert_ne!(
+        sha256(&good),
+        sha256(&lies),
+        "test setup: the good + lies blobs must hash differently so the \
+         deferred e2e SHA-256 verify actually fails",
+    );
+
+    let (fs_store, content_path) = make_filesystem_store().await;
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let dispatcher = BazelChunkedDispatcherImpl::new_with_state_for_test(
+        Arc::clone(&fs_store),
+        Arc::clone(&in_flight),
+        budget,
+        CHUNK,
+    );
+
+    // ---- Step 1: drive a POST-ADMISSION commit failure. ----
+    // dispatch returns Ok at admission (β AsyncCommit); the e2e SHA-256
+    // mismatch is detected later by the deferred reaper.
+    let admission_size = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_dispatch_with_complete_but_mismatched_blob(
+            &dispatcher,
+            declared_digest,
+            Bytes::from(lies.clone()),
+        ),
+    )
+    .await
+    .expect("must not deadlock — mismatched-blob dispatch must return promptly at admission")
+    .expect(
+        "β async-commit MUST return Ok at admission even for a blob that will \
+         fail the deferred e2e SHA-256 verify (anti-#203: admission does not \
+         block on the slow-tier commit)",
+    );
+    assert_eq!(
+        admission_size, SIZE as u64,
+        "admission must report the declared size on AsyncCommit Ok",
+    );
+
+    // ---- Step 2: the deferred reaper force-removes the poisoned slot. ----
+    // (Mutation of the deferred-arm force_remove leaves the slot resident
+    // with a poisoned commit_done_flag(Err); this poll Elapses and red-fails
+    // first with the deferred-arm immortality message below.)
+    wait_for_registry_slot_removed(&fs_store, &declared_digest, Duration::from_secs(5))
+        .await
+        .expect(
+            "F-A deferred-arm immortality: after a POST-ADMISSION async-commit \
+             FAILURE the deferred reaper MUST force-remove the race-state \
+             registry slot (chunked_write_handler.rs:4451-4458). A surviving \
+             slot means the poisoned commit_done_flag(Err) is immortal — every \
+             later v1 WriteChunked for this digest peeks the stale e2e-mismatch \
+             Err and fails forever (the FL-688 infinite-re-upload loop, \
+             deferred-AsyncCommit variant)",
+        );
+
+    // ---- Step 3: a fresh backfill for the SAME digest re-claims Owner ----
+    // and lands the CANONICAL blob (now streaming the GOOD bytes that hash
+    // to declared_digest). Without the deferred-arm force-remove this would
+    // attach, see commit_done_flag, return AwaitCommit, and peek the stale
+    // Err forever.
+    let backfill_size = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_dispatch_with_full_blob(&dispatcher, declared_digest, Bytes::from(good.clone())),
+    )
+    .await
+    .expect("must not deadlock — backfill dispatch must complete in 5s")
+    .expect(
+        "deferred-arm reopen: a post-admission async-commit failure must NOT \
+         block a backfill re-write — the deferred force-remove reopens the \
+         Owner door (without it, the second dispatch attaches, sees \
+         commit_done_flag=true, returns AwaitCommit, and peeks the stale \
+         e2e-mismatch Err forever)",
+    );
+    assert_eq!(
+        backfill_size, SIZE as u64,
+        "backfill dispatch must report the declared size on AsyncCommit Ok",
+    );
+
+    // ---- Step 4: the GOOD blob actually LANDS on the slow tier. ----
+    // (Index-visibility contract: the AsyncCommit reaper renames the GOOD
+    // bytes into the canonical CAS path. The earlier mismatched attempt
+    // never landed anything — its commit was rejected pre-rename.)
+    let on_disk = wait_for_cas_file(&content_path, &declared_digest, Duration::from_secs(5))
+        .await
+        .expect(
+            "deferred-arm reopen: the backfill re-write MUST land the canonical \
+             CAS file — if the poisoned deferred-failure slot blocked Owner, \
+             the driver never ran and no file appears (the blob stays \
+             permanently absent, exactly the FL-688 live symptom)",
+        );
+    assert_eq!(
+        on_disk, SIZE as u64,
+        "post-backfill, the canonical CAS file MUST have the declared length",
+    );
 }

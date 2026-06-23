@@ -2570,3 +2570,219 @@ async fn producer_arrival_probe_quiet_below_threshold() {
          warns."
     );
 }
+
+// -----------------------------------------------------------------------------
+// #40 F-A worker-arm coverage (the worker `write_chunked_inner` Err-publish
+// at `chunked_write_handler.rs:1539`).
+//
+// The worker v1 WriteChunked path attaches to the SAME per-digest
+// `chunked_race_registry` the Bazel-facing dispatch + v2 paths use, runs
+// the chunked driver SYNCHRONOUSLY (`await_completion`), and on a commit
+// FAILURE publishes the Err into the race-state. WITHOUT F-A's
+// `force_remove` at `:1539`, the resident slot is immortal exactly like
+// the Bazel-facing synchronous arm: `publish_commit_result` is
+// no-overwrite + `commit_done_flag` is sticky + v1 paths never call
+// `try_remove_if_unused`, so every subsequent v1 WriteChunked for the same
+// digest attaches, sees `commit_done_flag`, returns AwaitCommit, peeks the
+// stale Err, and fails forever.
+//
+// Lever: end-to-end SHA-256 mismatch (honest per-chunk SHA-256 so admission
+// succeeds; the assembled blob hashes to a different digest than declared
+// so the synchronous commit fails) — the SAME lever
+// `handler_e2e_sha256_mismatch_never_lands_at_canonical_cas_path` uses,
+// here extended to assert the registry-slot removal + a subsequent worker
+// WriteChunked re-claiming Owner.
+// -----------------------------------------------------------------------------
+
+/// Stream a complete, EOF-terminated blob through the worker
+/// `write_chunked` RPC handler under `digest`. Each `WriteChunk` carries
+/// an HONEST per-chunk SHA-256 (`make_chunk` computes it), so per-chunk
+/// admission always succeeds; whether the COMMIT succeeds depends solely
+/// on whether the assembled blob's end-to-end SHA-256 matches `digest`.
+/// Returns the handler's `Result<Response, Status>`.
+async fn run_worker_write_chunked(
+    handler: &Arc<ChunkedWriteHandler>,
+    digest: DigestInfo,
+    blob: &[u8],
+    chunk: usize,
+) -> Result<tonic::Response<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunkedResponse>, tonic::Status> {
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+    let n = blob.len() / chunk;
+    let blob_owned = blob.to_vec();
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        for i in 0..n {
+            let c = make_chunk(
+                digest,
+                (i * chunk) as u64,
+                &blob_owned[i * chunk..(i + 1) * chunk],
+                i == n - 1,
+            );
+            tx.send(frame_chunk(&c))
+                .await
+                .expect("channel send to worker handler must succeed");
+        }
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — streaming worker chunks should finish promptly");
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — worker handler must respond within 5s")
+        .expect("worker handler task must not panic")
+}
+
+/// **F-A worker-arm (the worker `write_chunked_inner` Err-publish).** A
+/// worker v1 WriteChunked whose assembled blob fails the synchronous
+/// end-to-end SHA-256 verify publishes a commit Err into the per-digest
+/// race-state. WITHOUT F-A's `force_remove` at
+/// `chunked_write_handler.rs:1539`, the registry slot is immortal
+/// (`commit_done_flag=true(Err)`, no-overwrite, never removed on v1
+/// paths) and every later worker WriteChunked for the SAME digest attaches,
+/// sees `commit_done_flag`, returns AwaitCommit, peeks the stale Err, and
+/// fails forever. WITH F-A, the failed commit force-removes the slot so the
+/// next worker WriteChunked mints a fresh `ChunkRaceState`, claims Owner,
+/// and actually commits the blob.
+///
+/// Seams crossed (identify-the-seam discipline): worker `Streaming<WriteChunk>`
+/// (honest per-chunk SHA-256, lying declared digest) →
+/// `ChunkedWriteHandler::write_chunked` → `write_chunked_inner`
+/// single-stream Owner attach on `chunked_race_registry` → synchronous
+/// `driver.await_completion()` → e2e SHA-256 verify Err → inline
+/// `publish_commit_result(Err)` → `commit_done_flag` →
+/// `chunked_race_registry().force_remove` (`:1539`) → the next
+/// `write_chunked_inner`'s single-stream attach Owner re-claim.
+///
+/// Production composition: real `FilesystemStore` + real `ChunkRaceRegistry`
+/// (shared via `store.chunked_race_registry()`) + real `ChunkedWriteHandler`,
+/// driven through the exact `write_chunked` RPC method workers invoke.
+///
+/// Mutation step (TDD step 5): disable the worker-arm `force_remove` at
+/// `chunked_write_handler.rs:1535-1543` (comment out the `if
+/// commit_result.is_err() { ... force_remove ... }` block) — the slot
+/// survives poisoned, the `wait_for_registry_slot_removed_worker` poll
+/// Elapses (red-fails with the worker-arm immortality message), and the
+/// backfill WriteChunked would AwaitCommit on the stale Err instead of
+/// re-claiming Owner.
+#[nativelink_test]
+async fn worker_write_chunked_commit_failure_reopens_owner_for_backfill() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const SIZE: usize = N * CHUNK;
+
+    // GOOD blob defines the declared digest; LIES blob is the same length
+    // but different bytes, so per-chunk SHA-256 is honest (admission
+    // succeeds) while the assembled e2e SHA-256 does NOT match the declared
+    // digest (synchronous commit fails). Mirrors the lies/expected
+    // construction in the Bazel-facing deferred-arm test.
+    let good: Vec<u8> = (0..SIZE).map(|i| (i * 11 + 5) as u8).collect();
+    let lies: Vec<u8> = (0..SIZE).map(|i| 0x3cu8.wrapping_add(i as u8)).collect();
+    let declared_digest = DigestInfo::new(sha256(&good), SIZE as u64);
+    assert_ne!(
+        sha256(&good),
+        sha256(&lies),
+        "test setup: the good + lies blobs must hash differently so the \
+         synchronous e2e SHA-256 verify actually fails",
+    );
+
+    let (store, content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    // ---- Step 1: poison the worker path via an e2e SHA-256 mismatch. ----
+    let poison_status = run_worker_write_chunked(&handler, declared_digest, &lies, CHUNK)
+        .await
+        .expect_err(
+            "worker WriteChunked for a blob that fails the e2e SHA-256 verify \
+             MUST return Err — this is the synchronous commit-failure poison \
+             event",
+        );
+    assert_eq!(
+        poison_status.code(),
+        tonic::Code::InvalidArgument,
+        "worker e2e SHA-256 mismatch must surface as InvalidArgument; got {poison_status:?}",
+    );
+
+    // The in-flight tracker drains after the synchronous commit-Err.
+    wait_for_no_in_flight(&in_flight, Duration::from_secs(5))
+        .await
+        .expect("worker in-flight entry must drain after the commit-Err publish");
+
+    // ---- Step 2: with F-A, the registry slot is GONE. ----
+    // The worker path's `force_remove` at `:1539` is SYNCHRONOUS (no
+    // deferred reaper), so the slot is already absent here; the bounded
+    // poll tolerates any residual scheduling slack without a sleep.
+    wait_for_registry_slot_removed_worker(&store, &declared_digest, Duration::from_secs(5))
+        .await
+        .expect(
+            "F-A worker-arm immortality: after a worker WriteChunked \
+             publish_commit_result(Err) the registry slot MUST be \
+             force-removed (chunked_write_handler.rs:1539). A surviving slot \
+             means the poisoned commit_done_flag(Err) is immortal — every \
+             later worker WriteChunked for this digest attaches, sees \
+             commit_done_flag, returns AwaitCommit, peeks the stale Err, and \
+             fails forever (the FL-688 infinite-re-upload loop, worker variant)",
+        );
+
+    // ---- Step 3: a fresh backfill worker WriteChunked re-claims Owner ----
+    // and commits the canonical blob (now streaming the GOOD bytes that hash
+    // to declared_digest). Without F-A this would attach, see
+    // commit_done_flag, return AwaitCommit, and peek the stale Err forever.
+    let backfill = run_worker_write_chunked(&handler, declared_digest, &good, CHUNK)
+        .await
+        .expect(
+            "worker-arm reopen: a synchronous commit failure must NOT block a \
+             backfill WriteChunked — F-A's force-remove reopens the Owner door \
+             (without it, the second WriteChunked attaches, sees \
+             commit_done_flag=true, returns AwaitCommit, and peeks the stale \
+             e2e-mismatch Err forever)",
+        )
+        .into_inner();
+    assert_eq!(
+        backfill.committed_size, SIZE as u64,
+        "backfill worker WriteChunked must report the declared committed_size",
+    );
+
+    // ---- Step 4: the GOOD blob actually LANDS at the canonical CAS path. ----
+    let final_path = format!(
+        "{}/d/{:02x}/{}",
+        content_path,
+        declared_digest.packed_hash()[0],
+        declared_digest,
+    );
+    let meta = tokio::fs::metadata(&final_path).await.expect(
+        "worker-arm reopen: the backfill commit MUST land the canonical CAS \
+         file — if the poisoned slot blocked Owner, the driver never ran and \
+         no file appears (the blob stays permanently absent, exactly the \
+         FL-688 live symptom)",
+    );
+    assert_eq!(
+        meta.len(),
+        SIZE as u64,
+        "post-backfill, the canonical CAS file MUST have the declared length",
+    );
+}
+
+/// Bounded-poll until the per-digest race-state registry slot is REMOVED.
+/// The worker path's `force_remove` is synchronous, but this loop (yield,
+/// no sleep, per CLAUDE.md test discipline) inside a `tokio::time::timeout`
+/// deadlock detector tolerates residual scheduling slack and gives a
+/// bespoke timeout message. Returns `Ok(())` on removal, `Err(&str)` on
+/// timeout.
+async fn wait_for_registry_slot_removed_worker(
+    store: &Arc<FilesystemStore<FileEntryImpl>>,
+    digest: &DigestInfo,
+    timeout: Duration,
+) -> Result<(), &'static str> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if store.chunked_race_registry().get(digest).is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "race-state registry slot did not get removed within timeout")
+}
