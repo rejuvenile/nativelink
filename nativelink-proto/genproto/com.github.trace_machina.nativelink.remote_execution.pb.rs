@@ -275,10 +275,10 @@ pub struct BlobsAvailableNotification {
     /// / `sysctl vm.swapusage` (`xsw_usage.xsu_used`); Linux reads
     /// / `/proc/meminfo` (`SwapTotal - SwapFree`). This is ABSOLUTE swap
     /// / occupancy, which LINGERS after memory pressure subsides, so it is
-    /// / a coarse signal only; the `pageouts_per_sec` RATE field below is
-    /// / the load-bearing dynamic-pressure indicator. `0` means either
-    /// / "no swap in use" or "sampler unavailable" (indistinguishable on
-    /// / the wire, matching the `cpu_load_pct = 0` unknown convention).
+    /// / a coarse signal only; the `swap_pressure_rate_per_sec` RATE field
+    /// / below is the load-bearing dynamic-pressure indicator. `0` means
+    /// / either "no swap in use" or "sampler unavailable" (indistinguishable
+    /// / on the wire, matching the `cpu_load_pct = 0` unknown convention).
     /// / The 16 GB Mac workers oversubscribe RAM invisibly under the
     /// / count-only admission gate (`worker.rs` `can_accept_work`); this
     /// / surfaces the missing memory signal.

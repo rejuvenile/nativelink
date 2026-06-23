@@ -775,7 +775,7 @@ impl ApiWorkerSchedulerImpl {
         let worker_matches_ignoring_swap = |pair: &(&WorkerId, &Worker)| -> bool {
             let (_, w) = pair;
             // Same as `worker_matches` minus the swap-pressure skip.
-            !w.quarantined_at.is_some()
+            w.quarantined_at.is_none()
                 && w.can_accept_work()
                 && !w.indefinite_pin_saturated
                 && platform_properties.is_satisfied_by(&w.platform_properties, false)
