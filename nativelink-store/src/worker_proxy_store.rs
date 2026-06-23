@@ -266,50 +266,89 @@ impl MirrorEndpointState {
 /// seen during the 2026-03-25 write burst.
 const MIRROR_PERMITS_PER_WORKER: usize = 16;
 
-/// CDN-tee cache mpsc capacity (#230). Bytes flow as:
+/// CDN-tee cache mpsc capacity (#230, raised 4 → 16 for FL-688). Bytes
+/// flow as:
 ///   peer chunks → forward to Bazel → `try_send` to cache mpsc → cache task
 ///                                                              → inner.update
 ///
-/// The cap is small on purpose. The CDN-tee is a best-effort fan-out:
-/// the user-explicit contract is "Bazel reader NEVER blocks on cache",
-/// so the per-chunk loop uses `try_send` and abandons on `Full`. A
-/// large buffer would let the cache task lag arbitrarily far behind
-/// the peer-reader; a tiny buffer detects cache stall fast and frees
-/// the abandon path to take over.
+/// `make_buf_channel_pair_with_size(CDN_TEE_CACHE_MPSC_CAP)` is a
+/// `mpsc::channel(capacity)` (see `buf_channel.rs:142-145`): the cap is a
+/// SLOT COUNT, one `Bytes` chunk per slot. Each chunk is one peer
+/// `get_part` `send`. The peer is a `GrpcStore` connection to another
+/// worker's CAS endpoint (`Connections` holds "Cached GrpcStore connections
+/// to worker endpoints"), so peer reads stream over the bytestream Read RPC:
+/// each `writer.send(data)` in `GrpcStore::get_part_single_stream`
+/// (`grpc_store.rs:2480-2582`) and the parallel-chunk path carries one
+/// `ReadResponse.data` frame. That frame is bounded by the SERVING peer's
+/// bytestream `max_bytes_per_stream` (`bytestream_server.rs:322` "Max number
+/// of bytes to send on each grpc stream chunk"), whose default is
+/// `DEFAULT_MAX_BYTES_PER_STREAM = 3 * 1024 * 1024` (`bytestream_server.rs:79`)
+/// — VERIFIED 3 MiB; the prod config does not override it. So worst-case
+/// bytes per in-flight fetch = `cap × 3 MiB`. (NOTE: the per-slot size is the
+/// PEER bytestream chunk cap, NOT `FilesystemStore::read_buffer_size` — the
+/// peer-fetch never reads the local filesystem store directly; tuning
+/// `read_buffer_size` does NOT change this budget, tuning the peer's
+/// `max_bytes_per_stream` does.)
 ///
-/// Why 4 specifically:
-/// - large enough to absorb a micro-burst (peer delivers 2-3 chunks
-///   back-to-back while cache_task is briefly preempted),
-/// - small enough that a slow inner-store update (sustained cache-tier
-///   latency, e.g. ZFS txg-sync hiccup) trips the abandon path within
-///   one peer-reader "burst" rather than letting the cache task
-///   accumulate hundreds of MiB of buffered chunks behind a stalled
-///   write,
-/// - matches the `mirror_channel = 16` direction the user requested
-///   (tighter back-pressure, less memory) for adjacent fan-out paths,
-///   and is even tighter because the cache-tee can be abandoned with
-///   no correctness loss while a mirror cannot.
+/// The cap is still small on purpose. The CDN-tee is a best-effort
+/// fan-out: the user-explicit contract is "Bazel reader NEVER blocks on
+/// cache", so the per-chunk loop uses `try_send` and abandons on `Full`. A
+/// huge buffer would let the cache task lag arbitrarily far behind the
+/// peer-reader; a bounded buffer detects a genuinely-wedged cache (e.g.
+/// ZFS txg-sync hiccup, `CDN_TEE_CACHE_TASK_TIMEOUT = 60s` stall) and frees
+/// the abandon path.
 ///
-/// Total memory budget per in-flight peer-fetch:
-///   - cache mpsc:   4 chunks × ~3 MiB `read_buffer_size` ≈ 12 MiB
-///   - proxy buffer: bounded by `DEFAULT_BUF_CHANNEL_CAPACITY = 1024`
-///     slots × peer chunk size. In practice peer chunks are also
-///     `read_buffer_size`-bounded (~3 MiB on FilesystemStore-backed
-///     peers), so the steady-state budget is dominated by whichever of
-///     `proxy_rx`/cache mpsc the consumer is draining slowest. With the
-///     post-#230 architecture the consumer drains proxy_rx at peer rate
-///     (so it sits near-empty under healthy load); a stalled consumer
-///     fills proxy_rx and the cache abandon path frees the cache mpsc.
-///     Worst-case per fetch is therefore the larger of the two
-///     channels' capacity-times-chunk-size product.
-/// With ~50 concurrent peer-fetches across the fleet, 12 MiB cache + a
-/// near-empty proxy_rx (consumer draining at peer rate) keeps total
-/// well below the 8 GiB MemoryStore fast-tier budget that motivated
-/// the 2026-03-25 OOM tuning. The Bazel-disconnect abandon path drops
-/// `proxy_rx` immediately so the peer task unblocks fast (M1 fix,
-/// 2026-05-02) — without it, proxy_tx could pin up to 1024 chunks per
-/// orphaned fetch indefinitely.
-const CDN_TEE_CACHE_MPSC_CAP: usize = 4;
+/// Why 16 (FL-688): the prior cap of 4 systematically ABANDONED large-blob
+/// proxy-caching. A large blob (e.g. 62 MB ≈ 21 × 3 MiB chunks) only had to
+/// let the cache-write task (`inner.update`) lag the Bazel-forward by 4
+/// chunks to trip `Full` — so a large blob abandoned ~every time the inner
+/// write was not strictly faster than the peer read. Observed:
+/// `cdn_tee_cache_abandoned_full_total` fired 1,730×; ead6c5ce abandoned at
+/// 34 MB / 62 MB. 16 slots = 48 MiB of slack absorbs the observed
+/// inner-vs-peer lag for the large-blob class while still tripping abandon
+/// long before a runaway buffer (16 < the ~21+ chunks of a multi-MiB blob,
+/// and far below the 128-chunk wedged-cache regression test).
+///
+/// Why FIXED 16, not a size-aware `min(ceil(blob/chunk), 16)`: the
+/// size-aware form was evaluated and REJECTED. For the large-blob class it
+/// is identical (both clamp to 16 once a blob exceeds 16 chunks — exactly
+/// the class that abandons). For SMALL blobs it is strictly WORSE: a 2-chunk
+/// blob would get cap `min(2, 16) = 2`, BELOW the current 4, removing the
+/// micro-burst slack (2-3 back-to-back chunks while the cache task is
+/// briefly preempted) the cap of 4 was specifically chosen to absorb — i.e.
+/// it would NEWLY abandon small blobs that work fine today, with zero
+/// large-blob benefit. Fixed 16 is simpler (one const, no per-call
+/// arithmetic) and fixes the large-blob abandon without that regression.
+/// Matches `MIRROR_PERMITS_PER_WORKER = 16` (the adjacent fan-out
+/// precedent), and stays even safer because the cache-tee can be abandoned
+/// with no correctness loss while a mirror cannot.
+///
+/// Memory budget (the constraint):
+///   - cache mpsc worst case: 16 chunks × 3 MiB ≈ 48 MiB per in-flight fetch.
+///   - proxy buffer: bounded by `DEFAULT_BUF_CHANNEL_CAPACITY = 1024` slots
+///     × peer chunk size, but the consumer drains `proxy_rx` at peer rate so
+///     it sits near-empty under healthy load; a stalled consumer fills
+///     proxy_rx and the cache abandon path frees the cache mpsc. Worst-case
+///     per fetch is therefore dominated by whichever channel the consumer
+///     drains slowest, ≈ the 48 MiB cache mpsc under a stalled cache.
+///   - Fleet worst case: this read path has NO dedicated concurrency
+///     semaphore (unlike the mirror WRITE path's `MIRROR_PERMITS_PER_WORKER`);
+///     concurrent fetches are bounded only by inbound proxied-read
+///     concurrency, and #130 singleflight collapses same-digest fetches to a
+///     single leader. At ~50 concurrent DISTINCT-digest large-blob fetches
+///     (the operational estimate; not a hard cap), 16 × 3 MiB × 50 ≈ 2.4 GiB
+///     — under the 8 GiB MemoryStore fast-tier budget that motivated the
+///     2026-03-25 OOM tuning. (4→16 raises this ceiling from 0.6 GiB to
+///     2.4 GiB; 32 would have been 4.8 GiB, leaving too little headroom.)
+/// The Bazel-disconnect abandon path drops `proxy_rx` immediately so the
+/// peer task unblocks fast (M1 fix, 2026-05-02) — without it, proxy_tx could
+/// pin up to 1024 chunks per orphaned fetch indefinitely.
+// CDN-tee cache mpsc capacity. CAPPED AT 16: worst-case 16 × 3 MiB ≈ 48 MiB
+// of `Bytes` per in-flight peer-fetch; over-cap behavior is `try_send` Full
+// → abandon (drop cache_tx, signal CACHE_FANOUT_ABANDONED_MARKER). Fleet
+// worst case ≈ 2.4 GiB at ~50 concurrent distinct-digest large-blob fetches,
+// under the 8 GiB MemoryStore fast-tier budget.
+const CDN_TEE_CACHE_MPSC_CAP: usize = 16;
 
 /// Typed signal written into `cache_tx` via `send_error` on every
 /// intentional best-effort cache fan-out abandonment (mpsc full or

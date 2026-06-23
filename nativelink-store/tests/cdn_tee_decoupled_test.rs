@@ -77,9 +77,9 @@ const VALID_HASH1: &str =
 /// CI run fails fast.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Note: the production `CDN_TEE_CACHE_MPSC_CAP = 4` is intentionally
-// not duplicated here; tests assert via behavior + counters, not by
-// re-coupling to the constant. If the cap changes in production,
+// Note: the production `CDN_TEE_CACHE_MPSC_CAP = 16` (FL-688; was 4) is
+// intentionally not duplicated here; tests assert via behavior + counters,
+// not by re-coupling to the constant. If the cap changes in production,
 // these tests should still pass on their behavioral assertions.
 
 // ---------------------------------------------------------------------
@@ -347,9 +347,9 @@ async fn cdn_tee_slow_consumer_does_not_stall_cache_completion()
     // Cache task outcome under slow consumer: with the production
     // architecture, the peer-reader spawns and writes into a 24-slot
     // proxy_tx; the forward loop reads at consumer rate and offers
-    // chunks to the 4-slot cache mpsc via try_send. With a fast peer
+    // chunks to the 16-slot cache mpsc via try_send. With a fast peer
     // and a slow consumer, proxy_tx fills first, then the forward
-    // loop's cache.try_send fills the 4-slot cache mpsc, then
+    // loop's cache.try_send fills the 16-slot cache mpsc, then
     // abandon-on-full fires. With a fast consumer, cache keeps up
     // and completed=1.
     //
@@ -392,10 +392,11 @@ async fn cdn_tee_slow_consumer_does_not_stall_cache_completion()
 // ---------------------------------------------------------------------
 
 /// Wraps the inner store in a SlowUpdateStore that holds `inner.update`
-/// open for 5s before returning. With cache mpsc cap = 4, the forward
-/// loop's `try_send` MUST return Full after 4 chunks and the abandon
-/// path MUST fire. Bazel must continue receiving the remaining chunks
-/// at peer-reader rate, NOT at cache rate.
+/// open for 5s before returning. With cache mpsc cap = 16 (FL-688) and a
+/// cache stalled 5s, the forward loop's `try_send` MUST return Full after
+/// ~16 chunks (the 8 MiB / 64 KiB blob is ~128 chunks, far more than the
+/// cap) and the abandon path MUST fire. Bazel must continue receiving the
+/// remaining chunks at peer-reader rate, NOT at cache rate.
 ///
 /// This is the motivating regression test for #230. Pre-#230, the
 /// `tokio::join!(forward_fut, cache_write_fut)` would have meant that
@@ -415,7 +416,7 @@ async fn cdn_tee_slow_consumer_does_not_stall_cache_completion()
 #[nativelink_test]
 async fn cdn_tee_slow_cache_abandons_does_not_block_bazel()
 -> Result<(), Error> {
-    // Blob big enough to fill the 4-slot mpsc and require many more
+    // Blob big enough to fill the 16-slot mpsc and require many more
     // chunks. We use a ChunkedPeerStore that splits the blob into
     // 64 KiB chunks so the per-chunk forward loop fires many iterations.
     let value = test_value(8 * 1024 * 1024); // 8 MiB
@@ -430,9 +431,9 @@ async fn cdn_tee_slow_cache_abandons_does_not_block_bazel()
     }));
 
     // ChunkedPeer: emit the blob in 64 KiB chunks. With the production
-    // cache mpsc cap of 4, the forward loop produces ~128 chunks; the
-    // slow cache (5s sleep before drain) means the mpsc fills almost
-    // immediately and the abandon path takes over.
+    // cache mpsc cap of 16 (FL-688), the forward loop produces ~128 chunks;
+    // the slow cache (5s sleep before drain) means the mpsc fills (16 slots)
+    // within the first ~16 chunks and the abandon path takes over.
     let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
         payload: Bytes::from(value.clone()),
         chunk_size: 64 * 1024,
@@ -826,7 +827,9 @@ async fn cdn_tee_sustained_cache_slowness_does_not_deadlock_201()
     );
 
     // At least one abandon-on-full MUST have fired (the slow inner.update
-    // backs up faster than the 4-slot mpsc can drain).
+    // backs up faster than the 16-slot mpsc can drain: a 4 MiB blob at
+    // 64 KiB/chunk is 64 chunks, far more than the 16 slots, against a
+    // 3s-per-update drain).
     let (attempts, _completed, full, _eof) =
         proxy_arc.cdn_tee_counters_snapshot();
     assert_eq!(
@@ -1179,7 +1182,7 @@ async fn cdn_tee_happy_path_huge_chunk_count_caches_all_bytes()
 // Production composition: real WPS + ExistenceCacheStore wrapping
 // DelayedReadInnerStore (matches the existence-cache layer in the
 // production CAS chain — see production seam list below). Delayed
-// read ensures the 4-slot mpsc fills and the Full-abandon path fires.
+// read ensures the 16-slot mpsc fills and the Full-abandon path fires.
 //
 // Production seam list (ordered producer → classifier):
 //   1. WorkerProxyStore (producer: send_error on Full-abandon)
@@ -1213,7 +1216,7 @@ async fn cdn_tee_abandonment_does_not_emit_error_log() -> Result<(), Error> {
     // DelayedReadInnerStore. The existence cache layer IS the one that
     // fires "ExistenceCacheStore::update: inner store write failed" in
     // the production error log (FU-6 finding). DelayedReadInnerStore
-    // sleeps before reading so the 4-slot mpsc fills (Full-abandon fires),
+    // sleeps before reading so the 16-slot mpsc fills (Full-abandon fires),
     // then reads from the reader and propagates the Aborted error.
     let delayed_inner = Store::new(Arc::new(DelayedReadInnerStore {
         sleep: Duration::from_secs(3),
@@ -1431,7 +1434,7 @@ async fn genuine_update_failure_still_logs_error_level() -> Result<(), Error> {
 // slow: MemoryStore}.  SlowUpdateInnerStore sleeps 3s before draining
 // fast_rx so fast_tx (128-slot) fills after ~128 × 64 KiB = 8 MiB of
 // forwarding, causing data_stream_fut to block on fast_guard.send(buffer)
-// → cache_rx is not drained → 4-slot WPS cache mpsc fills → Full-abandon
+// → cache_rx is not drained → 16-slot WPS cache mpsc fills → Full-abandon
 // fires → send_error → data_stream_fut's reader.recv() returns Err(Aborted)
 // → FSS non-chunked error check at ~5228 classifies correctly.
 //
@@ -1445,14 +1448,14 @@ async fn cdn_tee_fss_nc_abandonment_does_not_emit_error_log() -> Result<(), Erro
     // 16 MiB blob with 64 KiB chunks → 256 iterations.
     // fast_tx has 128 slots; after 128 sends SlowUpdateInnerStore is still
     // sleeping (has not yet drained fast_rx), so fast_guard.send(buffer)
-    // blocks on the 129th chunk.  cache_rx stalls → WPS 4-slot mpsc fills
+    // blocks on the 129th chunk.  cache_rx stalls → WPS 16-slot mpsc fills
     // → Full-abandon fires → send_error(Aborted+MARKER).
     let value = test_value(16 * 1024 * 1024);
     let digest = digest_for_size(value.len() as u64);
 
     // FSS fast store: SlowUpdateInnerStore sleeps 3s before draining
     // fast_rx. This backs up fast_tx (128-slot), which backs up
-    // cache_rx (4-slot WPS mpsc) → Full-abandon → send_error(Aborted+MARKER).
+    // cache_rx (16-slot WPS mpsc) → Full-abandon → send_error(Aborted+MARKER).
     let slow_fast = Store::new(Arc::new(SlowUpdateInnerStore {
         sleep: Duration::from_secs(3),
         update_calls: AtomicU64::new(0),
@@ -1517,7 +1520,7 @@ async fn cdn_tee_fss_nc_abandonment_does_not_emit_error_log() -> Result<(), Erro
         full >= 1,
         "abandon-on-full MUST fire with 16 MiB blob and slow FSS fast store \
          (fast_tx fills after 128 × 64 KiB = 8 MiB, blocking data_stream_fut, \
-         backing up the 4-slot WPS mpsc); observed full={full} — FSS \
+         backing up the 16-slot WPS mpsc); observed full={full} — FSS \
          non-chunked demotion path was not exercised (FU-6 Test A-FSS-NC)",
     );
 
@@ -2096,7 +2099,7 @@ impl StoreDriver for DelayedReadInnerStore {
         _upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
         // Sleep before reading, giving the forward loop time to fill
-        // the 4-slot mpsc and trigger the Full-abandon + send_error path.
+        // the 16-slot mpsc and trigger the Full-abandon + send_error path.
         tokio::time::sleep(self.sleep).await;
         // Read and propagate errors (unlike SlowUpdateInnerStore which
         // uses `let _drained = reader.drain().await` to discard errors).
@@ -2153,7 +2156,7 @@ impl StoreDriver for DelayedReadInnerStore {
 
 /// Peer fake that returns a fixed payload as N small chunks, with an
 /// optional inter-chunk sleep. Used to:
-///   - force many forward-loop iterations so the 4-slot cache mpsc has
+///   - force many forward-loop iterations so the 16-slot cache mpsc has
 ///     a real chance to fill,
 ///   - keep the peer producer alive while the consumer disconnects so
 ///     the abandon-on-consumer-eof path actually fires.
