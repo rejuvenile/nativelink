@@ -167,6 +167,15 @@ pub struct WorkerApiServer {
     /// disconnect-cleanup task — both of which operate inside this
     /// server, not the scheduler.
     endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+    /// (#58 directive-3) When the startup locality reload primed the sentinel
+    /// (`__reloaded_unconfirmed__`) entries. The never-reconnect sweep
+    /// (`LocalityPersister::sweep_unconfirmed`) refuses to drop any sentinel
+    /// entry until this is at least `grace` old — so the `grace` arg is
+    /// load-bearing under ANY scheduler (one-shot at grace OR a periodic tick
+    /// that fires before grace must NOT prematurely sweep). Process-wide
+    /// singleton shared with every `LocalityPersister` clone (reload stamps it;
+    /// sweep reads it). `None` until a reload runs.
+    locality_reload_baseline: Arc<parking_lot::Mutex<Option<Instant>>>,
     /// (#387) Per-endpoint flap-detection history. Held in a SEPARATE
     /// `parking_lot::Mutex` from `endpoint_state` so it survives the
     /// disconnect-cleanup `state.remove(&cas_endpoint)` at
@@ -515,6 +524,7 @@ impl WorkerApiServer {
             worker_proxy,
             small_blob_dispatcher,
             endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            locality_reload_baseline: Arc::new(parking_lot::Mutex::new(None)),
             flap_history: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             compatible_build_shas,
             metrics: Arc::new(WorkerApiMetrics::default()),
@@ -1150,6 +1160,7 @@ impl WorkerApiServer {
         Some(LocalityPersister {
             locality_map,
             endpoint_state: self.endpoint_state.clone(),
+            reload_baseline: self.locality_reload_baseline.clone(),
         })
     }
 }
@@ -1207,10 +1218,11 @@ impl ShutdownPuller {
         // Enumeration (design §4): snapshot the locality map ONCE under the
         // read lock into an owned Vec, then drop the lock. digest → the set of
         // worker endpoints that hold it.
-        // CAPPED AT digest_count(): one-shot locality snapshot, ~40 B/digest +
-        // a small endpoint Vec, dropped when this fn returns. Bounded by the
-        // fleet CAS union; blob BYTES are never collected here — they stream
-        // worker → server CAS → disk via the existing backfill path.
+        // ~72 B/pair (string-encoded DigestInfo), CAPPED AT pair_count:
+        // one-shot locality snapshot + a small endpoint Vec, dropped when this
+        // fn returns. Bounded by the fleet CAS union; blob BYTES are never
+        // collected here — they stream worker → server CAS → disk via the
+        // existing backfill path.
         let pull_set: Vec<(DigestInfo, Vec<Arc<str>>)> = {
             let guard = locality_map.read();
             guard
@@ -1546,6 +1558,14 @@ pub const LOCALITY_PERSIST_RECONNECT_GRACE_SECS: u64 = 600;
 pub struct LocalityPersister {
     locality_map: SharedBlobLocalityMap,
     endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+    /// When the startup reload primed the sentinel entries. The never-reconnect
+    /// sweep refuses to drop any sentinel entry until this is at least `grace`
+    /// old, so the `grace` arg is load-bearing under ANY scheduler (one-shot OR
+    /// periodic). `None` until a reload has run (a sweep before any reload is a
+    /// no-op — there are no sentinel entries to drop). Shared across clones so
+    /// the reload clone's stamp is visible to the sweep clone. See
+    /// `sweep_unconfirmed`.
+    reload_baseline: Arc<parking_lot::Mutex<Option<Instant>>>,
 }
 
 impl LocalityPersister {
@@ -1562,10 +1582,10 @@ impl LocalityPersister {
         // Snapshot BOTH maps under their locks into owned data, then DROP the
         // locks before the (potentially large) encode + the .await write —
         // never hold a lock across .await.
-        // CAPPED AT digest_count(): one owned Vec, ~40 B/(endpoint,digest) pair
-        // (string-encoded DigestInfo on disk), dropped after the write. NOT a
-        // network path — shutdown-local. Blob BYTES are never collected; only
-        // the (digest hash + size) index.
+        // ~72 B/pair (string-encoded DigestInfo), CAPPED AT pair_count: one
+        // owned Vec, dropped after the write. NOT a network path —
+        // shutdown-local. Blob BYTES are never collected; only the (digest hash
+        // + size) index.
         let endpoint_digests = self.locality_map.read().snapshot_endpoint_blobs();
         let entries: Vec<PersistedEndpoint> = {
             let state = self.endpoint_state.lock();
@@ -1705,15 +1725,31 @@ impl LocalityPersister {
                 // THE PRIMING (trap guard): record the persisted boot_epoch +
                 // the sentinel owner so the #141 connect-path wipe reconciles
                 // this endpoint on reconnect.
-                state.insert(
-                    entry.cas_endpoint,
-                    EndpointState {
-                        boot_epoch: entry.boot_epoch,
-                        owner_worker_id: WorkerId(RELOADED_UNCONFIRMED_OWNER.to_string()),
-                    },
-                );
+                //
+                // `or_insert` (NOT `insert`): the reload runs CONCURRENTLY with
+                // the worker-API listener bind (workers may reconnect during the
+                // reload window). If a worker has ALREADY connected for this
+                // endpoint, `endpoint_state[ep]` is a LIVE entry carrying its
+                // real `WorkerId` + boot_epoch — clobbering it with the sentinel
+                // would (a) re-stamp a live worker as "unconfirmed" so the
+                // never-reconnect sweep could DROP its locality at grace, and
+                // (b) overwrite a correct boot_epoch with the stale persisted
+                // one. The priming-trap guard only matters for endpoints that
+                // have NOT reconnected yet (the leak case); those are ABSENT
+                // here, so `or_insert` primes them exactly as before. A
+                // reconnected worker already won the #141 reconciliation, so it
+                // needs no priming.
+                state.entry(entry.cas_endpoint).or_insert_with(|| EndpointState {
+                    boot_epoch: entry.boot_epoch,
+                    owner_worker_id: WorkerId(RELOADED_UNCONFIRMED_OWNER.to_string()),
+                });
             }
         }
+        // Stamp the reload baseline so the never-reconnect sweep can enforce
+        // `grace` (it refuses to drop a sentinel entry until the reload is at
+        // least `grace` old). Set AFTER the priming so a concurrent sweep never
+        // sees a baseline before the sentinels it gates exist.
+        *self.reload_baseline.lock() = Some(Instant::now());
         info!(
             endpoints = endpoints_loaded,
             digests = digests_loaded,
@@ -1740,15 +1776,26 @@ impl LocalityPersister {
     /// (`inner_connect_worker`), so the sweep cannot race a concurrent reconnect
     /// into a half-applied state. Never touches `flap_history`.
     ///
-    /// `grace` is interpreted as "sweep an endpoint whose worker has not
-    /// reconnected"; the time check is implicit in the sentinel (a reconnect
-    /// always clears it), so any endpoint still carrying the sentinel when the
-    /// one-shot sweep fires at `grace` after boot is by definition past grace.
+    /// `grace` is LOAD-BEARING: the sweep refuses to drop ANY sentinel entry
+    /// until the startup reload baseline (`reload_baseline`, stamped at the end
+    /// of `reload_from_disk`) is at least `grace` old. This makes the sweep safe
+    /// under a periodic scheduler (a tick before grace is a no-op) AND under a
+    /// one-shot-at-grace scheduler, rather than relying on the caller to fire at
+    /// exactly `grace`. A sweep before any reload (no baseline) is a no-op.
+    /// Identity (the sentinel) AND time (the baseline + grace) are BOTH checked:
+    /// a reconnect clears the sentinel, and grace must have elapsed.
     #[must_use]
     pub fn sweep_unconfirmed(&self, grace: Duration) -> usize {
-        // `grace` is logged for operator visibility; the sentinel is the
-        // authoritative "never reconnected" signal (a reconnect overwrites it).
-        let _ = grace;
+        // Time gate: do not sweep until the reload is at least `grace` old.
+        // Before any reload there is no baseline (and no sentinel entries), so
+        // this is a no-op. `saturating` via the `Option` + `elapsed` compare.
+        match *self.reload_baseline.lock() {
+            None => return 0,
+            Some(baseline) if baseline.elapsed() < grace => {
+                return 0;
+            }
+            Some(_) => {}
+        }
         let mut state = self.endpoint_state.lock();
         let stale: Vec<String> = state
             .iter()

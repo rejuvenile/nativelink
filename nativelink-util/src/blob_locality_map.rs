@@ -377,10 +377,10 @@ impl BlobLocalityMap {
     /// large) bincode encode runs in `spawn_blocking` — never holding the lock
     /// across `.await`.
     ///
-    /// CAPPED AT digest_count(): one owned `Vec<(Arc<str>, Vec<DigestInfo>)>`,
-    /// ~40 B/(endpoint,digest) pair, dropped after the encode. NOT a network
-    /// path — this is a shutdown-local snapshot. Blob BYTES are never collected;
-    /// only the (digest hash + size) index.
+    /// ~72 B/pair (string-encoded DigestInfo), CAPPED AT pair_count: one owned
+    /// `Vec<(Arc<str>, Vec<DigestInfo>)>`, dropped after the encode. NOT a
+    /// network path — this is a shutdown-local snapshot. Blob BYTES are never
+    /// collected; only the (digest hash + size) index.
     #[must_use]
     pub fn snapshot_endpoint_blobs(&self) -> Vec<(Arc<str>, Vec<DigestInfo>)> {
         self.endpoint_blobs
@@ -435,7 +435,14 @@ const PERSIST_HEADER_LEN: usize = 6;
 /// Best-effort: persisted on graceful SIGTERM only. A SIGKILL skips the persist;
 /// the map then rebuilds from worker full-snapshot `BlobsAvailable` on reconnect
 /// (slower but lossless — the map is an INDEX, not a durable copy of any blob).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are derived directly: the bincode body is EXACTLY
+/// these two fields (the magic+version are module consts written as a raw frame,
+/// NOT struct fields), so there is no separate payload twin. This avoids a full
+/// `entries.clone()` on the SIGTERM persist path and removes the silent-drift
+/// hazard a field-identical twin would carry (add a field to one, forget the
+/// other → data-loss-on-reload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedLocalityMap {
     /// Unix seconds at persist time. Drives the never-reconnect grace TTL: a
     /// reloaded endpoint that never reconnects is swept `grace_secs` after this.
@@ -444,14 +451,20 @@ pub struct PersistedLocalityMap {
     pub entries: Vec<PersistedEndpoint>,
 }
 
-/// The bincode-serialized payload (everything after the raw magic+version
-/// frame). Split out so the frame is validated from raw bytes before any
-/// bincode decode touches an attacker-/corruption-controlled length prefix.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedPayload {
-    persisted_at_unix_s: u64,
-    entries: Vec<PersistedEndpoint>,
-}
+/// Upper bound on the bincode-decoded body of a reloaded persist file. With
+/// `bincode::config::standard()` alone (`NoLimit`), a valid 6-byte frame
+/// followed by a corrupt/oversized `Vec` length prefix drives a giant
+/// `Vec::with_capacity(attacker_len)` → allocator abort → startup crash-loop,
+/// violating the §3.3 fail-open guarantee. `.with_limit::<N>()` makes bincode's
+/// prealloc guard fire so an oversized length surfaces as
+/// `DecodeError::LimitExceeded` (which `deserialize_from_bytes` maps to `Err`
+/// and `reload_from_disk` maps to fail-open + empty map) BEFORE any allocation.
+///
+/// 4 GiB is a generous ceiling over the §2.4 fleet-scale ~200 MB encoded-size
+/// estimate (~20× headroom), so a legitimate file never trips it while a corrupt
+/// length always does. Applied to the DECODE side only — the encode input is
+/// ours, so `serialize_to_bytes` stays unbounded `standard()`.
+const PERSIST_DECODE_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 impl PersistedLocalityMap {
     /// Build a persisted map.
@@ -469,11 +482,10 @@ impl PersistedLocalityMap {
     /// Pure CPU work — the caller runs it in `spawn_blocking` when the snapshot
     /// is large so it never blocks a tokio worker.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let payload = PersistedPayload {
-            persisted_at_unix_s: self.persisted_at_unix_s,
-            entries: self.entries.clone(),
-        };
-        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        // Encode `self` directly — the bincode body is exactly
+        // (`persisted_at_unix_s`, `entries`); no twin struct, no `entries`
+        // clone. Encode side stays unbounded `standard()`: the input is ours.
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| make_input_err!("failed to bincode-encode locality persist map: {e}"))?;
         let mut out = Vec::with_capacity(PERSIST_HEADER_LEN + encoded.len());
         out.extend_from_slice(&PERSIST_MAGIC.to_le_bytes());
@@ -507,15 +519,16 @@ impl PersistedLocalityMap {
                 "locality persist file version mismatch {version} (expected {PERSIST_VERSION}); ignoring"
             ));
         }
-        let (payload, _len): (PersistedPayload, usize) = bincode::serde::decode_from_slice(
+        // BOUNDED decode (`with_limit`): a corrupt/oversized body length prefix
+        // surfaces as `DecodeError::LimitExceeded` (mapped to `Err` below →
+        // fail-open empty map upstream) instead of a giant `Vec::with_capacity`
+        // → allocator abort → startup crash-loop. See `PERSIST_DECODE_LIMIT_BYTES`.
+        let (map, _len): (Self, usize) = bincode::serde::decode_from_slice(
             &bytes[PERSIST_HEADER_LEN..],
-            bincode::config::standard(),
+            bincode::config::standard().with_limit::<PERSIST_DECODE_LIMIT_BYTES>(),
         )
         .map_err(|e| make_input_err!("failed to bincode-decode locality persist map payload: {e}"))?;
-        Ok(Self {
-            persisted_at_unix_s: payload.persisted_at_unix_s,
-            entries: payload.entries,
-        })
+        Ok(map)
     }
 }
 

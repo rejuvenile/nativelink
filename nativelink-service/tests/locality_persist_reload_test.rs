@@ -476,3 +476,208 @@ async fn reload_corrupt_file_fails_open() -> Result<(), Box<dyn core::error::Err
     drop(summary);
     Ok(())
 }
+
+/// FAIL-OPEN on a VALID-FRAME-but-HOSTILE-BODY file (security S1 fix-up, item D).
+///
+/// The raw magic+version frame guard only rejects a foreign/headerless file; it
+/// does NOT cover the bincode BODY. A file carrying a VALID 6-byte frame
+/// followed by a body whose `entries` `Vec` length-prefix is huge
+/// (`u64::MAX` declared, then NO element bytes) must FAIL OPEN — the reload
+/// returns `Ok(empty)`, the server starts, the map stays empty. It must NOT
+/// propagate the decode error up to crash startup, and (with the bounded decode)
+/// it must NOT drive an unbounded allocation.
+///
+/// DRIFT NOTE (verified against bincode-2.0.1 + serde): the security review's
+/// "`Vec::with_capacity(u64::MAX)` → allocator abort" premise does NOT hold on
+/// the `bincode::serde::decode_from_slice` path — serde's `Vec` visitor uses a
+/// cautious capacity cap and bincode decodes element-by-element against a
+/// slice-bounded reader, so a SHORT hostile body hits `UnexpectedEnd` and the
+/// `with_limit` makes no observable difference for THIS input (empirically
+/// confirmed: the decode returns `Err`, not an abort, with OR without the
+/// limit). The bounded decode (`with_limit`) is retained as cheap cumulative-
+/// allocation defense-in-depth, but the load-bearing fail-open mechanism this
+/// test pins is the `Err → Ok(empty)` mapping in `reload_from_disk`, NOT the
+/// limit. The existing `reload_corrupt_file_fails_open` uses a WRONG-MAGIC file
+/// rejected by the FRAME guard before bincode runs; this test reaches the BODY
+/// decode (valid frame) and pins that a body-decode error ALSO fails open.
+///
+/// Mutation (in `reload_from_disk`, change the corrupt-body arm
+/// `Err(e) => { warn!(...); return Ok(empty) }` to `Err(e) => return Err(e)`):
+/// the body-decode error propagates instead of failing open → the
+/// `.expect("must FAIL OPEN ...")` below red-fails with its bespoke message.
+#[nativelink_test]
+async fn reload_valid_frame_hostile_body_fails_open()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (server, locality_map) = make_server()?;
+
+    // A real serialize gives us the exact, correct 6-byte magic+version frame
+    // (so the frame guard PASSES and we genuinely reach the body decode).
+    let real = persisted_bytes(vec![]);
+    let frame: Vec<u8> = real[..6].to_vec();
+
+    // Hostile body: persisted_at_unix_s = 0 (varint single byte), then
+    // entries.len() = u64::MAX (U64_BYTE prefix + 8 LE bytes) with NO element
+    // bytes — an inconsistent/oversized length the body decode must reject.
+    const U64_BYTE: u8 = 253;
+    let mut bytes = frame;
+    bytes.push(0x00); // persisted_at_unix_s = 0
+    bytes.push(U64_BYTE);
+    bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // entries.len() = u64::MAX
+    let path = write_persist_file(&bytes).await;
+
+    // Must FAIL OPEN — return Ok(empty), NOT propagate the decode error to crash
+    // startup.
+    let summary = server
+        .reload_locality_from_disk(&path)
+        .await
+        .expect(
+            "a valid-frame + hostile-body file must FAIL OPEN (Ok empty) — the \
+             body-decode error must be mapped to an empty map, NOT propagated to \
+             crash startup (mutation: make reload_from_disk's corrupt-body arm \
+             `return Err(e)` instead of `Ok(empty)`)",
+        );
+    assert_eq!(
+        summary.endpoints_loaded, 0,
+        "a hostile-body file must yield no endpoints (fail-open empty map)"
+    );
+    assert_eq!(
+        locality_map.read().digest_count(),
+        0,
+        "map stays empty after a hostile-body reload"
+    );
+    Ok(())
+}
+
+/// GRACE IS LOAD-BEARING (distsys MAJOR-1 + code-reviewer fix-up, item B): the
+/// never-reconnect sweep must NOT drop sentinel entries until the reload is at
+/// least `grace` old. A sweep with a grace LARGER than the elapsed-since-reload
+/// time must be a no-op; only once grace has elapsed (here: grace=ZERO, always
+/// elapsed) does it sweep. This pins that `grace` is actually CHECKED, not
+/// ignored (`let _ = grace;`).
+///
+/// Mutation (drop the grace gate — `let _ = grace;` / remove the
+/// `baseline.elapsed() < grace` early-return in `sweep_unconfirmed`): the
+/// huge-grace sweep would sweep the never-reconnect entry immediately → the
+/// first `assert_eq!(swept_too_early, 0, ...)` red-fails with its bespoke
+/// message.
+#[nativelink_test]
+async fn sweep_honors_grace_no_sweep_before_grace_elapses()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (server, locality_map) = make_server()?;
+    let gone_ep = "grpc://w-grace-gone:50081";
+    let gone_digest = digest(0x33, 100);
+    let bytes = persisted_bytes(vec![(gone_ep, 7777, vec![gone_digest])]);
+    let path = write_persist_file(&bytes).await;
+
+    tokio::time::timeout(DEADLOCK_DETECTOR, server.reload_locality_from_disk(&path))
+        .await
+        .expect("reload must not hang")
+        .expect("reload must succeed");
+
+    // The reloaded entry is present and the worker never reconnected (sentinel).
+    assert_eq!(
+        locality_map.read().lookup_workers(&gone_digest).len(),
+        1,
+        "pre-condition: the never-reconnect entry is present after reload"
+    );
+
+    // A grace FAR larger than the elapsed-since-reload time: the sweep must be a
+    // no-op (grace not yet elapsed). If `grace` were ignored, this would sweep.
+    let swept_too_early =
+        server.sweep_unconfirmed_reloaded_locality(Duration::from_secs(86_400));
+    assert_eq!(
+        swept_too_early, 0,
+        "sweep must NOT drop a sentinel entry before grace elapses — grace is \
+         load-bearing (mutation: `let _ = grace;` ignores it and sweeps \
+         immediately)"
+    );
+    assert_eq!(
+        locality_map.read().lookup_workers(&gone_digest).len(),
+        1,
+        "the entry must SURVIVE a pre-grace sweep"
+    );
+
+    // Now sweep with grace=ZERO (always elapsed): the entry IS past grace and
+    // must be swept. Proves the no-op above was the grace gate, not a dead sweep.
+    let swept_after_grace = server.sweep_unconfirmed_reloaded_locality(Duration::ZERO);
+    assert_eq!(
+        swept_after_grace, 1,
+        "with grace=ZERO (elapsed) the never-reconnect entry MUST be swept"
+    );
+    assert!(
+        locality_map.read().lookup_workers(&gone_digest).is_empty(),
+        "the never-reconnect entry must be gone once grace has elapsed"
+    );
+    Ok(())
+}
+
+/// RECONNECT-DURING-RELOAD must NOT clobber a LIVE entry (distsys MAJOR-2
+/// fix-up, item C): the reload runs concurrently with the worker-API listener
+/// bind, so a worker can connect for an endpoint BEFORE the reload's priming
+/// loop reaches it. The reload's `endpoint_state` prime must be CONDITIONAL
+/// (`entry().or_insert`) so it does NOT overwrite the live connection's real
+/// `WorkerId` with the `__reloaded_unconfirmed__` sentinel — otherwise the
+/// never-reconnect sweep would later DROP the LIVE worker's locality entries.
+///
+/// Composition: connect worker E live (real connect → live `endpoint_state`
+/// owner) + register a live blob for E (models a BlobsAvailable that already
+/// landed), THEN reload a persist file that ALSO names E (with a stale digest +
+/// the persisted boot_epoch). With the conditional prime, E keeps its live
+/// owner, so a subsequent grace-elapsed sweep does NOT touch it and the LIVE
+/// blob survives.
+///
+/// Mutation (revert the conditional prime to an unconditional
+/// `state.insert(...)`): the reload clobbers E's live owner with the sentinel →
+/// the `sweep_unconfirmed(ZERO)` drops E → `lookup_workers(live_digest)` is
+/// empty → the final assert red-fails with its bespoke message.
+#[nativelink_test]
+async fn reload_does_not_clobber_live_reconnected_endpoint()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (server, locality_map) = make_server()?;
+    let endpoint = "grpc://w-race:50081";
+    let live_digest = digest(0x44, 100);
+    let stale_digest = digest(0x45, 200);
+
+    // The worker connected LIVE before the reload's priming loop (it raced the
+    // reload window and won). Real connect → live endpoint_state owner.
+    let (_tx, _stream) = open_worker_connection(&server, endpoint, 9999).await?;
+    // A BlobsAvailable that already landed for the live worker: register a live
+    // blob in the locality map under E.
+    locality_map.write().register_blobs(endpoint, &[live_digest]);
+    assert_eq!(
+        locality_map.read().lookup_workers(&live_digest).len(),
+        1,
+        "pre-condition: the live worker's blob is registered"
+    );
+
+    // Reload a persist file that ALSO names E (stale digest + persisted epoch).
+    // The conditional prime must NOT overwrite E's live owner with the sentinel.
+    let bytes = persisted_bytes(vec![(endpoint, 1234, vec![stale_digest])]);
+    let path = write_persist_file(&bytes).await;
+    tokio::time::timeout(DEADLOCK_DETECTOR, server.reload_locality_from_disk(&path))
+        .await
+        .expect("reload must not hang")
+        .expect("reload must succeed");
+
+    // Grace-elapsed sweep (grace=ZERO). If the reload clobbered E's live owner
+    // with the sentinel, this sweeps E and wipes the LIVE worker's blob.
+    let swept = server.sweep_unconfirmed_reloaded_locality(Duration::ZERO);
+    assert_eq!(
+        swept, 0,
+        "a LIVE reconnected endpoint must NOT be swept — its real owner must \
+         survive the reload (mutation: unconditional reload state.insert \
+         clobbers the live owner with the sentinel, so the sweep drops it)"
+    );
+
+    // THE LOAD-BEARING ASSERTION: the live worker's blob survives.
+    assert_eq!(
+        locality_map.read().lookup_workers(&live_digest).len(),
+        1,
+        "the LIVE reconnected worker's locality entry was CLOBBERED by the \
+         reload and then swept — reload `state.insert` must be conditional \
+         (`entry().or_insert`) so it never overwrites a live connection's owner. \
+         Found: {:?}",
+        locality_map.read().lookup_workers(&live_digest)
+    );
+    Ok(())
+}

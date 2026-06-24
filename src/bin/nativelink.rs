@@ -46,7 +46,9 @@ use nativelink_service::execution_server::ExecutionServer;
 use nativelink_service::fetch_server::FetchServer;
 use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
-use nativelink_service::worker_api_server::WorkerApiServer;
+use nativelink_service::worker_api_server::{
+    LOCALITY_PERSIST_RECONNECT_GRACE_SECS, WorkerApiServer,
+};
 use nativelink_util::blob_locality_map;
 use nativelink_store::completeness_checking_store::inject_h4_pending_registry_into_ac_chains;
 use nativelink_store::store_manager::{StoreManager, build_store_manager};
@@ -1645,6 +1647,37 @@ async fn inner_main(
         });
     }
 
+    // (#58 directive-3) NEVER-RECONNECT TTL SWEEP driver. The startup reload
+    // primes a sentinel (`__reloaded_unconfirmed__`) owner for every persisted
+    // endpoint; a worker that reconnects overwrites it with a real WorkerId, but
+    // a DECOMMISSIONED / renamed worker never does — so without a sweep its
+    // reloaded entries are IMMORTAL (the "hold-forever" behavior design §4.4
+    // explicitly rejected), feeding doomed peer-fetch attempts against a dead
+    // endpoint. `sweep_unconfirmed` is internally gated on the reload baseline +
+    // grace (it no-ops until the reload is ≥ grace old), so a one-shot fire at
+    // grace after boot drops exactly the endpoints that never reconnected within
+    // the window. One-shot (not periodic): the reload happens once per boot, so
+    // a single sweep at grace covers the whole reloaded set; a worker that
+    // reconnects after grace simply re-registers (its entries are live, not
+    // sentinel). Best-effort: a `None` persister (no worker_api) skips it.
+    {
+        let sweep_persister = locality_persister.clone();
+        #[expect(clippy::disallowed_methods, reason = "one-shot locality sweep task spawned in inner_main")]
+        tokio::spawn(async move {
+            let Some(persister) = sweep_persister else {
+                return;
+            };
+            let grace = Duration::from_secs(LOCALITY_PERSIST_RECONNECT_GRACE_SECS);
+            tokio::time::sleep(grace).await;
+            let swept = persister.sweep_unconfirmed(grace);
+            info!(
+                swept,
+                grace_secs = LOCALITY_PERSIST_RECONNECT_GRACE_SECS,
+                "never-reconnect locality sweep fired (one-shot at grace after boot)"
+            );
+        });
+    }
+
     // Move into an Option so the per-entry loop can `.take()` it exactly once.
     let mut pre_built_worker_api_holder = pre_built_worker_api_holder;
 
@@ -2701,8 +2734,12 @@ async fn inner_main(
             // 2026-06-23 17:38 restart lost 827,204 SMALL_CAS_CACHED blobs to a
             // 30 s deadline. Trade-off: a wedged slow tier blocks SIGTERM-to-exit
             // indefinitely; systemd `TimeoutStopSec=infinity` is required.
+            // Phase-1 in-flight-drain budget, shared by the Phase 1+2 flush and
+            // the Phase 3.6 post-pull flush. Bounds ONLY the in-flight drain;
+            // the fast→slow Phase-2 drain each invocation runs is unbounded
+            // (`None`).
+            let flush_budget = Duration::from_secs(30);
             if let Some(sm) = STORE_MANAGER.get() {
-                let flush_budget = Duration::from_secs(30);
                 let flush_start = std::time::Instant::now();
                 info!(
                     phase_1_timeout_secs = flush_budget.as_secs(),
@@ -2742,6 +2779,50 @@ async fn inner_main(
                 );
             } else {
                 info!("no worker-pull handle (no worker_api entry); skipping pull phase");
+            }
+
+            // Phase 3.6 (#58 directive-1 re-run, post-pull DURABILITY barrier):
+            // the Phase-3 pull lands worker-only blobs into the server CAS via
+            // the normal write path — which puts them in the fast-tier
+            // MemoryStore and SPAWNS the slow-tier write async
+            // (`fast_slow_store.rs` `update` → `tokio::spawn`). The pull's
+            // completion check is `has_with_results`, which returns `Some` for a
+            // blob present ONLY in the volatile in-flight map / fast tier (it is
+            // NOT a durability check — fast_slow_store.rs `has_with_results`
+            // reads `in_flight_slow_writes`). So when the pull future resolves,
+            // an unknown subset of the pulled blobs is still MemoryStore-only
+            // with a RACING async slow write that the process exit would abandon.
+            //
+            // Phase 2 ran BEFORE the pull, so it never saw these pull-landed
+            // blobs. Re-run the unbounded flush HERE so every pulled blob is
+            // DURABLE on the slow tier before persist/eviction/exit. This
+            // mirrors the smallack path's "await the durable slow write" intent
+            // for the large/chunked class. The second flush is BOUNDED +
+            // IDEMPOTENT: `flush_fast_to_slow_at_shutdown` `slow.has`-skips every
+            // blob the first flush already persisted (CAS content-addressed, so
+            // a redundant write is a no-op), so it only drives the NEW
+            // pull-landed residue — it does not re-walk the whole tier's work.
+            //
+            // UNBOUNDED (same directive as Phase 2): `flush_budget` bounds only
+            // the Phase-1 in-flight drain inside `flush_slow_writes`; the
+            // Phase-2 fast→slow drain it runs is `None`/unbounded.
+            if let Some(sm) = STORE_MANAGER.get() {
+                let post_pull_start = std::time::Instant::now();
+                info!(
+                    "post-pull durability flush (Phase 3.6): draining pull-landed \
+                     MemoryStore-only blobs to the slow tier before persist/exit",
+                );
+                sm.flush_slow_writes(flush_budget).await;
+                info!(
+                    elapsed_ms = u64::try_from(post_pull_start.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "post-pull durability flush returned",
+                );
+            } else {
+                warn!(
+                    "STORE_MANAGER not initialized at shutdown; \
+                     skipping post-pull durability flush",
+                );
             }
 
             // Phase 3.5 (#58 directive-3): PERSIST the locality map to NVMe

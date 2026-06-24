@@ -21,20 +21,26 @@
 //! On SIGTERM the server's graceful-shutdown sequence must converge the
 //! in-flight write set to zero (so the directive-1 flush + the directive-2
 //! worker-pull can reach a fixed point) instead of chasing newly-arriving
-//! Bazel writes. To do that we QUIESCE the Bazel-facing REAPI listeners
-//! (`:50051` / `:50071` / `:50072` — CAS / AC / ByteStream / Execution /
-//! Capabilities) at the very START of shutdown: any NEW request on those
-//! listeners gets `Code::Unavailable`; requests already in-flight finish
+//! Bazel writes. To do that we QUIESCE the PUBLIC Bazel-facing REAPI listener
+//! (the `:50051` public listener — CAS / AC / ByteStream / Execution /
+//! Capabilities) at the very START of shutdown: any NEW request on that
+//! listener gets `Code::Unavailable`; requests already in-flight finish
 //! normally (this layer only gates the entry of a new request, it does not
 //! interrupt a running one — hyper's `GracefulShutdown` GOAWAY at the later
 //! drain step handles in-flight completion).
 //!
-//! CRITICAL — the worker API listener (`:50061`) MUST NOT be quiesced. The
-//! directive-2 pull phase needs CONNECTED workers to push their blobs to the
-//! server; quiescing `:50061` would sever the very transport the pull relies
-//! on. So this layer is applied ONLY to listeners whose `services.worker_api`
-//! is `None` (every Bazel-facing listener), never to the worker_api listener.
-//! The bin's listener loop owns that selection.
+//! SELECTION — explicit per-listener `quiesce_on_shutdown` config flag, NOT a
+//! `services.worker_api.is_none()` heuristic. The heuristic was REJECTED (see
+//! the `quiesce_on_shutdown` config-schema doc in `cas_server.rs`): the
+//! worker-facing CAS listeners (`:50071` / `:50072`) ALSO have no `worker_api`
+//! service, so an `is_none()` heuristic would WRONGLY quiesce them — and the
+//! directive-2 worker-pull pushes worker blobs THROUGH `:50071`/`:50072`, so
+//! quiescing those would sever the pull. The flag is therefore set ONLY on the
+//! public `:50051` listener. The worker API control-plane listener (`:50061`)
+//! and the worker-CAS listeners (`:50071`/`:50072`) are NEVER quiesced — the
+//! pull needs all of them open. The bin's listener loop reads
+//! `server_cfg.quiesce_on_shutdown` per listener and applies this layer only
+//! where it is `true`.
 //!
 //! Mechanism mirrors `nativelink_util::telemetry::OtlpLayer` /
 //! `OtlpMiddleware` (the existing in-repo `tower::Layer` + `tower::Service`
