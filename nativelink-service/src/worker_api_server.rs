@@ -1014,6 +1014,337 @@ impl WorkerApiServer {
     ) -> Result<Response<ConnectWorkerStream>, Error> {
         self.inner_connect_worker(update_stream).await
     }
+
+    /// (#58 directive-2: server durability bundle — shutdown WORKER-PULL phase)
+    ///
+    /// Pull every worker-resident CAS blob the server does NOT already hold
+    /// durably down to the server CAS, so that after a restart the server
+    /// serves ALL blobs locally with ZERO dependence on worker re-backfill
+    /// (closes the 2026-06-23 restart's "lost input #21" window — design
+    /// `shutdown-pull-worker-blobs-design-2026-06-23.md`).
+    ///
+    /// MUST run BEFORE worker eviction (the SIGTERM handler reorders it ahead
+    /// of `scheduler.shutdown`): eviction disconnects workers, wiping both the
+    /// enumeration source (`locality_map`) and the transport
+    /// (`SmallBlobDispatcher` `worker_tx`). You cannot pull from a worker you
+    /// have already evicted.
+    ///
+    /// UNBOUNDED time (operator directive 2026-06-23: "can't shutdown until we
+    /// have pulled all remote blobs on workers into disk on the server"). NO
+    /// per-RPC timeout — liveness is the skip-policy + the no-progress
+    /// watchdog, consistent with the no-internal-RPC-timeout invariant. The
+    /// loop terminates when the residual is empty OR every residual digest has
+    /// zero connected source OR the no-progress watchdog fires; never wedges.
+    ///
+    /// Mechanism: REUSES the existing worker-push backfill
+    /// (`WorkerConnection::request_missing_blob_uploads`) — the SAME
+    /// `has_with_results`-gated `mark_stable` (BIS durability oath, design §9,
+    /// NOT weakened) + the SAME `UploadMissingBlobs` send the worker handles
+    /// via `local_worker.rs:handle_upload_missing_blobs` (streams blob → server
+    /// CAS, never buffers the whole blob). The ONLY new code here is the
+    /// completion-detection poll loop + the enumeration + the skip-policy + the
+    /// progress logging. No new proto, no new transfer mechanism, no fsync —
+    /// blobs land via the normal async CAS write path (durability = mirror
+    /// ≥2-replica + ZFS `sync=disabled`).
+    pub async fn pull_all_worker_blobs_at_shutdown(&self) -> ShutdownPullSummary {
+        let Some(puller) = self.shutdown_puller() else {
+            info!(
+                "shutdown pull phase: no locality_map / cas_store / dispatcher \
+                 configured — nothing to pull (standalone / test run without \
+                 worker mirror)"
+            );
+            return ShutdownPullSummary::default();
+        };
+        puller.run().await
+    }
+
+    /// (#58 directive-2) Build the standalone [`ShutdownPuller`] handle the
+    /// SIGTERM closure drives BEFORE the `WorkerApiServer` is consumed by
+    /// `into_service` (the tonic service owns it by value, so the bin cannot
+    /// keep the server itself — design §3.4 / F5). The handle holds cheap
+    /// clones of exactly the four shared handles the pull reads
+    /// (`locality_map`, `cas_store`, `small_blob_dispatcher`, `metrics`); all
+    /// are process-wide `Arc`/`Store` singletons, so the handle observes the
+    /// SAME live locality map + CAS the server does. Returns `None` when any of
+    /// the three required handles is absent (standalone / test runs).
+    #[must_use]
+    pub fn shutdown_puller(&self) -> Option<ShutdownPuller> {
+        let locality_map = self.locality_map.clone()?;
+        let cas_store = self.cas_store.clone()?;
+        let dispatcher = self.small_blob_dispatcher.clone()?;
+        Some(ShutdownPuller {
+            locality_map,
+            cas_store,
+            dispatcher,
+            metrics: self.metrics.clone(),
+        })
+    }
+}
+
+/// (#58 directive-2: server durability bundle — shutdown WORKER-PULL phase)
+///
+/// Standalone handle that drives the shutdown worker-pull. Held by the SIGTERM
+/// closure in `nativelink.rs` (built via [`WorkerApiServer::shutdown_puller`]
+/// before the server is moved into its tonic service) and used by tests via
+/// [`WorkerApiServer::pull_all_worker_blobs_at_shutdown`], which delegates here.
+///
+/// Pulls every worker-resident CAS blob the server does NOT already hold
+/// durably down to the server CAS, so that after a restart the server serves
+/// ALL blobs locally with ZERO dependence on worker re-backfill (closes the
+/// 2026-06-23 restart's "lost input #21" window — design
+/// `shutdown-pull-worker-blobs-design-2026-06-23.md`).
+///
+/// MUST run BEFORE worker eviction (the SIGTERM handler reorders it ahead of
+/// `scheduler.shutdown`): eviction disconnects workers, wiping both the
+/// enumeration source (`locality_map`) and the transport (`SmallBlobDispatcher`
+/// `worker_tx`). You cannot pull from a worker you have already evicted.
+///
+/// UNBOUNDED time (operator directive 2026-06-23: "can't shutdown until we have
+/// pulled all remote blobs on workers into disk on the server"). NO per-RPC
+/// timeout — liveness is the skip-policy + the no-progress watchdog, consistent
+/// with the no-internal-RPC-timeout invariant. The loop terminates when the
+/// residual is empty OR every residual digest has zero connected source OR the
+/// no-progress watchdog fires; never wedges.
+///
+/// Mechanism: REUSES the existing worker-push backfill
+/// (`WorkerConnection::request_missing_blob_uploads`) — the SAME
+/// `has_with_results`-gated `mark_stable` (BIS durability oath, design §9, NOT
+/// weakened) + the SAME `UploadMissingBlobs` send the worker handles via
+/// `local_worker.rs:handle_upload_missing_blobs` (streams blob → server CAS,
+/// never buffers the whole blob). The ONLY new code is the completion-detection
+/// poll loop + the enumeration + the skip-policy + the progress logging. No new
+/// proto, no new transfer mechanism, no fsync — blobs land via the normal async
+/// CAS write path (durability = mirror ≥2-replica + ZFS `sync=disabled`).
+#[derive(Clone)]
+pub struct ShutdownPuller {
+    locality_map: SharedBlobLocalityMap,
+    cas_store: Store,
+    dispatcher: Arc<SmallBlobDispatcher>,
+    metrics: Arc<WorkerApiMetrics>,
+}
+
+impl ShutdownPuller {
+    /// Drive the shutdown worker-pull to completion. See the type docs.
+    pub async fn run(&self) -> ShutdownPullSummary {
+        let start = Instant::now();
+        let locality_map = &self.locality_map;
+        let cas_store = &self.cas_store;
+        let dispatcher = &self.dispatcher;
+
+        // Enumeration (design §4): snapshot the locality map ONCE under the
+        // read lock into an owned Vec, then drop the lock. digest → the set of
+        // worker endpoints that hold it.
+        // CAPPED AT digest_count(): one-shot locality snapshot, ~40 B/digest +
+        // a small endpoint Vec, dropped when this fn returns. Bounded by the
+        // fleet CAS union; blob BYTES are never collected here — they stream
+        // worker → server CAS → disk via the existing backfill path.
+        let pull_set: Vec<(DigestInfo, Vec<Arc<str>>)> = {
+            let guard = locality_map.read();
+            guard
+                .blobs_map()
+                .iter()
+                .map(|(digest, endpoints)| {
+                    (*digest, endpoints.iter().cloned().collect::<Vec<Arc<str>>>())
+                })
+                .collect()
+        };
+        let connected_count = dispatcher.connected_workers_with_senders().len();
+        info!(
+            pull_set = pull_set.len(),
+            connected_workers = connected_count,
+            "shutdown pull phase starting"
+        );
+        if pull_set.is_empty() {
+            return ShutdownPullSummary {
+                pulled: 0,
+                at_risk_skipped: 0,
+                elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            };
+        }
+
+        // Residual: digest → known-holder endpoints. Mutated as digests land.
+        let mut residual: HashMap<DigestInfo, Vec<Arc<str>>> = pull_set.into_iter().collect();
+
+        // Drop digests ALREADY present in the server CAS up front (design §4.2:
+        // the directive-1 flush already persisted MemoryStore-only blobs, so a
+        // large fraction of the set is typically already present). These are
+        // NOT counted in `pulled` — `pulled` reports only blobs the pull itself
+        // localized (digests that go absent → present DURING the loop).
+        Self::drop_present_from_residual(cas_store, &mut residual).await;
+
+        let mut pulled = 0usize;
+        let mut no_progress_iters: u32 = 0;
+        let mut at_risk_skipped = 0usize;
+
+        loop {
+            if residual.is_empty() {
+                break;
+            }
+
+            // Recompute the connected-worker set + transport EVERY iteration so
+            // a mid-pull disconnect drops that worker from the source set and
+            // the next iteration re-routes to a surviving replica (design §5.2).
+            let connected: HashMap<Arc<str>, mpsc::UnboundedSender<UpdateForWorker>> = dispatcher
+                .connected_workers_with_senders()
+                .into_iter()
+                .map(|(endpoint, _epoch, tx)| (endpoint, tx))
+                .collect();
+
+            // Count residual digests that STILL have ≥1 connected source.
+            // A digest is unpullable ONLY if ALL of its locality-workers are
+            // disconnected (design §5.3); given ≥2-replica that requires ≥2
+            // simultaneous worker losses at shutdown.
+            let pullable_remaining = residual
+                .values()
+                .filter(|endpoints| endpoints.iter().any(|ep| connected.contains_key(ep)))
+                .count();
+
+            if pullable_remaining == 0 {
+                // Nothing left has a connected source: every residual digest is
+                // unpullable. Skip them all (NEVER wedge) and exit. Justified by
+                // ≥2-replica (design §5.3): a zero-connected-source blob is
+                // exactly the case where the invariant was already violated
+                // (both replicas gone). Phase 3 cannot conjure a blob no
+                // connected worker holds, and refusing to exit would only
+                // deadlock the restart — strictly worse than a single-blob gap.
+                for digest in residual.keys() {
+                    let endpoints: Vec<&Arc<str>> = residual[digest].iter().collect();
+                    warn!(
+                        ?digest,
+                        known_workers = ?endpoints,
+                        "at-risk unpullable on shutdown: all_disconnected — no \
+                         connected worker holds this blob; skipping (≥2-replica \
+                         already violated, refusing to wedge the restart)"
+                    );
+                }
+                // Escalate the entire residual to at-risk-skip and exit. (To
+                // reproduce the zero-source wedge for the
+                // `shutdown_pull_skips_zero_source_blob_and_does_not_hang`
+                // mutation: replace these three lines with `continue;` — the
+                // loop then spins forever and the test's deadlock detector
+                // fires with its bespoke "MUST NOT wedge" message.)
+                at_risk_skipped += residual.len();
+                residual.clear();
+                break;
+            }
+
+            // For each connected worker, drive the existing backfill send-half
+            // for the subset of the residual that worker holds. A FRESH
+            // per-iteration inflight map means no digest is suppressed across
+            // iterations, so a re-route to a sibling on the NEXT iteration is
+            // immediate (not blocked by the 60 s production re-request window).
+            let fresh_inflight = parking_lot::Mutex::new(HashMap::new());
+            for (endpoint, tx) in &connected {
+                let subset: Vec<DigestInfo> = residual
+                    .iter()
+                    .filter(|(_, endpoints)| endpoints.iter().any(|ep| ep == endpoint))
+                    .map(|(d, _)| *d)
+                    .collect();
+                if subset.is_empty() {
+                    continue;
+                }
+                // Synthetic WorkerId for the backfill log lines (transport is
+                // the tx; the id is only used for logging in the send-half).
+                let worker_id = WorkerId(endpoint.to_string());
+                WorkerConnection::request_missing_blob_uploads(
+                    cas_store,
+                    tx,
+                    &worker_id,
+                    &subset,
+                    &fresh_inflight,
+                    // send_uploads_if_missing: the pull MUST send (no cooldown).
+                    true,
+                    &self.metrics,
+                )
+                .await;
+            }
+
+            // Give the worker uploads a moment to land, then re-check the
+            // residual for completion (design §3.2 step 4).
+            tokio::time::sleep(SHUTDOWN_PULL_POLL_INTERVAL).await;
+            let before = residual.len();
+            Self::drop_present_from_residual(cas_store, &mut residual).await;
+            let landed = before - residual.len();
+            pulled += landed;
+
+            // No-progress watchdog (design §7): a half-open / stalled worker
+            // keeps a digest's source "connected" but never uploads. If the
+            // residual does not shrink for SHUTDOWN_PULL_NO_PROGRESS_ITERS
+            // consecutive polls, escalate the remaining residual to at-risk-
+            // skip and exit so the unbounded loop cannot wedge the restart.
+            if landed == 0 {
+                no_progress_iters += 1;
+            } else {
+                no_progress_iters = 0;
+            }
+            info!(
+                pulled,
+                remaining = residual.len(),
+                at_risk = at_risk_skipped,
+                no_progress_iters,
+                "shutdown pull progress"
+            );
+            if no_progress_iters >= SHUTDOWN_PULL_NO_PROGRESS_ITERS {
+                for digest in residual.keys() {
+                    let endpoints: Vec<&Arc<str>> = residual[digest].iter().collect();
+                    warn!(
+                        ?digest,
+                        known_workers = ?endpoints,
+                        no_progress_iters,
+                        "at-risk unpullable on shutdown: stalled_source — a \
+                         connected worker holds this blob but has not uploaded \
+                         within the no-progress window; skipping (refusing to \
+                         wedge the restart)"
+                    );
+                }
+                at_risk_skipped += residual.len();
+                residual.clear();
+                break;
+            }
+        }
+
+        let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        info!(
+            pulled,
+            at_risk_skipped, elapsed_ms, "shutdown pull complete"
+        );
+        ShutdownPullSummary {
+            pulled,
+            at_risk_skipped,
+            elapsed_ms,
+        }
+    }
+
+    /// Remove from `residual` every digest now present in the server CAS,
+    /// batched (`BACKFILL_BATCH_SIZE`) to avoid an O(N) per-digest existence
+    /// storm. Errors on a batch are logged and that batch is left in the
+    /// residual (a transient `has_with_results` failure must not drop a
+    /// not-yet-durable blob from the pull set).
+    async fn drop_present_from_residual(
+        cas_store: &Store,
+        residual: &mut HashMap<DigestInfo, Vec<Arc<str>>>,
+    ) {
+        let digests: Vec<DigestInfo> = residual.keys().copied().collect();
+        for chunk in digests.chunks(BACKFILL_BATCH_SIZE) {
+            let keys: Vec<StoreKey<'_>> = chunk.iter().map(|d| StoreKey::from(*d)).collect();
+            let mut results = vec![None; keys.len()];
+            if let Err(err) = cas_store.has_with_results(&keys, &mut results).await {
+                warn!(
+                    ?err,
+                    count = chunk.len(),
+                    "shutdown pull: has_with_results failed for a residual batch; \
+                     leaving it in the pull set (a transient failure must not \
+                     drop a not-yet-durable blob)"
+                );
+                continue;
+            }
+            for (digest, present) in chunk.iter().zip(results.iter()) {
+                if present.is_some() {
+                    residual.remove(digest);
+                }
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -1058,6 +1389,46 @@ const BACKFILL_COOLDOWN_SECS: u64 = 5;
 /// re-requested. If a worker hasn't uploaded the blob within this window,
 /// the request is assumed to have failed silently.
 const BACKFILL_INFLIGHT_TIMEOUT_SECS: u64 = 60;
+
+/// (#58 directive-2 shutdown worker-pull) Poll interval between completion
+/// re-checks in `pull_all_worker_blobs_at_shutdown`. Short enough that the
+/// shutdown pull observes worker uploads landing promptly; long enough that
+/// the `has_with_results` re-check of the residual is not a hot loop. The
+/// existence check is mostly served by `ExistenceCacheStore` so the per-poll
+/// cost is small even at fleet scale.
+const SHUTDOWN_PULL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// (#58 directive-2) No-progress watchdog threshold for the shutdown pull.
+/// A half-open / stalled worker (live TCP, no upload) keeps a digest's source
+/// "connected" but never delivers the blob; without a watchdog the unbounded
+/// loop would hang forever (a restart-wedge strictly worse than the NotFound
+/// window the pull replaces — design §7). If this many consecutive poll
+/// iterations reduce the residual by ZERO, the pull escalates the entire
+/// remaining residual to at-risk-skip and exits. The window
+/// (`SHUTDOWN_PULL_POLL_INTERVAL` × this) is a small multiple of the
+/// `BACKFILL_INFLIGHT_TIMEOUT_SECS = 60` re-request window so a transiently
+/// slow (but live) upload is NOT prematurely abandoned: 280 × 250 ms = 70 s.
+const SHUTDOWN_PULL_NO_PROGRESS_ITERS: u32 = 280;
+
+/// Outcome of `WorkerApiServer::pull_all_worker_blobs_at_shutdown`.
+///
+/// `pulled` + `at_risk_skipped` together account for the whole pull set; a
+/// non-zero `at_risk_skipped` means some worker-only blob(s) could not be
+/// localized because no connected worker held them (the ≥2-replica invariant
+/// was already violated for those — design §5). The SIGTERM handler logs this
+/// and proceeds: refusing to exit would deadlock the restart, which is
+/// strictly worse than the durability gap the ≥2-replica invariant already
+/// makes unlikely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShutdownPullSummary {
+    /// Worker-only digests localized to the server CAS during the pull.
+    pub pulled: usize,
+    /// Worker-only digests SKIPPED because no connected worker held them
+    /// (zero-connected-source) or the no-progress watchdog fired.
+    pub at_risk_skipped: usize,
+    /// Wall-clock duration of the pull, milliseconds.
+    pub elapsed_ms: u64,
+}
 
 struct WorkerConnection {
     scheduler: Arc<dyn WorkerScheduler>,

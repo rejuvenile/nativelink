@@ -37,6 +37,7 @@ use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
 use nativelink_service::ac_server::{AcServer, SharedLivenessChecker};
+use nativelink_service::bazel_reapi_quiesce::BazelReapiQuiesce;
 use nativelink_service::bep_server::BepServer;
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_service::capabilities_server::CapabilitiesServer;
@@ -1434,6 +1435,16 @@ async fn inner_main(
     #[cfg(target_family = "unix")]
     let mut drain_receivers: Vec<oneshot::Receiver<()>> = Vec::new();
 
+    // (#58 directive-2) Bazel-REAPI quiesce latch. ONE shared instance cloned
+    // into every listener whose config sets `quiesce_on_shutdown: true` (the
+    // PUBLIC Bazel-client listener only, e.g. `:50051`) and into the SIGTERM
+    // handler (which flips it at shutdown START so the flush + worker-pull can
+    // converge instead of chasing new Bazel writes). The worker-facing CAS
+    // listeners (`:50071`/`:50072`) and the worker_api listener (`:50061`) do
+    // NOT set the flag, so they stay fully OPEN through shutdown — the pull
+    // needs them. See `BazelReapiQuiesce` docs + `quiesce_on_shutdown` config.
+    let bazel_reapi_quiesce = BazelReapiQuiesce::new();
+
     // (#12 H4 cross-entry scoping fix) PRE-PASS: scan ALL server entries to build
     // WorkerApiServer ONCE and extract liveness_checker BEFORE the per-entry loop.
     //
@@ -1489,6 +1500,17 @@ async fn inner_main(
     if let Some(ref server) = pre_built_worker_api_holder {
         metrics_registry.register("worker_api", server.metrics());
     }
+
+    // (#58 directive-2) Capture the shutdown worker-pull handle BEFORE the
+    // `WorkerApiServer` is consumed by `into_service` in the per-entry loop
+    // below. The handle holds cheap clones of the shared {locality_map,
+    // cas_store, small_blob_dispatcher, metrics} the pull reads, so the SIGTERM
+    // closure can drive the pull while workers are still connected. `None` when
+    // there is no worker_api entry (the pull is then a no-op). See
+    // `WorkerApiServer::shutdown_puller` / design §3.4.
+    let shutdown_puller = pre_built_worker_api_holder
+        .as_ref()
+        .and_then(WorkerApiServer::shutdown_puller);
 
     // Note on test coverage: `inject_h4_pending_registry_into_ac_chains` is
         // unit-tested via `split_topology_ac_ccs_receives_registry`. The
@@ -1818,6 +1840,25 @@ async fn inner_main(
 
         let health_registry = health_registry_builder.lock().await.build();
 
+        // (#58 directive-2) Whether this listener is quiesced at shutdown START
+        // (Bazel-facing REAPI rejected with UNAVAILABLE). Read BEFORE the match
+        // moves `server_cfg.listener`. A QUIC listener cannot take the
+        // request-level quiesce layer (the H3 router is a `Routes` newtype with
+        // no per-request layer point); warn loudly if one is marked so the
+        // operator knows the quiesce did NOT apply rather than silently failing.
+        let quiesce_this_listener = server_cfg.quiesce_on_shutdown;
+        if quiesce_this_listener {
+            if let ListenerConfig::Http3(_) = server_cfg.listener {
+                warn!(
+                    server = %server_cfg.name,
+                    "quiesce_on_shutdown set on a QUIC/HTTP3 listener, but the \
+                     request-level Bazel-REAPI quiesce only applies to HTTP/2 \
+                     listeners — this QUIC listener will NOT be quiesced at \
+                     shutdown; move the Bazel-client REAPI to an HTTP/2 listener \
+                     or rely on the connection-level accept-stop"
+                );
+            }
+        }
         match server_cfg.listener {
         ListenerConfig::Http(http_config) => {
         let mut svc =
@@ -1826,6 +1867,22 @@ async fn inner_main(
                 .layer(nativelink_util::telemetry::OtlpLayer::new(
                     server_cfg.experimental_identity_header.required,
                 ));
+
+        // (#58 directive-2) On the PUBLIC Bazel-client listener, wrap the
+        // router in the quiesce layer so that once the SIGTERM handler flips
+        // the shared latch, new CAS/AC/ByteStream/Execution requests get
+        // `Code::Unavailable` while in-flight ones drain. Applied OUTSIDE the
+        // OtlpLayer so a quiesced request still short-circuits before any
+        // CAS/AC work. No-op (zero overhead beyond one Relaxed atomic load per
+        // request) until the latch is flipped.
+        if quiesce_this_listener {
+            info!(
+                server = %server_cfg.name,
+                "Bazel-REAPI quiesce armed on this listener: new requests will \
+                 be rejected with UNAVAILABLE once graceful shutdown begins"
+            );
+            svc = svc.layer(bazel_reapi_quiesce.layer());
+        }
 
         if let Some(health_cfg) = services.health {
             let path = if health_cfg.path.is_empty() {
@@ -2461,15 +2518,23 @@ async fn inner_main(
         }
     }
 
-    // Graceful SIGTERM handler: evict workers → stop accepting →
-    // drain connections → flush writes → shut down local workers → exit.
+    // Graceful SIGTERM handler (#58 directive-2 reorder). New ordering:
+    //   quiesce Bazel REAPI → flush server fast tier → PULL worker-only blobs
+    //   (workers still connected) → [directive-3 persist-locality slot] → evict
+    //   workers → stop accepting → drain → shut down local workers → exit.
+    // Eviction MUST stay before listener-drain (preserves `21c78b53`: evicting
+    // closes ConnectWorker streams so :50061 drains fast) but MUST move AFTER
+    // the pull (you cannot pull from a worker you have already evicted).
     #[cfg(target_family = "unix")]
     {
         let shutdown_tx_clone = shutdown_tx.clone();
-        // Clone schedulers so SIGTERM handler can evict workers before
-        // draining connections. This ensures ConnectWorker streams close
-        // promptly (no 30s timeout) and no new work is assigned during drain.
+        // Clone schedulers so SIGTERM handler can evict workers (after the
+        // pull) before draining connections.
         let schedulers_for_shutdown: Vec<_> = worker_schedulers.values().cloned().collect();
+        // (#58 directive-2) The Bazel-REAPI quiesce latch (flipped first) and
+        // the worker-pull handle (driven before eviction), captured by move.
+        let shutdown_quiesce = bazel_reapi_quiesce.clone();
+        let shutdown_puller = shutdown_puller;
         #[expect(clippy::disallowed_methods, reason = "signal handler spawned in inner_main")]
         tokio::spawn(async move {
             signal(SignalKind::terminate())
@@ -2478,9 +2543,86 @@ async fn inner_main(
                 .await;
             warn!("SIGTERM received, starting graceful shutdown");
 
-            // Step 1: Evict all remote workers from schedulers. This closes
-            // their ConnectWorker streams so port 50061 drains promptly,
-            // and prevents the scheduler from assigning new work during drain.
+            // Phase 0 (#58 directive-2): QUIESCE the Bazel-facing REAPI. New
+            // CAS/AC/ByteStream/Execution requests on the public listener now
+            // get UNAVAILABLE so the flush + pull below converge to a fixed
+            // point instead of chasing newly-arriving Bazel writes (operator
+            // directive 2026-06-23: "no more bazel REAPI once shutdown starts").
+            // The worker-facing CAS listeners (:50071/:50072) and the
+            // worker_api control plane (:50061) are NOT quiesced — the pull
+            // needs them OPEN. In-flight requests still drain.
+            shutdown_quiesce.quiesce();
+            info!("Bazel REAPI quiesced; new client requests will get UNAVAILABLE");
+
+            // Phase 1+2 (#210, moved up): flush in-flight slow writes + drain
+            // every MemoryStore-only CAS blob to the durable slow tier, BEFORE
+            // the pull so the pull's existence check sees them and does NOT
+            // re-request them from workers. Workers are still connected here.
+            //
+            // CRITICAL: skipping this causes production "Lost inputs no longer
+            // available remotely" Bazel failures — the cas_FAST_SLOW_STORE fast
+            // tier is a MemoryStore that dies with the process; AC entries
+            // reference blobs the slow tier must hold before exit.
+            //
+            // UNBOUNDED Phase 2 (operator directive 2026-06-23): NO outer
+            // wall-clock timeout. Phase 1 (in-flight drain) is internally
+            // bounded by `flush_budget`; Phase 2 (#210 MemoryStore→slow) runs to
+            // COMPLETION so it can never again lose CAS blobs the way the
+            // 2026-06-23 17:38 restart lost 827,204 SMALL_CAS_CACHED blobs to a
+            // 30 s deadline. Trade-off: a wedged slow tier blocks SIGTERM-to-exit
+            // indefinitely; systemd `TimeoutStopSec=infinity` is required.
+            if let Some(sm) = STORE_MANAGER.get() {
+                let flush_budget = Duration::from_secs(30);
+                let flush_start = std::time::Instant::now();
+                info!(
+                    phase_1_timeout_secs = flush_budget.as_secs(),
+                    "flushing in-flight slow writes before shutdown (Phase 2 unbounded)",
+                );
+                // No `tokio::time::timeout`: capping here would cancel the
+                // unbounded Phase-2 drain and re-introduce the #210 data loss.
+                sm.flush_slow_writes(flush_budget).await;
+                info!(
+                    elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "slow-write flush returned",
+                );
+            } else {
+                warn!(
+                    "STORE_MANAGER not initialized at shutdown; \
+                     skipping slow-write flush",
+                );
+            }
+
+            // Phase 3 (#58 directive-2): PULL every worker-only CAS blob into
+            // the server slow tier while workers are STILL CONNECTED, so the
+            // restarted server serves all blobs locally with zero dependence on
+            // worker re-backfill (closes the 2026-06-23 "lost input #21"
+            // window). UNBOUNDED time; terminates via the skip-policy +
+            // no-progress watchdog (never wedges). MUST precede eviction.
+            if let Some(puller) = shutdown_puller.as_ref() {
+                let pull_start = std::time::Instant::now();
+                info!("starting shutdown worker-pull phase (workers still connected)");
+                let summary = puller.run().await;
+                info!(
+                    pulled = summary.pulled,
+                    at_risk_skipped = summary.at_risk_skipped,
+                    elapsed_ms = u64::try_from(pull_start.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "shutdown worker-pull phase complete"
+                );
+            } else {
+                info!("no worker-pull handle (no worker_api entry); skipping pull phase");
+            }
+
+            // [DIRECTIVE-3 INSERTION POINT] persist-locality slot goes HERE —
+            // after the pull localizes worker-only blobs and BEFORE eviction
+            // wipes the locality map. A later directive adds the persist call at
+            // this exact point; do not move eviction above it.
+
+            // Step A (was Step 1): Evict all remote workers from schedulers.
+            // This closes their ConnectWorker streams so port 50061 drains
+            // promptly. Runs AFTER the pull (workers were connected for it) and
+            // BEFORE the listener-drain wait (preserves `21c78b53`).
             // Per-scheduler 10s timeout so a wedged backend can't stall SIGTERM.
             if !schedulers_for_shutdown.is_empty() {
                 info!(
@@ -2506,14 +2648,13 @@ async fn inner_main(
                 );
             }
 
-            // Step 2: Stop accepting new connections. Each HTTP listener
-            // sees this in its select! and starts draining via GOAWAY.
+            // Step B (was Step 2): Stop accepting new connections. Each HTTP
+            // listener sees this in its select! and starts draining via GOAWAY.
             let _ = accept_stop_tx.send(true);
 
-            // Step 3: Wait for all listeners to finish draining in-flight
-            // connections. Each listener has its own 30s drain timeout.
-            // With workers already evicted, ConnectWorker streams should
-            // close quickly so this should complete well under 30s.
+            // Step C (was Step 3): Wait for all listeners to finish draining
+            // in-flight connections. With workers already evicted, ConnectWorker
+            // streams close quickly so this completes well under 35s.
             info!(
                 listeners = drain_receivers.len(),
                 "waiting for listeners to drain"
@@ -2528,55 +2669,9 @@ async fn inner_main(
                 }
             }
 
-            // Step 4: Flush in-flight background slow writes. All RPCs
-            // have completed (or timed out), so all writes are queued.
-            //
-            // CRITICAL: skipping this step causes production
-            // "Lost inputs no longer available remotely" Bazel failures.
-            // The fast tier of cas_FAST_SLOW_STORE is a MemoryStore that
-            // dies with the process. AC entries get written to Redis the
-            // moment the fast write succeeds — if we exit before the
-            // background slow write durably persists the blob to the
-            // FilesystemStore, AC references a blob that no longer exists
-            // anywhere. Bazel asks for the action result, the CAS doesn't
-            // have it, and the build dies across many crates.
-            //
-            // UNBOUNDED Phase 2 (operator directive 2026-06-23): there is NO
-            // outer wall-clock timeout around `flush_slow_writes`. Phase 1
-            // (in-flight slow-write drain) is still internally bounded by
-            // `flush_budget`; Phase 2 (#210 MemoryStore-only → slow tier) runs
-            // to COMPLETION with no deadline so it can never again lose CAS
-            // blobs the way the 2026-06-23 17:38 restart lost 827,204
-            // SMALL_CAS_CACHED blobs to a 30 s deadline. The per-store Phase-2
-            // drain logs forward progress so a long drain is visibly not a
-            // wedge. Trade-off: a genuinely wedged slow tier now blocks
-            // SIGTERM-to-exit indefinitely; systemd `TimeoutStopSec=infinity`
-            // is required so systemd does not SIGKILL the unit mid-flush.
-            if let Some(sm) = STORE_MANAGER.get() {
-                let flush_budget = Duration::from_secs(30);
-                let flush_start = std::time::Instant::now();
-                info!(
-                    phase_1_timeout_secs = flush_budget.as_secs(),
-                    "flushing in-flight slow writes before shutdown (Phase 2 unbounded)",
-                );
-                // No `tokio::time::timeout`: capping here would cancel the
-                // unbounded Phase-2 drain and re-introduce the #210 data loss.
-                sm.flush_slow_writes(flush_budget).await;
-                info!(
-                    elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
-                    "slow-write flush returned",
-                );
-            } else {
-                warn!(
-                    "STORE_MANAGER not initialized at shutdown; \
-                     skipping slow-write flush",
-                );
-            }
-
-            // Step 5: Shut down local workers (20s budget). Remote workers
-            // were already evicted in Step 1; this handles local workers
-            // and the ShutdownGuard coordination.
+            // Step D (was Step 5): Shut down local workers (20s budget). Remote
+            // workers were already evicted above; this handles local workers and
+            // the ShutdownGuard coordination.
             drop(shutdown_tx_clone.send(shutdown_guard.clone()));
             tokio::select! {
                 result = async {

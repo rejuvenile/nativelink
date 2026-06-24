@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod ac_server;
+pub mod bazel_reapi_quiesce;
 pub mod bep_server;
 pub mod blobs_available_accumulator;
 pub mod bytestream_server;

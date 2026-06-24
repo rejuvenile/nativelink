@@ -737,6 +737,29 @@ pub struct ServerConfig {
     /// Default: {see `IdentityHeaderSpec`}
     #[serde(default)]
     pub experimental_identity_header: IdentityHeaderSpec,
+
+    /// (#58 directive-2: server durability bundle) When `true`, this listener's
+    /// Bazel-facing REAPI (CAS / AC / ByteStream / Execution / Capabilities) is
+    /// QUIESCED at the very start of graceful shutdown: new requests are
+    /// rejected with `Code::Unavailable` (the client retries on a healthy
+    /// server) so the shutdown blob-flush + worker-pull can converge to a fixed
+    /// point instead of chasing newly-arriving Bazel writes
+    /// (operator directive 2026-06-23: "no more bazel REAPI once shutdown
+    /// starts"). Existing in-flight requests still drain.
+    ///
+    /// Set this ONLY on the PUBLIC Bazel-client listener (e.g. `:50051`). It
+    /// MUST NOT be set on the worker-facing CAS listeners (`:50071` / `:50072`)
+    /// — the shutdown worker-pull phase needs those endpoints OPEN so workers
+    /// can push their blobs into the server CAS — nor on the worker_api
+    /// scheduler control-plane listener (`:50061`). A boolean on the listener
+    /// (rather than an automatic `services.worker_api.is_none()` heuristic) is
+    /// load-bearing: in production the worker-facing CAS listeners ALSO have no
+    /// `worker_api` service, so an automatic heuristic would wrongly quiesce
+    /// them and sever the worker-pull.
+    ///
+    /// Default: `false` (listener is NOT quiesced at shutdown).
+    #[serde(default)]
+    pub quiesce_on_shutdown: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
