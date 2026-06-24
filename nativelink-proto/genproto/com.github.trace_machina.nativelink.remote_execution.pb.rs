@@ -275,40 +275,45 @@ pub struct BlobsAvailableNotification {
     /// / `sysctl vm.swapusage` (`xsw_usage.xsu_used`); Linux reads
     /// / `/proc/meminfo` (`SwapTotal - SwapFree`). This is ABSOLUTE swap
     /// / occupancy, which LINGERS after memory pressure subsides, so it is
-    /// / a coarse signal only; the `swap_pressure_rate_per_sec` RATE field
-    /// / below is the load-bearing dynamic-pressure indicator. `0` means
-    /// / either "no swap in use" or "sampler unavailable" (indistinguishable
-    /// / on the wire, matching the `cpu_load_pct = 0` unknown convention).
-    /// / The 16 GB Mac workers oversubscribe RAM invisibly under the
-    /// / count-only admission gate (`worker.rs` `can_accept_work`); this
-    /// / surfaces the missing memory signal.
+    /// / a coarse signal only; the `memory_pressure_level` field below is the
+    /// / load-bearing dynamic-pressure indicator. `0` means either "no swap
+    /// / in use" or "sampler unavailable" (indistinguishable on the wire,
+    /// / matching the `cpu_load_pct = 0` unknown convention). The 16 GB Mac
+    /// / workers oversubscribe RAM invisibly under the count-only admission
+    /// / gate (`worker.rs` `can_accept_work`); this surfaces the missing
+    /// / memory signal.
     /// /
     /// / OBSERVABILITY signal: the #37 gate keys off the worker-local atomic
-    /// / (the rate's EWMA), not this wire field; this is surfaced for
+    /// / (the free-floor primary), not this wire field; this is surfaced for
     /// / operator tuning/visibility (per-worker swap occupancy).
     #[prost(uint64, tag = "19")]
     pub swap_used_bytes: u64,
-    /// / Host swap-pressure RATE in events/sec, computed worker-side as the
-    /// / delta of the cumulative swap-pressure counter between FIXED-interval
-    /// / sampler ticks (NOT between heartbeats, whose cadence varies 100 ms
-    /// / to 6 s). macOS reads mach `host_statistics64(HOST_VM_INFO64)`
-    /// / `compressions` (the EARLIEST Apple-Silicon swap-pressure signal —
-    /// / the compressor fires before disk swap; `pageouts` is the WRONG,
-    /// / file-backed counter, see design §0); Linux reads `/proc/vmstat`
-    /// / `pswpout` (the anonymous-swap-out counter). A non-zero rate means
-    /// / the host is ACTIVELY compressing/swapping anonymous memory right now
-    /// / (the thing that makes a swapping Mac slow), whereas `swap_used_bytes`
-    /// / can stay high long after pressure ends. `0` means "no recent
-    /// / pressure" or "sampler unavailable".
+    /// / (#37 rev-4) Worker memory-pressure LEVEL — the in-place repurpose of
+    /// / the former `swap_pressure_rate_per_sec` field (same field NUMBER 20
+    /// / and wire type u32; proto3 field NAMES are off-wire, so this rename is
+    /// / a no-op on the wire). Higher = more pressured; `0` = healthy or
+    /// / sampler unavailable. It is a SHORTFALL gauge: how far the worker's
+    /// / free-page headroom has fallen below the gate's free-floor, expressed
+    /// / in MiB-below-floor (`0` whenever free is at or above the floor). The
+    /// / PRIMARY (leading) gate trip on rev-4 is this free-page FLOOR
+    /// / (`vm_statistics64.free_count` on macOS / `MemAvailable` on Linux);
+    /// / the re-fault rate (`decompressions+swapins` / PSI `full total=`) is
+    /// / the CORROBORATION, not the primary, per design §0-rev4. A monotonic
+    /// / "how pressured" scalar (vs the old re-fault RATE) keeps the server's
+    /// / least-pressured fail-open ranking (`min_by_key` in
+    /// / `api_worker_scheduler.rs`) on a comparable unit across the fleet.
     /// /
-    /// / OBSERVABILITY signal (per-worker pressure rate for operator tuning);
-    /// / the #37 gate keys off the worker-local EWMA, not this wire field.
+    /// / OBSERVABILITY + fail-open RANKING signal; the SAFETY-CRITICAL gate
+    /// / keys off the worker-local atomics (free-floor + re-fault EWMA), not
+    /// / this wire field.
     #[prost(uint32, tag = "20")]
-    pub swap_pressure_rate_per_sec: u32,
-    /// / (#37) Coarse 1-bit swap-pressure verdict — `true` when the worker's
-    /// / local fast-attack/slow-release EWMA of the swap-pressure rate has
-    /// / crossed the gate threshold AND the sample is fresh. ADVISORY ONLY:
-    /// / the matcher uses it for a PROACTIVE skip (mirrors
+    pub memory_pressure_level: u32,
+    /// / (#37) Coarse 1-bit memory-pressure verdict — `true` when the
+    /// / worker's local gate trips: the free-page FLOOR is breached (PRIMARY)
+    /// / OR the re-fault-rate EWMA is rising (CORROBORATION), AND the sample
+    /// / is fresh (design §0-rev4 AND/OR logic). The in-place rename of the
+    /// / former `swap_pressured` (same field NUMBER 21, wire type bool).
+    /// / ADVISORY ONLY: the matcher uses it for a PROACTIVE skip (mirrors
     /// / `indefinite_pin_saturated`) so a pressured worker is not selected
     /// / and then forced to NAK. The SAFETY-CRITICAL enforcing decision (the
     /// / worker-side StartAction NAK) reads the worker's OWN in-process
@@ -317,7 +322,7 @@ pub struct BlobsAvailableNotification {
     /// / workers that never report pressure (pre-#37 / gate disabled /
     /// / sampler stale → fail-open).
     #[prost(bool, tag = "21")]
-    pub swap_pressured: bool,
+    pub memory_pressured: bool,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -679,18 +684,22 @@ pub struct BlobsAvailableChunk {
     /// / `BlobsAvailableNotification.swap_used_bytes` (field 19).
     #[prost(uint64, tag = "23")]
     pub swap_used_bytes: u64,
-    /// / Host swap-pressure rate (events/sec) — only meaningful on chunk 0;
-    /// / subsequent chunks leave at proto3 default `0`. The accumulator
-    /// / carries the chunk-0 value forward into the reassembled
-    /// / `BlobsAvailableNotification.swap_pressure_rate_per_sec` (field 20).
+    /// / (#37 rev-4) Worker memory-pressure LEVEL (MiB below the free-floor)
+    /// / — only meaningful on chunk 0; subsequent chunks leave at proto3
+    /// / default `0`. In-place rename of the former
+    /// / `swap_pressure_rate_per_sec` (same field NUMBER 24, wire type u32).
+    /// / The accumulator carries the chunk-0 value forward into the
+    /// / reassembled `BlobsAvailableNotification.memory_pressure_level`
+    /// / (field 20).
     #[prost(uint32, tag = "24")]
-    pub swap_pressure_rate_per_sec: u32,
-    /// / (#37) Coarse swap-pressure verdict — only meaningful on chunk 0;
-    /// / subsequent chunks leave at proto3 default `false`. The accumulator
-    /// / carries the chunk-0 value forward into the reassembled
-    /// / `BlobsAvailableNotification.swap_pressured` (field 21).
+    pub memory_pressure_level: u32,
+    /// / (#37) Coarse memory-pressure verdict — only meaningful on chunk 0;
+    /// / subsequent chunks leave at proto3 default `false`. In-place rename
+    /// / of the former `swap_pressured` (same field NUMBER 25, wire type
+    /// / bool). The accumulator carries the chunk-0 value forward into the
+    /// / reassembled `BlobsAvailableNotification.memory_pressured` (field 21).
     #[prost(bool, tag = "25")]
-    pub swap_pressured: bool,
+    pub memory_pressured: bool,
 }
 /// / A streaming-message envelope shared across the cas→worker, scheduler→
 /// / worker, and worker→scheduler chunk producers. Exactly ONE of the

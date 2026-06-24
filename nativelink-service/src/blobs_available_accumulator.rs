@@ -135,13 +135,14 @@ struct HeaderScalars {
     mirror_max_bytes: u64,
     // (FL-681) Indefinite-pin-cap saturation, carried from chunk 0.
     indefinite_pin_saturated: bool,
-    // Host swap pressure, carried from chunk 0. `swap_used_bytes` +
-    // `swap_pressure_rate_per_sec` are OBSERVABILITY scalars; `swap_pressured`
-    // is the coarse gate verdict the matcher consumes (#37) via
+    // Host memory pressure, carried from chunk 0 (#37 rev-4).
+    // `swap_used_bytes` + `memory_pressure_level` are OBSERVABILITY scalars
+    // (the latter is MiB below the free-floor + the fail-open ranking key);
+    // `memory_pressured` is the coarse gate verdict the matcher consumes via
     // `update_worker_swap_pressure` after reassembly.
     swap_used_bytes: u64,
-    swap_pressure_rate_per_sec: u32,
-    swap_pressured: bool,
+    memory_pressure_level: u32,
+    memory_pressured: bool,
 }
 
 /// One in-flight broadcast's accumulated state.
@@ -255,8 +256,8 @@ impl BroadcastAccumulator {
                 mirror_max_bytes: chunk.mirror_max_bytes,
                 indefinite_pin_saturated: chunk.indefinite_pin_saturated,
                 swap_used_bytes: chunk.swap_used_bytes,
-                swap_pressure_rate_per_sec: chunk.swap_pressure_rate_per_sec,
-                swap_pressured: chunk.swap_pressured,
+                memory_pressure_level: chunk.memory_pressure_level,
+                memory_pressured: chunk.memory_pressured,
             });
         }
 
@@ -817,8 +818,8 @@ impl BlobsAvailableAccumulator {
                     body.mirror_max_bytes = headers.mirror_max_bytes;
                     body.indefinite_pin_saturated = headers.indefinite_pin_saturated;
                     body.swap_used_bytes = headers.swap_used_bytes;
-                    body.swap_pressure_rate_per_sec = headers.swap_pressure_rate_per_sec;
-                    body.swap_pressured = headers.swap_pressured;
+                    body.memory_pressure_level = headers.memory_pressure_level;
+                    body.memory_pressured = headers.memory_pressured;
                 }
                 body.is_full_snapshot = removed.is_full_snapshot;
                 Some(body)
@@ -911,8 +912,8 @@ mod tests {
             mirror_max_bytes: 0,
             indefinite_pin_saturated: false,
             swap_used_bytes: 0,
-            swap_pressure_rate_per_sec: 0,
-            swap_pressured: false,
+            memory_pressure_level: 0,
+            memory_pressured: false,
         }
     }
 
@@ -1394,7 +1395,7 @@ mod tests {
         );
     }
 
-    /// Swap-pressure scalars + the `swap_pressured` verdict ride chunk 0
+    /// Memory-pressure scalars + the `memory_pressured` verdict ride chunk 0
     /// and the accumulator MUST carry them forward into the reassembled
     /// notification — the terminal chunk leaves them at the proto3 default,
     /// so without the carry-forward copy the values are silently lost in
@@ -1403,21 +1404,21 @@ mod tests {
     ///
     /// Mutation step (CLAUDE.md TDD #5): comment out the
     /// `body.swap_used_bytes = headers.swap_used_bytes;` /
-    /// `body.swap_pressure_rate_per_sec = headers.swap_pressure_rate_per_sec;` /
-    /// `body.swap_pressured = headers.swap_pressured;` lines in the
+    /// `body.memory_pressure_level = headers.memory_pressure_level;` /
+    /// `body.memory_pressured = headers.memory_pressured;` lines in the
     /// terminal-commit arm of `merge_chunk`. This test red-fails with the
     /// bespoke "lost in chunked reassembly" message below.
     #[test]
     fn swap_pressure_scalars_carried_forward_from_chunk_zero() {
         let acc = BlobsAvailableAccumulator::new();
-        // Chunk 0 carries the swap scalars; chunk 1 (terminal) leaves
+        // Chunk 0 carries the memory scalars; chunk 1 (terminal) leaves
         // them at proto3 default per the wire contract.
         let mut c0 = chunk(1, 0, false, 99, vec![bdi(1)]);
         c0.swap_used_bytes = 9_876_543_210;
-        c0.swap_pressure_rate_per_sec = 4242;
-        c0.swap_pressured = true;
+        c0.memory_pressure_level = 4242;
+        c0.memory_pressured = true;
 
-        // Terminal chunk: swap scalars default (helper). If the
+        // Terminal chunk: memory scalars default (helper). If the
         // accumulator failed to carry chunk-0's values, the terminal's
         // default would win and these assertions would see 0/false.
         let c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
@@ -1431,14 +1432,14 @@ mod tests {
              accumulator carry-forward missing)"
         );
         assert_eq!(
-            out.swap_pressure_rate_per_sec, 4242,
-            "chunk-0 swap_pressure_rate_per_sec was lost in chunked reassembly \
+            out.memory_pressure_level, 4242,
+            "chunk-0 memory_pressure_level was lost in chunked reassembly \
              (the terminal chunk's default 0 clobbered the carried value — \
              accumulator carry-forward missing)"
         );
         assert!(
-            out.swap_pressured,
-            "chunk-0 swap_pressured verdict was lost in chunked reassembly \
+            out.memory_pressured,
+            "chunk-0 memory_pressured verdict was lost in chunked reassembly \
              (the terminal chunk's default false clobbered the carried value \
              — accumulator carry-forward missing)"
         );
@@ -1705,8 +1706,8 @@ mod tests {
     ///
     /// Mutation step (CLAUDE.md TDD #5): comment out the
     /// `body.swap_used_bytes = headers.swap_used_bytes;` /
-    /// `body.swap_pressure_rate_per_sec = headers.swap_pressure_rate_per_sec;` /
-    /// `body.swap_pressured = headers.swap_pressured;` lines in the
+    /// `body.memory_pressure_level = headers.memory_pressure_level;` /
+    /// `body.memory_pressured = headers.memory_pressured;` lines in the
     /// terminal-commit arm of `merge_chunk`: this test red-fails with the
     /// bespoke "did not survive the real chunker→accumulator round-trip"
     /// message below, NOT a generic is_none/0 assert that another bug could
@@ -1716,17 +1717,17 @@ mod tests {
         use nativelink_util::blobs_available_chunking::chunk_blobs_available;
 
         const SWAP_USED: u64 = 7_654_321_098;
-        const RATE: u32 = 31337;
+        const LEVEL: u32 = 31337;
         const BROADCAST_ID: u64 = 4242;
         const TOKEN: u64 = 0xCAFEF00D;
 
         let notification = BlobsAvailableNotification {
-            // Non-zero swap pressure on the INPUT notification — the
+            // Non-zero memory pressure on the INPUT notification — the
             // signal that must survive the full chunk→reassemble path.
             swap_used_bytes: SWAP_USED,
-            swap_pressure_rate_per_sec: RATE,
-            swap_pressured: true,
-            // 10 digests at 3-per-chunk forces ≥4 chunks, so the swap
+            memory_pressure_level: LEVEL,
+            memory_pressured: true,
+            // 10 digests at 3-per-chunk forces ≥4 chunks, so the memory
             // scalars (chunk-0-only) must be carried forward across a
             // terminal chunk that zeroes them.
             digest_infos: (0..10).map(bdi).collect(),
@@ -1742,12 +1743,12 @@ mod tests {
              carry-forward is actually exercised; saw {} chunk(s)",
             chunks.len()
         );
-        // Sanity: the producer writes the swap scalars on chunk 0 only —
+        // Sanity: the producer writes the memory scalars on chunk 0 only —
         // the terminal chunk MUST present default, so a missing
         // carry-forward in the accumulator would surface as 0/false below.
         assert_eq!(chunks[0].swap_used_bytes, SWAP_USED);
-        assert_eq!(chunks[0].swap_pressure_rate_per_sec, RATE);
-        assert!(chunks[0].swap_pressured);
+        assert_eq!(chunks[0].memory_pressure_level, LEVEL);
+        assert!(chunks[0].memory_pressured);
         let terminal = chunks.last().expect("at least one chunk");
         assert!(terminal.is_last, "last chunk must be terminal");
         assert_eq!(
@@ -1755,8 +1756,8 @@ mod tests {
             "wire contract: terminal (non-zero sequence) chunk leaves \
              swap_used_bytes at the proto3 default 0"
         );
-        assert_eq!(terminal.swap_pressure_rate_per_sec, 0);
-        assert!(!terminal.swap_pressured);
+        assert_eq!(terminal.memory_pressure_level, 0);
+        assert!(!terminal.memory_pressured);
 
         // Drive the REAL accumulator with the REAL chunker output.
         let acc = BlobsAvailableAccumulator::new();
@@ -1778,14 +1779,14 @@ mod tests {
              carried value (accumulator carry-forward missing)"
         );
         assert_eq!(
-            reassembled.swap_pressure_rate_per_sec, RATE,
-            "swap_pressure_rate_per_sec did not survive the real chunker→ \
+            reassembled.memory_pressure_level, LEVEL,
+            "memory_pressure_level did not survive the real chunker→ \
              accumulator round-trip — the terminal chunk's default 0 clobbered \
              chunk-0's carried value (accumulator carry-forward missing)"
         );
         assert!(
-            reassembled.swap_pressured,
-            "swap_pressured verdict did not survive the real chunker→ \
+            reassembled.memory_pressured,
+            "memory_pressured verdict did not survive the real chunker→ \
              accumulator round-trip — the terminal chunk's default false \
              clobbered chunk-0's carried value (accumulator carry-forward \
              missing)"

@@ -279,15 +279,36 @@ mod cpu_impl {
     }
 }
 
-/// Platform-specific host swap/page-out sampling. Mirrors `cpu_impl`:
-/// the macOS path reads `sysctl vm.swapusage` + mach
-/// `host_statistics64(HOST_VM_INFO64)`; the Linux path reads
-/// `/proc/meminfo` + `/proc/vmstat`; everything else is a no-op. Each
-/// call is a couple of syscalls (no per-tick `vm_stat` fork); the
-/// dedicated sampler thread reads them on the existing 100 ms cadence
-/// and stores the derived values into atomics the heartbeat reads.
+/// (#37 rev-4) One sampler-tick read of the two memory-pressure signals.
+/// `free_bytes` is the PRIMARY (leading) free-page floor — available host
+/// RAM headroom; the gate trips when this falls below `FREE_FLOOR_BYTES`.
+/// `refault_cumulative` is the CORROBORATION (a monotonic counter the
+/// sampler turns into a per-second rate via the existing delta/elapsed →
+/// EWMA pipeline) — pages faulting BACK in (macOS `decompressions+swapins`)
+/// / cumulative memory-stall µs (Linux PSI `full total=`). Both come from a
+/// SINGLE platform read so the two signals are coherent for one tick (design
+/// §0-rev4.2/.3/.4).
+#[derive(Clone, Copy)]
+pub(super) struct MemorySignals {
+    /// Available host RAM headroom in bytes (the free-floor PRIMARY).
+    pub(super) free_bytes: u64,
+    /// Monotonic re-fault / memory-stall counter (the CORROBORATION).
+    pub(super) refault_cumulative: u64,
+}
+
+/// Platform-specific host memory-pressure sampling. Mirrors `cpu_impl`:
+/// the macOS path reads `sysctl vm.swapusage` (observability) + a single
+/// mach `host_statistics64(HOST_VM_INFO64)` (free-floor + re-fault); the
+/// Linux path reads `/proc/meminfo` (`MemAvailable` free-floor + swap used)
+/// and `/proc/pressure/memory` (PSI `full total=` re-fault analogue);
+/// everything else is a no-op. Each call is a couple of syscalls / small
+/// file reads (no per-tick `vm_stat` fork); the dedicated sampler thread
+/// reads them on the existing 100 ms cadence and stores the derived values
+/// into atomics the heartbeat + the worker-local gate read.
 #[cfg(target_os = "linux")]
 mod mem_impl {
+    use super::MemorySignals;
+
     /// Host swap currently in use, in bytes. `/proc/meminfo` reports
     /// `SwapTotal`/`SwapFree` in KiB; used = (total - free) * 1024.
     pub(super) fn read_swap_used_bytes() -> Option<u64> {
@@ -305,17 +326,54 @@ mod mem_impl {
         Some(total.saturating_sub(free).saturating_mul(1024))
     }
 
-    /// Cumulative count of pages swapped OUT since boot. `/proc/vmstat`
-    /// `pswpout` is the anonymous-page swap-out counter — the CORRECT
-    /// Linux swap-pressure signal (the semantic analog of the mach
-    /// `compressions`/`swapouts` counters #37 reads on macOS, NOT the
-    /// file-backed `pageouts` daemon counter). Monotonic until reboot; the
-    /// sampler turns it into a per-second rate.
-    pub(super) fn read_swap_pressure_cumulative() -> Option<u64> {
-        let contents = std::fs::read_to_string("/proc/vmstat").ok()?;
-        for line in contents.lines() {
-            if let Some(rest) = line.strip_prefix("pswpout ") {
-                return rest.trim().parse().ok();
+    /// (#37 rev-4) Read the free-floor PRIMARY (`MemAvailable`) + the
+    /// re-fault CORROBORATION (PSI `full total=`) in one pass.
+    ///
+    /// - PRIMARY: `/proc/meminfo` `MemAvailable` (KiB) — the kernel's own
+    ///   "memory available to start a new app without swapping" estimate,
+    ///   the Linux analogue of the macOS free-page floor. Required; the read
+    ///   fails (returns `None`) if it is absent.
+    /// - CORROBORATION: `/proc/pressure/memory` `full … total=<µs>` — the
+    ///   MONOTONIC cumulative-stall-µs counter (NOT `avg10`, which is a
+    ///   pre-normalized windowed fraction that the strictly-delta/elapsed
+    ///   `compute_swap_pressure_rate` would read as ~0 under sustained
+    ///   steady stall — design §0-rev4.4). Absent PSI (kernel without
+    ///   `CONFIG_PSI`) ⇒ corroboration `0`; the free-floor primary still
+    ///   gates.
+    pub(super) fn read_memory_signals() -> Option<MemorySignals> {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut avail_kib: Option<u64> = None;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                avail_kib = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+                break;
+            }
+        }
+        let free_bytes = avail_kib?.saturating_mul(1024);
+        // PSI is best-effort: a kernel without CONFIG_PSI has no file, in
+        // which case the corroboration is 0 (the free-floor primary still
+        // gates). `full … total=<µs>` is the cumulative stall counter.
+        let refault_cumulative = std::fs::read_to_string("/proc/pressure/memory")
+            .ok()
+            .and_then(|psi| read_psi_full_total(&psi))
+            .unwrap_or(0);
+        Some(MemorySignals {
+            free_bytes,
+            refault_cumulative,
+        })
+    }
+
+    /// Parse the `full` line's `total=<µs>` cumulative-stall counter from
+    /// the contents of `/proc/pressure/memory`. Returns `None` if the file
+    /// has no `full` line or no `total=` token (caller treats as 0).
+    fn read_psi_full_total(psi: &str) -> Option<u64> {
+        for line in psi.lines() {
+            if let Some(rest) = line.strip_prefix("full ") {
+                for tok in rest.split_whitespace() {
+                    if let Some(val) = tok.strip_prefix("total=") {
+                        return val.parse().ok();
+                    }
+                }
             }
         }
         None
@@ -324,6 +382,7 @@ mod mem_impl {
 
 #[cfg(target_os = "macos")]
 mod mem_impl {
+    use super::MemorySignals;
     use libc::{
         host_statistics64, integer_t, mach_host_self, mach_msg_type_number_t, vm_statistics64,
         HOST_VM_INFO64, HOST_VM_INFO64_COUNT,
@@ -367,30 +426,65 @@ mod mem_impl {
         if ret == 0 { Some(usage.xsu_used) } else { None }
     }
 
-    /// Cumulative swap-pressure counter since boot, via mach
-    /// `host_statistics64(HOST_VM_INFO64)`. Returns `compressions` (the
-    /// EARLIEST Apple-Silicon swap-pressure signal: under memory pressure
-    /// the XNU pager COMPRESSES anonymous pages first, then swaps the
-    /// compressed pool to disk only later). Monotonic until reboot; the
-    /// sampler derives a per-second rate.
+    /// Host page size in bytes, via `sysctl hw.pagesize`. Apple Silicon is
+    /// 16 KiB, Intel Macs 4 KiB — NOT hardcoded (design §0-rev4.2: "read
+    /// `host_page_size` or hw.pagesize, don't hardcode") so `free_count`
+    /// (a PAGE count) converts to bytes correctly on either. `None` on
+    /// syscall failure ⇒ the caller treats the read as unavailable.
+    fn read_page_size() -> Option<u64> {
+        use std::ffi::CString;
+        let cname = CString::new("hw.pagesize").ok()?;
+        // hw.pagesize is reported as a 32-bit int on Darwin.
+        let mut value: i32 = 0;
+        let mut len = core::mem::size_of::<i32>();
+        // SAFETY: sysctlbyname is a stable POSIX API; `value` is a
+        // correctly-sized i32 buffer; newp is null (read-only request).
+        let ret = unsafe {
+            libc::sysctlbyname(
+                cname.as_ptr(),
+                &raw mut value as *mut _,
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 && value > 0 {
+            Some(value as u64)
+        } else {
+            None
+        }
+    }
+
+    /// (#37 rev-4) Read the free-floor PRIMARY (`free_count` × page size)
+    /// + the re-fault CORROBORATION (`decompressions + swapins`) from a
+    /// SINGLE mach `host_statistics64(HOST_VM_INFO64)` call.
     ///
-    /// `pageouts` (the field #28 originally read) is the pageout-daemon
-    /// FILE-backed dirty-page write counter — empirically 20–500x smaller
-    /// than `compressions`/`swapouts` even on an actively-swapping Apple
-    /// Silicon worker, and DECOUPLED from anonymous-swap pressure. See
-    /// memory `macos-pageouts-not-swap-signal` (vm_stat measured on the M4
-    /// fleet) and the #37 design §0. The §4 falsifying probe FINALIZES
-    /// `compressions` vs `swapouts`; until it runs, `compressions` is the
-    /// design's leading candidate (earliest signal, cross-checked against
-    /// `vm.swapusage`-growth).
-    pub(super) fn read_swap_pressure_cumulative() -> Option<u64> {
+    /// - PRIMARY: `vm_statistics64.free_count` (a PAGE count of genuinely
+    ///   free RAM) × `hw.pagesize`. Raw `free_count` is the clean floor —
+    ///   NOT `active+wire+compressor ≥ phys − margin`, which reads ~6.7 GiB
+    ///   "available" at the COLD-IDLE wall because it omits the large
+    ///   reclaimable `inactive`+`purgeable` pools (design §0-rev4.2). It
+    ///   separates the at-the-wall case (68 MiB free) from IDLE (8969 MiB
+    ///   free) ~100× cleanly.
+    /// - CORROBORATION: `decompressions + swapins` — pages faulting BACK in
+    ///   (the thrash tell). Monotonic until reboot; the sampler turns it
+    ///   into a per-second rate via the existing delta/elapsed → EWMA path.
+    ///   `swapins` is included for completeness/cross-platform symmetry but
+    ///   contributes ~0 on the compressor-dominant fleet; `decompressions`
+    ///   carries the signal.
+    ///
+    /// All fields are read BY NAME off libc's `vm_statistics64` — no offset
+    /// arithmetic, no hand-rolled struct, no `62/248` literals (design
+    /// §0-rev4.7: those are canonical-XNU and would overrun the 152-byte
+    /// libc struct; `HOST_VM_INFO64_COUNT` is computed from libc's own
+    /// struct = 38, never 62).
+    pub(super) fn read_memory_signals() -> Option<MemorySignals> {
         // Use libc's own `vm_statistics64` (`#[repr(packed(8))]`) rather
-        // than a hand-rolled struct: `compressions` sits DEEP in the
-        // struct (well past `pageouts`@40), so a hand-rolled copy that
-        // diverges in the tail (as #28's did at `phys_footprint`) cannot
-        // even reach it at the correct offset. libc tracks the upstream
-        // ABI, so a future field shift is a noticed crate bump, not a
-        // silent offset slide.
+        // than a hand-rolled struct: `free_count` is the first field but
+        // `decompressions`/`swapins` sit DEEP (well past `pageouts`@40), so
+        // a hand-rolled copy that diverges in the tail cannot reach them at
+        // the correct offset. libc tracks the upstream ABI, so a future
+        // field shift is a noticed crate bump, not a silent offset slide.
         let mut stats = vm_statistics64 {
             free_count: 0,
             active_count: 0,
@@ -420,15 +514,17 @@ mod mem_impl {
         let mut count: mach_msg_type_number_t = HOST_VM_INFO64_COUNT;
         // SAFETY: host_statistics64 is a stable macOS kernel API. `stats`
         // is libc's `vm_statistics64` (`#[repr(packed(8))]`) whose size
-        // (HOST_VM_INFO64_COUNT words) is >= the running kernel's
-        // HOST_VM_INFO64 revision size, and `count` is initialized to that
-        // word count. The kernel does NOT write our full `count` words:
-        // host.c `vm_stats` clamps to its OWN revision (REV0/REV1/REV2),
-        // writes only that many fields, never overruns past its revision
-        // size (a larger caller buffer is left untouched), and overwrites
-        // `*count` with the words actually written. `compressions` is a
-        // REV1 field, present on every Apple Silicon kernel, so it is
-        // written on KERN_SUCCESS. We read it only when ret == 0.
+        // (HOST_VM_INFO64_COUNT words = 38, computed from libc's OWN struct
+        // — never the canonical-XNU 62 that would overrun the 152-byte
+        // buffer) is >= the running kernel's HOST_VM_INFO64 revision size,
+        // and `count` is initialized to that word count. The kernel does
+        // NOT write our full `count` words: host.c `vm_stats` clamps to its
+        // OWN revision (REV0/REV1/REV2), writes only that many fields, never
+        // overruns past its revision size (a larger caller buffer is left
+        // untouched), and overwrites `*count` with the words actually
+        // written. `free_count` is REV0; `decompressions`/`swapins` are
+        // REV1, present on every Apple Silicon kernel, so all are written
+        // on KERN_SUCCESS. We read them only when ret == 0.
         let ret = unsafe {
             host_statistics64(
                 mach_host_self(),
@@ -437,19 +533,30 @@ mod mem_impl {
                 &mut count,
             )
         };
-        // `compressions` is a packed field; copy it to a local before
-        // returning to avoid taking a reference into the packed struct.
-        let compressions = stats.compressions;
-        if ret == 0 { Some(compressions) } else { None }
+        if ret != 0 {
+            return None;
+        }
+        // Copy packed fields to locals before arithmetic to avoid taking a
+        // reference into the `#[repr(packed(8))]` struct.
+        let free_count = u64::from(stats.free_count);
+        let decompressions = stats.decompressions;
+        let swapins = stats.swapins;
+        let page_size = read_page_size()?;
+        Some(MemorySignals {
+            free_bytes: free_count.saturating_mul(page_size),
+            refault_cumulative: decompressions.saturating_add(swapins),
+        })
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod mem_impl {
+    use super::MemorySignals;
+
     pub(super) fn read_swap_used_bytes() -> Option<u64> {
         None
     }
-    pub(super) fn read_swap_pressure_cumulative() -> Option<u64> {
+    pub(super) fn read_memory_signals() -> Option<MemorySignals> {
         None
     }
 }
@@ -460,32 +567,36 @@ static E_CORE_PCT: AtomicU32 = AtomicU32::new(0);
 /// Host swap-used bytes, refreshed by the sampler thread every 100 ms.
 /// `0` = no swap in use OR sampler unavailable (indistinguishable, per
 /// the `cpu_load_pct = 0` unknown convention). Observability only — the
-/// gate keys off the RATE below, not this lingering LEVEL gauge.
+/// gate keys off the free-floor PRIMARY below, not this lingering LEVEL
+/// gauge (swap occupancy can stay high long after pressure subsides).
 static SWAP_USED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Host swap-pressure RATE in events/sec, derived by the sampler thread
-/// from the delta of the cumulative swap-pressure counter
-/// (`compressions` on macOS / `pswpout` on Linux — NOT `pageouts`, see
-/// `mem_impl::read_swap_pressure_cumulative`) across its fixed 100 ms
-/// ticks. This is the raw windowed rate carried on the wire for
-/// observability; the GATE keys off the EWMA of this rate (fast-attack /
-/// slow-release), not the raw value, so a single spike does not stick.
-static SWAP_PRESSURE_RATE: AtomicU32 = AtomicU32::new(0);
+/// (#37 rev-4) Worker memory-pressure LEVEL: how far the free-page
+/// headroom has fallen below the gate's `FREE_FLOOR_BYTES`, expressed in
+/// MiB-below-floor (`0` whenever free is at or above the floor). Refreshed
+/// by the sampler thread every 100 ms; carried on the wire (field 20) for
+/// observability AND for the server's least-pressured fail-open ranking
+/// (`min_by_key` — lower = less pressured). This is the PRIMARY-signal
+/// magnitude, NOT the old re-fault rate. The gate verdict itself is the
+/// boolean `MEMORY_PRESSURED` below; this scalar is the "how pressured"
+/// gauge behind it.
+static MEMORY_PRESSURE_LEVEL: AtomicU32 = AtomicU32::new(0);
 /// (#37) Monotonic nanoseconds (since `PROCESS_START`) at which the
-/// swap sampler last published a value. The worker-local gate reads this
+/// memory sampler last published a value. The worker-local gate reads this
 /// to detect a wedged/dead sampler: if the most recent sample is older
 /// than `SWAP_SAMPLE_MAX_AGE`, the gate's pressure state is UNKNOWN and
 /// it FAILS OPEN (§3a rule 2 / §5 case 4). NET-NEW — the CPU sampler has
 /// no age atomic to inherit. Monotonic source so an NTP step cannot
 /// spuriously trip or suppress the fail-open. `0` = never sampled yet.
 static LAST_SAMPLE_INSTANT: AtomicU64 = AtomicU64::new(0);
-/// (#37) Coarse 1-bit gate verdict published by the sampler: `true` when
-/// the EWMA swap-pressure estimate crosses `SWAP_PRESSURE_GATE_RATE` AND
-/// the sample is fresh. Mirrors `indefinite_pin_saturated`: the heartbeat
-/// carries it (advisory matcher hint) and the worker-local StartAction
-/// NAK reads it (authoritative gate — the local atomic, never the wire
-/// boolean, is the safety-critical decision). `false` when fresh-and-low,
-/// stale (fail-open), or sampler-unavailable.
-static SWAP_PRESSURED: AtomicBool = AtomicBool::new(false);
+/// (#37 rev-4) Coarse 1-bit gate verdict published by the sampler: `true`
+/// when the free-page FLOOR is breached (PRIMARY) OR the re-fault-rate
+/// EWMA crosses `REFAULT_CONFIRM_RATE` (CORROBORATION), AND the sample is
+/// fresh (design §0-rev4 AND/OR logic). Mirrors `indefinite_pin_saturated`:
+/// the heartbeat carries it (advisory matcher hint) and the worker-local
+/// StartAction NAK reads it (authoritative gate — the local atomic, never
+/// the wire boolean, is the safety-critical decision). `false` when
+/// fresh-and-healthy, stale (fail-open), or sampler-unavailable.
+static MEMORY_PRESSURED: AtomicBool = AtomicBool::new(false);
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Process-start anchor for the monotonic `LAST_SAMPLE_INSTANT` atomic.
@@ -495,31 +606,65 @@ static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 /// never wall-clock.
 static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
-/// (#37) EWMA gate-trip threshold on the swap-pressure rate
-/// (events/sec). PROVISIONAL — MUST be finalized from the §4 falsifying
-/// probe (which picks `compressions` vs `swapouts`) AND a separate soak
-/// that characterizes the baseline-rate distribution under normal
-/// multi-action load (a busy-but-healthy worker has a nonzero noisy
-/// baseline the idle probe never reveals). Until both run, the gate is
-/// held DISABLED via `SWAP_GATE_ENABLED` so a guessed threshold cannot
-/// false-trip a healthy worker in production. See design §6.2 and §4.
-const SWAP_PRESSURE_GATE_RATE: u32 = 10_000;
+/// (#37 rev-4) PRIMARY (leading) gate trip: free-page FLOOR. The gate
+/// trips when available host RAM (`vm_statistics64.free_count` × page size
+/// on macOS / `MemAvailable` on Linux) falls below this margin.
+///
+/// CONSERVATIVE safe-enable value, chosen from the idle probe's ~100×
+/// separation between healthy and at-the-wall (design §0-rev4.2):
+///   - healthy IDLE   = 8969 MiB free (574018 pages × 16 KiB)
+///   - at-the-RAM-wall =   68 MiB free (4359 pages × 16 KiB)
+/// 1 GiB sits safely INSIDE that gap: 9× below healthy headroom (so a
+/// busy-but-healthy worker is very unlikely to dip below it) and 15× above
+/// the at-wall floor (so it leads the cliff with real margin). At <1 GiB
+/// free, a 16 GiB worker genuinely cannot admit another multi-GiB link
+/// without thrashing. NOT soak-validated — this is a CONSERVATIVE
+/// safe-enable value PENDING a busy-worker soak that refines it (the soak
+/// optimizes LEAD-TIME; it does NOT gate enablement, given the 100×
+/// separation makes a false-trip on a healthy worker structurally
+/// implausible at this margin). The companion re-fault CORROBORATION
+/// (`REFAULT_CONFIRM_RATE`) catches any pathology where free reads
+/// non-floor but the box is actively thrashing. See design §0-rev4.2/.8.
+const FREE_FLOOR_BYTES: u64 = 1 << 30; // 1 GiB
 
-/// (#37) Master enable for the worker-local swap admission gate and its
-/// proactive heartbeat boolean. Held `false` until the §4 probe finalizes
-/// the counter and a soak sets `SWAP_PRESSURE_GATE_RATE`: with the
-/// threshold unproven, enabling the gate risks false-tripping a healthy
-/// worker (a strictly worse regression than the invisible oversubscription
-/// it guards). The sampler still publishes the rate + swap-used for
-/// observability while disabled; only the gate verdict (`SWAP_PRESSURED`)
-/// and the NAK are suppressed. Flip to `true` once the constants are set.
-const SWAP_GATE_ENABLED: bool = false;
+/// (#37 rev-4) Hysteresis band above `FREE_FLOOR_BYTES` for CLEARING the
+/// free-floor trip: trip below `FREE_FLOOR_BYTES`, clear only once free
+/// recovers above `FREE_FLOOR_BYTES + FREE_FLOOR_HYSTERESIS`, so the level
+/// does not chatter at the boundary (design §0-rev4.4 — the free-floor is
+/// a LEVEL, so it uses a two-threshold band, not the re-fault EWMA). 256
+/// MiB = a quarter of the floor.
+const FREE_FLOOR_HYSTERESIS: u64 = 256 << 20; // 256 MiB
 
-/// (#37) EWMA smoothing weight applied to each fresh rate sample
+/// (#37 rev-4) CORROBORATION threshold: the re-fault-rate EWMA
+/// (events/sec) above which the gate trips on the secondary signal even if
+/// the free-floor is not breached (the "already over the edge / actively
+/// thrashing" confirm — design §0-rev4.3/.4). CONSERVATIVE: the idle probe
+/// showed thrash at 44K–297K re-faults/s with a non-thrash max of ~1503/s,
+/// so 10000/s sits with wide margin above any non-thrash baseline and well
+/// below genuine thrash. NOT soak-validated — pending the busy-worker soak
+/// that characterizes the baseline re-fault rate under normal multi-action
+/// load. The free-floor PRIMARY is the load-bearing trip; this confirm
+/// strengthens but is not required for the gate to fire.
+const REFAULT_CONFIRM_RATE: u32 = 10_000;
+
+/// (#37 rev-4) Master enable for the worker-local memory-pressure
+/// admission gate and its proactive heartbeat boolean. ENABLED: the
+/// free-floor PRIMARY (`FREE_FLOOR_BYTES`) is a CONSERVATIVE safe-enable
+/// value chosen from the idle probe's ~100× healthy/at-wall separation
+/// (design §0-rev4.8), and the re-fault CORROBORATION + the §3a/§5
+/// fail-opens bound the failure modes. When enabled the gate NAKs new
+/// `StartAction`s under sustained pressure and the matcher proactively
+/// skips a pressured worker; the §3a sampler-dead fail-open and the §5
+/// fleet fail-open keep a dead sampler or an all-pressured fleet from
+/// wedging. The sampler always publishes the level + swap-used for
+/// observability.
+const MEMORY_GATE_ENABLED: bool = true;
+
+/// (#37) EWMA smoothing weight applied to each fresh re-fault-rate sample
 /// (fast-ATTACK). A high weight on RISING samples means a post-action
 /// peak (§3b) trips the estimate quickly; the slow-release below keeps it
 /// from sticking. `estimate += ATTACK * (sample - estimate)` when sample
-/// rises. PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+/// rises.
 const SWAP_EWMA_ATTACK: f64 = 0.5;
 
 /// (#37) EWMA smoothing weight applied when the fresh sample is BELOW the
@@ -527,27 +672,26 @@ const SWAP_EWMA_ATTACK: f64 = 0.5;
 /// slowly, so a single completed heavy action whose post-action peak
 /// tripped the gate cannot trip-then-immediately-clear-then-retrip
 /// (security S-MED-2: the release MUST outlast the post-action RSS-reclaim
-/// time). PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+/// time).
 const SWAP_EWMA_RELEASE: f64 = 0.05;
 
 /// (#37) Time-bounded fleet fail-open window (§5 case 3b). A worker that
-/// has been NAKing new work under swap pressure with NO in-flight actions
-/// for longer than this accepts ONE action regardless of pressure, so an
-/// all-idle all-pressured fleet (e.g. a memory leak unrelated to actions
-/// — pressure never decays because nothing completes) cannot deadlock.
-/// This is the load-bearing anti-wedge clause: it works with a stale
-/// server view and needs no fleet-global state. MUST exceed the typical
-/// transient-pressure duration so it does not defeat the gate on ordinary
-/// spikes. PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
+/// has been NAKing new work under memory pressure with NO in-flight
+/// actions for longer than this accepts ONE action regardless of pressure,
+/// so an all-idle all-pressured fleet (e.g. a memory leak unrelated to
+/// actions — pressure never decays because nothing completes) cannot
+/// deadlock. This is the load-bearing anti-wedge clause: it works with a
+/// stale server view and needs no fleet-global state. MUST exceed the
+/// typical transient-pressure duration so it does not defeat the gate on
+/// ordinary spikes.
 const SWAP_FAIL_OPEN_AFTER: Duration = Duration::from_secs(30);
 
-/// (#37) Max age of the most recent swap sample before the gate treats
+/// (#37) Max age of the most recent memory sample before the gate treats
 /// its state as UNKNOWN and fails OPEN (§3a rule 2 / §5 case 4). MUST be
 /// strictly GREATER than the worst-case legitimate sampler stall (a GC /
 /// scheduler-starvation pause under the very pressure being measured) and
 /// strictly LESS than the time for an un-gated worker to OOM (security
 /// S-MED-1). At the 100 ms sampler cadence, 2 s = 20 missed ticks.
-/// PROVISIONAL (see `SWAP_PRESSURE_GATE_RATE`).
 const SWAP_SAMPLE_MAX_AGE: Duration = Duration::from_secs(2);
 
 /// Starts a dedicated OS thread that samples system-wide CPU utilization
@@ -623,15 +767,62 @@ fn update_swap_ewma(prev_estimate: f64, sample: f64) -> f64 {
     prev_estimate + weight * (sample - prev_estimate)
 }
 
-/// Per-tick swap-sampler state threaded through the sampler loop. `prev`
-/// is the last cumulative counter + the `Instant` it was read (so the
-/// rate uses the REAL elapsed interval, robust to sampler jitter, not an
-/// assumed 100 ms). `ewma` is the running fast-attack/slow-release
-/// estimate that the GATE keys off.
+/// (#37 rev-4) PRIMARY free-floor trip with a two-threshold hysteresis
+/// band (design §0-rev4.4 — the free-floor is a LEVEL, so it cannot use the
+/// re-fault EWMA; a band keeps it from chattering at the boundary).
+///
+/// - Trip when `free_bytes < FREE_FLOOR_BYTES`.
+/// - Once tripped, stay tripped until free recovers ABOVE
+///   `FREE_FLOOR_BYTES + FREE_FLOOR_HYSTERESIS` (so a worker hovering right
+///   at the floor does not flap admit/refuse every tick).
+/// - In the band (between the two thresholds), HOLD the prior state.
+///
+/// Pure function of `(free_bytes, currently_tripped)` so it is unit-testable
+/// in isolation. The caller threads `currently_tripped` across ticks.
+const fn free_floor_breached(free_bytes: u64, currently_tripped: bool) -> bool {
+    if free_bytes < FREE_FLOOR_BYTES {
+        true
+    } else if free_bytes >= FREE_FLOOR_BYTES.saturating_add(FREE_FLOOR_HYSTERESIS) {
+        false
+    } else {
+        // In the hysteresis band: hold the prior verdict.
+        currently_tripped
+    }
+}
+
+/// (#37 rev-4) The observability/ranking LEVEL scalar (wire field 20):
+/// how far free headroom has fallen below `FREE_FLOOR_BYTES`, in MiB. `0`
+/// whenever free is at or above the floor. Higher = more pressured, so the
+/// server's `min_by_key` least-pressured fail-open ranking stays correct.
+/// Saturates into `u32` (a 16 GiB shortfall fits trivially).
+fn memory_pressure_level_mib(free_bytes: u64) -> u32 {
+    let shortfall = FREE_FLOOR_BYTES.saturating_sub(free_bytes);
+    u32::try_from(shortfall >> 20).unwrap_or(u32::MAX)
+}
+
+/// (#37 rev-4) The combined gate verdict the sampler publishes: pressured
+/// when the gate is ENABLED and EITHER the free-floor PRIMARY is breached OR
+/// the re-fault CORROBORATION confirms thrash (design §0-rev4.4 OR logic).
+/// Held `false` entirely while `enabled` is `false` so the proactive matcher
+/// skip never fires on an unproven threshold. Pure function of the three
+/// inputs so the OR logic is unit-testable AND so the production sampler and
+/// the test bind to the SAME expression (a mutation deleting either disjunct
+/// red-fails the test).
+const fn memory_gate_verdict(enabled: bool, free_tripped: bool, refault_confirmed: bool) -> bool {
+    enabled && (free_tripped || refault_confirmed)
+}
+
+/// Per-tick memory-sampler state threaded through the sampler loop. `prev`
+/// is the last cumulative re-fault counter + the `Instant` it was read (so
+/// the rate uses the REAL elapsed interval, robust to sampler jitter, not
+/// an assumed 100 ms). `ewma` is the running fast-attack/slow-release
+/// estimate of the re-fault rate (the CORROBORATION). `free_tripped` holds
+/// the free-floor (PRIMARY) hysteresis-band verdict across ticks.
 #[derive(Clone, Copy)]
 struct SwapSamplerState {
     prev: Option<(u64, Instant)>,
     ewma: f64,
+    free_tripped: bool,
 }
 
 impl SwapSamplerState {
@@ -639,20 +830,27 @@ impl SwapSamplerState {
         Self {
             prev: None,
             ewma: 0.0,
+            free_tripped: false,
         }
     }
 }
 
-/// Sample host swap pressure on the sampler thread's fixed cadence and
+/// Sample host memory pressure on the sampler thread's fixed cadence and
 /// publish into the atomics the heartbeat + the worker-local gate read.
 /// Updates: `SWAP_USED_BYTES` (level gauge, observability),
-/// `SWAP_PRESSURE_RATE` (raw windowed rate, wire/observability),
-/// `LAST_SAMPLE_INSTANT` (sample-age liveness for the fail-open), and
-/// `SWAP_PRESSURED` (the EWMA-derived gate verdict). Returns the new
-/// `SwapSamplerState` to thread into the next tick.
+/// `MEMORY_PRESSURE_LEVEL` (MiB below the free-floor, wire/observability +
+/// fail-open ranking), `LAST_SAMPLE_INSTANT` (sample-age liveness for the
+/// fail-open), and `MEMORY_PRESSURED` (the rev-4 free-floor-OR-re-fault gate
+/// verdict). Returns the new `SwapSamplerState` to thread into the next
+/// tick.
+///
+/// rev-4 trip logic (design §0-rev4.4): the gate is pressured when the
+/// free-page FLOOR is breached (PRIMARY, a LEVEL with a hysteresis band) OR
+/// the re-fault-rate EWMA crosses `REFAULT_CONFIRM_RATE` (CORROBORATION, a
+/// RATE on the existing fast-attack/slow-release pipeline).
 fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     // swap-used is an absolute gauge — publish whatever we read (0 if
-    // unavailable), no prev-state needed.
+    // unavailable), no prev-state needed. Observability only.
     SWAP_USED_BYTES.store(
         mem_impl::read_swap_used_bytes().unwrap_or(0),
         Ordering::Relaxed,
@@ -660,8 +858,8 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
 
     let now = Instant::now();
     // Publish the sample-age anchor on EVERY successful tick (BEFORE the
-    // counter read can early-return) so the gate's fail-open sees a live
-    // sampler even on ticks where the swap counter itself is unreadable.
+    // signal read can early-return) so the gate's fail-open sees a live
+    // sampler even on ticks where the signals themselves are unreadable.
     // Stored as monotonic nanos since PROCESS_START — never wall-clock.
     let since_start = now.duration_since(*PROCESS_START).as_nanos();
     LAST_SAMPLE_INSTANT.store(
@@ -669,39 +867,56 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
         Ordering::Relaxed,
     );
 
-    let Some(curr_count) = mem_impl::read_swap_pressure_cumulative() else {
-        // Counter unreadable this tick: report no pressure and drop the
+    let Some(signals) = mem_impl::read_memory_signals() else {
+        // Signals unreadable this tick: report no pressure and drop the
         // prev anchor so the next successful read doesn't compute a rate
         // across an unknown-length gap. The EWMA is left intact (it will
-        // decay on the next readable tick); the gate verdict is cleared so
-        // an unreadable counter never holds the gate tripped.
-        SWAP_PRESSURE_RATE.store(0, Ordering::Relaxed);
-        SWAP_PRESSURED.store(false, Ordering::Relaxed);
+        // decay on the next readable tick); the gate verdict and the level
+        // scalar are cleared so an unreadable read never holds the gate
+        // tripped. (Persistent unreadability is caught by the sample-age
+        // fail-open via a NON-updated `LAST_SAMPLE_INSTANT`... but note we
+        // DID update the anchor above, so a one-off unreadable tick does
+        // not look like a dead sampler — only a sampler that stops ticking
+        // entirely trips the age fail-open.)
+        MEMORY_PRESSURE_LEVEL.store(0, Ordering::Relaxed);
+        MEMORY_PRESSURED.store(false, Ordering::Relaxed);
         return SwapSamplerState {
             prev: None,
             ewma: state.ewma,
+            free_tripped: false,
         };
     };
 
+    // PRIMARY (leading): free-page floor, a LEVEL with a hysteresis band.
+    let free_tripped = free_floor_breached(signals.free_bytes, state.free_tripped);
+    // Publish the "how pressured" magnitude (MiB below the floor) for
+    // observability + the server's least-pressured fail-open ranking.
+    MEMORY_PRESSURE_LEVEL.store(
+        memory_pressure_level_mib(signals.free_bytes),
+        Ordering::Relaxed,
+    );
+
+    // CORROBORATION (secondary): re-fault rate → fast-attack/slow-release
+    // EWMA, on the existing delta/elapsed pipeline.
     let rate = if let Some((prev_count, prev_at)) = state.prev {
         let elapsed = now.duration_since(prev_at).as_secs_f64();
-        compute_swap_pressure_rate(prev_count, curr_count, elapsed)
+        compute_swap_pressure_rate(prev_count, signals.refault_cumulative, elapsed)
     } else {
         // First sample: no interval to rate against yet.
         0
     };
-    SWAP_PRESSURE_RATE.store(rate, Ordering::Relaxed);
-
     let ewma = update_swap_ewma(state.ewma, f64::from(rate));
-    // Publish the gate verdict from the SMOOTHED estimate, never the raw
-    // sample (§3b). Held false entirely while the gate is disabled so the
-    // proactive matcher skip never fires on an unproven threshold.
-    let pressured = SWAP_GATE_ENABLED && ewma >= f64::from(SWAP_PRESSURE_GATE_RATE);
-    SWAP_PRESSURED.store(pressured, Ordering::Relaxed);
+    let refault_confirmed = ewma >= f64::from(REFAULT_CONFIRM_RATE);
+
+    // Trip when the free-floor PRIMARY is breached OR the re-fault
+    // CORROBORATION confirms thrash (design §0-rev4.4 OR logic).
+    let pressured = memory_gate_verdict(MEMORY_GATE_ENABLED, free_tripped, refault_confirmed);
+    MEMORY_PRESSURED.store(pressured, Ordering::Relaxed);
 
     SwapSamplerState {
-        prev: Some((curr_count, now)),
+        prev: Some((signals.refault_cumulative, now)),
         ewma,
+        free_tripped,
     }
 }
 
@@ -804,31 +1019,28 @@ fn get_e_core_load_pct() -> u32 {
 
 /// Returns host swap-used bytes sampled by the dedicated sampler thread.
 /// `0` means no swap in use OR sampler unavailable. Absolute LEVEL gauge
-/// (observability) — pair with [`get_swap_pressure_rate_per_sec`] (the
-/// dynamic-pressure signal the gate keys off).
+/// (observability) — pair with [`get_memory_pressure_level`] (the
+/// free-floor-shortfall magnitude behind the gate verdict).
 fn get_swap_used_bytes() -> u64 {
     SWAP_USED_BYTES.load(Ordering::Relaxed)
 }
 
-/// Returns the host swap-pressure RATE (events/sec), derived by the
-/// sampler thread from the delta of the cumulative swap-pressure counter
-/// (`compressions`/`pswpout`, NOT `pageouts`) across its fixed 100 ms
-/// ticks. Non-zero ⇒ the host is actively compressing/swapping anonymous
-/// memory right now (the load-bearing swap-pressure signal). `0` ⇒ no
-/// recent pressure or sampler unavailable. This is the raw windowed rate
-/// carried on the wire for observability; the GATE uses
-/// [`swap_gate_pressured`], which reads the EWMA-derived verdict with a
-/// sample-age fail-open.
-fn get_swap_pressure_rate_per_sec() -> u32 {
-    SWAP_PRESSURE_RATE.load(Ordering::Relaxed)
+/// (#37 rev-4) Returns the worker memory-pressure LEVEL (MiB below the
+/// free-floor), refreshed by the sampler thread. `0` ⇒ free headroom is at
+/// or above `FREE_FLOOR_BYTES` (healthy) OR sampler unavailable; higher ⇒
+/// deeper below the floor. This is the wire-field-20 scalar carried for
+/// observability + the server's least-pressured fail-open ranking; the GATE
+/// verdict itself is [`swap_gate_pressured`] (free-floor OR re-fault, with
+/// a sample-age fail-open).
+fn get_memory_pressure_level() -> u32 {
+    MEMORY_PRESSURE_LEVEL.load(Ordering::Relaxed)
 }
 
-/// (#37) Pure swap-gate verdict — the sample-age fail-open logic, factored
+/// (#37) Pure memory-gate verdict — the sample-age fail-open logic, factored
 /// out of [`swap_gate_pressured`] so it is unit-testable with `enabled =
-/// true` independent of the `SWAP_GATE_ENABLED` compile-time flag (which
-/// short-circuits the production wrapper to `false`).
+/// true` independent of the `MEMORY_GATE_ENABLED` compile-time flag.
 ///
-/// Returns `Some(true)` only when the gate is enabled, the most recent
+/// Returns `(true, _)` only when the gate is enabled, the most recent
 /// sample is FRESH, and the sampler published a pressured verdict. FAILS
 /// OPEN (`false`) when disabled, never-sampled (`last_nanos == 0`), or
 /// STALE (`age > SWAP_SAMPLE_MAX_AGE`). `stale` is returned separately so
@@ -857,19 +1069,20 @@ fn swap_gate_verdict(
     (pressured, false)
 }
 
-/// (#37) Authoritative worker-local swap-gate decision. Returns `true`
-/// only when the gate is ENABLED, the most recent swap sample is FRESH
+/// (#37) Authoritative worker-local memory-gate decision. Returns `true`
+/// only when the gate is ENABLED, the most recent memory sample is FRESH
 /// (within `SWAP_SAMPLE_MAX_AGE`), and the sampler published a pressured
-/// verdict (EWMA over threshold). FAILS OPEN — returns `false` — when the
-/// sampler is wedged/dead (stale or never-published `LAST_SAMPLE_INSTANT`)
-/// so a dead pressure sampler never wedges the worker into refusing all
-/// work (§3a rule 2 / §5 case 4). Reads ONLY in-process atomics on a
-/// monotonic clock; never the wire boolean (the safety-critical decision
-/// never crosses the worker→server trust boundary, design §2 S-LOW-2).
+/// verdict (free-floor breached OR re-fault EWMA over threshold). FAILS
+/// OPEN — returns `false` — when the sampler is wedged/dead (stale or
+/// never-published `LAST_SAMPLE_INSTANT`) so a dead pressure sampler never
+/// wedges the worker into refusing all work (§3a rule 2 / §5 case 4). Reads
+/// ONLY in-process atomics on a monotonic clock; never the wire boolean
+/// (the safety-critical decision never crosses the worker→server trust
+/// boundary, design §2 S-LOW-2).
 fn swap_gate_pressured() -> bool {
     let (pressured, stale) = swap_gate_verdict(
-        SWAP_GATE_ENABLED,
-        SWAP_PRESSURED.load(Ordering::Relaxed),
+        MEMORY_GATE_ENABLED,
+        MEMORY_PRESSURED.load(Ordering::Relaxed),
         LAST_SAMPLE_INSTANT.load(Ordering::Relaxed),
         Instant::now().duration_since(*PROCESS_START),
         SWAP_SAMPLE_MAX_AGE,
@@ -878,7 +1091,7 @@ fn swap_gate_pressured() -> bool {
         // The count-only gate + memory_kb admission remain the only bounds
         // (both still active) rather than gating all work forever.
         warn!(
-            "stale swap sample: swap sampler appears wedged/dead, failing the swap gate OPEN"
+            "stale memory sample: memory-pressure sampler appears wedged/dead, failing the gate OPEN"
         );
     }
     pressured
@@ -2903,16 +3116,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // worker proactively rather than re-NAK-spinning it. Cheap: one relaxed
         // atomic load + compare, no lock, no await (`moka_evicting_map.rs`).
         let indefinite_pin_saturated = state.fs_store.indefinite_pin_saturated();
-        // Host swap pressure, read from the sampler-thread atomics (same
-        // cheap relaxed-load pattern as cpu_load_pct). The pressure RATE is
-        // the observability signal; swap-used is the coarse LEVEL gauge.
-        // `swap_pressured` is the coarse 1-bit gate verdict the matcher
-        // uses for a PROACTIVE skip (advisory only — the authoritative NAK
-        // reads the local atomic, not this wire boolean, design §2).
+        // Host memory pressure, read from the sampler-thread atomics (same
+        // cheap relaxed-load pattern as cpu_load_pct). `memory_pressure_level`
+        // is the MiB-below-free-floor magnitude (observability + the server's
+        // least-pressured fail-open ranking); swap-used is the coarse swap
+        // LEVEL gauge. `memory_pressured` is the coarse 1-bit gate verdict the
+        // matcher uses for a PROACTIVE skip (advisory only — the authoritative
+        // NAK reads the local atomic, not this wire boolean, design §2).
         let swap_used_bytes = get_swap_used_bytes();
-        let swap_pressure_rate_per_sec = get_swap_pressure_rate_per_sec();
-        let swap_pressured = swap_gate_pressured();
-        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} swap_pressure_rate_per_sec={swap_pressure_rate_per_sec} swap_pressured={swap_pressured}");
+        let memory_pressure_level = get_memory_pressure_level();
+        let memory_pressured = swap_gate_pressured();
+        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} memory_pressure_level={memory_pressure_level} memory_pressured={memory_pressured}");
         let notification = BlobsAvailableNotification {
             worker_cas_endpoint: state.cas_endpoint.clone(),
             digests: Vec::new(),
@@ -2980,11 +3194,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             pinned_ac_mirror_entries,
             // (FL-681) Snapshot taken above from the local CAS FilesystemStore.
             indefinite_pin_saturated,
-            // Host swap pressure (read above). Periodic heartbeat carries
+            // Host memory pressure (read above). Periodic heartbeat carries
             // the authoritative sampler values + the coarse gate verdict.
             swap_used_bytes,
-            swap_pressure_rate_per_sec,
-            swap_pressured,
+            memory_pressure_level,
+            memory_pressured,
         };
 
         // (#99) If the notification's encoded estimate exceeds the
@@ -3605,16 +3819,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         swap_first_idle_gated_at = Some(now);
                                     }
                                     warn!(
-                                        swap_pressure_rate_per_sec = get_swap_pressure_rate_per_sec(),
+                                        memory_pressure_level = get_memory_pressure_level(),
                                         in_flight,
-                                        "worker NAKing action: sustained host swap pressure (additive backstop to memory_kb admission)"
+                                        "worker NAKing action: sustained host memory pressure (additive backstop to memory_kb admission)"
                                     );
                                     if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
                                         self.grpc_client.clone().execution_response(
                                             ExecuteResult{
                                                 instance_name,
                                                 operation_id: start_execute.operation_id,
-                                                result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker under swap pressure").into())),
+                                                result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker under memory pressure").into())),
                                             }
                                         ).await?;
                                     }
@@ -3626,9 +3840,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     // until it drains (monotonic progress).
                                     swap_fail_open_latched = true;
                                     warn!(
-                                        swap_pressure_rate_per_sec = get_swap_pressure_rate_per_sec(),
+                                        memory_pressure_level = get_memory_pressure_level(),
                                         fail_open_after_secs = SWAP_FAIL_OPEN_AFTER.as_secs(),
-                                        "worker swap gate FAILING OPEN: idle+pressured past the fail-open window, accepting one action to avoid a fleet wedge"
+                                        "worker memory gate FAILING OPEN: idle+pressured past the fail-open window, accepting one action to avoid a fleet wedge"
                                     );
                                 }
                                 SwapGateDecision::Accept => {
@@ -3892,15 +4106,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             // this one-shot delta reports the
                                                             // AUTHORITATIVE current value. The
                                                             // post-action sample is a PEAK (RSS
-                                                            // not yet reclaimed); `swap_pressured`
-                                                            // comes from the EWMA verdict
-                                                            // (`swap_gate_pressured`), never the
-                                                            // raw peak, so one heavy action cannot
-                                                            // look like sustained pressure (§3b).
+                                                            // not yet reclaimed); `memory_pressured`
+                                                            // comes from the gate verdict
+                                                            // (`swap_gate_pressured`: free-floor OR
+                                                            // re-fault EWMA), never the raw peak, so
+                                                            // one heavy action cannot look like
+                                                            // sustained pressure (§3b).
                                                             swap_used_bytes: get_swap_used_bytes(),
-                                                            swap_pressure_rate_per_sec:
-                                                                get_swap_pressure_rate_per_sec(),
-                                                            swap_pressured: swap_gate_pressured(),
+                                                            memory_pressure_level:
+                                                                get_memory_pressure_level(),
+                                                            memory_pressured: swap_gate_pressured(),
                                                         }
                                                     ).await {
                                                         // Failure to send BlobsAvailable
@@ -6206,28 +6421,28 @@ mod tests {
         );
     }
 
-    /// The heartbeat reads host swap pressure via the process-global
-    /// sampler atomics (`get_swap_used_bytes` / `get_swap_pressure_rate_per_sec`),
+    /// The heartbeat reads host memory pressure via the process-global
+    /// sampler atomics (`get_swap_used_bytes` / `get_memory_pressure_level`),
     /// exactly like `get_cpu_load_pct`. This fakes a sampler tick by
     /// storing into the atomics and asserts the reader observes it — the
     /// path the periodic + post-action heartbeat build sites use.
     ///
-    /// Mutation step: change `get_swap_pressure_rate_per_sec` to read
-    /// `CPU_PCT` instead of `SWAP_PRESSURE_RATE` (wrong static). This test
-    /// red-fails because the faked rate value is not observed.
+    /// Mutation step: change `get_memory_pressure_level` to read `CPU_PCT`
+    /// instead of `MEMORY_PRESSURE_LEVEL` (wrong static). This test
+    /// red-fails because the faked level value is not observed.
     ///
     /// `#[serial(swap_sampler_atomics)]`: this test and
-    /// `sample_mem_pressure_first_tick_publishes_zero_rate` both mutate the
-    /// process-global `SWAP_USED_BYTES` / `SWAP_PRESSURE_RATE` statics. Under
-    /// the default multi-threaded test runner the other test's poison store
-    /// (`SWAP_PRESSURE_RATE = 99_999`) races this read; serializing the two
-    /// removes the cross-test interleave (no production-path change).
+    /// `sample_mem_pressure_first_tick_publishes_live_anchor` both mutate the
+    /// process-global `SWAP_USED_BYTES` / `MEMORY_PRESSURE_LEVEL` statics.
+    /// Under the default multi-threaded test runner the other test's stores
+    /// race this read; serializing the two removes the cross-test interleave
+    /// (no production-path change).
     #[test]
     #[serial(swap_sampler_atomics)]
     fn heartbeat_reads_swap_pressure_from_sampler_atomics() {
         // Fake a sampler tick.
         SWAP_USED_BYTES.store(7_654_321, Ordering::Relaxed);
-        SWAP_PRESSURE_RATE.store(1337, Ordering::Relaxed);
+        MEMORY_PRESSURE_LEVEL.store(1337, Ordering::Relaxed);
         assert_eq!(
             get_swap_used_bytes(),
             7_654_321,
@@ -6235,38 +6450,54 @@ mod tests {
              sampler atomic"
         );
         assert_eq!(
-            get_swap_pressure_rate_per_sec(),
+            get_memory_pressure_level(),
             1337,
-            "heartbeat must read swap_pressure_rate_per_sec from the \
-             SWAP_PRESSURE_RATE sampler atomic"
+            "heartbeat must read memory_pressure_level from the \
+             MEMORY_PRESSURE_LEVEL sampler atomic"
         );
     }
 
-    /// `sample_mem_pressure` is the per-tick sampler step. On the FIRST
-    /// call there is no prior anchor, so the rate must publish 0 (no
-    /// interval to rate against) while still returning the cumulative
-    /// anchor for the next tick. This guards against a first-tick spike
-    /// where the absolute counter would be mistaken for a one-tick delta.
+    /// `sample_mem_pressure` MUST publish the monotonic `LAST_SAMPLE_INSTANT`
+    /// liveness anchor on EVERY tick (BEFORE the signal read can
+    /// early-return), so the gate's sample-age fail-open (§3a) sees a live
+    /// sampler. This guards the rev-4 invariant that a sampler that IS
+    /// ticking never trips the age fail-open, while a sampler that STOPS
+    /// ticking does.
+    ///
+    /// Note: `LAST_SAMPLE_INSTANT` is monotonic nanos since `PROCESS_START`.
+    /// On the very FIRST sampler reference, `PROCESS_START` lazy-inits to a
+    /// moment AT/AFTER the tick's `now`, so the first tick can legitimately
+    /// publish 0 (read as never-sampled → fail-open, which is correct that
+    /// early). We therefore initialize `PROCESS_START` first, then assert a
+    /// SUBSEQUENT tick publishes a strictly positive anchor.
     ///
     /// `#[serial(swap_sampler_atomics)]`: shares the process-global
-    /// `SWAP_PRESSURE_RATE` static with
-    /// `heartbeat_reads_swap_pressure_from_sampler_atomics`; serialized so
-    /// the poison store below cannot race that test's read.
+    /// `LAST_SAMPLE_INSTANT` static with the other sampler-atomic tests;
+    /// serialized so a concurrent store cannot race this read.
     #[test]
     #[serial(swap_sampler_atomics)]
-    fn sample_mem_pressure_first_tick_publishes_zero_rate() {
-        SWAP_PRESSURE_RATE.store(99_999, Ordering::Relaxed); // poison
+    fn sample_mem_pressure_first_tick_publishes_live_anchor() {
+        // Initialize PROCESS_START so the tick's `now` is strictly after it.
+        let start = *PROCESS_START;
+        // Busy-wait a hair so `Instant::now()` inside the tick is strictly
+        // greater than `start` (no sleep-as-synchronization — this is a
+        // monotonic-clock advance guarantee, not cross-thread coordination).
+        while Instant::now() <= start {
+            core::hint::spin_loop();
+        }
+        LAST_SAMPLE_INSTANT.store(0, Ordering::Relaxed);
         let next = sample_mem_pressure(SwapSamplerState::new());
-        assert_eq!(
-            get_swap_pressure_rate_per_sec(),
-            0,
-            "first sampler tick has no prior interval; rate must be 0, not \
-             the absolute counter mistaken for a one-tick delta"
+        let after = LAST_SAMPLE_INSTANT.load(Ordering::Relaxed);
+        assert!(
+            after > 0,
+            "sample_mem_pressure must publish a fresh strictly-positive \
+             monotonic LAST_SAMPLE_INSTANT anchor on every tick (once \
+             PROCESS_START is initialized) so the sample-age fail-open sees \
+             a live sampler; anchor was {after}"
         );
-        // On Linux/macOS the cumulative read succeeds and returns an
-        // anchor; on unsupported targets it is None. Either way the rate
-        // was published as 0 above. We don't assert the anchor's presence
-        // because the no-op `mem_impl` legitimately returns None.
+        // The returned state carries the anchor for the next tick. We don't
+        // assert the cumulative anchor's presence because the no-op
+        // `mem_impl` legitimately returns None (unsupported target).
         let _ = next;
     }
 
@@ -6306,12 +6537,235 @@ mod tests {
         );
     }
 
+    /// (#37 rev-4, deliverable (a)) The PRIMARY free-floor trip: free BELOW
+    /// `FREE_FLOOR_BYTES` ⇒ gate; free at/above the floor (out of the
+    /// hysteresis band) ⇒ no gate. This is the leading-signal trip that
+    /// reads the at-the-RAM-wall case (68 MiB free) as pressured while the
+    /// re-fault rate is still silent (design §0-rev4.2).
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): in `free_floor_breached`, invert
+    /// the PRIMARY comparator (`free_bytes < FREE_FLOOR_BYTES` →
+    /// `free_bytes > FREE_FLOOR_BYTES`). The at-the-wall assertion below
+    /// red-fails with its bespoke "free below the floor must trip" message —
+    /// proving the comparator direction is load-bearing.
+    #[test]
+    fn free_floor_trips_below_floor_not_above() {
+        // At the RAM wall: 68 MiB free ≪ 1 GiB floor ⇒ MUST trip.
+        assert!(
+            free_floor_breached(68 << 20, false),
+            "free below the floor must trip the gate: 68 MiB free is the \
+             at-the-RAM-wall case the free-floor PRIMARY exists to catch \
+             (the re-fault rate reads it as healthy) — comparator inverted?"
+        );
+        // Healthy headroom: 8969 MiB free ≫ floor+hysteresis ⇒ MUST NOT trip.
+        assert!(
+            !free_floor_breached(8969 << 20, false),
+            "free far above the floor must NOT trip: 8969 MiB is the healthy \
+             IDLE headroom; tripping here would false-gate a healthy worker"
+        );
+        // Exactly at the floor is NOT below it (strict `<`) ⇒ no trip from
+        // a cold state.
+        assert!(
+            !free_floor_breached(FREE_FLOOR_BYTES, false),
+            "free exactly at the floor is not BELOW it; the trip is strict <"
+        );
+        // One byte below the floor ⇒ trip.
+        assert!(
+            free_floor_breached(FREE_FLOOR_BYTES - 1, false),
+            "one byte below the floor must trip"
+        );
+    }
+
+    /// (#37 rev-4) The free-floor is a LEVEL with a two-threshold hysteresis
+    /// band (design §0-rev4.4): once tripped it stays tripped until free
+    /// recovers ABOVE `FREE_FLOOR_BYTES + FREE_FLOOR_HYSTERESIS`, so a worker
+    /// hovering at the boundary does not flap admit/refuse every tick.
+    #[test]
+    fn free_floor_hysteresis_band_holds_prior_state() {
+        // In the band (between floor and floor+hysteresis):
+        let in_band = FREE_FLOOR_BYTES + (FREE_FLOOR_HYSTERESIS / 2);
+        // ...holds tripped if it was tripped...
+        assert!(
+            free_floor_breached(in_band, true),
+            "in the hysteresis band, a tripped gate must STAY tripped \
+             (no admit/refuse chatter at the boundary)"
+        );
+        // ...and holds clear if it was clear.
+        assert!(
+            !free_floor_breached(in_band, false),
+            "in the hysteresis band, a clear gate must STAY clear"
+        );
+        // Above the band ⇒ clears regardless of prior state.
+        assert!(
+            !free_floor_breached(FREE_FLOOR_BYTES + FREE_FLOOR_HYSTERESIS, false),
+            "free recovered above floor+hysteresis must clear the trip"
+        );
+    }
+
+    /// (#37 rev-4) The wire/observability LEVEL scalar (field 20): MiB
+    /// below the free-floor, `0` when at/above it. Higher = more pressured,
+    /// so the server's `min_by_key` least-pressured fail-open ranking stays
+    /// correct.
+    #[test]
+    fn memory_pressure_level_is_mib_below_floor() {
+        // 256 MiB below the floor ⇒ level 256.
+        assert_eq!(
+            memory_pressure_level_mib(FREE_FLOOR_BYTES - (256 << 20)),
+            256,
+            "level must be MiB below the free-floor"
+        );
+        // At/above the floor ⇒ 0 (healthy).
+        assert_eq!(
+            memory_pressure_level_mib(FREE_FLOOR_BYTES),
+            0,
+            "at the floor, the shortfall (and thus the level) is 0"
+        );
+        assert_eq!(
+            memory_pressure_level_mib(8969 << 20),
+            0,
+            "healthy headroom reports level 0"
+        );
+        // A deeper shortfall reports a HIGHER level (the ranking direction).
+        assert!(
+            memory_pressure_level_mib(10 << 20) > memory_pressure_level_mib(900 << 20),
+            "a deeper free-shortfall must report a HIGHER level so the \
+             server's min_by_key fail-open picks the least-pressured worker"
+        );
+    }
+
+    /// (#37 rev-4, deliverable (b)) A DEAD sampler must fail OPEN even if
+    /// the last published verdict was "pressured" (e.g. the last free
+    /// reading was below the floor). A wedged sampler that froze with
+    /// `MEMORY_PRESSURED = true` must NOT pin the worker gated forever —
+    /// the sample-age fail-open is what releases it (§3a rule 2 / §5 case
+    /// 4). This composes the value atomic (frozen "pressured") with a STALE
+    /// age, exactly the production read in `swap_gate_pressured`.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): delete the
+    /// `if age > max_age { return (false, true) }` arm in
+    /// `swap_gate_verdict` (let the stale "pressured" value fall through).
+    /// This test red-fails with its bespoke "dead sampler must fail open"
+    /// message — proving the age check, not just the value, gates.
+    #[test]
+    fn dead_sampler_fails_open_even_when_last_reading_was_below_floor() {
+        let max_age = SWAP_SAMPLE_MAX_AGE;
+        // The value atomic is frozen at "pressured" (the free floor was
+        // breached on the sampler's last live tick), but the sampler then
+        // DIED: its last anchor is at t=1s and "now" is t=10s ⇒ age 9s ≫ 2s.
+        let (pressured, stale) = swap_gate_verdict(
+            true,                                      // gate enabled
+            true,                                      // last verdict: pressured (below floor)
+            Duration::from_secs(1).as_nanos() as u64,  // last sample at t=1s
+            Duration::from_secs(10),                   // now at t=10s
+            max_age,
+        );
+        assert!(
+            !pressured,
+            "dead sampler must fail open: a wedged sampler frozen at \
+             'pressured' (its last free reading was below the floor) must \
+             NOT keep the worker gated forever — the sample-age fail-open \
+             releases it"
+        );
+        assert!(
+            stale,
+            "the stale path must be flagged so the wedged-sampler warn! fires"
+        );
+    }
+
+    /// (#37 rev-4, deliverable (c) — numeric-constant discipline) Pin the
+    /// CONSERVATIVE free-floor value at the declaration site so a
+    /// doc-comment rewrite cannot drift it. 1 GiB sits inside the idle
+    /// probe's ~100× healthy(8969 MiB)/at-wall(68 MiB) separation: 9× below
+    /// healthy, 15× above the at-wall floor. This is a CONSERVATIVE
+    /// safe-enable value pending a busy-worker soak; it is NOT asserted as
+    /// soak-validated.
+    #[test]
+    fn free_floor_bytes_is_conservative_one_gib() {
+        assert_eq!(
+            FREE_FLOOR_BYTES,
+            1_073_741_824,
+            "FREE_FLOOR_BYTES must be 1 GiB (1 << 30): the conservative \
+             safe-enable margin inside the probe's ~100× healthy/at-wall \
+             separation. If this drifts, the gate's false-trip risk on a \
+             busy-but-healthy worker changes — re-justify from the probe"
+        );
+        // The hysteresis band is a quarter of the floor (256 MiB).
+        assert_eq!(
+            FREE_FLOOR_HYSTERESIS,
+            268_435_456,
+            "FREE_FLOOR_HYSTERESIS must be 256 MiB (256 << 20)"
+        );
+        // The corroboration confirm threshold is the conservative re-fault
+        // rate well above any non-thrash baseline (~1503/s) and below
+        // genuine thrash (44K-297K/s).
+        assert_eq!(
+            REFAULT_CONFIRM_RATE, 10_000,
+            "REFAULT_CONFIRM_RATE must be 10000/s (conservative re-fault \
+             confirm threshold)"
+        );
+        // And the gate ships ENABLED (the whole point of this change).
+        assert!(
+            MEMORY_GATE_ENABLED,
+            "MEMORY_GATE_ENABLED must be true — the operator directed this \
+             gate shipped ENABLED with the conservative free-floor"
+        );
+    }
+
+    /// (#37 rev-4, deliverable (d)) The re-fault CORROBORATION: even when
+    /// the free-floor is NOT breached, a re-fault confirm trips the gate
+    /// (the design's OR logic — §0-rev4.4). This binds to the SAME pure
+    /// `memory_gate_verdict` the production sampler calls, so it proves the
+    /// secondary signal is wired into the real verdict, not decorative.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): in `memory_gate_verdict`, drop the
+    /// `|| refault_confirmed` disjunct (free-floor only). The thrash-confirm
+    /// assertion below red-fails — and because `sample_mem_pressure` calls
+    /// the same function, that mutation also breaks production.
+    #[test]
+    fn refault_corroboration_trips_gate_without_free_floor() {
+        // Free-floor healthy, but re-fault confirmed (active thrash) ⇒ trip.
+        assert!(
+            memory_gate_verdict(true, false, true),
+            "re-fault corroboration must trip the gate even when the \
+             free-floor is healthy: the OR logic catches a box that reads \
+             non-floor free but is actively thrashing (design §0-rev4.4)"
+        );
+        // Free-floor breached, re-fault healthy ⇒ trip (the PRIMARY alone).
+        assert!(
+            memory_gate_verdict(true, true, false),
+            "the free-floor PRIMARY must trip the gate on its own (re-fault \
+             is silent at the RAM wall — the whole point of the redesign)"
+        );
+        // Neither signal ⇒ no trip.
+        assert!(
+            !memory_gate_verdict(true, false, false),
+            "neither signal tripped: a healthy worker must not gate"
+        );
+        // Disabled ⇒ never trip, regardless of signals.
+        assert!(
+            !memory_gate_verdict(false, true, true),
+            "a disabled gate must never trip even with both signals active"
+        );
+
+        // And a re-fault EWMA at 2x the confirm threshold IS confirmed (the
+        // rate→confirm wiring `sample_mem_pressure` does before calling the
+        // verdict).
+        let refault_confirmed = update_swap_ewma(
+            f64::from(REFAULT_CONFIRM_RATE) * 2.0,
+            f64::from(REFAULT_CONFIRM_RATE) * 2.0,
+        ) >= f64::from(REFAULT_CONFIRM_RATE);
+        assert!(
+            refault_confirmed,
+            "a re-fault EWMA at 2x the confirm threshold must be confirmed"
+        );
+    }
+
     /// (#37) The gate MUST fail OPEN when the sampler is wedged/dead: a
     /// STALE `LAST_SAMPLE_INSTANT` means UNKNOWN, and the gate must NOT
     /// report pressured (else a dead sampler wedges the worker into
     /// refusing all work forever — §3a rule 2 / §5 case 4). Drives the
     /// pure `swap_gate_verdict` with `enabled = true` so the age check is
-    /// exercised regardless of the `SWAP_GATE_ENABLED` ship flag.
+    /// exercised regardless of the `MEMORY_GATE_ENABLED` ship flag.
     ///
     /// Mutation step (CLAUDE.md TDD #5): delete the
     /// `if age > max_age { return (false, true) }` arm in

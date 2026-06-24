@@ -145,26 +145,29 @@ pub struct Worker {
     #[metric(help = "If the worker's indefinite-pin cap is reported saturated.")]
     pub indefinite_pin_saturated: bool,
 
-    /// (#37 swap-pressure gate) Whether the worker reported sustained host
-    /// swap pressure in its last `BlobsAvailable` heartbeat (the coarse
-    /// 1-bit EWMA verdict). While `true`, the matcher PROACTIVELY skips
-    /// this worker for new actions (mirrors `indefinite_pin_saturated`) so
-    /// a pressured-but-idle worker is not selected and then forced to
+    /// (#37 rev-4 memory-pressure gate) Whether the worker reported
+    /// sustained host memory pressure in its last `BlobsAvailable` heartbeat
+    /// (the coarse 1-bit verdict: free-floor breached OR re-fault EWMA over
+    /// threshold). While `true`, the matcher PROACTIVELY skips this worker
+    /// for new actions (mirrors `indefinite_pin_saturated`) so a
+    /// pressured-but-idle worker is not selected and then forced to
     /// worker-side NAK → re-queue → re-dispatch spin. ADVISORY ONLY: the
     /// authoritative gate is the worker's local atomic (the StartAction
     /// NAK); this is the proactive optimization. `false` for workers that
     /// never report pressure (pre-#37 / gate disabled / sampler stale).
     /// The fleet fail-open (`api_worker_scheduler`) overrides this skip
-    /// when EVERY candidate is swap-gated, degrading to least-pressured
+    /// when EVERY candidate is memory-gated, degrading to least-pressured
     /// placement rather than a wedge.
-    #[metric(help = "If the worker reported sustained host swap pressure.")]
+    #[metric(help = "If the worker reported sustained host memory pressure.")]
     pub swap_pressured: bool,
 
-    /// (#37) The worker's last-reported swap-pressure RATE (events/sec),
-    /// used ONLY to rank the least-pressured worker in the fleet fail-open
-    /// (when all candidates are swap-gated). Observability + tie-break;
-    /// NOT a gate input on its own. `0` = unknown / no pressure reported.
-    #[metric(help = "Worker-reported swap-pressure rate (events/sec).")]
+    /// (#37 rev-4) The worker's last-reported memory-pressure LEVEL (MiB
+    /// below the free-floor), used ONLY to rank the least-pressured worker
+    /// in the fleet fail-open (when all candidates are memory-gated).
+    /// Observability + tie-break; NOT a gate input on its own. `0` =
+    /// unknown / no pressure reported. Higher = more pressured, so the
+    /// `min_by_key` fail-open ranking selects the least-pressured worker.
+    #[metric(help = "Worker-reported memory-pressure level (MiB below free-floor).")]
     pub swap_pressure_rate_per_sec: u32,
 
     /// Digests of input root directories cached in the worker's directory cache.
