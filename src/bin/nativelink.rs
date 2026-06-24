@@ -1655,25 +1655,49 @@ async fn inner_main(
     // explicitly rejected), feeding doomed peer-fetch attempts against a dead
     // endpoint. `sweep_unconfirmed` is internally gated on the reload baseline +
     // grace (it no-ops until the reload is ≥ grace old), so a one-shot fire at
-    // grace after boot drops exactly the endpoints that never reconnected within
-    // the window. One-shot (not periodic): the reload happens once per boot, so
-    // a single sweep at grace covers the whole reloaded set; a worker that
-    // reconnects after grace simply re-registers (its entries are live, not
+    // grace AFTER THE BASELINE drops exactly the endpoints that never reconnected
+    // within the window. One-shot (not periodic): the reload happens once per
+    // boot, so a single sweep at grace covers the whole reloaded set; a worker
+    // that reconnects after grace simply re-registers (its entries are live, not
     // sentinel). Best-effort: a `None` persister (no worker_api) skips it.
+    //
+    // (#66) The grace timer MUST start from the reload BASELINE, not boot.
+    // `reload_baseline` is stamped at the END of `reload_from_disk` (after the
+    // async read + decode = `boot + reload_duration`); a timer started at boot
+    // fires when `baseline.elapsed() = grace − reload_duration < grace`, so the
+    // strict `<` time-gate in `sweep_unconfirmed` returns 0 on the single fire
+    // EVERY boot (distsys MAJOR-1). We therefore await the SAME `bazel_ready`
+    // gate the Bazel-REAPI listeners gate on — it flips `true` only AFTER the
+    // reload task's `reload_from_disk` returns (which is after the baseline is
+    // stamped) — and only THEN sleep `grace`, so `baseline.elapsed() >= grace`
+    // holds at fire. `run_never_reconnect_sweep` owns the await→sleep→sweep
+    // sequence so the bin path and the production-timing test share it.
     {
         let sweep_persister = locality_persister.clone();
+        let mut sweep_ready_rx = bazel_ready_tx.subscribe();
         #[expect(clippy::disallowed_methods, reason = "one-shot locality sweep task spawned in inner_main")]
         tokio::spawn(async move {
             let Some(persister) = sweep_persister else {
                 return;
             };
             let grace = Duration::from_secs(LOCALITY_PERSIST_RECONNECT_GRACE_SECS);
-            tokio::time::sleep(grace).await;
-            let swept = persister.sweep_unconfirmed(grace);
+            // reload_done: resolves once the readiness gate flips `true`, which
+            // the reload task does ONLY after `reload_from_disk` returns (baseline
+            // stamped). On sender-drop (reload task gone) the wait ends too —
+            // sweep then no-ops on a `None` baseline, which is correct (no reload
+            // ran → no sentinel entries to sweep).
+            let reload_done = async move {
+                while !*sweep_ready_rx.borrow_and_update() {
+                    if sweep_ready_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let swept = persister.run_never_reconnect_sweep(reload_done, grace).await;
             info!(
                 swept,
                 grace_secs = LOCALITY_PERSIST_RECONNECT_GRACE_SECS,
-                "never-reconnect locality sweep fired (one-shot at grace after boot)"
+                "never-reconnect locality sweep fired (one-shot at grace after reload baseline)"
             );
         });
     }

@@ -52,7 +52,9 @@ use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker_registry::WorkerRegistry;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
-use nativelink_service::worker_api_server::WorkerApiServer;
+use nativelink_service::worker_api_server::{
+    LOCALITY_PERSIST_RECONNECT_GRACE_SECS, WorkerApiServer,
+};
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::blob_locality_map::{
     PersistedEndpoint, PersistedLocalityMap, SharedBlobLocalityMap, new_shared_blob_locality_map,
@@ -678,6 +680,99 @@ async fn reload_does_not_clobber_live_reconnected_endpoint()
          (`entry().or_insert`) so it never overwrites a live connection's owner. \
          Found: {:?}",
         locality_map.read().lookup_workers(&live_digest)
+    );
+    Ok(())
+}
+
+/// PRODUCTION-TIMING SCHEDULING (distsys MAJOR-1, RE-OPENED — task #66): the
+/// never-reconnect sweep SCHEDULER must fire `grace` after the RELOAD BASELINE,
+/// not after boot. This is the test the prior sweep tests could not catch: they
+/// all call `sweep_unconfirmed_reloaded_locality(grace)` directly with `grace`
+/// DECOUPLED from the production sleep timing (grace=ZERO always-elapsed or
+/// grace=86400 never-elapsed), so they never compose the real
+/// `sleep(grace)`-relative-to-`reload_baseline` schedule.
+///
+/// THE BUG this pins: `reload_from_disk` stamps `reload_baseline` at its END
+/// (after the async file read + decode = `boot + reload_duration`). If the
+/// scheduler sleeps `grace` from BOOT and then calls `sweep_unconfirmed(grace)`,
+/// at fire time `baseline.elapsed() = grace − reload_duration < grace`, so the
+/// strict `<` time-gate returns 0 EVERY boot — the single one-shot fire is a
+/// guaranteed no-op and never-reconnect entries leak forever.
+///
+/// This test composes the PRODUCTION schedule via
+/// `LocalityPersister::run_never_reconnect_sweep(reload_done, grace)`, passing
+/// the REAL `reload_from_disk` future as `reload_done` (so the sleep-start is
+/// COUPLED to the baseline-stamp, exactly as the bin couples it to the
+/// `bazel_ready` gate that flips only after the reload returns) and the REAL
+/// production `LOCALITY_PERSIST_RECONNECT_GRACE_SECS` (600 s) as `grace`. Under
+/// `start_paused`, the 600 s `sleep` is virtualized: the real file read advances
+/// virtual time ~0 (it parks on real I/O, not a timer), the baseline is stamped
+/// at virtual≈0, then the awaited `sleep(grace)` auto-advances the clock by
+/// `grace`, so `baseline.elapsed() == grace` at fire and the entry is swept.
+///
+/// Mutation (in `run_never_reconnect_sweep`, swap the ordering to sleep-from-boot
+/// — `tokio::time::sleep(grace).await; reload_done.await;` instead of awaiting
+/// `reload_done` FIRST): the sleep runs before the reload, the virtual clock
+/// advances `grace`, THEN `reload_done` completes and stamps the baseline at
+/// virtual=`grace`, so at fire `baseline.elapsed() ≈ 0 < grace` → the sweep
+/// returns 0 and the entry LEAKS → the `assert_eq!(swept, 1, ...)` red-fails with
+/// its bespoke message. This is the boot-vs-baseline bug biting.
+#[nativelink_test(start_paused = true)]
+async fn never_reconnect_sweep_fires_grace_after_baseline_not_boot()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (server, locality_map) = make_server()?;
+    let gone_ep = "grpc://w-timing-gone:50081";
+    let gone_digest = digest(0x55, 100);
+    let bytes = persisted_bytes(vec![(gone_ep, 8888, vec![gone_digest])]);
+    let path = write_persist_file(&bytes).await;
+
+    // The persister handle the bin's sweep task owns — the EXACT production
+    // handle (cheap clones of locality_map + endpoint_state + reload_baseline).
+    let persister = server
+        .locality_persister()
+        .expect("server built with a locality_map must yield a persister");
+
+    // Compose the PRODUCTION schedule: reload-done signal = the real
+    // `reload_from_disk` future (stamps `reload_baseline` at its END), grace =
+    // the real production constant. `run_never_reconnect_sweep` awaits the reload
+    // FIRST, THEN sleeps grace, THEN sweeps — so the grace timer starts from the
+    // baseline, never from boot.
+    let grace = Duration::from_secs(LOCALITY_PERSIST_RECONNECT_GRACE_SECS);
+    let reload_done = async move {
+        // The bin maps any reload error to fail-open; here a well-formed file
+        // must reload cleanly. We only need the future to RESOLVE (and stamp the
+        // baseline) — its summary is asserted by the dedicated reload tests.
+        server
+            .reload_locality_from_disk(&path)
+            .await
+            .expect("reload of a well-formed file must succeed");
+    };
+
+    // A generous deadlock detector that, under virtual time, the awaited
+    // `sleep(grace)` advances through deterministically (the real 600 s never
+    // elapses on the wall clock). A genuine hang (e.g. the sweep awaiting a
+    // signal that never fires) trips this instead of wedging the test runner.
+    let swept = tokio::time::timeout(
+        Duration::from_secs(LOCALITY_PERSIST_RECONNECT_GRACE_SECS * 4),
+        persister.run_never_reconnect_sweep(reload_done, grace),
+    )
+    .await
+    .expect("sweep scheduler must not hang — it must fire once grace elapses from the baseline");
+
+    assert_eq!(
+        swept, 1,
+        "the never-reconnect sweep must FIRE grace after the reload BASELINE — \
+         the scheduler sleeps grace AFTER awaiting reload-completion, so \
+         baseline.elapsed() >= grace at fire. Mutation (sleep grace from BOOT \
+         before awaiting reload-done) makes baseline.elapsed() = grace − \
+         reload_duration < grace, the strict `<` gate returns 0, and the entry \
+         leaks — swept would be 0, not 1"
+    );
+    assert!(
+        locality_map.read().lookup_workers(&gone_digest).is_empty(),
+        "the never-reconnect entry must be GONE after the production-timed sweep \
+         (mutation: sleep-from-boot leaves it present because the grace gate \
+         no-ops on the single one-shot fire)"
     );
     Ok(())
 }

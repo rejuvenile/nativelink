@@ -175,7 +175,17 @@ pub struct WorkerApiServer {
     /// that fires before grace must NOT prematurely sweep). Process-wide
     /// singleton shared with every `LocalityPersister` clone (reload stamps it;
     /// sweep reads it). `None` until a reload runs.
-    locality_reload_baseline: Arc<parking_lot::Mutex<Option<Instant>>>,
+    ///
+    /// `tokio::time::Instant` (NOT `std::time::Instant`): the never-reconnect
+    /// sweep schedule (`run_never_reconnect_sweep`) sleeps `grace` then compares
+    /// `baseline.elapsed() >= grace`. Both the sleep AND the elapsed-comparison
+    /// MUST read the SAME clock or the production-timing test cannot virtualize
+    /// the 600 s window under `tokio::time::pause()` — `std::time::Instant` is
+    /// the real wall clock, which `pause()` does NOT advance, so a virtualized
+    /// `sleep(grace)` would leave `baseline.elapsed()` at ~0 and the gate would
+    /// no-op. In production (never paused) `tokio::time::Instant` delegates to
+    /// the real monotonic clock, so runtime behavior is identical.
+    locality_reload_baseline: Arc<parking_lot::Mutex<Option<tokio::time::Instant>>>,
     /// (#387) Per-endpoint flap-detection history. Held in a SEPARATE
     /// `parking_lot::Mutex` from `endpoint_state` so it survives the
     /// disconnect-cleanup `state.remove(&cas_endpoint)` at
@@ -1564,8 +1574,10 @@ pub struct LocalityPersister {
     /// periodic). `None` until a reload has run (a sweep before any reload is a
     /// no-op — there are no sentinel entries to drop). Shared across clones so
     /// the reload clone's stamp is visible to the sweep clone. See
-    /// `sweep_unconfirmed`.
-    reload_baseline: Arc<parking_lot::Mutex<Option<Instant>>>,
+    /// `sweep_unconfirmed`. `tokio::time::Instant` (NOT std) so the sweep's
+    /// `sleep(grace)` and `baseline.elapsed()` share one virtualizable clock —
+    /// see `WorkerApiServer::locality_reload_baseline` for the full rationale.
+    reload_baseline: Arc<parking_lot::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl LocalityPersister {
@@ -1749,7 +1761,9 @@ impl LocalityPersister {
         // `grace` (it refuses to drop a sentinel entry until the reload is at
         // least `grace` old). Set AFTER the priming so a concurrent sweep never
         // sees a baseline before the sentinels it gates exist.
-        *self.reload_baseline.lock() = Some(Instant::now());
+        // `tokio::time::Instant` (see field docs): same clock the sweep's
+        // `sleep(grace)` advances, so the grace gate is testable under `pause()`.
+        *self.reload_baseline.lock() = Some(tokio::time::Instant::now());
         info!(
             endpoints = endpoints_loaded,
             digests = digests_loaded,
@@ -1817,6 +1831,45 @@ impl LocalityPersister {
             "locality reload: swept never-reconnected reloaded endpoints past grace"
         );
         stale.len()
+    }
+
+    /// (#58 directive-3 — task #66) The startup never-reconnect sweep SCHEDULER.
+    ///
+    /// Drives the single sweep fire at `grace` after the RELOAD BASELINE — NOT
+    /// after boot. This is the load-bearing ordering: `reload_from_disk` stamps
+    /// `reload_baseline` at its END (after the async file read + decode), so the
+    /// baseline is `boot + reload_duration`. If the grace timer started at boot
+    /// (sleeping `grace` from `t_spawn ≈ boot`), then at fire time
+    /// `baseline.elapsed() = grace − reload_duration < grace`, and
+    /// `sweep_unconfirmed`'s strict `<` time-gate returns 0 EVERY boot — the
+    /// sweep is a guaranteed no-op and never-reconnect entries leak forever
+    /// (distsys MAJOR-1, re-opened). Awaiting `reload_done` BEFORE the `sleep`
+    /// guarantees the timer starts at-or-after the baseline stamp, so
+    /// `baseline.elapsed() >= grace` holds at fire.
+    ///
+    /// `reload_done` is the reload-completion signal — in the bin, the
+    /// `bazel_ready` readiness gate (flipped `true` only AFTER `reload_from_disk`
+    /// returns, which is after the baseline is stamped); in tests, the
+    /// `reload_from_disk` future itself (so the test couples the sleep-start to
+    /// the baseline-stamp, the exact production composition). Consumes `self`
+    /// (the task owns the handle for its lifetime). Returns the number of
+    /// endpoints swept (for logging / assertion).
+    ///
+    /// NO blocking primitive: `tokio::time::sleep` (virtualizable under
+    /// `tokio::time::pause`), no `std::thread::sleep`. One-shot, not periodic:
+    /// the reload happens once per boot, so a single correctly-timed fire covers
+    /// the whole reloaded set; a worker that reconnects after grace simply
+    /// re-registers (its entries are live, not sentinel).
+    #[must_use]
+    pub async fn run_never_reconnect_sweep<F>(self, reload_done: F, grace: Duration) -> usize
+    where
+        F: core::future::Future<Output = ()>,
+    {
+        // Start the grace timer from the BASELINE, not boot: await reload
+        // completion FIRST so the sleep begins at-or-after the baseline stamp.
+        reload_done.await;
+        tokio::time::sleep(grace).await;
+        self.sweep_unconfirmed(grace)
     }
 }
 
