@@ -194,3 +194,11 @@ name = "o2_channel_capacity_test"
 # which is gated behind `cfg(any(test, feature = "test-utils"))`.
 name = "w6_sync_giveup_requeue_test"
 required-features = ["test-utils"]
+
+[[test]]
+# (M1 publish-closure seam) Uses `utils::local_worker_test_utils::setup_local_worker`,
+# which calls `LocalWorker::set_ac_write_semaphore_for_test` — gated behind
+# `cfg(any(test, feature = "test-utils"))`. Without this entry a plain
+# `cargo test -p nativelink-worker` builds the auto-discovered target and fails.
+name = "kill_upload_tail_publish_seam_test"
+required-features = ["test-utils"]
