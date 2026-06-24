@@ -187,3 +187,10 @@ required-features = ["test-utils"]
 # concurrency-without-serialization proof, and FIFO ordering verification.
 # No test-utils required — uses the real WorkerApiClientWrapper directly.
 name = "o2_channel_capacity_test"
+
+[[test]]
+# (#FL-688 W6) Drives the REAL `spawn_upload_to_remote` give-up arm
+# end-to-end via the `spawn_upload_to_remote_for_test` JoinHandle seam,
+# which is gated behind `cfg(any(test, feature = "test-utils"))`.
+name = "w6_sync_giveup_requeue_test"
+required-features = ["test-utils"]

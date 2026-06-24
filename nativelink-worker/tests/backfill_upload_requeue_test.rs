@@ -41,14 +41,20 @@
 //!              where the worker holds a pinned mirror copy the server is
 //!              asking it to upload back (`local_worker.rs:2682-2684`).
 //!              The worker `get_cas_store()` FSS is NOT `local_only_reads`
-//!              (`local_worker.rs:4951`), so its `has_with_results`
-//!              consults slow → in-flight → mirror, and `get_part` reads
-//!              mirror-first — exactly the tiers seeded here.
+//!              (the worker builds its `effective_cas_store` as a plain FSS
+//!              at `local_worker.rs:4690`; `local_only_reads` is a separate
+//!              opt-in), so its `has_with_results` default branch consults
+//!              slow → in-flight → mirror (`fast_slow_store.rs:4967` "Only
+//!              check the slow store" + the mirror check at `:5047`), and
+//!              `get_part` reads mirror-first — exactly the tiers seeded here.
 //! Manager:     real `RunningActionsManager` trait via
 //!              `MockRunningActionsManager`, whose `get_cas_store()` returns
-//!              the composed FSS.
-//! Re-queue seam: the W4 Err arm → `FastSlowStore::failed_writes_inserter`
-//!              → `failed_slow_writes` HashSet.
+//!              the composed FSS (production impl at
+//!              `running_actions_manager.rs:7493`).
+//! Re-queue seam: the W4 Err arm → `FastSlowStore::requeue_failed_push`
+//!              → `failed_slow_writes` HashSet (the capped re-queue inserter;
+//!              the older `failed_writes_inserter` closure is the chunked-path
+//!              sibling, NOT the W4 arm).
 //! Drain seam:  `FastSlowStore::drain_failed_digests` (what the reconnect
 //!              drainer calls) observes the re-queued digest.
 
@@ -212,15 +218,16 @@ fn mk_digest(seed: u8, size: usize) -> DigestInfo {
 /// Seed a blob into the FSS `mirror_blobs` map — the production-faithful
 /// "worker holds a pinned mirror copy the server is asking it to upload
 /// back" state. The worker's `get_cas_store()` returns the PLAIN (non
-/// `local_only_reads`) `effective_cas_store` (`local_worker.rs:4951`),
-/// whose `has_with_results` checks slow → in-flight → mirror (NOT the
-/// fast tier directly — `fast_slow_store.rs:4847` "Only check the slow
-/// store"). A blob held only in the fast tier would be reported MISSING
-/// and the handler would early-return at the "none found locally" arm,
-/// never reaching the W4 upload Err arm under test. `mirror_blobs` is the
-/// tier the default `has_with_results` (`:4938`) AND `get_part`
-/// (`:6114`, mirror-first) both consult, so seeding here exercises the
-/// real backfill read→upload→Err→re-queue path.
+/// `local_only_reads`) `effective_cas_store` (built at
+/// `local_worker.rs:4690`), whose default `has_with_results` branch checks
+/// slow → in-flight → mirror (NOT the fast tier directly —
+/// `fast_slow_store.rs:4967` "Only check the slow store"). A blob held only
+/// in the fast tier would be reported MISSING and the handler would
+/// early-return at the "none found locally" arm, never reaching the W4
+/// upload Err arm under test. `mirror_blobs` is the tier the default
+/// `has_with_results` (mirror check at `fast_slow_store.rs:5047`) AND
+/// `get_part` (`:6234`, mirror-first) both consult, so seeding here
+/// exercises the real backfill read→upload→Err→re-queue path.
 fn seed_mirror(fss: &Arc<FastSlowStore>, digest: DigestInfo, payload: Bytes) {
     fss.test_insert_mirror_blob_unchecked(digest, payload);
 }

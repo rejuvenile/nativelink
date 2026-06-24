@@ -6321,19 +6321,39 @@ impl RunningActionsManagerImpl {
         action_result: &ActionResult,
         action: Option<&Arc<RunningActionImpl>>,
     ) {
+        // Production entry point: schedule the background upload and DROP the
+        // JoinHandle (fire-and-forget, exactly as before). The `_impl` carries
+        // the body and returns the handle so the #FL-688 W6 production-
+        // composition test can `.await` the real upload task to completion
+        // and observe the give-up arm's `requeue_failed_push` deterministically
+        // (no detached-spawn polling). Behavior change: NONE — the handle is
+        // immediately dropped here, which is identical to the prior
+        // `tokio::spawn(...)`-without-binding.
+        drop(self.spawn_upload_to_remote_impl(action_result, action));
+    }
+
+    /// Body of [`Self::spawn_upload_to_remote`]; returns the spawned upload
+    /// task's `JoinHandle` (or `None` when the upload is skipped — noop slow
+    /// store, read-only/get slow direction, or no eligible output digests).
+    /// Production drops the handle; the W6 test awaits it.
+    fn spawn_upload_to_remote_impl(
+        self: &Arc<Self>,
+        action_result: &ActionResult,
+        action: Option<&Arc<RunningActionImpl>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let slow_store = self.cas_store.slow_store();
         if slow_store
             .inner_store(None::<StoreKey<'_>>)
             .optimized_for(StoreOptimizations::NoopUpdates)
         {
-            return;
+            return None;
         }
         // Respect slow_direction config — when set to Get or ReadOnly,
         // the slow store should not receive writes (same check as
         // FastSlowStore::update).
         let dir = self.cas_store.slow_direction();
         if dir == StoreDirection::Get || dir == StoreDirection::ReadOnly {
-            return;
+            return None;
         }
 
         let mut digests = Vec::new();
@@ -6356,7 +6376,7 @@ impl RunningActionsManagerImpl {
             digests.push(action_result.stderr_digest);
         }
         if digests.is_empty() {
-            return;
+            return None;
         }
 
         // Pin output digests to prevent eviction during background upload.
@@ -6438,7 +6458,7 @@ impl RunningActionsManagerImpl {
                 }
             }
         }
-        tokio::spawn(async move {
+        let upload_task = tokio::spawn(async move {
             let slow_store = cas_store.slow_store();
             let start = std::time::Instant::now();
 
@@ -6992,6 +7012,29 @@ impl RunningActionsManagerImpl {
                     .commit_action_pin_extension(phase0_action_key);
             });
         });
+        // The upload task's `while let Some(ok) = uploads.next().await` (the
+        // per-digest retry loop, including the #FL-688 W6 give-up arm that
+        // calls `requeue_failed_push`) completes BEFORE the detached 30 s
+        // phase0-commit spawn above, so awaiting this handle observes the
+        // give-up arm deterministically without waiting on that timer.
+        Some(upload_task)
+    }
+
+    /// #FL-688 W6 production-composition seam: schedule the real upload task
+    /// and return its `JoinHandle` so a test can `.await` it to completion and
+    /// observe the give-up arm's `requeue_failed_push` side effect on the
+    /// shared `failed_slow_writes` set — driving the REAL
+    /// `spawn_upload_to_remote_impl` body (sync-retry exhaustion → the real
+    /// `should_requeue_on_giveup` + `requeue_failed_push` call), not a
+    /// re-implemented gate. Identical to [`Self::spawn_upload_to_remote`]
+    /// except the handle is returned instead of dropped.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn spawn_upload_to_remote_for_test(
+        self: &Arc<Self>,
+        action_result: &ActionResult,
+        action: Option<&Arc<RunningActionImpl>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.spawn_upload_to_remote_impl(action_result, action)
     }
 
     /// Fixes a race condition that occurs when an action fails to execute on a worker, and the same worker

@@ -96,30 +96,58 @@ pub type ChunkedInFlightMap = Arc<Mutex<HashMap<DigestInfo, ChunkedInFlightEntry
 /// writer can record a per-peer failure and route the next attempt elsewhere.
 const DEFAULT_MIRROR_BLOBS_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
-/// CAPPED AT 1_000_000: hard ceiling on the `failed_slow_writes`
-/// retry-until-durable set, enforced by [`FastSlowStore::requeue_failed_push`]
-/// (the worker WORKER→SERVER backfill / action-output re-queue path,
-/// #FL-688). `failed_slow_writes` is a network-path buffer — every entry
-/// is a digest the worker is still responsible for pushing to the server —
-/// so it requires a measured cap with documented over-cap behavior.
+/// CAPPED AT 1_000_000: ceiling enforced on ONE producer of the
+/// `failed_slow_writes` set — the worker WORKER→SERVER re-queue path
+/// ([`FastSlowStore::requeue_failed_push`], the W4 backfill / W6
+/// action-output give-up arms, #FL-688). This is a PER-PRODUCER cap, NOT a
+/// global ceiling on the set: `failed_slow_writes` has ≥8 OTHER producers
+/// that insert WITHOUT consulting this constant — `:555` (pin-expiry
+/// watchdog), `:728` (#367 slow-tier eviction → V3), `:2047`/`:2139` (#496
+/// chunked-dispatcher Err arms), `:5092`/`:5757` (`ignore_slow` skip-path),
+/// `:5435`/`:5821` (#334 capacity-gate rejection), the background-spawn Err
+/// arms (`:5555`/`:5669`/`:5896`/`:5952`), and the server-side drain
+/// re-insert (`reinsert_failed_digests:7490`). Those producers are
+/// bounded-in-practice (HashSet dedup + the worker's own
+/// `MIRROR_BLOBS_MAX_BYTES` 2 GiB storage cap + the trusted-worker model)
+/// but are NOT hard-capped here. Routing them through this cap is a tracked
+/// follow-up (`.claude/audits/40-failed-slow-writes-producer-cap-followup.md`):
+/// the two SAFETY-NET producers (`:555` pin-expiry, `:728` eviction) are the
+/// sole observers of their silent-failure events, so a reject-on-over-cap
+/// there would DROP a durability signal with no guaranteed re-discovery —
+/// itself a new abandonment. Capping them safely needs a re-discovery
+/// backstop, not just a `len()` check, so it is out of scope for the
+/// re-queue fix.
 ///
-/// Memory: a `DigestInfo` is 40 B (32 B hash + 8 B size); in a hashbrown
-/// `HashSet` at ~7/8 load factor the amortized per-entry cost is ~48 B, so
-/// the worst-case footprint of a full set is ~48 MiB. Cheap, and far above
-/// any realistic backlog: the live FL-688 stuck loop showed `missing=3244`;
-/// a worker re-pushing its entire pinned mirror set is bounded by
-/// `MIRROR_BLOBS_MAX_BYTES` (2 GiB) / min-blob-size, which for the 16 KiB+
-/// large-blob tier is ≤131 072 digests — an order of magnitude under the cap.
+/// PER-INSTANCE, too (distsys B2): the server-side `cas_STORE` FSS holds the
+/// same-named `failed_slow_writes` struct drained by
+/// `nativelink-service/src/failed_writes_drain.rs` (`drain_tick`), but that
+/// instance NEVER calls `requeue_failed_push`, so this cap is a no-op on the
+/// SERVER set. Do NOT read 1_000_000 as a ceiling an operator can trust for
+/// the server-side drain set — it bounds only the worker re-queue producer
+/// on the worker FSS instance.
 ///
-/// Over-cap behavior: REJECT the new insert (keep existing entries) and
-/// `warn!` — do NOT drop-oldest. The entries already in the set are the
-/// digests we have been trying longest to make durable; evicting one to
-/// admit a newcomer would abandon the blob closest to needing recovery —
-/// itself an abandonment. The rejected newcomer is not lost: the server's
-/// periodic `BlobsAvailable` re-request re-offers it on the next ~62 s tick
-/// (the set is the reconnect safety-net, not the only retry path during a
-/// stable connection), and the fast/mirror tier still holds the bytes. In
-/// practice the cap is never reached, so the rejection branch is a
+/// Memory (worker re-queue producer): a `DigestInfo` is 40 B (32 B hash +
+/// 8 B size); in a hashbrown `HashSet` at ~7/8 load factor the amortized
+/// per-entry cost is ~48 B, so 1M entries is ~48 MiB. Cheap, and far above
+/// any realistic re-queue backlog: the live FL-688 stuck loop showed
+/// `missing=3244` (≈3-4 orders of magnitude under the cap). As a SECONDARY
+/// order-of-magnitude sanity check, a worker re-pushing its entire pinned
+/// mirror set is loosely correlated with `MIRROR_BLOBS_MAX_BYTES` (2 GiB) /
+/// min-blob-size (≤131 072 for the 16 KiB+ tier) — but `failed_slow_writes`
+/// is a SEPARATE map fed by arbitrary-size server-requested digests, so this
+/// is a correlated proxy for realistic backlog, NOT a bound on the re-queue
+/// set. The hard bound on this producer is the 1M cap below; the realism
+/// evidence is the observed `missing≤3244`.
+///
+/// Over-cap behavior (this producer only): REJECT the new insert (keep
+/// existing entries) and `warn!` — do NOT drop-oldest. The entries already
+/// in the set are the digests we have been trying longest to make durable;
+/// evicting one to admit a newcomer would abandon the blob closest to needing
+/// recovery — itself an abandonment. The rejected newcomer is not lost: the
+/// server's periodic `BlobsAvailable` re-request re-offers it on the next
+/// ~62 s tick (the set is the reconnect safety-net, not the only retry path
+/// during a stable connection), and the fast/mirror tier still holds the
+/// bytes. In practice the cap is never reached, so the rejection branch is a
 /// last-resort backstop, not a steady-state path.
 const FAILED_SLOW_WRITES_MAX: usize = 1_000_000;
 
@@ -995,6 +1023,23 @@ pub struct FastSlowStore {
     shutting_down: AtomicBool,
     /// Digests whose background slow-store write failed. Tracked so the
     /// worker can retry uploads on reconnect.
+    // UNBOUNDED-OK: this network-path set has ONE hard-capped producer
+    // ([`FastSlowStore::requeue_failed_push`], gated by
+    // `FAILED_SLOW_WRITES_MAX = 1_000_000`) and ≥8 producers that insert
+    // without a `len()` check (`:555` pin-expiry, `:728` eviction,
+    // `:2047`/`:2139` chunked Err arms, `:5092`/`:5757` ignore_slow,
+    // `:5435`/`:5821` capacity-gate, the background-spawn Err arms, and
+    // `reinsert_failed_digests`). The effective bound on the uncapped
+    // producers is: HashSet dedup (each digest counted once) + the worker's
+    // own `MIRROR_BLOBS_MAX_BYTES` (2 GiB) storage cap — a worker can only
+    // surface digests for blobs it actually holds, and it cannot hold more
+    // than its mirror+fast storage allows — + the trusted-worker model
+    // (workers are first-party, not adversarial). At ~48 B/entry the
+    // worst-case footprint if every producer filled to the realistic
+    // storage-correlated backlog is tens of MiB, not the OOM class. This is
+    // bounded-in-practice, NOT a hard ceiling; converting the safety-net
+    // producers (`:555`/`:728`) to a hard cap needs a re-discovery backstop
+    // (tracked: `.claude/audits/40-failed-slow-writes-producer-cap-followup.md`).
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
     /// Blobs received via server-side mirror that are held in memory only.
     /// These are pinned on the worker indefinitely until the server confirms
