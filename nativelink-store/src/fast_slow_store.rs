@@ -1797,6 +1797,18 @@ impl FastSlowStore {
     /// retried until it lands on the server, never silently dropped. The
     /// pre-fix behavior was `warn!` + drop (the stuck-loop root).
     ///
+    /// INVARIANT (durability-ack v3 Stage 1, forward guarantee): this is the
+    /// documented register into `failed_slow_writes`, one of the three sets
+    /// that make up the shutdown flush's acked-not-durable set
+    /// ({in_flight_slow_writes, chunked_in_flight_digests,
+    /// failed_slow_writes}). The server-side cap-rejection arms (#334) and the
+    /// bg-write failure arm also insert into `failed_slow_writes` directly;
+    /// every such site keeps an acked-not-durable blob's digest visible to
+    /// `flush_fast_to_slow_at_shutdown`, which skips any fast-tier resident
+    /// NOT in one of the three sets. Any new acked-not-durable server write
+    /// path MUST register here (or in a sibling set) before its ack or the
+    /// shutdown flush will miss it.
+    ///
     /// Returns `true` if the digest is now tracked for retry (newly
     /// inserted OR already present), `false` ONLY if the set was at
     /// `FAILED_SLOW_WRITES_MAX` and the digest was not already present —
@@ -1847,13 +1859,28 @@ impl FastSlowStore {
     ///    `admission_elapsed_ms`. Operators compute the commit-pipeline
     ///    span via `commit_elapsed_ms = elapsed_ms - admission_elapsed_ms`.
     ///
-    /// In practice this function returns Ok only AFTER the dispatcher's
-    /// `dispatch(...)` future resolves — i.e. after the full commit
-    /// pipeline (per-chunk SHA-256 / pwrite / `commit_and_verify` /
-    /// rename / `finalize_holding`) completes inside `join3`. The driver
-    /// task itself continues serving reads from the fast-tier replica
-    /// during the async-commit window via Phase 2.5's `failed_writes` /
-    /// in-flight pin.
+    /// **Ack timing — NOT durable-at-ack (pair-a/red-team F3 correction).**
+    /// This function returns Ok after `join3` resolves, but the dispatcher's
+    /// `dispatch(...)` future resolves at ADMISSION, not at durable commit:
+    /// in the (β) `AsyncCommit` production mode the dispatch returns
+    /// `Ok(DispatchOutcome)` as soon as the per-blob driver is spawned
+    /// (`chunked_write_handler.rs:3651`, authoritative doc at `:3670-3671`
+    /// "the dispatch returns Ok as soon as admission is complete, NOT after
+    /// on-disk commit"). The durable commit pipeline (per-chunk SHA-256 /
+    /// pwrite / `commit_and_verify` / rename / `finalize_holding`) runs in
+    /// the spawned async reaper AFTER this Ok — so the chunked blob is
+    /// ACKED-NOT-DURABLE for the commit window. The driver continues serving
+    /// reads from the fast-tier replica during that window via Phase 2.5's
+    /// `failed_writes` / in-flight pin.
+    ///
+    /// What spans the ack→durable gap is the `chunked_in_flight_digests`
+    /// registration (`InFlightChunkedGuard`, constructed before dispatch
+    /// returns Ok and held until the reaper's commit resolves), NOT
+    /// durability at ack. That registration is also what makes the chunked
+    /// blob visible to the shutdown flush's at-risk set (durability-ack v3
+    /// Stage 1) — the flush sources the bytes from the fast tier and filters
+    /// on `chunked_in_flight_digests` membership, so a not-yet-durable
+    /// chunked blob is drained on a graceful restart.
     ///
     /// (β) async-commit. Anti-#203 mandatory.
     #[cfg(feature = "chunked_fast_slow")]
@@ -2336,6 +2363,18 @@ impl FastSlowStore {
         self.failed_slow_writes.lock().contains(digest)
     }
 
+    /// Test accessor (durability-ack v3 Stage 1 forward-guarantee test):
+    /// returns `true` iff the digest is currently registered in
+    /// `in_flight_slow_writes` (the legacy `update`/`update_oneshot` spawn
+    /// path's at-risk set). Sibling of [`Self::failed_slow_writes_contains`];
+    /// the shutdown-flush test uses it to prove a blob is at-risk via the
+    /// `in_flight_slow_writes` member specifically.
+    #[must_use]
+    pub fn in_flight_contains_for_test(&self, digest: &DigestInfo) -> bool {
+        let key = StoreKey::Digest(*digest);
+        self.in_flight_slow_writes.lock().contains_key(&key)
+    }
+
     /// Phase 2.7 chunked size threshold (cached on this store). Reads
     /// from a relaxed atomic; cheap on the `update()` hot path.
     #[cfg(feature = "chunked_fast_slow")]
@@ -2669,6 +2708,20 @@ impl FastSlowStore {
         // new can be added concurrently; a bg slow write completing during
         // the drain only REMOVES from these sets, which at worst makes us
         // flush a now-durable blob (idempotent CAS no-op) — never a miss.
+        //
+        // INVARIANT (durability-ack v3 Stage 1, forward guarantee): any
+        // server write path that ACKs a blob before it is durable MUST
+        // register the digest in one of {in_flight_slow_writes,
+        // chunked_in_flight_digests, failed_slow_writes} before the ack; the
+        // shutdown flush relies on this being the COMPLETE acked-not-durable
+        // set. Stage 1 ships the 3-set FILTER on the whole-tier scan (the v2
+        // subset), NOT a whole-tier superset — so completeness is
+        // load-bearing, not free. A fast-tier resident in an UNANTICIPATED
+        // state (acked-not-durable but registered in none of the three) is
+        // SKIPPED here and lost on restart. Guarded by
+        // `shutdown_flush_memory_test::in_flight_slow_writes_only_blob_flushed_via_real_update_path`
+        // + `shutdown_flush_chunked_safe_test::{chunked_inflight_blob_flushed_without_has_probe,
+        // failed_write_blob_flushed_at_shutdown}` — one per at-risk class.
         let at_risk: HashSet<DigestInfo> = {
             let mut set = HashSet::new();
             for k in self.in_flight_slow_writes.lock().keys() {
@@ -5619,6 +5672,18 @@ impl StoreDriver for FastSlowStore {
 
         // Insert into in-flight map so get_part can serve this blob even if
         // the fast store evicts it before the slow write completes.
+        //
+        // INVARIANT (durability-ack v3 Stage 1, forward guarantee): this is
+        // the legacy `update` path's registration into `in_flight_slow_writes`,
+        // one of the three sets that make up the shutdown flush's
+        // acked-not-durable set ({in_flight_slow_writes,
+        // chunked_in_flight_digests, failed_slow_writes}). It runs
+        // synchronously BEFORE the bg slow-write `tokio::spawn` below and
+        // before this `update()` returns Ok (the ack), and is removed only in
+        // the bg task's Ok arm (= durable). The shutdown flush
+        // (`flush_fast_to_slow_at_shutdown`) skips any fast-tier resident NOT
+        // in one of the three sets, so any acked-not-durable write path MUST
+        // register here (or in one of the sibling sets) before its ack.
         let owned_key = key.borrow().into_owned();
         self.in_flight_slow_writes
             .lock()

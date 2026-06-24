@@ -65,13 +65,14 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_store::verify_store::VerifyStore;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
     ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, UploadSizeInfo,
 };
+use tokio::sync::Notify;
 
 /// Generous deadlock-detector timeout. A correctly-wired flush completes in
 /// milliseconds; 5 seconds protects against slow CI runners without masking
@@ -726,134 +727,21 @@ impl StoreDriver for EveryOtherFailsProbe {
     }
 }
 
-/// Test 5 (skip already-present): if the slow tier ALREADY has a blob with
-/// that digest, the flush MUST NOT redundantly write it (avoids wasted I/O,
-/// avoids re-pinning a blob that the slow tier already considers stable).
-/// We expose this via a probe whose `update_oneshot` panics if invoked
-/// after pre-loading the same blob.
-#[nativelink_test]
-async fn shutdown_flush_skips_blobs_already_in_slow_tier() -> Result<(), Error> {
-    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let probe_arc: Arc<dyn StoreDriver> = Arc::new(NoUpdateExpectedProbe {
-        inner: inner.clone(),
-    });
-    let probe = Store::new(probe_arc);
-    let (fast_slow, fast_store) = build_fast_slow_with_slow_probe(probe.clone());
-
-    let payload = vec![0x77u8; 32];
-    let digest = unique_digest(4001, payload.len() as u64);
-
-    // Pre-load slow tier directly via the inner MemoryStore (bypassing the
-    // probe wrapper so the pre-load doesn't trip the panic guard).
-    inner
-        .update_oneshot(digest, Bytes::from(payload.clone()))
-        .await?;
-
-    // Independently put it in the fast tier.
-    fast_store
-        .update_oneshot(digest, Bytes::from(payload.clone()))
-        .await?;
-
-    let unflushed = tokio::time::timeout(
-        NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(),
-    )
-    .await
-    .expect("DEADLOCK: flush did not return");
-    // 0 unflushed (skip-counted) AND the probe was never invoked for
-    // update_oneshot (would have panicked on call).
-    assert_eq!(
-        unflushed, 0,
-        "#210 skip-existing: flush must not report the already-present blob \
-         as unflushed",
-    );
-    Ok(())
-}
-
-#[derive(Debug, MetricsComponent)]
-struct NoUpdateExpectedProbe {
-    inner: Store,
-}
-
-default_health_status_indicator!(NoUpdateExpectedProbe);
-
-#[async_trait]
-impl StoreDriver for NoUpdateExpectedProbe {
-    async fn has_with_results(
-        self: Pin<&Self>,
-        digests: &[StoreKey<'_>],
-        results: &mut [Option<u64>],
-    ) -> Result<(), Error> {
-        self.inner.has_with_results(digests, results).await
-    }
-
-    async fn update(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _reader: DropCloserReadHalf,
-        _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        panic!(
-            "NoUpdateExpectedProbe::update invoked — flush should have skipped \
-             the blob because it is already in the slow tier"
-        );
-    }
-
-    async fn update_oneshot(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _data: Bytes,
-    ) -> Result<(), Error> {
-        panic!(
-            "NoUpdateExpectedProbe::update_oneshot invoked — flush should have \
-             skipped the blob because it is already in the slow tier"
-        );
-    }
-
-    async fn get_part(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        writer: &mut DropCloserWriteHalf,
-        offset: u64,
-        length: Option<u64>,
-    ) -> Result<(), Error> {
-        self.inner.get_part(key, writer, offset, length).await
-    }
-
-    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
-        self
-    }
-
-    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
-        self
-    }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
-        self
-    }
-
-    fn register_item_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn ItemCallback>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
-        StableDigestDelegation::Inner(self.inner.as_store_driver())
-    }
-
-    fn pin_delegation(&self) -> PinDelegation<'_> {
-        PinDelegation::Inner(self.inner.as_store_driver())
-    }
-
-    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
-        MarkStableDelegation::Inner(self.inner.as_store_driver())
-    }
-    fn durable_delegation(&self) -> DurableDelegation<'_> {
-        DurableDelegation::Inner(self.inner.as_store_driver())
-    }
-}
+// Test 5 (`shutdown_flush_skips_blobs_already_in_slow_tier`) + its
+// `NoUpdateExpectedProbe` were DELETED by durability-ack v3 Stage 1 fix-up
+// (pair-b T1). They are dead guards under the Change A filter: the v3 flush
+// skips a durable resident via AT-RISK-ABSENCE (`if !at_risk.contains(&digest)`
+// in `flush_fast_to_slow_at_shutdown`), NOT via a `slow.has()` pre-check (which
+// Change A removed). Test 5 pre-loaded the slow tier and wrote the SAME digest
+// to the fast tier but NEVER registered it at-risk, so the flush skipped it on
+// at-risk-absence and the probe's `update_oneshot` panic guard was unreachable
+// — its mutation (drop the filter) would not red-fail. The genuine "skip a
+// durable resident" semantics are covered by
+// `shutdown_flush_chunked_safe_test::durable_resident_skipped_via_in_memory_state`,
+// which registers a SECOND at-risk blob so the per-key drain actually runs past
+// the filter, making its mutation (`if false && at_risk.contains(..)`) red-fail
+// with a bespoke `NoUpdateExpected` panic. Verified that replacement covers the
+// semantics before deleting (fix-up report, item 3).
 
 /// BLOCK-1 regression test (#335 follow-up): `StoreManager::flush_slow_writes`
 /// MUST descend the production wrapper chain to find the inner
@@ -1012,4 +900,233 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
     );
 
     Ok(())
+}
+
+/// FORWARD-GUARANTEE — `in_flight_slow_writes`-only at-risk member, exercised
+/// through the REAL `FastSlowStore::update` spawn path (durability-ack v3
+/// Stage 1, pair-a F1 / red-team / assumption-auditor convergent).
+///
+/// The shutdown flush filters the whole-tier scan through the 3-set
+/// acked-not-durable union
+/// (`in_flight_slow_writes` ∪ `chunked_in_flight_digests` ∪
+/// `failed_slow_writes`). The existing flush tests only register at-risk via
+/// `requeue_failed_push` (→ `failed_slow_writes`) or the chunked map; NONE
+/// exercised an `in_flight_slow_writes`-ONLY member produced by the real
+/// `update`-spawn path. That is the path-1 the keystone proof names: the
+/// legacy `update` inserts `in_flight_slow_writes` BEFORE the bg slow-write
+/// spawn and BEFORE `update()` returns Ok (the ack), removing it only in the
+/// bg task's Ok arm (= durable). This test closes pair-b's named gap.
+///
+/// Setup drives a real streaming `update()` whose slow-tier bg write is
+/// BLOCKED on a `Notify`, so at flush time the digest is registered in
+/// `in_flight_slow_writes` ONLY (not in `failed_slow_writes` or
+/// `chunked_in_flight_digests`) and its bytes are in the fast tier. The flush
+/// MUST drain it. The slow tier's bg `update` is blocked; the flush's
+/// `update_oneshot` is allowed through (it is the only path that lands the
+/// blob during the test).
+///
+/// Mutation step (CLAUDE.md mandate): in
+/// `FastSlowStore::flush_fast_to_slow_at_shutdown`'s at-risk-union
+/// construction, drop the `in_flight_slow_writes` member (comment out the
+/// `for k in self.in_flight_slow_writes.lock().keys() { ... }` loop). With
+/// that member gone the digest is no longer at-risk, the flush SKIPS it, and
+/// the `assert_eq!(unflushed, 0, ...)` / slow-tier presence assertion
+/// red-fails with the bespoke message
+/// `"FORWARD-GUARANTEE: an in_flight_slow_writes-only blob (real update-spawn
+/// path) MUST be flushed at shutdown — the in_flight_slow_writes at-risk
+/// member was dropped"`.
+#[nativelink_test]
+async fn in_flight_slow_writes_only_blob_flushed_via_real_update_path() -> Result<(), Error> {
+    let slow_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let release = Arc::new(Notify::new());
+    let bg_update_entered = Arc::new(Notify::new());
+    let probe_arc: Arc<dyn StoreDriver> = Arc::new(BlockingUpdateProbe {
+        inner: slow_inner.clone(),
+        release: release.clone(),
+        update_entered: bg_update_entered.clone(),
+    });
+    let slow_probe = Store::new(probe_arc);
+    // The fast tier is written via the real `update()` below, not directly.
+    let (fast_slow, _fast_store) = build_fast_slow_with_slow_probe(slow_probe.clone());
+
+    let payload = vec![0xB6u8; 4096];
+    let digest = unique_digest(11_001, payload.len() as u64);
+
+    // Drive a REAL streaming `FastSlowStore::update`: feed the bytes through a
+    // buf_channel producer while the FSS consumes. `update()` writes the fast
+    // tier, inserts `in_flight_slow_writes`, spawns the (blocked) bg slow
+    // write, and returns Ok — modelling an acked-not-durable blob.
+    let (mut tx, rx) = make_buf_channel_pair();
+    let payload_for_send = payload.clone();
+    let send_handle = tokio::spawn(async move {
+        tx.send(Bytes::from(payload_for_send)).await?;
+        tx.send_eof()?;
+        Result::<(), Error>::Ok(())
+    });
+    tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        Pin::new(fast_slow.as_ref()).update(
+            digest.into(),
+            rx,
+            UploadSizeInfo::ExactSize(payload.len() as u64),
+        ),
+    )
+    .await
+    .expect("DEADLOCK: FastSlowStore::update did not return")?;
+    send_handle
+        .await
+        .expect("producer task panicked")
+        .err_tip(|| "producer send failed")?;
+
+    // Wait until the bg slow-write task has actually entered the probe's
+    // `update` (so it is parked on `release`, holding the digest in-flight)
+    // — channel/notify synchronization, NOT a sleep.
+    tokio::time::timeout(NO_DEADLOCK_TIMEOUT, bg_update_entered.notified())
+        .await
+        .expect("bg slow-write task never entered the blocking probe update");
+
+    // The digest must be at-risk via `in_flight_slow_writes` ONLY.
+    assert!(
+        fast_slow.in_flight_contains_for_test(&digest),
+        "setup: digest must be registered in in_flight_slow_writes by the real \
+         update-spawn path"
+    );
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&digest),
+        "setup: digest must NOT be in failed_slow_writes (this test exercises \
+         the in_flight_slow_writes-only at-risk class)"
+    );
+
+    // Sanity: slow tier (inner) is still empty (bg write is blocked).
+    assert!(
+        slow_inner.has(digest).await?.is_none(),
+        "setup: slow tier must be empty before flush (bg write is blocked)"
+    );
+
+    let unflushed = tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        fast_slow.flush_fast_to_slow_at_shutdown(),
+    )
+    .await
+    .expect(
+        "DEADLOCK: flush_fast_to_slow_at_shutdown did not return for a single \
+         in_flight_slow_writes-only blob; a correct flush finishes in milliseconds.",
+    );
+
+    assert_eq!(
+        unflushed, 0,
+        "FORWARD-GUARANTEE: an in_flight_slow_writes-only blob (real update-spawn \
+         path) MUST be flushed at shutdown — the in_flight_slow_writes at-risk \
+         member was dropped; got {unflushed} unflushed (expected 0)",
+    );
+
+    let stored = slow_inner
+        .get_part_unchunked(digest, 0, None)
+        .await
+        .err_tip(|| {
+            "FORWARD-GUARANTEE: an in_flight_slow_writes-only blob (real \
+             update-spawn path) MUST be flushed at shutdown — the \
+             in_flight_slow_writes at-risk member was dropped; blob missing from \
+             slow tier post-flush"
+        })?;
+    assert_eq!(
+        stored.as_ref(),
+        payload.as_slice(),
+        "in_flight_slow_writes-only flush: slow-tier content mismatch",
+    );
+
+    // Release the blocked bg write so the spawned task does not leak.
+    release.notify_waiters();
+    Ok(())
+}
+
+/// Slow-tier probe whose streaming `update` (the bg slow-write path) BLOCKS on
+/// `release` after announcing entry via `update_entered`, while `update_oneshot`
+/// (the shutdown-flush path) delegates immediately. Lets a test hold a digest
+/// in `in_flight_slow_writes` across the flush without a sleep.
+#[derive(Debug, MetricsComponent)]
+struct BlockingUpdateProbe {
+    inner: Store,
+    // No `#[metric]` attribute: the derive only publishes annotated fields, so
+    // these test sync primitives (which do not implement MetricsComponent) are
+    // correctly left out of the metrics tree.
+    release: Arc<Notify>,
+    update_entered: Arc<Notify>,
+}
+
+default_health_status_indicator!(BlockingUpdateProbe);
+
+#[async_trait]
+impl StoreDriver for BlockingUpdateProbe {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.inner.has_with_results(digests, results).await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Announce entry, then park until the test releases us. We do NOT
+        // consume the reader or write to `inner`: the test only needs the
+        // digest to stay registered in `in_flight_slow_writes` (which the FSS
+        // already did before spawning this bg task) across the flush. The
+        // flush itself lands the bytes via `update_oneshot`.
+        self.update_entered.notify_waiters();
+        self.release.notified().await;
+        Ok(())
+    }
+
+    async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
+        self.inner.update_oneshot(key, data).await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        self.inner.get_part(key, writer, offset, length).await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
+    }
 }

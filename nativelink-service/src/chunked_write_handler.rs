@@ -4075,6 +4075,18 @@ impl InFlightChunkedGuard {
     /// pre-existing call shape used by tests; production sites pass
     /// their identity here (e.g. `"bazel_facing_v1_dispatcher"`,
     /// `"server_v2_session"`).
+    ///
+    /// INVARIANT (durability-ack v3 Stage 1, forward guarantee): this is
+    /// the chunked path's registration into `chunked_in_flight_digests`,
+    /// one of the three sets that make up the shutdown flush's
+    /// acked-not-durable set ({in_flight_slow_writes,
+    /// chunked_in_flight_digests, failed_slow_writes}). It MUST be
+    /// constructed BEFORE the chunked write is acked to the client and held
+    /// until the durable commit resolves; the shutdown flush
+    /// (`FastSlowStore::flush_fast_to_slow_at_shutdown`) skips any fast-tier
+    /// resident NOT in one of the three sets, so a chunked path that acks
+    /// without this guard would silently lose its bytes on a graceful
+    /// restart.
     #[must_use]
     pub fn new_with_caller(
         set: ChunkedInFlightMap,

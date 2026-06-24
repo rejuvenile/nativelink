@@ -2142,6 +2142,12 @@ async fn worker_api_metrics_mark_stable_failures_visible_in_metric_tree() {
     metrics
         .mark_stable_has_with_results_failures
         .fetch_add(3, Ordering::Relaxed);
+    // durability-ack v3 Stage 1 (pair-a F2): the DISTINCT durable-gate
+    // counter. Driven with a different value so the assertions below cannot
+    // pass by reading the wrong field.
+    metrics
+        .mark_stable_has_durably_failures
+        .fetch_add(7, Ordering::Relaxed);
 
     // Walk the metric tree the same way the metric exporter does.
     metrics
@@ -2175,6 +2181,36 @@ async fn worker_api_metrics_mark_stable_failures_visible_in_metric_tree() {
         "expected non-empty help text for `mark_stable_has_with_results_failures` \
          so operators have a description in the metric stream — found empty help. \
          Add `#[metric(help = \"...\")]` to the field."
+    );
+
+    // durability-ack v3 Stage 1 (pair-a F2): the new durable-gate counter MUST
+    // be wired into the same metrics tree (distinct from the has_with_results
+    // counter), or an operator alerting on the durable-gate failure rate sees
+    // nothing. Pins the literal emitted name per the worker-metrics-exposure
+    // pattern.
+    let durable_metric = captured
+        .iter()
+        .find(|m| m.name == "mark_stable_has_durably_failures")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected metric `mark_stable_has_durably_failures` to be \
+                 published when WorkerApiMetrics::publish() walks the tree. \
+                 Captured events: {captured:#?}. The v3 durable-gate Err path \
+                 increments this distinct counter (pair-a F2); without \
+                 #[metric(help = ...)] on the field it stays invisible to \
+                 operators."
+            )
+        });
+    assert_eq!(
+        durable_metric.value, "7",
+        "expected durable-gate counter value 7 to flow through the publish chain \
+         — got {:?}. A wrong value here means the F2 split is reading/writing the \
+         wrong field.",
+        durable_metric.value
+    );
+    assert!(
+        !durable_metric.help.is_empty(),
+        "expected non-empty help text for `mark_stable_has_durably_failures`",
     );
 }
 

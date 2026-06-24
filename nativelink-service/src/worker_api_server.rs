@@ -270,6 +270,27 @@ pub struct WorkerApiMetrics {
     )]
     pub mark_stable_has_with_results_failures: AtomicU64,
 
+    /// (durability-ack v3 Stage 1, pair-a F2) Total `cas_store.has_durably`
+    /// failures inside the BlobsAvailable `mark_stable` keystone gate.
+    /// SEPARATE from `mark_stable_has_with_results_failures`: the v3 keystone
+    /// added a second existence query (`has_durably`, the slow-tier-only
+    /// durable-presence check that gates the BIS→unpin oath) whose Err arm
+    /// must skip `mark_stable` this round. Folding both failures into one
+    /// counter conflated two distinct sources (the upload-request existence
+    /// check vs. the durable-gate check); an operator alerting on the metric
+    /// could not tell which query was failing. A sustained non-zero rate here
+    /// means durable digests are not being acked this round (each tick
+    /// recovers, but the counter exposes the rate).
+    #[metric(
+        help = "Total `cas_store.has_durably` failures during the BlobsAvailable \
+                mark_stable keystone gate (durability-ack v3). Distinct from \
+                mark_stable_has_with_results_failures: this is the slow-tier-only \
+                durable-presence query that gates the BIS→unpin oath. Sustained \
+                non-zero rate means durable digests are not being acked this round \
+                (each BlobsAvailable tick recovers, but the counter exposes the rate)."
+    )]
+    pub mark_stable_has_durably_failures: AtomicU64,
+
     /// (#216) Total `connect_worker` requests rejected because the
     /// worker's reported `build_sha` was not in the configured
     /// `compatible_build_shas` allowlist. Operators alert on a
@@ -3072,10 +3093,14 @@ impl WorkerConnection {
                 // A failed durable check must NOT fire the unpin oath (a
                 // false-durable would lose data). Skip mark_stable this
                 // round; the next BlobsAvailable tick recovers. Surface a
-                // noisy counter alongside the log (same pattern as the
-                // has_with_results failure path above).
+                // noisy counter alongside the log. pair-a F2: use the
+                // DISTINCT `mark_stable_has_durably_failures` counter — NOT
+                // `mark_stable_has_with_results_failures` above — so an
+                // operator alerting on the metric stream can tell the
+                // durable-gate query apart from the upload-request existence
+                // query (the two have different recovery implications).
                 metrics
-                    .mark_stable_has_with_results_failures
+                    .mark_stable_has_durably_failures
                     .fetch_add(1, Ordering::Relaxed);
                 error!(
                     worker_id=?worker_id,
@@ -3084,7 +3109,7 @@ impl WorkerConnection {
                     "mark_stable: has_durably check failed; worker pins for \
                      durable digests will not be acked this round (next \
                      BlobsAvailable tick recovers); metric \
-                     `mark_stable_has_with_results_failures` incremented"
+                     `mark_stable_has_durably_failures` incremented"
                 );
             }
         }
