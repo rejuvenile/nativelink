@@ -96,6 +96,33 @@ pub type ChunkedInFlightMap = Arc<Mutex<HashMap<DigestInfo, ChunkedInFlightEntry
 /// writer can record a per-peer failure and route the next attempt elsewhere.
 const DEFAULT_MIRROR_BLOBS_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
+/// CAPPED AT 1_000_000: hard ceiling on the `failed_slow_writes`
+/// retry-until-durable set, enforced by [`FastSlowStore::requeue_failed_push`]
+/// (the worker WORKER→SERVER backfill / action-output re-queue path,
+/// #FL-688). `failed_slow_writes` is a network-path buffer — every entry
+/// is a digest the worker is still responsible for pushing to the server —
+/// so it requires a measured cap with documented over-cap behavior.
+///
+/// Memory: a `DigestInfo` is 40 B (32 B hash + 8 B size); in a hashbrown
+/// `HashSet` at ~7/8 load factor the amortized per-entry cost is ~48 B, so
+/// the worst-case footprint of a full set is ~48 MiB. Cheap, and far above
+/// any realistic backlog: the live FL-688 stuck loop showed `missing=3244`;
+/// a worker re-pushing its entire pinned mirror set is bounded by
+/// `MIRROR_BLOBS_MAX_BYTES` (2 GiB) / min-blob-size, which for the 16 KiB+
+/// large-blob tier is ≤131 072 digests — an order of magnitude under the cap.
+///
+/// Over-cap behavior: REJECT the new insert (keep existing entries) and
+/// `warn!` — do NOT drop-oldest. The entries already in the set are the
+/// digests we have been trying longest to make durable; evicting one to
+/// admit a newcomer would abandon the blob closest to needing recovery —
+/// itself an abandonment. The rejected newcomer is not lost: the server's
+/// periodic `BlobsAvailable` re-request re-offers it on the next ~62 s tick
+/// (the set is the reconnect safety-net, not the only retry path during a
+/// stable connection), and the fast/mirror tier still holds the bytes. In
+/// practice the cap is never reached, so the rejection branch is a
+/// last-resort backstop, not a steady-state path.
+const FAILED_SLOW_WRITES_MAX: usize = 1_000_000;
+
 /// Concurrency cap on the per-key fan-out used by `batch_get_part_unchunked`
 /// when `local_only_reads` is enabled. Each in-flight `get_part_unchunked`
 /// reserves a `BytesMut` plus a buf_channel pair (~3 MiB chunks × 24 slots
@@ -1681,6 +1708,53 @@ impl FastSlowStore {
             // worker reconnects.
             fast_store.pin_digests(&[digest]);
         })
+    }
+
+    /// #FL-688 WORKER→SERVER push retry-until-durable: re-queue a digest
+    /// whose worker→server push FAILED back into `failed_slow_writes` so
+    /// the reconnect drainer (`local_worker.rs` `drain_failed_digests` →
+    /// `handle_upload_missing_blobs`) re-attempts it, and re-pin the fast
+    /// tier so the bytes survive until that retry. This is the bounded
+    /// sibling of [`failed_writes_inserter`]: the worker backfill /
+    /// action-output give-up paths (W4 / W6) can fire per-blob across a
+    /// whole backfill set (the live FL-688 loop re-requested 3244 blobs
+    /// every ~62 s), so unlike the gated server-side insert sites this one
+    /// enforces `FAILED_SLOW_WRITES_MAX`.
+    ///
+    /// The invariant: a blob the worker is responsible for pushing is
+    /// retried until it lands on the server, never silently dropped. The
+    /// pre-fix behavior was `warn!` + drop (the stuck-loop root).
+    ///
+    /// Returns `true` if the digest is now tracked for retry (newly
+    /// inserted OR already present), `false` ONLY if the set was at
+    /// `FAILED_SLOW_WRITES_MAX` and the digest was not already present —
+    /// the over-cap rejection (see the const doc-comment for why we reject
+    /// the newcomer rather than drop-oldest). The caller logs the `false`
+    /// case at `warn!` so an over-cap event is observable.
+    ///
+    /// Lock discipline: `parking_lot::Mutex` on `failed_slow_writes`
+    /// (single contains/insert) released BEFORE the `pin_digests` call;
+    /// the method is synchronous and holds no lock across `.await`.
+    #[must_use]
+    pub fn requeue_failed_push(&self, digest: DigestInfo) -> bool {
+        let admitted = {
+            let mut guard = self.failed_slow_writes.lock();
+            if guard.contains(&digest) {
+                true
+            } else if guard.len() >= FAILED_SLOW_WRITES_MAX {
+                false
+            } else {
+                guard.insert(digest);
+                true
+            }
+        };
+        if admitted {
+            // Re-pin so the blob survives until the reconnect retry. The
+            // re-pin is meaningless (and skipped) when the digest was
+            // over-cap-rejected: we are not tracking it for retry.
+            self.fast_store.pin_digests(&[digest]);
+        }
+        admitted
     }
 
     /// #212 Phase 2.7 helper: dispatch a Bazel-facing write through

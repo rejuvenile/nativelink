@@ -2747,6 +2747,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 let cas_store_wrapped = cas_store_wrapped.clone();
                 let slow_store = slow_store.clone();
                 let upload_sem = Arc::clone(&upload_sem);
+                // #FL-688 W4 retry-until-durable: clone the FSS handle so the
+                // per-blob Err arm can re-queue the digest into the shared
+                // `failed_slow_writes` set instead of dropping it.
+                let cas_store = cas_store.clone();
                 async move {
                     let _permit = upload_counters.acquire(&upload_sem).await;
                     // Use in-memory transfer for small blobs, streaming for
@@ -2819,7 +2823,38 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     match result {
                         Ok(()) => true,
                         Err(err) => {
-                            warn!(?digest, ?err, "UploadMissingBlobs: failed to transfer blob");
+                            // #FL-688 W4 retry-until-durable: a failed
+                            // worker→server backfill push MUST NOT be
+                            // dropped. Re-queue the digest into the shared
+                            // `failed_slow_writes` set (+ re-pin the fast
+                            // tier) so the reconnect drainer
+                            // (`drain_failed_digests` → this same handler)
+                            // re-attempts it. Pre-fix this arm `warn!`-logged
+                            // and dropped the blob, so the server re-requested
+                            // the identical missing set every BlobsAvailable
+                            // tick and the count never decreased (the stuck
+                            // loop). The re-queue is bounded by
+                            // `FAILED_SLOW_WRITES_MAX`; `requeue_failed_push`
+                            // returns false only on the over-cap rejection,
+                            // surfaced here at warn! so the (never-in-practice)
+                            // over-cap event is observable.
+                            let requeued = cas_store.requeue_failed_push(digest);
+                            if requeued {
+                                warn!(
+                                    ?digest,
+                                    ?err,
+                                    "UploadMissingBlobs: failed to transfer blob; \
+                                     re-queued into failed_slow_writes for retry-until-durable"
+                                );
+                            } else {
+                                warn!(
+                                    ?digest,
+                                    ?err,
+                                    "UploadMissingBlobs: failed to transfer blob AND \
+                                     failed_slow_writes is at cap — digest NOT re-queued; \
+                                     server BlobsAvailable re-request is the remaining retry path"
+                                );
+                            }
                             false
                         }
                     }
@@ -4490,6 +4525,33 @@ pub async fn send_periodic_blobs_available_for_test<
         is_first,
     )
     .await
+}
+
+/// Test seam (#FL-688 §4): drive the production backfill upload handler
+/// `LocalWorkerImpl::handle_upload_missing_blobs` against a real
+/// `RunningActionsManager` whose `get_cas_store()` returns a
+/// production-composed `FastSlowStore`. Exposed so the retry-until-durable
+/// regression test exercises the EXACT per-blob Err arm (W4) — including
+/// the re-queue into `failed_slow_writes` — rather than re-implementing the
+/// upload sequence by hand (which the legacy
+/// `end_to_end_mirror_reconciliation_test` does and which therefore cannot
+/// observe the W4 drop-vs-requeue contract).
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn handle_upload_missing_blobs_for_test<
+    T: WorkerApiClientTrait + 'static,
+    U: RunningActionsManager,
+>(
+    running_actions_manager: &Arc<U>,
+    digests: Vec<DigestInfo>,
+    max_concurrent_uploads: usize,
+) {
+    LocalWorkerImpl::<T, U>::handle_upload_missing_blobs(
+        running_actions_manager,
+        digests,
+        max_concurrent_uploads,
+    )
+    .await;
 }
 
 type ConnectionFactory<T> = Box<dyn Fn() -> BoxFuture<'static, Result<T, Error>> + Send + Sync>;

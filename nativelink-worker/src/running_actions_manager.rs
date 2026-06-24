@@ -1310,6 +1310,27 @@ const fn plan_retry_step(
     }
 }
 
+/// #FL-688 W6: decide whether a give-up should re-queue the digest into
+/// `failed_slow_writes` for retry-until-durable. The give-up arm of
+/// `spawn_upload_to_remote` re-queues a digest ONLY when the loop is
+/// stopping (`give_up_flag == false`, the loop's terminal failure value)
+/// AND the error CAN succeed on a later attempt
+/// (`classify_upload_error == Retry`, i.e. the SYNC-mode finite budget was
+/// exhausted on a transient error). A `PermanentGiveUp` (InvalidArgument,
+/// PermissionDenied, …) is NOT re-queued — it can never succeed by retry,
+/// so a re-queue would be a dead-weight reconnect retry. `AlreadyExists`
+/// (success) is handled by the loop's explicit success arm and never
+/// reaches the give-up arm. Deferred mode never gives up on a retryable
+/// class (retry-forever), so this returns `true` only on the production
+/// synchronous path.
+///
+/// Single source of truth so the production give-up arm and the W6
+/// regression test exercise the SAME predicate (a mutation that guts this
+/// function red-fails the test).
+fn should_requeue_on_giveup(e: &Error, give_up_flag: bool) -> bool {
+    !give_up_flag && classify_upload_error(e) == UploadRetryDecision::Retry
+}
+
 /// FL-681 Q1+Q2: per-digest retry control for the deferred upload loop.
 ///
 /// Owns the `attempt` counter and the `remote_backoff` ramp so the loop
@@ -1376,16 +1397,26 @@ impl DeferredUploadRetry {
                     return Some(false);
                 }
                 UploadRetryDecision::Retry => {
-                    // Synchronous-mode finite budget exhausted — hand
-                    // persistent failure to the failed_slow_writes /
-                    // reconnect-UploadMissingBlobs backstop. (Deferred mode
-                    // never reaches here: retry_forever.)
+                    // Synchronous-mode finite budget exhausted. This function
+                    // is the pure retry-policy decision point and takes NO
+                    // side effect on the store; it returns `Some(false)` to
+                    // STOP the loop. The caller (the give-up arm in
+                    // `spawn_upload_to_remote`) is responsible for arming the
+                    // `failed_slow_writes` backstop on this exact decision
+                    // (`#FL-688 W6` — it re-derives `classify_upload_error`
+                    // and calls `requeue_failed_push`). Pre-#FL-688 this loop
+                    // wrote to the bare `slow_store` and recorded NOTHING on
+                    // give-up; the "deferring to the backstop" claim was a
+                    // load-bearing falsehood (the backstop was armed only by
+                    // the EARLIER `inner_upload_results` FSS write, not by
+                    // this loop). (Deferred mode never reaches here:
+                    // retry_forever.)
                     error!(
                         ?digest,
                         ?e,
                         code = ?e.code,
                         attempts = self.attempt + 1,
-                        "upload_to_remote: synchronous-mode retry budget exhausted; deferring to failed_slow_writes / UploadMissingBlobs backstop",
+                        "upload_to_remote: synchronous-mode retry budget exhausted; caller arms failed_slow_writes backstop for retry-until-durable (#FL-688 W6)",
                     );
                     return Some(false);
                 }
@@ -6632,10 +6663,17 @@ impl RunningActionsManagerImpl {
                 // source → fails." In the SYNCHRONOUS path the pin is
                 // time-bounded and the blob was already written to the full
                 // FastSlowStore by `inner_upload_results`; that path keeps a
-                // FINITE retry and hands persistent failures to the existing
+                // FINITE retry, and on give-up THIS loop now arms the
                 // `failed_slow_writes` / reconnect-`UploadMissingBlobs`
-                // backstop. `SYNC_MAX_RETRIES` preserves the prior
-                // synchronous-mode give-up bound (was `MAX_RETRIES = 4`).
+                // backstop itself (#FL-688 W6 — the give-up arm below calls
+                // `requeue_failed_push`). Pre-#FL-688 the backstop was armed
+                // only by the EARLIER `inner_upload_results` FSS write; this
+                // loop's give-up recorded nothing (it writes to the bare
+                // `slow_store`), so a digest whose FSS write succeeded but
+                // whose subsequent bare-`slow_store` push exhausted retries
+                // was never re-queued by this loop. `SYNC_MAX_RETRIES`
+                // preserves the prior synchronous-mode give-up bound (was
+                // `MAX_RETRIES = 4`).
                 // `deferred_pin` IS the retry-forever switch: the planner
                 // (`plan_retry_step`) treats `deferred_pin == true` as
                 // retry-forever and `false` as the finite `SYNC_MAX_RETRIES`
@@ -6855,6 +6893,44 @@ impl RunningActionsManagerImpl {
                                     )
                                     .await;
                                 if let Some(flag) = outcome {
+                                    // #FL-688 W6 retry-until-durable: when the
+                                    // SYNCHRONOUS-mode finite retry budget is
+                                    // exhausted (decision == Retry give-up),
+                                    // arm the `failed_slow_writes` backstop so
+                                    // the reconnect drainer re-attempts the
+                                    // push — closing the load-bearing-false
+                                    // doc gap (`:1378-1391` claimed a backstop
+                                    // this loop never armed: it writes to the
+                                    // bare `slow_store`, not the FSS, so its
+                                    // give-up recorded nothing). A
+                                    // `PermanentGiveUp` (e.g. InvalidArgument)
+                                    // is NOT re-queued — it can never succeed
+                                    // by retry. `AlreadyExists` is handled by
+                                    // the explicit success arm above and never
+                                    // reaches here. Deferred mode never gives
+                                    // up on a retryable class (retry-forever),
+                                    // so this only fires in the production
+                                    // synchronous path.
+                                    if should_requeue_on_giveup(&e, flag) {
+                                        let requeued =
+                                            cas_store_ref.requeue_failed_push(digest);
+                                        if requeued {
+                                            warn!(
+                                                ?digest,
+                                                "upload_to_remote: sync-mode retry budget \
+                                                 exhausted; re-queued into failed_slow_writes \
+                                                 for retry-until-durable (#FL-688 W6)"
+                                            );
+                                        } else {
+                                            warn!(
+                                                ?digest,
+                                                "upload_to_remote: sync-mode retry budget \
+                                                 exhausted AND failed_slow_writes is at cap — \
+                                                 digest NOT re-queued; server BlobsAvailable \
+                                                 re-request is the remaining retry path (#FL-688 W6)"
+                                            );
+                                        }
+                                    }
                                     break flag;
                                 }
                             }
@@ -8575,6 +8651,7 @@ mod upload_retry_classification_tests {
     use core::time::Duration;
 
     use nativelink_error::{Code, Error, make_err};
+    use nativelink_macro::nativelink_test;
 
     use super::{
         READ_LOCAL_BACKOFF_MAX, READ_LOCAL_BACKOFF_MIN, RepinMode, UploadFailureSide,
@@ -8672,6 +8749,130 @@ mod upload_retry_classification_tests {
                  must STILL retry (old MAX_RETRIES={OLD_MAX_RETRIES} finite limit removed — FL-681 Fix B)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // #FL-688 W6: sync-mode give-up MUST arm the failed_slow_writes
+    // backstop for retryable (transient) errors, and MUST NOT for
+    // permanent errors. This models the give-up arm in
+    // `spawn_upload_to_remote` exactly: `!flag && classify_upload_error(&e)
+    // == Retry` → `requeue_failed_push`. Pre-#FL-688 the give-up recorded
+    // NOTHING (the loop wrote to the bare slow_store), so the
+    // doc-comment's "deferring to the failed_slow_writes backstop" was a
+    // load-bearing falsehood for this loop.
+    // -----------------------------------------------------------------
+
+    /// Compose a real `FastSlowStore` (MemoryStore fast, MemoryStore slow)
+    /// so the W6 give-up arm's `requeue_failed_push` side effect is
+    /// observable via `failed_slow_writes_contains`. The slow tier is
+    /// never written here — the test drives the GIVE-UP arm decision +
+    /// re-queue, not the upload itself.
+    fn w6_test_fss() -> std::sync::Arc<nativelink_store::fast_slow_store::FastSlowStore> {
+        use nativelink_config::stores::{
+            FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
+        };
+        use nativelink_store::fast_slow_store::FastSlowStore;
+        use nativelink_store::memory_store::MemoryStore;
+        use nativelink_util::store_trait::Store;
+        let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+        FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            fast,
+            slow,
+        )
+    }
+
+    fn w6_digest(seed: u8) -> nativelink_util::common::DigestInfo {
+        let mut h = [0u8; 32];
+        h[0] = seed;
+        nativelink_util::common::DigestInfo::new(h, 7)
+    }
+
+    /// Drives the EXACT production give-up arm side effect from
+    /// `spawn_upload_to_remote` (W6): gate on the production
+    /// `should_requeue_on_giveup` predicate, then perform the
+    /// `requeue_failed_push`. Both the predicate and the re-queue are
+    /// production code — a mutation that guts either red-fails this test.
+    /// Returns whether the re-queue fired.
+    fn w6_giveup_requeue(
+        fss: &std::sync::Arc<nativelink_store::fast_slow_store::FastSlowStore>,
+        e: &Error,
+        flag: bool,
+        digest: nativelink_util::common::DigestInfo,
+    ) -> bool {
+        if super::should_requeue_on_giveup(e, flag) {
+            fss.requeue_failed_push(digest)
+        } else {
+            false
+        }
+    }
+
+    /// W6: a SYNC-mode give-up on a TRANSIENT error (the budget was
+    /// exhausted, but the error CAN succeed later) MUST arm the
+    /// `failed_slow_writes` backstop — never silently drop the output blob.
+    ///
+    /// `#[nativelink_test]` because `FastSlowStore::new` spawns the BIS /
+    /// watchdog background tasks and therefore needs a Tokio runtime.
+    #[nativelink_test]
+    async fn w6_sync_giveup_on_transient_arms_backstop() {
+        let fss = w6_test_fss();
+        let digest = w6_digest(0x61);
+        let transient = err(Code::Unavailable);
+        // The loop reaches the give-up arm with `flag == false` after
+        // `SYNC_MAX_RETRIES` attempts (see plan_retry_step `:1295`).
+        let requeued = w6_giveup_requeue(&fss, &transient, false, digest);
+        assert!(
+            requeued,
+            "W6: sync-mode retry budget exhausted on a transient \
+             ({:?}) MUST re-queue the output digest into failed_slow_writes \
+             for retry-until-durable — the loop's doc claimed this backstop \
+             but pre-#FL-688 never armed it (#FL-688 W6 false-backstop)",
+            Code::Unavailable,
+        );
+        assert!(
+            fss.failed_slow_writes_contains(&digest),
+            "W6: after sync-mode give-up the digest MUST be present in \
+             failed_slow_writes so the reconnect drainer re-attempts it",
+        );
+        // Reference SYNC_MAX_RETRIES so the test reads against the real
+        // give-up bound (the give-up `flag == false` is produced by the
+        // loop only AFTER this many attempts).
+        assert_eq!(
+            SYNC_MAX_RETRIES, 4,
+            "give-up bound changed — re-confirm the W6 give-up arm still \
+             fires at the documented sync budget",
+        );
+    }
+
+    /// W6 (negative / asymmetric coverage): a PERMANENT request error
+    /// (`InvalidArgument`) gives up too, but re-queuing it would be a
+    /// dead-weight retry that can NEVER succeed. The give-up arm MUST NOT
+    /// arm the backstop for permanent classes.
+    #[nativelink_test]
+    async fn w6_sync_giveup_on_permanent_does_not_arm_backstop() {
+        let fss = w6_test_fss();
+        let digest = w6_digest(0x62);
+        let permanent = err(Code::InvalidArgument);
+        let requeued = w6_giveup_requeue(&fss, &permanent, false, digest);
+        assert!(
+            !requeued,
+            "W6: a permanent request error ({:?}) can never succeed by \
+             retry — the give-up arm MUST NOT re-queue it (dead-weight \
+             reconnect retry)",
+            Code::InvalidArgument,
+        );
+        assert!(
+            !fss.failed_slow_writes_contains(&digest),
+            "W6: a permanently-failed digest MUST NOT be in failed_slow_writes",
+        );
     }
 
     // -----------------------------------------------------------------

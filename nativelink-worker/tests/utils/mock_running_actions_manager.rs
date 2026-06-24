@@ -17,6 +17,7 @@ use std::sync::Arc;
 use async_lock::Mutex;
 use nativelink_error::{Error, make_input_err};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::StartExecute;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_util::action_messages::{ActionResult, OperationId};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -66,6 +67,16 @@ pub(crate) struct MockRunningActionsManager {
     // regression test drive a still-saturated worker so it can assert the
     // delta reports the real value instead of a hardcoded `false`.
     indefinite_pin_saturated: std::sync::atomic::AtomicBool,
+
+    // (#FL-688 §4 backfill retry-until-durable) when set, the
+    // `get_cas_store()` trait method returns this `FastSlowStore` instead
+    // of the default `None`. Lets `handle_upload_missing_blobs` run its
+    // real per-blob upload fan-out against a production-composed store so
+    // the W4 failed-upload re-queue contract is exercised end-to-end.
+    // `std::sync::Mutex` (not the async `Mutex`) because the
+    // `get_cas_store` trait method is synchronous; the store is installed
+    // once before the backfill call and never contended.
+    cas_store: std::sync::Mutex<Option<Arc<FastSlowStore>>>,
 }
 
 impl Default for MockRunningActionsManager {
@@ -94,7 +105,18 @@ impl MockRunningActionsManager {
             cache_action_result_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_action_result_err: Mutex::new(None),
             indefinite_pin_saturated: std::sync::atomic::AtomicBool::new(false),
+            cas_store: std::sync::Mutex::new(None),
         }
+    }
+
+    /// (#FL-688 §4) Install the `FastSlowStore` returned by
+    /// `get_cas_store()`. The backfill retry-until-durable test composes a
+    /// real FSS whose slow tier rejects writes, installs it here, then
+    /// drives `handle_upload_missing_blobs` so the W4 Err arm fires against
+    /// production composition.
+    #[allow(dead_code, reason = "consumed by #FL-688 backfill retry test")]
+    pub(crate) fn set_cas_store(&self, cas_store: Arc<FastSlowStore>) {
+        *self.cas_store.lock().expect("cas_store mutex poisoned") = Some(cas_store);
     }
 
     /// #O15 (2026-06-07): install a `Notify` that `cache_action_result`
@@ -274,6 +296,13 @@ impl RunningActionsManager for MockRunningActionsManager {
     fn indefinite_pin_saturated(&self) -> bool {
         self.indefinite_pin_saturated
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn get_cas_store(&self) -> Option<Arc<FastSlowStore>> {
+        self.cas_store
+            .lock()
+            .expect("cas_store mutex poisoned")
+            .clone()
     }
 
     async fn cached_directory_digests(&self) -> Vec<DigestInfo> {

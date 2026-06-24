@@ -143,6 +143,14 @@ name = "end_to_end_mirror_reconciliation_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (#FL-688 §4) Drives the production backfill handler
+# `handle_upload_missing_blobs` via the
+# `handle_upload_missing_blobs_for_test` seam (gated behind `test-utils`)
+# and `MockRunningActionsManager::set_cas_store`, both `cfg(test-utils)`.
+name = "backfill_upload_requeue_test"
+required-features = ["test-utils"]
+
+[[test]]
 # `bis_ac_routing_test` constructs `BlobsAvailableState::from_test_args` with an
 # `ac_mirror_target`, gated behind `cfg(any(test, feature = "test-utils"))`.
 # Without this `[[test]]` entry the default `cargo test -p nativelink-worker`
