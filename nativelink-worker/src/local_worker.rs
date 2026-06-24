@@ -658,7 +658,13 @@ const REFAULT_CONFIRM_RATE: u32 = 10_000;
 /// fleet fail-open keep a dead sampler or an all-pressured fleet from
 /// wedging. The sampler always publishes the level + swap-used for
 /// observability.
-const MEMORY_GATE_ENABLED: bool = true;
+// #64 INCIDENT 2026-06-24: DISABLED. The 1 GiB raw-`free_count` floor
+// false-tripped fleet-wide on macOS (busy raw free is normally a few
+// hundred MiB; e.g. worker-06 NAKed with 10.4 GiB available) → a
+// 3.6k-NAK/min storm + worker flapping. W4 (the upload retry-until-durable
+// fix in this same binary) stays ON. Re-enable only after the floor reads
+// `available` (free+inactive+speculative+purgeable), not raw free_count.
+const MEMORY_GATE_ENABLED: bool = false;
 
 /// (#37) EWMA smoothing weight applied to each fresh re-fault-rate sample
 /// (fast-ATTACK). A high weight on RISING samples means a post-action
@@ -1812,7 +1818,11 @@ pub(crate) fn apply_periodic_tick_memo_resets(
 /// pending-BIS re-advertisement test can assert the value at the declaration
 /// site and drive exactly one full heartbeat cycle without re-deriving the
 /// cadence.
-pub const AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS: u64 = 60;
+// #63: 60s anti-entropy resync (was 60 ticks = 6s at the 100ms
+// BLOBS_AVAILABLE_MAX_INTERVAL_MS tick — too frequent, re-sent the whole
+// AC-pin set 10x/min). Time-based off the tick interval so a future
+// tick-rate change can't silently re-shrink it. = 600 ticks today.
+pub const AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS: u64 = 60_000 / BLOBS_AVAILABLE_MAX_INTERVAL_MS;
 
 /// Counts how many AC-pin digests have been added (in `current` but not
 /// `last`) and removed (in `last` but not `current`). Pure function so
@@ -5924,14 +5934,16 @@ mod tests {
         let last_sent = Mutex::new(HashSet::new());
         let counter = AtomicU64::new(0);
 
-        // Drive 65 ticks so AT LEAST one heartbeat MUST land if
-        // `AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS <= 65`. If the constant
-        // is set higher (e.g. u64::MAX) the firing count drops to 0
-        // and the next assertion red-fails with the bespoke message.
+        // Drive 605 ticks so AT LEAST one heartbeat MUST land if
+        // `AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS <= 605` (now 600 = 60s at
+        // the 100ms BLOBS_AVAILABLE_MAX_INTERVAL_MS tick). FIXED loop
+        // bound (NOT N-derived) so the mutation `N -> u64::MAX` keeps the
+        // loop at 605 → firing count drops to 0 and the next assertion
+        // red-fails with the bespoke message.
         let mut heartbeat_ticks: Vec<u64> = Vec::new();
         let mut reconnect_count = 0usize;
         let mut none_count = 0usize;
-        for _ in 0..65 {
+        for _ in 0..605 {
             match apply_periodic_tick_memo_resets(
                 &last_sent,
                 &counter,
@@ -5952,7 +5964,7 @@ mod tests {
         assert_eq!(
             heartbeat_ticks.len(),
             1,
-            "heartbeat resync did not fire at tick 60: {} firings, expected 1 (firings at ticks {heartbeat_ticks:?})",
+            "heartbeat resync did not fire at tick {AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS}: {} firings, expected 1 (firings at ticks {heartbeat_ticks:?})",
             heartbeat_ticks.len()
         );
         assert_eq!(
@@ -5961,16 +5973,20 @@ mod tests {
             heartbeat_ticks[0]
         );
         assert_eq!(
-            none_count, 64,
-            "heartbeat resync over/under-fired: expected 64 None outcomes (65 ticks - 1 heartbeat), got {none_count}"
+            none_count, 604,
+            "heartbeat resync over/under-fired: expected 604 None outcomes (605 ticks - 1 heartbeat), got {none_count}"
         );
 
         // Independent check that the heartbeat interval has not
         // drifted from the design value. Final assertion so the
         // firing-count check fires first on the canonical mutation.
+        // Pin the SEMANTIC (60s anti-entropy interval), not the raw tick
+        // count, so the value tracks BLOBS_AVAILABLE_MAX_INTERVAL_MS (#63).
         assert_eq!(
-            AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS, 60,
-            "heartbeat constant drifted: AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS expected 60"
+            AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS * BLOBS_AVAILABLE_MAX_INTERVAL_MS,
+            60_000,
+            "heartbeat interval drifted: must be 60s, got {} ms",
+            AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS * BLOBS_AVAILABLE_MAX_INTERVAL_MS
         );
     }
 
