@@ -2821,11 +2821,15 @@ async fn inner_main(
             // blobs. Re-run the unbounded flush HERE so every pulled blob is
             // DURABLE on the slow tier before persist/eviction/exit. This
             // mirrors the smallack path's "await the durable slow write" intent
-            // for the large/chunked class. The second flush is BOUNDED +
-            // IDEMPOTENT: `flush_fast_to_slow_at_shutdown` `slow.has`-skips every
-            // blob the first flush already persisted (CAS content-addressed, so
-            // a redundant write is a no-op), so it only drives the NEW
-            // pull-landed residue — it does not re-walk the whole tier's work.
+            // for the large/chunked class. The second flush is IDEMPOTENT: per
+            // durability-ack v3 Change A, `flush_fast_to_slow_at_shutdown`
+            // flushes only the in-memory NOT-YET-DURABLE at-risk subset
+            // (in_flight ∪ chunked ∪ failed). Pull-landed blobs go through the
+            // normal `update` path, so they are in `in_flight_slow_writes` until
+            // their bg write completes — the at-risk filter catches exactly that
+            // residue. Blobs the first flush already persisted are either
+            // removed from the at-risk set by their completed bg write OR, on
+            // the rare race, re-written idempotently (CAS content-addressed).
             //
             // UNBOUNDED (same directive as Phase 2): `flush_budget` bounds only
             // the Phase-1 in-flight drain inside `flush_slow_writes`; the

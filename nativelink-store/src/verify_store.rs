@@ -31,7 +31,7 @@ use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_dig
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike,
     UploadSizeInfo,
 };
@@ -552,6 +552,9 @@ impl StoreDriver for VerifyStore {
     /// forced-delegation enum mechanism).
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner_store.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

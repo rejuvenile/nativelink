@@ -41,7 +41,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::{background_spawn, spawn};
 use nativelink_util::store_trait::{
-    BoolValue, ItemCallback, MarkStableDelegation, PinDelegation, SchedulerCurrentVersionProvider,
+    BoolValue, ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, SchedulerCurrentVersionProvider,
     SchedulerIndexProvider, SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
     SchedulerStoreKeyProvider, SchedulerSubscription, SchedulerSubscriptionManager,
     StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
@@ -3034,6 +3034,9 @@ where
     /// is owned by the wrapping `FastSlowStore`, not this leaf). (Task #157.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

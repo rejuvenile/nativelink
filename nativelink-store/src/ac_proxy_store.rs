@@ -72,7 +72,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, Writ
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    IS_AC_PEER_FETCH, ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation,
+    IS_AC_PEER_FETCH, ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation,
     Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 
@@ -620,6 +620,9 @@ impl StoreDriver for AcProxyStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 

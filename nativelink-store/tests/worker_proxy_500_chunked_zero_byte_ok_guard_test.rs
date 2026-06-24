@@ -88,7 +88,7 @@ use nativelink_util::buf_channel::{
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, REDIRECT_PREFIX, StableDigestDelegation,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, REDIRECT_PREFIX, StableDigestDelegation,
     Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 
@@ -183,6 +183,9 @@ impl StoreDriver for OkEmptyPeerStore {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
+    }
 }
 
 // ----- Inner-store wrapper that emits REDIRECT_PREFIX -----
@@ -267,6 +270,9 @@ impl StoreDriver for RedirectInnerStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 
@@ -603,6 +609,9 @@ impl StoreDriver for PartialThenUnavailablePeerStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

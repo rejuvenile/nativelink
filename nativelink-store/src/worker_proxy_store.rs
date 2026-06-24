@@ -46,7 +46,7 @@ use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
+    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation,
     REDIRECT_PREFIX, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
     StoreOptimizations, UploadSizeInfo,
 };
@@ -4798,6 +4798,19 @@ impl StoreDriver for WorkerProxyStore {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
+
+    /// `has_durably` forwards to `inner` (`Inner`) — and CRUCIALLY does NOT
+    /// consult the locality short-circuit. `has_with_results` augments the
+    /// inner result with locality-map hits (a peer WORKER holds the blob in
+    /// RAM), but a locality hit is another worker's volatile RAM, NEVER
+    /// durable. The trait-default `has_durably` for `Inner` calls
+    /// `inner.has_durably` (NOT this store's `has_with_results`), so the
+    /// durable-presence query goes straight to the inner CAS chain (→
+    /// FastSlowStore slow tier) with no locality augmentation.
+    /// (durability-ack v3 §3.0.)
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
+    }
 }
 
 #[async_trait]
@@ -6206,6 +6219,9 @@ mod tests {
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Leaf
         }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Leaf
+        }
     }
 
     #[async_trait]
@@ -6493,6 +6509,9 @@ mod tests {
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Leaf
         }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Leaf
+        }
     }
 
     #[async_trait]
@@ -6571,6 +6590,9 @@ mod tests {
         }
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Leaf
+        }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Leaf
         }
     }
 

@@ -891,7 +891,7 @@ mod wps_wireup {
         HealthStatusIndicator, default_health_status_indicator,
     };
     use nativelink_util::store_trait::{
-        ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation,
+        ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation,
         Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
     };
     use pretty_assertions::assert_eq;
@@ -1005,6 +1005,9 @@ mod wps_wireup {
         }
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Inner(self.inner.as_store_driver())
+        }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Inner(self.inner.as_store_driver())
         }
     }
 
@@ -1483,6 +1486,9 @@ mod wps_wireup {
         }
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Inner(self.inner.as_store_driver())
+        }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Inner(self.inner.as_store_driver())
         }
     }
 

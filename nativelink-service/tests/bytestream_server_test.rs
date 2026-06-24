@@ -2892,7 +2892,7 @@ use nativelink_util::health_utils::{
     HealthStatusIndicator, default_health_status_indicator,
 };
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation,
     StoreDriver, StoreKey, UploadSizeInfo,
 };
 
@@ -2986,6 +2986,9 @@ impl StoreDriver for LyingHasStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 
@@ -3401,6 +3404,9 @@ impl StoreDriver for FailAfterNBytesStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 
@@ -4150,6 +4156,9 @@ impl StoreDriver for PartialErrThenDropStore {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
+    }
 }
 
 /// #500 regression: silent-zero on `consume_ok_eof` branch.
@@ -4513,6 +4522,9 @@ impl StoreDriver for SendEofThenOkStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

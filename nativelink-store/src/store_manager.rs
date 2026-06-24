@@ -308,8 +308,9 @@ impl StoreManager {
                     return (name_owned, 0, core::time::Duration::ZERO);
                 };
                 let store_started = std::time::Instant::now();
-                // `None` = unbounded: drain to zero, no deadline.
-                let unflushed = fss.flush_fast_to_slow_at_shutdown(None).await;
+                // Unbounded (R2): drain the not-yet-durable at-risk subset to
+                // completion, no deadline. (durability-ack v3 Change A.)
+                let unflushed = fss.flush_fast_to_slow_at_shutdown().await;
                 (name_owned, unflushed, store_started.elapsed())
             }));
         }

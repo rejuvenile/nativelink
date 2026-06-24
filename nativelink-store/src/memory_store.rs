@@ -38,7 +38,7 @@ use nativelink_util::health_utils::{
     HealthRegistryBuilder, HealthStatusIndicator, default_health_status_indicator,
 };
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
     StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
 
@@ -816,6 +816,9 @@ impl StoreDriver for MemoryStore {
     /// not stable, so no BIS-feeder push from this layer). (Task #157.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

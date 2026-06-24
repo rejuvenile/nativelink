@@ -24,7 +24,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    DelegationChildren, ItemCallback, MarkStableDelegation, MergedNotifyState, PinDelegation,
+    DelegationChildren, ItemCallback, DurableDelegation, MarkStableDelegation, MergedNotifyState, PinDelegation,
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::join;
@@ -126,6 +126,61 @@ impl StoreDriver for SizePartitioningStore {
                 *result = lower_results
                     .next()
                     .err_tip(|| "lower_results out of sync with lower_digests")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// DURABLE-presence query (durability-ack v3 §3.0). Partitions by size
+    /// exactly like `has_with_results`, but routes each tier's slice through
+    /// `has_durably` (NOT `has_many`), so a blob present only in the FSS
+    /// fast tier reports absent. Mirrors the `has_with_results` interleave.
+    async fn has_durably(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        let mut non_digest_sample = None;
+        let (lower_digests, upper_digests): (Vec<_>, Vec<_>) =
+            keys.iter().map(StoreKey::borrow).partition(|k| {
+                let StoreKey::Digest(digest) = k else {
+                    non_digest_sample = Some(k.borrow().into_owned());
+                    return false;
+                };
+                digest.size_bytes() < self.partition_size
+            });
+        if let Some(non_digest) = non_digest_sample {
+            return Err(make_input_err!(
+                "SizePartitioningStore only supports Digest keys, got {non_digest:?}"
+            ));
+        }
+        let mut lower_buf = vec![None; lower_digests.len()];
+        let mut upper_buf = vec![None; upper_digests.len()];
+        let (lower_res, upper_res) = join!(
+            self.lower_store.has_durably(&lower_digests, &mut lower_buf),
+            self.upper_store.has_durably(&upper_digests, &mut upper_buf),
+        );
+        match lower_res {
+            Ok(()) => {}
+            Err(err) => match upper_res {
+                Ok(()) => return Err(err),
+                Err(upper_err) => return Err(err.merge(upper_err)),
+            },
+        }
+        upper_res?;
+        let mut upper_digests = upper_digests.into_iter().peekable();
+        let mut lower_iter = lower_buf.into_iter();
+        let mut upper_iter = upper_buf.into_iter();
+        for (digest, result) in keys.iter().zip(results.iter_mut()) {
+            if Some(digest) == upper_digests.peek() {
+                upper_digests.next();
+                *result = upper_iter
+                    .next()
+                    .err_tip(|| "upper has_durably results out of sync with upper_digests")?;
+            } else {
+                *result = lower_iter
+                    .next()
+                    .err_tip(|| "lower has_durably results out of sync with lower_digests")?;
             }
         }
         Ok(())
@@ -338,6 +393,16 @@ impl StoreDriver for SizePartitioningStore {
     /// enum mechanism; per-digest routers stay as Leaf+override.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+
+    /// `has_durably` needs PER-DIGEST routing (each digest lives in EITHER
+    /// the lower OR upper tier, never both), which `Many` (which OR-merges
+    /// the WHOLE slice across both tiers) would mis-handle. Declare `Leaf`
+    /// and override `has_durably` (in the StoreDriver impl above) to
+    /// partition by size — same pattern as `has_with_results`/`mark_stable`.
+    /// (durability-ack v3 §3.0.)
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 
     /// Route each digest to the inner store that owns it (by size partition)

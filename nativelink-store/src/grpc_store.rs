@@ -54,7 +54,7 @@ use nativelink_util::proto_stream_utils::{
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    IS_AC_PEER_FETCH, IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation,
+    IS_AC_PEER_FETCH, IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, DurableDelegation, MarkStableDelegation,
     PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
     UploadSizeInfo,
 };
@@ -3796,6 +3796,9 @@ impl StoreDriver for GrpcStore {
     /// push into BIS). (Task #157.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

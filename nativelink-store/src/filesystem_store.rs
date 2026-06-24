@@ -38,7 +38,7 @@ use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
     StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
 use tokio::sync::Semaphore;
@@ -2695,6 +2695,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
     /// BIS chain. (Task #157.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 
     /// FilesystemStore is disk-backed: a sustained latency hiccup on the

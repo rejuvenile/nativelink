@@ -104,7 +104,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, UploadSizeInfo,
 };
 use opentelemetry::context::FutureExt;
@@ -242,6 +242,9 @@ impl StoreDriver for ReaderObservingInnerStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

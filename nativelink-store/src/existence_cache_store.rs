@@ -45,7 +45,7 @@ use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 
@@ -978,6 +978,17 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
     /// forced-delegation enum mechanism).
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner_store.as_store_driver())
+    }
+
+    /// `has_durably` forwards to `inner_store` (`Inner`) — it MUST NOT be
+    /// satisfied from the existence cache. The cache records "the inner
+    /// store has this blob" regardless of which tier holds it (fast or
+    /// slow), so a cache hit is NOT proof of durability. The `Inner` route
+    /// bypasses the cache (the trait default dispatches straight to
+    /// `inner_store.has_durably`), so the durable-presence query reaches the
+    /// FastSlowStore boundary undistorted. (durability-ack v3 §3.0.)
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

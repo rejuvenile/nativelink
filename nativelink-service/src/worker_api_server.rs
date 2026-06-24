@@ -3031,19 +3031,62 @@ impl WorkerConnection {
             .filter_map(|(d, r)| r.map(|_| *d))
             .collect();
 
-        // mark_stable for the present subset: the server has each of these
-        // digests in stable storage, so the worker's pin is no longer
-        // load-bearing. The BIS broadcast loop in `nativelink.rs` drains
-        // `stable_digests` and emits `BlobsInStableStorage` to every
-        // worker, which calls `unpin_digest` (`local_worker.rs:717`).
-        // The has_with_results check above guarantees we never tell the
-        // worker to unpin a digest the server doesn't actually have
-        // (which would lose the only durable copy of a `mirror_blob`).
-        // Idempotent: the broadcast loop dedups downstream and
-        // `unpin_digest` is itself idempotent.
-        if !present_in_cas.is_empty() {
-            let present_vec: Vec<DigestInfo> = present_in_cas.iter().copied().collect();
-            cas_store.mark_stable(&present_vec);
+        // mark_stable for the DURABLE subset (durability-ack v3 §3.0
+        // keystone): the worker's pin on a digest is the ≥2-replica
+        // backstop while the server's copy is only in volatile RAM (the
+        // fast tier / in-flight slow-write maps / RAM-only mirror). The BIS
+        // broadcast loop drains `stable_digests`, emits `BlobsInStableStorage`
+        // to the worker, which calls `unpin_digest` (`local_worker.rs:717`) —
+        // dropping the worker's copy. That unpin OATH may fire ONLY once the
+        // server holds a DURABLE copy (survives a restart), never on RAM-only
+        // presence: unpinning a RAM-only digest would discard the only
+        // durable copy of a `mirror_blob` on the next server restart.
+        //
+        // So the gate is `has_durably` (the SLOW-tier-only query), NOT the
+        // `has_with_results` above. `has_with_results` (which the FSS
+        // satisfies from the fast tier + in-flight maps + mirror) still
+        // drives the upload-request decision below — a blob present in RAM
+        // need not be re-requested for upload — but it must NOT gate the
+        // unpin oath. This is strictly-safer than the prior code: BIS now
+        // fires LATER (once durable), never earlier. Idempotent: the
+        // broadcast loop dedups downstream and `unpin_digest` is itself
+        // idempotent.
+        let durable_keys: Vec<StoreKey<'_>> =
+            digests.iter().map(|d| StoreKey::from(*d)).collect();
+        let mut durable_results = vec![None; durable_keys.len()];
+        match cas_store
+            .has_durably(&durable_keys, &mut durable_results)
+            .await
+        {
+            Ok(()) => {
+                let durable_vec: Vec<DigestInfo> = digests
+                    .iter()
+                    .zip(durable_results.iter())
+                    .filter_map(|(d, r)| r.map(|_| *d))
+                    .collect();
+                if !durable_vec.is_empty() {
+                    cas_store.mark_stable(&durable_vec);
+                }
+            }
+            Err(err) => {
+                // A failed durable check must NOT fire the unpin oath (a
+                // false-durable would lose data). Skip mark_stable this
+                // round; the next BlobsAvailable tick recovers. Surface a
+                // noisy counter alongside the log (same pattern as the
+                // has_with_results failure path above).
+                metrics
+                    .mark_stable_has_with_results_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                error!(
+                    worker_id=?worker_id,
+                    ?err,
+                    count=digests.len(),
+                    "mark_stable: has_durably check failed; worker pins for \
+                     durable digests will not be acked this round (next \
+                     BlobsAvailable tick recovers); metric \
+                     `mark_stable_has_with_results_failures` incremented"
+                );
+            }
         }
 
         // The mark_stable side runs every BlobsAvailable tick (~100 ms);

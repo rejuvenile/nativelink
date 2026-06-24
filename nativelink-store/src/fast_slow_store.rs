@@ -41,7 +41,7 @@ use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::phase0_metrics::{is_server_process, server_phase0_metrics};
 use nativelink_util::store_trait::{
-    DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
+    DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation,
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
     UploadSizeInfo, slow_update_store_with_file,
 };
@@ -2542,66 +2542,85 @@ impl FastSlowStore {
         }
     }
 
-    /// Phase 2 of graceful shutdown (#210): enumerate every key in the
-    /// fast tier and write any blob the slow tier does not yet hold to
-    /// the slow tier before returning. Returns the number of fast-tier
-    /// blobs that could NOT be persisted (0 when all blobs are durable).
+    /// Phase 2 of graceful shutdown (#210 + durability-ack v3 Change A):
+    /// enumerate every key in the fast tier and write each NOT-YET-DURABLE
+    /// blob to the slow tier before returning. Returns the number of
+    /// not-yet-durable blobs that could NOT be persisted (0 when every
+    /// at-risk blob is durable).
     ///
-    /// `deadline`:
-    /// - **`None` (production #210 path):** unbounded — the flush runs to
-    ///   completion, draining EVERY memory-only blob to the slow tier no
-    ///   matter how long it takes. This is the operator directive after the
-    ///   2026-06-23 restart lost 827,204 SMALL_CAS_CACHED blobs to a 30 s
-    ///   deadline ("give shutdown unlimited time to flush blobs to redis and
-    ///   to disk"). With `None` the only way this returns non-zero is a
-    ///   per-entry slow-tier write error.
-    /// - **`Some(d)`:** best-effort within `d`; once `d` elapses, no further
-    ///   blobs are launched and the remainder is reported as unflushed. Used
-    ///   by callers that still want a wall-clock cap.
+    /// **Unbounded (R2): no deadline.** The flush runs to completion,
+    /// draining every at-risk memory-only blob to the slow tier no matter
+    /// how long it takes. This is the operator directive after the
+    /// 2026-06-23 restart lost 827,204 SMALL_CAS_CACHED blobs to a 30 s
+    /// deadline ("give shutdown unlimited time to flush blobs to redis and
+    /// to disk"). systemd `TimeoutStopSec` must accommodate the worst-case
+    /// flush wall-time (at-risk byte volume / slow-tier write rate); the
+    /// at-risk subset is the small not-yet-durable tail in steady state.
+    ///
+    /// **Change A: chunked-write-path safety + the dropped `slow.has()`
+    /// probe.** The byte source is the WHOLE-tier `fast_store.list()` scan
+    /// (#210's "drain ALL memory-only blobs" superset — and the ONLY source
+    /// that reaches CHUNKED acked-not-durable bytes, which live in the fast
+    /// tier, NOT in `chunked_in_flight_digests`, which holds only a refcount
+    /// + Notify). The per-key `slow.has()` pre-check is GONE: at the
+    /// 2026-06-23 restart it spent the whole deadline doing ~591 k serial
+    /// `has()` probes of already-durable blobs and flushed ZERO. The
+    /// not-yet-durable FILTER is now the in-memory AT-RISK DIGEST SET
+    /// (`in_flight_slow_writes` ∪ `chunked_in_flight_digests` ∪
+    /// `failed_slow_writes`) — a content-addressed re-write is idempotent,
+    /// so flushing only the at-risk set is lossless while skipping
+    /// already-durable residents (back-populated reads, durable mirror
+    /// copies) without any slow-tier round-trip.
+    ///
+    /// **Filter predicate (the implementing-commit choice).** The at-risk
+    /// digest set is used rather than a fast-tier pin-state query: it is
+    /// already queryable (three `self.` fields, no new moka API) and is the
+    /// SAME set assumption-auditor verified COMPLETE for the
+    /// acked-not-durable class (the chunked ack-gate `try_join!`
+    /// structurally forbids a mirror-only ack, so every acked-not-durable
+    /// server copy has its digest in one of the three). A fast-tier
+    /// resident NOT in the at-risk set is either already durable (its bg
+    /// slow write returned Ok and removed it from `in_flight_slow_writes`)
+    /// or a durable mirror/back-populated read — in all cases skipping it is
+    /// correct, and on the rare doubt a content-addressed re-write would be
+    /// an idempotent no-op anyway.
     ///
     /// **Why this exists in addition to [`Self::flush_slow_writes`]:**
-    /// `flush_slow_writes` only drains the in-flight write map populated
-    /// when a write enters `update`/`update_oneshot` and spawns a
-    /// background slow-store task. Blobs that landed in the fast tier
-    /// via OTHER paths (slow-tier read back-population, peer mirror
-    /// promotion, retry-after-failed-slow-write where the in-flight
-    /// entry was already removed, or any direct write to the fast store
-    /// that bypassed the spawn) are invisible to that drain. With a
-    /// MemoryStore fast tier (`cas_FAST_SLOW_STORE`,
-    /// `SMALL_CAS_CACHED`), every such blob dies with the process and
-    /// the build later fails with "Lost inputs no longer available
-    /// remotely" because the AC entry references a CAS digest that
-    /// vanished. #206's investigation observed 9904 of 66174 worker-
-    /// reported blobs missing for 6+ hours after restart, with 4 of 5
-    /// sampled small-blob digests missing from Redis.
+    /// `flush_slow_writes` Phase 1 only drains the in-flight write map's
+    /// bytes (the legacy `update`/`update_oneshot` spawn path). Chunked
+    /// acked-not-durable blobs carry NO bytes in any map (their bytes are in
+    /// the fast tier), so they are invisible to Phase 1 — Phase 2 here is
+    /// the only drain that reaches them. With a MemoryStore fast tier
+    /// (`cas_FAST_SLOW_STORE`, `SMALL_CAS_CACHED`) an unflushed at-risk blob
+    /// dies with the process and the build later fails with "Lost inputs no
+    /// longer available remotely".
     ///
     /// **Contract directions** (CLAUDE.md asymmetric-coverage rule):
-    /// - **Under-action:** every fast-tier blob NOT in slow tier MUST be
-    ///   written to the slow tier before this returns (within the
-    ///   deadline, if any). Failure mode: lost data on restart.
-    /// - **Over-action / deadline:** when `deadline` is `Some(d)`, this MUST
-    ///   return within ~`d` even if the slow tier is so slow it cannot drain
-    ///   everything. With `None` the directive is the opposite — drain to
-    ///   zero however long it takes; a wedged slow tier blocking
-    ///   SIGTERM-to-exit is the explicitly accepted trade (see the
-    ///   wedged-slow-tier risk note in the #210 commit).
+    /// - **Under-action:** every NOT-YET-DURABLE fast-tier blob (digest in
+    ///   the at-risk set) MUST be written to the slow tier before this
+    ///   returns. Failure mode: lost data on restart.
+    /// - **Over-action:** an ALREADY-DURABLE fast-tier resident (NOT in the
+    ///   at-risk set) MUST be skipped — no redundant write, no `slow.has()`
+    ///   probe. Failure mode: re-walking 591 k durable blobs (the RCA).
     /// - **Per-entry tolerance:** a single failing slow-tier write MUST
     ///   NOT abort the drain — the other blobs still get written.
-    /// - **Skip-existing:** a blob the slow tier already has MUST NOT be
-    ///   re-written (avoids amplifying tail-latency on stores like
-    ///   FilesystemStore where update_oneshot is non-trivial).
     ///
     /// The drain runs at bounded concurrency ([`SHUTDOWN_FLUSH_CONCURRENCY`])
-    /// so a large fast tier (the production SMALL_CAS_CACHED tier held 1.4 M
-    /// keys at the #210 restart) drains in N/K round-trips rather than N
+    /// so a large fast tier drains in N/K round-trips rather than N
     /// strictly-serial ones.
     ///
-    /// Mirror blobs (`mirror_blobs`) are intentionally NOT flushed here
-    /// — those are pinned in memory only by design until the server's
-    /// `BlobsInStableStorage` ack arrives, and writing them to the slow
-    /// tier would defeat the mirror-only invariant. The
-    /// `mirror_blobs_max_bytes` cap already bounds their footprint.
-    pub async fn flush_fast_to_slow_at_shutdown(&self, deadline: Option<Duration>) -> usize {
+    /// **Ordering (Change A.4).** The caller MUST run this AFTER the
+    /// Bazel-facing listeners are quiesced (#58 directive-2), so no NEW
+    /// acked write can begin during the drain; a snapshot of the at-risk
+    /// set taken at flush start then cannot miss a later-acked blob, and a
+    /// bg durable write completing concurrently is benign (idempotent CAS).
+    ///
+    /// Mirror blobs (`mirror_blobs`) are intentionally NOT flushed: they are
+    /// NOT in the at-risk set (the server already holds them durably — a
+    /// mirror is a copy the server pushed FROM its durable tier), so the
+    /// at-risk filter skips them automatically. The `mirror_blobs_max_bytes`
+    /// cap already bounds their footprint.
+    pub async fn flush_fast_to_slow_at_shutdown(&self) -> usize {
         // Snapshot every key currently in the fast tier. We use the
         // generic `StoreDriver::list` API so this works for any fast
         // tier that implements list, but in production this is a
@@ -2641,47 +2660,64 @@ impl FastSlowStore {
             }
         }
         let snapshot_count = keys.len();
+
+        // Change A: snapshot the in-memory AT-RISK DIGEST SET ONCE
+        // (in_flight_slow_writes ∪ chunked_in_flight_digests ∪
+        // failed_slow_writes). This is the not-yet-durable filter — flush a
+        // fast-tier resident iff its digest is in this set. Taken after the
+        // caller has quiesced the Bazel-facing listeners (A.4), so nothing
+        // new can be added concurrently; a bg slow write completing during
+        // the drain only REMOVES from these sets, which at worst makes us
+        // flush a now-durable blob (idempotent CAS no-op) — never a miss.
+        let at_risk: HashSet<DigestInfo> = {
+            let mut set = HashSet::new();
+            for k in self.in_flight_slow_writes.lock().keys() {
+                if let StoreKey::Digest(d) = k.borrow() {
+                    set.insert(d);
+                }
+            }
+            for d in self.chunked_in_flight_digests.lock().keys() {
+                set.insert(*d);
+            }
+            for d in self.failed_slow_writes.lock().iter() {
+                set.insert(*d);
+            }
+            set
+        };
+
         info!(
             snapshot_count,
-            // -1 = unbounded (`None`); the production #210 path. Logged as a
-            // sentinel so an operator can see at a glance the flush will run
-            // to completion rather than time out.
-            deadline_secs = deadline.map_or(-1i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            at_risk_count = at_risk.len(),
             fast_store = %self.fast_store.inner_store(
                 Option::<StoreKey<'_>>::None
             ).get_name(),
             slow_store = %self.slow_store.inner_store(
                 Option::<StoreKey<'_>>::None
             ).get_name(),
-            "FastSlowStore::flush_fast_to_slow_at_shutdown: enumerated fast tier"
+            "FastSlowStore::flush_fast_to_slow_at_shutdown: enumerated fast tier \
+             (unbounded; flushing the not-yet-durable at-risk subset)"
         );
 
-        if snapshot_count == 0 {
+        if snapshot_count == 0 || at_risk.is_empty() {
             return 0;
         }
 
-        // Bounded-concurrency drain. #210: the prior implementation processed
-        // the snapshot strictly serially — one `slow.has` RTT then one
-        // `slow.update_oneshot` RTT per blob. With 1.4 M keys that meant up to
-        // 1.4 M serial round-trips; the 30 s deadline fired after ~591 k `has`
-        // probes (all already-present) having flushed ZERO blobs. Running the
-        // per-blob work K-at-a-time turns N serial RTTs into N/K.
+        // Bounded-concurrency UNBOUNDED drain (R2: no deadline). Change A:
+        // the per-key `slow.has()` pre-check is GONE — at the 2026-06-23
+        // restart it spent the whole deadline doing ~591 k serial `has()`
+        // probes of already-durable blobs and flushed ZERO. The
+        // not-yet-durable filter is the in-memory `at_risk` snapshot, so a
+        // skip is a HashSet membership test (no slow-tier round-trip).
         //
         // Counters are atomics shared across the concurrent tasks. Per-entry
         // errors are logged and counted but NEVER abort the drain.
         let flushed = AtomicU64::new(0);
         let skipped_already = AtomicU64::new(0);
         let errored = AtomicU64::new(0);
-        // `processed` = blobs that actually ran the has/get/update work (i.e.
-        // were NOT short-circuited by an elapsed deadline). With `None` every
-        // blob is processed, so `deadline_exceeded` below is always 0.
+        // `processed` = blobs whose at-risk membership was evaluated. With no
+        // deadline every key is processed (kept for the progress log shape).
         let processed = AtomicU64::new(0);
 
-        // `deadline.is_none()` ⇒ unbounded: never short-circuit. Otherwise a
-        // task launched after the deadline has elapsed performs no work and is
-        // counted as deadline-exceeded (so we still return a non-zero unflushed
-        // count without blocking past the deadline).
-        //
         // We stream over plain `usize` indices (not over `&StoreKey` or owned
         // `StoreKey<'_>`): a `StoreKey<'a>` carries a lifetime parameter, and a
         // `.map` closure yielding a `StoreKey`-bearing future cannot satisfy
@@ -2689,6 +2725,7 @@ impl FastSlowStore {
         // `FnOnce` is not general enough"). `usize` is lifetime-free, so each
         // task indexes the borrowed `keys` snapshot to get its key.
         let keys = &keys;
+        let at_risk = &at_risk;
         let drain = futures::stream::iter(0..snapshot_count)
             .map(|idx| {
                 let flushed = &flushed;
@@ -2697,14 +2734,6 @@ impl FastSlowStore {
                 let processed = &processed;
                 async move {
                     let key = &keys[idx];
-                    if let Some(deadline) = deadline {
-                        if started.elapsed() >= deadline {
-                            // Past the deadline — leave this blob unprocessed.
-                            // It is accounted as deadline-exceeded by the
-                            // `snapshot_count - processed` arithmetic below.
-                            return;
-                        }
-                    }
                     let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % SHUTDOWN_FLUSH_PROGRESS_EVERY as u64 == 0 {
                         // Forward-progress line so an operator watching a long
@@ -2721,28 +2750,19 @@ impl FastSlowStore {
                         );
                     }
 
-                    // Skip blobs the slow tier already holds. A failed `has`
-                    // check is treated as "unknown" → write anyway (better to
-                    // duplicate-write than to silently lose). The slow tier's
-                    // own update path is idempotent for CAS digests
-                    // (FilesystemStore dedups via its in-memory index;
-                    // RedisStore re-write of the same digest is a no-op
-                    // content-wise), so a redundant write on a `has` error is
-                    // safe.
-                    match self.slow_store.has(key.borrow()).await {
-                        Ok(Some(_)) => {
-                            skipped_already.fetch_add(1, Ordering::Relaxed);
-                            return;
-                        }
-                        Ok(None) => {} // proceed to write
-                        Err(err) => {
-                            debug!(
-                                ?key,
-                                ?err,
-                                "FastSlowStore::flush_fast_to_slow_at_shutdown: slow.has \
-                                 failed; will attempt write anyway"
-                            );
-                        }
+                    // Change A filter: flush iff the resident is NOT-YET-DURABLE
+                    // (digest in the at-risk snapshot). An already-durable
+                    // resident — bg slow write completed (removed from
+                    // in_flight), durable mirror, or back-populated read — is
+                    // skipped WITHOUT a slow-tier probe. No `slow.has()`.
+                    let StoreKey::Digest(digest) = key.borrow() else {
+                        // Non-digest keys are never CAS blobs; skip.
+                        skipped_already.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
+                    if !at_risk.contains(&digest) {
+                        skipped_already.fetch_add(1, Ordering::Relaxed);
+                        return;
                     }
 
                     // Read the bytes from the fast tier. `get_part_unchunked`
@@ -2774,7 +2794,9 @@ impl FastSlowStore {
 
                     // Write to the slow tier. Per-entry errors are logged and
                     // counted; we do NOT propagate them (one failure must not
-                    // strand the other blobs).
+                    // strand the other blobs). A content-addressed re-write of
+                    // an already-durable digest is an idempotent no-op, so the
+                    // at-risk filter erring toward flush is always safe.
                     match self.slow_store.update_oneshot(key.borrow(), data).await {
                         Ok(()) => {
                             flushed.fetch_add(1, Ordering::Relaxed);
@@ -2797,13 +2819,9 @@ impl FastSlowStore {
         let flushed = flushed.into_inner();
         let skipped_already = skipped_already.into_inner();
         let errored = errored.into_inner();
-        let processed = processed.into_inner();
-        // Blobs never reached because the (finite) deadline elapsed mid-drain.
-        // Always 0 when `deadline` is `None`.
-        let deadline_exceeded = snapshot_count as u64 - processed;
 
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if errored > 0 || deadline_exceeded > 0 {
+        if errored > 0 {
             // Loud summary line that ops will grep for after a restart
             // when investigating "Lost inputs" / missing-CAS reports.
             warn!(
@@ -2811,10 +2829,9 @@ impl FastSlowStore {
                 flushed,
                 skipped_already,
                 errored,
-                deadline_exceeded,
                 elapsed_ms,
                 "FastSlowStore::flush_fast_to_slow_at_shutdown: COMPLETED WITH \
-                 UNFLUSHED OR FAILED BLOBS — these will be lost on exit"
+                 FAILED BLOBS — these will be lost on exit"
             );
         } else {
             info!(
@@ -2822,12 +2839,13 @@ impl FastSlowStore {
                 flushed,
                 skipped_already,
                 elapsed_ms,
-                "FastSlowStore::flush_fast_to_slow_at_shutdown: drained fast tier"
+                "FastSlowStore::flush_fast_to_slow_at_shutdown: drained at-risk subset"
             );
         }
-        // Unflushed = errored + deadline-exceeded. Skipped-already is NOT
-        // counted as unflushed because the slow tier already holds the blob.
-        usize::try_from(errored + deadline_exceeded).unwrap_or(usize::MAX)
+        // Unflushed = errored (a not-yet-durable blob the slow write failed
+        // for). Skipped-already (durable per in-memory state) is NOT counted
+        // as unflushed. With no deadline there is no deadline-exceeded class.
+        usize::try_from(errored).unwrap_or(usize::MAX)
     }
 
     pub const fn fast_store(&self) -> &Store {
@@ -5160,6 +5178,28 @@ impl StoreDriver for FastSlowStore {
             }
         }
         Ok(())
+    }
+
+    /// DURABLE-presence query (durability-ack v3 §3.0 keystone). Routes to
+    /// the SLOW tier's `has_with_results` ONLY — the durable medium
+    /// (FilesystemStore / RedisStore in production). This is the deliberate
+    /// inverse of [`Self::has_with_results`]: it does NOT consult the fast
+    /// tier, the `in_flight_slow_writes` map, the `chunked_in_flight_digests`
+    /// set, or the RAM-only `mirror_blobs` — none of which survive a process
+    /// restart. The worker API server gates `mark_stable` (→ BIS → worker
+    /// UNPIN) on this query so the unpin oath fires only once a durable
+    /// server copy exists.
+    ///
+    /// If the slow store is a NoopStore (the worker public-CAS variant,
+    /// `local_only_reads`), `has_with_results` on it returns all-`None` —
+    /// i.e. the worker has no durable tier, so `has_durably` correctly
+    /// reports absent for every key. No special-case needed.
+    async fn has_durably(
+        self: Pin<&Self>,
+        key: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.slow_store.has_with_results(key, results).await
     }
 
     async fn update(
@@ -7583,6 +7623,16 @@ impl StoreDriver for FastSlowStore {
     /// enum mechanism.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+
+    /// FastSlowStore IS the durability boundary (durability-ack v3 §3.0
+    /// keystone). `Leaf` makes the trait-default `has_durably` report
+    /// ABSENT; the `has_durably` override (in the StoreDriver impl above)
+    /// routes the durable-presence query to `slow_store.has_with_results`
+    /// ONLY — excluding the fast tier, the in-flight slow-write maps, and
+    /// the RAM-only mirror, which are NOT durable.
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 
     /// Push the given digests into the BIS feeder queue and wake the

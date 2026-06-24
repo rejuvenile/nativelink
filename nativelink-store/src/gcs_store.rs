@@ -29,7 +29,7 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
     StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use rand::Rng;
@@ -501,6 +501,9 @@ where
     /// FastSlowStore if any). (Task #157.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 
     /// GcsStore is remote-disk-backed: a sustained latency hiccup at the

@@ -64,7 +64,7 @@ use nativelink_util::health_utils::{
     HealthStatusIndicator, default_health_status_indicator,
 };
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store,
     StoreDriver, StoreKey, UploadSizeInfo,
 };
 use tonic::Request;
@@ -180,6 +180,9 @@ impl StoreDriver for OverdeliveringStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

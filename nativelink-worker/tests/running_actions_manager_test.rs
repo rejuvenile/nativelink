@@ -70,7 +70,7 @@ mod tests {
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
     use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
     use nativelink_util::store_trait::{
-        ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store,
+        ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store,
         StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
     };
     use nativelink_worker::local_worker::AcMirrorTarget;
@@ -6642,6 +6642,9 @@ exit 1
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Leaf
         }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Leaf
+        }
 
         fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
             false
@@ -7626,6 +7629,9 @@ exit 1
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Leaf
         }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Leaf
+        }
 
         fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
             false
@@ -8328,6 +8334,9 @@ exit 1
 
         fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
             MarkStableDelegation::Leaf
+        }
+        fn durable_delegation(&self) -> DurableDelegation<'_> {
+            DurableDelegation::Leaf
         }
 
         fn optimized_for(&self, optimization: StoreOptimizations) -> bool {

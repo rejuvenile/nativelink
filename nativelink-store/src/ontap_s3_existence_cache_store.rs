@@ -36,7 +36,7 @@ use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
@@ -556,6 +556,9 @@ where
     /// forced-delegation enum mechanism).
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner_store.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

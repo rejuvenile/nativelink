@@ -30,7 +30,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, UploadSizeInfo,
 };
 
@@ -164,6 +164,16 @@ impl StoreDriver for RefStore {
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
         self.get_store()?.has_with_results(keys, results).await
+    }
+
+    /// Resolve the ref target and forward the DURABLE-presence query
+    /// (durability-ack v3 §3.0). Mirrors `has_with_results`'s lazy resolve.
+    async fn has_durably(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.get_store()?.has_durably(keys, results).await
     }
 
     async fn update(
@@ -307,6 +317,16 @@ impl StoreDriver for RefStore {
     /// the trait default a no-op; the override owns dispatch. (Task #157.)
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+
+    /// Same `Leaf`-plus-explicit-override pattern: the `has_durably`
+    /// override (in the StoreDriver impl above) lazily resolves the ref
+    /// target via `get_store()` and forwards the durable-presence query, so
+    /// a RefStore-mediated chain (e.g. `Verify(Ref(cas_INNER))`) routes
+    /// durability correctly. `Leaf` makes the trait default report ABSENT;
+    /// the override owns dispatch. (durability-ack v3 §3.0.)
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 
     fn drain_stable_digests(&self) -> Vec<DigestInfo> {

@@ -58,7 +58,7 @@ use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, UploadSizeInfo,
 };
 use nativelink_util::task::JoinHandleDropGuard;
@@ -285,6 +285,9 @@ impl StoreDriver for AlwaysFailPeer {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
+    }
 }
 
 #[async_trait]
@@ -360,6 +363,9 @@ impl StoreDriver for DelayedSlowStore {
     }
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 
@@ -486,6 +492,9 @@ impl StoreDriver for GatedMirrorStore {
     }
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 

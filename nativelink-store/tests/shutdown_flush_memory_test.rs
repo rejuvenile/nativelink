@@ -69,7 +69,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, UploadSizeInfo,
 };
 
@@ -138,6 +138,9 @@ async fn shutdown_flushes_memory_only_blobs_to_slow_tier() -> Result<(), Error> 
         fast_store
             .update_oneshot(digest, Bytes::from(payload.clone()))
             .await?;
+        // durability-ack v3 Change A: register at-risk (not-yet-durable) so
+        // the not-yet-durable filter flushes it (models production state).
+        assert!(fast_slow.requeue_failed_push(digest));
         digests.push(digest);
         payloads.push(payload);
     }
@@ -153,7 +156,7 @@ async fn shutdown_flushes_memory_only_blobs_to_slow_tier() -> Result<(), Error> 
 
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(None),
+        fast_slow.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect(
@@ -271,12 +274,14 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
     upper_fast
         .update_oneshot(upper_digest, Bytes::from(upper_payload.clone()))
         .await?;
+    assert!(upper_fss.requeue_failed_push(upper_digest)); // v3 Change A: at-risk
 
     let lower_payload = vec![0xAAu8; 256];
     let lower_digest = unique_digest(1002, lower_payload.len() as u64);
     lower_fast
         .update_oneshot(lower_digest, Bytes::from(lower_payload.clone()))
         .await?;
+    assert!(lower_fss.requeue_failed_push(lower_digest)); // v3 Change A: at-risk
 
     // Sanity: the slow tiers really start empty for these digests.
     assert!(upper_slow.has(upper_digest).await?.is_none());
@@ -288,13 +293,13 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
     // walker.)
     let upper_remaining = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        upper_fss.flush_fast_to_slow_at_shutdown(None),
+        upper_fss.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect("DEADLOCK: upper-tier flush did not return");
     let lower_remaining = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        lower_fss.flush_fast_to_slow_at_shutdown(None),
+        lower_fss.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect("DEADLOCK: lower-tier flush did not return");
@@ -327,87 +332,11 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
     Ok(())
 }
 
-/// Test 3 (over-action / deadline-bound): when a FINITE deadline is supplied
-/// (`Some(_)`), flush MUST honor it and return promptly even when the slow
-/// tier is so slow that not all blobs can be drained in time. The contract is
-/// "best-effort within the deadline; report unflushed count + log; do NOT
-/// block shutdown longer than the deadline."
-///
-/// `None` would mean unbounded (the production #210 path — proven by the
-/// `..._unbounded_...` tests below). This test pins the OTHER half of the
-/// contract: callers that pass `Some(deadline)` (e.g. an operator-bounded
-/// future flush, or the existing deadline-bound test harness) still get a
-/// wall-clock cap.
-///
-/// We install a slow-tier probe that delays each `update_oneshot` by 200ms.
-/// With 300 blobs queued, a 200 ms deadline, and a bounded flush concurrency
-/// well under 300, the flush completes at most ~one concurrency-wave of writes
-/// before the deadline triggers. The flush must return within ~deadline +
-/// overhead and the unflushed count must be > 0 (NOT silently report 0).
-#[nativelink_test]
-async fn shutdown_flush_respects_deadline_when_slow_tier_is_slow() -> Result<(), Error> {
-    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let slow_call_count = Arc::new(AtomicUsize::new(0));
-    let probe_arc: Arc<dyn StoreDriver> = Arc::new(SlowSlowProbe {
-        inner: inner.clone(),
-        per_update_delay: Duration::from_millis(200),
-        update_count: slow_call_count.clone(),
-    });
-    let slow_probe = Store::new(probe_arc);
-    let (fast_slow, fast_store) = build_fast_slow_with_slow_probe(slow_probe.clone());
-
-    // N must exceed the flush concurrency by enough that a single
-    // concurrency-wave (which fits in one 200 ms delay window) cannot drain
-    // all blobs before the deadline fires; otherwise `unflushed > 0` would be
-    // concurrency-sensitive. 300 ≫ any reasonable bounded concurrency.
-    const N: usize = 300;
-    for i in 0..N {
-        let payload = vec![(i & 0xFF) as u8; 64];
-        let digest = unique_digest(2000 + i as u64, payload.len() as u64);
-        fast_store
-            .update_oneshot(digest, Bytes::from(payload))
-            .await?;
-    }
-
-    let deadline = Duration::from_millis(200);
-    let started = std::time::Instant::now();
-    let unflushed = tokio::time::timeout(
-        NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(Some(deadline)),
-    )
-    .await
-    .expect(
-        "DEADLOCK DETECTED: flush_fast_to_slow_at_shutdown did not return \
-         within the outer 5s timeout despite a 200 ms per-store deadline. \
-         #210 over-action: flush MUST cap wall-clock at the supplied deadline; \
-         a wedge here means the deadline guard is missing.",
-    );
-    let elapsed = started.elapsed();
-
-    // Deadline guard: the flush must return within a reasonable buffer of
-    // the supplied deadline. Allow generous slack (2s) so CI variance does
-    // not flake — the bug we're guarding against is "blocks forever," not
-    // "took 250ms instead of 200ms."
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "#210 over-action: flush_fast_to_slow_at_shutdown took {elapsed:?} \
-         despite a {deadline:?} deadline; the deadline cap is not enforced",
-    );
-
-    // The slow-tier probe should NOT have completed all N writes — that
-    // would either mean the flush ignored the deadline (bad) or that the
-    // delays did not fire. Asserting `unflushed > 0` AND that the slow
-    // tier did NOT receive all N updates pins down the deadline-cap
-    // contract.
-    let completed = slow_call_count.load(Ordering::SeqCst);
-    assert!(
-        unflushed > 0,
-        "#210 over-action: with a 200 ms deadline and {N} × 200 ms slow \
-         probe, flush should have left blobs unflushed; got 0 (probe \
-         completed {completed} updates) — deadline likely ignored",
-    );
-    Ok(())
-}
+// Test 3 (deadline-bound over-action) REMOVED by durability-ack v3 Change A:
+// the `deadline: Option<Duration>` parameter is gone (R2 — flush is
+// unconditionally unbounded). The 'drain to completion despite a slow tier'
+// half of the contract is now covered by
+// `shutdown_flush_unbounded_drains_despite_slow_tier` (test 7).
 
 /// Test 6 (#210 UNBOUNDED — the production cure): with NO deadline (`None`),
 /// the flush MUST drain EVERY MemoryStore-only blob to the slow tier and
@@ -440,17 +369,20 @@ async fn shutdown_flush_unbounded_drains_all_blobs() -> Result<(), Error> {
         fast_store
             .update_oneshot(digest, Bytes::from(payload.clone()))
             .await?;
+        // durability-ack v3 Change A: register at-risk (not-yet-durable) so
+        // the not-yet-durable filter flushes it (models production state).
+        assert!(fast_slow.requeue_failed_push(digest));
         digests.push(digest);
         payloads.push(payload);
     }
 
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(None),
+        fast_slow.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect(
-        "DEADLOCK DETECTED: unbounded flush_fast_to_slow_at_shutdown(None) did \
+        "DEADLOCK DETECTED: unbounded flush_fast_to_slow_at_shutdown() did \
          not return within 5s for 250 trivial blobs; a correct unbounded drain \
          of a handful of in-memory blobs finishes in milliseconds.",
     );
@@ -510,12 +442,15 @@ async fn shutdown_flush_unbounded_drains_despite_slow_tier() -> Result<(), Error
         fast_store
             .update_oneshot(digest, Bytes::from(payload))
             .await?;
+        // durability-ack v3 Change A: register at-risk (not-yet-durable) so
+        // the not-yet-durable filter flushes it (models production state).
+        assert!(fast_slow.requeue_failed_push(digest));
         digests.push(digest);
     }
 
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(None),
+        fast_slow.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect(
@@ -632,6 +567,9 @@ impl StoreDriver for SlowSlowProbe {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
+    }
 }
 
 /// Test 4 (over-action / per-entry tolerance): one failing slow-tier write
@@ -659,13 +597,16 @@ async fn shutdown_flush_continues_past_per_entry_errors() -> Result<(), Error> {
         fast_store
             .update_oneshot(digest, Bytes::from(payload.clone()))
             .await?;
+        // durability-ack v3 Change A: register at-risk (not-yet-durable) so
+        // the not-yet-durable filter flushes it (models production state).
+        assert!(fast_slow.requeue_failed_push(digest));
         digests.push(digest);
         payloads.push(payload);
     }
 
     let _ = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(None),
+        fast_slow.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect(
@@ -780,6 +721,9 @@ impl StoreDriver for EveryOtherFailsProbe {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
+    }
 }
 
 /// Test 5 (skip already-present): if the slow tier ALREADY has a blob with
@@ -812,7 +756,7 @@ async fn shutdown_flush_skips_blobs_already_in_slow_tier() -> Result<(), Error> 
 
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(None),
+        fast_slow.flush_fast_to_slow_at_shutdown(),
     )
     .await
     .expect("DEADLOCK: flush did not return");
@@ -905,6 +849,9 @@ impl StoreDriver for NoUpdateExpectedProbe {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 
@@ -1023,6 +970,7 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
     upper_fast
         .update_oneshot(digest, Bytes::from(payload.clone()))
         .await?;
+    assert!(upper_fss.requeue_failed_push(digest)); // v3 Change A: at-risk
 
     // Sanity: slow tier starts empty for this digest.
     assert!(upper_slow.has(digest).await?.is_none());

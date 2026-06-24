@@ -351,6 +351,61 @@ pub enum MarkStableDelegation<'a> {
     Passthrough(&'a (dyn StoreDriver + 'static)),
 }
 
+/// Delegation strategy for [`StoreDriver::has_durably`] — the DURABLE-tier
+/// presence query (durability-ack v3 §3.0 keystone).
+///
+/// `has_durably` answers "does the server hold this digest DURABLY?" — i.e.
+/// on a medium that survives a process restart — as opposed to
+/// [`StoreDriver::has_with_results`], which on a [`FastSlowStore`] is
+/// satisfied by the volatile fast tier, the in-flight slow-write maps, and
+/// the RAM-only mirror. The worker API server gates `mark_stable` (→ BIS
+/// broadcast → worker UNPIN) on `has_durably`: the unpin oath may fire only
+/// once a durable server copy exists, never on RAM-only presence.
+///
+/// **No default body on [`StoreDriver::durable_delegation`]** — every store
+/// MUST declare its arm explicitly (the §6.8 seam guarantee). A new wrapper
+/// that omits the arm is a COMPILE ERROR. There is deliberately NO
+/// `has_with_results`-collapsing default: the [`Self::Leaf`] arm reports
+/// ABSENT (not "ask the non-durable path"), so a store that forgets to route
+/// durability under-reports (strictly-safer: BIS fires LATER, never earlier)
+/// rather than manufacturing a false-durable that would tell a worker to
+/// drop the only durable copy of a mirror blob.
+///
+/// **Custom-routing wrappers** that cannot express durability as a simple
+/// `Inner`/`Many` fan-out (`SizePartitioningStore` routes per-digest by
+/// size; `FastSlowStore` IS the durability boundary, routing to its slow
+/// tier) declare [`Self::Leaf`] AND override [`StoreDriver::has_durably`]
+/// manually — the same pattern those stores use for `mark_stable`.
+pub enum DurableDelegation<'a> {
+    /// Leaf store — `has_durably` reports ABSENT for every digest (the
+    /// default body fills no slots). Used by non-durable leaves (Memory,
+    /// Noop) and by stores that are NOT the durability authority in the CAS
+    /// chain. Stores that ARE the durability boundary ([`FastSlowStore`])
+    /// declare `Leaf` here AND override `has_durably` to route to their
+    /// durable tier. Per-digest-routing wrappers (`SizePartitioning`)
+    /// likewise declare `Leaf` and override.
+    ///
+    /// Reporting absent (rather than collapsing to `has_with_results`) is
+    /// the strictly-safer default: a missed durability route delays an
+    /// unpin, never loses data.
+    Leaf,
+    /// Single-inner wrapper — forwards the query to one inner store's
+    /// `has_durably`. Used by Verify, ExistenceCache (which must NOT serve
+    /// a durable query from its non-durable existence cache), WorkerProxy
+    /// (which must NOT consult the locality short-circuit — a locality hit
+    /// is another worker's RAM, never durable), Compression, etc.
+    Inner(&'a (dyn StoreDriver + 'static)),
+    /// Multi-inner wrapper — fans the query to every inner store's
+    /// `has_durably` and OR-merges per digest (durable in ANY inner ⇒
+    /// durable). Suitable only when every inner participates symmetrically
+    /// as a durable tier. Per-digest-routing wrappers declare `Leaf` and
+    /// override.
+    Many(DelegationChildren<'a>),
+    /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
+    /// intent for resolved-by-name wrappers (e.g. `RefStore`).
+    Passthrough(&'a (dyn StoreDriver + 'static)),
+}
+
 /// Optimizations that stores may want to expose to the callers.
 /// This is useful for specific cases when the store can optimize the processing
 /// of the data being processed.
@@ -805,6 +860,22 @@ pub trait StoreLike: Send + Sync + Sized + Unpin + 'static {
             .has_with_results(digests, results)
     }
 
+    /// DURABLE-tier presence query (durability-ack v3 §3.0 keystone). Like
+    /// [`Self::has_with_results`] but reports `Some(size)` only for digests
+    /// the store holds DURABLY (survives a process restart). See
+    /// [`StoreDriver::has_durably`] for the routing/seam semantics.
+    #[inline]
+    fn has_durably<'a>(
+        &'a self,
+        digests: &'a [StoreKey<'a>],
+        results: &'a mut [Option<u64>],
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        if digests.is_empty() {
+            return future::ready(Ok(())).boxed();
+        }
+        self.as_store_driver_pin().has_durably(digests, results)
+    }
+
     /// List all the keys in the store that are within the given range.
     /// `handler` is called for each key in the range. If `handler` returns
     /// false, the listing is stopped.
@@ -997,6 +1068,62 @@ pub trait StoreDriver:
         digests: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error>;
+
+    /// DURABLE-tier presence query (durability-ack v3 §3.0 keystone).
+    /// Fills `results[i] = Some(size)` iff digest `i` is held DURABLY —
+    /// i.e. on a medium that survives a process restart. Same shape as
+    /// [`Self::has_with_results`], but the [`FastSlowStore`] arm routes to
+    /// its SLOW tier ONLY (excluding the fast tier, the in-flight slow-write
+    /// maps, the RAM-only mirror, AND — for [`WorkerProxyStore`] — the
+    /// locality short-circuit, since a locality hit is another worker's RAM,
+    /// never durable).
+    ///
+    /// The worker API server gates `mark_stable` (→ BIS broadcast → worker
+    /// UNPIN) on this query: the unpin oath may fire only once the server
+    /// holds a durable copy, never on RAM-only presence.
+    ///
+    /// **The default body dispatches via [`Self::durable_delegation`]** and
+    /// is deliberately NOT a `has_with_results`-collapse: the
+    /// [`DurableDelegation::Leaf`] arm leaves every slot untouched (reports
+    /// ABSENT), so a store that forgets durability routing under-reports
+    /// (strictly-safer) rather than manufacturing a false-durable.
+    /// Custom-routing stores ([`FastSlowStore`], `SizePartitioningStore`)
+    /// declare `Leaf` and override this method.
+    async fn has_durably(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        match self.durable_delegation() {
+            DurableDelegation::Leaf => {
+                // Non-durable leaves and chain wrappers that are not the
+                // durability authority report ABSENT (leave slots
+                // untouched). Producer leaves (FastSlowStore) and
+                // per-digest routers (SizePartitioning) override this.
+                Ok(())
+            }
+            DurableDelegation::Inner(s) | DurableDelegation::Passthrough(s) => {
+                Pin::new(s).has_durably(digests, results).await
+            }
+            DurableDelegation::Many(children) => {
+                // OR-merge: durable in ANY inner ⇒ durable. Query each
+                // child into a scratch buffer and fold in `Some` results.
+                let mut scratch = vec![None; digests.len()];
+                for child in children {
+                    for slot in &mut scratch {
+                        *slot = None;
+                    }
+                    Pin::new(child).has_durably(digests, &mut scratch).await?;
+                    for (out, found) in results.iter_mut().zip(scratch.iter()) {
+                        if out.is_none() {
+                            *out = *found;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 
     /// See: [`StoreLike::list`] for details.
     async fn list(
@@ -1386,6 +1513,15 @@ pub trait StoreDriver:
     /// `.claude/reviews/a1-mark-stable/red-team.md` finding 3 and task
     /// #157). See [`MarkStableDelegation`] for variants and rationale.
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_>;
+
+    /// Declare how this store routes [`Self::has_durably`] — the
+    /// DURABLE-tier presence query (durability-ack v3 §3.0 keystone).
+    ///
+    /// **No default body** — every store MUST implement this so the author
+    /// is forced at compile time to think about durable-presence routing.
+    /// See [`DurableDelegation`] for variants and the strictly-safer
+    /// (report-absent, never collapse-to-`has_with_results`) rationale.
+    fn durable_delegation(&self) -> DurableDelegation<'_>;
 
     /// Drain digests that have completed their write to stable storage
     /// (e.g., FilesystemStore in a FastSlowStore).

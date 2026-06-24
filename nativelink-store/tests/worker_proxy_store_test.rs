@@ -34,7 +34,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation, REDIRECT_PREFIX,
+    IS_WORKER_REQUEST, ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, REDIRECT_PREFIX,
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
     UploadSizeInfo,
 };
@@ -737,6 +737,9 @@ impl StoreDriver for PartialFailStore {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
+    }
 }
 
 // -------------------------------------------------------------------
@@ -1004,6 +1007,9 @@ impl StoreDriver for StructuredFailStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 
@@ -1521,6 +1527,9 @@ impl StoreDriver for EmptyEofStore {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
+    }
 }
 
 // ===================================================================
@@ -1620,6 +1629,9 @@ impl StoreDriver for PartialWriteThenErrorStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 
@@ -2032,6 +2044,9 @@ impl StoreDriver for DelayedPeerStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 
@@ -2562,6 +2577,9 @@ impl StoreDriver for RecordingInnerStore {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
+    }
 }
 
 /// Test 3: a tee failure (e.g. inner.update() returns Err) must NOT
@@ -2918,6 +2936,9 @@ impl StoreDriver for FailingUpdateStore {
 
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
+    }
+    fn durable_delegation(&self) -> DurableDelegation<'_> {
+        DurableDelegation::Leaf
     }
 }
 
