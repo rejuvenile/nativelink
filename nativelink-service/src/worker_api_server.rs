@@ -44,7 +44,9 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
 use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
-use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
+use nativelink_util::blob_locality_map::{
+    PersistedEndpoint, PersistedLocalityMap, ReloadedLocalitySummary, SharedBlobLocalityMap,
+};
 use nativelink_util::common::DigestInfo;
 use nativelink_scheduler::worker::Worker;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
@@ -1079,6 +1081,77 @@ impl WorkerApiServer {
             metrics: self.metrics.clone(),
         })
     }
+
+    /// (#58 directive-3: server durability bundle — persist the locality map)
+    ///
+    /// Snapshot the live blob-locality map JOINED with `endpoint_state` (which
+    /// carries the per-endpoint `boot_epoch`) into the on-disk
+    /// [`PersistedLocalityMap`] shape, then write it atomically to `path`.
+    ///
+    /// Runs at graceful SIGTERM **Phase 3.5 — AFTER directive-2's worker-pull,
+    /// BEFORE worker eviction**. Eviction's `remove_endpoint` wipes the map, so
+    /// the persist MUST precede it (the same crux directive-2's pull has).
+    ///
+    /// NO fsync (HARD CONSTRAINT): the write is `tokio::fs::write`(tmp) +
+    /// `tokio::fs::rename` — an atomic torn-write-avoidance primitive, NOT a
+    /// durability primitive. Durability is best-effort (ZFS txg-commit + worker
+    /// re-announce on the rebuild path); a SIGKILL skips this entirely and the
+    /// map rebuilds from worker full-snapshot `BlobsAvailable`. The bincode
+    /// encode runs in `spawn_blocking` so a multi-hundred-MB serialize never
+    /// blocks a tokio worker.
+    ///
+    /// Returns the number of (endpoint, digest) pairs persisted (for logging).
+    /// Fails-soft: a serialize / write error is returned as `Err` so the SIGTERM
+    /// handler can log it and proceed to eviction (never blocks exit). Delegates
+    /// to [`LocalityPersister`] (the handle the bin uses post-`into_service`);
+    /// this method exists so tests + the in-server path share one code path.
+    pub async fn persist_locality_to_disk(&self, path: &std::path::Path) -> Result<usize, Error> {
+        let Some(persister) = self.locality_persister() else {
+            info!("locality persist: no locality_map configured — nothing to persist");
+            return Ok(0);
+        };
+        persister.persist_to_disk(path).await
+    }
+
+    /// (#58 directive-3) Reload the persisted locality map from `path` and prime
+    /// BOTH `locality_map` AND `endpoint_state`. Delegates to
+    /// [`LocalityPersister::reload_from_disk`] — see its docs for the
+    /// priming-trap guard (design §4.5) and the fail-open guarantee.
+    pub async fn reload_locality_from_disk(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<ReloadedLocalitySummary, Error> {
+        let Some(persister) = self.locality_persister() else {
+            info!("locality reload: no locality_map configured — nothing to reload");
+            return Ok(ReloadedLocalitySummary::empty());
+        };
+        persister.reload_from_disk(path).await
+    }
+
+    /// (#58 directive-3) Never-reconnect TTL sweep (design §4.4). Delegates to
+    /// [`LocalityPersister::sweep_unconfirmed`].
+    pub fn sweep_unconfirmed_reloaded_locality(&self, grace: Duration) -> usize {
+        let Some(persister) = self.locality_persister() else {
+            return 0;
+        };
+        persister.sweep_unconfirmed(grace)
+    }
+
+    /// (#58 directive-3) Build the standalone [`LocalityPersister`] handle the
+    /// SIGTERM closure + startup reload drive, extracted BEFORE the
+    /// `WorkerApiServer` is consumed by `into_service` (the same pattern as
+    /// [`WorkerApiServer::shutdown_puller`]). Holds cheap clones of the
+    /// `locality_map` + `endpoint_state` (both process-wide singletons) so the
+    /// handle observes the SAME live state the server does. Returns `None` when
+    /// there is no `locality_map` (standalone / test runs).
+    #[must_use]
+    pub fn locality_persister(&self) -> Option<LocalityPersister> {
+        let locality_map = self.locality_map.clone()?;
+        Some(LocalityPersister {
+            locality_map,
+            endpoint_state: self.endpoint_state.clone(),
+        })
+    }
 }
 
 /// (#58 directive-2: server durability bundle — shutdown WORKER-PULL phase)
@@ -1428,6 +1501,276 @@ pub struct ShutdownPullSummary {
     pub at_risk_skipped: usize,
     /// Wall-clock duration of the pull, milliseconds.
     pub elapsed_ms: u64,
+}
+
+/// (#58 directive-3) Synthetic `owner_worker_id` stamped on every endpoint
+/// primed into `endpoint_state` at reload, BEFORE any worker reconnects. A real
+/// connect overwrites it with a live `WorkerId` (`inner_connect_worker`
+/// `state.insert`), so an endpoint still carrying this sentinel after the grace
+/// window is one whose worker never reconnected — the never-reconnect TTL sweep
+/// (`LocalityPersister::sweep_unconfirmed`) drops exactly those.
+const RELOADED_UNCONFIRMED_OWNER: &str = "__reloaded_unconfirmed__";
+
+/// (#58 directive-3) Default never-reconnect grace TTL (design §4.4). A
+/// reloaded endpoint whose worker has not reconnected within this window after
+/// boot is swept (its persisted entries dropped). 600 s is generous for normal
+/// worker reconnect (seconds-to-low-minutes) yet bounds how long a
+/// decommissioned/renamed worker's stale entries haunt the map. The bin passes
+/// this; tests pass `Duration::ZERO` to force every still-unconfirmed entry past
+/// grace.
+pub const LOCALITY_PERSIST_RECONNECT_GRACE_SECS: u64 = 600;
+
+/// (#58 directive-3 — server durability bundle: persist the locality map)
+///
+/// Standalone handle that drives the shutdown locality-map PERSIST and the
+/// startup RELOAD + reconciliation priming. Built via
+/// [`WorkerApiServer::locality_persister`] BEFORE the server is moved into its
+/// tonic service (the same extraction pattern as [`ShutdownPuller`]); held by
+/// the SIGTERM closure (persist) and the startup reload task (reload) in
+/// `nativelink.rs`, and exercised by the integration tests via the
+/// `WorkerApiServer::{persist,reload,sweep}_*` delegators.
+///
+/// Holds cheap clones of the two shared handles the persist/reload read+mutate:
+/// `locality_map` (the digest→endpoint index) and `endpoint_state` (the
+/// endpoint→boot_epoch map the #141 wipe reconciles against). Both are
+/// process-wide singletons, so the handle observes the SAME live state the
+/// server does.
+///
+/// NO fsync (HARD CONSTRAINT): the persist writes a tmp file then atomically
+/// `tokio::fs::rename`s it — a torn-write-avoidance primitive, NOT a durability
+/// primitive. Durability is best-effort (ZFS txg-commit + worker re-announce);
+/// a SIGKILL skips the persist and the map rebuilds from worker full-snapshot
+/// `BlobsAvailable` (slower but lossless — the map is an INDEX, not a durable
+/// copy of any blob).
+#[derive(Clone)]
+pub struct LocalityPersister {
+    locality_map: SharedBlobLocalityMap,
+    endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+}
+
+impl LocalityPersister {
+    /// Snapshot the live locality map JOINED with `endpoint_state` (for the
+    /// per-endpoint `boot_epoch`) and write it atomically to `path`.
+    ///
+    /// Runs at graceful SIGTERM Phase 3.5 — AFTER directive-2's worker-pull,
+    /// BEFORE worker eviction (eviction's `remove_endpoint` wipes the map, so
+    /// the persist MUST precede it). Returns the number of (endpoint, digest)
+    /// pairs persisted (for logging). The bincode encode runs in
+    /// `spawn_blocking` so a multi-hundred-MB serialize never blocks a tokio
+    /// worker; the file write/rename use `tokio::fs` (async). NO sync primitive.
+    pub async fn persist_to_disk(&self, path: &std::path::Path) -> Result<usize, Error> {
+        // Snapshot BOTH maps under their locks into owned data, then DROP the
+        // locks before the (potentially large) encode + the .await write —
+        // never hold a lock across .await.
+        // CAPPED AT digest_count(): one owned Vec, ~40 B/(endpoint,digest) pair
+        // (string-encoded DigestInfo on disk), dropped after the write. NOT a
+        // network path — shutdown-local. Blob BYTES are never collected; only
+        // the (digest hash + size) index.
+        let endpoint_digests = self.locality_map.read().snapshot_endpoint_blobs();
+        let entries: Vec<PersistedEndpoint> = {
+            let state = self.endpoint_state.lock();
+            endpoint_digests
+                .into_iter()
+                .map(|(endpoint, digests)| {
+                    // The boot_epoch JOIN: an endpoint present in the locality
+                    // map but absent from endpoint_state (no live connection at
+                    // snapshot time) persists with boot_epoch 0 — the #141 wipe
+                    // treats a 0 epoch as "cannot distinguish", so it is wiped on
+                    // the worker's next connect (conservative; never leaks).
+                    let boot_epoch = state
+                        .get(endpoint.as_ref())
+                        .map_or(0, |s| s.boot_epoch);
+                    PersistedEndpoint {
+                        cas_endpoint: endpoint.as_ref().to_string(),
+                        boot_epoch,
+                        digests,
+                    }
+                })
+                .collect()
+        };
+
+        let pair_count: usize = entries.iter().map(|e| e.digests.len()).sum();
+        let persisted_at_unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let persisted = PersistedLocalityMap::new(persisted_at_unix_s, entries);
+
+        // Encode off the tokio worker (CPU-bound on a multi-hundred-MB struct).
+        let bytes = tokio::task::spawn_blocking(move || persisted.serialize_to_bytes())
+            .await
+            .err_tip(|| "locality persist: serialize task panicked")??;
+
+        // Atomic rename: write tmp, then rename over the canonical path. NO
+        // fsync — ZFS txg-commit + best-effort recovery is the durability model.
+        let tmp_path = path.with_extension(format!("bin.tmp-{}", std::process::id()));
+        tokio::fs::write(&tmp_path, &bytes)
+            .await
+            .err_tip(|| format!("locality persist: write tmp {}", tmp_path.display()))?;
+        tokio::fs::rename(&tmp_path, path)
+            .await
+            .err_tip(|| format!("locality persist: rename {} -> {}", tmp_path.display(), path.display()))?;
+        info!(
+            endpoints = self.endpoint_state.lock().len(),
+            pairs = pair_count,
+            bytes = bytes.len(),
+            path = %path.display(),
+            "locality persist: wrote map (atomic rename, no fsync)"
+        );
+        Ok(pair_count)
+    }
+
+    /// Reload the persisted map from `path` and prime BOTH `locality_map` AND
+    /// `endpoint_state` (with the persisted `boot_epoch` + a sentinel owner).
+    ///
+    /// THE PRIMING TRAP (design §4.5, the single biggest risk): priming ONLY
+    /// `locality_map` and not `endpoint_state` makes `prev == None` on a
+    /// rebooted worker's reconnect, so the #141 wipe's `needs_wipe` is false and
+    /// the stale persisted entries LEAK. Priming `endpoint_state[endpoint] = {
+    /// boot_epoch: B, owner: sentinel }` makes `prev == Some(B)`, so a different
+    /// boot_epoch on reconnect fires the EXISTING wipe and a matching one keeps
+    /// the entries until the first full snapshot. The reconciliation IS the #141
+    /// logic — this priming is the only new code that makes it fire.
+    ///
+    /// FAIL-OPEN (design §3.3): a missing / corrupt / version-mismatched file
+    /// returns `Ok(empty)` (NOT `Err`) so a reload failure degrades to
+    /// worker-re-announce and NEVER wedges startup. Only an unexpected read I/O
+    /// error other than NotFound is surfaced — and even then the caller in the
+    /// bin maps it to fail-open + flips the readiness gate.
+    pub async fn reload_from_disk(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<ReloadedLocalitySummary, Error> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(
+                    path = %path.display(),
+                    "locality reload: no persist file (fresh boot / SIGKILL last \
+                     run) — starting with an empty map, will rebuild from worker \
+                     re-announce"
+                );
+                return Ok(ReloadedLocalitySummary::empty());
+            }
+            Err(e) => {
+                // Any other read error fails OPEN: log + empty, never wedge.
+                error!(
+                    path = %path.display(),
+                    err = %e,
+                    "locality reload: read error — failing OPEN with an empty map"
+                );
+                return Ok(ReloadedLocalitySummary::empty());
+            }
+        };
+
+        // Decode off the tokio worker (CPU-bound on a large file).
+        let decoded = tokio::task::spawn_blocking(move || {
+            PersistedLocalityMap::deserialize_from_bytes(&bytes)
+        })
+        .await
+        .err_tip(|| "locality reload: decode task panicked")?;
+        let persisted = match decoded {
+            Ok(p) => p,
+            Err(e) => {
+                // Corrupt / wrong-magic / version-mismatch fails OPEN.
+                warn!(
+                    path = %path.display(),
+                    err = %e,
+                    "locality reload: corrupt/foreign persist file — failing OPEN \
+                     with an empty map"
+                );
+                return Ok(ReloadedLocalitySummary::empty());
+            }
+        };
+
+        let persisted_at_unix_s = persisted.persisted_at_unix_s;
+        let mut digests_loaded = 0usize;
+        let mut endpoints_loaded = 0usize;
+        // Prime BOTH maps. Take the endpoint_state lock for the whole reload so a
+        // concurrently-connecting worker either sees the fully-primed prev or no
+        // prev — never a half-primed state. (Workers cannot connect before the
+        // worker-API listener accepts, but the reload runs concurrently with
+        // listener bind, so this is defensive.) Lock-order rule: endpoint_state
+        // is taken first and never co-held with flap_history — satisfied (we
+        // never touch flap_history here).
+        {
+            let mut state = self.endpoint_state.lock();
+            let mut locality = self.locality_map.write();
+            for entry in persisted.entries {
+                if entry.digests.is_empty() {
+                    continue;
+                }
+                locality.register_blobs(&entry.cas_endpoint, &entry.digests);
+                digests_loaded += entry.digests.len();
+                endpoints_loaded += 1;
+                // THE PRIMING (trap guard): record the persisted boot_epoch +
+                // the sentinel owner so the #141 connect-path wipe reconciles
+                // this endpoint on reconnect.
+                state.insert(
+                    entry.cas_endpoint,
+                    EndpointState {
+                        boot_epoch: entry.boot_epoch,
+                        owner_worker_id: WorkerId(RELOADED_UNCONFIRMED_OWNER.to_string()),
+                    },
+                );
+            }
+        }
+        info!(
+            endpoints = endpoints_loaded,
+            digests = digests_loaded,
+            persisted_at_unix_s,
+            path = %path.display(),
+            "locality reload: primed locality_map + endpoint_state from persist \
+             file (boot_epoch reconciliation armed)"
+        );
+        Ok(ReloadedLocalitySummary {
+            endpoints_loaded,
+            digests_loaded,
+            persisted_at_unix_s,
+        })
+    }
+
+    /// Never-reconnect TTL sweep (design §4.4). Drops the reloaded entries for
+    /// every endpoint that STILL carries the reload sentinel owner (its worker
+    /// never reconnected) AND is past `grace`. A reconnected worker's sentinel
+    /// was overwritten by a real `WorkerId` at connect, so it is NOT swept.
+    /// Returns the number of endpoints swept.
+    ///
+    /// Lock-order: takes `endpoint_state` first, then `locality_map.write()` for
+    /// the `remove_endpoint` — the SAME order the #141 wipe uses
+    /// (`inner_connect_worker`), so the sweep cannot race a concurrent reconnect
+    /// into a half-applied state. Never touches `flap_history`.
+    ///
+    /// `grace` is interpreted as "sweep an endpoint whose worker has not
+    /// reconnected"; the time check is implicit in the sentinel (a reconnect
+    /// always clears it), so any endpoint still carrying the sentinel when the
+    /// one-shot sweep fires at `grace` after boot is by definition past grace.
+    #[must_use]
+    pub fn sweep_unconfirmed(&self, grace: Duration) -> usize {
+        // `grace` is logged for operator visibility; the sentinel is the
+        // authoritative "never reconnected" signal (a reconnect overwrites it).
+        let _ = grace;
+        let mut state = self.endpoint_state.lock();
+        let stale: Vec<String> = state
+            .iter()
+            .filter(|(_, s)| s.owner_worker_id.0 == RELOADED_UNCONFIRMED_OWNER)
+            .map(|(endpoint, _)| endpoint.clone())
+            .collect();
+        if stale.is_empty() {
+            return 0;
+        }
+        let mut locality = self.locality_map.write();
+        for endpoint in &stale {
+            locality.remove_endpoint(endpoint);
+            state.remove(endpoint);
+        }
+        drop(locality);
+        drop(state);
+        info!(
+            swept = stale.len(),
+            "locality reload: swept never-reconnected reloaded endpoints past grace"
+        );
+        stale.len()
+    }
 }
 
 struct WorkerConnection {

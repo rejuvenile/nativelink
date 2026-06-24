@@ -17,9 +17,12 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::DigestInfo;
+use nativelink_error::{Error, make_input_err};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tracing::info;
+
+use crate::common::DigestInfo;
 
 // DEBUG INSTRUMENTATION (remove after wedge root cause confirmed):
 // Targets the cover.o wedge digest to expose every locality_map mutation
@@ -365,6 +368,178 @@ impl BlobLocalityMap {
     /// Caller must hold the read lock.
     pub fn blobs_map(&self) -> &DigestMap<EndpointList> {
         &self.blobs
+    }
+
+    /// (#58 directive-3) Snapshot the `endpoint → digests` reverse index into an
+    /// owned `Vec`, for the shutdown locality-map persist. Cloning under the
+    /// caller's read lock (the `WorkerApiServer` takes `locality_map.read()`)
+    /// into owned data lets the caller drop the lock before the (potentially
+    /// large) bincode encode runs in `spawn_blocking` — never holding the lock
+    /// across `.await`.
+    ///
+    /// CAPPED AT digest_count(): one owned `Vec<(Arc<str>, Vec<DigestInfo>)>`,
+    /// ~40 B/(endpoint,digest) pair, dropped after the encode. NOT a network
+    /// path — this is a shutdown-local snapshot. Blob BYTES are never collected;
+    /// only the (digest hash + size) index.
+    #[must_use]
+    pub fn snapshot_endpoint_blobs(&self) -> Vec<(Arc<str>, Vec<DigestInfo>)> {
+        self.endpoint_blobs
+            .iter()
+            .map(|(endpoint, digests)| (endpoint.clone(), digests.iter().copied().collect()))
+            .collect()
+    }
+}
+
+/// (#58 directive-3) Magic header for the persisted locality-map file
+/// (`"NLLM"`). Validated on reload so a foreign / truncated file is rejected
+/// (fail-open: the reload then starts with an empty map, never crashes).
+const PERSIST_MAGIC: u32 = 0x4E4C_4C4D;
+
+/// (#58 directive-3) Persist format version. Bump on any incompatible schema
+/// change; a version mismatch on reload is rejected (fail-open → empty map).
+const PERSIST_VERSION: u16 = 1;
+
+/// (#58 directive-3) One persisted endpoint: a stable `(cas_endpoint,
+/// boot_epoch)` identity plus the digests it held at graceful shutdown. The
+/// `boot_epoch` is the #141 reconciliation discriminator — on reload it primes
+/// `endpoint_state` so a rebooted worker (different boot_epoch) has its stale
+/// entries wiped by the EXISTING connect-path wipe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedEndpoint {
+    /// The worker's CAS endpoint string — the exact key the locality map is
+    /// keyed on; stable across IP changes (it is a hostname).
+    pub cas_endpoint: String,
+    /// The `boot_epoch_id` observed for this endpoint at persist time.
+    pub boot_epoch: u64,
+    /// The digests this endpoint held at graceful shutdown.
+    pub digests: Vec<DigestInfo>,
+}
+
+/// (#58 directive-3) Raw 6-byte file frame: `PERSIST_MAGIC` (u32 LE) +
+/// `PERSIST_VERSION` (u16 LE). Written ahead of the bincode payload and
+/// validated from the raw leading bytes BEFORE any bincode decode runs, so a
+/// foreign / truncated / corrupt file is rejected up front rather than letting
+/// bincode interpret a stray length prefix and attempt a giant allocation. The
+/// payload (`persisted_at_unix_s` + `entries`) is bincode-encoded after this
+/// frame.
+const PERSIST_HEADER_LEN: usize = 6;
+
+/// (#58 directive-3) On-disk shape of the persisted blob-locality map. Written
+/// at graceful shutdown (Phase 3.5) and reloaded at startup behind the Bazel
+/// readiness gate. The on-disk layout is a raw 6-byte magic+version frame
+/// (validated FIRST, before any decode) followed by a bincode-encoded payload
+/// (`persisted_at_unix_s` + `entries`). The magic/version are NOT bincode
+/// fields — they are a manual frame so a corrupt header is rejected before
+/// bincode reads any embedded length prefix.
+///
+/// Best-effort: persisted on graceful SIGTERM only. A SIGKILL skips the persist;
+/// the map then rebuilds from worker full-snapshot `BlobsAvailable` on reconnect
+/// (slower but lossless — the map is an INDEX, not a durable copy of any blob).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedLocalityMap {
+    /// Unix seconds at persist time. Drives the never-reconnect grace TTL: a
+    /// reloaded endpoint that never reconnects is swept `grace_secs` after this.
+    pub persisted_at_unix_s: u64,
+    /// One entry per endpoint.
+    pub entries: Vec<PersistedEndpoint>,
+}
+
+/// The bincode-serialized payload (everything after the raw magic+version
+/// frame). Split out so the frame is validated from raw bytes before any
+/// bincode decode touches an attacker-/corruption-controlled length prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedPayload {
+    persisted_at_unix_s: u64,
+    entries: Vec<PersistedEndpoint>,
+}
+
+impl PersistedLocalityMap {
+    /// Build a persisted map.
+    #[must_use]
+    pub fn new(persisted_at_unix_s: u64, entries: Vec<PersistedEndpoint>) -> Self {
+        Self {
+            persisted_at_unix_s,
+            entries,
+        }
+    }
+
+    /// Encode to the on-disk bytes: a raw 6-byte magic+version frame followed by
+    /// the bincode-encoded payload.
+    ///
+    /// Pure CPU work — the caller runs it in `spawn_blocking` when the snapshot
+    /// is large so it never blocks a tokio worker.
+    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let payload = PersistedPayload {
+            persisted_at_unix_s: self.persisted_at_unix_s,
+            entries: self.entries.clone(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+            .map_err(|e| make_input_err!("failed to bincode-encode locality persist map: {e}"))?;
+        let mut out = Vec::with_capacity(PERSIST_HEADER_LEN + encoded.len());
+        out.extend_from_slice(&PERSIST_MAGIC.to_le_bytes());
+        out.extend_from_slice(&PERSIST_VERSION.to_le_bytes());
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    /// Validate the raw magic+version frame, THEN bincode-decode the payload.
+    /// Rejects a too-short file, a wrong magic, or an unsupported version with a
+    /// bespoke `Error` — BEFORE bincode interprets any length prefix — so the
+    /// reload path can fail-open (log + start empty) rather than mis-decode a
+    /// foreign file (or attempt a giant allocation on a corrupt length).
+    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < PERSIST_HEADER_LEN {
+            return Err(make_input_err!(
+                "locality persist file too short ({} bytes, need >= {} for the magic+version frame); ignoring",
+                bytes.len(),
+                PERSIST_HEADER_LEN
+            ));
+        }
+        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if magic != PERSIST_MAGIC {
+            return Err(make_input_err!(
+                "locality persist file has bad magic 0x{magic:08X} (expected 0x{PERSIST_MAGIC:08X}); ignoring"
+            ));
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != PERSIST_VERSION {
+            return Err(make_input_err!(
+                "locality persist file version mismatch {version} (expected {PERSIST_VERSION}); ignoring"
+            ));
+        }
+        let (payload, _len): (PersistedPayload, usize) = bincode::serde::decode_from_slice(
+            &bytes[PERSIST_HEADER_LEN..],
+            bincode::config::standard(),
+        )
+        .map_err(|e| make_input_err!("failed to bincode-decode locality persist map payload: {e}"))?;
+        Ok(Self {
+            persisted_at_unix_s: payload.persisted_at_unix_s,
+            entries: payload.entries,
+        })
+    }
+}
+
+/// Result of reloading the persisted locality map (design §8.2 proving test
+/// assertions read these counters).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReloadedLocalitySummary {
+    /// Endpoints repopulated into `locality_map` + `endpoint_state`.
+    pub endpoints_loaded: usize,
+    /// Total (endpoint, digest) pairs registered into `locality_map`.
+    pub digests_loaded: usize,
+    /// `persisted_at_unix_s` from the reloaded file (0 when no/corrupt file).
+    pub persisted_at_unix_s: u64,
+}
+
+impl ReloadedLocalitySummary {
+    /// A fail-open empty summary (no file / corrupt file / read error).
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            endpoints_loaded: 0,
+            digests_loaded: 0,
+            persisted_at_unix_s: 0,
+        }
     }
 }
 

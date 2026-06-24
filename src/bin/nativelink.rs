@@ -162,6 +162,18 @@ const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// `max_encoding_message_size` in the config.
 const DEFAULT_MAX_ENCODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
+/// (#58 directive-3) Path the blob-locality map is persisted to at graceful
+/// shutdown and reloaded from at startup. `/srv/nativelink/` is the NVMe
+/// server-metadata pool (NOT `/srv/bulk`, which holds CAS payload) — see design
+/// §2.1. The persist is atomic-rename, NO fsync.
+const LOCALITY_PERSIST_PATH: &str = "/srv/nativelink/locality-map.bin";
+
+/// (#58 directive-3) Fail-open watchdog: if the startup locality reload has not
+/// flipped the Bazel readiness gate within this window, a backstop flips it so
+/// a slow/hung reload can never wedge Bazel serving (design §3.3). Generous for
+/// a ≤200 MB decode of a local NVMe file.
+const LOCALITY_RELOAD_MAX_WAIT_SECS: u64 = 30;
+
 async fn inner_main(
     cfg: CasConfig,
     shutdown_tx: broadcast::Sender<ShutdownGuard>,
@@ -1432,6 +1444,17 @@ async fn inner_main(
     // Graceful shutdown: accept_stop signals HTTP accept loops to stop,
     // drain_receivers lets the SIGTERM handler wait for connection drain.
     let (accept_stop_tx, _accept_stop_rx) = tokio::sync::watch::channel(false);
+
+    // (#58 directive-3) Bazel-REAPI startup readiness gate — the INVERSE-phased
+    // twin of `accept_stop_tx`. Starts `false` (not ready); the startup reload
+    // task flips it `true` once the persisted locality map is reloaded (or
+    // fails OPEN). Every Bazel-REAPI listener (the same listeners directive-2
+    // marks `quiesce_on_shutdown: true`) binds its socket immediately but does
+    // NOT `accept()` until this flips — so Bazel never gets a NotFound for a
+    // blob the persisted map could resolve. The worker-API (:50061) +
+    // worker-facing CAS (:50071/:50072) listeners (NOT quiesce-flagged) stay
+    // UNGATED so workers reconnect + reconcile DURING the reload. See design §3.
+    let (bazel_ready_tx, _bazel_ready_rx) = tokio::sync::watch::channel(false);
     #[cfg(target_family = "unix")]
     let mut drain_receivers: Vec<oneshot::Receiver<()>> = Vec::new();
 
@@ -1512,6 +1535,17 @@ async fn inner_main(
         .as_ref()
         .and_then(WorkerApiServer::shutdown_puller);
 
+    // (#58 directive-3) Capture the locality-persist handle BEFORE the
+    // `WorkerApiServer` is consumed by `into_service`. Holds cheap clones of the
+    // shared {locality_map, endpoint_state} the persist snapshots + the reload
+    // primes. Drives both the startup RELOAD (before the Bazel gate flips) and
+    // the SIGTERM Phase-3.5 PERSIST. `None` when there is no worker_api entry
+    // (no locality map → nothing to persist/reload). See
+    // `WorkerApiServer::locality_persister` / design §3.
+    let locality_persister = pre_built_worker_api_holder
+        .as_ref()
+        .and_then(WorkerApiServer::locality_persister);
+
     // Note on test coverage: `inject_h4_pending_registry_into_ac_chains` is
         // unit-tested via `split_topology_ac_ccs_receives_registry`. The
         // nativelink.rs call site itself (config parse -> store_manager build ->
@@ -1551,6 +1585,64 @@ async fn inner_main(
         info!(
             "H4 phase 3: no worker_api service configured — pending-registry consult not applicable"
         );
+    }
+
+    // (#58 directive-3) STARTUP RELOAD (Stage R1+R2): reload the persisted
+    // locality map and flip the Bazel readiness gate when done. Spawned here —
+    // BEFORE the listener loop binds sockets — so it runs CONCURRENTLY with
+    // listener bind: worker-API/worker-CAS listeners (ungated) come up
+    // immediately and workers reconnect + reconcile WHILE this reloads, but the
+    // Bazel-REAPI listeners (gated on `bazel_ready_tx`) do not `accept()` until
+    // this flips the gate. Fails OPEN on any reload error (missing/corrupt file
+    // → serve with an empty map). A watchdog backstop flips the gate regardless
+    // so a slow/hung reload can never wedge Bazel serving. See design §3.
+    {
+        let ready_tx = bazel_ready_tx.clone();
+        let reload_persister = locality_persister.clone();
+        #[expect(clippy::disallowed_methods, reason = "startup reload task spawned in inner_main")]
+        tokio::spawn(async move {
+            let path = std::path::Path::new(LOCALITY_PERSIST_PATH);
+            // Watchdog: bound the wait so a slow decode can't wedge startup.
+            // `reload_from_disk` already fails OPEN internally; the timeout is a
+            // belt-and-suspenders backstop for an unexpectedly slow disk read.
+            match reload_persister {
+                Some(persister) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(LOCALITY_RELOAD_MAX_WAIT_SECS),
+                        persister.reload_from_disk(path),
+                    )
+                    .await
+                    {
+                        Ok(Ok(summary)) => {
+                            info!(
+                                endpoints = summary.endpoints_loaded,
+                                digests = summary.digests_loaded,
+                                "locality reload complete; opening Bazel REAPI gate"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            // reload_from_disk fails OPEN internally and returns
+                            // Ok(empty) for missing/corrupt; an Err here is an
+                            // unexpected panic-propagation. Fail OPEN anyway.
+                            error!(?e, "locality reload errored; failing OPEN, opening Bazel REAPI gate");
+                        }
+                        Err(_) => {
+                            error!(
+                                max_wait_secs = LOCALITY_RELOAD_MAX_WAIT_SECS,
+                                "locality reload exceeded max wait; serving Bazel REAPI with partial/empty map"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    info!("no locality_map configured (no worker_api entry); opening Bazel REAPI gate immediately");
+                }
+            }
+            // ALWAYS flip the gate (fail-open). A reload failure must NEVER wedge
+            // Bazel serving — total unavailability is strictly worse than the
+            // NotFound storm this feature fixes (design §3.3).
+            let _ = ready_tx.send(true);
+        });
     }
 
     // Move into an Option so the per-entry loop can `.take()` it exactly once.
@@ -2092,6 +2184,12 @@ async fn inner_main(
         info!("Ready, listening on {socket_addr}",);
         let graceful = GracefulShutdown::new();
         let mut accept_stop_rx = accept_stop_tx.subscribe();
+        // (#58 directive-3) Bazel-REAPI readiness gate. A listener that
+        // directive-2 marks `quiesce_on_shutdown: true` IS the public Bazel-REAPI
+        // listener — gate its accept() on the locality reload. Ungated listeners
+        // (worker_api :50061, worker-CAS :50071/:50072) come up immediately.
+        let gate_on_locality_reload = quiesce_this_listener;
+        let mut bazel_ready_rx = bazel_ready_tx.subscribe();
         let (drain_tx, drain_rx) = oneshot::channel::<()>();
         #[cfg(target_family = "unix")]
         drain_receivers.push(drain_rx);
@@ -2099,6 +2197,19 @@ async fn inner_main(
         drop(drain_rx);
 
         root_futures.push(Box::pin(async move {
+            // Socket is already bound (kernel SYN-queues incoming Bazel conns);
+            // we just don't accept() until the persisted map is reloaded — so
+            // Bazel sees connect-backpressure, not a NotFound. Mirrors how
+            // `accept_stop_rx` stops accepts at shutdown, inverted.
+            if gate_on_locality_reload {
+                while !*bazel_ready_rx.borrow_and_update() {
+                    info!(%socket_addr, "Bazel REAPI listener waiting for locality-map reload before accepting");
+                    if bazel_ready_rx.changed().await.is_err() {
+                        // Sender dropped → reload task gone → fail OPEN (proceed).
+                        break;
+                    }
+                }
+            }
             loop {
                 select! {
                     accept_result = tcp_listener.accept() => {
@@ -2413,12 +2524,28 @@ async fn inner_main(
 
             info!("Ready, listening on {socket_addr} (QUIC/HTTP3)");
             let mut quic_stop_rx = accept_stop_tx.subscribe();
+            // (#58 directive-3) Same Bazel-REAPI readiness gate as the HTTP
+            // listener: a `quiesce_on_shutdown`-flagged QUIC listener waits for
+            // the locality reload before serving. (Production Bazel REAPI is
+            // HTTP/2; this keeps QUIC consistent if a Bazel REAPI QUIC listener
+            // is ever configured.) The endpoint is already bound; we delay the
+            // serve_with_shutdown accept-drive, not the bind.
+            let quic_gate_on_locality_reload = quiesce_this_listener;
+            let mut quic_bazel_ready_rx = bazel_ready_tx.subscribe();
             let (quic_drain_tx, quic_drain_rx) = oneshot::channel::<()>();
             #[cfg(target_family = "unix")]
             drain_receivers.push(quic_drain_rx);
             #[cfg(not(target_family = "unix"))]
             drop(quic_drain_rx);
             root_futures.push(Box::pin(async move {
+                if quic_gate_on_locality_reload {
+                    while !*quic_bazel_ready_rx.borrow_and_update() {
+                        info!(%socket_addr, "Bazel REAPI QUIC listener waiting for locality-map reload before serving");
+                        if quic_bazel_ready_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
                 if let Err(err) = h3_router
                     .serve_with_shutdown(acceptor, async move {
                         let _ = quic_stop_rx.changed().await;
@@ -2535,6 +2662,9 @@ async fn inner_main(
         // the worker-pull handle (driven before eviction), captured by move.
         let shutdown_quiesce = bazel_reapi_quiesce.clone();
         let shutdown_puller = shutdown_puller;
+        // (#58 directive-3) Locality-persist handle, driven at Phase 3.5 (after
+        // the pull, before eviction). Moved into the SIGTERM closure.
+        let shutdown_locality_persister = locality_persister;
         #[expect(clippy::disallowed_methods, reason = "signal handler spawned in inner_main")]
         tokio::spawn(async move {
             signal(SignalKind::terminate())
@@ -2614,10 +2744,35 @@ async fn inner_main(
                 info!("no worker-pull handle (no worker_api entry); skipping pull phase");
             }
 
-            // [DIRECTIVE-3 INSERTION POINT] persist-locality slot goes HERE —
-            // after the pull localizes worker-only blobs and BEFORE eviction
-            // wipes the locality map. A later directive adds the persist call at
-            // this exact point; do not move eviction above it.
+            // Phase 3.5 (#58 directive-3): PERSIST the locality map to NVMe
+            // (atomic rename, NO fsync) so the restarted server reloads the
+            // digest→worker index and can peer-fetch worker-only blobs the
+            // instant a worker reconnects — BEFORE its first full BlobsAvailable
+            // snapshot. MUST run HERE: after the pull (most-complete,
+            // most-quiescent map) and BEFORE eviction (Step A wipes the map via
+            // remove_endpoint — persisting then would persist nothing; same crux
+            // as the pull). Fails-soft: a persist error is logged and shutdown
+            // proceeds (never blocks exit). See design §2.2 / §8.
+            if let Some(persister) = shutdown_locality_persister.as_ref() {
+                let persist_start = std::time::Instant::now();
+                let path = std::path::Path::new(LOCALITY_PERSIST_PATH);
+                info!(path = %path.display(), "persisting blob-locality map (Phase 3.5)");
+                match persister.persist_to_disk(path).await {
+                    Ok(pairs) => info!(
+                        pairs,
+                        elapsed_ms = u64::try_from(persist_start.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "locality map persisted (atomic rename, no fsync)"
+                    ),
+                    Err(e) => error!(
+                        ?e,
+                        "locality persist failed; proceeding to eviction (the map \
+                         rebuilds from worker re-announce on the next boot)"
+                    ),
+                }
+            } else {
+                info!("no locality-persist handle (no worker_api entry); skipping persist phase");
+            }
 
             // Step A (was Step 1): Evict all remote workers from schedulers.
             // This closes their ConnectWorker streams so port 50061 drains
