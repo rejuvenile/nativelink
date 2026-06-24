@@ -274,21 +274,24 @@ impl StoreManager {
         // watchdog-marked, etc.) — vanish on exit because the
         // MemoryStore dies with the process. #206 observed 9904 of 66174
         // worker-reported blobs missing for 6+ hours after restart, with
-        // 4 of 5 sampled small-blob digests missing from Redis. We use
-        // the deadline budget that remains after Phase 1; if Phase 1
-        // consumed all of it, Phase 2 still gets a small floor (1
-        // second) so it can at least make progress on a near-empty fast
-        // tier rather than reporting the entire snapshot as unflushed.
-        const PHASE_2_FLOOR: core::time::Duration =
-            core::time::Duration::from_secs(1);
-        let phase_2_deadline = timeout
-            .checked_sub(started.elapsed())
-            .unwrap_or(PHASE_2_FLOOR)
-            .max(PHASE_2_FLOOR);
+        // 4 of 5 sampled small-blob digests missing from Redis.
+        //
+        // UNBOUNDED (operator directive 2026-06-23): Phase 2 runs to
+        // COMPLETION with NO deadline. The prior bounded version lost
+        // 827,204 SMALL_CAS_CACHED blobs at the 2026-06-23 17:38 restart
+        // when its 30 s budget fired mid-drain (`flushed=0
+        // deadline_exceeded=827204`). Passing `None` to
+        // `flush_fast_to_slow_at_shutdown` makes each store drain every
+        // memory-only blob to its slow tier however long it takes; the
+        // per-store flush logs forward progress so a long drain is visibly
+        // not a wedge. Trade-off: a genuinely wedged slow tier now blocks
+        // SIGTERM-to-exit indefinitely (see #210 commit risk note). This is
+        // the explicitly accepted cost of never again losing CAS blobs on
+        // restart. systemd's `TimeoutStopSec` must be `infinity` for this to
+        // take effect (otherwise systemd SIGKILLs first).
         info!(
-            phase_2_deadline_secs = phase_2_deadline.as_secs(),
             stores = targets.len(),
-            "flush_slow_writes: Phase 2 — flushing MemoryStore-only blobs to slow tier",
+            "flush_slow_writes: Phase 2 — flushing MemoryStore-only blobs to slow tier (unbounded)",
         );
 
         let phase_2_started = std::time::Instant::now();
@@ -298,7 +301,6 @@ impl StoreManager {
         for (name, store, _) in &targets {
             let name_owned = name.clone();
             let store_clone = store.clone();
-            let phase_2_per_store = phase_2_deadline;
             phase_2_joins.push(tokio::spawn(async move {
                 let driver: &dyn StoreDriver =
                     store_clone.inner_store(Some(synthetic_large_key()));
@@ -306,42 +308,24 @@ impl StoreManager {
                     return (name_owned, 0, core::time::Duration::ZERO);
                 };
                 let store_started = std::time::Instant::now();
-                let unflushed = fss
-                    .flush_fast_to_slow_at_shutdown(phase_2_per_store)
-                    .await;
+                // `None` = unbounded: drain to zero, no deadline.
+                let unflushed = fss.flush_fast_to_slow_at_shutdown(None).await;
                 (name_owned, unflushed, store_started.elapsed())
             }));
         }
 
-        let phase_2_drain = async {
-            let mut results: Vec<(String, usize, core::time::Duration)> =
-                Vec::with_capacity(phase_2_joins.len());
-            for join in phase_2_joins {
-                match join.await {
-                    Ok(tuple) => results.push(tuple),
-                    Err(e) => {
-                        warn!(error = ?e, "flush_slow_writes: Phase 2 task panicked")
-                    }
+        // No outer wall-clock guard: Phase 2 is unbounded by directive. Await
+        // every per-store drain to completion.
+        let mut phase_2_results: Vec<(String, usize, core::time::Duration)> =
+            Vec::with_capacity(phase_2_joins.len());
+        for join in phase_2_joins {
+            match join.await {
+                Ok(tuple) => phase_2_results.push(tuple),
+                Err(e) => {
+                    warn!(error = ?e, "flush_slow_writes: Phase 2 task panicked")
                 }
             }
-            results
-        };
-        let phase_2_results = match tokio::time::timeout(
-            phase_2_deadline + core::time::Duration::from_secs(2),
-            phase_2_drain,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(
-                    elapsed_ms = u64::try_from(phase_2_started.elapsed().as_millis())
-                        .unwrap_or(u64::MAX),
-                    "flush_slow_writes: Phase 2 outer wall-clock timeout fired",
-                );
-                Vec::new()
-            }
-        };
+        }
 
         let phase_2_total_unflushed: usize =
             phase_2_results.iter().map(|(_, r, _)| *r).sum();

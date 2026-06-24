@@ -2541,44 +2541,32 @@ async fn inner_main(
             // anywhere. Bazel asks for the action result, the CAS doesn't
             // have it, and the build dies across many crates.
             //
-            // We wrap with a wall-clock timeout so a wedged backend cannot
-            // stall SIGTERM forever. The inner flush_slow_writes already
-            // honors the same budget; this outer guard is belt-and-braces.
+            // UNBOUNDED Phase 2 (operator directive 2026-06-23): there is NO
+            // outer wall-clock timeout around `flush_slow_writes`. Phase 1
+            // (in-flight slow-write drain) is still internally bounded by
+            // `flush_budget`; Phase 2 (#210 MemoryStore-only → slow tier) runs
+            // to COMPLETION with no deadline so it can never again lose CAS
+            // blobs the way the 2026-06-23 17:38 restart lost 827,204
+            // SMALL_CAS_CACHED blobs to a 30 s deadline. The per-store Phase-2
+            // drain logs forward progress so a long drain is visibly not a
+            // wedge. Trade-off: a genuinely wedged slow tier now blocks
+            // SIGTERM-to-exit indefinitely; systemd `TimeoutStopSec=infinity`
+            // is required so systemd does not SIGKILL the unit mid-flush.
             if let Some(sm) = STORE_MANAGER.get() {
                 let flush_budget = Duration::from_secs(30);
                 let flush_start = std::time::Instant::now();
                 info!(
-                    timeout_secs = flush_budget.as_secs(),
-                    "flushing in-flight slow writes before shutdown",
+                    phase_1_timeout_secs = flush_budget.as_secs(),
+                    "flushing in-flight slow writes before shutdown (Phase 2 unbounded)",
                 );
-                // The outer guard accommodates BOTH phases of
-                // `StoreManager::flush_slow_writes`:
-                //   Phase 1 (in-flight drain) ≤ flush_budget,
-                //   Phase 2 (#210 MemoryStore→slow) ≥ 1s floor when
-                //                                      Phase 1 used the full
-                //                                      budget, plus its own
-                //                                      2s outer-guard slack.
-                // 8s of headroom keeps the SIGTERM-to-exit budget tight
-                // (well under listener-drain's 35s) while leaving enough
-                // room that the inner timeouts always fire first.
-                match tokio::time::timeout(
-                    flush_budget + Duration::from_secs(8),
-                    sm.flush_slow_writes(flush_budget),
-                )
-                .await
-                {
-                    Ok(()) => info!(
-                        elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
-                            .unwrap_or(u64::MAX),
-                        "slow-write flush returned",
-                    ),
-                    Err(_) => warn!(
-                        elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
-                            .unwrap_or(u64::MAX),
-                        "slow-write flush wall-clock timeout fired; \
-                         continuing with shutdown",
-                    ),
-                }
+                // No `tokio::time::timeout`: capping here would cancel the
+                // unbounded Phase-2 drain and re-introduce the #210 data loss.
+                sm.flush_slow_writes(flush_budget).await;
+                info!(
+                    elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "slow-write flush returned",
+                );
             } else {
                 warn!(
                     "STORE_MANAGER not initialized at shutdown; \

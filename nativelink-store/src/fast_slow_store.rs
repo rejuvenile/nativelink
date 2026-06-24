@@ -159,6 +159,33 @@ const FAILED_SLOW_WRITES_MAX: usize = 1_000_000;
 /// overlapping enough I/O to saturate the local filesystem tier.
 const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 
+/// Bounded concurrency for the shutdown drain in
+/// [`FastSlowStore::flush_fast_to_slow_at_shutdown`]. #210: the prior
+/// implementation processed the fast-tier snapshot strictly serially
+/// (`slow.has` RTT, then `slow.update_oneshot` RTT, one blob at a time). At
+/// the 2026-06-23 17:38 restart this enumerated 1,418,996 SMALL_CAS_CACHED
+/// keys and burned the entire 30 s budget on ~591 k serial Redis `has`
+/// round-trips, flushing ZERO blobs (`flushed=0 deadline_exceeded=827204`)
+/// before exit lost them. Draining K-at-a-time turns N serial RTTs into N/K,
+/// so an unbounded drain of a large fast tier finishes in minutes, not the
+/// ~tens-of-minutes a strictly-serial drain would take.
+///
+/// Capped at 64: each in-flight slot holds at most one blob's bytes
+/// (`get_part_unchunked` materializes the blob) plus its `has`/`update`
+/// futures. The fast tier here is a MemoryStore, so the bytes are already
+/// resident — the cap bounds only the transient duplicate copies handed to
+/// the slow tier, not new allocation pressure of consequence. 64 saturates a
+/// Redis/Filesystem slow tier's pipeline without flooding it.
+const SHUTDOWN_FLUSH_CONCURRENCY: usize = 64;
+
+/// Emit an `info!` progress line every this many processed blobs during the
+/// shutdown drain so an operator watching `journalctl` through a long
+/// unbounded flush sees forward motion (flushed/skipped/remaining) and can
+/// distinguish "patiently draining 800 k blobs" from "wedged on a dead slow
+/// tier". Chosen so a multi-hundred-k drain logs on the order of tens of
+/// lines, not one-per-blob.
+const SHUTDOWN_FLUSH_PROGRESS_EVERY: usize = 50_000;
+
 /// Wall-clock deadline for the background slow-store write task. If the
 /// spawn has not produced a terminal Ok/Err result within this window,
 /// the watchdog records the digest in `failed_slow_writes` so a worker
@@ -2518,8 +2545,19 @@ impl FastSlowStore {
     /// Phase 2 of graceful shutdown (#210): enumerate every key in the
     /// fast tier and write any blob the slow tier does not yet hold to
     /// the slow tier before returning. Returns the number of fast-tier
-    /// blobs that could NOT be persisted within the deadline (0 when all
-    /// blobs are durable).
+    /// blobs that could NOT be persisted (0 when all blobs are durable).
+    ///
+    /// `deadline`:
+    /// - **`None` (production #210 path):** unbounded — the flush runs to
+    ///   completion, draining EVERY memory-only blob to the slow tier no
+    ///   matter how long it takes. This is the operator directive after the
+    ///   2026-06-23 restart lost 827,204 SMALL_CAS_CACHED blobs to a 30 s
+    ///   deadline ("give shutdown unlimited time to flush blobs to redis and
+    ///   to disk"). With `None` the only way this returns non-zero is a
+    ///   per-entry slow-tier write error.
+    /// - **`Some(d)`:** best-effort within `d`; once `d` elapses, no further
+    ///   blobs are launched and the remainder is reported as unflushed. Used
+    ///   by callers that still want a wall-clock cap.
     ///
     /// **Why this exists in addition to [`Self::flush_slow_writes`]:**
     /// `flush_slow_writes` only drains the in-flight write map populated
@@ -2540,24 +2578,30 @@ impl FastSlowStore {
     /// **Contract directions** (CLAUDE.md asymmetric-coverage rule):
     /// - **Under-action:** every fast-tier blob NOT in slow tier MUST be
     ///   written to the slow tier before this returns (within the
-    ///   deadline). Failure mode: lost data on restart.
-    /// - **Over-action / deadline:** this MUST return within ~`deadline`
-    ///   even if the slow tier is so slow it cannot drain everything.
-    ///   Failure mode: a wedged slow tier blocks SIGTERM-to-exit
-    ///   forever, which `nativelink.rs:1488`'s 35s drain wait would
-    ///   interpret as a hang.
+    ///   deadline, if any). Failure mode: lost data on restart.
+    /// - **Over-action / deadline:** when `deadline` is `Some(d)`, this MUST
+    ///   return within ~`d` even if the slow tier is so slow it cannot drain
+    ///   everything. With `None` the directive is the opposite — drain to
+    ///   zero however long it takes; a wedged slow tier blocking
+    ///   SIGTERM-to-exit is the explicitly accepted trade (see the
+    ///   wedged-slow-tier risk note in the #210 commit).
     /// - **Per-entry tolerance:** a single failing slow-tier write MUST
-    ///   NOT abort the loop — the next blob still has a chance.
+    ///   NOT abort the drain — the other blobs still get written.
     /// - **Skip-existing:** a blob the slow tier already has MUST NOT be
     ///   re-written (avoids amplifying tail-latency on stores like
     ///   FilesystemStore where update_oneshot is non-trivial).
+    ///
+    /// The drain runs at bounded concurrency ([`SHUTDOWN_FLUSH_CONCURRENCY`])
+    /// so a large fast tier (the production SMALL_CAS_CACHED tier held 1.4 M
+    /// keys at the #210 restart) drains in N/K round-trips rather than N
+    /// strictly-serial ones.
     ///
     /// Mirror blobs (`mirror_blobs`) are intentionally NOT flushed here
     /// — those are pinned in memory only by design until the server's
     /// `BlobsInStableStorage` ack arrives, and writing them to the slow
     /// tier would defeat the mirror-only invariant. The
     /// `mirror_blobs_max_bytes` cap already bounds their footprint.
-    pub async fn flush_fast_to_slow_at_shutdown(&self, deadline: Duration) -> usize {
+    pub async fn flush_fast_to_slow_at_shutdown(&self, deadline: Option<Duration>) -> usize {
         // Snapshot every key currently in the fast tier. We use the
         // generic `StoreDriver::list` API so this works for any fast
         // tier that implements list, but in production this is a
@@ -2567,8 +2611,7 @@ impl FastSlowStore {
         // Collecting the keys up-front (before doing any work) lets us
         // (a) drop the btree read-lock immediately, (b) iterate the
         // snapshot deterministically without re-locking on every
-        // iteration, and (c) bound the per-blob deadline check by a
-        // simple counter.
+        // iteration.
         let started = Instant::now();
         let mut keys: Vec<StoreKey<'static>> = Vec::new();
         {
@@ -2600,7 +2643,10 @@ impl FastSlowStore {
         let snapshot_count = keys.len();
         info!(
             snapshot_count,
-            deadline_secs = deadline.as_secs(),
+            // -1 = unbounded (`None`); the production #210 path. Logged as a
+            // sentinel so an operator can see at a glance the flush will run
+            // to completion rather than time out.
+            deadline_secs = deadline.map_or(-1i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             fast_store = %self.fast_store.inner_store(
                 Option::<StoreKey<'_>>::None
             ).get_name(),
@@ -2614,102 +2660,150 @@ impl FastSlowStore {
             return 0;
         }
 
-        // Per-blob loop. We honor the deadline by checking
-        // `started.elapsed()` before each iteration — once we cross it,
-        // every remaining key is reported as unflushed. Per-entry
-        // errors are logged but do not abort the loop.
-        let mut flushed = 0usize;
-        let mut skipped_already = 0usize;
-        let mut errored = 0usize;
-        let mut deadline_remaining = snapshot_count;
-        for (idx, key) in keys.iter().enumerate() {
-            if started.elapsed() >= deadline {
-                let unflushed = snapshot_count - idx;
-                warn!(
-                    snapshot_count,
-                    flushed,
-                    skipped_already,
-                    errored,
-                    unflushed,
-                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    "FastSlowStore::flush_fast_to_slow_at_shutdown: deadline \
-                     exceeded; remaining blobs will be lost on exit"
-                );
-                deadline_remaining = unflushed;
-                break;
-            }
-            // Skip blobs the slow tier already holds. A failed `has`
-            // check is treated as "unknown" → write anyway (better to
-            // duplicate-write than to silently lose).
-            match self.slow_store.has(key.borrow()).await {
-                Ok(Some(_)) => {
-                    skipped_already += 1;
-                    deadline_remaining = deadline_remaining.saturating_sub(1);
-                    continue;
-                }
-                Ok(None) => {} // proceed to write
-                Err(err) => {
-                    debug!(
-                        ?key,
-                        ?err,
-                        "FastSlowStore::flush_fast_to_slow_at_shutdown: slow.has \
-                         failed; will attempt write anyway"
-                    );
-                }
-            }
+        // Bounded-concurrency drain. #210: the prior implementation processed
+        // the snapshot strictly serially — one `slow.has` RTT then one
+        // `slow.update_oneshot` RTT per blob. With 1.4 M keys that meant up to
+        // 1.4 M serial round-trips; the 30 s deadline fired after ~591 k `has`
+        // probes (all already-present) having flushed ZERO blobs. Running the
+        // per-blob work K-at-a-time turns N serial RTTs into N/K.
+        //
+        // Counters are atomics shared across the concurrent tasks. Per-entry
+        // errors are logged and counted but NEVER abort the drain.
+        let flushed = AtomicU64::new(0);
+        let skipped_already = AtomicU64::new(0);
+        let errored = AtomicU64::new(0);
+        // `processed` = blobs that actually ran the has/get/update work (i.e.
+        // were NOT short-circuited by an elapsed deadline). With `None` every
+        // blob is processed, so `deadline_exceeded` below is always 0.
+        let processed = AtomicU64::new(0);
 
-            // Read the bytes from the fast tier. We use
-            // `get_part_unchunked` to materialize the full blob — for
-            // MemoryStore this is a near-zero-copy fetch from the
-            // BytesWrapper chain. We deliberately do NOT stream into
-            // the slow tier via a buf_channel: the slow stores at this
-            // point are Redis (oneshot) or FilesystemStore (also
-            // oneshot-ish), and `update_oneshot` is the cheaper path
-            // when the data is already in memory.
-            let data = match self
-                .fast_store
-                .get_part_unchunked(key.borrow(), 0, None)
-                .await
-            {
-                Ok(b) => b,
-                Err(err) => {
-                    // Likely an evicted-since-list race or a corrupt
-                    // entry. Skip-and-continue is the only safe
-                    // response — there is nothing to write.
-                    debug!(
-                        ?key,
-                        ?err,
-                        "FastSlowStore::flush_fast_to_slow_at_shutdown: fast.get \
-                         failed; skipping (likely evicted between list and read)"
-                    );
-                    errored += 1;
-                    deadline_remaining = deadline_remaining.saturating_sub(1);
-                    continue;
-                }
-            };
+        // `deadline.is_none()` ⇒ unbounded: never short-circuit. Otherwise a
+        // task launched after the deadline has elapsed performs no work and is
+        // counted as deadline-exceeded (so we still return a non-zero unflushed
+        // count without blocking past the deadline).
+        //
+        // We stream over plain `usize` indices (not over `&StoreKey` or owned
+        // `StoreKey<'_>`): a `StoreKey<'a>` carries a lifetime parameter, and a
+        // `.map` closure yielding a `StoreKey`-bearing future cannot satisfy
+        // `buffer_unordered`'s higher-ranked `FnMut` bound ("implementation of
+        // `FnOnce` is not general enough"). `usize` is lifetime-free, so each
+        // task indexes the borrowed `keys` snapshot to get its key.
+        let keys = &keys;
+        let drain = futures::stream::iter(0..snapshot_count)
+            .map(|idx| {
+                let flushed = &flushed;
+                let skipped_already = &skipped_already;
+                let errored = &errored;
+                let processed = &processed;
+                async move {
+                    let key = &keys[idx];
+                    if let Some(deadline) = deadline {
+                        if started.elapsed() >= deadline {
+                            // Past the deadline — leave this blob unprocessed.
+                            // It is accounted as deadline-exceeded by the
+                            // `snapshot_count - processed` arithmetic below.
+                            return;
+                        }
+                    }
+                    let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % SHUTDOWN_FLUSH_PROGRESS_EVERY as u64 == 0 {
+                        // Forward-progress line so an operator watching a long
+                        // unbounded shutdown drain sees motion, not a wedge.
+                        info!(
+                            snapshot_count,
+                            flushed = flushed.load(Ordering::Relaxed),
+                            skipped_already = skipped_already.load(Ordering::Relaxed),
+                            errored = errored.load(Ordering::Relaxed),
+                            remaining = snapshot_count as u64 - n,
+                            elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            "FastSlowStore::flush_fast_to_slow_at_shutdown: draining"
+                        );
+                    }
 
-            // Write to the slow tier. Per-entry errors are logged and
-            // skipped; we do NOT propagate them. (Returning early would
-            // strand later blobs.)
-            match self.slow_store.update_oneshot(key.borrow(), data).await {
-                Ok(()) => {
-                    flushed += 1;
+                    // Skip blobs the slow tier already holds. A failed `has`
+                    // check is treated as "unknown" → write anyway (better to
+                    // duplicate-write than to silently lose). The slow tier's
+                    // own update path is idempotent for CAS digests
+                    // (FilesystemStore dedups via its in-memory index;
+                    // RedisStore re-write of the same digest is a no-op
+                    // content-wise), so a redundant write on a `has` error is
+                    // safe.
+                    match self.slow_store.has(key.borrow()).await {
+                        Ok(Some(_)) => {
+                            skipped_already.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Ok(None) => {} // proceed to write
+                        Err(err) => {
+                            debug!(
+                                ?key,
+                                ?err,
+                                "FastSlowStore::flush_fast_to_slow_at_shutdown: slow.has \
+                                 failed; will attempt write anyway"
+                            );
+                        }
+                    }
+
+                    // Read the bytes from the fast tier. `get_part_unchunked`
+                    // materializes the full blob — for MemoryStore this is a
+                    // near-zero-copy fetch from the BytesWrapper chain. We do
+                    // NOT stream via a buf_channel: the slow stores here are
+                    // Redis or FilesystemStore and `update_oneshot` is the
+                    // cheaper path when the data is already in memory.
+                    let data = match self
+                        .fast_store
+                        .get_part_unchunked(key.borrow(), 0, None)
+                        .await
+                    {
+                        Ok(b) => b,
+                        Err(err) => {
+                            // Likely an evicted-since-list race or a corrupt
+                            // entry. Skip-and-continue is the only safe
+                            // response — there is nothing to write.
+                            debug!(
+                                ?key,
+                                ?err,
+                                "FastSlowStore::flush_fast_to_slow_at_shutdown: fast.get \
+                                 failed; skipping (likely evicted between list and read)"
+                            );
+                            errored.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
+
+                    // Write to the slow tier. Per-entry errors are logged and
+                    // counted; we do NOT propagate them (one failure must not
+                    // strand the other blobs).
+                    match self.slow_store.update_oneshot(key.borrow(), data).await {
+                        Ok(()) => {
+                            flushed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            warn!(
+                                ?key,
+                                ?err,
+                                "FastSlowStore::flush_fast_to_slow_at_shutdown: slow.update \
+                                 failed; blob will be lost on exit"
+                            );
+                            errored.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        ?key,
-                        ?err,
-                        "FastSlowStore::flush_fast_to_slow_at_shutdown: slow.update \
-                         failed; blob will be lost on exit"
-                    );
-                    errored += 1;
-                }
-            }
-            deadline_remaining = deadline_remaining.saturating_sub(1);
-        }
+            })
+            .buffer_unordered(SHUTDOWN_FLUSH_CONCURRENCY);
+        drain.for_each(|()| async {}).await;
+
+        let flushed = flushed.into_inner();
+        let skipped_already = skipped_already.into_inner();
+        let errored = errored.into_inner();
+        let processed = processed.into_inner();
+        // Blobs never reached because the (finite) deadline elapsed mid-drain.
+        // Always 0 when `deadline` is `None`.
+        let deadline_exceeded = snapshot_count as u64 - processed;
 
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if errored > 0 || deadline_remaining > 0 {
+        if errored > 0 || deadline_exceeded > 0 {
             // Loud summary line that ops will grep for after a restart
             // when investigating "Lost inputs" / missing-CAS reports.
             warn!(
@@ -2717,7 +2811,7 @@ impl FastSlowStore {
                 flushed,
                 skipped_already,
                 errored,
-                deadline_exceeded = deadline_remaining,
+                deadline_exceeded,
                 elapsed_ms,
                 "FastSlowStore::flush_fast_to_slow_at_shutdown: COMPLETED WITH \
                  UNFLUSHED OR FAILED BLOBS — these will be lost on exit"
@@ -2733,7 +2827,7 @@ impl FastSlowStore {
         }
         // Unflushed = errored + deadline-exceeded. Skipped-already is NOT
         // counted as unflushed because the slow tier already holds the blob.
-        errored + deadline_remaining
+        usize::try_from(errored + deadline_exceeded).unwrap_or(usize::MAX)
     }
 
     pub const fn fast_store(&self) -> &Store {

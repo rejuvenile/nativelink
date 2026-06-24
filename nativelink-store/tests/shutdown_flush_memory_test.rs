@@ -153,7 +153,7 @@ async fn shutdown_flushes_memory_only_blobs_to_slow_tier() -> Result<(), Error> 
 
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(NO_DEADLOCK_TIMEOUT),
+        fast_slow.flush_fast_to_slow_at_shutdown(None),
     )
     .await
     .expect(
@@ -288,13 +288,13 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
     // walker.)
     let upper_remaining = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        upper_fss.flush_fast_to_slow_at_shutdown(NO_DEADLOCK_TIMEOUT),
+        upper_fss.flush_fast_to_slow_at_shutdown(None),
     )
     .await
     .expect("DEADLOCK: upper-tier flush did not return");
     let lower_remaining = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        lower_fss.flush_fast_to_slow_at_shutdown(NO_DEADLOCK_TIMEOUT),
+        lower_fss.flush_fast_to_slow_at_shutdown(None),
     )
     .await
     .expect("DEADLOCK: lower-tier flush did not return");
@@ -327,13 +327,21 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
     Ok(())
 }
 
-/// Test 3 (over-action / deadline-bound): flush MUST honor the deadline and
-/// return promptly even when the slow tier is so slow that not all blobs
-/// can be drained in time. The contract is "best-effort within the
-/// deadline; report unflushed count + log; do NOT block shutdown forever."
+/// Test 3 (over-action / deadline-bound): when a FINITE deadline is supplied
+/// (`Some(_)`), flush MUST honor it and return promptly even when the slow
+/// tier is so slow that not all blobs can be drained in time. The contract is
+/// "best-effort within the deadline; report unflushed count + log; do NOT
+/// block shutdown longer than the deadline."
+///
+/// `None` would mean unbounded (the production #210 path — proven by the
+/// `..._unbounded_...` tests below). This test pins the OTHER half of the
+/// contract: callers that pass `Some(deadline)` (e.g. an operator-bounded
+/// future flush, or the existing deadline-bound test harness) still get a
+/// wall-clock cap.
 ///
 /// We install a slow-tier probe that delays each `update_oneshot` by 200ms.
-/// With 50 blobs queued and a 200 ms deadline, AT MOST 1-2 should land
+/// With 300 blobs queued, a 200 ms deadline, and a bounded flush concurrency
+/// well under 300, the flush completes at most ~one concurrency-wave of writes
 /// before the deadline triggers. The flush must return within ~deadline +
 /// overhead and the unflushed count must be > 0 (NOT silently report 0).
 #[nativelink_test]
@@ -348,7 +356,11 @@ async fn shutdown_flush_respects_deadline_when_slow_tier_is_slow() -> Result<(),
     let slow_probe = Store::new(probe_arc);
     let (fast_slow, fast_store) = build_fast_slow_with_slow_probe(slow_probe.clone());
 
-    const N: usize = 50;
+    // N must exceed the flush concurrency by enough that a single
+    // concurrency-wave (which fits in one 200 ms delay window) cannot drain
+    // all blobs before the deadline fires; otherwise `unflushed > 0` would be
+    // concurrency-sensitive. 300 ≫ any reasonable bounded concurrency.
+    const N: usize = 300;
     for i in 0..N {
         let payload = vec![(i & 0xFF) as u8; 64];
         let digest = unique_digest(2000 + i as u64, payload.len() as u64);
@@ -361,7 +373,7 @@ async fn shutdown_flush_respects_deadline_when_slow_tier_is_slow() -> Result<(),
     let started = std::time::Instant::now();
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(deadline),
+        fast_slow.flush_fast_to_slow_at_shutdown(Some(deadline)),
     )
     .await
     .expect(
@@ -394,6 +406,150 @@ async fn shutdown_flush_respects_deadline_when_slow_tier_is_slow() -> Result<(),
          probe, flush should have left blobs unflushed; got 0 (probe \
          completed {completed} updates) — deadline likely ignored",
     );
+    Ok(())
+}
+
+/// Test 6 (#210 UNBOUNDED — the production cure): with NO deadline (`None`),
+/// the flush MUST drain EVERY MemoryStore-only blob to the slow tier and
+/// return `0` unflushed. This is the operator directive: "give shutdown
+/// unlimited time to flush blobs to redis and to disk." The returned count is
+/// `errored + deadline_exceeded`; with no deadline and no errors it MUST be 0,
+/// which directly guards the production `flushed=0 deadline_exceeded=827204`
+/// data-loss (827,204 SMALL_CAS_CACHED blobs lost at the 2026-06-23 17:38
+/// restart because the 30 s deadline fired mid-drain).
+///
+/// Mutation step (CLAUDE.md mandate): re-introduce a finite per-iter deadline
+/// in `flush_fast_to_slow_at_shutdown` (e.g. hardcode `Some(Duration::ZERO)`
+/// in place of the `None` branch, or `break` the loop early) — the
+/// `assert_eq!(unflushed, 0, ...)` MUST red-fail with the bespoke message
+/// `"#210 UNBOUNDED flush must drain ALL memory-only blobs — data-loss
+/// regression"`.
+#[nativelink_test]
+async fn shutdown_flush_unbounded_drains_all_blobs() -> Result<(), Error> {
+    let slow_probe = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (fast_slow, fast_store) = build_fast_slow_with_slow_probe(slow_probe.clone());
+
+    // More blobs than any bounded flush concurrency, so a correct unbounded
+    // drain must process multiple waves — not just the first.
+    const N: usize = 250;
+    let mut digests = Vec::with_capacity(N);
+    let mut payloads = Vec::with_capacity(N);
+    for i in 0..N {
+        let payload = vec![(i & 0xFF) as u8; 48 + (i % 7)];
+        let digest = unique_digest(5000 + i as u64, payload.len() as u64);
+        fast_store
+            .update_oneshot(digest, Bytes::from(payload.clone()))
+            .await?;
+        digests.push(digest);
+        payloads.push(payload);
+    }
+
+    let unflushed = tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        fast_slow.flush_fast_to_slow_at_shutdown(None),
+    )
+    .await
+    .expect(
+        "DEADLOCK DETECTED: unbounded flush_fast_to_slow_at_shutdown(None) did \
+         not return within 5s for 250 trivial blobs; a correct unbounded drain \
+         of a handful of in-memory blobs finishes in milliseconds.",
+    );
+
+    // unflushed == 0 ⇒ flushed == N (skipped_already == 0 here because the
+    // slow tier started empty). This is the counter the production log
+    // reported as `flushed=0`; here it MUST account for every blob.
+    assert_eq!(
+        unflushed, 0,
+        "#210 UNBOUNDED flush must drain ALL memory-only blobs — data-loss \
+         regression: {unflushed} of {N} blobs left unflushed with no deadline",
+    );
+
+    // Every blob is present in the slow tier with correct content.
+    for (digest, payload) in digests.iter().zip(payloads.iter()) {
+        let stored = slow_probe
+            .get_part_unchunked(*digest, 0, None)
+            .await
+            .err_tip(|| format!("blob {digest:?} missing from slow tier post-unbounded-flush"))?;
+        assert_eq!(
+            stored.as_ref(),
+            payload.as_slice(),
+            "#210 UNBOUNDED flush: slow-tier digest {digest:?} content mismatch",
+        );
+    }
+    Ok(())
+}
+
+/// Test 7 (#210 UNBOUNDED vs SLOW TIER — proves the DEADLINE, not a structural
+/// cap, bounded the production drain): inject a per-`update_oneshot` latency on
+/// the slow tier and flush with NO deadline (`None`). ALL N blobs MUST still
+/// land. If a finite deadline (or any internal structural cap on processed
+/// count) survived, a slow tier would strand blobs exactly as production did.
+/// Because the flush is unbounded, the only thing that can stop it is running
+/// out of blobs — so all N drain regardless of how slow each write is.
+///
+/// The injected latency is small (8 ms) and N modest (40) so the test stays
+/// well under the 5 s deadlock-detector while still forcing many serialized
+/// slow-tier round-trips that a finite deadline would have truncated.
+#[nativelink_test]
+async fn shutdown_flush_unbounded_drains_despite_slow_tier() -> Result<(), Error> {
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_call_count = Arc::new(AtomicUsize::new(0));
+    let probe_arc: Arc<dyn StoreDriver> = Arc::new(SlowSlowProbe {
+        inner: inner.clone(),
+        per_update_delay: Duration::from_millis(8),
+        update_count: slow_call_count.clone(),
+    });
+    let slow_probe = Store::new(probe_arc);
+    let (fast_slow, fast_store) = build_fast_slow_with_slow_probe(slow_probe.clone());
+
+    const N: usize = 40;
+    let mut digests = Vec::with_capacity(N);
+    for i in 0..N {
+        let payload = vec![(i & 0xFF) as u8; 64];
+        let digest = unique_digest(6000 + i as u64, payload.len() as u64);
+        fast_store
+            .update_oneshot(digest, Bytes::from(payload))
+            .await?;
+        digests.push(digest);
+    }
+
+    let unflushed = tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        fast_slow.flush_fast_to_slow_at_shutdown(None),
+    )
+    .await
+    .expect(
+        "DEADLOCK DETECTED: unbounded flush did not return within 5s despite a \
+         slow (8 ms/write) slow tier; unbounded flush must still terminate once \
+         all blobs are drained.",
+    );
+
+    assert_eq!(
+        unflushed, 0,
+        "#210 UNBOUNDED-vs-slow-tier: a slow tier MUST NOT strand blobs when \
+         the deadline is unbounded; {unflushed} of {N} left unflushed — this is \
+         the production `deadline_exceeded` data-loss the directive removes",
+    );
+
+    // Directly guard the `flushed` counter that production logged as `0`:
+    // EXACTLY N slow-tier writes must have been issued (the slow tier started
+    // empty, so none are skip-existing). A counter/loop bug that under-counts
+    // or short-circuits writes shows up here as != N.
+    let writes = slow_call_count.load(Ordering::SeqCst);
+    assert_eq!(
+        writes, N,
+        "#210 flushed-counter guard: unbounded flush must issue exactly {N} \
+         slow-tier writes (the production log showed flushed=0); got {writes}",
+    );
+
+    // Confirm the slow tier physically received every blob.
+    for digest in &digests {
+        let exists = inner
+            .has(*digest)
+            .await?
+            .ok_or_else(|| make_err!(Code::NotFound, "blob missing post-flush: {digest:?}"))?;
+        let _ = exists;
+    }
     Ok(())
 }
 
@@ -509,7 +665,7 @@ async fn shutdown_flush_continues_past_per_entry_errors() -> Result<(), Error> {
 
     let _ = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(NO_DEADLOCK_TIMEOUT),
+        fast_slow.flush_fast_to_slow_at_shutdown(None),
     )
     .await
     .expect(
@@ -656,7 +812,7 @@ async fn shutdown_flush_skips_blobs_already_in_slow_tier() -> Result<(), Error> 
 
     let unflushed = tokio::time::timeout(
         NO_DEADLOCK_TIMEOUT,
-        fast_slow.flush_fast_to_slow_at_shutdown(NO_DEADLOCK_TIMEOUT),
+        fast_slow.flush_fast_to_slow_at_shutdown(None),
     )
     .await
     .expect("DEADLOCK: flush did not return");
