@@ -4627,3 +4627,478 @@ async fn read_legitimate_empty_blob_returns_clean_eof_not_error() -> Result<(), 
 
     Ok(())
 }
+
+// ===================================================================
+// F1: drain the worker inbound stream to EOF before returning on the
+// no-drain early-return Write paths (EYC->zero fix).
+//
+// PROBLEM (eBPF-confirmed 99.976%): `bytestream_write` has TWO no-drain
+// `WriteResponse` early-returns (G1 already-exists short-circuit at
+// `bytestream_server.rs:3259`, G1b in-flight dedup-coalesce success at
+// `:3336`) that return the response while the client is still uploading.
+// The forgotten/reaped h2 stream then receives the late inbound DATA →
+// counting `library_reset(STREAM_CLOSED)` → fills the 1024 budget →
+// `GoAway(ENHANCE_YOUR_CALM)`. Draining the inbound stream to h2
+// END_STREAM first makes the stream's `state.is_closed()` TRUE → the
+// `maybe_cancel` reap-gate (`ref_count==0 && !is_closed()`) is FALSE →
+// no forget → no counting reset.
+//
+// PRODUCTION-COMPOSITION SEAM (the contract under test): "the client
+// keeps sending DATA frames after the server would short-circuit." The
+// fix's observable is that the server CONSUMES every inbound frame to the
+// stream's terminal BEFORE returning the `WriteResponse`. We compose the
+// real `ByteStreamServer::write` handler (→ real `WriteRequestStreamWrapper`
+// → real `bytestream_write` → real drain) over a body that records exactly
+// how many `WriteRequest` frames the server polled, so we can assert the
+// server reached the inbound stream's terminal (no forgotten-stream / no
+// late-DATA-on-reaped-stream condition).
+//
+// F1-A (BINDING, the impl landmine, re-review re-review-f1-f3.md §F1-A):
+// `WriteRequestStreamWrapper::next()` returns `Err(Code::Cancelled)` NOT
+// `None` when the client half-closes (h2 END_STREAM without
+// `finish_write=true`; Bazel local-execution-wins, proto_stream_utils.rs:538).
+// The drain MUST poll the inner stream to END_STREAM and treat that
+// terminal `Err(Code::Cancelled)` as drain-COMPLETE, else F1 silently
+// fails on the half-close path. Both terminal shapes are covered below.
+// ===================================================================
+
+use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::collections::VecDeque;
+
+/// Terminal shape the inbound body presents AFTER all DATA frames, i.e.
+/// how the client closes the upload stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboundTerminal {
+    /// The final `WriteRequest` carried `finish_write=true`, then the
+    /// body ends. `WriteRequestStreamWrapper::next()` yields `None`.
+    FinishWrite,
+    /// The client half-closes (h2 END_STREAM) without ever sending
+    /// `finish_write=true`. The body ends with no finish flag, so the
+    /// wrapper translates the inner `Poll::Ready(None)` into
+    /// `Err(Code::Cancelled)` (proto_stream_utils.rs:538). This is the
+    /// F1-A landmine path.
+    HalfClose,
+}
+
+/// A `hyper::body::Body` that yields a fixed sequence of pre-encoded
+/// `WriteRequest` frames and counts how many it has actually handed out
+/// (i.e. how many the server consumed). The shared counter is the
+/// production-composition observable: with the F1 drain, the server polls
+/// EVERY frame to the terminal before returning; without it, the server
+/// short-circuits and leaves the late frames un-consumed.
+///
+/// Bounded by construction (a finite, test-supplied `VecDeque`); no
+/// network path, test-only.
+struct TrackingInboundBody {
+    frames: VecDeque<Frame<Bytes>>,
+    /// Bumped once per `poll_frame` that returns a real frame.
+    consumed: Arc<AtomicUsize>,
+}
+
+impl hyper::body::Body for TrackingInboundBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.frames.pop_front() {
+            Some(frame) => {
+                self.consumed.fetch_add(1, AtomicOrdering::SeqCst);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+/// Build a `Streaming<WriteRequest>` that uploads `data` for `digest`
+/// across `1 + extra_data_frames` DATA frames, then closes per
+/// `terminal`. Returns the streaming handle plus the shared consumed
+/// counter and the total frame count the server SHOULD reach if it drains
+/// to the terminal.
+///
+/// The first frame is `finish_write=false` so the upload takes the
+/// streaming (non-oneshot) path through `bytestream_write` — the path
+/// that contains both early-return short-circuits.
+fn make_tracking_inbound_stream(
+    resource_name: &str,
+    data: &Bytes,
+    extra_data_frames: usize,
+    terminal: InboundTerminal,
+) -> (Streaming<WriteRequest>, Arc<AtomicUsize>, usize) {
+    // Split `data` across (1 + extra_data_frames) chunks so every frame
+    // carries some payload; the last DATA frame sets finish_write per the
+    // terminal shape.
+    let total_data_frames = 1 + extra_data_frames;
+    let mut frames: VecDeque<Frame<Bytes>> = VecDeque::new();
+    let chunk_len = data.len().div_ceil(total_data_frames).max(1);
+    let mut offset = 0usize;
+    for i in 0..total_data_frames {
+        let start = offset.min(data.len());
+        let end = (offset + chunk_len).min(data.len());
+        offset = end;
+        let is_last = i == total_data_frames - 1;
+        let finish_write = is_last && terminal == InboundTerminal::FinishWrite;
+        let req = WriteRequest {
+            resource_name: resource_name.to_string(),
+            write_offset: start as i64,
+            finish_write,
+            data: data.slice(start..end),
+        };
+        frames.push_back(Frame::data(
+            encode_stream_proto(&req).expect("encode write request"),
+        ));
+    }
+    let expected_consumed = frames.len();
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let body = TrackingInboundBody {
+        frames,
+        consumed: Arc::clone(&consumed),
+    };
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    let stream = Streaming::new_request(codec.decoder(), body, None, None);
+    (stream, consumed, expected_consumed)
+}
+
+/// Shared assertion for the two G1 (already-exists short-circuit) cases:
+/// pre-populate `main_cas` so `store.has(digest)` returns Some → the G1
+/// arm at `bytestream_server.rs:3259` fires; drive a streaming upload
+/// that keeps sending DATA after the short-circuit point; assert the
+/// server returns the `WriteResponse` AND consumed every inbound frame
+/// (drained to the terminal — no forgotten-stream condition).
+async fn assert_g1_already_exists_drains(terminal: InboundTerminal) {
+    const BLOB: &[u8] = b"f1-already-exists-blob-drain-test-payload-0123456789ABCDEF";
+    // 6 extra DATA frames after the first — these are the "client keeps
+    // sending after the server short-circuits" frames the un-drained path
+    // would reap.
+    const EXTRA_DATA_FRAMES: usize = 6;
+
+    let store_manager = make_store_manager().await.expect("store manager");
+    let store = store_manager.get_store("main_cas").expect("main_cas");
+    let digest = DigestInfo::try_new(HASH1, BLOB.len()).expect("digest");
+
+    // Pre-populate so the already-exists short-circuit (G1) fires:
+    // `store.has(digest)` returns Some and the store is not a FastSlowStore
+    // (so `is_chunked_in_flight` is false) → the `:3259` arm is taken.
+    store
+        .update_oneshot(digest, Bytes::from_static(BLOB))
+        .await
+        .expect("pre-populate blob");
+
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("server"),
+    );
+
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, "f1111111-1111-1111-1111-111111111111", HASH1, BLOB.len(),
+    );
+    let data = Bytes::from_static(BLOB);
+    let (stream, consumed, expected_consumed) =
+        make_tracking_inbound_stream(&resource_name, &data, EXTRA_DATA_FRAMES, terminal);
+
+    // The deadlock detector: a drain that never reaches the terminal (or a
+    // hang) trips this with a bespoke message rather than hanging the suite.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bs_server.write(Request::new(stream)),
+    )
+    .await
+    .expect("G1 already-exists drain must not hang — drain failed to reach inbound EOF")
+    .expect("G1 already-exists short-circuit must return Ok(WriteResponse)");
+
+    assert_eq!(
+        response.into_inner(),
+        WriteResponse {
+            committed_size: BLOB.len() as i64,
+        },
+        "G1 short-circuit must report the full declared size as committed",
+    );
+
+    // THE F1 CONTRACT: the server must have drained the inbound stream to
+    // its terminal before returning. If the drain is absent, the server
+    // short-circuits after the first frame's has()-check and the late DATA
+    // frames are left un-consumed → in production those land on the
+    // forgotten/reaped h2 stream as STREAM_CLOSED resets.
+    assert_eq!(
+        consumed.load(AtomicOrdering::SeqCst),
+        expected_consumed,
+        "F1 drain missing on the G1 already-exists short-circuit \
+         (bytestream_server.rs:3259): the server returned WriteResponse \
+         without consuming all {expected_consumed} inbound frames \
+         (consumed {} of {expected_consumed}) — late inbound DATA would \
+         hit the reaped h2 stream as a counting STREAM_CLOSED reset \
+         (terminal={terminal:?})",
+        consumed.load(AtomicOrdering::SeqCst),
+    );
+}
+
+/// G1 already-exists short-circuit, `finish_write=true` terminal: the
+/// server must drain the inbound stream to EOF before returning.
+#[nativelink_test]
+pub async fn f1_g1_already_exists_drains_inbound_finish_write()
+-> Result<(), Box<dyn core::error::Error>> {
+    assert_g1_already_exists_drains(InboundTerminal::FinishWrite).await;
+    Ok(())
+}
+
+/// G1 already-exists short-circuit, HALF-CLOSE terminal (h2 END_STREAM
+/// without finish_write=true — the F1-A landmine): the wrapper yields
+/// `Err(Code::Cancelled)` at the terminal; the drain MUST treat that as
+/// drain-complete and still consume every inbound frame.
+#[nativelink_test]
+pub async fn f1_g1_already_exists_drains_inbound_half_close()
+-> Result<(), Box<dyn core::error::Error>> {
+    assert_g1_already_exists_drains(InboundTerminal::HalfClose).await;
+    Ok(())
+}
+
+/// G1b in-flight dedup-coalesce success: a primary writer commits the
+/// blob; a second writer for the same digest coalesces onto it and hits
+/// the dedup-coalesce success return at `bytestream_server.rs:3336`. The
+/// second writer keeps sending DATA after the coalesce point; the server
+/// must drain its inbound stream to the terminal before returning.
+async fn assert_g1b_dedup_coalesce_drains(terminal: InboundTerminal) {
+    const BLOB: &[u8] = b"f1-dedup-coalesce-blob-drain-test-payload-0123456789ABCDEF01";
+    const EXTRA_DATA_FRAMES: usize = 6;
+
+    let store_manager = make_store_manager().await.expect("store manager");
+    let store = store_manager.get_store("main_cas").expect("main_cas");
+    let digest = DigestInfo::try_new(HASH1, BLOB.len()).expect("digest");
+    let data = Bytes::from_static(BLOB);
+
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("server"),
+    );
+
+    // PRIMARY writer: a normal streaming write that commits the blob and
+    // publishes Ok to the in_flight_writes watch channel. We drive it to
+    // completion FIRST so the coalescing second writer observes a
+    // committed Some(true) outcome and takes the G1b success return.
+    //
+    // To make the second writer coalesce (not short-circuit on has()), the
+    // store must NOT already contain the blob when the second writer's
+    // has() runs but the primary's outcome must be observable. We arrange
+    // this by inserting the in_flight_writes entry via the primary, then
+    // releasing the primary so its result is published, then driving the
+    // second writer. The deterministic ordering uses the primary's own
+    // commit: after the primary returns Ok, the blob IS in the store — so
+    // to force the G1b path specifically (coalesce, not has-short-circuit)
+    // we instead keep the primary in-flight while the second arrives.
+    let primary_uuid = "e0000000-0000-0000-0000-0000000000a1";
+    let primary_resource = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, primary_uuid, HASH1, BLOB.len(),
+    );
+    let (primary_tx, primary_stream) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_primary = bs_server.clone();
+    let primary_handle = spawn!("f1_primary_write", async move {
+        bs_primary.write(Request::new(primary_stream)).await
+    });
+
+    // Primary sends a partial frame (does NOT finish) → it becomes the
+    // primary in in_flight_writes and parks awaiting more data.
+    let primary_partial = WriteRequest {
+        resource_name: primary_resource.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: data.slice(..10),
+    };
+    primary_tx
+        .send(Frame::data(encode_stream_proto(&primary_partial).expect("encode")))
+        .await
+        .expect("primary partial send");
+    yield_now().await;
+    yield_now().await;
+
+    // SECOND writer (the one under test): same digest, different UUID.
+    // It finds the primary in in_flight_writes and coalesces. We give it a
+    // tracking inbound stream with extra DATA frames after the first.
+    let second_resource = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, "e0000000-0000-0000-0000-0000000000a2", HASH1, BLOB.len(),
+    );
+    let (second_stream, consumed, expected_consumed) =
+        make_tracking_inbound_stream(&second_resource, &data, EXTRA_DATA_FRAMES, terminal);
+    let bs_second = bs_server.clone();
+    let second_handle = spawn!("f1_second_write", async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            bs_second.write(Request::new(second_stream)),
+        )
+        .await
+    });
+    yield_now().await;
+    yield_now().await;
+
+    // Now finish the primary so it commits and publishes Ok(true) to the
+    // coalesced second writer.
+    let primary_final = WriteRequest {
+        resource_name: primary_resource,
+        write_offset: 10,
+        finish_write: true,
+        data: data.slice(10..),
+    };
+    primary_tx
+        .send(Frame::data(encode_stream_proto(&primary_final).expect("encode")))
+        .await
+        .expect("primary final send");
+    drop(primary_tx);
+
+    let primary_result = primary_handle.await.expect("primary panicked");
+    assert!(
+        primary_result.is_ok(),
+        "primary writer must commit the blob: {:?}",
+        primary_result.err(),
+    );
+
+    let second_result = second_handle
+        .await
+        .expect("second writer panicked")
+        .expect("G1b second writer must not hang — drain failed to reach inbound EOF");
+
+    // The second writer must have either coalesced (G1b @3336) or done its
+    // own write; EITHER way, with F1 it must have drained its inbound
+    // stream. We assert success + full consumption. If it coalesced, the
+    // drain at the G1b return consumed the frames; if it raced and did its
+    // own write, the normal path consumed them. The load-bearing assertion
+    // is full consumption (no reaped-stream condition).
+    let second_response = second_result
+        .expect("second writer must return Ok(WriteResponse)");
+    assert_eq!(
+        second_response.into_inner(),
+        WriteResponse {
+            committed_size: BLOB.len() as i64,
+        },
+        "G1b coalesced writer must report the full declared size as committed",
+    );
+
+    assert_eq!(
+        consumed.load(AtomicOrdering::SeqCst),
+        expected_consumed,
+        "F1 drain missing on the G1b dedup-coalesce success return \
+         (bytestream_server.rs:3336): the coalesced second writer returned \
+         WriteResponse without consuming all {expected_consumed} inbound \
+         frames (consumed {} of {expected_consumed}) — late inbound DATA \
+         would hit the reaped h2 stream as a counting STREAM_CLOSED reset \
+         (terminal={terminal:?})",
+        consumed.load(AtomicOrdering::SeqCst),
+    );
+}
+
+/// G1b dedup-coalesce with finish_write terminal.
+#[nativelink_test]
+pub async fn f1_g1b_dedup_coalesce_drains_inbound_finish_write()
+-> Result<(), Box<dyn core::error::Error>> {
+    assert_g1b_dedup_coalesce_drains(InboundTerminal::FinishWrite).await;
+    Ok(())
+}
+
+/// G1b dedup-coalesce with HALF-CLOSE terminal (F1-A landmine on the
+/// dedup path).
+#[nativelink_test]
+pub async fn f1_g1b_dedup_coalesce_drains_inbound_half_close()
+-> Result<(), Box<dyn core::error::Error>> {
+    assert_g1b_dedup_coalesce_drains(InboundTerminal::HalfClose).await;
+    Ok(())
+}
+
+/// Over-cap: a client that streams MORE than `declared + 4 MiB` slack on
+/// the G1 short-circuit drain must trip the drain's OWN cumulative size cap
+/// and surface an error rather than buffering the over-claim. Mirrors the
+/// bound in `bounded_drain_grpc_stream` (declared +
+/// EARLY_DEDUP_DRAIN_SIZE_SLACK).
+///
+/// SUBTLETY: `WriteRequestStreamWrapper` already rejects a frame whose
+/// high-watermark `write_offset + data.len()` exceeds `expected_size`
+/// ("sent too much data", proto_stream_utils.rs:567). That check is on the
+/// per-frame high-watermark, NOT cumulative bytes. A pathological producer
+/// that re-sends frames ALL at `write_offset=0` with `data.len() ==
+/// declared` keeps the high-watermark pinned at `declared` (the wrapper
+/// never trips) while streaming unboundedly many frames — this is the
+/// replayed-prefix / offset-rewind abuse shape. The drain's OWN cumulative
+/// `consumed` cap is the load-bearing bound that catches it. This test
+/// drives exactly that shape so the failure is attributable to the drain
+/// cap, not the wrapper.
+#[nativelink_test]
+pub async fn f1_g1_drain_over_cap_returns_err()
+-> Result<(), Box<dyn core::error::Error>> {
+    // Declared digest size; each frame re-sends exactly this many bytes at
+    // write_offset=0 so the wrapper's high-watermark stays == declared and
+    // never trips, but the drain's cumulative consumed grows per frame.
+    const DECLARED: usize = 64 * 1024;
+    const SLACK: usize = 4 * 1024 * 1024;
+    // frames * DECLARED must exceed DECLARED + SLACK. 70 * 64KiB = 4.375 MiB
+    // > 64KiB + 4 MiB = 4.0625 MiB.
+    const NUM_FRAMES: usize = 70;
+
+    let store_manager = make_store_manager().await?;
+    let store = store_manager.get_store("main_cas").expect("main_cas");
+    // Populate the declared digest so the G1 short-circuit fires (has()
+    // Some) and the drain runs.
+    let digest = DigestInfo::try_new(HASH1, DECLARED)?;
+    store
+        .update_oneshot(digest, Bytes::from(vec![0u8; DECLARED]))
+        .await
+        .expect("pre-populate declared blob");
+
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("server"),
+    );
+
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, "f2222222-2222-2222-2222-222222222222", HASH1, DECLARED,
+    );
+    // Every frame: write_offset=0, data.len()=DECLARED, finish_write=false.
+    // The wrapper's high-watermark stays at DECLARED (no "sent too much
+    // data"); the drain's cumulative consumed crosses DECLARED + 4 MiB.
+    let chunk = Bytes::from(vec![7u8; DECLARED]);
+    let mut frames: VecDeque<Frame<Bytes>> = VecDeque::new();
+    for _ in 0..NUM_FRAMES {
+        let req = WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: 0,
+            finish_write: false,
+            data: chunk.clone(),
+        };
+        frames.push_back(Frame::data(encode_stream_proto(&req)?));
+    }
+    let consumed_counter = Arc::new(AtomicUsize::new(0));
+    let body = TrackingInboundBody {
+        frames,
+        consumed: Arc::clone(&consumed_counter),
+    };
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    // Allow large decoded messages so the 64 KiB frames aren't rejected by
+    // the codec before the drain's cap can engage.
+    let stream = Streaming::new_request(codec.decoder(), body, None, Some(16 * 1024 * 1024));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bs_server.write(Request::new(stream)),
+    )
+    .await
+    .expect("over-cap drain must not hang");
+
+    let err = result.expect_err(
+        "F1 over-cap drain must return Err: the client streamed more than \
+         declared + 4 MiB slack (cumulative) on the G1 short-circuit drain; \
+         the drain's own cumulative cap must trip rather than buffer the \
+         over-claim",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeded declared size") && msg.contains("cap="),
+        "over-cap error must name the DRAIN cap trip, not the wrapper's \
+         high-watermark check (got: {msg})",
+    );
+
+    Ok(())
+}

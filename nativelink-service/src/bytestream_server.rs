@@ -81,6 +81,124 @@ const DEFAULT_MAX_BYTES_PER_STREAM: usize = 3 * 1024 * 1024;
 /// Default memory budget for partial (idle) writes: 256 MiB.
 const DEFAULT_MAX_PARTIAL_WRITE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// F1 (worker-durability EYC->zero): per-`recv` no-progress deadline for
+/// the early-return inbound drain. Mirrors
+/// `chunked_write_handler::EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT` (15 s).
+/// This is a PER-RECV timer, NOT a whole-RPC / per-RPC deadline (operator
+/// directive: no per-RPC timeouts on internal RPCs; liveness is transport
+/// keepalive). A steadily-streaming producer resets it every frame; only
+/// a stalled producer trips it (surfacing `Code::DeadlineExceeded` instead
+/// of holding the drain forever).
+const EARLY_RETURN_DRAIN_PER_RECV_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// F1: hard cap on bytes consumed by the early-return inbound drain. The
+/// producer declared `digest.size_bytes()`; a well-behaved producer sends
+/// exactly that. We allow a small slack for protocol framing overhead.
+/// Anything beyond declared + slack is a malicious / buggy producer
+/// claiming a small digest while streaming a large payload — abort with
+/// `Code::InvalidArgument` rather than let the bytes accumulate. Mirrors
+/// `chunked_write_handler::EARLY_DEDUP_DRAIN_SIZE_SLACK` (4 MiB).
+const EARLY_RETURN_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
+
+/// F1 — drain a `WriteRequestStreamWrapper` to its terminal (h2
+/// END_STREAM) before returning a `WriteResponse` on an early-return
+/// path, with bounded resource use.
+///
+/// **Why this exists (worker-durability EYC->zero):** `bytestream_write`
+/// has two no-drain `WriteResponse` early-returns — the already-exists
+/// short-circuit (G1) and the in-flight dedup-coalesce success (G1b).
+/// Returning the response while the worker is still uploading drops the
+/// `RecvStream`; h2's `maybe_cancel` (`streams.rs:1578`) then RSTs +
+/// FORGETS the stream because the reap-gate `ref_count == 0 &&
+/// !state.is_closed()` is TRUE (the recv side never reached END_STREAM).
+/// The worker's in-flight DATA then lands on the forgotten stream as a
+/// budget-counting `library_reset(STREAM_CLOSED)` → 1024 budget →
+/// `GoAway(ENHANCE_YOUR_CALM)`. Polling the inbound stream to END_STREAM
+/// first flips `state.is_closed()` TRUE → the reap-gate is FALSE → no
+/// forget → no counting reset (eBPF-confirmed 99.976% of the feeder
+/// reaps).
+///
+/// **F1-A (the half-close landmine):** `WriteRequestStreamWrapper::next()`
+/// returns `Err(Code::Cancelled)` — NOT `None` — when the client
+/// half-closes (h2 END_STREAM without `finish_write=true`; Bazel
+/// local-execution-wins, `proto_stream_utils.rs:538`). For the reap-gate
+/// what matters is that the INNER h2 stream reached END_STREAM, which it
+/// did in BOTH cases. So a terminal `Err(Code::Cancelled)` is treated as
+/// drain-COMPLETE (success). Any OTHER terminal `Err` is surfaced.
+///
+/// **Bounds (copied from `bounded_drain_grpc_stream`):**
+/// 1. Per-`recv` no-progress timeout of [`EARLY_RETURN_DRAIN_PER_RECV_TIMEOUT`]
+///    (`Code::DeadlineExceeded` on a stalled producer); NOT a whole-drain
+///    deadline.
+/// 2. Size cap of `declared + EARLY_RETURN_DRAIN_SIZE_SLACK`
+///    (`Code::InvalidArgument` on over-claim). The drain DISCARDS every
+///    frame (it counts `data.len()` then drops the `WriteRequest`); there
+///    is NO `Vec<Bytes>` buffer.
+///
+/// Returns `Ok(())` on clean terminal (finish_write EOF / half-close); Err
+/// otherwise.
+async fn drain_write_request_stream_to_eof<T, E>(
+    stream: &mut WriteRequestStreamWrapper<T>,
+    declared_size: u64,
+) -> Result<(), Error>
+where
+    T: Stream<Item = Result<WriteRequest, E>> + Unpin,
+    E: Into<Error>,
+{
+    let cap = declared_size.saturating_add(EARLY_RETURN_DRAIN_SIZE_SLACK);
+    // CAPPED AT declared+4MiB: bounded per-frame discard sink — `consumed`
+    // is a running byte count, not a buffer; each polled `WriteRequest` is
+    // counted then dropped. The cap bounds total bytes pulled from the
+    // worker so an over-claiming producer surfaces InvalidArgument rather
+    // than letting bytes accumulate (the #203 cascade shape). No owned
+    // bytes are retained across iterations.
+    let mut consumed: u64 = 0;
+    loop {
+        let next_fut = stream.next();
+        let item = match tokio::time::timeout(EARLY_RETURN_DRAIN_PER_RECV_TIMEOUT, next_fut).await {
+            Ok(item) => item,
+            Err(_) => {
+                return Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "early-return drain: no progress for {EARLY_RETURN_DRAIN_PER_RECV_TIMEOUT:?} \
+                     (consumed={consumed} declared={declared_size})",
+                ));
+            }
+        };
+        match item {
+            // Clean EOF: the producer sent `finish_write=true` and the
+            // wrapper reached its end. The inner h2 stream is at
+            // END_STREAM.
+            None => return Ok(()),
+            Some(Ok(req)) => {
+                consumed = consumed.saturating_add(req.data.len() as u64);
+                if consumed > cap {
+                    return Err(make_err!(
+                        Code::InvalidArgument,
+                        "early-return drain: producer exceeded declared size \
+                         (consumed={consumed} declared={declared_size} cap={cap})"
+                    ));
+                }
+            }
+            // `WriteRequestStreamWrapper::next()` yields the concrete
+            // nativelink `Error` (it maps the inner `E: Into<Error>`
+            // internally), so `err` is already an `Error` here.
+            Some(Err(err)) => {
+                // F1-A: a half-close (h2 END_STREAM without
+                // finish_write=true) surfaces here as `Code::Cancelled`
+                // from the wrapper. The inner stream DID reach END_STREAM,
+                // so the reap-gate is satisfied — treat it as
+                // drain-complete. Any other terminal error is a real
+                // stream failure; surface it.
+                if err.code == Code::Cancelled {
+                    return Ok(());
+                }
+                return Err(err.append("early-return drain: inbound stream errored mid-drain"));
+            }
+        }
+    }
+}
+
 /// Saturating decrement for an `AtomicU64`. Prevents wrapping to `u64::MAX`
 /// if concurrent `fetch_sub` calls race (e.g., sweeper eviction + stream resume).
 #[inline]
@@ -3150,7 +3268,11 @@ impl ByteStreamServer {
     async fn bytestream_write(
         &self,
         start_time: Instant,
-        stream: WriteRequestStreamWrapper<
+        // `mut` so the two no-drain early-return paths (G1 already-exists
+        // short-circuit, G1b in-flight dedup-coalesce) can drain the
+        // inbound stream to EOF before returning (F1 — see
+        // `drain_write_request_stream_to_eof`).
+        mut stream: WriteRequestStreamWrapper<
             impl Stream<Item = Result<WriteRequest, Status>> + Unpin + Send + 'static,
         >,
         zero_copy: bool,
@@ -3256,6 +3378,20 @@ impl ByteStreamServer {
                 arm_name = "server_has_short_circuit",
                 "#62 ByteStream::Write: server returning WriteResponse (already-exists short-circuit)",
             );
+            // F1 (worker-durability EYC->zero): drain the inbound stream to
+            // h2 END_STREAM BEFORE returning. Without this, returning here
+            // drops the RecvStream while the worker is still uploading; h2
+            // reaps + FORGETS the stream (reap-gate `ref_count==0 &&
+            // !is_closed()` TRUE) and the worker's in-flight DATA lands on
+            // the forgotten stream as a counting STREAM_CLOSED reset →
+            // 1024 budget → GoAway(ENHANCE_YOUR_CALM). The already-resident
+            // bytes are discardable (the blob already exists), so this is a
+            // bounded discard sink, NOT a read-into-memory.
+            drain_write_request_stream_to_eof(&mut stream, expected_size)
+                .await
+                .err_tip(|| {
+                    "draining inbound stream on already-exists short-circuit (F1)"
+                })?;
             return Ok(Response::new(WriteResponse {
                 committed_size: expected_size as i64,
             }));
@@ -3333,6 +3469,18 @@ impl ByteStreamServer {
                         arm_name = "server_dedup_coalesce_ok",
                         "#62 ByteStream::Write: server returning WriteResponse (in-flight dedup coalesce)",
                     );
+                    // F1 (worker-durability EYC->zero): drain the inbound
+                    // stream to h2 END_STREAM BEFORE returning the coalesced
+                    // response. Same reap-gate hazard as the already-exists
+                    // short-circuit above — this RPC's bytes are redundant
+                    // (the primary writer already committed the blob), so a
+                    // bounded discard sink. The dedup lock was released at
+                    // `drop(guard)` above, so this `.await` holds no lock.
+                    drain_write_request_stream_to_eof(&mut stream, expected_size)
+                        .await
+                        .err_tip(|| {
+                            "draining inbound stream on in-flight dedup-coalesce (F1)"
+                        })?;
                     return Ok(Response::new(WriteResponse {
                         committed_size: expected_size as i64,
                     }));
