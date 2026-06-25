@@ -192,6 +192,45 @@ pub struct WorkerProxyStore {
     ///
     /// Published under: `<store_key>_wps_cas_and_peer_notfound_total_counter`.
     wps_cas_and_peer_notfound_total: CounterWithTime,
+    /// (#p2p-metrics Option B-server) Bare `AtomicU64` (not `CounterWithTime`)
+    /// so the rendered Prometheus name is the clean `_total` literal with no
+    /// `_counter`/`_last_time` suffix artifact — the headline ratio wants a
+    /// single counter line per outcome. The three `wps_worker_read_*` fields
+    /// partition every WORKER-origin read (`IS_WORKER_REQUEST=true`) on the
+    /// SERVER-side WPS sequential path (`race_peers=false`) into the terminal
+    /// outcome the server steered it to. All three are incremented ONLY when
+    /// `is_worker == true`; a Bazel-origin read bumps none.
+    ///
+    /// **`wps_worker_read_inner_hit_total`** — a worker read served from the
+    /// server's OWN inner CAS (`get_part_sequential` returned `Ok(())` from
+    /// `self.inner.get_part`; the blob was present locally, so no peer was
+    /// consulted).
+    ///
+    /// **Denominator = inner_hit + redirected_to_peer + no_source; headline =
+    /// `redirected_to_peer / denominator`.** This is server REDIRECT-INTENT,
+    /// NOT confirmed worker-side P2P delivery: a redirect means the worker
+    /// *will then* fetch from a peer, but the byte transfer happens worker→peer
+    /// and is invisible here. It ALSO misses worker↔worker reads that bypass
+    /// the server entirely (the worker-side WPS races peers and may never ask
+    /// the server). Option C (worker-side `/metrics`) is the literal number.
+    wps_worker_read_inner_hit_total: AtomicU64,
+    /// (#p2p-metrics Option B-server) A worker read the server steered to a
+    /// peer: inner CAS missed and at least one peer holds the blob in the
+    /// locality map, so `get_part_sequential` returned a `REDIRECT_PREFIX`
+    /// `FailedPrecondition` telling the worker to fetch P2P. This is the
+    /// NUMERATOR of the headline ratio. Counts server REDIRECT-INTENT only —
+    /// not whether the worker's subsequent P2P fetch actually delivered bytes
+    /// (a redirected peer may have evicted the blob between BlobsAvailable
+    /// registration and the worker's fetch). See `wps_worker_read_inner_hit_total`.
+    wps_worker_read_redirected_to_peer_total: AtomicU64,
+    /// (#p2p-metrics Option B-server) A worker read with no source: inner CAS
+    /// missed AND no peer holds the blob in the locality map, so the server
+    /// returned NotFound with nothing to steer to. Part of the headline
+    /// denominator. Distinct from `wps_cas_and_peer_notfound_total` (which
+    /// fires on the non-worker proxy path after all worker fetches fail);
+    /// this counts the SERVER-side `is_worker` no-peers NotFound arm of
+    /// `get_part_sequential`. See `wps_worker_read_inner_hit_total`.
+    wps_worker_read_no_source_total: AtomicU64,
     /// #130 — singleflight/dedup map for concurrent same-digest peer
     /// fetches. Collapses the "N callers, same digest, ms apart" cohort
     /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
@@ -709,6 +748,40 @@ impl MetricsComponent for WorkerProxyStore {
              Cross-reference worker_proxy_peer_fetch_notfound_total to distinguish \
              sub-cases. See field doc-comment for triage guide."
         );
+        // (#p2p-metrics Option B-server) The three worker-read redirect-intent
+        // counters. Bare AtomicU64 ⇒ rendered as the clean `_total` literal
+        // (no CounterWithTime `_counter`/`_last_time` suffix). Help text states
+        // these are server REDIRECT-INTENT, not confirmed worker P2P delivery.
+        publish!(
+            "wps_worker_read_inner_hit_total",
+            &self.wps_worker_read_inner_hit_total,
+            MetricKind::Counter,
+            "Option B-server: WORKER-origin reads the server served from its OWN \
+             inner CAS (no peer consulted). Part of the headline denominator \
+             (inner_hit + redirected_to_peer + no_source). Increments only when \
+             IS_WORKER_REQUEST=true on the server-side WPS (race_peers=false)."
+        );
+        publish!(
+            "wps_worker_read_redirected_to_peer_total",
+            &self.wps_worker_read_redirected_to_peer_total,
+            MetricKind::Counter,
+            "Option B-server: WORKER-origin reads the server steered to a peer via \
+             REDIRECT_PREFIX (numerator of redirected/sum). This is server \
+             REDIRECT-INTENT — the worker WILL THEN fetch P2P, but the byte \
+             transfer is worker→peer and invisible here; a redirected peer may \
+             have evicted the blob before the worker's fetch. ALSO misses \
+             worker↔worker reads that bypass the server. Option C (worker-side \
+             /metrics) is the literal P2P-delivery number."
+        );
+        publish!(
+            "wps_worker_read_no_source_total",
+            &self.wps_worker_read_no_source_total,
+            MetricKind::Counter,
+            "Option B-server: WORKER-origin reads with no source — inner CAS missed \
+             AND no peer holds the blob, so the server returned NotFound with \
+             nothing to steer to. Part of the headline denominator. Increments \
+             only when IS_WORKER_REQUEST=true on the server-side WPS."
+        );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
         // outside the lock so we never hold it across the macro's tracing
@@ -968,6 +1041,9 @@ impl WorkerProxyStore {
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
             worker_proxy_peer_fetch_notfound_total: CounterWithTime::default(),
             wps_cas_and_peer_notfound_total: CounterWithTime::default(),
+            wps_worker_read_inner_hit_total: AtomicU64::new(0),
+            wps_worker_read_redirected_to_peer_total: AtomicU64::new(0),
+            wps_worker_read_no_source_total: AtomicU64::new(0),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -1000,6 +1076,9 @@ impl WorkerProxyStore {
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
             worker_proxy_peer_fetch_notfound_total: CounterWithTime::default(),
             wps_cas_and_peer_notfound_total: CounterWithTime::default(),
+            wps_worker_read_inner_hit_total: AtomicU64::new(0),
+            wps_worker_read_redirected_to_peer_total: AtomicU64::new(0),
+            wps_worker_read_no_source_total: AtomicU64::new(0),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -2801,6 +2880,12 @@ impl WorkerProxyStore {
         length: Option<u64>,
     ) -> Result<(), Error> {
         let mut redirect_endpoints: Option<Vec<String>> = None;
+        // (#p2p-metrics Option B-server) Capture the OUTER caller's
+        // IS_WORKER_REQUEST value ONCE, before the inner.get_part call below
+        // re-scopes it to `true` for its own duration. Read here (not after the
+        // match) so the inner-hit `Ok(())` arm can gate its B-server counter on
+        // the same value the redirect/no-source arms use further down.
+        let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
         // Capture the writer's byte position BEFORE calling the inner store.
         // If the inner store streams partial bytes and then errors with a
         // peer-fallback-eligible code (e.g. mid-stream Internal/DataLoss/
@@ -2844,7 +2929,17 @@ impl WorkerProxyStore {
             "WorkerProxyStore::get_part_sequential: inner.get_part returned"
         );
         match inner_result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // (#p2p-metrics Option B-server) inner CAS served the blob; for
+                // a WORKER-origin read this is the "server kept it locally, did
+                // not steer to a peer" outcome. Gate on `is_worker` so Bazel
+                // reads (the common case) do not pollute the P2P denominator.
+                if is_worker {
+                    self.wps_worker_read_inner_hit_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             Err(e) if should_try_peers(e.code) => {
                 let bytes_written_by_inner =
                     writer.get_bytes_written() - bytes_before_inner;
@@ -2949,7 +3044,8 @@ impl WorkerProxyStore {
             }
         }
 
-        let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
+        // `is_worker` was captured at the top of this function (before the
+        // inner.get_part re-scoped IS_WORKER_REQUEST). Reuse it here.
 
         if let Some(endpoints) = redirect_endpoints {
             // For worker requests, pass the redirect through instead of
@@ -3059,6 +3155,12 @@ impl WorkerProxyStore {
                 .map(|p| p.to_string())
                 .collect();
             if !peers.is_empty() {
+                // (#p2p-metrics Option B-server) server steered this WORKER
+                // read to a peer — the numerator of the headline redirect ratio.
+                // This whole arm is already inside `if is_worker` and past the
+                // `race_peers=false` (server-side) guard, so no extra gate.
+                self.wps_worker_read_redirected_to_peer_total
+                    .fetch_add(1, Ordering::Relaxed);
                 let ep_str = peers.join(",");
                 debug!(
                     ?digest,
@@ -3077,6 +3179,12 @@ impl WorkerProxyStore {
                 writer.send_error(err.clone());
                 return Err(err);
             }
+            // (#p2p-metrics Option B-server) server-side WORKER read with no
+            // source — inner CAS missed and no peer holds the blob, so there is
+            // nothing to steer to. Part of the headline denominator. Gated by
+            // the enclosing `if is_worker` + server-side `race_peers=false`.
+            self.wps_worker_read_no_source_total
+                .fetch_add(1, Ordering::Relaxed);
             let err = Error::not_found_with_detail(
                 format!(
                     "Blob {digest:?} not found in inner store or any peer (worker request)"
@@ -6940,6 +7048,326 @@ mod tests {
             matches!(outcome, MirrorConfirmOutcome::Failed(_)),
             "all-peers-fail must yield Failed (refuse to ack <2 replicas) — \
              got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // B-server redirect-intent counters (#p2p-metrics Option B-server)
+    //
+    // Three worker-gated counters on the SERVER-side WPS sequential path
+    // (`race_peers=false`) partition every `is_worker` read into the
+    // terminal outcome the server steered it to:
+    //   - inner-hit       (`get_part_sequential` Ok(()) from inner CAS)
+    //   - redirected      (server returned REDIRECT_PREFIX → worker P2P)
+    //   - no-source       (no peer + inner miss → NotFound)
+    // Headline = redirected / (inner_hit + redirected + no_source).
+    //
+    // Production composition: server-side WPS is the outermost CAS store
+    // wrapper (`nativelink.rs` `add_store`), registered into the served
+    // `/metrics` tree via `register("nativelink", store_manager)`. Worker
+    // reads arrive with `IS_WORKER_REQUEST=true` set by the server's
+    // bytestream_server; `race_peers=false` so they all flow through
+    // `get_part_sequential` (the `peers.is_empty()` branch of `get_part`).
+    //
+    // Helper: read the three B-server counters as a tuple snapshot.
+    fn read_bserver_counters(
+        proxy: &WorkerProxyStore,
+    ) -> (u64, u64, u64) {
+        (
+            proxy
+                .wps_worker_read_inner_hit_total
+                .load(Ordering::Relaxed),
+            proxy
+                .wps_worker_read_redirected_to_peer_total
+                .load(Ordering::Relaxed),
+            proxy
+                .wps_worker_read_no_source_total
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    // inner-hit: server served the blob from its OWN inner CAS for an
+    // is_worker read → ONLY wps_worker_read_inner_hit_total increments.
+    //
+    // Mutation guard: comment out the `inner_hit` increment in the
+    // `Ok(())` arm of `get_part_sequential`; this test red-fails with
+    // "B-server inner-hit counter must increment ...".
+    #[nativelink_test]
+    async fn test_worker_read_inner_hit_counter() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        // race_peers OFF → server-side WPS sequential path.
+        let proxy_arc = WorkerProxyStore::new(inner.clone(), locality_map);
+        let store = Store::new(proxy_arc.clone());
+
+        let value = b"served from server inner cas";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+        inner
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+
+        let (h0, r0, n0) = read_bserver_counters(&proxy_arc);
+
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            IS_WORKER_REQUEST.scope(true, store.get_part_unchunked(digest, 0, None)),
+        )
+        .await
+        .expect("must not deadlock — inner-hit get_part completes within 5s")?;
+        assert_eq!(result.as_ref(), value, "inner CAS must serve the blob");
+
+        let (h1, r1, n1) = read_bserver_counters(&proxy_arc);
+        assert_eq!(
+            h1 - h0, 1,
+            "B-server inner-hit counter must increment once when an is_worker \
+             read is served from the server's own inner CAS"
+        );
+        assert_eq!(
+            r1 - r0, 0,
+            "redirected counter must NOT increment on an inner-hit read"
+        );
+        assert_eq!(
+            n1 - n0, 0,
+            "no-source counter must NOT increment on an inner-hit read"
+        );
+        Ok(())
+    }
+
+    // redirected-to-peer: inner miss + peer in locality → server returns
+    // REDIRECT_PREFIX (steers the worker to fetch P2P) → ONLY
+    // wps_worker_read_redirected_to_peer_total increments.
+    //
+    // Mutation guard: comment out the `redirected` increment at the
+    // server-side redirect-emit site in `get_part_sequential`; this test
+    // red-fails with "B-server redirected counter must increment ...".
+    #[nativelink_test]
+    async fn test_worker_read_redirected_to_peer_counter() -> Result<(), Error> {
+        let (store, locality_map) = make_proxy_store();
+        // make_proxy_store is server-side (race_peers OFF). Reach the
+        // concrete Arc for counter reads via downcast is not exposed, so
+        // rebuild by hand to keep the Arc.
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map2 = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner, locality_map2.clone());
+        let store2 = Store::new(proxy_arc.clone());
+        drop((store, locality_map));
+
+        let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+        let peer_endpoint = "grpc://peer-worker:50071";
+        locality_map2
+            .write()
+            .register_blobs(peer_endpoint, &[digest]);
+
+        let (h0, r0, n0) = read_bserver_counters(&proxy_arc);
+
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            IS_WORKER_REQUEST.scope(true, store2.get_part_unchunked(digest, 0, None)),
+        )
+        .await
+        .expect("must not deadlock — redirect get_part completes within 5s");
+        let err = result.expect_err("server must return a redirect error");
+        assert_eq!(
+            err.code,
+            Code::FailedPrecondition,
+            "redirect carries FailedPrecondition+REDIRECT_PREFIX"
+        );
+        assert!(
+            err.message_string().contains(REDIRECT_PREFIX),
+            "redirect message must contain REDIRECT_PREFIX"
+        );
+
+        let (h1, r1, n1) = read_bserver_counters(&proxy_arc);
+        assert_eq!(
+            r1 - r0, 1,
+            "B-server redirected counter must increment once when the server \
+             steers an is_worker read to a peer via REDIRECT_PREFIX"
+        );
+        assert_eq!(
+            h1 - h0, 0,
+            "inner-hit counter must NOT increment on a redirect read"
+        );
+        assert_eq!(
+            n1 - n0, 0,
+            "no-source counter must NOT increment on a redirect read"
+        );
+        Ok(())
+    }
+
+    // no-source: inner miss + NO peer in locality → NotFound (server has
+    // nothing to steer to) → ONLY wps_worker_read_no_source_total
+    // increments.
+    //
+    // Mutation guard: comment out the `no_source` increment at the
+    // server-side no-peers NotFound site in `get_part_sequential`; this
+    // test red-fails with "B-server no-source counter must increment ...".
+    #[nativelink_test]
+    async fn test_worker_read_no_source_counter() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner, locality_map);
+        let store = Store::new(proxy_arc.clone());
+
+        let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+        let (h0, r0, n0) = read_bserver_counters(&proxy_arc);
+
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            IS_WORKER_REQUEST.scope(true, store.get_part_unchunked(digest, 0, None)),
+        )
+        .await
+        .expect("must not deadlock — no-source get_part completes within 5s");
+        let err = result.expect_err("server must return NotFound (no source)");
+        assert_eq!(
+            err.code,
+            Code::NotFound,
+            "no-source path returns NotFound, got {err:?}"
+        );
+
+        let (h1, r1, n1) = read_bserver_counters(&proxy_arc);
+        assert_eq!(
+            n1 - n0, 1,
+            "B-server no-source counter must increment once when an is_worker \
+             read has no peer and the inner CAS misses"
+        );
+        assert_eq!(
+            h1 - h0, 0,
+            "inner-hit counter must NOT increment on a no-source read"
+        );
+        assert_eq!(
+            r1 - r0, 0,
+            "redirected counter must NOT increment on a no-source read"
+        );
+        Ok(())
+    }
+
+    // Over-action guard (asymmetric-coverage contract): a Bazel-origin
+    // read (`IS_WORKER_REQUEST=false`) must bump NONE of the three
+    // B-server counters — the denominator counts WORKER-origin reads only.
+    // Exercises both the inner-hit and the miss arms with is_worker=false.
+    //
+    // Mutation guard: drop the `is_worker` gate on any of the three
+    // increments; this test red-fails with the bespoke message naming
+    // the polluted counter.
+    #[nativelink_test]
+    async fn test_bazel_read_bumps_no_p2p_counters() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+        let store = Store::new(proxy_arc.clone());
+
+        // (a) Bazel inner-hit: blob present, is_worker=false.
+        let value = b"bazel read of present blob";
+        let hit_digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+        inner
+            .update_oneshot(hit_digest, Bytes::from_static(value))
+            .await?;
+        // (b) Bazel miss WITH a peer registered (strongest over-action guard:
+        //     a peer IS available, yet a Bazel read must NOT count as a
+        //     redirect because the redirect arm is `is_worker`-gated; the
+        //     server proxies for Bazel instead). Inject an EMPTY in-process
+        //     peer MemoryStore so the proxy resolves instantly (no DNS) and
+        //     returns NotFound — same fixture shape as the existing
+        //     `test_peer_fetch_notfound_counter_increments_on_error_site`.
+        let miss_digest = DigestInfo::try_new(VALID_HASH2, 100)?;
+        let empty_peer = Store::new(MemoryStore::new(&MemorySpec::default()));
+        proxy_arc.inject_worker_connection("grpc://peer-worker:50071", empty_peer);
+        locality_map
+            .write()
+            .register_blobs("grpc://peer-worker:50071", &[miss_digest]);
+
+        let (h0, r0, n0) = read_bserver_counters(&proxy_arc);
+
+        let hit = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            IS_WORKER_REQUEST.scope(false, store.get_part_unchunked(hit_digest, 0, None)),
+        )
+        .await
+        .expect("must not deadlock — bazel inner-hit completes within 5s")?;
+        assert_eq!(hit.as_ref(), value);
+
+        // The miss path proxies to the empty in-process peer and ultimately
+        // errors NotFound; we only care that NO B-server counter moved.
+        let _miss = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            IS_WORKER_REQUEST.scope(false, store.get_part_unchunked(miss_digest, 0, None)),
+        )
+        .await
+        .expect("must not deadlock — bazel miss completes within 5s");
+
+        let (h1, r1, n1) = read_bserver_counters(&proxy_arc);
+        assert_eq!(
+            h1 - h0, 0,
+            "inner-hit counter must NOT increment for a Bazel (is_worker=false) read — \
+             the B-server denominator counts WORKER-origin reads only"
+        );
+        assert_eq!(
+            r1 - r0, 0,
+            "redirected counter must NOT increment for a Bazel (is_worker=false) read"
+        );
+        assert_eq!(
+            n1 - n0, 0,
+            "no-source counter must NOT increment for a Bazel (is_worker=false) read"
+        );
+        Ok(())
+    }
+
+    // Render-test: pins the LITERAL emitted Prometheus metric names so the
+    // doubled-name / silent-zero trap (memory worker-metrics-exposure-pattern
+    // #86) and the CounterWithTime `_counter` suffix artifact cannot regress
+    // the contract. The B-server counters are bare AtomicU64 published under
+    // the registered key, so the rendered suffix is exactly `_total`.
+    //
+    // Mutation guard: rename one publish! key (or re-wrap in CounterWithTime);
+    // this test red-fails with the bespoke `got:\n{body}` message.
+    #[nativelink_test]
+    async fn test_wps_worker_read_counters_render_exact_names() -> Result<(), Error> {
+        use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner.clone(), locality_map);
+        let store = Store::new(proxy_arc.clone());
+
+        // Drive one inner-hit (worker) so inner_hit renders a non-zero
+        // value and the line is unambiguously present.
+        let value = b"render test blob";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+        inner
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        IS_WORKER_REQUEST
+            .scope(true, store.get_part_unchunked(digest, 0, None))
+            .await?;
+
+        let registry = MetricsRegistry::new();
+        registry.register("wps_test", proxy_arc.clone());
+        let body = render_prometheus(&registry);
+
+        // Literal name contract — the registered prefix `wps_test` plus the
+        // bare `_total` suffix, NO `_counter` / `_last_time` artifact.
+        assert!(
+            body.contains("\nwps_test_wps_worker_read_inner_hit_total 1\n"),
+            "expected `wps_test_wps_worker_read_inner_hit_total 1` line, got:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE wps_test_wps_worker_read_inner_hit_total counter"),
+            "expected TYPE counter line for inner_hit, got:\n{body}"
+        );
+        assert!(
+            body.contains("\nwps_test_wps_worker_read_redirected_to_peer_total 0\n"),
+            "expected `wps_test_wps_worker_read_redirected_to_peer_total 0` line, got:\n{body}"
+        );
+        assert!(
+            body.contains("\nwps_test_wps_worker_read_no_source_total 0\n"),
+            "expected `wps_test_wps_worker_read_no_source_total 0` line, got:\n{body}"
+        );
+        // Guard against the CounterWithTime `_counter` suffix regression.
+        assert!(
+            !body.contains("wps_worker_read_inner_hit_total_counter"),
+            "inner_hit must render as bare _total (no CounterWithTime _counter suffix), got:\n{body}"
         );
         Ok(())
     }
