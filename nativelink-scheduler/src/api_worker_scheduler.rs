@@ -7279,13 +7279,27 @@ mod tests {
     /// `#[metric(group = "scheduler_metrics")]` on the `metrics` field
     /// of `ApiWorkerScheduler` — the root `publish()` then skips the
     /// sub-component and every assertion red-fails.
-    #[test]
-    fn scheduler_metrics_rendered_on_metrics_endpoint() {
+    #[tokio::test]
+    async fn scheduler_metrics_rendered_on_metrics_endpoint() {
         use nativelink_util::metrics_publisher::{
             MetricsComponentTrait, MetricsRegistry, render_prometheus,
         };
 
         let scheduler = make_test_scheduler();
+
+        // Register one worker through the production helper so the
+        // `inner` (`ApiWorkerSchedulerImpl`) sub-tree has a stable,
+        // non-empty leaf to assert on below. With zero workers the
+        // `Workers::publish` loop emits nothing, and `NoopWsm` /
+        // empty `known_properties` make the other two `group!`-recursing
+        // children empty too — so a registered worker is the only
+        // unconditional inner-tree leaf available in this harness.
+        let _rx = register_worker_endpoint(
+            &scheduler,
+            "wmetric",
+            "grpc://wmetric.local:50081",
+        )
+        .await;
 
         // Set distinctive non-zero values on a representative spread of
         // the counter kinds: a plain AtomicU64 (find_worker_hits), a
@@ -7317,6 +7331,19 @@ mod tests {
             scheduler.clone()
                 as Arc<dyn MetricsComponentTrait + Send + Sync>,
         );
+
+        // (#231 T1 de-flake) Warm the lazy `with_default` /
+        // span-thread-local path ONCE and DISCARD the output before the
+        // asserted render. `render_prometheus` installs a fresh
+        // thread-local `Registry` subscriber via `with_default` for the
+        // duration of the walk; on a cold first call the span-attribute
+        // capture (`on_new_span` storing `SpanGroupName`, walked by
+        // `on_event`) is not yet warm, and the whole-group-vanishes
+        // failure mode observed 1/47 on cold builds rendered every
+        // `group!`-recursing child empty while the bare scalars
+        // survived. A discarded warm-up render makes the asserted render
+        // deterministic WITHOUT a sleep (no time-based synchronization).
+        let _warm = render_prometheus(&registry);
 
         let body = render_prometheus(&registry);
 
@@ -7368,6 +7395,38 @@ mod tests {
             body.contains("\nscheduler_testsched_worker_scheduler_metrics_cache_warm_spawned_counter 1\n"),
             "#231: cache_warm_spawned.counter rendered the wrong value \
              (expected 1 after one inc()). body=\n{body}"
+        );
+
+        // (#231 T1 de-flake) Sibling assertion on the `inner`
+        // (`ApiWorkerSchedulerImpl`) sub-tree. The whole-group-vanishes
+        // failure mode rendered every `group!`-span-recursing child
+        // EMPTY while the two bare-scalar `u64` fields (`worker_timeout_s`,
+        // `memory_store_threshold`) survived — so the original
+        // assertions could pass on the survivors even when the entire
+        // `scheduler_metrics` walk was dark. This leaf comes from the
+        // registered worker inside `ApiWorkerSchedulerImpl.workers` (the
+        // `#[metric(group = "workers")]` field whose `Workers::publish`
+        // enters a second `workers` group then a per-worker
+        // `group!(worker_id)`), proving a SECOND independent
+        // span-recursing child rendered. If it vanishes while the bare
+        // scalars survive, this fails loudly instead of the test passing
+        // on the survivors. The `{value="wmetric"}` doubles as a
+        // wrong-field guard (`WorkerId::publish` emits a String gauge of
+        // the worker id).
+        assert!(
+            body.contains("scheduler_testsched_worker_workers_workers_wmetric_id"),
+            "#231 T1: the inner ApiWorkerSchedulerImpl `workers` sub-tree \
+             rendered EMPTY — a registered worker's `id` leaf is absent. \
+             This is the whole-group-vanishes mode: only bare scalars \
+             survived the render. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "scheduler_testsched_worker_workers_workers_wmetric_id{value=\"wmetric\"} 1\n"
+            ),
+            "#231 T1: inner-tree worker `id` rendered the wrong value \
+             (expected the registered worker id \"wmetric\") — group/field \
+             routing into ApiWorkerSchedulerImpl.workers is wrong. body=\n{body}"
         );
     }
 }
