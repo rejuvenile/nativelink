@@ -120,6 +120,9 @@ fn make_scheduler() -> Arc<ApiWorkerScheduler> {
         None,
         None,
         None,
+        // (#sched-blend) blend tunables — defaults (this path doesn't score).
+        512 * 1024,
+        8,
     )
 }
 
@@ -145,6 +148,8 @@ async fn register_worker_endpoint(
         42, // timestamp
         0,  // max_inflight_tasks
         cas_endpoint.to_string(),
+        0, // p_core_count (#sched-blend; unknown in this test)
+        0, // e_core_count
     );
     WorkerScheduler::add_worker(scheduler.as_ref(), worker)
         .await

@@ -549,6 +549,113 @@ fn worker_api_config_round_trip_default_is_none() {
     );
 }
 
+/// (#sched-blend security S1) A worker reporting an over-large
+/// `p_core_count` / `e_core_count` on its connect hello frame MUST have
+/// both counts CLAMPED to `MAX_PLAUSIBLE_CORES` at the ingest seam
+/// (`worker_api_server::inner_connect_worker`), symmetric with the
+/// hello-string bound. The counts feed the continuous cache-vs-load
+/// blend's penalty denominator; an unclamped over-report would compute
+/// near-infinite free capacity, zero its load penalty regardless of real
+/// load, and monopolize cache-tied placement (and feed the
+/// widen-before-multiply overflow surface).
+///
+/// This is the AUTHORITATIVE ingest-clamp test — the only place the real
+/// connect-frame path is exercised end-to-end. The scheduler-crate unit
+/// test pins only the clamp expression + the no-overflow arithmetic.
+///
+/// TDD provenance: red BEFORE the `.min(MAX_PLAUSIBLE_CORES)` clamp was
+/// added at `worker_api_server.rs inner_connect_worker`; green after.
+/// Mutation: delete the two `.min(MAX_PLAUSIBLE_CORES)` clamps → the
+/// stored counts become `u32::MAX` and this test red-fails with the
+/// bespoke message below.
+#[nativelink_test]
+async fn connect_clamps_over_reported_core_counts() -> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_scheduler::worker::MAX_PLAUSIBLE_CORES;
+
+    let (server, scheduler) = build_server(None)?;
+
+    let request = ConnectWorkerRequest {
+        worker_id_prefix: "liar_".to_string(),
+        build_sha: String::new(),
+        // Over-reported topology (sysctl glitch / future-chip / config typo).
+        p_core_count: u32::MAX,
+        e_core_count: u32::MAX,
+        ..Default::default()
+    };
+    let stream = make_hello_stream(request);
+
+    let response = tokio::time::timeout(
+        TEST_TIMEOUT,
+        server.inner_connect_worker_for_testing(stream),
+    )
+    .await
+    .expect("must not deadlock — connect with over-reported counts must return immediately")?;
+
+    // Drain the first frame so the worker is registered (ConnectionResult).
+    let mut response_stream = response.into_inner();
+    let first = tokio::time::timeout(TEST_TIMEOUT, response_stream.next())
+        .await
+        .expect("must not deadlock — ConnectionResult expected")
+        .ok_or("response stream EOF without ConnectionResult")?
+        .map_err(|e| format!("response stream errored: {e:?}"))?;
+    let worker_id = match first.update {
+        Some(update_for_worker::Update::ConnectionResult(cr)) => WorkerId(cr.worker_id.clone()),
+        other => return Err(format!("expected ConnectionResult, got {other:?}").into()),
+    };
+
+    // The stored counts MUST be clamped — NOT u32::MAX.
+    let (p, e) = scheduler
+        .worker_core_counts_for_test(&worker_id)
+        .await
+        .expect("worker must be registered after a successful connect");
+    assert_eq!(
+        p, MAX_PLAUSIBLE_CORES,
+        "p_core_count MUST be clamped to MAX_PLAUSIBLE_CORES at ingest — an unclamped \
+         over-report (got {p}) zeros the load penalty and monopolizes cache-tied placement (S1)"
+    );
+    assert_eq!(
+        e, MAX_PLAUSIBLE_CORES,
+        "e_core_count MUST be clamped to MAX_PLAUSIBLE_CORES at ingest (got {e})"
+    );
+    Ok(())
+}
+
+/// (#sched-blend) A worker reporting PLAUSIBLE counts has them stored
+/// verbatim (the clamp does not mangle normal values) — over-action guard
+/// for the clamp.
+#[nativelink_test]
+async fn connect_passes_plausible_core_counts_unchanged() -> Result<(), Box<dyn core::error::Error>> {
+    let (server, scheduler) = build_server(None)?;
+
+    let request = ConnectWorkerRequest {
+        worker_id_prefix: "honest_".to_string(),
+        build_sha: String::new(),
+        p_core_count: 8,
+        e_core_count: 4,
+        ..Default::default()
+    };
+    let stream = make_hello_stream(request);
+    let response = tokio::time::timeout(TEST_TIMEOUT, server.inner_connect_worker_for_testing(stream))
+        .await
+        .expect("must not deadlock")?;
+    let mut response_stream = response.into_inner();
+    let first = tokio::time::timeout(TEST_TIMEOUT, response_stream.next())
+        .await
+        .expect("must not deadlock")
+        .ok_or("response stream EOF")?
+        .map_err(|e| format!("response stream errored: {e:?}"))?;
+    let worker_id = match first.update {
+        Some(update_for_worker::Update::ConnectionResult(cr)) => WorkerId(cr.worker_id.clone()),
+        other => return Err(format!("expected ConnectionResult, got {other:?}").into()),
+    };
+    let (p, e) = scheduler
+        .worker_core_counts_for_test(&worker_id)
+        .await
+        .expect("worker registered");
+    assert_eq!((p, e), (8, 4), "plausible (8, 4) counts MUST pass through the clamp unchanged");
+    Ok(())
+}
+
 /// (#216) Round-trip a populated allowlist through serde_json5 and
 /// confirm the parsed Vec preserves entry order + content. Belt-and-
 /// suspenders against the rename / serde-attribute changes that would

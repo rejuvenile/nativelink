@@ -60,6 +60,20 @@ pub struct PendingActionInfoData {
     pub action_info: ActionInfoWithProps,
 }
 
+/// (#sched-blend, security S1) Upper bound on the worker-reported P/E
+/// logical-CPU counts, applied at the connect-frame ingest seam
+/// (`worker_api_server::inner_connect_worker`). The counts feed the
+/// continuous cache-vs-load blend's *penalty denominator*: a worker
+/// reporting a huge count would compute near-infinite free capacity →
+/// zero load penalty *regardless of its real load* → it would win every
+/// cache-tied selection and become a placement monopoly (and feed the
+/// widen-before-multiply overflow surface). Workers are trusted, so this
+/// is robustness defence-in-depth (a sysctl glitch / future-chip
+/// mis-report / config typo), symmetric with the existing hello-frame
+/// string bound (`MAX_HELLO_STRING_LEN = 256`). `1024` is generous for
+/// any real machine (largest current servers are ~256 logical CPUs).
+pub const MAX_PLAUSIBLE_CORES: u32 = 1024;
+
 /// Represents a connection to a worker and used as the medium to
 /// interact with the worker from the client/scheduler.
 #[derive(Debug, MetricsComponent)]
@@ -130,6 +144,27 @@ pub struct Worker {
     /// 100 on CPUs without E-cores.
     #[metric(help = "E-core load percentage reported by the worker.")]
     pub e_core_load_pct: u32,
+
+    /// (#sched-blend) Number of performance (P) logical CPUs the worker
+    /// reported on its connect hello frame. Static for the worker's
+    /// lifetime (logical CPU topology does not change at runtime), so it
+    /// rides the connect frame, not the per-tick load path. `0` means the
+    /// worker did not report a count (legacy / Linux / Intel Mac); the
+    /// continuous cache-vs-load blend substitutes `assume_core_count` for
+    /// the absolute-capacity math. Clamped at ingest to
+    /// `MAX_PLAUSIBLE_CORES` (`worker_api_server`), so an over-report
+    /// cannot zero its load penalty and monopolize placement.
+    #[metric(help = "Number of P logical CPUs reported by the worker (0 = unknown).")]
+    pub p_core_count: u32,
+
+    /// (#sched-blend) Number of efficiency (E) logical CPUs the worker
+    /// reported on its connect hello frame. `0` means none / unknown — the
+    /// blend's E-capacity term is keyed off this count (not `e_core_load_pct`,
+    /// whose `100` is ambiguous between "no E-cores" and "E saturated"), so
+    /// `e_core_count == 0` contributes zero free E capacity by construction.
+    /// Clamped at ingest to `MAX_PLAUSIBLE_CORES`.
+    #[metric(help = "Number of E logical CPUs reported by the worker (0 = none/unknown).")]
+    pub e_core_count: u32,
 
     /// (FL-681 re-saturation gate) Whether the worker's local CAS
     /// FilesystemStore reported its indefinite-pin cap saturated in its last
@@ -222,7 +257,19 @@ impl Worker {
         timestamp: WorkerTimestamp,
         max_inflight_tasks: u64,
     ) -> Self {
-        Self::new_with_cas_endpoint(id, platform_properties, tx, timestamp, max_inflight_tasks, String::new())
+        // (#sched-blend) The no-endpoint path has no connect frame, so core
+        // counts are unknown (`0,0`) → the blend uses the `assume_core_count`
+        // fallback. Tests set real counts via `set_core_counts` (below).
+        Self::new_with_cas_endpoint(
+            id,
+            platform_properties,
+            tx,
+            timestamp,
+            max_inflight_tasks,
+            String::new(),
+            0,
+            0,
+        )
     }
 
     pub fn new_with_cas_endpoint(
@@ -232,6 +279,8 @@ impl Worker {
         timestamp: WorkerTimestamp,
         max_inflight_tasks: u64,
         cas_endpoint: String,
+        p_core_count: u32,
+        e_core_count: u32,
     ) -> Self {
         Self {
             id,
@@ -249,6 +298,8 @@ impl Worker {
             cpu_load_pct: 0,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            p_core_count,
+            e_core_count,
             indefinite_pin_saturated: false,
             swap_pressured: false,
             swap_pressure_rate_per_sec: 0,
@@ -265,6 +316,18 @@ impl Worker {
                 notify_disconnect: CounterWithTime::default(),
             }),
         }
+    }
+
+    /// (#sched-blend) Test-only setter for the P/E logical-CPU counts.
+    /// In production the counts arrive only on the connect hello frame
+    /// (`new_with_cas_endpoint`); the no-endpoint test path (`new`)
+    /// defaults them to `(0,0)`. Heterogeneous-fleet tests (e.g. 96-core
+    /// vs 2-core) need real counts to exercise the absolute-capacity blend,
+    /// so they call this after `add_worker_*`.
+    #[cfg(test)]
+    pub fn set_core_counts(&mut self, p_core_count: u32, e_core_count: u32) {
+        self.p_core_count = p_core_count;
+        self.e_core_count = e_core_count;
     }
 
     /// Sends the initial connection information to the worker. This generally is just meta info.

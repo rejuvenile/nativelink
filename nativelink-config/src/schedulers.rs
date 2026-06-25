@@ -189,6 +189,49 @@ pub struct SimpleSpec {
     /// action affinity tier is used).
     #[serde(default)]
     pub cas_store: Option<StoreRefName>,
+
+    /// (#sched-blend) Cache-vs-load crossover knob for the continuous
+    /// cache-affinity blend (Tier 1 / Tier 1.5). Bytes-equivalent cost
+    /// charged per ONE WHOLE weighted core of free-capacity deficit: a
+    /// cache-warm-but-busy worker must save at least this many input
+    /// bytes per weighted core it is into deficit to still be preferred
+    /// over an idle peer. Larger ⇒ cache affinity dominates longer into
+    /// load; smaller ⇒ load sheds cache affinity earlier.
+    ///
+    /// Default: 524288 (512 KiB). PROVISIONAL — this is the design's
+    /// reasoned *anchor* (≈ 5 cached files, or one medium blob), NOT a
+    /// measured optimum, and it sits on a routing-flip boundary for
+    /// marginal cache hits. It is intended to be SOAK-SELECTED before the
+    /// first production deploy by sweeping {128 KiB, 512 KiB, 2 MiB} and
+    /// shipping the sweep-selected value; deploy the chosen value via
+    /// this config, do not rely on the anchor as if it were validated.
+    #[serde(default = "default_load_byte_cost", deserialize_with = "convert_numeric_with_shellexpand")]
+    pub load_byte_cost: u64,
+
+    /// (#sched-blend) Substituted P-core count for workers that report
+    /// `p_core_count = 0` on their connect frame (legacy worker / Linux /
+    /// Intel Mac with no perflevel sysctl). Gives the absolute-capacity
+    /// blend a denominator so a count-less worker is order-preserving
+    /// among other count-less workers (same relative ranking the prior
+    /// %-only path gave them) and intentionally *under*-credited versus a
+    /// count-reporting worker (the safe direction — we do not over-load a
+    /// worker whose true capacity is unknown). Inert in an all-Apple-Silicon
+    /// fleet (every Mac reports real counts).
+    ///
+    /// Default: 8.
+    #[serde(default = "default_assume_core_count", deserialize_with = "convert_numeric_with_shellexpand")]
+    pub assume_core_count: u32,
+}
+
+/// (#sched-blend) Default cache-vs-load crossover anchor (512 KiB).
+/// PROVISIONAL — see `SimpleSpec::load_byte_cost`; soak-select before deploy.
+const fn default_load_byte_cost() -> u64 {
+    512 * 1024
+}
+
+/// (#sched-blend) Default substituted P-core count for count-less workers.
+const fn default_assume_core_count() -> u32 {
+    8
 }
 
 #[derive(Deserialize, Serialize, Debug)]

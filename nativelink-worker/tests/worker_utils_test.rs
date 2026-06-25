@@ -23,7 +23,7 @@ async fn make_connect_worker_request_with_extra_envs() -> Result<(), Error> {
     extra_envs.insert("PATH".into(), env::var("PATH").unwrap());
 
     let res =
-        make_connect_worker_request("1234".to_string(), &worker_properties, &extra_envs, 1, String::new()).await?;
+        make_connect_worker_request("1234".to_string(), &worker_properties, &extra_envs, 1, String::new(), 8, 4).await?;
     assert_eq!(
         res.properties.first(),
         Some(&Property {
@@ -31,6 +31,9 @@ async fn make_connect_worker_request_with_extra_envs() -> Result<(), Error> {
             value: "test_value_for_demo_env".into()
         })
     );
+    // (#sched-blend) the two new core-count args plumb into the hello frame.
+    assert_eq!(res.p_core_count, 8, "p_core_count must be carried on the connect frame");
+    assert_eq!(res.e_core_count, 4, "e_core_count must be carried on the connect frame");
     Ok(())
 }
 
@@ -51,6 +54,8 @@ async fn make_connect_worker_request_populates_build_sha() -> Result<(), Error> 
         &extra_envs,
         1,
         String::new(),
+        0,
+        0,
     )
     .await?;
     assert_eq!(

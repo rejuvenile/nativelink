@@ -60,6 +60,8 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
     extra_envs: &HashMap<String, String, S>,
     max_inflight_tasks: u64,
     cas_endpoint: String,
+    p_core_count: u32,
+    e_core_count: u32,
 ) -> Result<ConnectWorkerRequest, Error> {
     let mut futures = vec![];
     for (property_name, worker_property) in worker_properties {
@@ -141,5 +143,10 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         // not in its `compatible_build_shas` allowlist. Empty string
         // when binary read fails — see `nativelink_util::build_sha`.
         build_sha: build_sha().to_string(),
+        // (#sched-blend) static P/E logical-CPU counts so the scheduler can
+        // rank workers by absolute free core capacity. `0` = unknown
+        // (Linux / Intel Mac) → scheduler uses `assume_core_count`.
+        p_core_count,
+        e_core_count,
     })
 }

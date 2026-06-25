@@ -131,6 +131,22 @@ message ConnectWorkerRequest {
     /// incompatible builds)
     string build_sha = 8;
 
+    /// Number of performance (P) logical CPUs on this worker.
+    /// macOS: hw.perflevel0.logicalcpu. 0 = unknown (legacy worker,
+    /// Linux, or Intel Mac with no perflevel sysctl) — the scheduler
+    /// substitutes its configured assume-core-count and competes the
+    /// worker in the P-core tier (preserves pre-change %-only behavior).
+    /// Logical CPU topology is static for the worker's lifetime, so this
+    /// rides the connect hello frame (not the per-tick KeepAlive).
+    /// (#sched-blend: continuous cache-vs-load blend ranks by absolute
+    /// free core capacity, which requires the core counts.)
+    uint32 p_core_count = 9;
+
+    /// Number of efficiency (E) logical CPUs on this worker.
+    /// macOS: hw.perflevel1.logicalcpu. 0 = none / unknown.
+    /// (#sched-blend: continuous cache-vs-load blend)
+    uint32 e_core_count = 10;
+
     reserved 4;
     reserved 6;
 }

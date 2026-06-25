@@ -711,6 +711,9 @@ impl SimpleScheduler {
             locality_map,
             cas_store,
             worker_tls_config,
+            // (#sched-blend) continuous cache-vs-load blend tunables.
+            spec.load_byte_cost,
+            spec.assume_core_count,
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();

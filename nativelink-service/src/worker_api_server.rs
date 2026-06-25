@@ -48,7 +48,7 @@ use nativelink_util::blob_locality_map::{
     PersistedEndpoint, PersistedLocalityMap, ReloadedLocalitySummary, SharedBlobLocalityMap,
 };
 use nativelink_util::common::DigestInfo;
-use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker::{MAX_PLAUSIBLE_CORES, Worker};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::background_spawn;
 use nativelink_util::action_messages::{OperationId, WorkerId};
@@ -984,6 +984,16 @@ impl WorkerApiServer {
         // ConnectionResult — and only then will the worker begin
         // sending BlobsAvailable.
         {
+            // (#sched-blend security S1) Clamp the worker-reported core
+            // counts at the ingest seam, symmetric with the string bound
+            // above (`MAX_HELLO_STRING_LEN`). The counts feed the blend's
+            // penalty denominator; an unclamped over-report (sysctl glitch /
+            // future-chip / config typo) would compute near-infinite free
+            // capacity → zero load penalty regardless of real load → the
+            // worker monopolizes cache-tied placement. This is the
+            // authoritative ingest clamp, not the proto.
+            let p_core_count = connect_worker_request.p_core_count.min(MAX_PLAUSIBLE_CORES);
+            let e_core_count = connect_worker_request.e_core_count.min(MAX_PLAUSIBLE_CORES);
             let worker = Worker::new_with_cas_endpoint(
                 worker_id.clone(),
                 platform_properties,
@@ -991,6 +1001,8 @@ impl WorkerApiServer {
                 (self.now_fn)()?.as_secs(),
                 connect_worker_request.max_inflight_tasks,
                 worker_cas_endpoint.clone(),
+                p_core_count,
+                e_core_count,
             );
             self.scheduler
                 .add_worker(worker)

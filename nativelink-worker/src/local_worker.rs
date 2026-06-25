@@ -103,6 +103,14 @@ mod cpu_impl {
         let total = busy + fields[3] + fields[4];
         Some(CpuTimes { busy, total })
     }
+
+    /// (#sched-blend) Linux does not split P/E logical CPUs here, so it
+    /// reports `(0, 0)` ("unknown") → the scheduler falls back to its
+    /// configured `assume_core_count`, preserving today's %-only behavior.
+    /// (A future `available_parallelism()` count is a deferred follow-up.)
+    pub(super) const fn core_counts() -> (u32, u32) {
+        (0, 0)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -141,7 +149,7 @@ mod cpu_impl {
 
     /// Returns the number of P-cores on Apple Silicon via sysctl.
     /// Returns 0 on Intel Macs (sysctl key doesn't exist).
-    fn p_core_count() -> u32 {
+    pub(super) fn p_core_count() -> u32 {
         use std::sync::OnceLock;
         static COUNT: OnceLock<u32> = OnceLock::new();
         *COUNT.get_or_init(|| sysctl_u32("hw.perflevel0.logicalcpu").unwrap_or(0))
@@ -149,10 +157,17 @@ mod cpu_impl {
 
     /// Returns the number of E-cores on Apple Silicon via sysctl.
     /// Returns 0 on Intel Macs or P-core-only Apple Silicon.
-    fn e_core_count() -> u32 {
+    pub(super) fn e_core_count() -> u32 {
         use std::sync::OnceLock;
         static COUNT: OnceLock<u32> = OnceLock::new();
         *COUNT.get_or_init(|| sysctl_u32("hw.perflevel1.logicalcpu").unwrap_or(0))
+    }
+
+    /// (#sched-blend) Static (P, E) logical-CPU counts reported on the
+    /// connect hello frame so the scheduler can rank workers by absolute
+    /// free core capacity. Both `OnceLock`-cached — no per-call syscall.
+    pub(super) fn core_counts() -> (u32, u32) {
+        (p_core_count(), e_core_count())
     }
 
     fn sysctl_u32(name: &str) -> Option<u32> {
@@ -276,6 +291,12 @@ mod cpu_impl {
 
     pub(super) fn read_cpu_times() -> Option<CpuTimes> {
         None
+    }
+
+    /// (#sched-blend) No P/E split on this platform → `(0, 0)` ("unknown");
+    /// the scheduler uses its `assume_core_count` fallback.
+    pub(super) const fn core_counts() -> (u32, u32) {
+        (0, 0)
     }
 }
 
@@ -5528,12 +5549,18 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             .config
             .cas_server_port
             .map_or_else(String::new, |port| cas_advertised_endpoint(port, use_tls));
+        // (#sched-blend) Static P/E logical-CPU counts for absolute-capacity
+        // scheduling. macOS reports real counts; Linux/other report (0,0)
+        // → scheduler uses `assume_core_count`. OnceLock-cached, no syscall.
+        let (p_core_count, e_core_count) = cpu_impl::core_counts();
         let connect_worker_request = make_connect_worker_request(
             self.config.name.clone(),
             &self.config.platform_properties,
             &extra_envs,
             self.config.max_inflight_tasks,
             cas_endpoint,
+            p_core_count,
+            e_core_count,
         )
         .await?;
         let mut update_for_worker_stream = client

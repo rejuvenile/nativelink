@@ -267,6 +267,156 @@ use crate::worker_capability_index::WorkerCapabilityIndex;
 use crate::worker_registry::SharedWorkerRegistry;
 use crate::worker_scheduler::WorkerScheduler;
 
+// ── (#sched-blend) Continuous cache-vs-load blend constants ──
+//
+// The blend ranks viable cache-affinity candidates (Tier 1 / Tier 1.5) by
+// `S = cache_gain - load_penalty`, where `load_penalty` is driven by a
+// worker's ABSOLUTE free core capacity at CENTI-CORE (1/100-core)
+// resolution rather than its load percentage. Carrying free capacity at
+// centi-core resolution is the whole point: an integer percentage load
+// maps EXACTLY to a free-capacity value (`count * (100 - load)`), with no
+// truncation, so the penalty grades CONTINUOUSLY across the load range and
+// a 96-core box and a 2-core box at the same load% rank by real spare
+// capacity. All arithmetic is `i64`/integer — no floats in the compare
+// path (determinism + no NaN-ordering hazard).
+
+/// (#sched-blend) Free weighted-capacity headroom (in the centi-core
+/// `2*p_free_centi + e_free_centi` numerator scale) at and above which a
+/// worker pays ZERO load penalty and competes purely on cache. `200`
+/// numerator-units = one free weighted P-core (100 centi-cores × the P
+/// weight numerator `2`): a worker with ≥1 idle P-core is "abundantly
+/// free." Below this the penalty rises linearly and continuously as free
+/// capacity shrinks toward zero (full saturation). The continuous analogue
+/// of the old binary cutoff's "any P-core idle ⇒ preferred."
+/// NUMERIC: the centi-core encoding — `200`, NOT `1`. The knee is one free
+/// P-core; `1` would put it at 1/200 of a core. (rev-3: this units choice
+/// is the fix for the rev-2 binary-collapse, where a whole-core scale made
+/// the penalty step only at 100%.)
+const REF_FREE: i64 = 200;
+
+/// (#sched-blend) Integer P-core weight numerator. One free P-core is the
+/// unit of capacity (`P:E = 2:1` over a `/2` scale). With `E_WEIGHT_NUM`
+/// this gives `weighted_free = P_WEIGHT_NUM*p_free_centi + E_WEIGHT_NUM*e_free_centi`.
+const P_WEIGHT_NUM: i64 = 2;
+
+/// (#sched-blend) Integer E-core weight numerator. An E-core does ~half a
+/// P-core of build work, so a free P-core outranks a free E-core and a
+/// worker with idle P-cores beats one with only idle E-cores at equal
+/// absolute free-core count (R2). Without a P>E weight, R2 fails.
+const E_WEIGHT_NUM: i64 = 1;
+
+/// (#sched-blend, backstop (a) / §R5.1) Saturation predicate threshold in
+/// the centi-core numerator space. A candidate is "saturated" when its
+/// `weighted_free` is `<=` this — i.e. exactly `0` (literally zero free
+/// centi-cores of either type). Kept as a named const for the numeric-pin
+/// test even though it is exactly zero: when EVERY viable candidate is
+/// saturated, the continuous penalty is the same maxed constant for all and
+/// CANCELS across them, so cache alone would decide (the #52 pile-on) — the
+/// cascade then falls through to the LRU/MRU path instead. `0` is
+/// mechanically derived (it fires exactly when the penalty stops
+/// discriminating), not a tuned guess.
+const SATURATION_EPSILON: i64 = 0;
+
+/// (#sched-blend) Per-candidate result of the continuous blend's
+/// free-capacity math, computed ONCE per viable worker in the selection
+/// loop and reused for both the penalty (Tier 1 / Tier 1.5 ranking) and
+/// the saturation predicate (backstop (a)). All centi-core integer.
+#[derive(Clone, Copy, Debug)]
+struct CapacityScore {
+    /// `2*p_free_centi + e_free_centi` — weighted free capacity, centi-core
+    /// numerator scale. `0` ⟺ the worker is fully saturated.
+    weighted_free: i64,
+    /// `LOAD_BYTE_COST * max(0, REF_FREE - weighted_free) / 200` —
+    /// bytes-equivalent load penalty, subtracted from `cache_gain`.
+    load_penalty: i64,
+}
+
+impl CapacityScore {
+    /// True when the worker has literally zero free weighted centi-cores —
+    /// the condition under which the penalty term cancels across candidates
+    /// (backstop (a) / §R5.1).
+    const fn is_saturated(&self) -> bool {
+        self.weighted_free <= SATURATION_EPSILON
+    }
+}
+
+/// (#sched-blend) Computes a worker's free-capacity score from its reported
+/// per-core-type load percentages and its (P, E) logical-CPU counts, at
+/// EXACT centi-core resolution. `assume_core_count` substitutes for a
+/// worker that reported `p_count == 0` (legacy / Linux / Intel Mac), giving
+/// the absolute-capacity math a denominator (§3.4). `load_byte_cost` is the
+/// soak-selected cache-vs-load crossover knob (config).
+///
+/// INTEGER-ARITHMETIC MANDATES (all load-bearing — see design §2.3):
+/// 1. `count * (100 - load)` is widened to `i64` BEFORE the multiply (the
+///    counts are `u32`; with the centi-core scale the products are ~100×
+///    larger than a whole-core scheme, so the widen is more load-bearing).
+/// 2. `REF_FREE - weighted_free` is computed SIGNED then `.max(0)` — an
+///    idle big box has `weighted_free >> REF_FREE`, so the subtraction goes
+///    negative; doing it in `u64` would underflow to a huge value and the
+///    idle box would get MAX penalty and never be selected (T-edge-signed).
+/// 3. The only division is the final `* load_byte_cost / 200` (rescaling
+///    the centi-core deficit to bytes-per-whole-core), applied AFTER the
+///    discriminating deficit is formed — so it cannot reintroduce a
+///    whole-core floor.
+fn capacity_score(
+    p_load: u32,
+    e_load: u32,
+    aggregate_load: u32,
+    p_count: u32,
+    e_count: u32,
+    assume_core_count: u32,
+    load_byte_cost: u64,
+) -> CapacityScore {
+    // Resolve the effective P-count and the effective P-load.
+    // A worker reporting no P-count (legacy / Linux / Intel) falls back to
+    // `assume_core_count` all-P, and its aggregate load stands in for
+    // p_load (no per-core-type signal). A count-reporting worker uses its
+    // real counts and per-type loads. E capacity is keyed off `e_count`
+    // (NOT `e_load`, whose `100` is ambiguous), so `e_count == 0`
+    // contributes zero free E capacity by construction (§3.4 D5).
+    let (eff_p_count, eff_p_load) = if p_count == 0 {
+        // Aggregate-only / legacy: assume-N all-P, aggregate stands in.
+        // (If the worker reported per-type p_load but zero count — not a
+        // real shape — prefer the aggregate, matching today's
+        // aggregate-only ranking.)
+        let load = if aggregate_load > 0 { aggregate_load } else { p_load };
+        (assume_core_count, load)
+    } else {
+        (p_count, p_load)
+    };
+
+    // Clamp loads to [0,100] defensively (wire values are u32; a glitch
+    // >100 would make `100 - load` underflow the u32 subtraction).
+    let eff_p_load = eff_p_load.min(100);
+    let e_load = e_load.min(100);
+
+    // MANDATE 1: widen to i64 BEFORE the multiply.
+    let p_free_centi: i64 = i64::from(eff_p_count) * i64::from(100 - eff_p_load);
+    let e_free_centi: i64 = if e_count > 0 {
+        i64::from(e_count) * i64::from(100 - e_load)
+    } else {
+        0
+    };
+
+    let weighted_free = P_WEIGHT_NUM * p_free_centi + E_WEIGHT_NUM * e_free_centi;
+
+    // MANDATE 2: SIGNED subtract THEN clamp (never u64-underflow).
+    let busy_core_equiv = (REF_FREE - weighted_free).max(0);
+
+    // MANDATE 3: the only division, applied after the deficit is formed.
+    // Widen the byte cost too so `load_byte_cost * busy_core_equiv` cannot
+    // overflow i64 (busy_core_equiv <= REF_FREE = 200, load_byte_cost is a
+    // few MiB at most — comfortably in i64, but widen for clarity/safety).
+    let load_penalty =
+        (i64::try_from(load_byte_cost).unwrap_or(i64::MAX) * busy_core_equiv) / 200;
+
+    CapacityScore {
+        weighted_free,
+        load_penalty,
+    }
+}
+
 /// Computes an effective load score for worker selection. Lower is better.
 /// Workers with idle P-cores always beat workers with only idle E-cores,
 /// creating a two-tier preference. Workers reporting only aggregate load
@@ -336,6 +486,14 @@ struct ApiWorkerSchedulerImpl {
     worker_state_manager: Arc<dyn WorkerStateManager>,
     /// The allocation strategy for workers.
     allocation_strategy: WorkerAllocationStrategy,
+    /// (#sched-blend) Cache-vs-load crossover knob (bytes-equiv per whole
+    /// weighted core of free-capacity deficit) for the Tier 1 / Tier 1.5
+    /// continuous blend. Config (`SimpleSpec::load_byte_cost`); soak-selected.
+    load_byte_cost: u64,
+    /// (#sched-blend) Substituted P-core count for workers that report
+    /// `p_core_count = 0` (legacy / Linux / Intel Mac). Config
+    /// (`SimpleSpec::assume_core_count`).
+    assume_core_count: u32,
     /// A channel to notify the matching engine that the worker pool has changed.
     worker_change_notify: Arc<Notify>,
     /// Worker registry for tracking worker liveness.
@@ -962,80 +1120,124 @@ impl ApiWorkerSchedulerImpl {
             platform_properties.is_satisfied_by(&w.platform_properties, false)
         };
 
-        // Workers above this load score are excluded from cache-affinity
-        // tiers — the CPU cost outweighs the I/O savings from cache hits.
-        const CACHE_AFFINITY_LOAD_CUTOFF: u64 = 99;
+        // (#sched-blend) Per-candidate free-capacity score. Replaces the
+        // binary `CACHE_AFFINITY_LOAD_CUTOFF` + `best_overloaded` soft-
+        // fallback in Tier 1 / Tier 1.5 with a CONTINUOUS load penalty
+        // driven by absolute free centi-cores (design §2). Computed from the
+        // worker's reported per-core-type loads + its (P, E) counts (with the
+        // `assume_core_count` fallback for count-less workers). The same
+        // score drives both the penalty (ranking) and the saturation
+        // predicate (backstop (a)).
+        let load_byte_cost = self.load_byte_cost;
+        let assume_core_count = self.assume_core_count;
+        let cap_score = |w: &Worker| -> CapacityScore {
+            capacity_score(
+                w.p_core_load_pct,
+                w.e_core_load_pct,
+                w.cpu_load_pct,
+                w.p_core_count,
+                w.e_core_count,
+                assume_core_count,
+                load_byte_cost,
+            )
+        };
 
-        // ── Tier 1: Exact root match ──
-        // If a viable worker has the action's input_root_digest in its directory
-        // cache (either as a root or as a subtree of a previously cached tree),
-        // it can hardlink the entire input tree in milliseconds instead of
-        // reconstructing it from CAS. Workers above the load cutoff are
-        // excluded; among the rest, pick the lightest-loaded.
-        let dir_cache_winner: Option<WorkerId> = {
-            let mut best: Option<(WorkerId, u64)> = None; // (id, load_score)
-            let mut best_overloaded: Option<(WorkerId, u64)> = None; // least-loaded among overloaded
+        // (#sched-blend, backstop (a) / §R5.1) The cache tiers must FALL
+        // THROUGH to the LRU/MRU path when EVERY viable candidate is
+        // saturated — on a fully-saturated fleet the continuous penalty is
+        // the same maxed constant for all candidates and CANCELS, so cache
+        // alone would decide (the #52 pile-on). Compute the predicate ONCE
+        // over the viable candidate set (no extra map walk, no extra lock —
+        // reuses the `peek`ed fields). `false` when there are no viable
+        // candidates at all (the existing all-gated fall-through, §7, still
+        // owns that case via `None` from the tiers).
+        let mut viable_count: usize = 0;
+        let mut all_viable_saturated = true;
+        for wid in &candidates {
+            if worker_is_viable(wid) {
+                viable_count += 1;
+                if let Some(w) = self.workers.0.peek(wid) {
+                    if !cap_score(w).is_saturated() {
+                        all_viable_saturated = false;
+                    }
+                }
+            }
+        }
+        // If no candidate is viable, leave the tiers to return `None` (the
+        // existing all-gated path), not the saturation fall-through.
+        let saturation_fall_through = viable_count > 0 && all_viable_saturated;
+        if saturation_fall_through {
+            // The real #52 signal: every viable candidate is fully
+            // saturated. Rate-limited at the call rate is acceptable here
+            // (it fires only on a fully-saturated fleet, not per dispatch on
+            // a healthy one). Driven by absolute free capacity, NOT the old
+            // misleading coverage_pct.
+            warn!(
+                viable_count,
+                %input_root_digest,
+                "all viable cache candidates saturated (weighted_free == 0) — \
+                 cache tiers fall through to LRU/MRU to spread the unavoidable work \
+                 (backstop a / #52)"
+            );
+        }
+
+        // ── Tier 1: Exact root match (continuous min-load among holders) ──
+        // If a viable worker has the action's input_root_digest in its
+        // directory cache (either as a root or as a subtree of a previously
+        // cached tree), it can hardlink the entire input tree in
+        // milliseconds. Among the viable root/subtree holders, pick the one
+        // with the SMALLEST `load_penalty` (= the most free capacity). No
+        // cutoff, no `best_overloaded` soft-fallback, no `EXACT_ROOT_GAIN`
+        // (dropped — a constant gain cancels across Tier-1 members, so the
+        // tier reduces to min-load; §4.1). When every viable candidate is
+        // saturated, the tier declines (backstop (a)).
+        let dir_cache_winner: Option<WorkerId> = if saturation_fall_through {
+            None
+        } else {
+            let mut best: Option<(WorkerId, i64)> = None; // (id, load_penalty)
             for wid in &candidates {
                 if let Some(w) = self.workers.0.peek(wid) {
                     let has_root_match = w.cached_directory_digests.contains(&input_root_digest);
                     let has_subtree_match = w.cached_subtree_digests.contains(&input_root_digest);
-                    if (has_root_match || has_subtree_match)
-                        && worker_is_viable(wid)
-                    {
-                        let score = effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct);
-                        if score > CACHE_AFFINITY_LOAD_CUTOFF {
-                            let dominated = best_overloaded.as_ref().is_some_and(|(_, s)| score >= *s);
-                            if !dominated {
-                                best_overloaded = Some((wid.clone(), score));
-                            }
-                            continue;
-                        }
-                        let dominated = best.as_ref().is_some_and(|(_, best_score)| {
-                            score >= *best_score
-                        });
+                    if (has_root_match || has_subtree_match) && worker_is_viable(wid) {
+                        let penalty = cap_score(w).load_penalty;
+                        let dominated = best
+                            .as_ref()
+                            .is_some_and(|(_, best_penalty)| penalty >= *best_penalty);
                         if !dominated {
-                            best = Some((wid.clone(), score));
+                            best = Some((wid.clone(), penalty));
                         }
                     }
                 }
             }
-            // If no candidate is under the cutoff, pick the least-loaded
-            // among overloaded cache matches — still better than a cache-cold
-            // worker from the LRU fallback.
-            if best.is_none() {
-                if let Some((ref wid, score)) = best_overloaded {
-                    warn!(
-                        ?wid,
-                        load_score = score,
-                        cutoff = CACHE_AFFINITY_LOAD_CUTOFF,
-                        %input_root_digest,
-                        "Directory cache hit -- all matches overloaded, picking least-loaded"
-                    );
-                }
-                best = best_overloaded;
-            }
-            if let Some((ref wid, score)) = best {
-                if score <= CACHE_AFFINITY_LOAD_CUTOFF {
-                    debug!(
-                        ?wid,
-                        load_score = score,
-                        %input_root_digest,
-                        "directory cache hit — worker has input_root cached"
-                    );
-                }
+            if let Some((ref wid, penalty)) = best {
+                debug!(
+                    ?wid,
+                    load_penalty = penalty,
+                    %input_root_digest,
+                    "directory cache hit — worker has input_root cached (min load_penalty)"
+                );
             }
             best.map(|(wid, _)| wid)
         };
 
-        // ── Tier 1.5: Partial subtree coverage scoring ──
-        // When no worker has the exact root cached, score workers by a blended
-        // metric of cached bytes and cached file count. Each cached file is
-        // worth PER_FILE_WEIGHT bytes in the score because hardlink/clonefile
-        // operations have a fixed per-file I/O cost (~0.1ms each, equivalent
-        // to ~100KB of network transfer at 10Gbps).
+        // ── Tier 1.5: Partial subtree coverage scoring (continuous blend) ──
+        // When no worker has the exact root cached, score workers by a
+        // blended metric of cached bytes and cached file count. Each cached
+        // file is worth PER_FILE_WEIGHT bytes (hardlink/clonefile has a fixed
+        // per-file I/O cost ~0.1 ms ≈ 100 KB at 10 Gbps). (#sched-blend) The
+        // selection is now `S = cached_score - load_penalty` (max S wins),
+        // where `load_penalty` is the continuous absolute-free-capacity
+        // penalty (design §4.2) — replacing the binary cutoff +
+        // `best_overloaded` soft-fallback. A moderately-loaded warm worker's
+        // marginal cache lead is shed earlier and smoothly; the fully-
+        // saturated #52 burst is caught by backstop (a) (the penalty cancels
+        // across saturated peers, so the cache tiers decline above).
         const PER_FILE_WEIGHT: u64 = 100 * 1024; // 100KB per file
-        let subtree_coverage_winner: Option<WorkerId> = if dir_cache_winner.is_some() {
-            None // exact match found, skip coverage scoring
+        let subtree_coverage_winner: Option<WorkerId> = if dir_cache_winner.is_some()
+            || saturation_fall_through
+        {
+            None // exact match found, OR all viable saturated → fall through
         } else if let Some(tree) = resolved_tree {
             let total_bytes: u64 = tree.subtree_bytes.get(&input_root_digest).copied().unwrap_or(0);
             let total_files: u64 = tree.subtree_files.get(&input_root_digest).copied().unwrap_or(0);
@@ -1043,9 +1245,8 @@ impl ApiWorkerSchedulerImpl {
             if tree.dir_digests.len() <= 1 || total_score == 0 {
                 None // only root (or empty), no subtrees to match
             } else {
-                // (id, cached_score, cached_bytes, cached_files, load_score)
-                let mut best: Option<(WorkerId, u64, u64, u64, u64)> = None;
-                let mut best_overloaded: Option<(WorkerId, u64, u64, u64, u64)> = None;
+                // (id, blended_S, cached_bytes, cached_files)
+                let mut best: Option<(WorkerId, i64, u64, u64)> = None;
                 for wid in &candidates {
                     if let Some(w) = self.workers.0.peek(wid) {
                         if !worker_is_viable(wid) {
@@ -1053,17 +1254,13 @@ impl ApiWorkerSchedulerImpl {
                         }
                         // #52 (option b2) numerator: sum DIRECT (non-
                         // recursive) bytes/files for each unique cached
-                        // dir digest. `dir_digests` is a `HashSet` so
-                        // each digest is counted once; `dir_direct_*` is
-                        // disjoint across directories. The resulting
-                        // `cached_score` is bounded by `total_score`
-                        // (max coverage_pct == 100) AND retains
-                        // partial-match resolution so workers with 30 %
-                        // vs 70 % of subtree bytes are distinguished.
-                        // See `compute_dedup_cached_score` doc-comment
-                        // and `.claude/audits/52-scheduler-subtree-
-                        // overload-rca-2026-06-04.md` (pre-fix p95 =
-                        // 466 %).
+                        // dir digest. `dir_digests` is a `HashSet` so each
+                        // digest is counted once; `dir_direct_*` is disjoint
+                        // across directories. `cached_score` is bounded by
+                        // `total_score` (coverage_pct ≤ 100) AND retains
+                        // partial-match resolution. See
+                        // `compute_dedup_cached_score` + `.claude/audits/
+                        // 52-scheduler-subtree-overload-rca-2026-06-04.md`.
                         let (cached_bytes, cached_files): (u64, u64) =
                             compute_dedup_cached_score(
                                 &tree.dir_digests,
@@ -1073,73 +1270,72 @@ impl ApiWorkerSchedulerImpl {
                             );
                         let cached_score = cached_bytes + cached_files * PER_FILE_WEIGHT;
                         if cached_score == 0 {
-                            continue;
+                            continue; // unchanged gate: cache-cold workers excluded
                         }
-                        let load_score = effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct);
-                        if load_score > CACHE_AFFINITY_LOAD_CUTOFF {
-                            // Track best among overloaded for soft fallback.
-                            let dominated = best_overloaded.as_ref().is_some_and(|(_, bs, _, _, bl)| {
-                                if cached_score != *bs { return cached_score < *bs; }
-                                load_score >= *bl
-                            });
-                            if !dominated {
-                                best_overloaded = Some((wid.clone(), cached_score, cached_bytes, cached_files, load_score));
-                            }
-                            continue;
-                        }
-                        let dominated = best.as_ref().is_some_and(|(_, best_score, _, _, best_load)| {
-                            if cached_score != *best_score {
-                                return cached_score < *best_score;
-                            }
-                            // Same cache score — prefer lower load score.
-                            load_score >= *best_load
-                        });
+                        // (#sched-blend) S = cache_gain - load_penalty. Both
+                        // i64; `cached_score` is naturally bounded ≪ 2^63 by
+                        // total tree bytes, and the difference must be signed
+                        // so a marginal cache hit on a busy worker can go
+                        // negative (correctly ranking below a cache-cold-but-
+                        // idle worker whose S = 0; that idle worker is NOT in
+                        // this loop — it has cached_score == 0 — so a negative
+                        // S still loses to the cascade's later tiers / LRU).
+                        let penalty = cap_score(w).load_penalty;
+                        let blended_s =
+                            i64::try_from(cached_score).unwrap_or(i64::MAX) - penalty;
+                        let dominated = best
+                            .as_ref()
+                            .is_some_and(|(_, best_s, _, _)| blended_s <= *best_s);
                         if !dominated {
-                            best = Some((wid.clone(), cached_score, cached_bytes, cached_files, load_score));
+                            best = Some((wid.clone(), blended_s, cached_bytes, cached_files));
                         }
                     }
                 }
-                // If no candidate is under the cutoff, pick the least-loaded
-                // among overloaded cache matches — still better than a
-                // cache-cold worker from the LRU fallback.
-                let used_overloaded = best.is_none() && best_overloaded.is_some();
-                if best.is_none() {
-                    best = best_overloaded;
-                }
-                if let Some((ref wid, cached_score, cached_bytes, cached_files, load_score)) = best {
+                // (#sched-blend §5.3) Keep the max-S worker only if its
+                // blended score is POSITIVE. A cache-cold-but-idle worker has
+                // S = 0 (cached_score 0, penalty 0) and is the implicit
+                // baseline — it is NOT in this loop (its cached_score == 0
+                // was `continue`d), so a NEGATIVE-S Tier-1.5 winner (a small
+                // cache hit on a busy worker) must NOT be committed; the tier
+                // DECLINES and the cascade falls through to the LRU/MRU path,
+                // which selects an idle worker (lowest effective_load_score).
+                // This is the crossover: take the cache pick iff the cache
+                // saving exceeds the load cost. (Without this gate Tier 1.5
+                // would return its only — negative-S — candidate and pile
+                // onto the busy warm worker.)
+                let best = best.filter(|(_, blended_s, _, _)| *blended_s > 0);
+                if let Some((ref wid, blended_s, cached_bytes, cached_files)) = best {
+                    let cached_score = cached_bytes + cached_files * PER_FILE_WEIGHT;
                     let pct = if total_score > 0 { cached_score * 100 / total_score } else { 0 };
-                    if used_overloaded {
-                        warn!(
-                            ?wid,
-                            load_score,
-                            cutoff = CACHE_AFFINITY_LOAD_CUTOFF,
-                            cached_score,
-                            coverage_pct = pct,
-                            %input_root_digest,
-                            "Subtree coverage -- all candidates overloaded, picking least-loaded cache match"
-                        );
-                    } else {
-                        debug!(
-                            ?wid,
-                            cached_bytes,
-                            cached_files,
-                            coverage_pct = pct,
-                            %input_root_digest,
-                            "subtree coverage winner — {}% cached",
-                            pct,
-                        );
-                    }
+                    debug!(
+                        ?wid,
+                        cached_bytes,
+                        cached_files,
+                        blended_s,
+                        coverage_pct = pct,
+                        %input_root_digest,
+                        "subtree coverage winner — {}% cached (max cache_gain - load_penalty)",
+                        pct,
+                    );
                 }
-                best.map(|(wid, _, _, _, _)| wid)
+                best.map(|(wid, _, _, _)| wid)
             }
         } else {
             None
         };
 
-        // ── Locality scoring ──
+        // ── Locality scoring (Tier 2) ──
         // Convert pre-computed endpoint scores to worker scores, filtering
         // to the candidate set. This is O(endpoints) not O(files).
-        let locality_winner = if let Some(ep_scores) = endpoint_scores {
+        // (#sched-blend) Tier 2's INTERNAL comparator is UNCHANGED this round
+        // (the load-blend here is deferred — §4.3), but backstop (a) applies
+        // at the cascade boundary to ALL cache tiers: when every viable
+        // candidate is saturated, Tier 2 also declines so the cascade falls
+        // through to the LRU/MRU path rather than piling onto the
+        // warmest-locality worker (§4.4).
+        let locality_winner = if saturation_fall_through {
+            None
+        } else if let Some(ep_scores) = endpoint_scores {
             let scores = endpoint_scores_to_worker_scores(
                 ep_scores,
                 &self.endpoint_to_worker,
@@ -1853,9 +2049,14 @@ impl ApiWorkerScheduler {
             None,
             None,
             None,
+            // (#sched-blend) defaults matching `SimpleSpec` serde defaults
+            // for the no-config constructor path.
+            512 * 1024,
+            8,
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub fn new_with_locality_map(
         worker_state_manager: Arc<dyn WorkerStateManager>,
         platform_property_manager: Arc<PlatformPropertyManager>,
@@ -1866,6 +2067,8 @@ impl ApiWorkerScheduler {
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
         worker_tls_config: Option<ClientTlsConfig>,
+        load_byte_cost: u64,
+        assume_core_count: u32,
     ) -> Arc<Self> {
         let memory_store_threshold = cas_store
             .as_ref()
@@ -1883,11 +2086,33 @@ impl ApiWorkerScheduler {
             NonZeroUsize::new(TREE_CACHE_CAPACITY).unwrap(),
         )));
 
+        // (#sched-blend) Zero-guard the assume-N fallback at STORE time. A
+        // worker reporting no core count (legacy / Linux / Intel) substitutes
+        // `assume_core_count` as its P-core denominator in `capacity_score`.
+        // If the operator configured `assume_core_count = 0`, that denominator
+        // is zero → `p_free_centi = 0` → `weighted_free = 0`, so the count-less
+        // worker is BOTH max-penalized AND spuriously flagged saturated even
+        // when idle → it can never win a cache-affine selection it should win
+        // (starved). Normalize to `>= 1` here, the single point the value
+        // enters `ApiWorkerSchedulerImpl`, so every downstream read is safe.
+        let assume_core_count = assume_core_count.max(1);
+        if assume_core_count == 1 {
+            // Reached only when the config value was 0 or 1; warn on the
+            // 0-misconfig case (1 P-core is an implausibly small assume-N).
+            warn!(
+                "assume_core_count normalized to 1 (configured value was 0 or 1); \
+                 count-less workers will be treated as single-P-core boxes — set a \
+                 realistic assume_core_count for any non-count-reporting fleet"
+            );
+        }
+
         Arc::new(Self {
             inner: RwLock::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
                 worker_state_manager,
                 allocation_strategy,
+                load_byte_cost,
+                assume_core_count,
                 worker_change_notify,
                 worker_registry: worker_registry.clone(),
                 shutting_down: false,
@@ -2519,6 +2744,24 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| w.indefinite_pin_saturated)
+    }
+
+    /// (#sched-blend) Reads a worker's stored (P, E) logical-CPU counts.
+    /// Test-only — lets the `worker_api_server` ingest-seam test assert that
+    /// a `ConnectWorkerRequest` carrying an over-large `p_core_count` was
+    /// CLAMPED to `MAX_PLAUSIBLE_CORES` before reaching the `Worker`
+    /// (security S1). `None` when the worker is absent.
+    #[must_use]
+    pub async fn worker_core_counts_for_test(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Option<(u32, u32)> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .0
+            .peek(worker_id)
+            .map(|w| (w.p_core_count, w.e_core_count))
     }
 
     /// A unit test function used to send the keep alive message to the worker from the server.
@@ -4331,6 +4574,33 @@ fn score_workers(
     endpoint_scores_to_worker_scores(&scoring.scores, endpoint_to_worker, candidates)
 }
 
+/// (#sched-blend) Test-only inherent methods on `ApiWorkerScheduler`.
+#[cfg(test)]
+impl ApiWorkerScheduler {
+    /// Test-only: set a registered worker's P/E logical-CPU counts. In
+    /// production the counts ride the connect frame; tests build the
+    /// heterogeneous fleet (e.g. 96-core vs 2-core) the absolute-capacity
+    /// blend depends on with this. `peek_mut` to avoid LRU promotion
+    /// (matches `update_worker_load` — a topology fact, not a work
+    /// assignment).
+    async fn set_worker_core_counts(
+        &self,
+        worker_id: &WorkerId,
+        p_core_count: u32,
+        e_core_count: u32,
+    ) -> Result<(), Error> {
+        let mut inner = self.inner.write().await;
+        let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+            make_input_err!(
+                "Worker not found in worker map in set_worker_core_counts() {}",
+                worker_id
+            )
+        })?;
+        worker.set_core_counts(p_core_count, e_core_count);
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl WorkerScheduler for ApiWorkerScheduler {
     fn get_platform_property_manager(&self) -> &PlatformPropertyManager {
@@ -5973,6 +6243,8 @@ mod tests {
             None,
             Some(store),
             None,
+            512 * 1024,
+            8,
         );
 
         // First call: cache miss, inline resolution succeeds and caches.
@@ -6100,6 +6372,8 @@ mod tests {
             None,
             Some(store),
             None,
+            512 * 1024,
+            8,
         );
 
         // First, verify guard wiring against the real shared map. Pre-insert
@@ -6228,6 +6502,8 @@ mod tests {
             None,
             None,
             None,
+            512 * 1024,
+            8,
         )
     }
 
@@ -6276,6 +6552,8 @@ mod tests {
             42, // timestamp
             0,  // max_inflight_tasks
             cas_endpoint.to_string(),
+            0, // p_core_count (unknown in this test)
+            0, // e_core_count (unknown in this test)
         );
         scheduler.add_worker(worker).await.expect("add_worker");
         rx
@@ -7070,6 +7348,16 @@ mod b1_lock_decouple_tests {
     }
 
     fn build_scheduler(wsm: Arc<BarrierWorkerStateManager>) -> Arc<ApiWorkerScheduler> {
+        build_scheduler_with_load_byte_cost(wsm, 512 * 1024)
+    }
+
+    /// (#sched-blend) Build a scheduler with an explicit `load_byte_cost`
+    /// so the continuous-blend crossover/mutation tests can drive the
+    /// cache-vs-load tradeoff (and the `LOAD_BYTE_COST = 0` mutation).
+    fn build_scheduler_with_load_byte_cost(
+        wsm: Arc<BarrierWorkerStateManager>,
+        load_byte_cost: u64,
+    ) -> Arc<ApiWorkerScheduler> {
         ApiWorkerScheduler::new_with_locality_map(
             wsm,
             Arc::new(PlatformPropertyManager::new(HashMap::new())),
@@ -7080,6 +7368,31 @@ mod b1_lock_decouple_tests {
             None,
             None,
             None,
+            load_byte_cost,
+            8,
+        )
+    }
+
+    /// (#sched-blend) Build a scheduler with an explicit `assume_core_count`
+    /// so the zero-guard test can pass the misconfigured `0` value and
+    /// observe that `new_with_locality_map` normalizes it at store time
+    /// (a count-less worker must not be starved by `assume_core_count == 0`).
+    fn build_scheduler_with_assume_core_count(
+        wsm: Arc<BarrierWorkerStateManager>,
+        assume_core_count: u32,
+    ) -> Arc<ApiWorkerScheduler> {
+        ApiWorkerScheduler::new_with_locality_map(
+            wsm,
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+            None,
+            512 * 1024,
+            assume_core_count,
         )
     }
 
@@ -7527,5 +7840,822 @@ mod b1_lock_decouple_tests {
             "update_operation must not run for an op the worker is not executing — \
              the (b) lock-free await must be unreachable on the op-not-running path"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (#sched-blend) Continuous cache-vs-load blend tests (design §9).
+    //
+    // Each behavioral test drives the PRODUCTION selection entry
+    // (`find_and_reserve_worker` → `inner_find_and_reserve_worker`, or the
+    // inner method directly for Tier 1.5 where per-worker `cached_score`
+    // must vary), composes the real `ApiWorkerSchedulerImpl` (cascade +
+    // viability gates + blend + backstop), and has a mutation that must
+    // red-fail with a bespoke message. All intermediate magnitudes are
+    // asserted in the centi-core integer space the impl runs (§2.2/§5).
+    // ════════════════════════════════════════════════════════════════════
+    mod sched_blend {
+        use std::collections::{HashMap, HashSet};
+
+        use super::*;
+        use crate::worker::MAX_PLAUSIBLE_CORES;
+
+        // The action has `input_root_digest = DigestInfo::new([0u8; 32], 0)`.
+        // A worker whose `cached_directory_digests` contains it is a Tier-1
+        // root match → the exact-root tier ranks it by `load_penalty` alone.
+        fn input_root() -> DigestInfo {
+            DigestInfo::new([0u8; 32], 0)
+        }
+
+        /// Action whose `platform_properties` are `props_pool()` so it
+        /// matches every pool worker AND the post-selection
+        /// `reduce_platform_properties` succeeds (the action's props must be
+        /// satisfied by the worker's props — both `pool=swap` here).
+        fn pool_action() -> ActionInfoWithProps {
+            use nativelink_util::action_messages::{ActionInfo, ActionUniqueKey, ActionUniqueQualifier};
+            ActionInfoWithProps {
+                inner: Arc::new(ActionInfo {
+                    command_digest: DigestInfo::new([0u8; 32], 0),
+                    input_root_digest: input_root(),
+                    timeout: Duration::MAX,
+                    platform_properties: HashMap::new(),
+                    priority: 0,
+                    load_timestamp: UNIX_EPOCH,
+                    insert_timestamp: SystemTime::now(),
+                    unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                        instance_name: "main".to_string(),
+                        digest_function: DigestHasherFunc::Sha256,
+                        digest: DigestInfo::new([7u8; 32], 1),
+                    }),
+                }),
+                platform_properties: props_pool(),
+            }
+        }
+
+        /// Register a pool worker with the given P/E counts and per-type
+        /// loads, and mark it a Tier-1 root match (so the exact-root tier
+        /// ranks it by the continuous `load_penalty`). All workers share
+        /// `props_pool()` so a single action matches the whole fleet.
+        async fn add_tier1_worker(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            p_count: u32,
+            e_count: u32,
+            cpu_load: u32,
+            p_load: u32,
+            e_load: u32,
+        ) {
+            let _rx = add_worker_in_pool(scheduler, name).await;
+            scheduler
+                .set_worker_core_counts(&WorkerId(name.to_string()), p_count, e_count)
+                .await
+                .expect("set core counts");
+            scheduler
+                .update_worker_load(&WorkerId(name.to_string()), cpu_load, p_load, e_load)
+                .await
+                .expect("set load");
+            let mut cached = HashSet::new();
+            cached.insert(input_root());
+            scheduler
+                .update_cached_directories(&WorkerId(name.to_string()), cached)
+                .await
+                .expect("set cached dirs");
+        }
+
+        /// Register a pool worker that matches the action's `input_root` ONLY
+        /// as a cached *subtree* (`cached_subtree_digests`), NOT as an exact
+        /// cached root (`cached_directory_digests`). Both arms route into the
+        /// Tier-1 min-`load_penalty` selection (`has_root_match ||
+        /// has_subtree_match`), so a subtree-only member must compete on load
+        /// like any holder — no whole-tree stickiness (design §4.1 D4).
+        async fn add_tier1_subtree_worker(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            p_count: u32,
+            e_count: u32,
+            cpu_load: u32,
+            p_load: u32,
+            e_load: u32,
+        ) {
+            let _rx = add_worker_in_pool(scheduler, name).await;
+            scheduler
+                .set_worker_core_counts(&WorkerId(name.to_string()), p_count, e_count)
+                .await
+                .expect("set core counts");
+            scheduler
+                .update_worker_load(&WorkerId(name.to_string()), cpu_load, p_load, e_load)
+                .await
+                .expect("set load");
+            // SUBTREE match only — input_root appears as a cached subtree of
+            // some other tree, not as an exact cached root.
+            scheduler
+                .update_cached_subtrees(
+                    &WorkerId(name.to_string()),
+                    true,
+                    vec![input_root()],
+                    vec![],
+                    vec![],
+                )
+                .await
+                .expect("set cached subtrees");
+        }
+
+        /// Run the production selection entry and return the chosen worker.
+        async fn select(scheduler: &Arc<ApiWorkerScheduler>) -> Option<WorkerId> {
+            let action = pool_action();
+            let op = OperationId::default();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                scheduler.find_and_reserve_worker(&props_pool(), &op, &action, false),
+            )
+            .await
+            .expect("selection must not hang (deadlock detector)")
+            .map(|(wid, _tx, _msg)| wid)
+        }
+
+        // ── T-const: numeric-constant pin (design §9 constant-pin) ──
+        // Pins the NEW/load-bearing constants at their integer encoding in
+        // the compare loop, NOT a float. `REF_FREE == 200` is the centi-core
+        // encoding of one free P-core (the rev-3 fix — NOT `1`, which would
+        // put the knee at 1/200 of a core). `SATURATION_EPSILON == 0` is the
+        // exact `weighted_free == 0` predicate. (Incident 2026-05-12: verify
+        // the const at the declaration site, not the doc-comment.)
+        #[test]
+        fn t_const_pins_blend_constants() {
+            assert_eq!(
+                super::super::REF_FREE,
+                200,
+                "REF_FREE must be 200 (centi-core encoding of one free P-core); \
+                 a value of 1 would put the knee at 1/200 of a core and reintroduce \
+                 the rev-2 binary collapse"
+            );
+            assert_eq!(
+                super::super::SATURATION_EPSILON,
+                0,
+                "SATURATION_EPSILON must be exactly 0 (the weighted_free == 0 \
+                 predicate); a non-zero value makes backstop (a) over-eager"
+            );
+            assert_eq!(super::super::P_WEIGHT_NUM, 2, "P-core weight numerator must be 2");
+            assert_eq!(super::super::E_WEIGHT_NUM, 1, "E-core weight numerator must be 1");
+            assert_eq!(
+                MAX_PLAUSIBLE_CORES, 1024,
+                "MAX_PLAUSIBLE_CORES ingest clamp must be 1024"
+            );
+        }
+
+        // ── T-const (config side): LOAD_BYTE_COST is config, not const ──
+        // Per §8 / §9: do NOT assert LOAD_BYTE_COST == 524288 as a fixed
+        // const — it is soak-selected config. Assert the serde default
+        // matches the documented anchor AND that a non-default value plumbs
+        // through to selection (the crossover tests below exercise the
+        // plumbed value; here we pin the default).
+        #[test]
+        fn t_const_load_byte_cost_default_is_anchor() {
+            use nativelink_config::schedulers::SimpleSpec;
+            let spec: SimpleSpec = serde_json::from_str("{}").expect("empty spec");
+            assert_eq!(
+                spec.load_byte_cost,
+                512 * 1024,
+                "load_byte_cost serde default must be the 512 KiB anchor (provisional, \
+                 soak-selected before deploy)"
+            );
+            assert_eq!(
+                spec.assume_core_count, 8,
+                "assume_core_count serde default must be 8"
+            );
+        }
+
+        // ── T-R3a: 96-core beats 2-core (the R3 headline) ──
+        // Equal cache (both Tier-1 root holders), heterogeneous counts. Loads
+        // chosen so the OLD load% rule and the NEW capacity rule DISAGREE
+        // deterministically: BIG @85% (load% 85), SMALL @80% (load% 80). The
+        // old `effective_load_score` (min load%) picks SMALL (80 < 85 —
+        // WRONG, a 2-core box). The new capacity math: 96@85% weighted_free=
+        // 2880 ≫ REF_FREE → penalty 0; 2@80% weighted_free=80 → penalty 307K
+        // → BIG wins (it has 14.4 free cores vs 0.40). The mutation back to
+        // `effective_load_score` flips the selection to SMALL.
+        #[nativelink_test]
+        async fn t_r3a_big_box_beats_small_box() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier1_worker(&scheduler, "BIG", 96, 0, 85, 85, 0).await;
+            add_tier1_worker(&scheduler, "SMALL", 2, 0, 80, 80, 0).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("BIG".to_string())),
+                "R3: a 96-core box at 85% (14.4 free cores, penalty 0) must beat a \
+                 2-core box at 80% (0.40 free cores, penalty 307K) — absolute free \
+                 capacity, not load %. The old load%-min rule wrongly picks SMALL (80<85)"
+            );
+        }
+
+        // ── T-R3b: 96@95% beats 2@90% (deeper into deficit) ──
+        // BIG @95% (load% 95), SMALL @90% (load% 90). Old picks SMALL (90<95).
+        // New: 96@95% weighted_free=960 → penalty 0; 2@90% weighted_free=40 →
+        // penalty 358K → BIG wins (4.8 free cores vs 0.20).
+        #[nativelink_test]
+        async fn t_r3b_big_box_beats_small_box_high_load() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier1_worker(&scheduler, "BIG", 96, 0, 95, 95, 0).await;
+            add_tier1_worker(&scheduler, "SMALL", 2, 0, 90, 90, 0).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("BIG".to_string())),
+                "R3: a 96-core box at 95% (4.8 free cores, penalty 0) must beat a \
+                 2-core box at 90% (0.20 free cores, penalty 358K); the old load%-min \
+                 rule wrongly picks SMALL (90<95)"
+            );
+        }
+
+        // ── T-R2a: P-free worker beats E-only worker (P ≫ E) ──
+        // Heterogeneous Macs p=8,e=4. A: p100/e75 → weighted_free=100,
+        // penalty=256K. B: p88/e100 → weighted_free=192 (one free P-core),
+        // penalty=20K. B wins.
+        #[nativelink_test]
+        async fn t_r2a_p_free_beats_e_only() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier1_worker(&scheduler, "A", 8, 4, 100, 100, 75).await;
+            add_tier1_worker(&scheduler, "B", 8, 4, 90, 88, 100).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("B".to_string())),
+                "R2: worker B with one free P-core (weighted_free=192, penalty 20K) \
+                 must beat worker A with only free E-cores (weighted_free=100, \
+                 penalty 256K) — free P capacity is weighted above free E capacity"
+            );
+        }
+
+        // ── T-R2b: 2-free-P beats 2-free-E at equal absolute free count ──
+        // box X: 2 free P, 0 free E (p_count=2 @0%, e_count=2 @100%)
+        //   → p_free_centi=200, e_free_centi=0, weighted_free=400.
+        // box Y: 0 free P, 2 free E (p_count=2 @100%, e_count=2 @0%)
+        //   → p_free_centi=0, e_free_centi=200, weighted_free=200 → penalty 0
+        //     too, but LESS weighted free, so it is ranked lower / sheds first.
+        // Push both into deficit so the weighting decides: use p_count=1 boxes.
+        // X: 1 free P (p1@0, e1@100): wf = 2*100 + 0 = 200, penalty 0.
+        // Y: 1 free E (p1@100, e1@0): wf = 0 + 100 = 100, penalty=256K.
+        #[nativelink_test]
+        async fn t_r2b_free_p_beats_free_e_equal_count() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            // X has a free P-core; Y has only a free E-core (equal free count = 1).
+            add_tier1_worker(&scheduler, "X", 1, 1, 50, 0, 100).await;
+            add_tier1_worker(&scheduler, "Y", 1, 1, 50, 100, 0).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("X".to_string())),
+                "R2: a worker with one free P-core (weighted_free=200, penalty 0) \
+                 must beat one with one free E-core (weighted_free=100, penalty 256K) \
+                 at equal absolute free-core count"
+            );
+        }
+
+        // ── T-edge-signed: idle big box is NOT penalized (u64-underflow guard) ──
+        // 64@0% → weighted_free=12800 ≫ REF_FREE=200, so REF_FREE - weighted_free
+        // is NEGATIVE; computed signed-then-clamped it is 0 (penalty 0). A loaded
+        // small peer (2@100%, penalty 512K) must lose. If the subtraction were
+        // done in u64 it would underflow to ~1.8e19 → the idle box gets MAX
+        // penalty → never selected.
+        #[nativelink_test]
+        async fn t_edge_signed_idle_big_box_not_penalized() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier1_worker(&scheduler, "IDLE_BIG", 64, 0, 0, 0, 0).await;
+            add_tier1_worker(&scheduler, "LOADED_SMALL", 2, 0, 100, 100, 0).await;
+
+            // Direct arithmetic assertion in centi-core space (signed clamp).
+            let cs = super::super::capacity_score(0, 0, 0, 64, 0, 8, 512 * 1024);
+            assert_eq!(cs.weighted_free, 12800, "64@0% weighted_free is 12800 centi-cores");
+            assert_eq!(
+                cs.load_penalty, 0,
+                "an idle big box (weighted_free ≫ REF_FREE) must pay ZERO penalty — \
+                 the REF_FREE - weighted_free subtraction is signed-then-clamped"
+            );
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("IDLE_BIG".to_string())),
+                "the idle 64-core box (penalty 0) must be selected over the loaded \
+                 2-core box (penalty 512K); a u64-underflow in the signed clamp would \
+                 give the idle box a huge penalty and starve it"
+            );
+        }
+
+        // ── T-clamp (arithmetic safety): widen-before-multiply (mandate 1) ──
+        // The AUTHORITATIVE ingest-clamp test (a worker reporting u32::MAX is
+        // clamped to MAX_PLAUSIBLE_CORES at the `worker_api_server` seam) lives
+        // in `nativelink-service/tests/worker_api_build_sha_test.rs` (the only
+        // place the real connect-frame ingest path is exercised). HERE we pin
+        // the arithmetic half of S1: even an UNCLAMPED u32::MAX count must NOT
+        // overflow / panic in `capacity_score` — mandate 1 widens to i64
+        // BEFORE the multiply (`u32::MAX * 100` would overflow u32). This is
+        // the defence-in-depth the clamp complements.
+        #[test]
+        fn t_clamp_arithmetic_no_overflow_on_max_count() {
+            // u32::MAX cores at 99% load: p_free_centi = u32::MAX * 1, widened
+            // to i64 (~4.29e9) — fine in i64; a u32 multiply would overflow.
+            let cs = super::super::capacity_score(99, 0, 99, u32::MAX, u32::MAX, 8, 512 * 1024);
+            // weighted_free is huge but finite; busy_core_equiv clamps to 0;
+            // penalty 0 — no panic, no overflow.
+            assert!(
+                cs.weighted_free > 0,
+                "u32::MAX cores @99% must compute a finite positive weighted_free \
+                 (widen to i64 before the multiply — mandate 1)"
+            );
+            assert_eq!(
+                cs.load_penalty, 0,
+                "an (over-reported) huge idle count pays zero penalty without overflow"
+            );
+            // And the clamp expression itself caps the value (the value the
+            // server stores; the END-TO-END ingest assertion is the service test).
+            assert_eq!(
+                u32::MAX.min(MAX_PLAUSIBLE_CORES),
+                MAX_PLAUSIBLE_CORES,
+                "the ingest clamp caps an over-report at MAX_PLAUSIBLE_CORES"
+            );
+        }
+
+        // ── T-compat: legacy 0-count worker uses assume_core_count ──
+        // A legacy worker (p_core_count=0) reporting cpu_load_pct=50 competes
+        // with a count-reporting 8@50% worker, equal cache. The legacy worker
+        // is ranked as assume_core_count(8)@50% → both have penalty 0 (8@50%
+        // weighted_free=2*8*50=800 ≫ 200) → TIE, legacy worker NOT starved.
+        // Mutation guard: without assume-N, free=0 → max penalty → starved.
+        #[nativelink_test]
+        async fn t_compat_legacy_zero_count_uses_assume_n() {
+            // Direct: legacy (0-count) at aggregate 50% is treated as
+            // assume_core_count @ aggregate, NOT free=0.
+            let legacy = super::super::capacity_score(0, 0, 50, 0, 0, 8, 512 * 1024);
+            let counted = super::super::capacity_score(50, 0, 50, 8, 0, 8, 512 * 1024);
+            assert_eq!(
+                legacy.load_penalty, counted.load_penalty,
+                "a legacy 0-count worker at aggregate 50% must rank identically to a \
+                 count-reporting 8@50% worker (assume_core_count=8 substitution)"
+            );
+            assert_eq!(
+                legacy.load_penalty, 0,
+                "8@50% has weighted_free=800 ≫ REF_FREE → penalty 0 (not starved)"
+            );
+
+            // Production composition: legacy worker must be selectable (here
+            // it ties the counted worker; assert it is not starved by being
+            // the only viable choice when the counted worker is saturated).
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier1_worker(&scheduler, "LEGACY", 0, 0, 50, 0, 0).await;
+            add_tier1_worker(&scheduler, "COUNTED_BUSY", 8, 0, 100, 100, 100).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("LEGACY".to_string())),
+                "a legacy 0-count worker at 50% (assume-N → penalty 0) must be chosen \
+                 over a saturated count-reporting worker — the assume-N fallback must \
+                 give it a real denominator, not free=0/max-penalty"
+            );
+        }
+
+        // ── T-compat-zero-assume: assume_core_count==0 must be normalized ──
+        // STEP-2 zero-guard. `assume_core_count` is config
+        // (`SimpleSpec::assume_core_count`, serde default 8) but an operator
+        // can set it to 0 (or shellexpand to 0). A count-less worker
+        // (p_core_count==0) then falls back to `eff_p_count = assume_core_count
+        // = 0` → p_free_centi = 0 → weighted_free = 0 → it is BOTH max-penalized
+        // AND spuriously flagged `is_saturated()` even when genuinely idle, so
+        // it can never win a Tier-1/1.5 selection it should win → starved.
+        // `new_with_locality_map` MUST normalize the stored `assume_core_count`
+        // to `>= 1` at store time (the dispatch's STEP-2: "normalize at the
+        // point of storing into ApiWorkerSchedulerImpl").
+        //
+        // Discriminator by SELECTION OUTCOME (production composition, via
+        // `select` → `find_and_reserve_worker`): scheduler built with
+        // `assume_core_count = 0`; two Tier-1 root holders —
+        //   - IDLE_LEGACY: count-less (p_count=0), aggregate load 10%.
+        //   - BUSY_SMALL : count-reporting p_count=2 @80%, e_count=0.
+        // WITH the guard (assume→1): IDLE_LEGACY → weighted_free = 2*1*90 = 180
+        //   (NOT saturated), penalty 51K; BUSY_SMALL → weighted_free = 2*2*20 =
+        //   80, penalty 307K. Neither saturated → Tier-1 min-penalty → the IDLE
+        //   legacy worker WINS (51K < 307K) — correct.
+        // WITHOUT the guard (assume stays 0): IDLE_LEGACY → weighted_free = 0 →
+        //   saturated, penalty 512K; BUSY_SMALL → weighted_free = 80 (NOT
+        //   saturated). Backstop does NOT fire (not ALL saturated) → Tier-1
+        //   min-penalty → BUSY_SMALL wins (307K < 512K) — WRONG: an idle worker
+        //   lost to a busy one solely because assume_core_count==0 zeroed its
+        //   denominator. The selection outcome differs → the guard is proven.
+        #[nativelink_test]
+        async fn t_compat_zero_assume_core_count_is_normalized() {
+            let scheduler =
+                build_scheduler_with_assume_core_count(BarrierWorkerStateManager::new(), 0);
+            // IDLE_LEGACY: count-less (p_count=0), idle (aggregate 10%).
+            add_tier1_worker(&scheduler, "IDLE_LEGACY", 0, 0, 10, 0, 0).await;
+            // BUSY_SMALL: count-reporting 2-core box at 80% (penalty 307K).
+            add_tier1_worker(&scheduler, "BUSY_SMALL", 2, 0, 80, 80, 0).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("IDLE_LEGACY".to_string())),
+                "assume_core_count==0 must be normalized to >=1 at store time: an idle \
+                 count-less worker (assume-N → weighted_free 180, penalty 51K) must beat \
+                 a busy 2-core box (penalty 307K). Without the zero-guard the legacy \
+                 worker gets weighted_free 0 → max penalty + spurious saturation → it is \
+                 starved and the busy box is wrongly selected"
+            );
+        }
+
+        // ── T-cascade: Tier-1 root match beats Tier-2 blob-locality ──
+        // Worker X_ROOT is a Tier-1 root holder, moderately loaded; worker
+        // Y_BLOB is idle with a LARGE Tier-2 blob-locality score (via the
+        // endpoint_scores map). The cascade consults Tier 1 FIRST, so X wins
+        // regardless of Y's locality bytes. Guards §6's non-collapse decision:
+        // collapsing to one global argmax would let a blob-locality crumb
+        // outrank a root hardlink. Drives the inner selection directly with a
+        // populated endpoint_scores map so Tier 2 genuinely fires for Y.
+        #[nativelink_test]
+        async fn t_cascade_tier1_root_beats_blob_locality() {
+            use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
+            let scheduler = ApiWorkerScheduler::new_with_locality_map(
+                BarrierWorkerStateManager::new(),
+                Arc::new(PlatformPropertyManager::new(HashMap::new())),
+                WorkerAllocationStrategy::default(),
+                Arc::new(Notify::new()),
+                100,
+                Arc::new(WorkerRegistry::new()),
+                Some(new_shared_blob_locality_map()),
+                None,
+                None,
+                512 * 1024,
+                8,
+            );
+            // X_ROOT: Tier-1 root match (cached_directory_digests ∋ input_root),
+            // moderately loaded.
+            add_tier1_worker(&scheduler, "X_ROOT", 8, 0, 80, 80, 0).await;
+            // Y_BLOB: idle, NO root match, registered WITH a cas_endpoint so it
+            // appears in endpoint_to_worker → Tier 2 can pick it.
+            let y_endpoint = "grpc://y.local:50081";
+            {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let mut worker = Worker::new_with_cas_endpoint(
+                    WorkerId("Y_BLOB".to_string()),
+                    props_pool(),
+                    tx,
+                    42,
+                    0,
+                    y_endpoint.to_string(),
+                    8,
+                    0,
+                );
+                worker.set_core_counts(8, 0);
+                scheduler.add_worker(worker).await.expect("add Y_BLOB");
+            }
+            scheduler
+                .update_worker_load(&WorkerId("Y_BLOB".to_string()), 5, 5, 0)
+                .await
+                .expect("load");
+
+            // A LARGE Tier-2 locality score for Y_BLOB's endpoint. If the
+            // cascade collapsed, this 100 MiB crumb would outrank X's root.
+            let mut endpoint_scores: HashMap<Arc<str>, u64> = HashMap::new();
+            endpoint_scores.insert(Arc::from(y_endpoint), 100 * 1024 * 1024);
+
+            let action = pool_action();
+            let op = OperationId::default();
+            let chosen = {
+                let mut inner = scheduler.inner.write().await;
+                inner
+                    .inner_find_and_reserve_worker(
+                        &props_pool(),
+                        &op,
+                        &action,
+                        false,
+                        Some(&endpoint_scores),
+                        None,
+                        None,
+                    )
+                    .map(|(wid, _tx, _msg)| wid)
+            };
+            assert_eq!(
+                chosen,
+                Some(WorkerId("X_ROOT".to_string())),
+                "cascade: a Tier-1 root/subtree match (X_ROOT) must beat a Tier-2 \
+                 blob-locality crumb (Y_BLOB, 100 MiB locality) — Tier 1 is consulted \
+                 FIRST; collapsing to one global score would let blob-locality outrank \
+                 a root hardlink"
+            );
+        }
+
+        // ── T-tier1-subtree-not-overcredited (design §4.1 D4) ──
+        // Tier 1 fires on `has_root_match OR has_subtree_match` (a worker
+        // whose cache holds the action's input_root as a *subtree* of some
+        // other tree, not as an exact cached root). The §4.1 D4 fix dropped
+        // `EXACT_ROOT_GAIN`, so Tier 1 ranks ALL holders by min `load_penalty`
+        // — a subtree-only member gets NO whole-tree stickiness; it competes on
+        // load like any holder. Scenario:
+        //   - SUBTREE_BUSY: subtree-only match, 8-P @90% → penalty 102K.
+        //   - ROOT_IDLE   : exact-root match, 8-P @5% (idle) → penalty 0.
+        // Tier-1 min-penalty → ROOT_IDLE wins (0 < 102K). If a future change
+        // re-introduced `EXACT_ROOT_GAIN` as a synthetic per-member gain that
+        // a subtree-only match also received, SUBTREE_BUSY would be held sticky
+        // (gain − 102K) and could beat the idle root worker — the over-credit
+        // this test guards against. (To MUTATE: add a positive synthetic gain
+        // to the Tier-1 `best` comparison so a busy holder outranks an idle one
+        // → SUBTREE_BUSY selected → red-fail with the message below.)
+        #[nativelink_test]
+        async fn t_tier1_subtree_only_not_overcredited() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            // Subtree-only match, moderately loaded (penalty 102K).
+            add_tier1_subtree_worker(&scheduler, "SUBTREE_BUSY", 8, 0, 90, 90, 0).await;
+            // Exact-root match, idle (penalty 0).
+            add_tier1_worker(&scheduler, "ROOT_IDLE", 8, 0, 5, 5, 0).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("ROOT_IDLE".to_string())),
+                "Tier-1 D4: a subtree-only (has_subtree_match) holder that is busy must \
+                 NOT be held sticky against an idle exact-root holder — both compete on \
+                 min load_penalty (ROOT_IDLE 0 < SUBTREE_BUSY 102K). Re-introducing a \
+                 synthetic EXACT_ROOT_GAIN would over-credit the subtree-only match with \
+                 whole-tree stickiness and wrongly select the busy worker"
+            );
+        }
+
+        // ── T-R5c: backstop (a) — all-saturated fleet falls through ──
+        // The load-bearing #52 reconciliation. ALL viable candidates are
+        // saturated (weighted_free == 0). WARM is the ONLY Tier-1 root holder
+        // (the c82b warmest-cache shape) — so WITHOUT the fall-through the
+        // cache tier would deterministically pick WARM and pile on. WITH
+        // backstop (a) the cache tiers decline and the LRU/MRU path picks by
+        // `effective_load_score`; the COLD workers (p100, e_count=0 →
+        // saturated, effective_load_score == 100) outrank WARM (p100/e100 →
+        // effective_load_score == 200), so the fall-through deterministically
+        // selects a COLD worker — i.e. the pile-on is broken. (D2: the result
+        // is an LRU-rotated worker, NOT BUSY — `can_accept_work` is dormant in
+        // prod, so this test does NOT stub `max_inflight_tasks`.)
+        #[nativelink_test]
+        async fn t_r5c_all_saturated_falls_through_then_resumes() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            // WARM: warmest-cache Tier-1 root, p8/e4 fully saturated
+            // (weighted_free 0, effective_load_score 200).
+            add_tier1_worker(&scheduler, "WARM", 8, 4, 100, 100, 100).await;
+            // COLD1/COLD2: saturated too (p8/e0 @100% → weighted_free 0) but
+            // NOT root matches, and with e_count=0 their effective_load_score
+            // is 100 (< WARM's 200) — so the LRU fall-through picks a COLD,
+            // NOT WARM. (If the cache tier ran under saturation WARM would win
+            // by being the only root holder = the pile-on the backstop breaks.)
+            let _rx2 = add_worker_in_pool(&scheduler, "COLD1").await;
+            let _rx3 = add_worker_in_pool(&scheduler, "COLD2").await;
+            for n in ["COLD1", "COLD2"] {
+                scheduler
+                    .set_worker_core_counts(&WorkerId(n.to_string()), 8, 0)
+                    .await
+                    .expect("counts");
+                scheduler
+                    .update_worker_load(&WorkerId(n.to_string()), 100, 100, 0)
+                    .await
+                    .expect("load");
+            }
+
+            // Arithmetic sanity: all three are saturated.
+            let warm_sat = super::super::capacity_score(100, 100, 100, 8, 4, 8, 512 * 1024);
+            let cold_sat = super::super::capacity_score(100, 0, 100, 8, 0, 8, 512 * 1024);
+            assert_eq!(warm_sat.weighted_free, 0, "WARM p100/e100 → weighted_free 0");
+            assert_eq!(cold_sat.weighted_free, 0, "COLD p100/e0(no E) → weighted_free 0");
+
+            // All saturated → backstop (a) fires → cache tiers decline → LRU
+            // fall-through. The pile-on is broken: the chosen worker is NOT
+            // WARM (it is a COLD via LRU `min_by_key(effective_load_score)`).
+            let chosen = select(&scheduler).await;
+            assert_ne!(
+                chosen,
+                Some(WorkerId("WARM".to_string())),
+                "saturated-fleet pile-on — backstop (a) fall-through missing: under \
+                 all-saturated the cache tier piled the dispatch onto the warmest \
+                 worker WARM instead of falling through to the LRU/MRU path"
+            );
+            assert!(
+                chosen.is_some(),
+                "the LRU fall-through must still place the action (CPU saturation does \
+                 not return BUSY — can_accept_work is dormant); got None"
+            );
+
+            // Now FREE the WARM worker → it is the only non-saturated AND the
+            // warmest → backstop (a) does NOT fire (not over-eager) → normal
+            // cache-aware routing resumes and selects WARM (§R5.1 row 2).
+            scheduler
+                .update_worker_load(&WorkerId("WARM".to_string()), 50, 50, 50)
+                .await
+                .expect("free WARM");
+            let chosen2 = select(&scheduler).await;
+            assert_eq!(
+                chosen2,
+                Some(WorkerId("WARM".to_string())),
+                "backstop (a) is not over-eager: the moment WARM frees up \
+                 (weighted_free > 0), normal cache-aware routing resumes and the \
+                 now-non-saturated warmest worker wins"
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // Tier-1.5 (subtree coverage) crossover tests. Per-worker
+        // `cached_score` must vary, so these call the inner selection method
+        // directly with a hand-built `ResolvedTree` (the resolution phase is
+        // upstream and separate; `inner_find_and_reserve_worker` is the real
+        // selection function under test).
+        // ════════════════════════════════════════════════════════════════
+
+        use super::super::ResolvedTree;
+        use nativelink_proto::build::bazel::remote::execution::v2::Directory;
+
+        /// Build a 2-level `ResolvedTree`: a root plus two child subtrees so a
+        /// worker caching a child gets a partial `cached_score`. `child_bytes`
+        /// sets each child's direct bytes (drives `cached_score` magnitude).
+        fn build_tree(child_a: DigestInfo, child_b: DigestInfo, child_bytes: u64) -> ResolvedTree {
+            let root = input_root();
+            let mut dir_digests = HashSet::new();
+            dir_digests.insert(root);
+            dir_digests.insert(child_a);
+            dir_digests.insert(child_b);
+
+            let mut dir_direct_bytes = HashMap::new();
+            dir_direct_bytes.insert(root, 0u64);
+            dir_direct_bytes.insert(child_a, child_bytes);
+            dir_direct_bytes.insert(child_b, child_bytes);
+
+            let mut dir_direct_files = HashMap::new();
+            dir_direct_files.insert(root, 0u64);
+            dir_direct_files.insert(child_a, 0u64);
+            dir_direct_files.insert(child_b, 0u64);
+
+            let mut subtree_bytes = HashMap::new();
+            subtree_bytes.insert(root, child_bytes * 2);
+            let mut subtree_files = HashMap::new();
+            subtree_files.insert(root, 0u64);
+
+            let mut directories = HashMap::new();
+            directories.insert(root, Directory::default());
+            directories.insert(child_a, Directory::default());
+            directories.insert(child_b, Directory::default());
+
+            ResolvedTree {
+                file_digests: Vec::new(),
+                dir_digests,
+                subtree_bytes,
+                subtree_files,
+                dir_direct_bytes,
+                dir_direct_files,
+                directories,
+            }
+        }
+
+        /// Register a pool worker with counts + load and a set of cached
+        /// subtree digests (for Tier-1.5 coverage scoring). Does NOT set a
+        /// root match (so Tier 1 is skipped and Tier 1.5 runs).
+        async fn add_tier15_worker(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            p_count: u32,
+            e_count: u32,
+            p_load: u32,
+            e_load: u32,
+            cached_subtrees: Vec<DigestInfo>,
+        ) {
+            let _rx = add_worker_in_pool(scheduler, name).await;
+            scheduler
+                .set_worker_core_counts(&WorkerId(name.to_string()), p_count, e_count)
+                .await
+                .expect("counts");
+            scheduler
+                .update_worker_load(&WorkerId(name.to_string()), p_load, p_load, e_load)
+                .await
+                .expect("load");
+            scheduler
+                .update_cached_subtrees(
+                    &WorkerId(name.to_string()),
+                    true,
+                    cached_subtrees,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .expect("set cached subtrees");
+        }
+
+        /// Drive the production inner selection with a hand-built tree (Tier
+        /// 1.5 path). Returns the chosen worker id.
+        async fn select_tier15(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            tree: &ResolvedTree,
+        ) -> Option<WorkerId> {
+            let action = pool_action();
+            let op = OperationId::default();
+            let mut inner = scheduler.inner.write().await;
+            inner
+                .inner_find_and_reserve_worker(
+                    &props_pool(),
+                    &op,
+                    &action,
+                    false,
+                    None,
+                    Some(tree),
+                    None,
+                )
+                .map(|(wid, _tx, _msg)| wid)
+        }
+
+        // ── T-R5a: continuous crossover (non-saturated, 8-P @90%) ──
+        // One warm worker on an 8-P box at 90% (centi: weighted_free=160,
+        // busy_core_equiv=40, penalty=102K — engaged but NOT saturated, so
+        // backstop (a) is dormant), cache just below the 102K crossover; one
+        // idle cold worker. The idle cold worker is selected — a selection the
+        // binary floor cannot make (8@90% floored → penalty 0). Then bump the
+        // warm worker's cache far above 102K → warm worker wins.
+        #[nativelink_test]
+        async fn t_r5a_continuous_crossover_non_saturated() {
+            let child_a = DigestInfo::new([0xa1u8; 32], 1);
+            let child_b = DigestInfo::new([0xb2u8; 32], 1);
+
+            // cache just BELOW the 102K crossover: child_bytes = 80_000 (the
+            // worker caches child_a only → cached_score = 80_000 < 102_400).
+            let tree = build_tree(child_a, child_b, 80_000);
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            // WARM: 8-P @90% (penalty 102K), caches child_a (80K cache).
+            add_tier15_worker(&scheduler, "WARM", 8, 0, 90, 0, vec![child_a]).await;
+            // COLD: known-idle (reports a low 5% load, NOT 0 — 0/0/0 is the
+            // "never reported" sentinel that sorts LAST in the LRU fallback),
+            // caches NOTHING (cached_score 0, penalty 0). When Tier 1.5
+            // declines (WARM's S < 0), the fall-through LRU path picks the
+            // lowest-load worker = COLD.
+            add_tier15_worker(&scheduler, "COLD", 8, 0, 5, 0, vec![]).await;
+
+            // Sanity: the penalty at 8@90% is 102K (centi), and 80K < 102K.
+            let cs = super::super::capacity_score(90, 0, 90, 8, 0, 8, 512 * 1024);
+            assert_eq!(cs.load_penalty, 104_857, "8@90% penalty is 102K (centi-core)");
+
+            let chosen = select_tier15(&scheduler, &tree).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("COLD".to_string())),
+                "R5 crossover: an 80K cache hit on an 8-P @90% worker (penalty 102K) \
+                 must lose to an idle cold peer — S_warm = 80K - 102K < 0 = S_cold; the \
+                 binary cutoff/floor docked nothing at 90% and kept the warm worker"
+            );
+
+            // Now make the cache hit large (≈3 MiB ≫ 102K) → warm worker wins.
+            let big_tree = build_tree(child_a, child_b, 3 * 1024 * 1024);
+            let scheduler2 = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier15_worker(&scheduler2, "WARM", 8, 0, 90, 0, vec![child_a]).await;
+            add_tier15_worker(&scheduler2, "COLD", 8, 0, 5, 0, vec![]).await;
+            let chosen2 = select_tier15(&scheduler2, &big_tree).await;
+            assert_eq!(
+                chosen2,
+                Some(WorkerId("WARM".to_string())),
+                "R5 crossover: a 3 MiB cache hit ≫ the 102K penalty must keep the warm \
+                 worker — the crossover does real work in BOTH directions"
+            );
+        }
+
+        // ── T-R5b: THE continuous-vs-binary distinguisher (design §9) ──
+        // 8-P box at 90%, marginal cache = 90 KiB, chosen INSIDE the
+        // (0, 102 KiB] window. Centi-core penalty = 102K > 90K cache → idle
+        // cold SELECTED. The binary floor (8@90% → p_free=1, penalty 0) and
+        // the old cutoff (90 < 99 → fully preferred) both keep the WARM worker
+        // — a DIFFERENT SELECTION. This is the test that would have caught the
+        // rev-2 collapse (whose T-R5b passed green against both new and old).
+        #[nativelink_test]
+        async fn t_r5b_distinguisher_idle_cold_selected_at_90kib() {
+            let child_a = DigestInfo::new([0xa1u8; 32], 1);
+            let child_b = DigestInfo::new([0xb2u8; 32], 1);
+            // 90 KiB cache: inside (0, 102 KiB].
+            let tree = build_tree(child_a, child_b, 90 * 1024);
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier15_worker(&scheduler, "WARM", 8, 0, 90, 0, vec![child_a]).await;
+            // COLD: known-idle (5% load, not the 0/0/0 "unreported" sentinel).
+            add_tier15_worker(&scheduler, "COLD", 8, 0, 5, 0, vec![]).await;
+
+            // The discriminator: centi-core penalty (102K) > cache (90K), and
+            // the whole-core floor would dock 0.
+            let centi = super::super::capacity_score(90, 0, 90, 8, 0, 8, 512 * 1024);
+            assert!(
+                centi.load_penalty > 90 * 1024,
+                "centi-core penalty (102K) must exceed the 90 KiB cache so the warm \
+                 worker is shed; got {}",
+                centi.load_penalty
+            );
+
+            let chosen = select_tier15(&scheduler, &tree).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("COLD".to_string())),
+                "THE distinguisher: a 90 KiB cache on an 8-P @90% worker must lose to \
+                 an idle cold peer (S_warm = 90K - 102K < 0). The binary-floor mutation \
+                 (8@90% → penalty 0) keeps WARM — a DIFFERENT selection, proving the \
+                 penalty is continuous, not binary"
+            );
+        }
     }
 }

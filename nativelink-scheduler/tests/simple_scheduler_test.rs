@@ -2924,6 +2924,8 @@ async fn setup_new_worker_with_cas_endpoint(
         NOW_TIME,
         0,
         cas_endpoint.to_string(),
+        0, // p_core_count (#sched-blend; unknown in this test)
+        0, // e_core_count
     );
     scheduler
         .add_worker(worker)

@@ -97,6 +97,22 @@ pub struct ConnectWorkerRequest {
     /// / incompatible builds)
     #[prost(string, tag = "8")]
     pub build_sha: ::prost::alloc::string::String,
+    /// / Number of performance (P) logical CPUs on this worker.
+    /// / macOS: hw.perflevel0.logicalcpu. 0 = unknown (legacy worker,
+    /// / Linux, or Intel Mac with no perflevel sysctl) — the scheduler
+    /// / substitutes its configured assume-core-count and competes the
+    /// / worker in the P-core tier (preserves pre-change %-only behavior).
+    /// / Logical CPU topology is static for the worker's lifetime, so this
+    /// / rides the connect hello frame (not the per-tick KeepAlive).
+    /// / (#sched-blend: continuous cache-vs-load blend ranks by absolute
+    /// / free core capacity, which requires the core counts.)
+    #[prost(uint32, tag = "9")]
+    pub p_core_count: u32,
+    /// / Number of efficiency (E) logical CPUs on this worker.
+    /// / macOS: hw.perflevel1.logicalcpu. 0 = none / unknown.
+    /// / (#sched-blend: continuous cache-vs-load blend)
+    #[prost(uint32, tag = "10")]
+    pub e_core_count: u32,
 }
 /// / Per-digest info reported by workers in BlobsAvailableNotification.
 /// / The previous `last_access_timestamp` field has been retired now that the
