@@ -235,7 +235,10 @@ where
 ///   pinned-byte usage).
 /// - `pin_cap`       — companion to `pinned_bytes`; the ceiling.
 /// - `entry_count`   — live moka entry count.
-/// - `weighted_size` — bytes resident in moka (does NOT include pinned).
+/// - `weighted_size` — KB-WEIGHT sum of resident entries (weigher rounds
+///   each value up to 1 KB; does NOT include pinned). NOT bytes.
+/// - `weighted_size_bytes` — byte-accurate view (`weighted_size × 1024`);
+///   use this for byte-vs-disk comparisons.
 /// - `evicted_bytes`, `evicted_items`, `replaced_bytes`,
 ///   `replaced_items`, `lifetime_inserted_bytes` — existing counters
 ///   already maintained by the eviction listener / insert paths.
@@ -261,7 +264,17 @@ where
     ) -> Result<nativelink_metric::MetricPublishKnownKindData, nativelink_metric::Error> {
         // Live cache accessors — gauges, not counters.
         let entry_count: u64 = self.cache.entry_count();
+        // `weighted_size()` is the sum of moka WEIGHTS, and the weigher in
+        // `with_anchor` emits weights in KB-units (`value.len().div_ceil(1024)`).
+        // So `weighted_size` is a KB-WEIGHT count, NOT a byte count.
+        // `weighted_size_bytes` below is the byte-accurate view (× the same
+        // 1024 the weigher and `would_exceed_capacity` use), so an operator
+        // can compare it to on-disk bytes directly without a 1024× misread.
+        // SCALE is kept inline (not exposed publicly), mirroring the same
+        // choice at the `would_exceed_capacity` call-site.
+        const WEIGHER_SCALE: u64 = 1024;
         let weighted_size: u64 = self.cache.weighted_size();
+        let weighted_size_bytes: u64 = weighted_size.saturating_mul(WEIGHER_SCALE);
         // Atomic gauge — current pinned bytes (admission/eviction/pin
         // composite invariant: `pinned_bytes <= pin_cap`).
         let pinned_bytes: u64 = self.pinned_bytes.load(Ordering::Relaxed);
@@ -314,7 +327,13 @@ where
             "weighted_size",
             &weighted_size,
             nativelink_metric::MetricKind::Default,
-            "Live weighted size (bytes) of moka cache entries; pinned-only bytes accounted separately under pinned_bytes."
+            "Live weighted size of moka cache entries in KB-WEIGHT units (NOT bytes): the weigher rounds each value up to 1 KB (value.len().div_ceil(1024)) and this is the sum of those weights. For a byte count, use weighted_size_bytes (= this × 1024). Pinned-only bytes accounted separately under pinned_bytes."
+        );
+        nativelink_metric::publish!(
+            "weighted_size_bytes",
+            &weighted_size_bytes,
+            nativelink_metric::MetricKind::Default,
+            "Live weighted size (bytes) of moka cache entries: weighted_size × 1024 (the weigher's KB scale, matching would_exceed_capacity). Use this — not weighted_size — for byte-vs-disk comparisons; reading weighted_size as bytes under-counts by 1024×. Pinned-only bytes accounted separately under pinned_bytes."
         );
         nativelink_metric::publish!(
             "max_bytes",

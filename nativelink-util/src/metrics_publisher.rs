@@ -527,6 +527,7 @@ mod endpoint {
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
+    use nativelink_macro::nativelink_test;
     use nativelink_metric::MetricsComponent;
 
     use super::*;
@@ -688,5 +689,104 @@ mod tests {
         // body shrinks during edits — we keep the import for future
         // assertions about anchor-time-derived gauges.
         let _ = Duration::from_secs(0);
+    }
+
+    /// F3a render-test (production `/metrics` collection path): the moka
+    /// weigher stores weights in KB-units (`value.len().div_ceil(1024)`),
+    /// so `cache.weighted_size()` is a KB-weight count, NOT a byte count.
+    /// The legacy `weighted_size` metric was published with a help-text
+    /// claiming "(bytes)", which a reader took at face value and compared
+    /// to on-disk bytes — producing a phantom 144 GB "orphan" (a 1024×
+    /// units misread). This test pins, via the same `render_prometheus`
+    /// walk `/metrics` uses, that:
+    ///
+    ///   1. an additive byte-accurate `weighted_size_bytes` gauge renders
+    ///      the true byte usage (`weighted_size * 1024`) with a "(bytes)"
+    ///      help-text, so byte↔disk comparisons are direct and correct; and
+    ///   2. the legacy `weighted_size` gauge keeps its name + KB-weight
+    ///      VALUE for dashboard back-compat, but its help-text no longer
+    ///      claims bytes — it states KB-weight units.
+    ///
+    /// A 4096-byte blob weighs `4096.div_ceil(1024) = 4` KB-units, so the
+    /// legacy gauge reads `4` and the byte-accurate gauge reads
+    /// `4 * 1024 = 4096`.
+    ///
+    /// Mutation step (CLAUDE.md TDD): (a) drop the `weighted_size_bytes`
+    /// `publish!` call OR (b) revert the `weighted_size` help-text back to
+    /// the "(bytes)" wording in `MokaEvictingMap::publish`
+    /// (`nativelink-util/src/moka_evicting_map.rs`). Each assertion below
+    /// MUST red-fail with its bespoke `F3a:` message.
+    #[nativelink_test("crate")]
+    async fn moka_weighted_size_bytes_units_are_correct() {
+        use std::time::SystemTime;
+
+        use nativelink_config::stores::EvictionPolicy;
+
+        use crate::evicting_map::NoopCallback;
+        use crate::moka_evicting_map::MokaEvictingMap;
+
+        #[derive(Debug, Clone)]
+        struct Entry(u64);
+        impl crate::evicting_map::LenEntry for Entry {
+            fn len(&self) -> u64 {
+                self.0
+            }
+            fn is_empty(&self) -> bool {
+                self.0 == 0
+            }
+        }
+
+        // 64 KiB cap so a single 4 KiB blob stays resident (no eviction).
+        let cfg = EvictionPolicy {
+            max_bytes: 64 * 1024,
+            evict_bytes: 0,
+            max_seconds: 0,
+            max_count: 0,
+        };
+        let map: MokaEvictingMap<u64, u64, Entry, SystemTime, NoopCallback> =
+            MokaEvictingMap::with_anchor(&cfg, SystemTime::now());
+
+        // 4096 bytes -> weighs 4096.div_ceil(1024) = 4 KB-units.
+        map.insert(1, Entry(4096)).await;
+
+        let registry = MetricsRegistry::new();
+        registry.register("memstore", Arc::new(map));
+
+        let body = render_prometheus(&registry);
+
+        // (1) Byte-accurate gauge renders the TRUE byte usage = 4096
+        //     (weighted_size 4 * SCALE 1024), not the KB-weight 4.
+        assert!(
+            body.contains("\nmemstore_weighted_size_bytes 4096\n"),
+            "F3a: weighted_size_bytes must render the true byte usage (weighted_size * 1024 = 4096) so byte<->disk comparisons are direct. body=\n{body}"
+        );
+        // (1b) ...with a help-text that actually says bytes.
+        let bytes_help = body
+            .lines()
+            .find(|l| l.starts_with("# HELP memstore_weighted_size_bytes "))
+            .unwrap_or("");
+        assert!(
+            bytes_help.contains("(bytes)"),
+            "F3a: weighted_size_bytes help-text must state it is in bytes. help line=\n{bytes_help}\nbody=\n{body}"
+        );
+
+        // (2) Legacy gauge keeps its KB-weight VALUE (=4) for back-compat.
+        assert!(
+            body.contains("\nmemstore_weighted_size 4\n"),
+            "F3a: legacy weighted_size gauge must keep its KB-weight value (=4) for dashboard back-compat (name/value unchanged). body=\n{body}"
+        );
+        // (2b) ...but its help-text must NO LONGER claim bytes; it must
+        //      state KB-weight units (this is the units-mislabel fix).
+        let legacy_help = body
+            .lines()
+            .find(|l| {
+                l.starts_with("# HELP memstore_weighted_size ")
+                    && !l.starts_with("# HELP memstore_weighted_size_bytes ")
+            })
+            .unwrap_or("");
+        assert!(
+            legacy_help.contains("KB-WEIGHT") && !legacy_help.contains("(bytes)"),
+            "F3a: legacy weighted_size help-text must state KB-WEIGHT units and must not claim '(bytes)' (the units mislabel that caused the phantom 144 GB orphan). help line=\n{legacy_help}\nbody=\n{body}"
+        );
     }
 }
