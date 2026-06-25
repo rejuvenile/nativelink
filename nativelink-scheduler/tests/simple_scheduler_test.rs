@@ -819,6 +819,234 @@ async fn indefinite_pin_saturated_worker_skipped_on_cache_affinity_path_test()
     Ok(())
 }
 
+/// (F4) T4 — disk-pressure routing. The matcher MUST route a new action AWAY
+/// from a `disk_pressured` worker to a healthy peer, so the action is not
+/// dispatched into a worker that would NAK ResourceExhausted (re-queue → re-
+/// dispatch spin) or ENOSPC at make_action_directory.
+///
+/// Topology note (vs the indefinite-pin sibling test): the disk gate has a
+/// FLEET FAIL-OPEN, so a SINGLE disk-pressured worker would be re-admitted via
+/// the fail-open (correct — better one NAK than a wedge). The "routes away"
+/// contract therefore needs a HEALTHY alternative: with one pressured + one
+/// healthy worker, the action must land on the HEALTHY one. This proves the
+/// `worker_matches` skip steers selection, distinct from the all-pressured
+/// fail-open (the sibling `all_disk_pressured_fleet_fail_open` test).
+///
+/// Production composition: drives the real `SimpleScheduler` (matcher + worker
+/// pool + state manager), exercising `update_worker_disk_pressure` →
+/// `Worker.disk_pressured` → `inner_find_and_reserve_worker` (`worker_matches`
+/// skip) end to end.
+///
+/// Mutation step (CLAUDE.md TDD #5): in `api_worker_scheduler.rs`, delete the
+/// `if w.disk_pressured { return false; }` skip in `worker_matches`. This test
+/// red-fails: the disk-pressured worker is no longer steered-around, so the
+/// action may dispatch to it (the pressured worker receives the StartAction).
+#[nativelink_test]
+async fn disk_pressured_worker_routed_away_test() -> Result<(), Error> {
+    let pressured_worker = WorkerId("disk_pressured_worker".to_string());
+    let healthy_worker = WorkerId("healthy_worker".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_pressured =
+        setup_new_worker(&scheduler, pressured_worker.clone(), PlatformProperties::default()).await?;
+    let mut rx_healthy =
+        setup_new_worker(&scheduler, healthy_worker.clone(), PlatformProperties::default()).await?;
+
+    // One worker disk-pressured (volume full), one healthy. The matcher must
+    // steer AROUND the pressured one.
+    scheduler
+        .update_worker_disk_pressure(&pressured_worker, true, 0)
+        .await?;
+    scheduler
+        .update_worker_disk_pressure(&healthy_worker, false, 100 * (1 << 30))
+        .await?;
+    tokio::task::yield_now().await;
+
+    let action_digest = DigestInfo::new([77u8; 32], 512);
+    let insert_timestamp = make_system_time(15);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    {
+        // The action dispatches (a healthy worker exists) → Executing.
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Executing,
+            "with a healthy worker available the action must dispatch"
+        );
+    }
+
+    // The load-bearing assertion: the HEALTHY worker received the StartAction,
+    // and the disk-pressured worker did NOT. Drain the healthy worker's channel
+    // with a budget (StartAction may interleave with a PeerHints ChunkedMessage)
+    // under a `tokio::time::timeout` deadlock detector.
+    let mut healthy_saw_start = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(5), rx_healthy.recv()).await {
+            Ok(Some(msg)) => match msg.update {
+                Some(update_for_worker::Update::StartAction(_)) => {
+                    healthy_saw_start = true;
+                    break;
+                }
+                _ => continue,
+            },
+            Ok(None) => panic!("healthy worker channel closed"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        healthy_saw_start,
+        "F4 disk-pressure gate: the HEALTHY worker did NOT receive the \
+         StartAction — the matcher must steer the action to the healthy worker \
+         and away from the disk-pressured one"
+    );
+    // The pressured worker must NOT have been dispatched to. By the time the
+    // healthy worker has the StartAction, the matcher has resolved this action,
+    // so the pressured channel holding any StartAction is a routing bug.
+    let mut pressured_saw_start = false;
+    while let Ok(msg) = rx_pressured.try_recv() {
+        if let Some(update_for_worker::Update::StartAction(_)) = msg.update {
+            pressured_saw_start = true;
+            break;
+        }
+    }
+    assert!(
+        !pressured_saw_start,
+        "F4 disk-pressure gate: the disk-pressured worker was dispatched to \
+         (matcher did not route around it)"
+    );
+
+    Ok(())
+}
+
+/// (F4) T4 — fleet fail-open MUST NOT wedge a fully disk-pressured fleet. The
+/// cadre's load-bearing correction: if `disk_pressured` is added to the
+/// `worker_matches` skip but the fleet fail-open predicate
+/// (`worker_matches_ignoring_pressure`) does NOT ignore it, then when EVERY
+/// candidate is disk-gated the matcher finds nothing and the action wedges in
+/// Queued forever (capability-class wedge). The worker-local statvfs fallback
+/// (rejecting only a TRULY-full disk) is the backstop, so placing on the
+/// least-pressured (most-free) worker is safe — better a worker-NAK re-queue
+/// than a permanent stall.
+///
+/// Production composition: a TWO-worker fleet, BOTH reporting disk-pressured.
+/// The action must still be DISPATCHED (the fleet fail-open at
+/// `api_worker_scheduler.rs` places on the most-free worker), NOT stuck in
+/// Queued.
+///
+/// Mutation step: in `worker_matches_ignoring_pressure`, add
+/// `&& !w.disk_pressured` (re-introduce the disk skip in the fail-open
+/// predicate). This test red-fails: with no fail-open target, the action stays
+/// Queued and the `recv()` of a StartAction times out / the stage assertion
+/// fails.
+#[nativelink_test]
+async fn all_disk_pressured_fleet_fail_open_does_not_wedge_test() -> Result<(), Error> {
+    let worker_id_1 = WorkerId("worker_1".to_string());
+    let worker_id_2 = WorkerId("worker_2".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_from_worker_1 =
+        setup_new_worker(&scheduler, worker_id_1.clone(), PlatformProperties::default()).await?;
+    let mut rx_from_worker_2 =
+        setup_new_worker(&scheduler, worker_id_2.clone(), PlatformProperties::default()).await?;
+
+    // BOTH workers disk-pressured. Worker 2 has MORE free bytes, so the
+    // most-free fail-open ranking should prefer it — but the load-bearing
+    // assertion is only that SOMETHING is dispatched (no wedge).
+    scheduler
+        .update_worker_disk_pressure(&worker_id_1, true, 1 << 30) // 1 GiB free
+        .await?;
+    scheduler
+        .update_worker_disk_pressure(&worker_id_2, true, 4 * (1 << 30)) // 4 GiB free
+        .await?;
+    tokio::task::yield_now().await;
+
+    let action_digest = DigestInfo::new([78u8; 32], 512);
+    let insert_timestamp = make_system_time(16);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    {
+        // The fleet fail-open MUST place the action despite every worker being
+        // disk-gated — else the capability class wedges.
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Executing,
+            "F4 fleet fail-open: an action wedged in Queued with EVERY worker \
+             disk-pressured — the fail-open predicate must ignore disk pressure \
+             and place on the least-pressured (most-free) worker, else a fully \
+             disk-pressured fleet deadlocks its capability class (cadre correction)"
+        );
+    }
+
+    // Confirm one of the two workers actually received the StartAction (the
+    // fail-open SELECTED a worker, not merely flipped the stage). The ranking
+    // prefers the most-free worker (worker 2), but accept either to keep the
+    // test about the no-wedge contract rather than the tie-break.
+    let mut saw_start = false;
+    for _ in 0..4 {
+        tokio::select! {
+            biased;
+            msg = rx_from_worker_2.recv() => {
+                if let Some(update_for_worker::Update::StartAction(_)) =
+                    msg.expect("worker 2 channel closed").update
+                {
+                    saw_start = true;
+                    break;
+                }
+            }
+            msg = rx_from_worker_1.recv() => {
+                if let Some(update_for_worker::Update::StartAction(_)) =
+                    msg.expect("worker 1 channel closed").update
+                {
+                    saw_start = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_start,
+        "fleet fail-open selected no worker for dispatch on a fully \
+         disk-pressured fleet (the matcher must degrade to least-pressured \
+         placement, not wedge)"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn set_drain_worker_pauses_and_resumes_worker_test() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());

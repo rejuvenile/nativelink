@@ -205,6 +205,31 @@ pub struct Worker {
     #[metric(help = "Worker-reported memory-pressure level (MiB below free-floor).")]
     pub swap_pressure_rate_per_sec: u32,
 
+    /// (F4) Whether the worker reported physical disk pressure on its
+    /// CAS/work_directory volume in its last `BlobsAvailable` heartbeat (free
+    /// bytes below `DISK_FREE_FLOOR_BYTES`). While `true`, the matcher
+    /// PROACTIVELY skips this worker for new actions (mirrors
+    /// `swap_pressured` / `indefinite_pin_saturated`) so a disk-pressured-but-
+    /// idle worker is not selected and then forced to worker-side NAK →
+    /// re-queue → re-dispatch spin. ADVISORY ONLY: the authoritative gate is
+    /// the worker's local atomic + statvfs fallback (the StartAction NAK).
+    /// `false` for workers that never report disk pressure (pre-F4 / sampler
+    /// stale → fail-open). The fleet fail-open (`api_worker_scheduler`)
+    /// overrides this skip when EVERY candidate is disk-gated, degrading to
+    /// least-pressured (most-free-bytes) placement rather than a wedge.
+    #[metric(help = "If the worker reported physical disk pressure on its CAS volume.")]
+    pub disk_pressured: bool,
+
+    /// (F4) The worker's last-reported free bytes on its CAS/work_directory
+    /// volume, used ONLY to rank the least-pressured worker in the disk fleet
+    /// fail-open (when all candidates are disk-gated). Observability +
+    /// tie-break; NOT a gate input on its own. `0` = unknown / volume full.
+    /// Higher = MORE free = LESS pressured, so the `max_by_key` fail-open
+    /// ranking selects the worker with the most headroom (the inverse of the
+    /// memory `min_by_key` shortfall ranking).
+    #[metric(help = "Worker-reported free bytes on its CAS volume (fail-open ranking).")]
+    pub available_disk_bytes: u64,
+
     /// Digests of input root directories cached in the worker's directory cache.
     /// The scheduler gives routing preference to workers that already have the
     /// action's input_root_digest cached.
@@ -303,6 +328,8 @@ impl Worker {
             indefinite_pin_saturated: false,
             swap_pressured: false,
             swap_pressure_rate_per_sec: 0,
+            disk_pressured: false,
+            available_disk_bytes: 0,
             cached_directory_digests: HashSet::new(),
             cached_subtree_digests: HashSet::new(),
             metrics: Arc::new(Metrics {

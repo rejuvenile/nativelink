@@ -940,6 +940,23 @@ impl ApiWorkerSchedulerImpl {
                 return false;
             }
 
+            // (F4 disk-pressure gate) Proactively skip a disk-pressured worker
+            // — mirrors the swap skip above. ADVISORY: the worker-side
+            // StartAction NAK (+ statvfs fallback) is the authoritative gate;
+            // this avoids the wasted dispatch round-trip (and the idle-worker
+            // spin) for a worker we already know is over its disk floor. When
+            // EVERY candidate is disk-gated, the fleet fail-open below
+            // (`worker_matches_ignoring_pressure` + the most-free ranking)
+            // re-admits the least-pressured one rather than wedging.
+            if w.disk_pressured {
+                if full_worker_logging {
+                    debug!(
+                        "Worker {worker_id} skipped: physical disk pressure (F4 disk gate)"
+                    );
+                }
+                return false;
+            }
+
             // Verify Minimum properties at runtime (their values are dynamic)
             if !platform_properties.is_satisfied_by(&w.platform_properties, full_worker_logging) {
                 return false;
@@ -949,20 +966,25 @@ impl ApiWorkerSchedulerImpl {
         };
 
         // (#37 fleet fail-open, §5 case 3a) A worker that passes EVERY
-        // viability check EXCEPT the swap-pressure skip. Used ONLY when the
-        // normal `viable` set is empty for this capability class, to avoid
-        // a whole-fleet wedge when every candidate is swap-gated: rather
-        // than place nothing (the OS pager only relieves pressure if
-        // SOMETHING completes, but nothing is running), the matcher
-        // degrades to placing on the LEAST-pressured gated worker. This is
-        // NET-NEW (the cache-affinity `best_overloaded` fallback runs on
+        // viability check EXCEPT the swap-pressure AND disk-pressure skips.
+        // Used ONLY when the normal `viable` set is empty for this capability
+        // class, to avoid a whole-fleet wedge when every candidate is
+        // pressure-gated: rather than place nothing, the matcher degrades to
+        // placing on the LEAST-pressured gated worker. This is NET-NEW (the
+        // cache-affinity `best_overloaded` fallback runs on
         // `worker_is_viable`-passing workers and STRUCTURALLY excludes
-        // swap-gated ones, so it cannot serve here). The worker-local
-        // time-bounded fail-open is the load-bearing backstop; this is the
-        // proactive optimization that picks the least-bad target.
-        let worker_matches_ignoring_swap = |pair: &(&WorkerId, &Worker)| -> bool {
+        // pressure-gated ones, so it cannot serve here). The worker-local
+        // fail-opens are the load-bearing backstop (swap: time-bounded; disk:
+        // the statvfs authoritative fallback rejects only a TRULY-full disk);
+        // this is the proactive optimization that picks the least-bad target.
+        // (F4 cadre correction: `disk_pressured` MUST be ignored here too —
+        // omit it and a fully disk-pressured fleet wedges its capability class.
+        // Placing on the most-free worker is safe: if even that one is truly
+        // full, its worker-local statvfs fallback NAKs ResourceExhausted, a
+        // re-queue, never an ENOSPC.)
+        let worker_matches_ignoring_pressure = |pair: &(&WorkerId, &Worker)| -> bool {
             let (_, w) = pair;
-            // Same as `worker_matches` minus the swap-pressure skip.
+            // Same as `worker_matches` minus the swap + disk pressure skips.
             w.quarantined_at.is_none()
                 && w.can_accept_work()
                 && !w.indefinite_pin_saturated
@@ -1005,35 +1027,53 @@ impl ApiWorkerSchedulerImpl {
             viable.first().map(|(id, _)| id.clone())
         };
 
-        // (#37 fleet fail-open, §5 case 3a) Nothing viable: if there ARE
-        // otherwise-viable candidates that were excluded ONLY by the swap
-        // skip, place on the LEAST-pressured one (lowest reported rate,
-        // LRU-order tie-break) instead of wedging the capability class. The
-        // worker-local time-bounded fail-open still backstops a stale
-        // server view; this just avoids the wasted queue-stall when the
-        // server already knows every candidate is gated.
+        // (#37 + F4 fleet fail-open, §5 case 3a) Nothing viable: if there ARE
+        // otherwise-viable candidates that were excluded ONLY by a pressure
+        // skip (swap OR disk), place on the LEAST-pressured one instead of
+        // wedging the capability class. The worker-local fail-opens still
+        // backstop a stale server view (swap: time-bounded; disk: the statvfs
+        // authoritative fallback rejects only a TRULY-full disk); this just
+        // avoids the wasted queue-stall when the server already knows every
+        // candidate is gated.
+        //
+        // (F4) The ranking key is a tuple `(disk_pressured, swap_shortfall,
+        // Reverse(available_disk_bytes))`: prefer a NOT-disk-pressured worker
+        // first (a truly-full disk ENOSPCs; swap degrades gracefully as the OS
+        // pager reclaims), then least swap shortfall, then most disk headroom.
+        // This DEGENERATES to the prior swap-only behavior when no worker is
+        // disk-pressured (all keys share `disk_pressured=false` → ranks purely
+        // by `swap_pressure_rate_per_sec`), and to most-free-bytes when all are
+        // disk-pressured (shared `swap=0` → ranks by `Reverse(free)`).
         if worker_id.is_none() {
             let workers_iter = self.workers.iter();
+            let rank_key = |w: &Worker| {
+                (
+                    w.disk_pressured,
+                    w.swap_pressure_rate_per_sec,
+                    core::cmp::Reverse(w.available_disk_bytes),
+                )
+            };
             let least_pressured = match self.allocation_strategy {
                 WorkerAllocationStrategy::LeastRecentlyUsed => workers_iter
                     .rev()
                     .filter(|(wid, _)| candidates.contains(wid))
-                    .filter(|pair| pair.1.swap_pressured)
-                    .filter(|pair| worker_matches_ignoring_swap(pair))
-                    .min_by_key(|(_, w)| w.swap_pressure_rate_per_sec)
+                    .filter(|pair| pair.1.swap_pressured || pair.1.disk_pressured)
+                    .filter(|pair| worker_matches_ignoring_pressure(pair))
+                    .min_by_key(|(_, w)| rank_key(w))
                     .map(|(_, w)| w.id.clone()),
                 WorkerAllocationStrategy::MostRecentlyUsed => workers_iter
                     .filter(|(wid, _)| candidates.contains(wid))
-                    .filter(|pair| pair.1.swap_pressured)
-                    .filter(|pair| worker_matches_ignoring_swap(pair))
-                    .min_by_key(|(_, w)| w.swap_pressure_rate_per_sec)
+                    .filter(|pair| pair.1.swap_pressured || pair.1.disk_pressured)
+                    .filter(|pair| worker_matches_ignoring_pressure(pair))
+                    .min_by_key(|(_, w)| rank_key(w))
                     .map(|(_, w)| w.id.clone()),
             };
             if let Some(ref wid) = least_pressured {
                 warn!(
                     worker_id = %wid,
-                    "fleet fail-open: every candidate worker is swap-gated; placing on the \
-                     least-pressured one to avoid a capability-class wedge (#37 §5 case 3a)"
+                    "fleet fail-open: every candidate worker is pressure-gated (swap and/or \
+                     disk); placing on the least-pressured one to avoid a capability-class \
+                     wedge (#37 / F4 §5 case 3a)"
                 );
             }
             worker_id = least_pressured;
@@ -1133,17 +1173,19 @@ impl ApiWorkerSchedulerImpl {
             // `can_accept_work()` so the `update_action` pause logic (which also
             // calls `can_accept_work()`) is untouched.
             //
-            // (#37 swap gate) Swap-pressured workers are likewise excluded
-            // from the cache-affinity tiers: a new action would be NAKed by
-            // the worker-local gate, so a cache hit on a pressured worker is
-            // a wasted dispatch. The all-gated case does NOT wedge here —
-            // the cache-affinity tiers fall through to
-            // `inner_find_worker_for_action`'s LRU/MRU path, which carries
-            // the fleet fail-open (least-pressured placement).
+            // (#37 swap gate / F4 disk gate) Swap- AND disk-pressured workers
+            // are likewise excluded from the cache-affinity tiers: a new action
+            // would be NAKed by the worker-local gate, so a cache hit on a
+            // pressured worker is a wasted dispatch. The all-gated case does NOT
+            // wedge here — the cache-affinity tiers fall through to
+            // `inner_find_worker_for_action`'s LRU/MRU path, which carries the
+            // fleet fail-open (least-pressured placement, ignoring BOTH swap and
+            // disk).
             if w.quarantined_at.is_some()
                 || !w.can_accept_work()
                 || w.indefinite_pin_saturated
                 || w.swap_pressured
+                || w.disk_pressured
             {
                 return false;
             }
@@ -5096,6 +5138,45 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // value is not-pressured, matching the indefinite-pin path); waking
         // on pressured=true is harmless (the matcher just skips the worker).
         if !swap_pressured {
+            inner.worker_change_notify.notify_one();
+        }
+        Ok(())
+    }
+
+    async fn update_worker_disk_pressure(
+        &self,
+        worker_id: &WorkerId,
+        disk_pressured: bool,
+        available_disk_bytes: u64,
+    ) -> Result<(), Error> {
+        // peek_mut to avoid LRU promotion — a pressure report is telemetry,
+        // not work assignment, and must not reorder scheduling (mirrors
+        // update_worker_swap_pressure).
+        let mut inner = self.inner.write().await;
+        {
+            let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+                make_input_err!(
+                    "Worker not found in worker map in \
+                     update_worker_disk_pressure() {}",
+                    worker_id
+                )
+            })?;
+            if worker.disk_pressured != disk_pressured {
+                debug!(
+                    %worker_id,
+                    disk_pressured,
+                    available_disk_bytes,
+                    "worker disk pressure changed"
+                );
+            }
+            worker.disk_pressured = disk_pressured;
+            worker.available_disk_bytes = available_disk_bytes;
+        }
+        // A transition to NOT-pressured re-opens this worker to the matcher;
+        // wake it so a queued action can be assigned without waiting for the
+        // next change tick (mirrors update_worker_swap_pressure). Waking on
+        // pressured=true is harmless (the matcher just skips the worker).
+        if !disk_pressured {
             inner.worker_change_notify.notify_one();
         }
         Ok(())

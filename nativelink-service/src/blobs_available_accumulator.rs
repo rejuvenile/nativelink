@@ -165,6 +165,12 @@ struct HeaderScalars {
     swap_used_bytes: u64,
     memory_pressure_level: u32,
     memory_pressured: bool,
+    // (F4) Disk pressure, carried from chunk 0. `available_disk_bytes` is the
+    // observability + least-pressured fail-open ranking key (MORE free = LESS
+    // pressured); `disk_pressured` is the coarse gate verdict the matcher
+    // consumes via `update_worker_disk_pressure` after reassembly.
+    available_disk_bytes: u64,
+    disk_pressured: bool,
 }
 
 /// One in-flight broadcast's accumulated state.
@@ -280,6 +286,8 @@ impl BroadcastAccumulator {
                 swap_used_bytes: chunk.swap_used_bytes,
                 memory_pressure_level: chunk.memory_pressure_level,
                 memory_pressured: chunk.memory_pressured,
+                available_disk_bytes: chunk.available_disk_bytes,
+                disk_pressured: chunk.disk_pressured,
             });
         }
 
@@ -868,6 +876,8 @@ impl BlobsAvailableAccumulator {
                     body.swap_used_bytes = headers.swap_used_bytes;
                     body.memory_pressure_level = headers.memory_pressure_level;
                     body.memory_pressured = headers.memory_pressured;
+                    body.available_disk_bytes = headers.available_disk_bytes;
+                    body.disk_pressured = headers.disk_pressured;
                 }
                 body.is_full_snapshot = removed.is_full_snapshot;
                 MergeOutcome::Accepted(Some(body))
@@ -962,6 +972,8 @@ mod tests {
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }
     }
 
@@ -1490,6 +1502,40 @@ mod tests {
             "chunk-0 memory_pressured verdict was lost in chunked reassembly \
              (the terminal chunk's default false clobbered the carried value \
              — accumulator carry-forward missing)"
+        );
+    }
+
+    /// (F4) `available_disk_bytes` + the `disk_pressured` verdict ride chunk 0
+    /// and the accumulator MUST carry them forward into the reassembled
+    /// notification (same half-applied-header bug class as the swap fields).
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): comment out the
+    /// `body.available_disk_bytes = headers.available_disk_bytes;` /
+    /// `body.disk_pressured = headers.disk_pressured;` lines in the
+    /// terminal-commit arm of `merge_chunk`. This test red-fails with the
+    /// bespoke "lost in chunked reassembly" message below.
+    #[test]
+    fn disk_pressure_scalars_carried_forward_from_chunk_zero() {
+        let acc = BlobsAvailableAccumulator::new();
+        let mut c0 = chunk(1, 0, false, 99, vec![bdi(1)]);
+        c0.available_disk_bytes = 123_456_789_012;
+        c0.disk_pressured = true;
+
+        let c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
+
+        assert!(acc.merge_chunk(c0).is_none());
+        let out = acc.merge_chunk(c1).expect("terminal commits");
+        assert_eq!(
+            out.available_disk_bytes, 123_456_789_012,
+            "chunk-0 available_disk_bytes was lost in chunked reassembly (the \
+             terminal chunk's default 0 clobbered the carried value — \
+             accumulator carry-forward missing)"
+        );
+        assert!(
+            out.disk_pressured,
+            "chunk-0 disk_pressured verdict was lost in chunked reassembly (the \
+             terminal chunk's default false clobbered the carried value — \
+             accumulator carry-forward missing)"
         );
     }
 

@@ -114,6 +114,27 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
         Ok(())
     }
 
+    /// (F4 disk-pressure gate) Updates whether the worker reported physical
+    /// disk pressure on its CAS/work_directory volume (free bytes below the
+    /// disk floor), plus its current free-bytes level. Carried on every
+    /// `BlobsAvailable` (both the periodic heartbeat AND the one-shot
+    /// post-action delta), like `indefinite_pin_saturated` / `swap_pressured`,
+    /// so the flag is not clobbered to `false` the instant an action
+    /// completes. When `disk_pressured` is `true`, the matcher PROACTIVELY
+    /// skips this worker for new actions (advisory — the worker-local NAK +
+    /// statvfs fallback is the authoritative gate); the free-bytes level ranks
+    /// the least-pressured (most-free) worker in the fleet fail-open. Default
+    /// impl is a no-op so schedulers without a worker pool need not implement
+    /// it.
+    async fn update_worker_disk_pressure(
+        &self,
+        _worker_id: &WorkerId,
+        _disk_pressured: bool,
+        _available_disk_bytes: u64,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Updates the set of cached directory digests for a worker.
     /// The scheduler uses this to give routing preference to workers that
     /// already have the action's input_root_digest cached in their directory cache.

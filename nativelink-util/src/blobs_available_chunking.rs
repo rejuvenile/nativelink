@@ -126,6 +126,8 @@ pub fn chunk_blobs_available(
         swap_used_bytes,
         memory_pressure_level,
         memory_pressured,
+        available_disk_bytes,
+        disk_pressured,
     } = notification;
 
     // Fold legacy field 2 (`digests`) into `digest_infos` for backwards
@@ -190,6 +192,11 @@ pub fn chunk_blobs_available(
                 0
             },
             memory_pressured: if sequence == 0 { memory_pressured } else { false },
+            // (F4) Disk pressure: chunk-0-only scalars (like swap_used_bytes);
+            // the accumulator carries chunk 0's value forward into the
+            // reassembled notification.
+            available_disk_bytes: if sequence == 0 { available_disk_bytes } else { 0 },
+            disk_pressured: if sequence == 0 { disk_pressured } else { false },
             digests: Vec::new(),
             cached_directory_digests: Vec::new(),
             pinned_mirror_entries: Vec::new(),
@@ -519,6 +526,47 @@ mod tests {
             assert!(
                 !c.memory_pressured,
                 "non-zero chunks must leave memory_pressured at the proto3 \
+                 default false (chunk-0-only scalar)"
+            );
+        }
+    }
+
+    /// (F4) `available_disk_bytes` + `disk_pressured` are chunk-0-only scalars
+    /// (like the swap fields): the accumulator carries chunk 0's value forward,
+    /// and subsequent chunks MUST leave them at the proto3 default so a value is
+    /// not double-counted or contradicted across chunks.
+    ///
+    /// Mutation step: in `chunk_blobs_available`, change the disk fields'
+    /// `if sequence == 0 { .. } else { 0/false }` to carry the value on EVERY
+    /// chunk. The non-zero-chunk assertions red-fail.
+    #[test]
+    fn disk_fields_ride_chunk_zero_only() {
+        let n = BlobsAvailableNotification {
+            available_disk_bytes: 123_456_789_012,
+            disk_pressured: true,
+            digest_infos: (0..10).map(bdi).collect(),
+            ..Default::default()
+        };
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 3)
+            .expect("multi-chunk must succeed");
+        assert!(chunks.len() >= 3, "need >1 chunk to test scalar placement");
+        assert_eq!(
+            chunks[0].available_disk_bytes, 123_456_789_012,
+            "chunk 0 must carry available_disk_bytes"
+        );
+        assert!(
+            chunks[0].disk_pressured,
+            "chunk 0 must carry disk_pressured"
+        );
+        for c in &chunks[1..] {
+            assert_eq!(
+                c.available_disk_bytes, 0,
+                "non-zero chunks must leave available_disk_bytes at the proto3 \
+                 default (chunk-0-only scalar)"
+            );
+            assert!(
+                !c.disk_pressured,
+                "non-zero chunks must leave disk_pressured at the proto3 \
                  default false (chunk-0-only scalar)"
             );
         }

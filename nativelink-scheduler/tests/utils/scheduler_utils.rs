@@ -184,5 +184,16 @@ pub(crate) fn update_eq(
             }
             _ => false,
         },
+        // (#FL-688) Server→worker durability ack. Test utility; no scheduler
+        // test compares this variant for equality (the worker consumes it on
+        // its own bidi stream), so eq is equality of the BlobsAvailableAck.
+        // Added to keep this exhaustive match compiling after the variant was
+        // introduced into the `UpdateForWorker.update` oneof.
+        update_for_worker::Update::BlobsAvailableAck(actual_update) => match expected_update {
+            update_for_worker::Update::BlobsAvailableAck(expected_update) => {
+                expected_update == actual_update
+            }
+            _ => false,
+        },
     }
 }

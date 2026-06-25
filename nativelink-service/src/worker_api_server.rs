@@ -2704,6 +2704,24 @@ impl WorkerConnection {
             warn!(worker_id=?self.worker_id, ?err, memory_pressured, memory_pressure_level, "Failed to update worker memory pressure");
         }
 
+        // (F4) Plumb the worker's coarse disk-pressure verdict + free-bytes
+        // level to the matcher (proactive skip / least-pressured fail-open
+        // ranking), mirroring the memory-pressure plumb above. Carried on BOTH
+        // the periodic heartbeat and the one-shot post-action delta so a
+        // disk-pressured worker's flag is not clobbered when an action
+        // completes. ADVISORY ONLY: the authoritative gate is the worker-local
+        // StartAction NAK (+ statvfs fallback); this is the proactive matcher
+        // hint so a pressured worker is not selected then forced to NAK.
+        let disk_pressured = notification.disk_pressured;
+        let available_disk_bytes = notification.available_disk_bytes;
+        if let Err(err) = self
+            .scheduler
+            .update_worker_disk_pressure(&self.worker_id, disk_pressured, available_disk_bytes)
+            .await
+        {
+            warn!(worker_id=?self.worker_id, ?err, disk_pressured, available_disk_bytes, "Failed to update worker disk pressure");
+        }
+
         // Mirror capacity report (review #1): the worker advertises its
         // current `mirror_blobs` total bytes and configured cap on every
         // BlobsAvailable. Plumb them into the WorkerProxyStore picker

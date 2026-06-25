@@ -643,6 +643,166 @@ static LAST_SAMPLE_INSTANT: AtomicU64 = AtomicU64::new(0);
 static MEMORY_PRESSURED: AtomicBool = AtomicBool::new(false);
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// (F4) Physical free bytes on the worker's CAS/work_directory volume, refreshed
+/// by the sampler thread every 100 ms via `statvfs` (`f_bavail * f_frsize`).
+/// `u64::MAX` is the never-sampled sentinel (so the gate fails OPEN before the
+/// first sample rather than reading `0` = "full" and NAKing everything at boot);
+/// the sampler overwrites it with the real free-bytes value on its first tick.
+/// Wire field 22 (observability + the server's most-free fail-open ranking).
+static DISK_FREE_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+/// (F4) Monotonic nanoseconds (since `PROCESS_START`) at which the disk-free
+/// sampler last published a value. The worker-local gate reads this to detect a
+/// wedged/dead sampler: if the most recent sample is older than
+/// `DISK_SAMPLE_MAX_AGE`, the gate's disk state is UNKNOWN and — UNLIKE the swap
+/// gate, which blind-fails-open — it consults the authoritative `statvfs`
+/// fallback (SEC-2: disk has no other live bound behind the gate). `0` = never
+/// sampled yet (also routes to the fallback). Monotonic source so an NTP step
+/// cannot spuriously trip or suppress the fallback.
+static LAST_DISK_SAMPLE_INSTANT: AtomicU64 = AtomicU64::new(0);
+/// (F4) Coarse 1-bit disk-gate verdict published by the sampler: `true` when
+/// the disk-free FLOOR is breached (with a hysteresis band), AND the gate is
+/// ENABLED. Mirrors `MEMORY_PRESSURED`: the heartbeat carries it (advisory
+/// matcher hint) and the worker-local StartAction NAK reads it (authoritative
+/// gate — the local atomic + statvfs fallback, never the wire boolean). `false`
+/// when fresh-and-healthy, never-sampled, or disabled.
+static DISK_PRESSURED: AtomicBool = AtomicBool::new(false);
+
+/// (F4) PRIMARY disk-admission floor: free bytes on the worker's
+/// CAS/work_directory volume below which the gate trips. The CAS fast tier
+/// (40 GiB cap, `cas_FAST_SLOW_STORE.fast` FilesystemStore on the prod workers)
+/// OVERSHOOTS its byte cap because moka's weight-based eviction is
+/// EVENTUALLY-CONSISTENT and trails sustained large-blob ingest by ~4× (the F3b
+/// finding); the work_directory shares that same physical volume (config
+/// invariant `cas_server::LocalWorkerConfig::work_directory`). So this gate is
+/// the BACKSTOP that rejects new work BEFORE raw ENOSPC at
+/// `make_action_directory` while eviction catches up.
+// THRESHOLD 8 GiB: a CONSERVATIVE safe-enable value on the 40 GiB prod fast
+// tier — 20% of the cap. It must sit ABOVE the worst-case eviction-lag overshoot
+// (so the gate leads ENOSPC with real margin: the largest observed chunked-write
+// class is ~295 MiB, and a single action's work_directory footprint + a burst of
+// in-flight large blobs is bounded well under 8 GiB) yet far below the cap (so a
+// busy-but-healthy worker with normal headroom is not falsely gated). NOT
+// soak-validated — pending a busy-worker soak that refines the lead-time; the
+// statvfs authoritative fallback + the fleet fail-open bound the failure modes.
+// Mirrors the #37 free-floor's conservative-safe-enable rationale (and heeds the
+// #64 lesson: a too-aggressive floor false-trips fleet-wide — 8 GiB on a 40 GiB
+// disk is structurally unlikely to false-trip a healthy worker).
+const DISK_FREE_FLOOR_BYTES: u64 = 8 * (1 << 30); // 8 GiB
+
+/// (F4) Hysteresis band above `DISK_FREE_FLOOR_BYTES` for CLEARING the disk-free
+/// trip: trip below the floor, clear only once free recovers above
+/// `DISK_FREE_FLOOR_BYTES + DISK_FREE_FLOOR_HYSTERESIS`, so a worker hovering at
+/// the floor (eviction freeing then ingest refilling) does not chatter
+/// admit/refuse every tick. 2 GiB = a quarter of the floor (mirrors the #37
+/// free-floor's quarter-band).
+const DISK_FREE_FLOOR_HYSTERESIS: u64 = 2 * (1 << 30); // 2 GiB
+
+/// (F4) Master enable for the worker-local disk-pressure admission gate and its
+/// heartbeat boolean. ENABLED: unlike the #37 memory floor (which read raw
+/// `free_count` and false-tripped on macOS — #64), the disk free-floor reads the
+/// AUTHORITATIVE `statvfs f_bavail` (free blocks available to non-root), which is
+/// not subject to the free-vs-available ambiguity that sank the memory gate; the
+/// 8 GiB floor on a 40 GiB cap is conservative; and the statvfs fallback +
+/// fleet fail-open bound the failure modes. When enabled the gate NAKs new
+/// `StartAction`s under sustained disk pressure and the matcher proactively skips
+/// a pressured worker.
+const DISK_GATE_ENABLED: bool = true;
+
+/// (F4) Max age of the most recent disk sample before the gate treats its disk
+/// state as UNKNOWN and consults the authoritative `statvfs` fallback (NOT a
+/// blind fail-open — SEC-2). MUST be strictly GREATER than the worst-case
+/// legitimate sampler stall and strictly LESS than the time for an un-gated
+/// worker to ENOSPC. At the 100 ms sampler cadence, 2 s = 20 missed ticks
+/// (mirrors `SWAP_SAMPLE_MAX_AGE`).
+const DISK_SAMPLE_MAX_AGE: Duration = Duration::from_secs(2);
+
+/// (F4) Time-bounded fleet fail-open window (§5 case 3b), mirroring
+/// `SWAP_FAIL_OPEN_AFTER`. A worker that has been NAKing new work under disk
+/// pressure with NO in-flight actions for longer than this accepts ONE action
+/// regardless of pressure, so an all-idle all-disk-pressured fleet cannot
+/// deadlock. The worker-local statvfs fallback already prevents admitting into a
+/// TRULY-full disk, so this clause only fires when the sampler-reported pressure
+/// has not yet cleared but the disk is not at the literal wall.
+const DISK_FAIL_OPEN_AFTER: Duration = Duration::from_secs(30);
+
+/// (F4) The `statvfs` target path the disk sampler measures — the worker's
+/// `work_directory`, which shares one physical volume with the CAS
+/// FilesystemStore `content_path` by config invariant
+/// (`cas_server::LocalWorkerConfig::work_directory`). Set ONCE at sampler
+/// startup (`start_cpu_sampler`). `None` ⇒ no path configured / CString
+/// conversion failed ⇒ the disk sampler is inert (publishes the never-sampled
+/// sentinel, and the gate's stale path then drives the statvfs fallback, which
+/// also no-ops on a missing path → last-resort fail-open).
+static DISK_SAMPLE_PATH: std::sync::OnceLock<Option<std::ffi::CString>> =
+    std::sync::OnceLock::new();
+
+/// (F4) Free bytes available to non-root on the volume containing `path`, via
+/// `statvfs` (`f_bavail * f_frsize`). POSIX — works on macOS and Linux (the only
+/// worker targets) with the SAME ABI. `None` on syscall failure (the caller
+/// treats it as "unmeasurable"). This is a BLOCKING syscall; it MUST only be
+/// called on the dedicated sampler OS thread (per-tick) or inside
+/// `spawn_blocking` (the gate's one-shot stale fallback) — NEVER directly on a
+/// tokio worker (CLAUDE.md async-blocking rule).
+fn read_disk_available_bytes(path: &std::ffi::CStr) -> Option<u64> {
+    // SAFETY: `statvfs` is a stable POSIX API; `buf` is a correctly-sized
+    // zeroed `libc::statvfs` and `path` is a valid NUL-terminated C string.
+    let mut buf: libc::statvfs = unsafe { core::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(path.as_ptr(), &raw mut buf) };
+    if ret != 0 {
+        return None;
+    }
+    // `f_bavail` = free blocks available to non-privileged processes (the
+    // admission-relevant figure, not `f_bfree` which includes root reserve);
+    // `f_frsize` = fundamental block size in bytes. Both are u64 on the worker
+    // targets but `c_ulong` in the binding, so go through u64 explicitly.
+    let avail = u64::try_from(buf.f_bavail).ok()?;
+    let frsize = u64::try_from(buf.f_frsize).ok()?;
+    Some(avail.saturating_mul(frsize))
+}
+
+/// (F4) One disk-sampler tick: `statvfs` the configured volume off the hot path
+/// and publish `DISK_FREE_BYTES` (free-bytes gauge), `LAST_DISK_SAMPLE_INSTANT`
+/// (liveness anchor for the gate's stale→statvfs-fallback decision), and
+/// `DISK_PRESSURED` (the free-floor-breached gate verdict with a hysteresis
+/// band). Returns the new `currently_tripped` state to thread into the next
+/// tick. Runs on the dedicated sampler thread alongside the CPU/memory samplers
+/// — NEVER per-action on a tokio worker. `currently_tripped` carries the
+/// hysteresis-band verdict across ticks.
+fn sample_disk_pressure(currently_tripped: bool) -> bool {
+    let now = Instant::now();
+    // Publish the liveness anchor on EVERY tick BEFORE the syscall can fail, so
+    // a one-off unreadable statvfs doesn't look like a dead sampler — only a
+    // sampler that stops ticking entirely trips the age fallback.
+    let since_start = now.duration_since(*PROCESS_START).as_nanos();
+    LAST_DISK_SAMPLE_INSTANT.store(
+        u64::try_from(since_start).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+
+    let Some(Some(path)) = DISK_SAMPLE_PATH.get() else {
+        // No path configured: leave the never-sampled sentinel + report no
+        // pressure. The gate's stale path will drive the (also-no-op) statvfs
+        // fallback → last-resort fail-open.
+        DISK_PRESSURED.store(false, Ordering::Relaxed);
+        return false;
+    };
+
+    let Some(free_bytes) = read_disk_available_bytes(path) else {
+        // statvfs failed this tick: report no pressure for this tick and leave
+        // the prior free-bytes value (don't publish a spurious 0 = "full").
+        DISK_PRESSURED.store(false, Ordering::Relaxed);
+        return false;
+    };
+
+    DISK_FREE_BYTES.store(free_bytes, Ordering::Relaxed);
+    let tripped = disk_floor_breached(free_bytes, currently_tripped);
+    // The published gate verdict is gated on DISK_GATE_ENABLED (a disabled gate
+    // never advertises pressure → the matcher never proactively skips on an
+    // unproven threshold), matching memory_gate_verdict.
+    DISK_PRESSURED.store(DISK_GATE_ENABLED && tripped, Ordering::Relaxed);
+    tripped
+}
+
 /// Process-start anchor for the monotonic `LAST_SAMPLE_INSTANT` atomic.
 /// `Instant` is not `Copy`-into-an-atomic, so the sampler stores
 /// `now.duration_since(*PROCESS_START)` nanos and the gate compares
@@ -744,15 +904,23 @@ const SWAP_FAIL_OPEN_AFTER: Duration = Duration::from_secs(30);
 /// S-MED-1). At the 100 ms sampler cadence, 2 s = 20 missed ticks.
 const SWAP_SAMPLE_MAX_AGE: Duration = Duration::from_secs(2);
 
-/// Starts a dedicated OS thread that samples system-wide CPU utilization
-/// every 100ms. Idempotent — only the first call spawns the thread.
-fn start_cpu_sampler() -> Result<(), Error> {
+/// Starts a dedicated OS thread that samples system-wide CPU utilization,
+/// memory pressure, AND (F4) physical disk-free on the worker's
+/// `work_directory` volume every 100ms. Idempotent — only the first call spawns
+/// the thread. `work_directory` is the path the disk sampler `statvfs`'s (it
+/// shares one physical volume with the CAS `content_path` by config invariant);
+/// it is set ONCE into `DISK_SAMPLE_PATH` (a bad/non-NUL path leaves the disk
+/// sampler inert → the gate's statvfs fallback covers it).
+fn start_cpu_sampler(work_directory: &str) -> Result<(), Error> {
     if SAMPLER_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
         .is_err()
     {
         return Ok(());
     }
+    // (F4) Record the disk-sampler target path ONCE. A path containing an
+    // interior NUL cannot become a CString → `None` → the disk sampler no-ops.
+    let _ = DISK_SAMPLE_PATH.set(std::ffi::CString::new(work_directory).ok());
     std::thread::Builder::new()
         .name("cpu-sampler".into())
         .spawn(cpu_sample_loop)
@@ -995,12 +1163,17 @@ fn cpu_sample_loop() {
     // where host_processor_info failed).
     let mut prev = cpu_impl::read_cpu_times();
     let mut mem_state = SwapSamplerState::new();
+    let mut disk_tripped = false;
     loop {
         std::thread::sleep(Duration::from_millis(100));
         // Sample host swap pressure on the same fixed cadence as CPU so
         // the pressure rate has a stable denominator (the heartbeat
         // cadence varies 100 ms-6 s and would make the rate noisy).
         mem_state = sample_mem_pressure(mem_state);
+        // (F4) Sample physical disk-free on the same cadence (off the hot
+        // path — never a per-action statvfs). Threads the hysteresis-band
+        // verdict across ticks.
+        disk_tripped = sample_disk_pressure(disk_tripped);
         let curr = cpu_impl::read_cpu_times();
         match (&prev, &curr) {
             (Some(p), Some(c)) => {
@@ -1016,11 +1189,15 @@ fn cpu_sample_loop() {
 fn per_type_sample_loop(initial: cpu_impl::PerTypeCpuTimes) {
     let mut prev = initial;
     let mut mem_state = SwapSamplerState::new();
+    let mut disk_tripped = false;
     loop {
         std::thread::sleep(Duration::from_millis(100));
         // Sample host swap pressure FIRST so it keeps publishing even on
         // ticks where the CPU read fails and `continue`s below.
         mem_state = sample_mem_pressure(mem_state);
+        // (F4) Sample physical disk-free on the same cadence, BEFORE the CPU
+        // read can `continue`, so it keeps publishing on CPU-read failures.
+        disk_tripped = sample_disk_pressure(disk_tripped);
         let Some(curr) = cpu_impl::read_per_type_cpu_times() else {
             CPU_PCT.store(0, Ordering::Relaxed);
             P_CORE_PCT.store(0, Ordering::Relaxed);
@@ -1203,6 +1380,163 @@ fn swap_gate_decision(
         }
         _ => SwapGateDecision::Nak,
     }
+}
+
+// ─────────────────────────── F4 disk-pressure gate ───────────────────────────
+
+/// (F4) PRIMARY disk-free floor trip with a two-threshold hysteresis band
+/// (mirrors `free_floor_breached`): the disk gate trips when free bytes on the
+/// CAS/work_directory volume fall below `DISK_FREE_FLOOR_BYTES`.
+///
+/// - Trip when `free_bytes < DISK_FREE_FLOOR_BYTES`.
+/// - Once tripped, stay tripped until free recovers ABOVE
+///   `DISK_FREE_FLOOR_BYTES + DISK_FREE_FLOOR_HYSTERESIS` (so a worker hovering
+///   at the floor — eviction freeing then ingest refilling — does not flap
+///   admit/refuse every tick).
+/// - In the band, HOLD the prior verdict.
+///
+/// Pure function of `(free_bytes, currently_tripped)` so it is unit-testable in
+/// isolation. The caller threads `currently_tripped` across sampler ticks.
+const fn disk_floor_breached(free_bytes: u64, currently_tripped: bool) -> bool {
+    if free_bytes < DISK_FREE_FLOOR_BYTES {
+        true
+    } else if free_bytes >= DISK_FREE_FLOOR_BYTES.saturating_add(DISK_FREE_FLOOR_HYSTERESIS) {
+        false
+    } else {
+        // In the hysteresis band: hold the prior verdict.
+        currently_tripped
+    }
+}
+
+/// (F4) Disk sample-age verdict: reports the sampler's pressure value AND
+/// whether the most recent sample is STALE. UNLIKE the swap gate (which
+/// blind-fails-open on stale), `stale` here is a signal that the caller MUST
+/// consult the authoritative `statvfs` fallback (SEC-2: disk has no other live
+/// bound behind the gate, so a blind fail-open on a stale sampler re-opens the
+/// ENOSPC the gate prevents). Returns `(pressured, stale)`:
+/// - disabled ⇒ `(false, false)` (never gate; no fallback).
+/// - never-sampled (`last_nanos == 0`) ⇒ `(false, true)` (route to fallback).
+/// - stale (`age > max_age`) ⇒ `(false, true)` (route to fallback).
+/// - fresh ⇒ `(pressured, false)` (trust the live sampler verdict).
+///
+/// Pure function of the time inputs (monotonic nanos since `PROCESS_START`) so
+/// it is unit-testable independent of the `DISK_GATE_ENABLED` ship flag.
+fn disk_gate_verdict(
+    enabled: bool,
+    pressured: bool,
+    last_nanos: u64,
+    now_since_start: Duration,
+    max_age: Duration,
+) -> (bool /* pressured */, bool /* stale */) {
+    if !enabled {
+        return (false, false);
+    }
+    if last_nanos == 0 {
+        // Never published a value — UNKNOWN → consult the statvfs fallback.
+        return (false, true);
+    }
+    let age = now_since_start.saturating_sub(Duration::from_nanos(last_nanos));
+    if age > max_age {
+        // Stale sample: the sampler is wedged/dead — UNKNOWN → statvfs fallback.
+        return (false, true);
+    }
+    (pressured, false)
+}
+
+/// (F4) Resolve the EFFECTIVE disk-pressure verdict, folding in the SEC-2
+/// authoritative `statvfs` fallback on a stale sampler. This is the load-bearing
+/// divergence from the swap gate:
+///
+/// - sampler FRESH (`!stale`) ⇒ trust the live sampler `pressured` value
+///   (`authoritative_free` is ignored).
+/// - sampler STALE ⇒ consult the one-shot authoritative `statvfs`:
+///   - `Some(free)` below the floor ⇒ effective-pressured (still reject — do NOT
+///     admit into a genuinely-full disk).
+///   - `Some(free)` at/above the floor ⇒ not pressured (measured headroom).
+///   - `None` (statvfs ITSELF failed) ⇒ not pressured = LAST-RESORT blind
+///     fail-open: with no measurement at all, refusing all work would wedge the
+///     worker, so admit (the only unmeasurable corner, mirroring the swap gate).
+///
+/// Pure function of `(pressured, stale, authoritative_free)` so the SEC-2 logic
+/// is unit-testable without the syscall.
+fn disk_effective_pressured(pressured: bool, stale: bool, authoritative_free: Option<u64>) -> bool {
+    if !stale {
+        return pressured;
+    }
+    match authoritative_free {
+        Some(free) => free < DISK_FREE_FLOOR_BYTES,
+        None => false,
+    }
+}
+
+/// (F4) The three outcomes of the worker-local disk-gate evaluation on a
+/// `StartAction`. Pure-function output of [`disk_gate_decision`] so the
+/// admission / fleet-fail-open / hysteresis logic is unit-testable without the
+/// full `LocalWorker::run` loop. Shape mirrors [`SwapGateDecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskGateDecision {
+    /// Accept the action normally (not pressured, or hysteresis latch holds).
+    Accept,
+    /// Accept via the time-bounded fleet fail-open (§5 case 3b): the worker has
+    /// been idle-gating past `DISK_FAIL_OPEN_AFTER`. Caller MUST set the
+    /// hysteresis latch so re-gating is suppressed until the action completes.
+    AcceptFailOpen,
+    /// Refuse the action with `ResourceExhausted` (sustained disk pressure with
+    /// either in-flight work draining or before the fail-open window).
+    Nak,
+}
+
+/// (F4) Pure disk-gate admission decision. `effective_pressured` already folds
+/// in the stale→statvfs fallback ([`disk_effective_pressured`]); from there the
+/// logic is byte-identical to [`swap_gate_decision`]:
+///
+/// - Not pressured ⇒ `Accept`.
+/// - Hysteresis `latched` (a fail-open action is still in flight) ⇒ `Accept`.
+/// - Pressured with in-flight work ⇒ `Nak` (the worker is draining; the
+///   server-side `has_actions()` pause re-selects it correctly).
+/// - Pressured + IDLE ⇒ `Nak` until idle-gated for `DISK_FAIL_OPEN_AFTER`, then
+///   `AcceptFailOpen` — so an all-idle all-disk-pressured fleet cannot deadlock.
+fn disk_gate_decision(
+    effective_pressured: bool,
+    in_flight: u64,
+    latched: bool,
+    first_idle_gated_at: Option<Instant>,
+    now: Instant,
+) -> DiskGateDecision {
+    if !effective_pressured || latched {
+        return DiskGateDecision::Accept;
+    }
+    if in_flight > 0 {
+        return DiskGateDecision::Nak;
+    }
+    match first_idle_gated_at {
+        Some(since) if now.duration_since(since) >= DISK_FAIL_OPEN_AFTER => {
+            DiskGateDecision::AcceptFailOpen
+        }
+        _ => DiskGateDecision::Nak,
+    }
+}
+
+/// (F4) Returns the worker's last-sampled free bytes on the CAS/work_directory
+/// volume. `u64::MAX` sentinel (never-sampled) is mapped to `0` on the wire so
+/// the server's most-free ranking treats an un-sampled worker as fully
+/// pressured (conservative for the fail-open ranking; the gate itself fails open
+/// pre-first-sample via the statvfs fallback, a separate path). Refreshed by the
+/// sampler thread every 100 ms.
+fn get_available_disk_bytes() -> u64 {
+    match DISK_FREE_BYTES.load(Ordering::Relaxed) {
+        u64::MAX => 0,
+        v => v,
+    }
+}
+
+/// (F4) The SAMPLER's coarse disk-pressure verdict (the wire boolean / advisory
+/// matcher hint). This is NOT the authoritative gate — it does not include the
+/// statvfs stale-fallback (that runs only on the StartAction path, where a
+/// `spawn_blocking` syscall is acceptable). `false` whenever the sampler is
+/// disabled, never-sampled, or fresh-and-healthy.
+fn disk_gate_sampler_pressured() -> bool {
+    DISK_GATE_ENABLED && DISK_PRESSURED.load(Ordering::Relaxed)
 }
 
 /// Build the advertised gRPC endpoint for peer blob sharing.
@@ -3620,7 +3954,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let swap_used_bytes = get_swap_used_bytes();
         let memory_pressure_level = get_memory_pressure_level();
         let memory_pressured = swap_gate_pressured();
-        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} memory_pressure_level={memory_pressure_level} memory_pressured={memory_pressured}");
+        // (F4) Physical disk pressure on the CAS/work_directory volume. The
+        // wire `disk_pressured` is the SAMPLER's coarse verdict only (advisory
+        // matcher hint); the authoritative StartAction NAK additionally
+        // consults the statvfs fallback on a stale sampler. `available_disk_bytes`
+        // is the free-bytes gauge (observability + fail-open ranking).
+        let available_disk_bytes = get_available_disk_bytes();
+        let disk_pressured = disk_gate_sampler_pressured();
+        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} memory_pressure_level={memory_pressure_level} memory_pressured={memory_pressured} available_disk_bytes={available_disk_bytes} disk_pressured={disk_pressured}");
         let notification = BlobsAvailableNotification {
             worker_cas_endpoint: state.cas_endpoint.clone(),
             digests: Vec::new(),
@@ -3693,6 +4034,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             swap_used_bytes,
             memory_pressure_level,
             memory_pressured,
+            // (F4) Physical disk pressure on the CAS/work_directory volume,
+            // read from the sampler-thread atomics (same cheap relaxed-load
+            // pattern). `available_disk_bytes` is the free-bytes magnitude
+            // (observability + the server's least-pressured fail-open ranking);
+            // `disk_pressured` is the coarse 1-bit gate verdict the matcher uses
+            // for a PROACTIVE skip (advisory only — the authoritative NAK reads
+            // the local atomic + statvfs fallback, not this wire boolean).
+            available_disk_bytes,
+            disk_pressured,
         };
 
         // (#99) Partition into bounded `BlobsAvailableChunk` envelopes and
@@ -4052,6 +4402,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // monotonic progress instead of accept→re-gate oscillation.
         let mut swap_first_idle_gated_at: Option<Instant> = None;
         let mut swap_fail_open_latched = false;
+        // (F4) Disk-gate fleet fail-open + hysteresis latch, threaded across
+        // loop iterations exactly like the swap state above.
+        let mut disk_first_idle_gated_at: Option<Instant> = None;
+        let mut disk_fail_open_latched = false;
 
         loop {
             select! {
@@ -4423,6 +4777,104 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 }
                             }
 
+                            // (F4) Worker-local DISK admission gate. AUTHORITATIVE
+                            // (reads the in-process atomic + a statvfs fallback, never
+                            // the wire boolean). The BACKSTOP that rejects new work
+                            // BEFORE raw ENOSPC at make_action_directory while moka's
+                            // eventually-consistent eviction catches up. SEC-2: unlike
+                            // the swap gate (which blind-fails-open on a stale sampler
+                            // because it degrades to other live bounds), disk has NO
+                            // other live bound, so a stale sampler routes to a one-shot
+                            // authoritative statvfs (off the hot path via spawn_blocking)
+                            // and rejects only a TRULY-full disk.
+                            if disk_fail_open_latched && in_flight == 0 {
+                                disk_fail_open_latched = false;
+                                disk_first_idle_gated_at = None;
+                            }
+                            let (disk_pressured_sampler, disk_stale) = disk_gate_verdict(
+                                DISK_GATE_ENABLED,
+                                DISK_PRESSURED.load(Ordering::Relaxed),
+                                LAST_DISK_SAMPLE_INSTANT.load(Ordering::Relaxed),
+                                Instant::now().duration_since(*PROCESS_START),
+                                DISK_SAMPLE_MAX_AGE,
+                            );
+                            // On a stale/dead sampler, consult the authoritative
+                            // statvfs ONCE off the hot path (never a per-action sync
+                            // syscall on a healthy sampler — that path reads the atomic
+                            // only). `None` ⇒ no path / syscall failed ⇒ unmeasurable.
+                            let disk_authoritative_free = if disk_stale {
+                                if let Some(Some(path)) = DISK_SAMPLE_PATH.get() {
+                                    let path = path.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        read_disk_available_bytes(&path)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if disk_stale {
+                                warn!(
+                                    "stale disk sample: disk-free sampler appears wedged/dead, \
+                                     consulting the authoritative statvfs fallback (SEC-2: disk \
+                                     has no other live bound behind the gate)"
+                                );
+                            }
+                            let disk_effective = disk_effective_pressured(
+                                disk_pressured_sampler,
+                                disk_stale,
+                                disk_authoritative_free,
+                            );
+                            let now = Instant::now();
+                            match disk_gate_decision(
+                                disk_effective,
+                                in_flight,
+                                disk_fail_open_latched,
+                                disk_first_idle_gated_at,
+                                now,
+                            ) {
+                                DiskGateDecision::Nak => {
+                                    if disk_first_idle_gated_at.is_none() && in_flight == 0 {
+                                        disk_first_idle_gated_at = Some(now);
+                                    }
+                                    warn!(
+                                        available_disk_bytes = get_available_disk_bytes(),
+                                        disk_stale,
+                                        in_flight,
+                                        "worker NAKing action: physical disk pressure on the \
+                                         CAS/work_directory volume (backstop before ENOSPC while \
+                                         eviction catches up)"
+                                    );
+                                    if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
+                                        self.grpc_client.clone().execution_response(
+                                            ExecuteResult{
+                                                instance_name,
+                                                operation_id: start_execute.operation_id,
+                                                result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker under disk pressure").into())),
+                                            }
+                                        ).await?;
+                                    }
+                                    continue;
+                                }
+                                DiskGateDecision::AcceptFailOpen => {
+                                    disk_fail_open_latched = true;
+                                    warn!(
+                                        available_disk_bytes = get_available_disk_bytes(),
+                                        fail_open_after_secs = DISK_FAIL_OPEN_AFTER.as_secs(),
+                                        "worker disk gate FAILING OPEN: idle+pressured past the fail-open window, accepting one action to avoid a fleet wedge"
+                                    );
+                                }
+                                DiskGateDecision::Accept => {
+                                    if !disk_effective {
+                                        disk_first_idle_gated_at = None;
+                                    }
+                                }
+                            }
+
                             self.metrics.start_actions_received.inc();
 
                             let execute_request = start_execute.execute_request.as_ref();
@@ -4694,6 +5146,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             memory_pressure_level:
                                                                 get_memory_pressure_level(),
                                                             memory_pressured: swap_gate_pressured(),
+                                                            // (F4) Disk pressure: same
+                                                            // process-global sampler atomics. The
+                                                            // wire boolean is the sampler verdict
+                                                            // (advisory matcher hint); the
+                                                            // authoritative gate adds the statvfs
+                                                            // fallback on a stale sampler.
+                                                            available_disk_bytes:
+                                                                get_available_disk_bytes(),
+                                                            disk_pressured:
+                                                                disk_gate_sampler_pressured(),
                                                         };
                                                     // (FL-688 v3 §3.8 part 2) Route the
                                                     // post-action output-digest delta through
@@ -5198,7 +5660,9 @@ pub async fn new_local_worker(
     ac_store_name: Option<String>,
     historical_store: Store,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
-    start_cpu_sampler()?;
+    // (F4) Pass work_directory so the disk-free sampler statvfs's the
+    // CAS/work_directory volume (shared physical disk by config invariant).
+    start_cpu_sampler(&config.work_directory)?;
 
     // #85 P4 (2026-06-07): periodic load_avg + mem_avail sampler.
     // macOS-only; no-op on Linux (server doesn't need it).
@@ -7525,6 +7989,287 @@ mod tests {
             SwapGateDecision::Accept,
             "while the hysteresis latch holds, a pressured worker must keep \
              accepting so the accepted action makes monotonic progress"
+        );
+    }
+
+    // ───────────────────────── F4 disk-pressure gate ─────────────────────────
+
+    /// (F4) The PRIMARY disk-free floor trip is a LEVEL with a two-threshold
+    /// hysteresis band (mirrors `free_floor_breached`): trip below
+    /// `DISK_FREE_FLOOR_BYTES`, clear only once free recovers above
+    /// `DISK_FREE_FLOOR_BYTES + DISK_FREE_FLOOR_HYSTERESIS`, hold the prior
+    /// verdict in the band. Without the band a worker hovering at the floor
+    /// flaps admit/refuse every sample tick.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): in `disk_floor_breached`, delete the
+    /// `free_bytes >= FLOOR + HYSTERESIS` clear-arm (so any non-trip free
+    /// value clears immediately). The in-band-hold assertion red-fails — a
+    /// worker just above the floor would chatter.
+    #[test]
+    fn disk_floor_breached_has_hysteresis_band() {
+        // Below the floor ⇒ trip regardless of prior state.
+        assert!(
+            disk_floor_breached(DISK_FREE_FLOOR_BYTES - 1, false),
+            "free below the disk floor must trip the disk gate"
+        );
+        // Well above floor+hysteresis ⇒ clear regardless of prior state.
+        assert!(
+            !disk_floor_breached(
+                DISK_FREE_FLOOR_BYTES + DISK_FREE_FLOOR_HYSTERESIS + 1,
+                true
+            ),
+            "free well above floor+hysteresis must clear the disk gate"
+        );
+        // In the band, with prior TRIPPED ⇒ HOLD tripped (no chatter).
+        assert!(
+            disk_floor_breached(DISK_FREE_FLOOR_BYTES + 1, true),
+            "in the hysteresis band the disk gate must HOLD its prior tripped \
+             verdict, else a worker hovering at the floor flaps every tick"
+        );
+        // In the band, with prior CLEAR ⇒ HOLD clear.
+        assert!(
+            !disk_floor_breached(DISK_FREE_FLOOR_BYTES + 1, false),
+            "in the hysteresis band the disk gate must HOLD its prior clear verdict"
+        );
+    }
+
+    /// (F4) The sample-age verdict fails the disk gate's pressure state into
+    /// UNKNOWN (`stale = true`) when the sampler is wedged/dead — but, unlike
+    /// swap, UNKNOWN does NOT mean "admit". It means "the caller must consult
+    /// the authoritative `statvfs` fallback" (SEC-2: disk has no other live
+    /// bound behind the gate). This pure verdict only reports fresh/stale +
+    /// the sampler value; the stale→statvfs resolution is
+    /// `disk_effective_pressured`.
+    ///
+    /// Mutation step: delete the `age > max_age ⇒ (false, true)` arm in
+    /// `disk_gate_verdict` (let a stale sample fall through to the live
+    /// value). The STALE assertion red-fails — a wedged sampler would report
+    /// its frozen value as authoritative instead of flagging stale, so the
+    /// statvfs fallback would never run.
+    #[test]
+    fn disk_gate_verdict_flags_stale_for_statvfs_fallback() {
+        let max_age = Duration::from_secs(2);
+        // FRESH + pressured ⇒ pressured, not stale.
+        let (p, stale) = disk_gate_verdict(
+            true,
+            true,
+            Duration::from_secs(10).as_nanos() as u64,
+            Duration::from_secs(10) + Duration::from_millis(100),
+            max_age,
+        );
+        assert!(p && !stale, "a fresh pressured disk sample must gate (control)");
+        // STALE ⇒ MUST flag stale so the caller runs the statvfs fallback.
+        let (_, is_stale) = disk_gate_verdict(
+            true,
+            false,
+            Duration::from_secs(1).as_nanos() as u64,
+            Duration::from_secs(10),
+            max_age,
+        );
+        assert!(
+            is_stale,
+            "a stale disk sample MUST flag stale so the caller consults the \
+             authoritative statvfs fallback (disk has no other live bound — SEC-2)"
+        );
+        // Never-sampled (0) ⇒ also UNKNOWN/stale → statvfs fallback.
+        let (_, stale0) = disk_gate_verdict(true, false, 0, Duration::from_secs(10), max_age);
+        assert!(
+            stale0,
+            "a never-sampled disk gate must flag stale so the statvfs fallback runs"
+        );
+    }
+
+    /// (F4) THE SEC-2 CONTRACT. On a stale/dead sampler the disk gate does
+    /// NOT blind-accept (the swap gate's fail-open). It resolves an effective
+    /// pressure from a one-shot authoritative `statvfs`: free below the floor
+    /// ⇒ effective-pressured (the gate still rejects), free at/above ⇒ not
+    /// pressured. Only when the statvfs itself fails (`None`) is there no
+    /// measurement at all and the last-resort blind-accept applies.
+    ///
+    /// Mutation step: in `disk_effective_pressured`, change the stale branch
+    /// to `=> false` (blind fail-open like swap). The "truly full" assertion
+    /// red-fails — a stale sampler over a genuinely-full disk would admit work
+    /// straight into the ENOSPC the gate exists to prevent.
+    #[test]
+    fn disk_effective_pressured_uses_statvfs_fallback_when_stale() {
+        // FRESH sampler ⇒ trust the live sampler verdict, ignore statvfs.
+        assert!(
+            disk_effective_pressured(true, false, Some(u64::MAX)),
+            "a FRESH pressured sampler must report pressured regardless of the \
+             (unused) statvfs fallback value"
+        );
+        assert!(
+            !disk_effective_pressured(false, false, None),
+            "a FRESH unpressured sampler must report not-pressured"
+        );
+        // STALE + statvfs says TRULY FULL (below floor) ⇒ effective-pressured.
+        assert!(
+            disk_effective_pressured(false, true, Some(DISK_FREE_FLOOR_BYTES - 1)),
+            "SEC-2: a STALE sampler over a genuinely-full disk (statvfs below \
+             the floor) must report effective-pressured so the gate still \
+             rejects — NOT blind-accept into ENOSPC"
+        );
+        // STALE + statvfs says HEALTHY (above floor) ⇒ not pressured.
+        assert!(
+            !disk_effective_pressured(false, true, Some(DISK_FREE_FLOOR_BYTES + 1)),
+            "a STALE sampler over a healthy disk (statvfs above the floor) must \
+             admit — the fallback measured headroom"
+        );
+        // STALE + statvfs ITSELF failed (None) ⇒ last-resort blind-accept
+        // (no measurement available at all; mirrors the swap fail-open only
+        // in this unmeasurable corner).
+        assert!(
+            !disk_effective_pressured(false, true, None),
+            "a STALE sampler whose statvfs fallback ALSO failed has no \
+             measurement; it must fail OPEN as the last resort (cannot wedge \
+             the worker on an unmeasurable disk)"
+        );
+    }
+
+    /// (F4) T1 (under-action) + T2 (over-action, asymmetric coverage): the
+    /// pure disk-gate decision. Not-pressured ⇒ Accept (T2: healthy disk does
+    /// NOT reject); pressured + in-flight ⇒ Nak (drain; the scheduler
+    /// re-selects); pressured + idle ⇒ Nak until the fleet fail-open window,
+    /// then AcceptFailOpen exactly once (so an all-pressured idle fleet cannot
+    /// wedge); a held latch keeps accepting (hysteresis). Same shape as
+    /// `swap_gate_decision`; the `effective_pressured` input already folds in
+    /// the stale→statvfs resolution.
+    ///
+    /// Mutation step: remove the
+    /// `now.duration_since(since) >= DISK_FAIL_OPEN_AFTER` arm in
+    /// `disk_gate_decision` (always Nak for idle+pressured). The fleet
+    /// fail-open assertion red-fails with the bespoke wedge message.
+    #[test]
+    fn disk_gate_decision_under_and_over_action() {
+        let t0 = Instant::now();
+        // T2 (OVER-action): a healthy/unpressured disk must NOT reject.
+        assert_eq!(
+            disk_gate_decision(false, 0, false, None, t0),
+            DiskGateDecision::Accept,
+            "asymmetric coverage: an unpressured (healthy-disk) worker must \
+             ACCEPT work — the disk gate must not reject when there is headroom"
+        );
+        // T1 (under-action): pressured WITH in-flight work ⇒ Nak.
+        assert_eq!(
+            disk_gate_decision(true, 2, false, None, t0),
+            DiskGateDecision::Nak,
+            "a disk-pressured worker WITH in-flight work must NAK new work \
+             (ResourceExhausted re-queue) so the scheduler re-queues it as \
+             backpressure rather than ENOSPC'ing at make_action_directory"
+        );
+        // Pressured + idle, BEFORE the fail-open window ⇒ Nak.
+        assert_eq!(
+            disk_gate_decision(true, 0, false, Some(t0), t0 + Duration::from_secs(1)),
+            DiskGateDecision::Nak,
+            "a disk-pressured idle worker must NAK before the fleet fail-open window"
+        );
+        // Pressured + idle, PAST the window ⇒ AcceptFailOpen.
+        assert_eq!(
+            disk_gate_decision(
+                true,
+                0,
+                false,
+                Some(t0),
+                t0 + DISK_FAIL_OPEN_AFTER + Duration::from_secs(1),
+            ),
+            DiskGateDecision::AcceptFailOpen,
+            "composite invariant: a disk-pressured idle worker past the \
+             fail-open window must FAIL OPEN once, else an all-idle \
+             all-disk-pressured fleet wedges with no compensating corner"
+        );
+        // Hysteresis latch held ⇒ Accept (the fail-open action is draining).
+        assert_eq!(
+            disk_gate_decision(true, 1, true, Some(t0), t0 + Duration::from_secs(1)),
+            DiskGateDecision::Accept,
+            "while the disk hysteresis latch holds, a pressured worker must \
+             keep accepting so the accepted action makes monotonic progress"
+        );
+    }
+
+    /// (F4) The disk threshold is a `pub const`; the wire/gate behaviour binds
+    /// to its declared value. Pins the numeric-constant (reviewer-dispatch
+    /// numeric-constant block) so a doc-comment edit cannot silently drift the
+    /// floor away from the asserted value.
+    #[test]
+    fn disk_free_floor_is_the_documented_threshold() {
+        assert_eq!(
+            DISK_FREE_FLOOR_BYTES,
+            8 * (1 << 30),
+            "the disk-free admission floor must be 8 GiB — the value the gate, \
+             the heartbeat verdict, and the soak-tuning note are all written \
+             against"
+        );
+    }
+
+    /// (F4) The heartbeat reads disk pressure via the process-global sampler
+    /// atomics (`get_available_disk_bytes` / `disk_gate_sampler_pressured`),
+    /// exactly like the swap fields. Fakes a sampler tick by storing into the
+    /// atomics and asserts the readers observe it — the path the periodic +
+    /// post-action heartbeat build sites use.
+    ///
+    /// Mutation step: change `get_available_disk_bytes` to read
+    /// `SWAP_USED_BYTES` (wrong static). This test red-fails because the faked
+    /// disk value is not observed.
+    ///
+    /// `#[serial(disk_sampler_atomics)]`: this test mutates the process-global
+    /// `DISK_FREE_BYTES` / `DISK_PRESSURED` statics; serialized so the other
+    /// disk-atomic test cannot race the read.
+    #[test]
+    #[serial(disk_sampler_atomics)]
+    fn heartbeat_reads_disk_pressure_from_sampler_atomics() {
+        DISK_FREE_BYTES.store(42_949_672_960, Ordering::Relaxed); // 40 GiB
+        DISK_PRESSURED.store(true, Ordering::Relaxed);
+        assert_eq!(
+            get_available_disk_bytes(),
+            42_949_672_960,
+            "heartbeat must read available_disk_bytes from the DISK_FREE_BYTES \
+             sampler atomic"
+        );
+        assert!(
+            disk_gate_sampler_pressured(),
+            "heartbeat must read disk_pressured from the DISK_PRESSURED sampler \
+             atomic (gated on DISK_GATE_ENABLED)"
+        );
+        // The never-sampled sentinel maps to 0 on the wire (conservative for
+        // the server's most-free ranking).
+        DISK_FREE_BYTES.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(
+            get_available_disk_bytes(),
+            0,
+            "the never-sampled u64::MAX sentinel must map to 0 on the wire so an \
+             un-sampled worker ranks as fully-pressured in the fail-open"
+        );
+    }
+
+    /// (F4) `sample_disk_pressure` MUST publish the monotonic
+    /// `LAST_DISK_SAMPLE_INSTANT` liveness anchor on every tick (BEFORE the
+    /// statvfs can fail), so the gate's stale→statvfs-fallback decision sees a
+    /// live sampler. Guards the invariant that a sampler that IS ticking does
+    /// not route to the fallback, while one that STOPS ticking does.
+    ///
+    /// `#[serial(disk_sampler_atomics)]`: shares the process-global
+    /// `LAST_DISK_SAMPLE_INSTANT` / `DISK_PRESSURED` statics with the other
+    /// disk-atomic test; serialized so a concurrent store cannot race the read.
+    #[test]
+    #[serial(disk_sampler_atomics)]
+    fn sample_disk_pressure_publishes_live_anchor() {
+        // Initialize PROCESS_START so the tick's `now` is strictly after it.
+        let start = *PROCESS_START;
+        while Instant::now() <= start {
+            core::hint::spin_loop();
+        }
+        LAST_DISK_SAMPLE_INSTANT.store(0, Ordering::Relaxed);
+        // No DISK_SAMPLE_PATH configured in the unit-test process → the tick
+        // takes the no-path early-return, but it MUST still publish the anchor
+        // first (the liveness guarantee is independent of the statvfs result).
+        let _tripped = sample_disk_pressure(false);
+        let after = LAST_DISK_SAMPLE_INSTANT.load(Ordering::Relaxed);
+        assert!(
+            after > 0,
+            "sample_disk_pressure must publish a fresh strictly-positive \
+             monotonic LAST_DISK_SAMPLE_INSTANT anchor on every tick (once \
+             PROCESS_START is initialized) so the gate's stale→statvfs-fallback \
+             decision sees a live sampler; anchor was {after}"
         );
     }
 }

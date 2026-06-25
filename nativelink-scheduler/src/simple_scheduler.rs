@@ -1162,6 +1162,17 @@ impl WorkerScheduler for SimpleScheduler {
             .await
     }
 
+    async fn update_worker_disk_pressure(
+        &self,
+        worker_id: &WorkerId,
+        disk_pressured: bool,
+        available_disk_bytes: u64,
+    ) -> Result<(), Error> {
+        self.worker_scheduler
+            .update_worker_disk_pressure(worker_id, disk_pressured, available_disk_bytes)
+            .await
+    }
+
     async fn update_cached_directories(
         &self,
         worker_id: &WorkerId,
