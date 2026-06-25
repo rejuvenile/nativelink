@@ -339,6 +339,37 @@ pub struct BlobsAvailableNotification {
     /// / sampler stale → fail-open).
     #[prost(bool, tag = "21")]
     pub memory_pressured: bool,
+    /// / (F4) Physical free bytes on the worker's CAS/work_directory volume
+    /// / (the two share one filesystem by config invariant — see
+    /// / `cas_server::LocalWorkerConfig::work_directory`), sampled off the hot
+    /// / path by the worker's disk-free sampler (`statvfs` `f_bavail *
+    /// / f_frsize`). This is the magnitude behind `disk_pressured` below and
+    /// / the server's least-pressured fail-open RANKING input (`max_by_key` —
+    /// / MORE free = LESS pressured, the inverse of `memory_pressure_level`).
+    /// / `0` means either "volume genuinely full" or "sampler unavailable"
+    /// / (indistinguishable on the wire, matching the `swap_used_bytes = 0`
+    /// / unknown convention). OBSERVABILITY + RANKING; the SAFETY-CRITICAL
+    /// / gate keys off the worker-local atomic + a `statvfs` fallback, never
+    /// / this wire field.
+    #[prost(uint64, tag = "22")]
+    pub available_disk_bytes: u64,
+    /// / (F4) Coarse 1-bit disk-pressure verdict — `true` when the worker's
+    /// / disk-free sampler reports free bytes on the CAS/work_directory volume
+    /// / below `DISK_FREE_FLOOR_BYTES` (with a hysteresis band, mirroring the
+    /// / memory free-floor). The CAS fast tier overshoots its byte cap because
+    /// / moka eviction is eventually-consistent, so this physical-disk gate is
+    /// / the BACKSTOP that rejects new work before raw ENOSPC at
+    /// / `make_action_directory`. ADVISORY ONLY on the wire: the matcher uses
+    /// / it for a PROACTIVE skip (mirrors `memory_pressured` /
+    /// / `indefinite_pin_saturated`) so a disk-pressured worker is not selected
+    /// / and then forced to NAK. The SAFETY-CRITICAL enforcing decision (the
+    /// / worker-side StartAction NAK, `local_worker.rs`) reads the worker's OWN
+    /// / in-process atomic + a one-shot authoritative `statvfs` fallback on a
+    /// / stale sampler (disk, unlike swap, has no other live bound behind the
+    /// / gate), never this wire boolean. `false` for workers that never report
+    /// / disk pressure (pre-F4 / sampler stale → fail-open via the fallback).
+    #[prost(bool, tag = "23")]
+    pub disk_pressured: bool,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -716,6 +747,19 @@ pub struct BlobsAvailableChunk {
     /// / reassembled `BlobsAvailableNotification.memory_pressured` (field 21).
     #[prost(bool, tag = "25")]
     pub memory_pressured: bool,
+    /// / (F4) Physical free bytes on the worker's CAS/work_directory volume —
+    /// / only meaningful on chunk 0; subsequent chunks leave at proto3 default
+    /// / `0`. The accumulator carries the chunk-0 value forward into the
+    /// / reassembled `BlobsAvailableNotification.available_disk_bytes`
+    /// / (field 22).
+    #[prost(uint64, tag = "26")]
+    pub available_disk_bytes: u64,
+    /// / (F4) Coarse disk-pressure verdict — only meaningful on chunk 0;
+    /// / subsequent chunks leave at proto3 default `false`. The accumulator
+    /// / carries the chunk-0 value forward into the reassembled
+    /// / `BlobsAvailableNotification.disk_pressured` (field 23).
+    #[prost(bool, tag = "27")]
+    pub disk_pressured: bool,
 }
 /// / A streaming-message envelope shared across the cas→worker, scheduler→
 /// / worker, and worker→scheduler chunk producers. Exactly ONE of the
