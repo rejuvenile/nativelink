@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::chunked_message;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::StoreLike;
@@ -133,12 +134,22 @@ async fn heartbeat_readvertises_pending_bis_cas_pin() {
 
     // Consumer: receive the single heartbeat BlobsAvailable and assert the
     // pending-BIS digest is present in digest_infos. The deadline doubles as a
-    // deadlock detector — if the fold never fires, no BlobsAvailable is emitted
-    // and `expect_blobs_available` would hang here.
+    // deadlock detector — if the fold never fires, nothing is emitted and
+    // `expect_chunked_message` would hang here.
+    //
+    // (FL-688 v3 §3.8 part 2) A heartbeat tick is a DELTA (is_first=false), so
+    // it now rides the ACKED chunked path: the worker emits a
+    // `ChunkedMessage(BlobsAvailable)`, not the legacy `blobs_available()`
+    // single-message call. A small heartbeat delta chunks to one terminal
+    // chunk carrying the pending-BIS digest.
     let consumer = async {
-        let notification = client.expect_blobs_available(Ok(())).await;
-        let advertised: Vec<DigestInfo> = notification
-            .digest_infos
+        let envelope = client.expect_chunked_message(Ok(())).await;
+        let chunk = match envelope.payload.expect("heartbeat ChunkedMessage payload") {
+            chunked_message::Payload::BlobsAvailable(c) => c,
+            other => panic!("heartbeat delta must be a BlobsAvailable chunk; got {other:?}"),
+        };
+        let advertised: Vec<DigestInfo> = chunk
+            .digests
             .into_iter()
             .filter_map(|info| info.digest.and_then(|d| DigestInfo::try_from(d).ok()))
             .collect();
@@ -146,7 +157,7 @@ async fn heartbeat_readvertises_pending_bis_cas_pin() {
             advertised.contains(&pending),
             "pending-BIS digest was never re-advertised on any of {AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS} \
              ticks: the missed-mark_stable digest would reach BIS only on reconnect, not within the \
-             heartbeat interval. digest_infos advertised: {advertised:?}"
+             heartbeat interval. chunk digests advertised: {advertised:?}"
         );
     };
 

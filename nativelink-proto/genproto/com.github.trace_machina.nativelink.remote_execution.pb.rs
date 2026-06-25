@@ -896,12 +896,16 @@ pub mod update_for_worker {
         /// / worker's BlobsAvailable delta chunks. The worker buffers each
         /// / unacked delta chunk in a bounded resend buffer keyed by
         /// / `(broadcast_id, sequence)` and clears the matching slot ONLY
-        /// / when this ack arrives; chunks still unacked when the
-        /// / connection drops are replayed on reconnect. Without it a lost
-        /// / worker→server delta send (the tracker is drained on send)
-        /// / leaves the server's locality view permanently stale — the
-        /// / orphaned-replica hole the reconcile/eviction-gate self-heal
-        /// / (v3 §3.4) relies on this ack to close.
+        /// / when this ack arrives; a chunk still unacked is RETRANSMITTED
+        /// / on every subsequent periodic tick (per-tick-until-acked, riding
+        /// / the existing event tick — no new timer) so a delta lost on a
+        /// / LIVE connection converges the server's locality view WITHOUT
+        /// / waiting for a reconnect, and on reconnect the full snapshot
+        /// / re-derives the set. Without it a lost worker→server delta send
+        /// / (the tracker is drained on send) leaves the server's locality
+        /// / view permanently stale — the orphaned-replica hole the
+        /// / reconcile/eviction-gate self-heal (v3 §3.4) relies on this ack
+        /// / to close.
         #[prost(message, tag = "12")]
         BlobsAvailableAck(super::BlobsAvailableAck),
     }
@@ -913,8 +917,10 @@ pub mod update_for_worker {
 /// / terminal-commit `is_last` chunk is acked the same as every
 /// / intermediate chunk so the worker's resend buffer releases each slot
 /// / independently). The worker uses `(broadcast_id, sequence)` to drop
-/// / the matching chunk from its per-server resend buffer; chunks NOT
-/// / acked when the connection closes are replayed on the next reconnect.
+/// / the matching chunk from its per-server resend buffer; a chunk NOT
+/// / acked is RETRANSMITTED on every subsequent periodic tick
+/// / (per-tick-until-acked) until the ack lands, and on reconnect the full
+/// / snapshot re-derives the set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlobsAvailableAck {
     /// / Worker-allocated broadcast_id echoed from the original

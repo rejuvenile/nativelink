@@ -177,6 +177,7 @@ async fn ac_chunk_drains_ac_only_not_cas() {
         BlobsAvailableTestArgs {
             cas_server_fss: Some(cas_fss.clone()),
             ac_mirror_target: Some(ac_target_for(ac_fss.clone())),
+            ..Default::default()
         },
     );
 
@@ -228,6 +229,7 @@ async fn cas_chunk_does_not_touch_ac_pins_even_under_aliased_digest() {
         BlobsAvailableTestArgs {
             cas_server_fss: Some(cas_fss.clone()),
             ac_mirror_target: Some(ac_target_for(ac_fss.clone())),
+            ..Default::default()
         },
     );
 
@@ -275,6 +277,7 @@ async fn unknown_store_id_chunk_is_noop_with_ac_target_present() {
         BlobsAvailableTestArgs {
             cas_server_fss: Some(cas_fss.clone()),
             ac_mirror_target: Some(ac_target_for(ac_fss.clone())),
+            ..Default::default()
         },
     );
 

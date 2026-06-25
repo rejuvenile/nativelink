@@ -133,6 +133,15 @@ name = "blobs_available_ack_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (FL-688 v3 §3.8 drain-on-ack flip) End-to-end convergence proof for the
+# per-tick replay reader. Drives `send_periodic_blobs_available_for_test` +
+# `test_record_added_digest` + the resend-buffer accessors, all gated
+# behind `cfg(any(test, feature = "test-utils"))`, plus the real
+# server-side `BlobsAvailableAccumulator` + `BlobLocalityMap`.
+name = "blobs_available_replay_test"
+required-features = ["test-utils"]
+
+[[test]]
 # (#97) `bis_chunked_dispatch_arm_round_trips_ack` constructs a
 # `BlobsAvailableState::from_test_args`, which is gated behind
 # `cfg(any(test, feature = "test-utils"))`. Cfg-test alone doesn't

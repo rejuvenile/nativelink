@@ -2116,10 +2116,47 @@ impl WorkerConnection {
                                         // resend buffer (drain-on-ack). The
                                         // ack rides the server→worker
                                         // `UpdateForWorker` mpsc; a lost ack
-                                        // is benign (the worker keeps the
-                                        // chunk buffered and re-advertises
-                                        // on reconnect — no per-tick replay
-                                        // in this stage).
+                                        // is benign — the worker keeps the
+                                        // chunk buffered and RETRANSMITS it
+                                        // each tick via `replay_unacked_chunks`
+                                        // (drain-on-ack flip) until a fresh
+                                        // ack drains the slot.
+                                        //
+                                        // LOAD-BEARING: ack EVERY accepted
+                                        // chunk — terminal (`is_last`) AND
+                                        // non-terminal. The worker's per-tick
+                                        // replay re-sends EVERY still-unacked
+                                        // slot, so a non-terminal chunk that
+                                        // is accepted-but-not-acked would be
+                                        // resent forever. Moving this
+                                        // `worker_tx.send(ack)` INSIDE the
+                                        // `if let Some(notification)`
+                                        // terminal-commit block below (it
+                                        // looks redundant to ack a
+                                        // non-terminal chunk) would leave
+                                        // multi-chunk deltas' non-terminal
+                                        // slots undrained → an unbounded
+                                        // per-tick resend storm bounded only
+                                        // by the 256 over-cap valve. Do NOT.
+                                        //
+                                        // ACK-BEFORE-EFFECT: this ack fires
+                                        // BEFORE `handle_blobs_available`
+                                        // applies the locality/AC-pin/mirror
+                                        // effects (terminal chunk only,
+                                        // below). If that terminal commit
+                                        // returns Err AFTER the ack, the
+                                        // worker has already drained the slot
+                                        // and replay can no longer re-drive
+                                        // it — that window self-heals via the
+                                        // worker's RECONNECT full snapshot,
+                                        // NOT via replay. So "acked" means
+                                        // "server accepted the chunk for
+                                        // processing," NOT "server durably
+                                        // registered the locality": the
+                                        // future eviction-gate stage (v3 §3.4)
+                                        // MUST treat a single ack as
+                                        // accepted-for-processing and confirm
+                                        // durable registration separately.
                                         if let Err(err) =
                                             instance.worker_tx.send(UpdateForWorker {
                                                 update: Some(

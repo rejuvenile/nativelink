@@ -1491,6 +1491,22 @@ impl BlobsAvailableResendBuffer {
         self.chunks.remove(&(broadcast_id, sequence));
     }
 
+    /// (FL-688 v3 §3.8 drain-on-ack flip) Snapshot every still-unacked
+    /// chunk for retransmit. CLONES rather than drains: a chunk stays
+    /// buffered until its `BlobsAvailableAck` arrives, so the same chunk
+    /// is re-sent every tick until the server confirms it (drain-on-ACK,
+    /// not drain-on-SEND). The `(broadcast_id, sequence)` and token are
+    /// preserved verbatim so the server's accumulator is idempotent under
+    /// the resend and the worker's `ack()` key matches.
+    ///
+    /// Returned in `(broadcast_id, sequence)` order so a multi-chunk
+    /// broadcast is retransmitted with its terminal (`is_last`) chunk
+    /// last — the server's accumulator only commits once it sees the
+    /// terminal, so out-of-order replay would never assemble.
+    fn unacked_chunks(&self) -> Vec<BlobsAvailableChunk> {
+        self.chunks.values().cloned().collect()
+    }
+
     fn len(&self) -> usize {
         self.chunks.len()
     }
@@ -2115,6 +2131,11 @@ pub struct BlobsAvailableTestArgs {
     /// AC-mirror target for tests that exercise AC-pin advertisement /
     /// unpin behavior.
     pub ac_mirror_target: Option<AcMirrorTarget>,
+    /// The worker's advertised CAS endpoint. Defaults to empty (the
+    /// pre-existing behavior). Tests that assert the SERVER's locality
+    /// view (which keys digests by this endpoint) set it non-empty so the
+    /// committed notification registers under a real key.
+    pub cas_endpoint: String,
 }
 
 impl BlobsAvailableState {
@@ -2141,11 +2162,12 @@ impl BlobsAvailableState {
         let BlobsAvailableTestArgs {
             cas_server_fss,
             ac_mirror_target,
+            cas_endpoint,
         } = args;
         Self {
             fs_store,
             tracker: BlobChangeTracker::new(Arc::new(Notify::new())),
-            cas_endpoint: String::new(),
+            cas_endpoint,
             notify: Arc::new(Notify::new()),
             max_interval: Duration::from_secs(60),
             cas_server_fss,
@@ -2205,6 +2227,13 @@ impl BlobsAvailableState {
         self.blobs_available_resend.lock().chunks.clear();
     }
 
+    /// (FL-688 v3 §3.8 drain-on-ack flip) Snapshot every still-unacked
+    /// delta chunk for the per-tick replay reader. Held lock is released
+    /// before the caller awaits the sends, so no lock crosses `.await`.
+    fn unacked_chunks_for_replay(&self) -> Vec<BlobsAvailableChunk> {
+        self.blobs_available_resend.lock().unacked_chunks()
+    }
+
     /// Test-only: number of unacked chunks currently buffered.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
@@ -2222,6 +2251,18 @@ impl BlobsAvailableState {
             .lock()
             .chunks
             .contains_key(&(broadcast_id, sequence))
+    }
+
+    /// Test-only: record `digest` as a newly-added blob in the change
+    /// tracker via the SAME `on_insert` path the FilesystemStore callback
+    /// fires in production. The next `is_first=false` tick then computes a
+    /// DELTA carrying this digest — used by the replay-convergence test to
+    /// drive a delta without registering the tracker on a live store +
+    /// racing a real write.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_record_added_digest(&self, digest: DigestInfo) {
+        self.tracker.on_insert(StoreKey::Digest(digest), 0);
     }
 }
 
@@ -3152,6 +3193,148 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         }
     }
 
+    /// (FL-688 v3 §3.8 — drain-on-ack flip) Per-tick REPLAY READER: the
+    /// consumer of [`BlobsAvailableResendBuffer`]. Retransmits every
+    /// still-unacked delta chunk verbatim (same `(broadcast_id, sequence,
+    /// worker_instance_token)`) so the server's accumulator is idempotent
+    /// under the resend and the worker's drain-on-ack key matches.
+    ///
+    /// Drives the SAME `chunked_message` wire path as the live delta send,
+    /// so the server's `merge_chunk_outcome` ACCEPTs the replay and emits a
+    /// `BlobsAvailableAck`; the matching `handle_blobs_available_ack` then
+    /// drops the slot. Until that ack arrives the chunk is RE-sent every
+    /// tick — drain-on-ACK, not drain-on-SEND.
+    ///
+    /// A send error propagates so the caller surfaces it (the connection is
+    /// dropping; the reconnect's full snapshot will re-converge and the
+    /// buffer is cleared then). On success NO buffer mutation happens here:
+    /// the chunk stays buffered until its ack lands (which may have crossed
+    /// this in-flight resend — idempotent).
+    async fn replay_unacked_chunks(
+        grpc_client: &mut T,
+        state: &BlobsAvailableState,
+    ) -> Result<(), Error> {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            ChunkedMessage, chunked_message,
+        };
+        // Snapshot under the lock, then release it before awaiting (no lock
+        // across `.await`).
+        let unacked = state.unacked_chunks_for_replay();
+        if unacked.is_empty() {
+            return Ok(());
+        }
+        let replay_count = unacked.len();
+        for chunk in unacked {
+            let broadcast_id = chunk.broadcast_id;
+            let sequence = chunk.sequence;
+            let envelope = ChunkedMessage {
+                payload: Some(chunked_message::Payload::BlobsAvailable(chunk)),
+            };
+            if let Err(err) = grpc_client.chunked_message(envelope).await {
+                warn!(
+                    target: "nativelink::blobs_available_ack",
+                    ?err,
+                    broadcast_id,
+                    sequence,
+                    replay_count,
+                    "failed to retransmit unacked BlobsAvailable delta chunk; \
+                     propagating to trigger reconnect (full snapshot re-converges)"
+                );
+                return Err(err);
+            }
+        }
+        info!(
+            target: "nativelink::blobs_available_ack",
+            replay_count,
+            "retransmitted unacked BlobsAvailable delta chunks (drain-on-ack replay)"
+        );
+        Ok(())
+    }
+
+    /// (FL-688 v3 §3.8 part 2) Send a POST-ACTION output-digest delta
+    /// through the ACKED/buffered/replayed chunked path.
+    ///
+    /// When `state` is `Some`, the notification is chunked (a small
+    /// post-action delta is one terminal chunk), each chunk is sent via
+    /// `chunked_message` AND buffered for drain-on-ack via
+    /// `state.buffer_delta_chunk` — so a lost post-action delta is
+    /// retransmitted by [`Self::replay_unacked_chunks`] on the next
+    /// periodic tick until the server acks it. The broadcast_id and
+    /// worker_instance_token come from the SAME `state` the periodic delta
+    /// path uses, so the server keys this broadcast identically.
+    ///
+    /// When `state` is `None` (worker has no fast-store BlobsAvailable
+    /// reporting), falls back to the legacy fire-and-forget
+    /// `blobs_available()` send — unchanged behaviour for that
+    /// configuration.
+    ///
+    /// This is a DELTA, never a full snapshot, so it always chunks (never
+    /// clears the buffer). An over-cap buffer accumulation sets the
+    /// force-full-snapshot flag (the periodic path's next tick re-converges)
+    /// exactly as the periodic delta path does.
+    async fn send_post_action_blobs_available_delta(
+        grpc_client: &mut T,
+        state: Option<&BlobsAvailableState>,
+        notification: BlobsAvailableNotification,
+    ) -> Result<(), Error> {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            ChunkedMessage, chunked_message,
+        };
+        use nativelink_util::blobs_available_chunking::{
+            BLOBS_AVAILABLE_PER_CHUNK, chunk_blobs_available,
+        };
+
+        let Some(state) = state else {
+            // No resend state on this worker — fall back to the raw send.
+            return grpc_client.blobs_available(notification).await;
+        };
+
+        let broadcast_id = state.next_broadcast_id.fetch_add(1, Ordering::Relaxed);
+        let worker_instance_token = state.worker_instance_token;
+        let chunks = match chunk_blobs_available(
+            notification,
+            broadcast_id,
+            worker_instance_token,
+            String::new(),
+            BLOBS_AVAILABLE_PER_CHUNK,
+        ) {
+            Ok(chunks) => chunks,
+            Err(reason) => {
+                // A single action's output-digest delta exceeding the
+                // per-broadcast chunk cap is implausible, but if it ever
+                // happens, log loudly and skip — the periodic full-snapshot
+                // path re-advertises the worker's whole inventory anyway.
+                warn!(
+                    target: "nativelink::blobs_available_ack",
+                    reason,
+                    broadcast_id,
+                    "post-action BlobsAvailable chunker rejected: output-digest delta too large \
+                     for one broadcast; skipping (periodic snapshot re-advertises)"
+                );
+                return Ok(());
+            }
+        };
+        for chunk in chunks {
+            // Buffer the delta chunk (clone) for drain-on-ack BEFORE moving
+            // it into the send envelope, mirroring the periodic delta path.
+            let buffered_delta = chunk.clone();
+            let envelope = ChunkedMessage {
+                payload: Some(chunked_message::Payload::BlobsAvailable(chunk)),
+            };
+            grpc_client.chunked_message(envelope).await?;
+            if state.buffer_delta_chunk(buffered_delta) {
+                warn!(
+                    target: "nativelink::blobs_available_ack",
+                    broadcast_id,
+                    cap = BLOBS_AVAILABLE_RESEND_MAX_CHUNKS,
+                    "post-action BlobsAvailable resend buffer over cap; cleared + forcing a full \
+                     snapshot next tick (server not acking deltas — partition?)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Sends a periodic BlobsAvailable notification.
     /// - First tick: full snapshot of all digests with timestamps (scans store once).
     ///   Also sends a full subtree snapshot with ALL subtree digests.
@@ -3174,6 +3357,34 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             || state
                 .blobs_available_force_full_snapshot
                 .swap(false, Ordering::Relaxed);
+
+        // (FL-688 v3 §3.8 — drain-on-ack flip, the per-tick REPLAY READER)
+        // Retransmit every still-unacked delta chunk BEFORE computing this
+        // tick's new delta and BEFORE the skip-gate. This is the consumer
+        // of the resend buffer (Stage 2 only RECORDED + DROPPED-on-ack —
+        // it had no reader, so a lost delta on a live connection stayed
+        // buffered forever and the server's locality view stayed stale
+        // until a reconnect). The invariant: a delta is RETAINED until the
+        // server acks it; a lost send is RETRANSMITTED on the next tick,
+        // converging the server's locality view WITHOUT a reconnect.
+        //
+        // Riding this existing per-tick call (NOT a new periodic timer)
+        // keeps the no-new-timer constraint: the tick is already woken by
+        // the change-`Notify` / mirror-`Notify` / AC-`Notify` / backstop
+        // `select!` in `run`. Placed BEFORE the skip-gate so an OTHERWISE-
+        // IDLE worker (no new blob changes) still retransmits its unacked
+        // backlog — the exact stale-forever scenario.
+        //
+        // Skipped on a full snapshot (`is_first`): the snapshot supersedes
+        // every buffered delta and the buffer is cleared on the snapshot
+        // send below, so replaying stale deltas first would be redundant.
+        // This touches ONLY the BlobsAvailable locality-delta path; it does
+        // not interact with the slow-write watchdog (writes are never
+        // aborted) or the BIS ack-gate.
+        if !is_first {
+            Self::replay_unacked_chunks(grpc_client, state).await?;
+        }
+
         // (A1 fix + fix-up F1+F2) Apply the per-tick memo-reset paths
         // at the function head: reconnect-clear (`is_first=true`)
         // wipes the AC-pin memo so the next delta replays the full
@@ -3484,14 +3695,26 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             memory_pressured,
         };
 
-        // (#99) If the notification's encoded estimate exceeds the
-        // chunking threshold, partition into bounded
-        // `BlobsAvailableChunk` envelopes and send each via the unified
-        // `Update::ChunkedMessage` arm. The server's per-broadcast
-        // accumulator buffers chunks and commits atomically on
-        // `is_last=true` (Path A semantics). Below the threshold,
-        // continue using the legacy single-message path for lower
-        // per-tick overhead.
+        // (#99) Partition into bounded `BlobsAvailableChunk` envelopes and
+        // send each via the unified `Update::ChunkedMessage` arm. The
+        // server's per-broadcast accumulator buffers chunks and commits
+        // atomically on `is_last=true` (Path A semantics).
+        //
+        // (FL-688 v3 §3.8, part 2 — small-delta coverage) A DELTA is
+        // ALWAYS routed through the chunked path so it rides the
+        // ACKED/buffered/replayed channel, even when it's small (the
+        // common case: most ticks carry < 100 entries). The legacy
+        // single-message `blobs_available()` send is fire-and-forget — the
+        // server emits NO ack for it (`worker_api_server.rs` non-chunked
+        // arm), so a lost small delta would otherwise be the orphaned-
+        // replica hole for the COMMON case. The chunker produces exactly
+        // one terminal chunk for a small payload (one extra envelope
+        // wrapper), and the server reassembles before `handle_blobs_available`
+        // so the path is wire-equivalent. A FULL SNAPSHOT stays on the
+        // size-gated decision (`should_chunk`): it is NOT buffered (it is
+        // self-correcting — re-derived from a whole-store rescan on the
+        // next reconnect/tick), so the legacy single-message path remains
+        // reliable enough for it.
         use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
             ChunkedMessage, chunked_message,
         };
@@ -3499,7 +3722,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             BLOBS_AVAILABLE_PER_CHUNK, chunk_blobs_available, should_chunk,
         };
 
-        if should_chunk(&notification) {
+        if !is_first || should_chunk(&notification) {
             let broadcast_id = state
                 .next_broadcast_id
                 .fetch_add(1, Ordering::Relaxed);
@@ -3542,12 +3765,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // For a DELTA, each chunk is buffered AFTER a successful send
             // so the server's `BlobsAvailableAck` can drop it
             // (drain-on-ack) and an over-cap accumulation forces the next
-            // tick to re-converge with a full snapshot. NOTE (Tier-3
-            // scope flag): Stage 2 buffers + acks + over-cap-resets the
-            // delta chunks but does NOT add per-tick replay of unacked
-            // chunks (that is the flow-control change deferred to a later
-            // stage); a lost-but-not-reconnected ack is healed by the
-            // next reconnect's full snapshot OR the over-cap valve.
+            // tick to re-converge with a full snapshot. A still-unacked
+            // delta chunk is RETRANSMITTED (clone, not drain) on every
+            // subsequent tick by `Self::replay_unacked_chunks` (called at
+            // the head of this fn, before the skip-gate) until its ack
+            // drains the slot — so a delta lost on a LIVE connection
+            // converges the server's locality view WITHOUT waiting for a
+            // reconnect. The over-cap valve caps the replay set at
+            // `BLOBS_AVAILABLE_RESEND_MAX_CHUNKS` (256) → force a full
+            // snapshot, and a send-error propagates to trigger reconnect;
+            // those three stop conditions bound the replay.
             if is_first {
                 state.clear_resend_buffer();
             }
@@ -4299,6 +4526,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     .map(|port| cas_advertised_endpoint(port, use_tls))
                                     .unwrap_or_default();
 
+                                // (FL-688 v3 §3.8 part 2 — post-action delta coverage)
+                                // Capture the BlobsAvailable resend state so the
+                                // post-action output-digest publish rides the
+                                // ACKED/buffered/replayed chunked path instead of the
+                                // fire-and-forget `blobs_available()` (which the server
+                                // never acks). `None` on workers with no fast-store
+                                // BlobsAvailable reporting — those fall back to the raw
+                                // send (unchanged).
+                                let blobs_available_state = self.blobs_available_state.clone();
                                 let running_actions_manager = self.running_actions_manager.clone();
                                 // AC-poisoning fix IC1: signature reshaped to accept
                                 // (ActionResult, Arc<U::RunningAction>) so the
@@ -4396,7 +4632,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     let p_load = get_p_core_load_pct();
                                                     let e_load = get_e_core_load_pct();
                                                     debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load}");
-                                                    if let Err(err) = grpc_client.blobs_available(
+                                                    let post_action_notification =
                                                         BlobsAvailableNotification {
                                                             worker_cas_endpoint: cas_endpoint_for_notify.clone(),
                                                             digests: output_digests,
@@ -4458,18 +4694,30 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             memory_pressure_level:
                                                                 get_memory_pressure_level(),
                                                             memory_pressured: swap_gate_pressured(),
-                                                        }
-                                                    ).await {
-                                                        // Failure to send BlobsAvailable
-                                                        // breaks external-consistency
-                                                        // (server has no peer-locality for
-                                                        // these blobs) but the action did
-                                                        // succeed and the slow-tier upload
-                                                        // is still scheduled. Log and
-                                                        // continue — this is no worse than
-                                                        // the pre-fix behaviour where
-                                                        // BlobsAvailable was always
-                                                        // best-effort.
+                                                        };
+                                                    // (FL-688 v3 §3.8 part 2) Route the
+                                                    // post-action output-digest delta through
+                                                    // the ACKED/buffered/replayed chunked path
+                                                    // (when this worker reports BlobsAvailable);
+                                                    // a lost post-action delta is then
+                                                    // retransmitted by the periodic replay
+                                                    // reader until the server acks it, instead
+                                                    // of being permanently lost. Workers with no
+                                                    // BlobsAvailable state fall back to the raw
+                                                    // fire-and-forget send (unchanged). A send
+                                                    // failure is logged and swallowed — the
+                                                    // action succeeded and the slow-tier upload
+                                                    // is still scheduled; no worse than the
+                                                    // pre-fix best-effort behaviour, and the
+                                                    // buffered chunk (chunked arm) will replay.
+                                                    if let Err(err) =
+                                                        Self::send_post_action_blobs_available_delta(
+                                                            &mut grpc_client,
+                                                            blobs_available_state.as_ref(),
+                                                            post_action_notification,
+                                                        )
+                                                        .await
+                                                    {
                                                         warn!(?err, "Failed to send blobs_available notification");
                                                     }
                                                 }
@@ -4830,6 +5078,32 @@ pub async fn send_periodic_blobs_available_for_test<
         state,
         running_actions_manager,
         is_first,
+    )
+    .await
+}
+
+/// (FL-688 v3 §3.8 part 2) Test seam: drive the production post-action
+/// output-digest publish routing
+/// ([`LocalWorkerImpl::send_post_action_blobs_available_delta`]) directly,
+/// so the chunk-and-buffer-on-ACK behavior of the post-action delta is
+/// exercised without standing up a full action through the publish closure.
+/// `U` is named only to satisfy the associated-fn's type parameter (the fn
+/// itself touches only `T` + the resend state); pass any
+/// `RunningActionsManager` mock.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn send_post_action_blobs_available_delta_for_test<
+    T: WorkerApiClientTrait + 'static,
+    U: RunningActionsManager,
+>(
+    grpc_client: &mut T,
+    state: Option<&BlobsAvailableState>,
+    notification: BlobsAvailableNotification,
+) -> Result<(), Error> {
+    LocalWorkerImpl::<T, U>::send_post_action_blobs_available_delta(
+        grpc_client,
+        state,
+        notification,
     )
     .await
 }
