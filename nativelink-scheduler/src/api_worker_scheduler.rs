@@ -57,41 +57,66 @@ use tonic::async_trait;
 use tracing::{debug, error, info, trace, warn};
 
 /// Metrics for tracking scheduler performance.
-#[derive(Debug, Default)]
+///
+/// (#231) Exposed on the server `/metrics` endpoint via
+/// `#[derive(MetricsComponent)]` + the `#[metric(group =
+/// "scheduler_metrics")]` annotation on `ApiWorkerScheduler::metrics`,
+/// which makes the `RootMetricsComponent` walk
+/// (`src/bin/nativelink.rs:559-568` → `render_prometheus`) descend into
+/// these counters. Before #231 they were dark — the only operator
+/// signal was the paired `warn!`s.
+#[derive(Debug, Default, MetricsComponent)]
 pub struct SchedulerMetrics {
     /// Total number of worker additions.
+    #[metric(help = "total number of worker additions")]
     pub workers_added: AtomicU64,
     /// Total number of worker removals.
+    #[metric(help = "total number of worker removals")]
     pub workers_removed: AtomicU64,
     /// Total number of `find_worker_for_action` calls.
+    #[metric(help = "total number of find_worker_for_action calls")]
     pub find_worker_calls: AtomicU64,
     /// Total number of successful worker matches.
+    #[metric(help = "total number of successful worker matches")]
     pub find_worker_hits: AtomicU64,
     /// Total number of failed worker matches (no worker found).
+    #[metric(help = "total number of failed worker matches (no worker found)")]
     pub find_worker_misses: AtomicU64,
     /// Total time spent in `find_worker_for_action` (nanoseconds).
+    #[metric(help = "total time spent in find_worker_for_action (nanoseconds)")]
     pub find_worker_time_ns: AtomicU64,
     /// Total number of workers iterated during find operations.
+    #[metric(help = "total number of workers iterated during find operations")]
     pub workers_iterated: AtomicU64,
     /// Total number of action dispatches.
+    #[metric(help = "total number of action dispatches")]
     pub actions_dispatched: AtomicU64,
     /// Total number of keep-alive updates.
+    #[metric(help = "total number of keep-alive updates")]
     pub keep_alive_updates: AtomicU64,
     /// Total number of worker timeouts.
+    #[metric(help = "total number of worker timeouts")]
     pub worker_timeouts: AtomicU64,
     /// Total number of prefetch tasks spawned.
+    #[metric(help = "total number of prefetch tasks spawned")]
     pub prefetch_tasks_spawned: AtomicU64,
     /// Total number of blobs successfully prefetched to workers.
+    #[metric(help = "total number of blobs successfully prefetched to workers")]
     pub prefetch_blobs_sent: AtomicU64,
     /// Total bytes successfully prefetched to workers.
+    #[metric(help = "total bytes successfully prefetched to workers")]
     pub prefetch_bytes_sent: AtomicU64,
     /// Total number of blobs that failed to prefetch.
+    #[metric(help = "total number of blobs that failed to prefetch")]
     pub prefetch_blobs_failed: AtomicU64,
     /// Total number of blobs skipped because they were already on the worker.
+    #[metric(help = "total number of blobs skipped because they were already on the worker")]
     pub prefetch_blobs_already_present: AtomicU64,
     /// Total number of batch RPCs sent to workers during prefetch.
+    #[metric(help = "total number of batch rpcs sent to workers during prefetch")]
     pub prefetch_batches_sent: AtomicU64,
     /// Total number of server-side cache warm tasks spawned.
+    #[metric(help = "total number of server-side cache warm tasks spawned")]
     pub cache_warm_spawned: CounterWithTime,
     /// (#214) Cumulative number of BIS replay-buffer chunks dropped by
     /// the per-worker overflow cap. A non-zero value means at least one
@@ -99,12 +124,14 @@ pub struct SchedulerMetrics {
     /// holding a connection slot) and the server is silently dropping
     /// replay state to bound memory.
     ///
-    /// **Operator visibility today:** SchedulerMetrics is internal-only
-    /// (no `#[derive(MetricsComponent)]` exporter wired); this counter
-    /// is *not* yet visible on a `/metrics` endpoint. The operator-
-    /// visible signal is the per-(endpoint, broadcast_id) `warn!` at
-    /// `bis_chunked_dispatch` — greppable from journald. See #231 to
-    /// surface the counter through the metrics exporter.
+    /// **Operator visibility (#231):** now surfaced on the `/metrics`
+    /// endpoint under `scheduler.<name>.worker.scheduler_metrics.\
+    /// bis_replay_buffer_overflow_drops`. The per-(endpoint,
+    /// broadcast_id) `warn!` at `bis_chunked_dispatch` remains the
+    /// per-event signal greppable from journald.
+    #[metric(
+        help = "(#214) cumulative BIS replay-buffer chunks dropped by the per-worker overflow cap; non-zero means a worker is holding a slot without acking and the server is dropping replay state to bound memory"
+    )]
     pub bis_replay_buffer_overflow_drops: AtomicU64,
     /// (#sched-b1) Cumulative count of completions whose operation was
     /// already removed from the worker's `running_action_infos` during
@@ -114,10 +141,13 @@ pub struct SchedulerMetrics {
     /// (b), so the second critical section softens the missing-op case to
     /// `Ok(())` instead of erroring. This is the EXPECTED post-unlock
     /// race; a non-zero, slowly-growing value is benign. The paired
-    /// `warn!` (see `update_action`) is the operator-visible signal
-    /// (SchedulerMetrics has no exporter wired yet) and, unlike the old
-    /// `debug!`, SURVIVES `release_max_level_info` so the softened branch
-    /// is not invisible in the production binary.
+    /// `warn!` (see `update_action`) is the per-event operator signal
+    /// and, unlike the old `debug!`, SURVIVES `release_max_level_info`
+    /// so the softened branch is not invisible in the production binary.
+    /// (#231) The cumulative count is also surfaced on `/metrics`.
+    #[metric(
+        help = "(#sched-b1) cumulative completions whose op was already removed during the B1 lock-free update_operation window (expected post-unlock race; slowly-growing is benign)"
+    )]
     pub update_action_op_already_finalized: AtomicU64,
 }
 
@@ -1745,6 +1775,10 @@ pub struct ApiWorkerScheduler {
     worker_registry: SharedWorkerRegistry,
 
     /// Performance metrics for observability.
+    /// (#231) `group = "scheduler_metrics"` makes the `RootMetricsComponent`
+    /// walk descend into `SchedulerMetrics` so its counters render on the
+    /// `/metrics` endpoint (previously dark).
+    #[metric(group = "scheduler_metrics")]
     metrics: Arc<SchedulerMetrics>,
 
     /// Blob locality map for peer-to-peer blob sharing.
@@ -7219,6 +7253,121 @@ mod tests {
              (1..={delta}); a survivor with broadcast_id <= {delta} \
              means a NEWER chunk was dropped instead of an older one, \
              violating the drop-oldest contract. min_survived={min_survived}"
+        );
+    }
+
+    /// (#231) Render-test: SchedulerMetrics counters must appear on the
+    /// PRODUCTION `/metrics` collection path.
+    ///
+    /// This drives the SAME walk `metrics_handler` uses in prod
+    /// (`nativelink-util/src/metrics_publisher.rs::render_prometheus`)
+    /// against an `ApiWorkerScheduler` registered exactly the way
+    /// `src/bin/nativelink.rs:559-568` registers worker schedulers: an
+    /// `Arc<dyn MetricsComponent + Send + Sync>` upcast from
+    /// `RootMetricsComponent`, under the `scheduler.<name>.worker`
+    /// prefix. It asserts the LITERAL leaf names of the
+    /// `SchedulerMetrics` sub-tree are present in the rendered
+    /// Prometheus body.
+    ///
+    /// Before #231 (no `#[derive(MetricsComponent)]` on
+    /// `SchedulerMetrics`, no `#[metric(group="scheduler_metrics")]` on
+    /// the `metrics` field) the root walk does not descend into the
+    /// counters, so every assertion below red-fails with its bespoke
+    /// "#231: ... dark on /metrics" message.
+    ///
+    /// Mutation step (per CLAUDE.md TDD): drop the
+    /// `#[metric(group = "scheduler_metrics")]` on the `metrics` field
+    /// of `ApiWorkerScheduler` — the root `publish()` then skips the
+    /// sub-component and every assertion red-fails.
+    #[test]
+    fn scheduler_metrics_rendered_on_metrics_endpoint() {
+        use nativelink_util::metrics_publisher::{
+            MetricsComponentTrait, MetricsRegistry, render_prometheus,
+        };
+
+        let scheduler = make_test_scheduler();
+
+        // Set distinctive non-zero values on a representative spread of
+        // the counter kinds: a plain AtomicU64 (find_worker_hits), a
+        // prefetch-tier counter (prefetch_blobs_sent), the #214 overflow
+        // drop counter (bis_replay_buffer_overflow_drops), and the
+        // CounterWithTime (cache_warm_spawned). The values double as a
+        // wrong-field guard — a misrouted group/field would render a
+        // different number.
+        scheduler
+            .metrics
+            .find_worker_hits
+            .fetch_add(11, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .prefetch_blobs_sent
+            .fetch_add(22, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .bis_replay_buffer_overflow_drops
+            .fetch_add(33, Ordering::Relaxed);
+        scheduler.metrics.cache_warm_spawned.inc();
+
+        // Register exactly as production does: upcast the scheduler
+        // (RootMetricsComponent: MetricsComponent) to the erased trait
+        // object and register_dyn under the prod prefix shape.
+        let registry = MetricsRegistry::new();
+        registry.register_dyn(
+            "scheduler.testsched.worker",
+            scheduler.clone()
+                as Arc<dyn MetricsComponentTrait + Send + Sync>,
+        );
+
+        let body = render_prometheus(&registry);
+
+        // The prod prefix + the `scheduler_metrics` group + the field
+        // name. `.` is sanitized to `_` by the Prometheus name
+        // sanitizer, so the leaf substring `scheduler_metrics_<field>`
+        // uniquely identifies the field under the SchedulerMetrics group.
+        assert!(
+            body.contains("scheduler_metrics_find_worker_hits"),
+            "#231: SchedulerMetrics.find_worker_hits dark on /metrics — \
+             the root walk did not descend into the metrics sub-component. \
+             body=\n{body}"
+        );
+        assert!(
+            body.contains("\nscheduler_testsched_worker_scheduler_metrics_find_worker_hits 11\n"),
+            "#231: find_worker_hits rendered the wrong value (expected 11) — \
+             group/field routing is wrong. body=\n{body}"
+        );
+        assert!(
+            body.contains("scheduler_metrics_prefetch_blobs_sent"),
+            "#231: SchedulerMetrics.prefetch_blobs_sent dark on /metrics — \
+             the prefetch-tier counter is the #linkperf measurement \
+             prerequisite. body=\n{body}"
+        );
+        assert!(
+            body.contains("\nscheduler_testsched_worker_scheduler_metrics_prefetch_blobs_sent 22\n"),
+            "#231: prefetch_blobs_sent rendered the wrong value (expected 22). \
+             body=\n{body}"
+        );
+        assert!(
+            body.contains("scheduler_metrics_bis_replay_buffer_overflow_drops"),
+            "#231: SchedulerMetrics.bis_replay_buffer_overflow_drops dark on \
+             /metrics — the #214 silent-drop counter has no operator signal \
+             but the paired warn!. body=\n{body}"
+        );
+        assert!(
+            body.contains("\nscheduler_testsched_worker_scheduler_metrics_bis_replay_buffer_overflow_drops 33\n"),
+            "#231: bis_replay_buffer_overflow_drops rendered the wrong value \
+             (expected 33). body=\n{body}"
+        );
+        // CounterWithTime nests under its own field name and emits a
+        // `counter` leaf (see CounterWithTime::publish).
+        assert!(
+            body.contains("scheduler_metrics_cache_warm_spawned_counter"),
+            "#231: SchedulerMetrics.cache_warm_spawned (CounterWithTime) dark \
+             on /metrics — must emit the nested `counter` leaf. body=\n{body}"
+        );
+        assert!(
+            body.contains("\nscheduler_testsched_worker_scheduler_metrics_cache_warm_spawned_counter 1\n"),
+            "#231: cache_warm_spawned.counter rendered the wrong value \
+             (expected 1 after one inc()). body=\n{body}"
         );
     }
 }
