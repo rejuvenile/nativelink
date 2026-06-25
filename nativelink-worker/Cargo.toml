@@ -126,6 +126,13 @@ name = "bis_chunk_handler_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (FL-688 v3 §3.8) Uses `BlobsAvailableState::from_test_args` + the
+# test-only resend-buffer accessors, all gated behind
+# `cfg(any(test, feature = "test-utils"))`.
+name = "blobs_available_ack_test"
+required-features = ["test-utils"]
+
+[[test]]
 # (#97) `bis_chunked_dispatch_arm_round_trips_ack` constructs a
 # `BlobsAvailableState::from_test_args`, which is gated behind
 # `cfg(any(test, feature = "test-utils"))`. Cfg-test alone doesn't

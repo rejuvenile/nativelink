@@ -39,8 +39,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    execute_result, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest,
-    UpdateForScheduler, UpdateForWorker, UploadMissingBlobsRequest,
+    execute_result, BlobsAvailableAck, ExecuteComplete, ExecuteResult, GoingAwayRequest,
+    KeepAliveRequest, UpdateForScheduler, UpdateForWorker, UploadMissingBlobsRequest,
 };
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
 use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
@@ -2096,24 +2096,79 @@ impl WorkerConnection {
                         use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::chunked_message;
                         match envelope.payload {
                             Some(chunked_message::Payload::BlobsAvailable(chunk)) => {
-                                if let Some(notification) = instance
+                                // (FL-688 v3 §3.8) Capture the ack triple
+                                // BEFORE `merge_chunk_outcome` consumes the
+                                // chunk. The worker echoes its
+                                // `worker_instance_token` back so it can
+                                // drop acks across its own bounce.
+                                let ack_broadcast_id = chunk.broadcast_id;
+                                let ack_sequence = chunk.sequence;
+                                let ack_worker_token = chunk.worker_instance_token;
+                                use crate::blobs_available_accumulator::MergeOutcome;
+                                let outcome = instance
                                     .blobs_available_accumulator
-                                    .merge_chunk(chunk)
-                                {
-                                    // Path A commit: accumulator yielded a
-                                    // fully-assembled notification on
-                                    // is_last=true. Hand to the legacy
-                                    // handler, which performs the
-                                    // remove_endpoint wipe (when
-                                    // is_full_snapshot=true) +
-                                    // register_blobs_iter + AC pin
-                                    // replace + mirror pipeline
-                                    // ATOMICALLY in one block.
-                                    instance.handle_blobs_available(notification).await
-                                } else {
-                                    // Non-terminal chunk: nothing more
-                                    // to do until the terminal arrives.
-                                    Ok(())
+                                    .merge_chunk_outcome(chunk);
+                                match outcome {
+                                    MergeOutcome::Accepted(maybe_notification) => {
+                                        // The chunk merged → ack it
+                                        // (per-chunk, NOT per-broadcast) so
+                                        // the worker drops it from its
+                                        // resend buffer (drain-on-ack). The
+                                        // ack rides the server→worker
+                                        // `UpdateForWorker` mpsc; a lost ack
+                                        // is benign (the worker keeps the
+                                        // chunk buffered and re-advertises
+                                        // on reconnect — no per-tick replay
+                                        // in this stage).
+                                        if let Err(err) =
+                                            instance.worker_tx.send(UpdateForWorker {
+                                                update: Some(
+                                                    update_for_worker::Update::BlobsAvailableAck(
+                                                        BlobsAvailableAck {
+                                                            broadcast_id: ack_broadcast_id,
+                                                            sequence: ack_sequence,
+                                                            worker_instance_token: ack_worker_token,
+                                                        },
+                                                    ),
+                                                ),
+                                            })
+                                        {
+                                            tracing::warn!(
+                                                worker_id=?instance.worker_id,
+                                                broadcast_id = ack_broadcast_id,
+                                                sequence = ack_sequence,
+                                                ?err,
+                                                "failed to send BlobsAvailableAck \
+                                                 (worker_tx closed); worker will \
+                                                 re-advertise on reconnect"
+                                            );
+                                        }
+                                        if let Some(notification) = maybe_notification {
+                                            // Path A commit: terminal chunk
+                                            // assembled the full
+                                            // notification. Hand to the
+                                            // legacy handler (remove_endpoint
+                                            // wipe when is_full_snapshot +
+                                            // register_blobs_iter + AC pin
+                                            // replace + mirror pipeline,
+                                            // ATOMICALLY).
+                                            instance.handle_blobs_available(notification).await
+                                        } else {
+                                            // Accepted non-terminal: nothing
+                                            // more until the terminal lands.
+                                            Ok(())
+                                        }
+                                    }
+                                    MergeOutcome::Dropped => {
+                                        // Validation/cap/completeness failure
+                                        // — do NOT ack (suppress, mirroring
+                                        // handle_bis_chunk) so the worker
+                                        // keeps the chunk buffered and
+                                        // re-advertises on reconnect. The
+                                        // accumulator already warn-logged the
+                                        // specific drop reason.
+                                        Ok(())
+                                    }
                                 }
                             }
                             // Other payload arms (PeerHints,

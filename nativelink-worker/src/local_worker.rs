@@ -18,7 +18,7 @@ use core::str;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::process::Stdio;
 use std::sync::{Arc, Weak};
@@ -33,9 +33,9 @@ use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BisAck, BlobDigestInfo, BlobsAvailableNotification, BlobsInStableStorageChunk, ExecuteComplete,
-    ExecuteResult, GoingAwayRequest, KeepAliveRequest, MirrorPinEntry, PeerHintsChunk,
-    UpdateForWorker, chunked_message, execute_result,
+    BisAck, BlobDigestInfo, BlobsAvailableAck, BlobsAvailableChunk, BlobsAvailableNotification,
+    BlobsInStableStorageChunk, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest,
+    MirrorPinEntry, PeerHintsChunk, UpdateForWorker, chunked_message, execute_result,
 };
 use nativelink_store::fast_slow_store::{FastSlowStore, SlowTierMetricSink};
 use nativelink_store::filesystem_store::FilesystemStore;
@@ -76,6 +76,29 @@ use crate::worker_utils::make_connect_worker_request;
 /// coalesced via drain-then-fire. Empty ticks are skipped (no send when
 /// there are no changes), so idle workers generate zero traffic.
 const BLOBS_AVAILABLE_MAX_INTERVAL_MS: u64 = 100;
+
+/// (FL-688 v3 §3.8) Cap on the worker's `BlobsAvailable` resend buffer —
+/// the bounded ring of unacked delta `BlobsAvailableChunk`s the worker
+/// holds until the server's `BlobsAvailableAck` arrives (drain-on-ack).
+/// Over this cap the worker CLEARS the buffer and forces a fresh FULL
+/// SNAPSHOT broadcast, which supersedes every buffered delta (the
+/// self-correcting reset — the convergence the removed 60s heartbeat used
+/// to provide, now triggered by buffer pressure = an EVENT, not a timer).
+///
+/// Sized to one broadcast's worth of sequences: the chunker caps a single
+/// broadcast at `MAX_SEQUENCES` (256, `blobs_available_chunking.rs`), so
+/// 256 lets a full snapshot's chunks sit in flight without tripping the
+/// reset, while still bounding worst-case buffer RSS at
+/// 256 × `BLOBS_AVAILABLE_PER_CHUNK` (4096) digest entries ≈ ~63 MiB at
+/// the per-entry worst case (a `BlobDigestInfo` ≈ 60 bytes); in steady
+/// state a responsive server acks within an RTT so the buffer stays
+/// near-empty and the typical chunk is far smaller. A non-acking server
+/// (partition) is the only path that grows it, and that path is the one
+/// the full-snapshot reset valve exists to bound.
+// CAPPED AT BLOBS_AVAILABLE_RESEND_MAX_CHUNKS: a bounded ring of unacked
+// worker→server delta chunks on the network path; over-cap → clear +
+// force a full-snapshot broadcast (lossless: the snapshot is a superset).
+pub const BLOBS_AVAILABLE_RESEND_MAX_CHUNKS: usize = 256;
 
 /// Platform-specific cumulative CPU time reading.
 #[cfg(target_os = "linux")]
@@ -1418,6 +1441,61 @@ fn start_worker_quic_server(
     }))
 }
 
+/// (FL-688 v3 §3.8) Bounded resend buffer of unacked worker→server
+/// `BlobsAvailableChunk` DELTAS, keyed `(broadcast_id, sequence)`.
+///
+/// The worker buffers each delta chunk it sends and clears the matching
+/// slot ONLY when the server's `BlobsAvailableAck` arrives (drain-on-ack).
+/// Chunks still unacked when the connection drops are replayed on the
+/// next reconnect (symmetric to the scheduler's `BisResendBuffer` for the
+/// reverse BIS direction). Without it, a lost worker→server delta send
+/// (the tracker is drained on send) leaves the server's locality view
+/// permanently stale — the orphaned-replica hole the reconcile /
+/// eviction-gate self-heal (v3 §3.4) relies on this buffer to close.
+///
+/// **Only DELTAS are buffered, never FULL SNAPSHOTS.** A full snapshot is
+/// self-correcting: a lost one is re-derived from a whole-store rescan on
+/// the next reconnect/tick, so it needs no replay. A delta is a one-shot
+/// difference that is NOT re-derived once `tracker.swap()` drained it, so
+/// only deltas need the drain-on-ack guarantee. (This narrows the design
+/// §3.8 four-site list to the two delta sites — see the impl note at the
+/// send path.)
+#[derive(Debug, Default)]
+pub struct BlobsAvailableResendBuffer {
+    /// (broadcast_id, sequence) → the unacked delta chunk.
+    chunks: BTreeMap<(u64, u32), BlobsAvailableChunk>,
+}
+
+impl BlobsAvailableResendBuffer {
+    /// Buffer one just-sent delta chunk. Returns `true` iff this push
+    /// would exceed [`BLOBS_AVAILABLE_RESEND_MAX_CHUNKS`]: in that case
+    /// the buffer is CLEARED and the caller MUST force a fresh full
+    /// snapshot (which supersedes every dropped delta — lossless). The
+    /// over-cap chunk itself is NOT inserted (the forced snapshot will
+    /// re-advertise it).
+    fn add(&mut self, chunk: BlobsAvailableChunk) -> bool {
+        if self.chunks.len() >= BLOBS_AVAILABLE_RESEND_MAX_CHUNKS {
+            self.chunks.clear();
+            return true;
+        }
+        self.chunks.insert((chunk.broadcast_id, chunk.sequence), chunk);
+        false
+    }
+
+    /// Drop the chunk matching one ack. PER-CHUNK: only the
+    /// `(broadcast_id, sequence)` slot is removed, never the whole
+    /// broadcast — an in-window ack must not drop sibling unacked deltas.
+    /// An ack for a slot not present is a harmless no-op (idempotent
+    /// under a resend that crosses an in-flight ack).
+    fn ack(&mut self, broadcast_id: u64, sequence: u32) {
+        self.chunks.remove(&(broadcast_id, sequence));
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
 /// Accumulated blob changes between BlobsAvailable ticks.
 ///
 /// `added` and `touched` are reported in the same outgoing
@@ -1996,6 +2074,23 @@ pub struct BlobsAvailableState {
     /// counter is per-state and accessed only from the single
     /// `send_periodic_blobs_available` task.
     ac_pin_full_snapshot_tick_counter: Arc<AtomicU64>,
+    /// (FL-688 v3 §3.8) Bounded resend buffer of unacked worker→server
+    /// DELTA `BlobsAvailableChunk`s. The send path buffers each delta
+    /// chunk here on send and `handle_blobs_available_ack` clears the
+    /// matching `(broadcast_id, sequence)` slot when the server's
+    /// `BlobsAvailableAck` arrives; a reconnect (full snapshot) clears it
+    /// wholesale (the snapshot supersedes every buffered delta).
+    /// `parking_lot::Mutex` is sync-only — held only briefly in the send /
+    /// ack paths, never across `.await`.
+    blobs_available_resend: Arc<Mutex<BlobsAvailableResendBuffer>>,
+    /// (FL-688 v3 §3.8) Set when the resend buffer overflows
+    /// [`BLOBS_AVAILABLE_RESEND_MAX_CHUNKS`]; promotes the NEXT
+    /// `send_periodic_blobs_available` tick to a full snapshot (which
+    /// supersedes every dropped delta — lossless). This is the
+    /// self-correcting convergence the removed 60s heartbeat used to
+    /// provide, now triggered by buffer pressure (an EVENT, not a timer).
+    /// `Relaxed` is sufficient — set and read only on the single send task.
+    blobs_available_force_full_snapshot: Arc<AtomicBool>,
 }
 
 /// Test-only builder for [`BlobsAvailableState`]. Lets each test set only
@@ -2062,7 +2157,71 @@ impl BlobsAvailableState {
             last_sent_ac_pin_set: Arc::new(Mutex::new(HashSet::new())),
             blobs_available_skipped_counter: Arc::new(AtomicU64::new(0)),
             ac_pin_full_snapshot_tick_counter: Arc::new(AtomicU64::new(0)),
+            blobs_available_resend: Arc::new(Mutex::new(BlobsAvailableResendBuffer::default())),
+            blobs_available_force_full_snapshot: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Test-only: whether the over-cap valve has requested a forced full
+    /// snapshot on the next tick (and clear it, mirroring the send path).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_take_force_full_snapshot(&self) -> bool {
+        self.blobs_available_force_full_snapshot
+            .swap(false, Ordering::Relaxed)
+    }
+
+    /// (FL-688 v3 §3.8) Buffer one just-sent DELTA chunk into the resend
+    /// buffer (drain-on-ack). On over-cap the buffer self-clears and we
+    /// SET the force-full-snapshot flag so the next tick re-converges with
+    /// a snapshot that supersedes every dropped delta. Returns `true` iff
+    /// the over-cap reset fired (the caller logs it). The production send
+    /// path and the test seam both go through here so the test crosses the
+    /// exact over-cap → force-snapshot wiring.
+    fn buffer_delta_chunk(&self, chunk: BlobsAvailableChunk) -> bool {
+        let over_cap = self.blobs_available_resend.lock().add(chunk);
+        if over_cap {
+            self.blobs_available_force_full_snapshot
+                .store(true, Ordering::Relaxed);
+        }
+        over_cap
+    }
+
+    /// Test-only: buffer one delta chunk as if it had just been sent (the
+    /// production [`Self::buffer_delta_chunk`] seam). Returns the over-cap
+    /// "force full snapshot" signal.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_buffer_delta_chunk(&self, chunk: BlobsAvailableChunk) -> bool {
+        self.buffer_delta_chunk(chunk)
+    }
+
+    /// (FL-688 v3 §3.8) Clear the resend buffer wholesale — called when a
+    /// full snapshot is sent (reconnect / forced), since the snapshot
+    /// supersedes every buffered delta.
+    fn clear_resend_buffer(&self) {
+        self.blobs_available_resend.lock().chunks.clear();
+    }
+
+    /// Test-only: number of unacked chunks currently buffered.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_resend_buffer_len(&self) -> usize {
+        self.blobs_available_resend.lock().len()
+    }
+
+    /// Test-only: whether `(broadcast_id, sequence)` is still buffered.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_resend_buffer_contains(&self, broadcast_id: u64, sequence: u32) -> bool {
+        self.blobs_available_resend
+            .lock()
+            .chunks
+            .contains_key(&(broadcast_id, sequence))
     }
 }
 
@@ -2458,6 +2617,53 @@ pub fn handle_bis_chunk(
         );
     }
     outcome
+}
+
+/// (FL-688 v3 §3.8) Process one `BlobsAvailableAck` arriving on the
+/// scheduler→worker stream: drop the matching `(broadcast_id, sequence)`
+/// delta chunk from the worker's resend buffer (drain-on-ack).
+///
+/// This is the mirror image of [`handle_bis_chunk`]'s ack EMISSION: there
+/// the worker emits a `BisAck` for a server BIS chunk; here the worker
+/// RECEIVES the server's ack for a delta chunk it sent.
+///
+/// **Token guard (red-team #5 on #97, opposite direction).** The ack
+/// echoes the `worker_instance_token` the worker stamped on the original
+/// chunk. We drop any ack whose echo ≠ this worker process's CURRENT
+/// token (regenerated each boot) — otherwise a server holding a STALE ack
+/// across a worker bounce could drop an unrelated chunk from the NEW
+/// process's resend buffer. A token of 0 is "uninitialised" and is
+/// always treated as mismatched. (Without the guard, the
+/// `stale_worker_token_ack_is_dropped` / `token_zero_ack_is_dropped`
+/// tests red-fail.)
+///
+/// **Per-chunk drop (not per-broadcast).** Only the exact
+/// `(broadcast_id, sequence)` slot is removed; sibling unacked deltas of
+/// the same broadcast stay buffered. An ack for a slot not present is a
+/// harmless no-op (idempotent under a resend that crosses an in-flight
+/// ack). This is a thin function so the `Update::BlobsAvailableAck`
+/// dispatch arm is a one-line call site and the guard logic is unit-
+/// testable without standing up the full stream stack.
+pub fn handle_blobs_available_ack(state: &BlobsAvailableState, ack: &BlobsAvailableAck) {
+    if ack.worker_instance_token == 0 || ack.worker_instance_token != state.worker_instance_token {
+        // Stale or uninitialised token — a different (or pre-fixup)
+        // worker process. Dropping the buffered chunk here would
+        // orphan the current process's still-unacked delta. Mirror of
+        // the scheduler's `bis_ack_received` server-token guard.
+        debug!(
+            target: "nativelink::blobs_available_ack",
+            broadcast_id = ack.broadcast_id,
+            sequence = ack.sequence,
+            ack_token = ack.worker_instance_token,
+            current_token = state.worker_instance_token,
+            "dropping BlobsAvailableAck with non-current worker_instance_token"
+        );
+        return;
+    }
+    state
+        .blobs_available_resend
+        .lock()
+        .ack(ack.broadcast_id, ack.sequence);
 }
 
 /// Process one `PeerHintsChunk` arriving on the scheduler→worker stream:
@@ -2957,6 +3163,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         running_actions_manager: &Arc<U>,
         is_first: bool,
     ) -> Result<(), Error> {
+        // (FL-688 v3 §3.8) Over-cap promotion: if the resend buffer
+        // overflowed on a prior tick, this tick is promoted to a full
+        // snapshot (which supersedes every dropped delta — lossless). The
+        // flag is taken (cleared) here so a single overflow promotes
+        // exactly one tick. ORing into `is_first` reuses the existing
+        // full-snapshot path; the flag itself is set by
+        // `buffer_delta_chunk` when the buffer overflows.
+        let is_first = is_first
+            || state
+                .blobs_available_force_full_snapshot
+                .swap(false, Ordering::Relaxed);
         // (A1 fix + fix-up F1+F2) Apply the per-tick memo-reset paths
         // at the function head: reconnect-clear (`is_first=true`)
         // wipes the AC-pin memo so the next delta replays the full
@@ -3320,7 +3537,30 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 }
             };
             let chunk_count = chunks.len();
+            // (FL-688 v3 §3.8) A full snapshot supersedes every buffered
+            // delta, so clear the resend buffer before (re)advertising it.
+            // For a DELTA, each chunk is buffered AFTER a successful send
+            // so the server's `BlobsAvailableAck` can drop it
+            // (drain-on-ack) and an over-cap accumulation forces the next
+            // tick to re-converge with a full snapshot. NOTE (Tier-3
+            // scope flag): Stage 2 buffers + acks + over-cap-resets the
+            // delta chunks but does NOT add per-tick replay of unacked
+            // chunks (that is the flow-control change deferred to a later
+            // stage); a lost-but-not-reconnected ack is healed by the
+            // next reconnect's full snapshot OR the over-cap valve.
+            if is_first {
+                state.clear_resend_buffer();
+            }
             for chunk in chunks {
+                // Buffer the DELTA chunk (clone) for drain-on-ack BEFORE
+                // moving it into the send envelope. Full-snapshot chunks
+                // are not buffered (self-correcting; the snapshot is
+                // re-derived from a whole-store scan on reconnect).
+                let buffered_delta = if is_first {
+                    None
+                } else {
+                    Some(chunk.clone())
+                };
                 let envelope = ChunkedMessage {
                     payload: Some(chunked_message::Payload::BlobsAvailable(chunk)),
                 };
@@ -3338,6 +3578,20 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         "Failed to send chunked BlobsAvailable"
                     );
                     return Err(err);
+                }
+                if let Some(delta_chunk) = buffered_delta {
+                    if state.buffer_delta_chunk(delta_chunk) {
+                        // Over-cap: the buffer self-cleared and the next
+                        // tick is promoted to a full snapshot. Log so a
+                        // chronic non-acking server (partition) is visible.
+                        warn!(
+                            target: "nativelink::blobs_available_ack",
+                            broadcast_id,
+                            cap = BLOBS_AVAILABLE_RESEND_MAX_CHUNKS,
+                            "BlobsAvailable resend buffer over cap; cleared + forcing a full \
+                             snapshot next tick (server not acking deltas — partition?)"
+                        );
+                    }
                 }
             }
             info!(
@@ -3787,6 +4041,28 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         "Update::ChunkedMessage with empty payload from scheduler; ignoring"
                                     );
                                 }
+                            }
+                        }
+                        Update::BlobsAvailableAck(ack) => {
+                            // (FL-688 v3 §3.8) Server acked one of the
+                            // delta `BlobsAvailableChunk`s we sent. Drop
+                            // the matching `(broadcast_id, sequence)` slot
+                            // from the resend buffer (drain-on-ack). The
+                            // token guard + per-chunk drop live in
+                            // `handle_blobs_available_ack`.
+                            if let Some(ref state) = self.blobs_available_state {
+                                handle_blobs_available_ack(state, &ack);
+                            } else {
+                                // No BlobsAvailable reporting on this
+                                // worker (no FilesystemStore fast tier) ⇒
+                                // we never sent a delta, so an ack is
+                                // unexpected; warn for observability.
+                                warn!(
+                                    target: "nativelink::blobs_available_ack",
+                                    broadcast_id = ack.broadcast_id,
+                                    sequence = ack.sequence,
+                                    "BlobsAvailableAck received but blobs_available_state is None (BUG?)"
+                                );
                             }
                         }
                         Update::UploadMissingBlobs(request) => {
@@ -5105,6 +5381,8 @@ pub async fn new_local_worker(
                 last_sent_ac_pin_set: Arc::new(Mutex::new(HashSet::new())),
                 blobs_available_skipped_counter: Arc::new(AtomicU64::new(0)),
                 ac_pin_full_snapshot_tick_counter: Arc::new(AtomicU64::new(0)),
+                blobs_available_resend: Arc::new(Mutex::new(BlobsAvailableResendBuffer::default())),
+                blobs_available_force_full_snapshot: Arc::new(AtomicBool::new(false)),
             })
         } else {
             warn!(

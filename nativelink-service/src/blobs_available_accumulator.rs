@@ -66,6 +66,28 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
+/// (FL-688 v3 §3.8) Outcome of [`BlobsAvailableAccumulator::merge_chunk_outcome`].
+///
+/// Distinguishes "the chunk was ACCEPTED into the accumulator" (the
+/// server should send a `BlobsAvailableAck` so the worker drops it from
+/// its resend buffer) from "the chunk was DROPPED" (a validation / cap /
+/// sequence-completeness failure — the server must NOT ack, so the worker
+/// keeps it buffered and re-advertises on reconnect). This is the same
+/// acceptance/drop discipline as the reverse-direction `handle_bis_chunk`
+/// ack-gate, where a partial failure suppresses the ack.
+#[derive(Debug)]
+pub enum MergeOutcome {
+    /// The chunk merged successfully. `Some(notification)` iff this was
+    /// the terminal chunk and the sequence-completeness gate passed (the
+    /// caller commits it via `handle_blobs_available`); `None` for an
+    /// accepted non-terminal chunk. EITHER way the server acks it.
+    Accepted(Option<BlobsAvailableNotification>),
+    /// The chunk was rejected (token mismatch/zero, a per-chunk/per-conn
+    /// cap, or a terminal that failed the completeness/chunk-0 gate). The
+    /// partial state is dropped; the server must NOT ack.
+    Dropped,
+}
+
 /// CAPPED AT 8: a misbehaving / wedged worker emitting chunks for new
 /// `broadcast_id`s without ever sending `is_last=true` would otherwise
 /// grow the accumulator monotonically. Steady-state rate is 1 broadcast
@@ -541,7 +563,30 @@ impl BlobsAvailableAccumulator {
     /// Validation failures (token mismatch, duplicate sequence, store_id
     /// drift, accumulator over cap) drop the partial state and return
     /// `None`; the worker MUST then re-broadcast on the next tick.
+    ///
+    /// This is a thin `Option`-returning wrapper over
+    /// [`Self::merge_chunk_outcome`] preserved for the many existing
+    /// callers/tests that only care about the terminal notification. The
+    /// `BlobsAvailableAck` server path uses `merge_chunk_outcome` so it
+    /// can distinguish "accepted (ack it)" from "dropped (do NOT ack so
+    /// the worker resends)".
     pub fn merge_chunk(&self, chunk: BlobsAvailableChunk) -> Option<BlobsAvailableNotification> {
+        match self.merge_chunk_outcome(chunk) {
+            MergeOutcome::Accepted(notification) => notification,
+            MergeOutcome::Dropped => None,
+        }
+    }
+
+    /// (FL-688 v3 §3.8) Process one chunk, reporting whether it was
+    /// ACCEPTED (merged into the accumulator — the server should send a
+    /// `BlobsAvailableAck` so the worker drops it from its resend buffer)
+    /// or DROPPED (a validation/cap/completeness failure — the server
+    /// must NOT ack so the worker keeps it buffered and re-advertises on
+    /// reconnect). A terminal accept additionally carries the assembled
+    /// `BlobsAvailableNotification` to commit. This is the same
+    /// acceptance/drop discipline as `handle_bis_chunk`'s ack-gate in the
+    /// reverse direction (a partial failure suppresses the ack).
+    pub fn merge_chunk_outcome(&self, chunk: BlobsAvailableChunk) -> MergeOutcome {
         let broadcast_id = chunk.broadcast_id;
         let token = chunk.worker_instance_token;
         let sequence = chunk.sequence;
@@ -560,7 +605,7 @@ impl BlobsAvailableAccumulator {
                 reason = "token_zero",
                 "rejecting BlobsAvailableChunk with worker_instance_token=0 (uninitialised)"
             );
-            return None;
+            return MergeOutcome::Dropped;
         }
 
         // Per-chunk entry-count cap (security M1 / Fix #11). Defends
@@ -584,7 +629,7 @@ impl BlobsAvailableAccumulator {
                 reason = "per_chunk_entries_cap",
                 "rejecting BlobsAvailableChunk with oversized per-chunk entry count"
             );
-            return None;
+            return MergeOutcome::Dropped;
         }
 
         let mut inner = self.inner.lock();
@@ -606,7 +651,7 @@ impl BlobsAvailableAccumulator {
                  dropping new broadcast — worker likely emitted chunks \
                  but never sent is_last=true"
             );
-            return None;
+            return MergeOutcome::Dropped;
         }
 
         // Per-conn entries cap pre-merge (Fix #11): bound transient
@@ -647,7 +692,7 @@ impl BlobsAvailableAccumulator {
                     .total_accumulated
                     .saturating_sub(removed.accumulated_entries);
             }
-            return None;
+            return MergeOutcome::Dropped;
         }
 
         // Token-mismatch rebuild is handled with a brief Occupied
@@ -738,7 +783,7 @@ impl BlobsAvailableAccumulator {
                 // `accumulated_entries` mutation.
                 inner.total_accumulated =
                     inner.total_accumulated.saturating_sub(acc_accumulated_entries);
-                None
+                MergeOutcome::Dropped
             }
             Ok(is_terminal) => {
                 // Read CURRENT total — NOT a pre-wipe snapshot — so the
@@ -754,7 +799,10 @@ impl BlobsAvailableAccumulator {
                 // `token_mismatch_drift_total_accumulated_consistency`.
                 inner.total_accumulated = inner.total_accumulated.saturating_add(delta);
                 if !is_terminal {
-                    return None;
+                    // Accepted a non-terminal chunk: its slice is now in
+                    // the accumulator → ack it so the worker drops it from
+                    // its resend buffer (drain-on-ack).
+                    return MergeOutcome::Accepted(None);
                 }
                 // Terminal chunk arrived. Apply the sequence-completeness
                 // gate (Fix #1, invariant-prover BLOCK).
@@ -785,7 +833,7 @@ impl BlobsAvailableAccumulator {
                          never landed; rejecting partial commit (header \
                          scalars missing)"
                     );
-                    return None;
+                    return MergeOutcome::Dropped;
                 }
 
                 if !contiguous {
@@ -802,7 +850,7 @@ impl BlobsAvailableAccumulator {
                          sequence; rejecting partial commit (worker \
                          re-broadcasts on next tick)"
                     );
-                    return None;
+                    return MergeOutcome::Dropped;
                 }
 
                 // Path A commit: assemble the body with header scalars
@@ -822,7 +870,7 @@ impl BlobsAvailableAccumulator {
                     body.memory_pressured = headers.memory_pressured;
                 }
                 body.is_full_snapshot = removed.is_full_snapshot;
-                Some(body)
+                MergeOutcome::Accepted(Some(body))
             }
         }
     }
