@@ -681,6 +681,23 @@ async fn inner_main(
         nativelink_util::o11_probes::symlink_fix_counters_arc(),
     );
 
+    // #DC3 (2026-06-25): register the directory-cache efficacy counters
+    // singleton so the per-OUTCOME dir-cache counters appear on /metrics:
+    // `dir_cache_exact_hit_total_counter`, `dir_cache_miss_total_counter`,
+    // `dir_cache_subtree_hit_total_counter`, `dir_cache_fuzzy_match_total_counter`,
+    // `dir_cache_hit_clonefile_total_counter`, `dir_cache_hit_hardlink_total_counter`.
+    // The per-instance `DirectoryCache` counters that these mirror were never
+    // registered with MetricsRegistry (the worker-metrics-exposure trap; same
+    // class #86 symlink_fix fixed) — they were dark on /metrics. Prefix is
+    // "dir_cache" (inner group!() names do NOT repeat it, avoiding the #86
+    // doubled-name trap). Registered unconditionally to match the #85 o11 /
+    // #86 sibling pattern; the producer (DirectoryCache) is WORKER-ONLY so the
+    // counters read 0 on server-only processes.
+    metrics_registry.register(
+        "dir_cache",
+        nativelink_util::o11_probes::dir_cache_counters_arc(),
+    );
+
     metrics_registry.register(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),

@@ -793,6 +793,317 @@ impl MetricsComponent for SymlinkFixCountersHandle {
 }
 
 // =====================================================================
+// #DC3: directory-cache efficacy counters, broken down by OUTCOME class
+// =====================================================================
+
+/// Process-global directory-cache efficacy counters, broken down by the
+/// cache-OUTCOME class. Surfaces on the worker `/metrics` endpoint so
+/// dir-cache efficacy ideas #1/#2 become measurable.
+///
+/// Background: the per-instance `DirectoryCache` (`directory_cache.rs`)
+/// already counts these outcomes in plain `AtomicU64` fields, but that
+/// struct has no `MetricsComponent` and is never registered with
+/// `MetricsRegistry` — so the counters are DARK on `/metrics` (the same
+/// worker-metrics-exposure trap #86 `SYMLINK_FIX_COUNTERS` fixed). This
+/// singleton is the `/metrics`-visible aggregate; increments are routed to
+/// it at the same six sites that bump the per-instance fields. The
+/// per-instance fields are KEPT because they feed live operator-visible
+/// hit-rate `info!` logs (a separate sink — not double-counting).
+///
+/// Outcome dimension (cardinality-bounded — a fixed 6-outcome enum, NOT a
+/// runtime-keyed label map, so no unbounded-label-set defect):
+/// - `exact_hit`  — digest already fully cached (the cheapest outcome).
+/// - `miss`       — full construction from the CAS (the most expensive).
+/// - `subtree_hit`— partial reuse of an already-cached subtree via symlink.
+/// - `fuzzy_match`— a miss resolved by patching the best-matching cached root.
+/// - `hit_clonefile` / `hit_hardlink` — the materialisation MECHANISM used
+///   on a hit (clonefile/reflink vs hardlink).
+///
+/// NOTE (action-class follow-up): the dispatch's "do link inputs hit the
+/// tree cache?" question wants a join to the Bazel action mnemonic. That
+/// label lives in REAPI `RequestMetadata.action_mnemonic` and never reaches
+/// the worker today; threading it is significant cross-component plumbing
+/// (scheduler `RequestMetadata` parse → worker-api proto → `ActionInfo`).
+/// Filed as a follow-up; the OUTCOME dimension here is the cleanest-available
+/// bounded dimension and is what #1/#2 actually need.
+///
+/// Aggregates across all configured `DirectoryCache` instances in the
+/// process (N worker configs = N instances; the process-wide sum is the
+/// correct `/metrics` total). On server-only processes the counters read 0.
+#[derive(Debug)]
+pub struct DirCacheCounters {
+    /// `dir_cache_exact_hit_total.counter` — digest already fully cached.
+    pub exact_hit: AtomicU64,
+    /// `dir_cache_miss_total.counter` — full construction from the CAS.
+    pub miss: AtomicU64,
+    /// `dir_cache_subtree_hit_total.counter` — cached-subtree reuse count.
+    pub subtree_hit: AtomicU64,
+    /// `dir_cache_fuzzy_match_total.counter` — best-match-patch resolutions.
+    pub fuzzy_match: AtomicU64,
+    /// `dir_cache_hit_clonefile_total.counter` — hit materialised via clonefile/reflink.
+    pub hit_clonefile: AtomicU64,
+    /// `dir_cache_hit_hardlink_total.counter` — hit materialised via hardlink.
+    pub hit_hardlink: AtomicU64,
+    // ---- #DC3 (scope ext): COLD-construct phase sub-cost decomposition ----
+    // The decision instrument for dir-cache ideas #1/#2: red-team showed the
+    // construct cost is blob-fetch-dominated, so the phase NAME is the
+    // cost-attribution axis. Each phase is a sum(ms)+count pair (mean =
+    // sum/count) — the cheapest signal that answers "where does the construct
+    // time go". Action-class labelling is the deferred follow-up (mnemonic is
+    // not at the worker); the phase metrics are NOT cross-labelled by outcome
+    // because the phase is itself the decomposition (an outcome cross-product
+    // would multiply series without decision value).
+    /// `dir_cache_construct_resolve_ms_{sum,count}` — parallel-BFS directory
+    /// tree resolve (`resolve_directory_tree`) span on a COLD construct.
+    pub construct_resolve_ms: PhaseTiming,
+    /// `dir_cache_construct_fetch_ms_{sum,count}` — the COLD-construct
+    /// fetch+materialise span (`download_to_directory`). Fetch-DOMINATED but
+    /// includes the in-construct hardlink emission; see the metric help for
+    /// the exact measured boundary (fetch and hardlink-emit interleave inside
+    /// `download_to_directory` and are not separable without entering
+    /// `running_actions_manager.rs`).
+    pub construct_fetch_ms: PhaseTiming,
+    /// `dir_cache_hit_assemble_ms_{sum,count}` — the HIT-path materialise span
+    /// (`hardlink_directory_tree` in `try_hardlink_cached`: cached entry →
+    /// dest). This is the cost dir-cache ideas #1/#2 would make MORE frequent.
+    pub hit_assemble_ms: PhaseTiming,
+}
+
+/// Sum+count pair for a single dir-cache construct phase. `sum` is the
+/// total observed milliseconds; `count` the number of observations. The
+/// per-phase mean is `sum / count`. A `Counter`-kind sum+count pair
+/// (Prometheus rate-friendly) is deliberately lighter than a full
+/// `O11LatencyHistogram` — for a cost-attribution decision the mean and
+/// rate are sufficient and avoid per-phase bucket-series cardinality.
+#[derive(Debug)]
+pub struct PhaseTiming {
+    /// Sum of all observed phase durations, in milliseconds.
+    pub sum_ms: AtomicU64,
+    /// Number of phase observations.
+    pub count: AtomicU64,
+}
+
+impl PhaseTiming {
+    const fn new() -> Self {
+        Self {
+            sum_ms: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one phase observation of `elapsed_ms` milliseconds.
+    pub fn observe_ms(&self, elapsed_ms: u64) {
+        self.sum_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl DirCacheCounters {
+    const fn new() -> Self {
+        Self {
+            exact_hit: AtomicU64::new(0),
+            miss: AtomicU64::new(0),
+            subtree_hit: AtomicU64::new(0),
+            fuzzy_match: AtomicU64::new(0),
+            hit_clonefile: AtomicU64::new(0),
+            hit_hardlink: AtomicU64::new(0),
+            construct_resolve_ms: PhaseTiming::new(),
+            construct_fetch_ms: PhaseTiming::new(),
+            hit_assemble_ms: PhaseTiming::new(),
+        }
+    }
+
+    /// Record an exact-hit outcome (digest already fully cached).
+    pub fn record_exact_hit(&self) {
+        self.exact_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a miss outcome (full construction from the CAS).
+    pub fn record_miss(&self) {
+        self.miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record `n` cached-subtree reuses (a single construction can reuse
+    /// many subtrees; the producer passes the per-construction count).
+    pub fn record_subtree_hits(&self, n: u64) {
+        self.subtree_hit.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record a fuzzy-match outcome (miss resolved via best-match patching).
+    pub fn record_fuzzy_match(&self) {
+        self.fuzzy_match.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a hit materialised via clonefile/reflink.
+    pub fn record_hit_clonefile(&self) {
+        self.hit_clonefile.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a hit materialised via hardlink.
+    pub fn record_hit_hardlink(&self) {
+        self.hit_hardlink.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a COLD-construct resolve-phase observation (ms).
+    pub fn record_construct_resolve_ms(&self, elapsed_ms: u64) {
+        self.construct_resolve_ms.observe_ms(elapsed_ms);
+    }
+
+    /// Record a COLD-construct fetch+materialise-phase observation (ms).
+    pub fn record_construct_fetch_ms(&self, elapsed_ms: u64) {
+        self.construct_fetch_ms.observe_ms(elapsed_ms);
+    }
+
+    /// Record a HIT-path assemble-phase (hardlink materialise) observation (ms).
+    pub fn record_hit_assemble_ms(&self, elapsed_ms: u64) {
+        self.hit_assemble_ms.observe_ms(elapsed_ms);
+    }
+}
+
+impl MetricsComponent for DirCacheCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        // Registered under prefix "dir_cache" (nativelink.rs). Each
+        // group!() adds ONE inner segment so the rendered name is
+        //   dir_cache . <outcome>_total . counter → dir_cache_<outcome>_total_counter
+        // Group names must NOT repeat the "dir_cache" prefix (the register
+        // key is already in scope) or it doubles to `dir_cache_dir_cache_…`
+        // (the #86 doubled-name trap, guarded by the render test).
+        let emit = |outcome: &'static str, field: &AtomicU64, help: &'static str| -> Result<(), nativelink_metric::Error> {
+            let grp = format!("{outcome}_total");
+            let _g = group!(grp).entered();
+            let v = field.load(Ordering::Relaxed);
+            publish!("counter", &v, MetricKind::Counter, help);
+            Ok(())
+        };
+        emit(
+            "exact_hit",
+            &self.exact_hit,
+            "Directory-cache exact-hit count: input root digest was already \
+             fully cached (cheapest outcome). Numerator for tree-cache efficacy.",
+        )?;
+        emit(
+            "miss",
+            &self.miss,
+            "Directory-cache miss count: full construction from the CAS (most \
+             expensive outcome). Denominator counterpart to the hit outcomes.",
+        )?;
+        emit(
+            "subtree_hit",
+            &self.subtree_hit,
+            "Directory-cache subtree-hit count: number of already-cached \
+             subtrees reused via symlink across all constructions. Measures \
+             partial tree-cache reuse on otherwise-missing roots.",
+        )?;
+        emit(
+            "fuzzy_match",
+            &self.fuzzy_match,
+            "Directory-cache fuzzy-match count: misses resolved by patching the \
+             best-matching cached root instead of full construction.",
+        )?;
+        emit(
+            "hit_clonefile",
+            &self.hit_clonefile,
+            "Directory-cache hit materialised via clonefile/reflink (the \
+             copy-on-write hit mechanism).",
+        )?;
+        emit(
+            "hit_hardlink",
+            &self.hit_hardlink,
+            "Directory-cache hit materialised via hardlink (the shared-inode \
+             hit mechanism).",
+        )?;
+
+        // #DC3 (scope ext): cold-construct phase sub-cost decomposition.
+        // Each phase emits dir_cache_<phase>_ms_sum (total ms) +
+        // dir_cache_<phase>_ms_count (#observations) under a group whose
+        // name does NOT repeat the "dir_cache" prefix (#86 doubled-name trap).
+        let emit_phase = |phase: &'static str, t: &PhaseTiming, help_sum: &'static str| -> Result<(), nativelink_metric::Error> {
+            let grp = format!("{phase}_ms");
+            let _g = group!(grp).entered();
+            let sum = t.sum_ms.load(Ordering::Relaxed);
+            let count = t.count.load(Ordering::Relaxed);
+            publish!("sum", &sum, MetricKind::Counter, help_sum);
+            publish!(
+                "count",
+                &count,
+                MetricKind::Counter,
+                "Number of observations for this dir-cache construct phase \
+                 (mean phase ms = sum / count)."
+            );
+            Ok(())
+        };
+        emit_phase(
+            "construct_resolve",
+            &self.construct_resolve_ms,
+            "Sum (ms) of the COLD-construct parallel-BFS directory-tree resolve \
+             phase (resolve_directory_tree). Boundary: from just-before the \
+             resolve call to just-after it returns.",
+        )?;
+        emit_phase(
+            "construct_fetch",
+            &self.construct_fetch_ms,
+            "Sum (ms) of the COLD-construct blob-fetch+materialise phase \
+             (download_to_directory). Boundary: the full download_to_directory \
+             span — fetch-DOMINATED but includes the in-construct hardlink \
+             emission (fetch and hardlink-emit interleave inside it and are not \
+             separable here).",
+        )?;
+        emit_phase(
+            "hit_assemble",
+            &self.hit_assemble_ms,
+            "Sum (ms) of the HIT-path assemble phase (hardlink_directory_tree: \
+             cached entry → action dest). Boundary: the hardlink_directory_tree \
+             span in try_hardlink_cached. This is the cost dir-cache ideas #1/#2 \
+             would make more frequent.",
+        )?;
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// #DC3: process-wide directory-cache outcome counters. Backed by a
+/// `static` so `const fn new()` suffices.
+static DIR_CACHE_COUNTERS: DirCacheCounters = DirCacheCounters::new();
+/// #DC3: cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents
+/// a double-registration hazard if `dir_cache_counters_arc()` is called
+/// twice — both calls return a clone of the same `Arc`.
+static DIR_CACHE_COUNTERS_ARC: OnceLock<Arc<DirCacheCountersHandle>> = OnceLock::new();
+
+/// #DC3: process-wide directory-cache outcome counters singleton. All
+/// calls within the process observe the same atomic state.
+#[must_use]
+pub fn dir_cache_counters() -> &'static DirCacheCounters {
+    &DIR_CACHE_COUNTERS
+}
+
+/// #DC3: `Arc` wrapper for `MetricsRegistry::register`. The singleton lives
+/// in a `static`; the `Arc` carries a zero-sized handle that delegates
+/// `publish` to the static so scrapes always read live state. `OnceLock`-
+/// cached so repeated calls return a clone of the same `Arc`.
+#[must_use]
+pub fn dir_cache_counters_arc() -> Arc<DirCacheCountersHandle> {
+    Arc::clone(DIR_CACHE_COUNTERS_ARC.get_or_init(|| Arc::new(DirCacheCountersHandle)))
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an
+/// `Arc<T: MetricsComponent>` for the `static`-backed `#DC3` counters.
+#[derive(Debug)]
+pub struct DirCacheCountersHandle;
+
+impl MetricsComponent for DirCacheCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        DIR_CACHE_COUNTERS.publish(kind, field_metadata)
+    }
+}
+
+// =====================================================================
 // P4 — System metrics sampler (macOS workers only)
 // =====================================================================
 
@@ -1378,6 +1689,243 @@ mod tests {
              `symlink_fix_symlink_fix_lock` — the register key `symlink_fix` and inner \
              group!() name are concatenating incorrectly (group name should be \
              `lock_acquires_total`, not `symlink_fix_lock_acquires_total`). body=\n{body}"
+        );
+    }
+
+    // =====================================================================
+    // #DC3 DirCacheCounters tests
+    // =====================================================================
+
+    /// #DC3: increment-observable test on a LOCAL `DirCacheCounters`. Each
+    /// `record_*` method must bump exactly its own outcome field, leaving
+    /// the others untouched (no cross-talk between outcome classes).
+    ///
+    /// Mutation: comment out `self.exact_hit.fetch_add(1, ...)` in
+    /// `record_exact_hit` → `exact_hit` stays at 0; this test red-fails with
+    /// "#DC3 increment-observable: record_exact_hit x3 must yield exact_hit==3".
+    #[test]
+    fn dir_cache_counters_increment_observable_per_outcome() {
+        let c = DirCacheCounters::new();
+        for _ in 0..3 {
+            c.record_exact_hit();
+        }
+        for _ in 0..2 {
+            c.record_miss();
+        }
+        c.record_subtree_hits(5);
+        c.record_fuzzy_match();
+        c.record_hit_clonefile();
+        c.record_hit_hardlink();
+        c.record_hit_hardlink();
+
+        assert_eq!(
+            c.exact_hit.load(Ordering::Relaxed), 3,
+            "#DC3 increment-observable: record_exact_hit x3 must yield exact_hit==3 (got {})",
+            c.exact_hit.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.miss.load(Ordering::Relaxed), 2,
+            "#DC3 increment-observable: record_miss x2 must yield miss==2 (got {})",
+            c.miss.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.subtree_hit.load(Ordering::Relaxed), 5,
+            "#DC3 increment-observable: record_subtree_hits(5) must yield subtree_hit==5 (got {})",
+            c.subtree_hit.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.fuzzy_match.load(Ordering::Relaxed), 1,
+            "#DC3 increment-observable: record_fuzzy_match x1 must yield fuzzy_match==1 (got {})",
+            c.fuzzy_match.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.hit_clonefile.load(Ordering::Relaxed), 1,
+            "#DC3 increment-observable: record_hit_clonefile x1 must yield hit_clonefile==1 (got {})",
+            c.hit_clonefile.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.hit_hardlink.load(Ordering::Relaxed), 2,
+            "#DC3 increment-observable: record_hit_hardlink x2 must yield hit_hardlink==2 (got {})",
+            c.hit_hardlink.load(Ordering::Relaxed)
+        );
+    }
+
+    /// #DC3: end-to-end render test — the PRIMARY contract guard for this
+    /// task. Verifies the `DirCacheCounters::publish` registered under prefix
+    /// `"dir_cache"` produces EXACTLY the Prometheus outcome lines via the
+    /// SAME `render_prometheus` walk the worker `/metrics` handler uses (NOT a
+    /// hand-rolled scrape). This is the test that catches the
+    /// worker-metrics-exposure trap: if the counters are dark on `/metrics`
+    /// (no `publish!` emitted, or the singleton never registered) the
+    /// outcome lines are ABSENT and this test red-fails.
+    ///
+    /// Newline-anchored exact-line assertions (`\nNAME VALUE\n`) so a
+    /// doubled-prefix regression (#86 class — registering under `dir_cache`
+    /// with an inner `group!("dir_cache_...")`) is also caught: the doubled
+    /// form `dir_cache_dir_cache_*` would make the correct line absent.
+    ///
+    /// Mutation (a): make `DirCacheCounters::publish` a no-op (the TDD-RED
+    /// stub) OR drop the `register("dir_cache", …)` → outcome lines vanish;
+    /// this test red-fails with the "dark on /metrics" message below.
+    #[test]
+    fn dir_cache_render_prometheus_exposes_outcome_counters() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // Arc-owned LOCAL counters for the 'static lifetime register() wants;
+        // the production DIR_CACHE_COUNTERS static accumulates across the
+        // process, so the test uses a local Arc to avoid cross-test interference.
+        let counters = Arc::new(DirCacheCounters::new());
+        for _ in 0..7 {
+            counters.record_exact_hit();
+        }
+        for _ in 0..3 {
+            counters.record_miss();
+        }
+        counters.record_subtree_hits(11);
+        counters.record_fuzzy_match();
+        counters.record_fuzzy_match();
+        counters.record_hit_clonefile();
+        for _ in 0..4 {
+            counters.record_hit_hardlink();
+        }
+
+        let registry = MetricsRegistry::new();
+        // Register under "dir_cache" — the prefix production nativelink.rs uses.
+        // Arc<DirCacheCounters> impls MetricsComponent via the blanket
+        // Arc<T: MetricsComponent> impl, delegating to DirCacheCounters::publish
+        // — the same delegation path as DirCacheCountersHandle.
+        registry.register("dir_cache", counters);
+
+        let body = render_prometheus(&registry);
+
+        // Each outcome must render as an exact newline-anchored line with the
+        // recorded value. Absence = "dark on /metrics" (the failure this task
+        // exists to prevent).
+        for (name, value) in [
+            ("dir_cache_exact_hit_total_counter", 7u64),
+            ("dir_cache_miss_total_counter", 3),
+            ("dir_cache_subtree_hit_total_counter", 11),
+            ("dir_cache_fuzzy_match_total_counter", 2),
+            ("dir_cache_hit_clonefile_total_counter", 1),
+            ("dir_cache_hit_hardlink_total_counter", 4),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "#DC3 dark on /metrics: expected exact line `{name} {value}` from the \
+                 render_prometheus walk, but it is ABSENT — the dir-cache outcome counter \
+                 is not exposed (publish emitted nothing, the value is wrong, or the metric \
+                 name is doubled e.g. `dir_cache_dir_cache_{name}`). body=\n{body}"
+            );
+        }
+
+        // Belt-and-braces: the doubled-prefix form (#86 class) must be absent
+        // so a name regression names itself.
+        assert!(
+            !body.contains("dir_cache_dir_cache"),
+            "#DC3 doubled metric name: rendered output contains doubled prefix \
+             `dir_cache_dir_cache` — the register key `dir_cache` and an inner group!() \
+             name are concatenating (group names must NOT repeat the `dir_cache` prefix). \
+             body=\n{body}"
+        );
+    }
+
+    /// #DC3 (scope ext): phase-observe increment test on a LOCAL
+    /// `DirCacheCounters`. Each `record_construct_*` / `record_hit_assemble_ms`
+    /// must accumulate sum + count on its own phase only.
+    ///
+    /// Mutation: comment out `self.count.fetch_add(1, ...)` in
+    /// `PhaseTiming::observe_ms` → count stays 0; this test red-fails with
+    /// "#DC3 phase-observe: resolve count must be 2".
+    #[test]
+    fn dir_cache_phase_timing_observe_accumulates_sum_and_count() {
+        let c = DirCacheCounters::new();
+        c.record_construct_resolve_ms(10);
+        c.record_construct_resolve_ms(30);
+        c.record_construct_fetch_ms(100);
+        c.record_hit_assemble_ms(7);
+
+        assert_eq!(
+            c.construct_resolve_ms.sum_ms.load(Ordering::Relaxed), 40,
+            "#DC3 phase-observe: resolve sum_ms must be 10+30=40 (got {})",
+            c.construct_resolve_ms.sum_ms.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.construct_resolve_ms.count.load(Ordering::Relaxed), 2,
+            "#DC3 phase-observe: resolve count must be 2 (got {})",
+            c.construct_resolve_ms.count.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.construct_fetch_ms.sum_ms.load(Ordering::Relaxed), 100,
+            "#DC3 phase-observe: fetch sum_ms must be 100 (got {})",
+            c.construct_fetch_ms.sum_ms.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.construct_fetch_ms.count.load(Ordering::Relaxed), 1,
+            "#DC3 phase-observe: fetch count must be 1 (got {})",
+            c.construct_fetch_ms.count.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.hit_assemble_ms.sum_ms.load(Ordering::Relaxed), 7,
+            "#DC3 phase-observe: assemble sum_ms must be 7 (got {})",
+            c.hit_assemble_ms.sum_ms.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            c.hit_assemble_ms.count.load(Ordering::Relaxed), 1,
+            "#DC3 phase-observe: assemble count must be 1 (got {})",
+            c.hit_assemble_ms.count.load(Ordering::Relaxed)
+        );
+    }
+
+    /// #DC3 (scope ext): end-to-end render test for the cold-construct phase
+    /// sub-cost decomposition. Verifies the three phase sum+count pairs render
+    /// via the SAME `render_prometheus` walk the worker `/metrics` handler
+    /// uses, with EXACT newline-anchored names. This is the dark-on-/metrics
+    /// guard for the phase decomposition (the actual #1/#2 decision instrument).
+    ///
+    /// Mutation: comment out the `emit_phase("construct_resolve", …)` call in
+    /// `DirCacheCounters::publish` → the resolve sum/count lines vanish; this
+    /// test red-fails with "#DC3 phase dark on /metrics: …".
+    #[test]
+    fn dir_cache_render_prometheus_exposes_construct_phase_costs() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(DirCacheCounters::new());
+        // resolve: 2 obs summing to 40ms; fetch: 1 obs of 100ms;
+        // assemble: 3 obs summing to 21ms.
+        counters.record_construct_resolve_ms(10);
+        counters.record_construct_resolve_ms(30);
+        counters.record_construct_fetch_ms(100);
+        counters.record_hit_assemble_ms(7);
+        counters.record_hit_assemble_ms(7);
+        counters.record_hit_assemble_ms(7);
+
+        let registry = MetricsRegistry::new();
+        registry.register("dir_cache", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("dir_cache_construct_resolve_ms_sum", 40u64),
+            ("dir_cache_construct_resolve_ms_count", 2),
+            ("dir_cache_construct_fetch_ms_sum", 100),
+            ("dir_cache_construct_fetch_ms_count", 1),
+            ("dir_cache_hit_assemble_ms_sum", 21),
+            ("dir_cache_hit_assemble_ms_count", 3),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "#DC3 phase dark on /metrics: expected exact line `{name} {value}` from the \
+                 render_prometheus walk, but it is ABSENT — the cold-construct phase \
+                 decomposition is not exposed (publish emitted nothing for this phase, the \
+                 value is wrong, or the name is doubled). body=\n{body}"
+            );
+        }
+
+        assert!(
+            !body.contains("dir_cache_dir_cache"),
+            "#DC3 doubled metric name (phase): rendered output contains `dir_cache_dir_cache`. \
+             body=\n{body}"
         );
     }
 }

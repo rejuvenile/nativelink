@@ -36,6 +36,7 @@ use nativelink_util::fs_util::{CloneMethod, hardlink_directory_tree};
 use nativelink_util::fs_util::calculate_directory_size;
 #[cfg(not(target_os = "macos"))]
 use nativelink_util::fs_util::set_readonly_and_calculate_size;
+use nativelink_util::o11_probes::dir_cache_counters;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -863,6 +864,8 @@ impl DirectoryCache {
 
         // Fast path: check if already in cache (read lock only for the lookup)
         if let Some((cache_path, pin_guard)) = self.try_symlink_cached(&digest, dest_path).await? {
+            // #DC3: route the exact-hit outcome to the /metrics singleton too.
+            dir_cache_counters().record_exact_hit();
             let hits = self.hit_count.fetch_add(1, Ordering::Relaxed) + 1;
             let misses = self.miss_count.load(Ordering::Relaxed);
             let total = hits + misses;
@@ -878,6 +881,8 @@ impl DirectoryCache {
             return Ok((cache_path, true, pin_guard));
         }
 
+        // #DC3: route the miss outcome to the /metrics singleton too.
+        dir_cache_counters().record_miss();
         let misses = self.miss_count.fetch_add(1, Ordering::Relaxed) + 1;
         let hits = self.hit_count.load(Ordering::Relaxed);
         let fuzzy = self.fuzzy_match_count.load(Ordering::Relaxed);
@@ -987,9 +992,12 @@ impl DirectoryCache {
             let resolved_tree = if let Some(fss) = &self.fast_slow_store {
                 let t0 = Instant::now();
                 let res = crate::running_actions_manager::resolve_directory_tree(fss, &digest).await;
+                let resolve_elapsed_ms = t0.elapsed().as_millis() as u64;
+                // #DC3 (scope ext): cold-construct resolve-phase cost to /metrics.
+                dir_cache_counters().record_construct_resolve_ms(resolve_elapsed_ms);
                 info!(
                     ?digest,
-                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    elapsed_ms = resolve_elapsed_ms,
                     ok = res.is_ok(),
                     "directory_cache(direct): resolve_directory_tree returned",
                 );
@@ -1036,6 +1044,8 @@ impl DirectoryCache {
                 let subtree_count = subtree_hits.len();
                 let total_dirs = resolved_tree.as_ref().map_or(0, |t| t.len());
                 self.subtree_hit_count.fetch_add(subtree_count as u64, Ordering::Relaxed);
+                // #DC3: route subtree-hit outcome to the /metrics singleton too.
+                dir_cache_counters().record_subtree_hits(subtree_count as u64);
                 info!(
                     hash = %&digest.packed_hash().to_string()[..12],
                     subtree_hits = subtree_count,
@@ -1085,6 +1095,8 @@ impl DirectoryCache {
                             "DirectoryCache direct-use: FUZZY MATCH found, patching from best match",
                         );
                         self.fuzzy_match_count.fetch_add(1, Ordering::Relaxed);
+                        // #DC3: route fuzzy-match outcome to the /metrics singleton too.
+                        dir_cache_counters().record_fuzzy_match();
                         info!(
                             ?digest,
                             "directory_cache(direct): leader entering construct_from_fuzzy_match",
@@ -1431,6 +1443,8 @@ impl DirectoryCache {
 
         // Fast path: check if already in cache (read lock only for the lookup)
         if let Some(method) = self.try_hardlink_cached(&digest, dest_path).await? {
+            // #DC3: route the exact-hit outcome to the /metrics singleton too.
+            dir_cache_counters().record_exact_hit();
             let hits = self.hit_count.fetch_add(1, Ordering::Relaxed) + 1;
             let misses = self.miss_count.load(Ordering::Relaxed);
             let total = hits + misses;
@@ -1455,6 +1469,8 @@ impl DirectoryCache {
             return Ok(true);
         }
 
+        // #DC3: route the miss outcome to the /metrics singleton too.
+        dir_cache_counters().record_miss();
         let misses = self.miss_count.fetch_add(1, Ordering::Relaxed) + 1;
         let hits = self.hit_count.load(Ordering::Relaxed);
         let total = hits + misses;
@@ -1554,7 +1570,11 @@ impl DirectoryCache {
             //   (a) subtree matching against the subtree_index
             //   (b) storing merkle metadata alongside the cache entry
             let resolved_tree = if let Some(fss) = &self.fast_slow_store {
-                match crate::running_actions_manager::resolve_directory_tree(fss, &digest).await {
+                let t0 = Instant::now();
+                let res = crate::running_actions_manager::resolve_directory_tree(fss, &digest).await;
+                // #DC3 (scope ext): cold-construct resolve-phase cost to /metrics.
+                dir_cache_counters().record_construct_resolve_ms(t0.elapsed().as_millis() as u64);
+                match res {
                     Ok(tree) => Some(tree),
                     Err(e) => {
                         warn!(
@@ -1607,6 +1627,8 @@ impl DirectoryCache {
                 let subtree_count = subtree_hits.len();
                 let total_dirs = resolved_tree.as_ref().map_or(0, |t| t.len());
                 self.subtree_hit_count.fetch_add(subtree_count as u64, Ordering::Relaxed);
+                // #DC3: route subtree-hit outcome to the /metrics singleton too.
+                dir_cache_counters().record_subtree_hits(subtree_count as u64);
                 info!(
                     hash = %&digest.packed_hash().to_string()[..12],
                     subtree_hits = subtree_count,
@@ -1647,6 +1669,8 @@ impl DirectoryCache {
                             "DirectoryCache: FUZZY MATCH found, patching from best match",
                         );
                         self.fuzzy_match_count.fetch_add(1, Ordering::Relaxed);
+                        // #DC3: route fuzzy-match outcome to the /metrics singleton too.
+                        dir_cache_counters().record_fuzzy_match();
                         self.construct_from_fuzzy_match(
                             &digest,
                             tree,
@@ -1887,11 +1911,19 @@ impl DirectoryCache {
                 match method {
                     CloneMethod::Clonefile => {
                         self.hit_clonefile_count.fetch_add(1, Ordering::Relaxed);
+                        // #DC3: route the clonefile hit-mechanism to /metrics.
+                        dir_cache_counters().record_hit_clonefile();
                     }
                     CloneMethod::Hardlink => {
                         self.hit_hardlink_count.fetch_add(1, Ordering::Relaxed);
+                        // #DC3: route the hardlink hit-mechanism to /metrics.
+                        dir_cache_counters().record_hit_hardlink();
                     }
                 }
+                // #DC3 (scope ext): HIT-path assemble-phase cost to /metrics
+                // (successful materialise only; the failure arm falls through
+                // to reconstruction and is not an assemble observation).
+                dir_cache_counters().record_hit_assemble_ms(hardlink_elapsed.as_millis() as u64);
                 info!(
                     hash = %&digest.packed_hash().to_string()[..12],
                     cached_size_bytes = cached_size,
@@ -2140,6 +2172,8 @@ impl DirectoryCache {
 
         self.subtree_hit_count
             .fetch_add(subtree_hits.len() as u64, Ordering::Relaxed);
+        // #DC3: route subtree-hit outcome (fuzzy-match reuse) to /metrics.
+        dir_cache_counters().record_subtree_hits(subtree_hits.len() as u64);
 
         // Reuse the existing subtree-aware construction method which handles
         // both symlink mode (direct-use) and hardlink mode.
@@ -2207,6 +2241,13 @@ impl DirectoryCache {
             )
             .await;
             let elapsed = construction_start.elapsed();
+            // #DC3 (scope ext): cold-construct fetch+materialise-phase cost to
+            // /metrics. Measures the FULL-construct fast `download_to_directory`
+            // span (fetch-dominated; includes in-construct hardlink emit).
+            // Recorded for success AND failure — both are a real fetch-cost
+            // observation of this path; the rare fast-fail→serial fallback is a
+            // separate path not double-counted here.
+            dir_cache_counters().record_construct_fetch_ms(elapsed.as_millis() as u64);
             match &result {
                 Ok(()) => {
                     info!(
@@ -3705,6 +3746,230 @@ mod tests {
         // Verify stats
         let stats = cache.stats().await;
         assert_eq!(stats.entries, 1);
+
+        Ok(())
+    }
+
+    /// #DC3 cross-seam test: a real `DirectoryCache::get_or_create` in
+    /// production composition (real `DirectoryCache` over a real
+    /// `MemoryStore`) must route its hit/miss OUTCOME across the seam into
+    /// the process-global `dir_cache_counters()` singleton that backs
+    /// `/metrics` — not only into the per-instance fields that back the logs.
+    ///
+    /// Seam crossed: `DirectoryCache::get_or_create` (worker) →
+    /// `nativelink_util::o11_probes::dir_cache_counters()` (process-global
+    /// metrics sink). The render test proves the singleton renders on
+    /// `/metrics`; this test proves the production cache call actually
+    /// FEEDS the singleton.
+    ///
+    /// Determinism under shared global: the singleton is process-wide and
+    /// other tests in this binary may bump it concurrently, so the global
+    /// delta is asserted as a LOWER bound (`>=`) while the per-instance
+    /// counters (single instance, unshared) pin the EXACT expected count.
+    /// `N` hits/misses (not 1) make the lower-bound assertion immune to a
+    /// concurrent test masking a dropped increment: the mutation that
+    /// removes `record_exact_hit()` makes this test contribute 0 to the
+    /// global, so `global_hit_delta >= N` would require N concurrent hits
+    /// from other tests inside this window — effectively impossible.
+    ///
+    /// Mutation: comment out `dir_cache_counters().record_exact_hit();` at
+    /// the `get_or_create` hit site → `global_hit_delta` drops to ~0; this
+    /// test red-fails with "#DC3 seam: exact-hit outcome not routed …".
+    #[nativelink_test]
+    async fn dir_cache_get_or_create_routes_outcomes_to_metrics_singleton() -> Result<(), Error> {
+        use nativelink_util::o11_probes::dir_cache_counters;
+
+        const N: u64 = 5;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: false,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        // Snapshot the process-global singleton + this instance's fields.
+        let g_miss_before = dir_cache_counters().miss.load(Ordering::Relaxed);
+        let g_hit_before = dir_cache_counters().exact_hit.load(Ordering::Relaxed);
+        let inst_miss_before = cache.miss_count.load(Ordering::Relaxed);
+        let inst_hit_before = cache.hit_count.load(Ordering::Relaxed);
+
+        // First access is a miss (full construction); subsequent N accesses
+        // to distinct dests are exact-hits (digest already cached).
+        let dest0 = temp_dir.path().join("dest0");
+        let hit0 = cache.get_or_create(dir_digest, &dest0).await?;
+        assert!(!hit0, "#DC3 seam: first access must be a miss");
+
+        for i in 0..N {
+            let dest = temp_dir.path().join(format!("hit_dest_{i}"));
+            let hit = cache.get_or_create(dir_digest, &dest).await?;
+            assert!(hit, "#DC3 seam: access {i} after construction must be an exact-hit");
+        }
+
+        // Per-instance fields are deterministic (single, unshared instance).
+        let inst_miss_delta = cache.miss_count.load(Ordering::Relaxed) - inst_miss_before;
+        let inst_hit_delta = cache.hit_count.load(Ordering::Relaxed) - inst_hit_before;
+        assert_eq!(
+            inst_miss_delta, 1,
+            "#DC3 seam precondition: exactly 1 miss expected on this instance (got {inst_miss_delta})"
+        );
+        assert_eq!(
+            inst_hit_delta, N,
+            "#DC3 seam precondition: exactly {N} exact-hits expected on this instance (got {inst_hit_delta})"
+        );
+
+        // The process-global singleton must have advanced by AT LEAST the
+        // per-instance delta — proving get_or_create routed the outcome into
+        // the /metrics sink, not only into the per-instance log fields.
+        let g_miss_delta = dir_cache_counters().miss.load(Ordering::Relaxed) - g_miss_before;
+        let g_hit_delta = dir_cache_counters().exact_hit.load(Ordering::Relaxed) - g_hit_before;
+        assert!(
+            g_miss_delta >= 1,
+            "#DC3 seam: miss outcome not routed to the /metrics singleton — \
+             dir_cache_counters().miss advanced by {g_miss_delta}, expected >= 1 \
+             (get_or_create miss path did not call record_miss())"
+        );
+        assert!(
+            g_hit_delta >= N,
+            "#DC3 seam: exact-hit outcome not routed to the /metrics singleton — \
+             dir_cache_counters().exact_hit advanced by {g_hit_delta}, expected >= {N} \
+             (get_or_create hit path did not call record_exact_hit())"
+        );
+
+        Ok(())
+    }
+
+    /// Build a `DirectoryCache` over a real `FastSlowStore` (two `MemoryStore`
+    /// halves) so `fast_slow_store.is_some()` — that is what gates the
+    /// cold-construct `resolve_directory_tree` phase. The fast tier is a
+    /// `MemoryStore` (not a `FilesystemStore`), so `has_fast_path == false`
+    /// and construction uses the serial path; the resolve phase still fires
+    /// because it is gated only on `fast_slow_store.is_some()`. Returns the
+    /// cache + the single-file directory digest from `setup_test_store`.
+    async fn setup_fast_slow_cache(cache_root: PathBuf) -> (DirectoryCache, DigestInfo) {
+        use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
+
+        let (store, dir_digest) = setup_test_store().await;
+        // Seed a second MemoryStore (the FastSlowStore fast tier) with the
+        // same blobs so resolve + serial construction both find content.
+        let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+        // The directory proto + its single file must exist in the fast tier
+        // too (resolve_directory_tree fetches through the FastSlowStore).
+        let file_digest = DigestInfo::try_new(
+            "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f",
+            13,
+        )
+        .unwrap();
+        // Re-encode the same directory proto setup_test_store built.
+        let directory = ProtoDirectory {
+            files: vec![FileNode {
+                name: "test.txt".to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut dir_data = Vec::new();
+        directory.encode(&mut dir_data).unwrap();
+        fast.update_oneshot(file_digest, b"Hello, World!".to_vec().into())
+            .await
+            .unwrap();
+        fast.update_oneshot(dir_digest, dir_data.into()).await.unwrap();
+
+        let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let fss: Arc<FastSlowStore> = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: Default::default(),
+                slow_direction: Default::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            fast,
+            slow,
+        );
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: false,
+        };
+        let cache = DirectoryCache::new(config, store, Some(fss)).await.unwrap();
+        (cache, dir_digest)
+    }
+
+    /// #DC3 (scope ext) cross-seam test: a real cold-construct (miss) through
+    /// `DirectoryCache::get_or_create` over a `FastSlowStore` must route the
+    /// resolve-PHASE cost into the process-global `dir_cache_counters()`
+    /// singleton; a subsequent hit must route the assemble-PHASE cost.
+    ///
+    /// Seam crossed: `DirectoryCache::get_or_create` (resolve_directory_tree
+    /// span + try_hardlink_cached hardlink span) → `dir_cache_counters()`
+    /// phase timings (the /metrics sink). Determinism: the per-phase COUNT is
+    /// process-global, so asserted as a `>=` lower bound; `N` repeated hits
+    /// make the assemble lower-bound immune to concurrent masking (a dropped
+    /// `record_hit_assemble_ms` makes this test contribute 0).
+    ///
+    /// NOTE on `fetch_ms`: the COLD-construct fetch phase
+    /// (`record_construct_fetch_ms`) is gated on a real `FilesystemStore` fast
+    /// tier (`has_fast_path`), which the production worker has but this
+    /// MemoryStore-fast harness does not (downcast to FilesystemStore is None
+    /// → serial construct). `fetch_ms` emission is covered by the unit
+    /// render-test + its emit-mutation; its runtime increment site is
+    /// verified by inspection (see report).
+    ///
+    /// Mutation: comment out `dir_cache_counters().record_construct_resolve_ms(…)`
+    /// at the construct resolve site → `g_resolve_delta` drops to 0; this test
+    /// red-fails with "#DC3 phase seam: resolve-phase cost not routed …".
+    #[nativelink_test]
+    async fn dir_cache_construct_routes_phase_costs_to_metrics_singleton() -> Result<(), Error> {
+        use nativelink_util::o11_probes::dir_cache_counters;
+
+        const N: u64 = 5;
+
+        let temp_dir = TempDir::new().unwrap();
+        let (cache, dir_digest) = setup_fast_slow_cache(temp_dir.path().join("cache")).await;
+
+        let g_resolve_before = dir_cache_counters().construct_resolve_ms.count.load(Ordering::Relaxed);
+        let g_assemble_before = dir_cache_counters().hit_assemble_ms.count.load(Ordering::Relaxed);
+
+        // Miss → cold construct → resolve phase fires.
+        let dest0 = temp_dir.path().join("dest0");
+        let hit0 = cache.get_or_create(dir_digest, &dest0).await?;
+        assert!(!hit0, "#DC3 phase seam: first access must be a miss");
+
+        // N hits → assemble (hardlink_directory_tree) phase fires N times.
+        for i in 0..N {
+            let dest = temp_dir.path().join(format!("phase_hit_{i}"));
+            let hit = cache.get_or_create(dir_digest, &dest).await?;
+            assert!(hit, "#DC3 phase seam: access {i} after construction must be a hit");
+        }
+
+        let g_resolve_delta =
+            dir_cache_counters().construct_resolve_ms.count.load(Ordering::Relaxed) - g_resolve_before;
+        let g_assemble_delta =
+            dir_cache_counters().hit_assemble_ms.count.load(Ordering::Relaxed) - g_assemble_before;
+
+        assert!(
+            g_resolve_delta >= 1,
+            "#DC3 phase seam: resolve-phase cost not routed to the /metrics singleton — \
+             construct_resolve_ms.count advanced by {g_resolve_delta}, expected >= 1 \
+             (the cold-construct resolve site did not call record_construct_resolve_ms())"
+        );
+        assert!(
+            g_assemble_delta >= N,
+            "#DC3 phase seam: assemble-phase cost not routed to the /metrics singleton — \
+             hit_assemble_ms.count advanced by {g_assemble_delta}, expected >= {N} \
+             (the hit hardlink site did not call record_hit_assemble_ms())"
+        );
 
         Ok(())
     }
