@@ -231,6 +231,21 @@ pub struct WorkerProxyStore {
     /// this counts the SERVER-side `is_worker` no-peers NotFound arm of
     /// `get_part_sequential`. See `wps_worker_read_inner_hit_total`.
     wps_worker_read_no_source_total: AtomicU64,
+    /// (#linkperf) Win-rate observability for the worker-side server-vs-peer
+    /// `get_part` race (`race_peers=true`). Incremented when a PEER produced
+    /// the winning first chunk (data or zero-length). Today the win/loss
+    /// outcome is only at `debug!` — compiled out under
+    /// `release_max_level_info`, so the race's effectiveness is DARK in the
+    /// production binary. This counter (+ `race_server_win_total`) makes the
+    /// peer-vs-server win-rate readable without journal grep. A high peer
+    /// win-rate confirms peer-fetch is offloading the central CAS; a near-zero
+    /// rate means the locality map rarely has a faster peer (the race is then
+    /// pure overhead — see the bandwidth-doubling note on the loser-cancel).
+    race_peer_win_total: CounterWithTime,
+    /// (#linkperf) Sibling of `race_peer_win_total`: incremented when the
+    /// SERVER (inner CAS) produced the winning first chunk. peer_win /
+    /// (peer_win + server_win) is the peer win-rate.
+    race_server_win_total: CounterWithTime,
     /// #130 — singleflight/dedup map for concurrent same-digest peer
     /// fetches. Collapses the "N callers, same digest, ms apart" cohort
     /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
@@ -782,6 +797,23 @@ impl MetricsComponent for WorkerProxyStore {
              nothing to steer to. Part of the headline denominator. Increments \
              only when IS_WORKER_REQUEST=true on the server-side WPS."
         );
+        publish!(
+            "race_peer_win_total",
+            &self.race_peer_win_total,
+            MetricKind::Counter,
+            "(#linkperf) Worker-side get_part race wins served by a PEER \
+             (first winning chunk). peer_win / (peer_win + server_win) is the \
+             peer win-rate — previously DARK (debug! only, compiled out under \
+             release_max_level_info). High rate = peers offloading the central \
+             CAS; near-zero = race is pure overhead for these reads."
+        );
+        publish!(
+            "race_server_win_total",
+            &self.race_server_win_total,
+            MetricKind::Counter,
+            "(#linkperf) Worker-side get_part race wins served by the SERVER \
+             (inner CAS, first winning chunk). Sibling of race_peer_win_total."
+        );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
         // outside the lock so we never hold it across the macro's tracing
@@ -1044,6 +1076,8 @@ impl WorkerProxyStore {
             wps_worker_read_inner_hit_total: AtomicU64::new(0),
             wps_worker_read_redirected_to_peer_total: AtomicU64::new(0),
             wps_worker_read_no_source_total: AtomicU64::new(0),
+            race_peer_win_total: CounterWithTime::default(),
+            race_server_win_total: CounterWithTime::default(),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -1079,6 +1113,8 @@ impl WorkerProxyStore {
             wps_worker_read_inner_hit_total: AtomicU64::new(0),
             wps_worker_read_redirected_to_peer_total: AtomicU64::new(0),
             wps_worker_read_no_source_total: AtomicU64::new(0),
+            race_peer_win_total: CounterWithTime::default(),
+            race_server_win_total: CounterWithTime::default(),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -3370,6 +3406,7 @@ impl WorkerProxyStore {
     /// peer also produces an empty-EOF for a non-zero digest, surface
     /// `Code::NotFound` — the blob is unavailable from either source.
     async fn await_peer_after_empty_server(
+        &self,
         writer: &mut DropCloserWriteHalf,
         peer_rx: &mut DropCloserReadHalf,
         peer_handle: JoinHandle<Result<(), Error>>,
@@ -3392,6 +3429,8 @@ impl WorkerProxyStore {
         };
         if peer_chunk.is_empty() {
             if is_zero_blob {
+                // (#linkperf) peer ultimately served (zero-length).
+                self.race_peer_win_total.inc();
                 writer.send_eof()
                     .err_tip(|| "WorkerProxyStore: peer EOF for zero-length blob")?;
                 return peer_handle.await
@@ -3413,6 +3452,8 @@ impl WorkerProxyStore {
             writer.send_error(err.clone());
             return Err(err);
         }
+        // (#linkperf) peer ultimately served (server empty/failed).
+        self.race_peer_win_total.inc();
         debug!(
             ?digest,
             endpoint = %peer_endpoint,
@@ -3428,6 +3469,7 @@ impl WorkerProxyStore {
     /// for the server racer instead. If the server also returns empty for
     /// a non-zero digest, surface `Code::NotFound`.
     async fn await_server_after_empty_peer(
+        &self,
         writer: &mut DropCloserWriteHalf,
         server_rx: &mut DropCloserReadHalf,
         server_handle: JoinHandle<Result<(), Error>>,
@@ -3447,6 +3489,8 @@ impl WorkerProxyStore {
         };
         if server_chunk.is_empty() {
             if is_zero_blob {
+                // (#linkperf) server ultimately served (zero-length).
+                self.race_server_win_total.inc();
                 writer.send_eof()
                     .err_tip(|| "WorkerProxyStore: server EOF for zero-length blob")?;
                 return server_handle.await
@@ -3466,6 +3510,8 @@ impl WorkerProxyStore {
             writer.send_error(err.clone());
             return Err(err);
         }
+        // (#linkperf) server ultimately served (peer empty/failed).
+        self.race_server_win_total.inc();
         debug!(
             ?digest,
             "WorkerProxyStore: server won race (peer empty/failed)"
@@ -4755,6 +4801,7 @@ impl StoreDriver for WorkerProxyStore {
                         // #147: cooperative cancel — drop peer_rx + brief
                         // grace window before falling back to abort().
                         Self::cancel_loser_racer(peer_rx, peer_handle);
+                        self.race_server_win_total.inc(); // (#linkperf)
                         debug!(
                             ?digest,
                             "WorkerProxyStore: server won race against peer"
@@ -4766,6 +4813,7 @@ impl StoreDriver for WorkerProxyStore {
                     Ok(_empty) if is_zero_blob => {
                         // Legitimate zero-length blob — server won the race.
                         Self::cancel_loser_racer(peer_rx, peer_handle);
+                        self.race_server_win_total.inc(); // (#linkperf)
                         debug!(
                             ?digest,
                             "WorkerProxyStore: server won race (zero-length blob)"
@@ -4783,7 +4831,7 @@ impl StoreDriver for WorkerProxyStore {
                             size_bytes = digest.size_bytes(),
                             "WorkerProxyStore: server returned empty EOF for non-zero digest, waiting for peer"
                         );
-                        Self::await_peer_after_empty_server(
+                        self.await_peer_after_empty_server(
                             writer, &mut peer_rx, peer_handle, &digest, &peer_endpoint, is_zero_blob,
                         ).await
                     }
@@ -4793,7 +4841,7 @@ impl StoreDriver for WorkerProxyStore {
                             ?digest,
                             "WorkerProxyStore: server racer failed, waiting for peer"
                         );
-                        Self::await_peer_after_empty_server(
+                        self.await_peer_after_empty_server(
                             writer, &mut peer_rx, peer_handle, &digest, &peer_endpoint, is_zero_blob,
                         ).await
                     }
@@ -4804,6 +4852,7 @@ impl StoreDriver for WorkerProxyStore {
                     Ok(chunk) if !chunk.is_empty() => {
                         // Peer produced data first — it wins.
                         Self::cancel_loser_racer(server_rx, server_handle);
+                        self.race_peer_win_total.inc(); // (#linkperf)
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,
@@ -4816,6 +4865,7 @@ impl StoreDriver for WorkerProxyStore {
                     Ok(_empty) if is_zero_blob => {
                         // Legitimate zero-length blob — peer won the race.
                         Self::cancel_loser_racer(server_rx, server_handle);
+                        self.race_peer_win_total.inc(); // (#linkperf)
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,
@@ -4840,7 +4890,7 @@ impl StoreDriver for WorkerProxyStore {
                         self.locality_map
                             .write()
                             .evict_blobs(&peer_endpoint, &[digest]);
-                        Self::await_server_after_empty_peer(
+                        self.await_server_after_empty_peer(
                             writer, &mut server_rx, server_handle, &digest, is_zero_blob,
                         ).await
                     }
@@ -4851,7 +4901,7 @@ impl StoreDriver for WorkerProxyStore {
                             endpoint = %peer_endpoint,
                             "WorkerProxyStore: peer racer failed, waiting for server"
                         );
-                        Self::await_server_after_empty_peer(
+                        self.await_server_after_empty_peer(
                             writer, &mut server_rx, server_handle, &digest, is_zero_blob,
                         ).await
                     }
@@ -6001,6 +6051,126 @@ mod tests {
 
         let result = store.get_part_unchunked(digest, 0, None).await?;
         assert_eq!(result.as_ref(), value);
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // (#linkperf) Win-rate observability: the worker-side server-vs-peer
+    // race in `get_part` is the production path for ALL worker input
+    // fetches (large blobs included, via FastSlowStore::populate ->
+    // slow_store.get -> WorkerProxyStore::get_part). The win/loss outcome
+    // was previously only at `debug!` (compiled out under
+    // release_max_level_info), so the race's effectiveness was dark. These
+    // two tests pin that `race_peer_win_total` / `race_server_win_total`
+    // increment for the respective winner.
+    //
+    // Production composition: WorkerProxyStore with race_peers=ON
+    // (enable_race_peers), non-IS_WORKER_REQUEST caller (INITIATOR mode) —
+    // exactly local_worker.rs:4733's wiring.
+    // ---------------------------------------------------------------
+
+    /// PEER serves the blob (inner CAS empty) => `race_peer_win_total`
+    /// increments and `race_server_win_total` does not.
+    ///
+    /// Mutation: comment out BOTH `self.race_peer_win_total.inc()` sites
+    /// (the primary peer-data select branch AND the
+    /// `await_peer_after_empty_server` fallback success); this test
+    /// red-fails with "peer win must increment race_peer_win_total".
+    #[nativelink_test]
+    async fn test_race_peer_win_increments_peer_counter() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let value = b"peer wins payload";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Inner empty; only the peer has the blob => peer must ultimately
+        // serve (via the primary peer-data branch OR, if the empty server
+        // racer fires first, the await_peer_after_empty_server fallback —
+        // both count race_peer_win_total).
+        let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        peer_store
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        proxy.inject_worker_connection("grpc://peer:50071", peer_store);
+        locality_map
+            .write()
+            .register_blobs("grpc://peer:50071", &[digest]);
+
+        let peer_before = proxy.race_peer_win_total.counter.load(Ordering::Relaxed);
+        let server_before = proxy.race_server_win_total.counter.load(Ordering::Relaxed);
+
+        let result = store.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(result.as_ref(), value, "peer must serve the bytes");
+
+        let peer_after = proxy.race_peer_win_total.counter.load(Ordering::Relaxed);
+        let server_after = proxy.race_server_win_total.counter.load(Ordering::Relaxed);
+        assert_eq!(
+            peer_after,
+            peer_before + 1,
+            "peer win must increment race_peer_win_total (was {peer_before}, now {peer_after})"
+        );
+        assert_eq!(
+            server_after, server_before,
+            "peer win must NOT increment race_server_win_total"
+        );
+
+        Ok(())
+    }
+
+    /// SERVER serves the blob (peer registered but its CAS is empty =>
+    /// stale-positive) => `race_server_win_total` increments and
+    /// `race_peer_win_total` does not.
+    ///
+    /// Mutation: comment out BOTH `self.race_server_win_total.inc()` sites
+    /// (the primary server-data select branch AND the
+    /// `await_server_after_empty_peer` fallback success); this test
+    /// red-fails with "server win must increment race_server_win_total".
+    #[nativelink_test]
+    async fn test_race_server_win_increments_server_counter() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let value = b"server wins payload";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Inner has the blob; the peer is registered in locality but its
+        // CAS is EMPTY (stale-positive). The peer racer returns empty EOF
+        // for the non-zero digest => await_server_after_empty_peer serves
+        // from the server, deterministically counting race_server_win_total.
+        inner
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        let empty_peer = Store::new(MemoryStore::new(&MemorySpec::default()));
+        proxy.inject_worker_connection("grpc://peer:50071", empty_peer);
+        locality_map
+            .write()
+            .register_blobs("grpc://peer:50071", &[digest]);
+
+        let peer_before = proxy.race_peer_win_total.counter.load(Ordering::Relaxed);
+        let server_before = proxy.race_server_win_total.counter.load(Ordering::Relaxed);
+
+        let result = store.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(result.as_ref(), value, "server must serve the bytes");
+
+        let peer_after = proxy.race_peer_win_total.counter.load(Ordering::Relaxed);
+        let server_after = proxy.race_server_win_total.counter.load(Ordering::Relaxed);
+        assert_eq!(
+            server_after,
+            server_before + 1,
+            "server win must increment race_server_win_total (was {server_before}, now {server_after})"
+        );
+        assert_eq!(
+            peer_after, peer_before,
+            "server win must NOT increment race_peer_win_total"
+        );
 
         Ok(())
     }
