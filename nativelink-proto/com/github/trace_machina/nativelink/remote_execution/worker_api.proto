@@ -798,8 +798,49 @@ message UpdateForWorker {
         /// same operation_id (no ordering invariant — each chunk's
         /// payload is independently meaningful).
         ChunkedMessage chunked_message = 11;
+
+        /// (FL-688 v3 §3.8) Acknowledgement of one
+        /// `BlobsAvailableChunk` the WORKER sent the scheduler. The
+        /// direction is the mirror image of `BisAck`: there the worker
+        /// acks the scheduler's BIS chunks; here the scheduler acks the
+        /// worker's BlobsAvailable delta chunks. The worker buffers each
+        /// unacked delta chunk in a bounded resend buffer keyed by
+        /// `(broadcast_id, sequence)` and clears the matching slot ONLY
+        /// when this ack arrives; chunks still unacked when the
+        /// connection drops are replayed on reconnect. Without it a lost
+        /// worker→server delta send (the tracker is drained on send)
+        /// leaves the server's locality view permanently stale — the
+        /// orphaned-replica hole the reconcile/eviction-gate self-heal
+        /// (v3 §3.4) relies on this ack to close.
+        BlobsAvailableAck blobs_available_ack = 12;
     }
     reserved 6; // Previously NextId, now reserved.
+}
+
+/// (FL-688 v3 §3.8) Acknowledgement of one `BlobsAvailableChunk` the
+/// worker sent the scheduler. Symmetric to `BisAck` but in the
+/// worker→server delta direction: the SERVER sends this after it has
+/// applied a chunk's effects (per-chunk, NOT per-broadcast — the
+/// terminal-commit `is_last` chunk is acked the same as every
+/// intermediate chunk so the worker's resend buffer releases each slot
+/// independently). The worker uses `(broadcast_id, sequence)` to drop
+/// the matching chunk from its per-server resend buffer; chunks NOT
+/// acked when the connection closes are replayed on the next reconnect.
+message BlobsAvailableAck {
+    /// Worker-allocated broadcast_id echoed from the original
+    /// `BlobsAvailableChunk`.
+    uint64 broadcast_id = 1;
+    /// Sequence within the broadcast that this ack covers.
+    uint32 sequence = 2;
+    /// Echo of `BlobsAvailableChunk.worker_instance_token`. The worker
+    /// silently drops acks whose token does not match its CURRENT
+    /// process token (regenerated each boot) — this guards against a
+    /// server holding a stale ack across a worker bounce dropping an
+    /// unrelated chunk from the new worker process's resend buffer.
+    /// Mirror of `BisAck.server_instance_token` (red-team #5 on #97) in
+    /// the opposite direction. A value of 0 means "uninitialised"; the
+    /// worker treats 0 as always-mismatched.
+    uint64 worker_instance_token = 3;
 }
 
 /// Acknowledgement of one BlobsInStableStorageChunk delivery (task #97).
