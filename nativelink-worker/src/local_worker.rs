@@ -2151,127 +2151,53 @@ impl SlowTierMetricSink for WorkerSlowTierMetricSink {
     }
 }
 
-/// (A1 fix-up F1) Outcome of [`apply_periodic_tick_memo_resets`] —
-/// which of the two reset paths (if any) fired this tick. Returned so
-/// the caller can log the heartbeat event with the correct tag and so
-/// the heartbeat-coverage test (T7) can assert exact-tick firing
-/// without relying on log capture.
+/// (A1 fix-up F1; FL-688 v3 Stage A) Outcome of
+/// [`apply_periodic_tick_memo_resets`] — whether the reconnect reset path
+/// fired this tick. Returned so the caller can log the reconnect event and so
+/// the reconnect-clear test (T6) can assert the clear without relying on log
+/// capture.
+///
+/// Stage A removed the `HeartbeatResync` variant: the timer-driven
+/// full-snapshot heartbeat is gone (convergence is now reconnect full snapshot
+/// + the Stage-2B replay-until-acked reader + the over-cap force-snapshot
+/// EVENT). Only `ReconnectClear` (an EVENT — a new `run()` re-entry) and `None`
+/// remain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeriodicTickMemoReset {
     /// No reset fired this tick — normal delta path.
     None,
     /// `is_first=true` reconnect-clear fired at the function head.
     ReconnectClear,
-    /// Forced full-snapshot heartbeat fired (counter % N == 0).
-    HeartbeatResync { tick: u64 },
 }
 
-/// (A1 fix-up F1+F2) Apply the two unconditional memo-reset paths at
+/// (A1 fix-up F2; FL-688 v3 Stage A) Apply the reconnect memo-reset path at
 /// the head of [`LocalWorkerImpl::send_periodic_blobs_available`]:
 ///
-///   1. On `is_first=true` (reconnect), clear `last_sent_ac_pin_set`
-///      so the next delta reports every current pin as `added` — the
-///      server's per-endpoint AC pin set was wiped by the disconnect;
-///      a full replay is the only way to restore parity.
-///   2. On every Nth tick (steady-state), clear
-///      `last_sent_ac_pin_set` to force a full-snapshot heartbeat.
-///      Bounds worker↔server registry divergence to ≤N tick intervals
-///      when the server mutates the registry out-of-band (AcProxy
-///      NotFound-eviction / BIS-ack sweep / cap-truncation).
+///   - On `is_first=true` (reconnect — a new `run()` re-entry, one per
+///     connection), clear `last_sent_ac_pin_set` so the next delta reports
+///     every current pin as `added`. The server's per-endpoint AC pin set was
+///     wiped by the disconnect; a full replay is the only way to restore
+///     parity.
 ///
-/// Returns which path fired so the caller can emit the matching
-/// `debug!` log. Takes only the two pieces of `BlobsAvailableState`
-/// the helper actually touches so tests (T6, T7) can drive the
-/// contract directly without constructing a full state (which
-/// otherwise requires standing up a tempdir-backed `FilesystemStore`).
-///
-/// The tick counter is incremented unconditionally — every call ticks
-/// it forward by one. Reconnect (`is_first=true`) does NOT reset the
-/// counter; the reconnect-clear already wipes the memo, and resetting
-/// the counter would extend the heartbeat interval immediately after
-/// reconnect by up to N ticks. Decoupling the two reset paths is
-/// load-bearing for the composite invariant.
+/// Stage A removed the periodic full-snapshot heartbeat (the every-Nth-tick
+/// forced memo clear). The out-of-band server-mutation classes that heartbeat
+/// guarded (AcProxy NotFound-eviction / BIS-ack sweep / cap-truncation) now
+/// re-converge via the reconnect full snapshot + the Stage-2B replay-until-
+/// acked reader (`replay_unacked_chunks`) + the over-cap force-snapshot EVENT —
+/// all event-driven, no timer. Returns which path fired so the caller can emit
+/// the matching log. Takes only the one piece of `BlobsAvailableState` the
+/// helper touches so the T6 test can drive the contract directly without
+/// constructing a full state.
 pub(crate) fn apply_periodic_tick_memo_resets(
     last_sent_ac_pin_set: &Mutex<HashSet<DigestInfo>>,
-    ac_pin_full_snapshot_tick_counter: &AtomicU64,
     is_first: bool,
 ) -> PeriodicTickMemoReset {
     if is_first {
         last_sent_ac_pin_set.lock().clear();
-    }
-    // `fetch_add` returns the pre-increment value; checking
-    // `(tick + 1) % N == 0` fires the heartbeat on the 60th, 120th,
-    // ... call (1-indexed). Tick 0 is the very first call, which is
-    // already a full snapshot via `is_first=true`.
-    let tick = ac_pin_full_snapshot_tick_counter.fetch_add(1, Ordering::Relaxed);
-    if is_first {
         return PeriodicTickMemoReset::ReconnectClear;
-    }
-    if (tick + 1) % AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS == 0 {
-        last_sent_ac_pin_set.lock().clear();
-        return PeriodicTickMemoReset::HeartbeatResync { tick: tick + 1 };
     }
     PeriodicTickMemoReset::None
 }
-
-/// (A1 fix-up F1) Forced full-snapshot heartbeat interval for the
-/// AC-pin delta-ack memo. The skip-gate suppresses ticks where the
-/// worker's `dispatched_ac_pin_snapshot` matches `last_sent_ac_pin_set`
-/// — correct under the worker-only-mutates assumption, but three
-/// server-side paths mutate the matching `AcPinRegistry` set out of
-/// band:
-///
-///   1. `AcProxyStore::get_part_and_cache` (`ac_proxy_store.rs:367`)
-///      calls `remove_digests_for_endpoint` on a peer NotFound — the
-///      server forgets the pin while the worker's memo still records
-///      it.
-///   2. The `BlobsInStableStorage` ack sweep
-///      (`worker_api_server.rs:1539`'s
-///      `remove_digests_for_endpoint_in_store`) prunes acked entries
-///      similarly.
-///   3. Cap-truncation at `worker_api_server.rs:1567` silently drops
-///      over-cap entries from the registry without notifying the
-///      worker.
-///
-/// After any of these fires, the worker's memo claims the server
-/// holds the digest; the next tick computes delta-empty; the gate
-/// suppresses; the server's registry stays empty until the worker
-/// disconnects OR a local AC pin add/remove on the worker re-syncs
-/// it. Pre-fix the absolute snapshot self-healed in 100 ms.
-///
-/// Trade-off: at 100 ms tick and `N = 60`, the worker sends a forced
-/// full snapshot every ~6 s. Steady-state empty-tick savings drop
-/// from 100% to 100% × (59 / 60) ≈ 98.3% — the heartbeat costs ~1.7%
-/// of the bandwidth savings to bound divergence at ≤6 s.
-///
-/// Composite invariant (updated): the worker's `last_sent_ac_pin_set`
-/// re-converges with the server's `ac_pin_registry` set within ≤60
-/// tick intervals (≤6 seconds) for drain paths that an idempotent
-/// re-PUT actually heals:
-///   - BIS-ack sweep (`remove_digests_for_endpoint_in_store`): the
-///     heartbeat's full snapshot re-inserts the swept digests →
-///     converges within ≤6 s.
-///   - AcProxy NotFound peer-fetch (`ac_proxy_store.rs:367`): the
-///     re-send re-asserts the worker's intent; whether the server
-///     re-accepts depends on the peer-fetch retry path, NOT on the
-///     heartbeat alone. Bounded observability cadence, not convergence.
-///   - Cap-truncation at `worker_api_server.rs:1567` (over
-///     `DEFAULT_MAX_AC_PINS_PER_ENDPOINT`): the heartbeat re-sends an
-///     identical (or larger) snapshot; the server applies the SAME
-///     deterministic truncation, dropping the same N entries. The
-///     heartbeat does NOT converge this class — over-cap divergence
-///     persists until the worker's local AC pin set drops below the
-///     cap OR a separate over-cap design ships (tracked as #81).
-///
-/// `pub` so the heartbeat coverage test (T7) and the FL-681 Follow-up B
-/// pending-BIS re-advertisement test can assert the value at the declaration
-/// site and drive exactly one full heartbeat cycle without re-deriving the
-/// cadence.
-// #63: 60s anti-entropy resync (was 60 ticks = 6s at the 100ms
-// BLOBS_AVAILABLE_MAX_INTERVAL_MS tick — too frequent, re-sent the whole
-// AC-pin set 10x/min). Time-based off the tick interval so a future
-// tick-rate change can't silently re-shrink it. = 600 ticks today.
-pub const AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS: u64 = 60_000 / BLOBS_AVAILABLE_MAX_INTERVAL_MS;
 
 /// Counts how many AC-pin digests have been added (in `current` but not
 /// `last`) and removed (in `last` but not `current`). Pure function so
@@ -2312,49 +2238,6 @@ fn should_skip_blobs_available_tick(
         && removed_subtree_count == 0
         && pinned_mirror_count == 0
         && ac_pin_delta_empty
-}
-
-/// FL-681 Follow-up B (MAJOR-2 robust close-out): fold the worker's pending-BIS
-/// (indefinite-pinned) CAS digest set into the heartbeat tick's `digest_infos`.
-///
-/// On the periodic full-snapshot heartbeat (`AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS`,
-/// ~6s) the worker re-advertises every still-indefinitely-pinned CAS digest so
-/// the server re-runs `has_with_results` + `mark_stable` on the present subset.
-/// A digest whose `mark_stable` was missed (transient server existence-check
-/// failure) is thereby re-driven to BIS within a bounded number of ticks rather
-/// than waiting for the next reconnect. The server side is UNCHANGED — its
-/// existing `mark_stable`-on-present path absorbs the re-advertised set,
-/// idempotently.
-///
-/// Pure so the fold is unit-testable without the full
-/// `send_periodic_blobs_available` machinery. Digests already present in
-/// `digest_infos` (e.g. this tick also `added`/`touched` them) are NOT
-/// duplicated — the heartbeat only ADDS the still-pending pins the delta would
-/// otherwise omit. The set is bounded by `indefinite_pin_cap` and self-prunes
-/// as BIS-acks release pins (`indefinite_pinned_digests` shrinks accordingly).
-#[inline]
-fn merge_pending_bis_pins_into_digest_infos(
-    digest_infos: &mut Vec<BlobDigestInfo>,
-    pending_bis_digests: &[DigestInfo],
-) {
-    if pending_bis_digests.is_empty() {
-        return;
-    }
-    let mut already_present: HashSet<DigestInfo> = digest_infos
-        .iter()
-        .filter_map(|info| {
-            info.digest
-                .as_ref()
-                .and_then(|d| DigestInfo::try_from(d.clone()).ok())
-        })
-        .collect();
-    for digest in pending_bis_digests {
-        if already_present.insert(*digest) {
-            digest_infos.push(BlobDigestInfo {
-                digest: Some((*digest).into()),
-            });
-        }
-    }
 }
 
 /// Holds the FilesystemStore reference and change tracker needed for
@@ -2412,18 +2295,6 @@ pub struct BlobsAvailableState {
     /// baseline. `Relaxed` is sufficient — read for diagnostics, not
     /// load-bearing.
     blobs_available_skipped_counter: Arc<AtomicU64>,
-    /// (A1 fix-up F1) Monotonic tick counter for the AC-pin forced
-    /// full-snapshot heartbeat. Incremented at the top of every
-    /// `send_periodic_blobs_available` call; when
-    /// `counter % AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS == 0` the call
-    /// clears `last_sent_ac_pin_set` to force the next delta
-    /// computation to report every current pin as `added` — a forced
-    /// full snapshot. Persists across reconnects (reconnect clears
-    /// `last_sent_ac_pin_set` directly via the `is_first` path, so the
-    /// counter does not need to reset). `Relaxed` is sufficient — the
-    /// counter is per-state and accessed only from the single
-    /// `send_periodic_blobs_available` task.
-    ac_pin_full_snapshot_tick_counter: Arc<AtomicU64>,
     /// (FL-688 v3 §3.8) Bounded resend buffer of unacked worker→server
     /// DELTA `BlobsAvailableChunk`s. The send path buffers each delta
     /// chunk here on send and `handle_blobs_available_ack` clears the
@@ -2512,7 +2383,6 @@ impl BlobsAvailableState {
             next_broadcast_id: Arc::new(AtomicU64::new(0)),
             last_sent_ac_pin_set: Arc::new(Mutex::new(HashSet::new())),
             blobs_available_skipped_counter: Arc::new(AtomicU64::new(0)),
-            ac_pin_full_snapshot_tick_counter: Arc::new(AtomicU64::new(0)),
             blobs_available_resend: Arc::new(Mutex::new(BlobsAvailableResendBuffer::default())),
             blobs_available_force_full_snapshot: Arc::new(AtomicBool::new(false)),
         }
@@ -3753,35 +3623,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             Self::replay_unacked_chunks(grpc_client, state).await?;
         }
 
-        // (A1 fix + fix-up F1+F2) Apply the per-tick memo-reset paths
-        // at the function head: reconnect-clear (`is_first=true`)
-        // wipes the AC-pin memo so the next delta replays the full
-        // snapshot; the forced full-snapshot heartbeat wipes the memo
-        // every Nth steady-state tick to bound divergence against
-        // out-of-band server mutations (AcProxy NotFound, BIS-ack
-        // sweep, cap-truncation). See [`apply_periodic_tick_memo_resets`].
-        let is_heartbeat_tick = match apply_periodic_tick_memo_resets(
-            &state.last_sent_ac_pin_set,
-            &state.ac_pin_full_snapshot_tick_counter,
-            is_first,
-        ) {
-            PeriodicTickMemoReset::None | PeriodicTickMemoReset::ReconnectClear => false,
-            PeriodicTickMemoReset::HeartbeatResync { tick } => {
-                // info! (not debug!) so the heartbeat fires-event survives the
-                // workspace's `release_max_level_info` pin on `tracing`
-                // (Cargo.toml:107) in release builds. As `debug!` it was
-                // compile-eliminated and the heartbeat invisible on workers
-                // despite the mechanism firing every 60 ticks (#93).
-                info!(
-                    tag = "ac_pin_heartbeat_resync",
-                    tick,
-                    interval = AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS,
-                    "forced AC-pin full-snapshot heartbeat: clearing last-sent memo to bound \
-                     server↔worker registry divergence"
-                );
-                true
-            }
-        };
+        // (A1 fix + fix-up F2; FL-688 v3 Stage A) Apply the reconnect
+        // memo-reset path at the function head: reconnect-clear
+        // (`is_first=true`) wipes the AC-pin memo so the next delta replays the
+        // full snapshot. Stage A removed the periodic full-snapshot heartbeat
+        // (the every-Nth-tick forced memo clear); the out-of-band server-
+        // mutation classes it guarded re-converge via reconnect + the Stage-2B
+        // replay-until-acked reader + the over-cap force-snapshot EVENT (above).
+        // See [`apply_periodic_tick_memo_resets`].
+        let _ = apply_periodic_tick_memo_resets(&state.last_sent_ac_pin_set, is_first);
         let (digest_infos, evicted_digests, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
@@ -3847,23 +3697,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             (infos, evicted_protos, mirror_added_protos)
         };
 
-        // FL-681 Follow-up B (MAJOR-2 robust close-out): on the periodic
-        // full-snapshot HEARTBEAT (every AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS,
-        // ~6s), re-advertise the worker's still-pending-BIS CAS pin set so a
-        // digest whose `mark_stable` was missed (transient server
-        // `has_with_results` failure) is re-driven to BIS within a bounded
-        // number of ticks — NOT only on reconnect. Folded into `digest_infos`
-        // (deduped); the server's existing `mark_stable`-on-present path absorbs
-        // it idempotently (no server change). Bounded by `indefinite_pin_cap`;
-        // self-pruning as BIS-acks release pins. NOT on every tick (storm risk —
-        // mirrors the AC-pin heartbeat's empty-tick-storm gate); NOT on
-        // `is_first` (the full snapshot already enumerates the whole store,
-        // including indefinite pins). Cheap DashMap snapshot — no `.await` held.
-        let mut digest_infos = digest_infos;
-        if is_heartbeat_tick && !is_first {
-            let pending_bis = state.fs_store.indefinite_pinned_digests();
-            merge_pending_bis_pins_into_digest_infos(&mut digest_infos, &pending_bis);
-        }
+        // (FL-688 v3 Stage A) The FL-681 Follow-up B periodic pending-BIS CAS
+        // re-advertise was REMOVED with the heartbeat tick that drove it. A
+        // digest whose `mark_stable` was missed now re-converges via the
+        // reconnect full snapshot (which enumerates the whole store, including
+        // every indefinite pin) + the Stage-2B replay-until-acked reader (the
+        // `added` delta that pinned it is retransmitted until the server acks)
+        // + the over-cap force-snapshot EVENT — all event-driven, no timer.
 
         // Collect subtree delta or full snapshot.
         let (
@@ -6152,7 +5992,6 @@ pub async fn new_local_worker(
                 next_broadcast_id: Arc::new(AtomicU64::new(0)),
                 last_sent_ac_pin_set: Arc::new(Mutex::new(HashSet::new())),
                 blobs_available_skipped_counter: Arc::new(AtomicU64::new(0)),
-                ac_pin_full_snapshot_tick_counter: Arc::new(AtomicU64::new(0)),
                 blobs_available_resend: Arc::new(Mutex::new(BlobsAvailableResendBuffer::default())),
                 blobs_available_force_full_snapshot: Arc::new(AtomicBool::new(false)),
             })
@@ -6966,10 +6805,8 @@ mod tests {
         let d2 = DigestInfo::new([2u8; 32], 100);
 
         let last_sent = Mutex::new(HashSet::from([d1, d2]));
-        let counter = AtomicU64::new(0);
 
-        let outcome =
-            apply_periodic_tick_memo_resets(&last_sent, &counter, /* is_first */ true);
+        let outcome = apply_periodic_tick_memo_resets(&last_sent, /* is_first */ true);
 
         let post_call: HashSet<DigestInfo> = last_sent.lock().iter().copied().collect();
         assert!(
@@ -6985,123 +6822,48 @@ mod tests {
         );
     }
 
-    /// (A1 fix-up F1+F3) T7 — heartbeat resync fires every N ticks.
-    /// Drive `apply_periodic_tick_memo_resets` for 65 steady-state
-    /// ticks (`is_first=false`); count `HeartbeatResync` outcomes.
-    /// Expect exactly 1 firing at tick 60 (1-indexed); ticks 1-59 and
-    /// 61-65 must report `None`. The first call would be tick 0 →
-    /// post-increment 1; the 60th call has pre-increment 59 →
-    /// `(59 + 1) % 60 == 0` → heartbeat fires.
+    /// (FL-688 v3 Stage A) The PERIODIC full-snapshot heartbeat is REMOVED:
+    /// across many steady-state (`is_first=false`) ticks with no blob changes,
+    /// `apply_periodic_tick_memo_resets` must NEVER force-clear the
+    /// `last_sent_ac_pin_set` memo (a forced clear was the periodic heartbeat,
+    /// which re-sent the whole AC-pin set every Nth tick). Convergence now comes
+    /// from reconnect full snapshot + the Stage-2B replay-until-acked reader +
+    /// the over-cap force-snapshot EVENT — none of them a timer/tick.
     ///
-    /// Asserts the heartbeat constant value at declaration via a
-    /// direct `assert_eq!` on
-    /// `AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS` so the numeric-claim
-    /// review block can verify the test references the actual
-    /// constant, not a hard-coded literal.
+    /// Drives 605 steady-state ticks: the OLD heartbeat would have fired at
+    /// tick 600 (`60_000 / BLOBS_AVAILABLE_MAX_INTERVAL_MS`), clearing the memo.
+    /// The memo is pre-populated so a forced clear is observable as an
+    /// emptied set. Verified RED against the pre-Stage-A heartbeat code (the
+    /// clear fires at tick 600); GREEN after the heartbeat is removed.
     ///
-    /// Mutation 2026-06-07: change `AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS`
-    /// from 60 to `u64::MAX` → red-fail "heartbeat resync did not fire
-    /// at tick 60: 0 firings, expected 1". The
-    /// `AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS == 60` assertion at the end
-    /// of the test ALSO catches the constant drift; the firing-count
-    /// check fires first when N is set to a value > 65 (the loop
-    /// bound) because no heartbeat would land.
+    /// Mutation: re-introduce the periodic clear (the
+    /// `(tick + 1) % N == 0 { last_sent_ac_pin_set.lock().clear() }` line) →
+    /// this test red-fails with its bespoke "periodic heartbeat fired" message.
     #[test]
-    fn t7_heartbeat_resync_fires_every_n_ticks() {
-        let last_sent = Mutex::new(HashSet::new());
-        let counter = AtomicU64::new(0);
+    fn steady_state_ticks_never_force_full_snapshot() {
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 100);
+        // Pre-populate the memo: a periodic forced clear would empty it.
+        let last_sent = Mutex::new(HashSet::from([d1, d2]));
 
-        // Drive 605 ticks so AT LEAST one heartbeat MUST land if
-        // `AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS <= 605` (now 600 = 60s at
-        // the 100ms BLOBS_AVAILABLE_MAX_INTERVAL_MS tick). FIXED loop
-        // bound (NOT N-derived) so the mutation `N -> u64::MAX` keeps the
-        // loop at 605 → firing count drops to 0 and the next assertion
-        // red-fails with the bespoke message.
-        let mut heartbeat_ticks: Vec<u64> = Vec::new();
-        let mut reconnect_count = 0usize;
-        let mut none_count = 0usize;
-        for _ in 0..605 {
-            match apply_periodic_tick_memo_resets(
-                &last_sent,
-                &counter,
-                /* is_first */ false,
-            ) {
-                PeriodicTickMemoReset::None => none_count += 1,
-                PeriodicTickMemoReset::ReconnectClear => reconnect_count += 1,
-                PeriodicTickMemoReset::HeartbeatResync { tick } => {
-                    heartbeat_ticks.push(tick);
-                }
-            }
+        for tick in 0..605u64 {
+            let outcome =
+                apply_periodic_tick_memo_resets(&last_sent, /* is_first */ false);
+            assert_eq!(
+                outcome,
+                PeriodicTickMemoReset::None,
+                "periodic heartbeat fired at steady-state tick {tick}: the timer-driven \
+                 full-snapshot heartbeat must be REMOVED — steady-state ticks produce only \
+                 event-driven deltas (got {outcome:?})"
+            );
+            assert_eq!(
+                last_sent.lock().len(),
+                2,
+                "periodic heartbeat cleared the last-sent memo at steady-state tick {tick}: the \
+                 forced full-snapshot heartbeat must be REMOVED (convergence is reconnect + \
+                 replay-until-acked + over-cap event, NOT a periodic tick)"
+            );
         }
-
-        assert_eq!(
-            reconnect_count, 0,
-            "heartbeat test contaminated by reconnect-clear: expected 0, got {reconnect_count}"
-        );
-        assert_eq!(
-            heartbeat_ticks.len(),
-            1,
-            "heartbeat resync did not fire at tick {AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS}: {} firings, expected 1 (firings at ticks {heartbeat_ticks:?})",
-            heartbeat_ticks.len()
-        );
-        assert_eq!(
-            heartbeat_ticks[0], AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS,
-            "heartbeat resync fired at wrong tick: expected {AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS}, got {}",
-            heartbeat_ticks[0]
-        );
-        assert_eq!(
-            none_count, 604,
-            "heartbeat resync over/under-fired: expected 604 None outcomes (605 ticks - 1 heartbeat), got {none_count}"
-        );
-
-        // Independent check that the heartbeat interval has not
-        // drifted from the design value. Final assertion so the
-        // firing-count check fires first on the canonical mutation.
-        // Pin the SEMANTIC (60s anti-entropy interval), not the raw tick
-        // count, so the value tracks BLOBS_AVAILABLE_MAX_INTERVAL_MS (#63).
-        assert_eq!(
-            AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS * BLOBS_AVAILABLE_MAX_INTERVAL_MS,
-            60_000,
-            "heartbeat interval drifted: must be 60s, got {} ms",
-            AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS * BLOBS_AVAILABLE_MAX_INTERVAL_MS
-        );
-    }
-
-    /// (A1 fix-up F1) T7b — reconnect does NOT reset the heartbeat
-    /// counter. The `is_first=true` path clears the memo but the
-    /// counter ticks forward; the next 59 steady-state ticks return
-    /// `None`, and the 60th call from worker-process-start (counting
-    /// the reconnect as tick 1) fires the heartbeat. This is the
-    /// design decision documented in `apply_periodic_tick_memo_resets`:
-    /// resetting the counter on reconnect would extend the post-
-    /// reconnect heartbeat interval by up to N ticks.
-    #[test]
-    fn t7b_reconnect_does_not_reset_heartbeat_counter() {
-        let last_sent = Mutex::new(HashSet::new());
-        let counter = AtomicU64::new(0);
-
-        // First call: is_first=true → ReconnectClear, counter ticks 0→1.
-        let outcome =
-            apply_periodic_tick_memo_resets(&last_sent, &counter, /* is_first */ true);
-        assert_eq!(outcome, PeriodicTickMemoReset::ReconnectClear);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-
-        // Drive 59 more steady-state ticks; the 60th (counting the
-        // reconnect) MUST be the heartbeat.
-        let mut firing_at: Option<u64> = None;
-        for _ in 0..59 {
-            if let PeriodicTickMemoReset::HeartbeatResync { tick } =
-                apply_periodic_tick_memo_resets(&last_sent, &counter, false)
-            {
-                firing_at = Some(tick);
-            }
-        }
-        assert_eq!(
-            firing_at,
-            Some(AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS),
-            "reconnect reset the counter: heartbeat did not fire at tick \
-             AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS (={AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS}) post-reconnect"
-        );
     }
 
     /// (A1 fix) T5 — non-AC corner coverage. A fast-store eviction,
@@ -7427,110 +7189,6 @@ mod tests {
             endpoint.ends_with(":40081"),
             "Expected endpoint to end with ':40081', got: {endpoint}"
         );
-    }
-
-    // FL-681 Follow-up B (MAJOR-2 robust close-out): the periodic heartbeat must
-    // re-advertise the worker's pending-BIS CAS pin set, sourced from the REAL
-    // FilesystemStore enumeration (`indefinite_pinned_digests`) and folded into
-    // `digest_infos` via the production fold helper. This is the exact seam
-    // MAJOR-2 flagged untested: a digest whose `mark_stable` was missed is
-    // re-driven to BIS on a HEARTBEAT tick (no reconnect needed).
-    //
-    // Production composition: real `FilesystemStore` (the worker's fast tier) +
-    // the real `indefinite_pinned_digests` enumeration + the real
-    // `merge_pending_bis_pins_into_digest_infos` fold. The only thing not driven
-    // here is the 60-tick counter, which `apply_periodic_tick_memo_resets`
-    // already gates and is covered by the AC-pin heartbeat tests; this test owns
-    // the NEW behavior — the CAS-pin fold itself.
-    #[tokio::test]
-    async fn pending_bis_cas_pins_fold_into_heartbeat_digest_infos() {
-        use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
-        use nativelink_store::filesystem_store::FilesystemStore;
-
-        let tmp = std::env::temp_dir().join(format!(
-            "fl681_b_heartbeat_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let spec = FilesystemSpec {
-            content_path: tmp.join("content").to_string_lossy().into_owned(),
-            temp_path: tmp.join("temp").to_string_lossy().into_owned(),
-            eviction_policy: Some(EvictionPolicy {
-                max_bytes: 1024 * 1024,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let fs_store: Arc<FilesystemStore> = FilesystemStore::new(&spec).await.unwrap();
-
-        // Write a CAS blob and pin it INDEFINITELY (the pending-BIS state: an F2
-        // output whose durability ack has not yet arrived).
-        let pending = DigestInfo::new([7u8; 32], 6);
-        Pin::new(fs_store.as_ref())
-            .update_oneshot(pending.into(), "hello!".into())
-            .await
-            .unwrap();
-        assert!(
-            fs_store.pin_digest_indefinite_with_result(&pending),
-            "indefinite pin of the pending-BIS digest should succeed"
-        );
-
-        // A normal DELTA tick that does NOT re-touch the pinned digest carries
-        // only an unrelated `added` digest — the pending-BIS digest is absent.
-        let unrelated = DigestInfo::new([8u8; 32], 3);
-        let mut delta_infos = vec![BlobDigestInfo {
-            digest: Some(unrelated.into()),
-        }];
-        let to_digest_set = |infos: &[BlobDigestInfo]| -> HashSet<DigestInfo> {
-            infos
-                .iter()
-                .filter_map(|i| {
-                    i.digest
-                        .as_ref()
-                        .and_then(|d| DigestInfo::try_from(d.clone()).ok())
-                })
-                .collect()
-        };
-        assert!(
-            !to_digest_set(&delta_infos).contains(&pending),
-            "precondition: a non-touching delta tick must NOT already carry the pending-BIS digest"
-        );
-
-        // HEARTBEAT tick: fold the real pending-BIS enumeration in.
-        let pending_bis = fs_store.indefinite_pinned_digests();
-        merge_pending_bis_pins_into_digest_infos(&mut delta_infos, &pending_bis);
-        let folded = to_digest_set(&delta_infos);
-        assert!(
-            folded.contains(&pending),
-            "heartbeat re-advertisement failed: the pending-BIS digest whose mark_stable was \
-             missed was NOT folded into digest_infos — it would never reach BIS until a reconnect"
-        );
-        assert!(
-            folded.contains(&unrelated),
-            "the fold must PRESERVE the tick's existing delta digests, not replace them"
-        );
-        // Dedup: re-folding the same set must not duplicate the entry.
-        let len_before = delta_infos.len();
-        merge_pending_bis_pins_into_digest_infos(&mut delta_infos, &pending_bis);
-        assert_eq!(
-            delta_infos.len(),
-            len_before,
-            "the fold must DEDUP — a pending-BIS digest already in digest_infos must not be \
-             re-appended, or the heartbeat payload grows unbounded on re-advertisement"
-        );
-
-        // Self-pruning: after a BIS-ack `unpin_digest`, the released digest must
-        // drop out of the enumeration so the NEXT heartbeat does not re-advertise it.
-        fs_store.unpin_digest(&pending);
-        assert!(
-            fs_store.indefinite_pinned_digests().is_empty(),
-            "after a BIS-ack unpin the released digest must drop out of the heartbeat set \
-             (self-pruning); otherwise the worker re-advertises an already-durable blob forever"
-        );
-
-        drop(tokio::fs::remove_dir_all(&tmp).await);
     }
 
     /// The swap-pressure RATE is the load-bearing dynamic signal: it is

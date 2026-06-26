@@ -115,10 +115,11 @@ name = "blobs_in_stable_storage_handler_test"
 required-features = ["test-utils"]
 
 [[test]]
-# FL-681 Follow-up B: uses MockWorkerApiClient + MockRunningActionsManager and
-# the `send_periodic_blobs_available_for_test` seam, all gated behind
+# (FL-688 v3 Stage A) No periodic full-snapshot heartbeat: uses
+# MockWorkerApiClient + MockRunningActionsManager and the
+# `send_periodic_blobs_available_for_test` seam, all gated behind
 # `cfg(any(test, feature = "test-utils"))`.
-name = "pending_bis_heartbeat_test"
+name = "blobs_available_no_heartbeat_test"
 required-features = ["test-utils"]
 
 [[test]]

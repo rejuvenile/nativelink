@@ -194,6 +194,43 @@ impl MockWorkerApiClient {
         }
     }
 
+    /// (FL-688 v3 Stage A) Non-blocking count of how many calls the worker
+    /// enqueued and are still pending, draining + auto-ack'ing each
+    /// `BlobsAvailable` / `ChunkedMessage` along the way. Used by the
+    /// no-periodic-heartbeat test to assert that across many steady-state ticks
+    /// the worker emitted ZERO calls (the timer-driven full-snapshot heartbeat
+    /// is removed, so an idle worker is silent). Panics on any other variant.
+    #[allow(dead_code, reason = "exercised only by the Stage A no-heartbeat test")]
+    pub(crate) fn drain_pending_call_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut rx_call_lock = match self.rx_call.try_lock() {
+            Some(lock) => lock,
+            None => return 0,
+        };
+        loop {
+            match rx_call_lock.try_recv() {
+                Ok(WorkerClientApiCalls::BlobsAvailable(_)) => {
+                    self.tx_resp
+                        .send(WorkerClientApiReturns::BlobsAvailable(Ok(())))
+                        .expect("Could not send response to mpsc");
+                    count += 1;
+                }
+                Ok(WorkerClientApiCalls::ChunkedMessage(_)) => {
+                    self.tx_resp
+                        .send(WorkerClientApiReturns::ChunkedMessage(Ok(())))
+                        .expect("Could not send response to mpsc");
+                    count += 1;
+                }
+                Ok(other) => panic!(
+                    "drain_pending_call_count expected BlobsAvailable/ChunkedMessage or empty, \
+                     got : {other:?}"
+                ),
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
     /// (#97) Receive the next call as a BisAck. Used by the
     /// production-composition test that asserts the worker's
     /// `Update::ChunkedMessage(BlobsInStableStorageChunk)` dispatch
