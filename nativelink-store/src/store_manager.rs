@@ -308,6 +308,24 @@ impl StoreManager {
                     return (name_owned, 0, core::time::Duration::ZERO);
                 };
                 let store_started = std::time::Instant::now();
+                // F5 (#F5): FIRST spill the C2* subset (mirror ∩ failed) to
+                // LOCAL DISK so a restart is non-lossy for RAM-only sole-copy
+                // mirror blobs. This MUST run before the C1→server flush
+                // below: the spill is the only NEW restart-loss path (C1 is
+                // already disk-durable), and on a degraded connection the
+                // server-bound flush fails harmlessly. The spill emits the
+                // terminal "shutdown mirror-spill complete" line the deploy
+                // restart sequence gates on. On instances with no mirror map
+                // the C2* set is empty and this is a cheap no-op.
+                let spill_failed = fss.spill_mirror_to_disk_at_shutdown().await;
+                if spill_failed > 0 {
+                    warn!(
+                        store = %name_owned,
+                        spill_failed,
+                        "flush_slow_writes: Phase 2 mirror-spill left C2* blobs unspilled \
+                         (e.g. ENOSPC) — these RAM-only sole copies will be lost on restart",
+                    );
+                }
                 // Unbounded (R2): drain the not-yet-durable at-risk subset to
                 // completion, no deadline. (durability-ack v3 Change A.)
                 let unflushed = fss.flush_fast_to_slow_at_shutdown().await;

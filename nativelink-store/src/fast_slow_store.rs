@@ -2901,6 +2901,192 @@ impl FastSlowStore {
         usize::try_from(errored).unwrap_or(usize::MAX)
     }
 
+    /// F5 (#F5): spill the **C2\*** subset of `mirror_blobs` to the local
+    /// fast tier (disk) at graceful shutdown so a worker restart is
+    /// NON-LOSSY for RAM-only sole-copy mirror blobs.
+    ///
+    /// ## Why this exists (the FL-688 hole, narrowed)
+    ///
+    /// A `mirror_blobs` entry is normally server-durable — the server pushed
+    /// it FROM its own durable tier — so a restart that loses the RAM copy is
+    /// non-lossy (the server re-pushes on reconnect) and
+    /// [`Self::flush_fast_to_slow_at_shutdown`] correctly does NOT spill it.
+    /// The exception is the FL-688 surface (`local_worker.rs:2959-2962`): when
+    /// the server `UploadMissingBlobs`-asks for a digest the worker holds
+    /// **only** as a mirror copy that never landed on disk, and that upload
+    /// then fails on a degraded connection, the worker re-queues it via
+    /// [`Self::requeue_failed_push`] → `failed_slow_writes`. Call this subset
+    /// **C2\*** = `mirror_blobs ∩ failed_slow_writes`. For a C2\* blob the
+    /// worker holds the *sole durable copy*; a `pkill`/degraded-restart loses
+    /// it.
+    ///
+    /// ## Why `flush_fast_to_slow_at_shutdown` cannot save C2\*
+    ///
+    /// That drain enumerates keys from `self.fast_store.list()` (DISK) and
+    /// reads bytes via `self.fast_store.get_part_unchunked` (DISK). A C2\*
+    /// blob is **not on disk** — it lives only in the RAM-only `mirror_blobs`
+    /// map — so it is never enumerated and never read. This pass enumerates
+    /// the mirror map instead (`mirror_blob_digests()`), which is the
+    /// load-bearing difference (see mutation `spill_enumerates_disk_list_misses_c2star`).
+    ///
+    /// ## Mechanism
+    ///
+    /// For each C2\* digest, at bounded concurrency
+    /// ([`SHUTDOWN_FLUSH_CONCURRENCY`] = 64), call the existing
+    /// [`Self::materialize_mirror_to_fast`] primitive (RAM mirror →
+    /// `fast_store.update_oneshot` = the worker's local `FilesystemStore`),
+    /// then `fast_store.pin_digests` the freshly-written entry.
+    ///
+    /// **The pin is load-bearing (distsys F5-1).** `materialize_mirror_to_fast`
+    /// does NOT pin on its own. The pre-existing `requeue_failed_push` pin is a
+    /// **no-op** for a C2\* blob because `EvictingMap::pin_keys` only pins a key
+    /// already present in the moka cache (`moka_evicting_map.rs:1241-1244`) — a
+    /// RAM-only mirror is NOT in the cache, so that earlier pin found nothing.
+    /// Only AFTER `materialize_mirror_to_fast` writes the blob (inserting it
+    /// into the moka cache) can a pin take effect. Without this re-pin the
+    /// freshly-spilled entry is plain-LRU-evictable and F3b's eviction-drain
+    /// could evict it before restart (mutation `spill_without_pin_is_evictable`).
+    ///
+    /// ## Hard constraints (honored)
+    ///
+    /// - **No fsync / sync-write.** Durability across the restart is the
+    ///   process exiting CLEANLY after the spill (kernel flushes dirty pages on
+    ///   normal close), identical to every other store write.
+    /// - **No TTL / timer.** Event-driven (fires once per shutdown). The pin is
+    ///   released by the normal `BlobsInStableStorage` ack path post-restart.
+    /// - **Slow-write-never-cancelled.** The spill does not touch in-flight slow
+    ///   (server) write spawns; it only adds disk copies of C2\*.
+    /// - **Bounded.** `spill_set ⊆ failed_slow_writes`, hard-capped at
+    ///   [`FAILED_SLOW_WRITES_MAX`]; each in-flight slot holds one
+    ///   already-RAM-resident mirror blob — no new buffer.
+    /// - **Per-entry ENOSPC tolerance (distsys F5-2 / SEC-4).** On a near-full
+    ///   disk a spill write can hit ENOSPC; that entry is logged + counted +
+    ///   LEFT IN `failed_slow_writes` (so a later attempt can retry it) and the
+    ///   spill of the rest continues — never crash/hang the shutdown (mutation
+    ///   `spill_enospc_is_tolerated_per_entry`).
+    ///
+    /// ## Ordering within Phase 2
+    ///
+    /// Called from `store_manager.rs`'s Phase-2 loop alongside
+    /// `flush_fast_to_slow_at_shutdown`, AFTER the Bazel-facing listeners are
+    /// quiesced (so no new mirror can arrive mid-spill). On instances with no
+    /// mirror map the intersection is empty and the pass is a cheap no-op.
+    ///
+    /// Returns the number of digests that errored (NOT spilled to disk).
+    pub async fn spill_mirror_to_disk_at_shutdown(&self) -> usize {
+        let started = Instant::now();
+
+        // Snapshot the C2* set = mirror_blobs ∩ failed_slow_writes. Both
+        // snapshots are taken under their own locks and released before any
+        // .await. `failed_slow_writes` is the only mirror digests that are
+        // NOT already server-durable; intersecting keeps the pass
+        // necessity-minimal (a plain server-durable mirror does not need a
+        // disk copy — the server re-pushes it on reconnect).
+        //
+        // CAPPED AT FAILED_SLOW_WRITES_MAX (1_000_000): `spill_set ⊆
+        // failed_slow_writes`, which `requeue_failed_push` hard-caps at
+        // FAILED_SLOW_WRITES_MAX. Each in-flight slot holds one
+        // already-RAM-resident mirror blob (no new owned-bytes buffer).
+        let failed: HashSet<DigestInfo> = self.failed_slow_writes.lock().iter().copied().collect();
+        let spill_set: Vec<DigestInfo> = {
+            let guard = self.mirror_blobs.read();
+            guard
+                .keys()
+                .filter(|d| failed.contains(d))
+                .copied()
+                .collect()
+        };
+
+        let spill_count = spill_set.len();
+        info!(
+            spill_count,
+            mirror_total = self.mirror_blob_count(),
+            failed_total = failed.len(),
+            fast_store = %self.fast_store.inner_store(
+                Option::<StoreKey<'_>>::None
+            ).get_name(),
+            "FastSlowStore::spill_mirror_to_disk_at_shutdown: spilling C2* (mirror ∩ failed) to local disk"
+        );
+
+        if spill_count == 0 {
+            // Terminal line (greppable; the deploy restart sequence gates on
+            // it). spilled/failed are zero for an instance with no C2*.
+            info!(
+                spilled = 0u64,
+                failed = 0u64,
+                "shutdown mirror-spill complete: spilled=0 failed=0"
+            );
+            return 0;
+        }
+
+        let spilled = AtomicU64::new(0);
+        let errored = AtomicU64::new(0);
+
+        // Bounded-concurrency spill (SHUTDOWN_FLUSH_CONCURRENCY = 64). We
+        // stream over indices (lifetime-free) the same way
+        // `flush_fast_to_slow_at_shutdown` does so the closure satisfies
+        // `buffer_unordered`'s higher-ranked bound.
+        let spill_set = &spill_set;
+        let spilled_ref = &spilled;
+        let errored_ref = &errored;
+        let drain = futures::stream::iter(0..spill_count)
+            .map(|idx| async move {
+                let digest = spill_set[idx];
+                // RAM mirror -> local disk (fast tier = FilesystemStore).
+                match self.materialize_mirror_to_fast(StoreKey::Digest(digest)).await {
+                    Ok(true) => {
+                        // F5-1 (BINDING): re-pin AFTER the disk write. The
+                        // earlier requeue_failed_push pin was a no-op (the blob
+                        // was RAM-only, not in the fast store's evicting_map);
+                        // only now that materialize wrote it into the map can a
+                        // pin take effect and keep F3b's eviction-drain from
+                        // evicting the spilled sole copy before restart.
+                        self.fast_store.pin_digests(&[digest]);
+                        spilled_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(false) => {
+                        // The mirror was evicted/acked between the snapshot and
+                        // the read — benign; nothing to spill. Not counted as
+                        // an error (no sole copy was lost; it left the set).
+                        debug!(
+                            %digest,
+                            "spill_mirror_to_disk_at_shutdown: mirror entry gone between \
+                             snapshot and read; skipping (benign)"
+                        );
+                    }
+                    Err(err) => {
+                        // Per-entry ENOSPC tolerance (F5-2 / SEC-4): a near-full
+                        // disk write fails here. Log + count + LEAVE the digest
+                        // in failed_slow_writes (we do NOT remove it) so a later
+                        // attempt can retry. Do NOT abort the spill of the rest;
+                        // do NOT crash/hang the shutdown.
+                        warn!(
+                            %digest,
+                            ?err,
+                            "spill_mirror_to_disk_at_shutdown: per-entry spill write failed \
+                             (e.g. ENOSPC); leaving digest in failed_slow_writes and continuing"
+                        );
+                        errored_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+            .buffer_unordered(SHUTDOWN_FLUSH_CONCURRENCY);
+        drain.for_each(|()| async {}).await;
+
+        let spilled = spilled.into_inner();
+        let errored = errored.into_inner();
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // TERMINAL greppable line — the deploy restart sequence gates on
+        // observing it before SIGKILL is safe.
+        info!(
+            spilled,
+            failed = errored,
+            elapsed_ms,
+            "shutdown mirror-spill complete: spilled={spilled} failed={errored}"
+        );
+        usize::try_from(errored).unwrap_or(usize::MAX)
+    }
+
     pub const fn fast_store(&self) -> &Store {
         &self.fast_store
     }
