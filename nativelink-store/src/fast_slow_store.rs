@@ -2935,17 +2935,30 @@ impl FastSlowStore {
     /// ([`SHUTDOWN_FLUSH_CONCURRENCY`] = 64), call the existing
     /// [`Self::materialize_mirror_to_fast`] primitive (RAM mirror →
     /// `fast_store.update_oneshot` = the worker's local `FilesystemStore`),
-    /// then `fast_store.pin_digests` the freshly-written entry.
+    /// then take an INDEFINITE pin on the freshly-written entry.
     ///
-    /// **The pin is load-bearing (distsys F5-1).** `materialize_mirror_to_fast`
-    /// does NOT pin on its own. The pre-existing `requeue_failed_push` pin is a
-    /// **no-op** for a C2\* blob because `EvictingMap::pin_keys` only pins a key
-    /// already present in the moka cache (`moka_evicting_map.rs:1241-1244`) — a
-    /// RAM-only mirror is NOT in the cache, so that earlier pin found nothing.
-    /// Only AFTER `materialize_mirror_to_fast` writes the blob (inserting it
-    /// into the moka cache) can a pin take effect. Without this re-pin the
-    /// freshly-spilled entry is plain-LRU-evictable and F3b's eviction-drain
-    /// could evict it before restart (mutation `spill_without_pin_is_evictable`).
+    /// **The pin is load-bearing (distsys F5-1) and MUST be indefinite (pair-a
+    /// MAJOR).** `materialize_mirror_to_fast` does NOT pin on its own. The
+    /// pre-existing `requeue_failed_push` pin is a **no-op** for a C2\* blob
+    /// because `EvictingMap::pin_keys` only pins a key already present in the
+    /// moka cache (`moka_evicting_map.rs:1241-1244`) — a RAM-only mirror is NOT
+    /// in the cache, so that earlier pin found nothing. Only AFTER materialize
+    /// writes the blob (inserting it into the moka cache) can a pin take effect.
+    /// Without it the freshly-spilled entry is plain-LRU-evictable and F3b's
+    /// eviction-drain could evict it before restart.
+    ///
+    /// The pin uses [`Store::pin_digests_indefinite_with_results`], NOT the
+    /// time-bounded `pin_digests`: `expire_stale_pins` demotes non-indefinite
+    /// pins to plain LRU at `PIN_TIMEOUT_SECS` (120 s) — and Phase-2's
+    /// C1→server flush is UNBOUNDED, so on the degraded server that creates C2\*
+    /// it can exceed 120 s, after which the demoted entry is evicted and the
+    /// blob re-lost AFTER "spill complete" printed. An indefinite pin is exempt
+    /// from that sweep (released only by post-restart BIS-ack), durability-
+    /// identical to F2 pending-BIS blobs. A pin REFUSE (indefinite-cap
+    /// exhausted) or eviction race is counted as a FAILED spill (kept in
+    /// `failed_slow_writes` for retry), since a non-indefinite pin would re-lose
+    /// the sole copy. Guarded by `spill_pin_survives_expire_stale_pins_sweep`
+    /// (mutation: revert to non-indefinite `pin_digests` → the sweep demotes it).
     ///
     /// ## Hard constraints (honored)
     ///
@@ -3035,14 +3048,47 @@ impl FastSlowStore {
                 // RAM mirror -> local disk (fast tier = FilesystemStore).
                 match self.materialize_mirror_to_fast(StoreKey::Digest(digest)).await {
                     Ok(true) => {
-                        // F5-1 (BINDING): re-pin AFTER the disk write. The
-                        // earlier requeue_failed_push pin was a no-op (the blob
-                        // was RAM-only, not in the fast store's evicting_map);
-                        // only now that materialize wrote it into the map can a
-                        // pin take effect and keep F3b's eviction-drain from
-                        // evicting the spilled sole copy before restart.
-                        self.fast_store.pin_digests(&[digest]);
-                        spilled_ref.fetch_add(1, Ordering::Relaxed);
+                        // F5-1 (BINDING): re-pin AFTER the disk write with an
+                        // INDEFINITE pin. The earlier requeue_failed_push pin
+                        // was a no-op (the blob was RAM-only, not in the fast
+                        // store's evicting_map); only now that materialize wrote
+                        // it into the map can a pin take effect.
+                        //
+                        // The pin MUST be INDEFINITE (pair-a MAJOR): a plain
+                        // `pin_digests` is time-bounded (indefinite:false), and
+                        // `expire_stale_pins` DEMOTES non-indefinite pins to
+                        // plain LRU at PIN_TIMEOUT_SECS=120 (it EXEMPTS
+                        // indefinite pins). Phase-2's C1->server flush is
+                        // UNBOUNDED and on the degraded server that triggers
+                        // C2* it can exceed 120 s; the demotion would then let
+                        // F3b's forced-drain evict the spilled sole copy AFTER
+                        // "spill complete" already printed — re-losing the blob.
+                        // Indefinite pins are released only by the post-restart
+                        // BlobsInStableStorage ack, durability-identical to F2
+                        // pending-BIS blobs.
+                        //
+                        // A `false` result is BACKPRESSURE (indefinite-pin cap
+                        // exhausted) or an eviction race: a non-indefinite /
+                        // absent pin does NOT give until-restart durability, so
+                        // treat it the SAME as the ENOSPC case below — count it
+                        // FAILED, leave the digest in failed_slow_writes for a
+                        // later retry, do NOT abort the spill of the rest.
+                        let pinned = self
+                            .fast_store
+                            .pin_digests_indefinite_with_results(&[digest]);
+                        if pinned.first().copied().unwrap_or(false) {
+                            spilled_ref.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            warn!(
+                                %digest,
+                                "spill_mirror_to_disk_at_shutdown: wrote blob to disk but could \
+                                 NOT take an indefinite pin (indefinite-pin cap exhausted or \
+                                 eviction race); a time-bounded pin would be demoted at 120s and \
+                                 the sole copy re-lost — counting FAILED and leaving in \
+                                 failed_slow_writes for retry"
+                            );
+                            errored_ref.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Ok(false) => {
                         // The mirror was evicted/acked between the snapshot and

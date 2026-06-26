@@ -750,6 +750,16 @@ impl Store {
         self.inner.pin_digests_with_results(digests)
     }
 
+    /// Take an INDEFINITE pin (exempt from the 120 s sweep) and report
+    /// per-digest success. Delegates to the inner
+    /// [`StoreDriver::pin_digests_indefinite_with_results`]. Used by the F5
+    /// C2\* mirror-spill (a spilled sole copy must survive a >120 s degraded
+    /// shutdown, so a time-bounded pin would re-lose it after the demotion).
+    #[inline]
+    pub fn pin_digests_indefinite_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        self.inner.pin_digests_indefinite_with_results(digests)
+    }
+
     /// Release pins acquired via [`Self::pin_digests`]. Used by the
     /// server-side BlobsInStableStorage broadcast loop after notifying
     /// workers that a digest is durably mirrored — see
@@ -1715,6 +1725,50 @@ pub trait StoreDriver:
                 let mut combined = vec![false; digests.len()];
                 for child in children {
                     let per_child = child.pin_digests_with_results(digests);
+                    debug_assert_eq!(per_child.len(), digests.len());
+                    for (slot, result) in combined.iter_mut().zip(per_child) {
+                        *slot |= result;
+                    }
+                }
+                combined
+            }
+        }
+    }
+
+    /// Like [`Self::pin_digests_with_results`] but takes an INDEFINITE pin —
+    /// one EXEMPT from the `PIN_TIMEOUT_SECS` (120 s) auto-unpin sweep,
+    /// released ONLY by an explicit unpin (BIS-ack). The returned vec has one
+    /// entry per input digest, in order: `true` only if the digest is now
+    /// held under a genuine INDEFINITE pin; `false` if it was absent (eviction
+    /// race) OR the indefinite-pin cap refused it (backpressure) — in either
+    /// `false` case the caller MUST NOT treat it as durably pinned.
+    ///
+    /// Used by the F5 C2\* mirror-spill: a spilled sole-copy blob is as
+    /// durability-critical as an F2 pending-BIS blob, so a time-bounded pin
+    /// (which `expire_stale_pins` demotes at 120 s) does NOT give the
+    /// until-restart durability the spill needs. A `false` result is treated
+    /// by the spill as a FAILED spill (kept in `failed_slow_writes` for retry).
+    ///
+    /// The default body dispatches via [`Self::pin_delegation`], mirroring
+    /// `pin_digests_with_results`. Stores that actually support indefinite
+    /// pinning (e.g. [`FilesystemStore`]) declare `Leaf` and override this to
+    /// report real per-key results from `MokaEvictingMap::pin_key_indefinite()`.
+    fn pin_digests_indefinite_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        match self.pin_delegation() {
+            PinDelegation::Leaf => {
+                // Non-pinning leaves (Memory, Noop) cannot give an indefinite
+                // pin; report all-false so the caller treats it as not-pinned.
+                // (Memory's fast tier is not the F5 spill target — only the
+                // worker FilesystemStore fast tier is.)
+                vec![false; digests.len()]
+            }
+            PinDelegation::Inner(s) | PinDelegation::Passthrough(s) => {
+                s.pin_digests_indefinite_with_results(digests)
+            }
+            PinDelegation::Many(children) => {
+                let mut combined = vec![false; digests.len()];
+                for child in children {
+                    let per_child = child.pin_digests_indefinite_with_results(digests);
                     debug_assert_eq!(per_child.len(), digests.len());
                     for (slot, result) in combined.iter_mut().zip(per_child) {
                         *slot |= result;

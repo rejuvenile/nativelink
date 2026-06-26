@@ -2659,6 +2659,22 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .collect()
     }
 
+    fn pin_digests_indefinite_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        // F5 C2* mirror-spill: take a genuine INDEFINITE pin per digest so the
+        // spilled sole copy is EXEMPT from the 120 s `expire_stale_pins` sweep
+        // (which would otherwise demote it to plain LRU during an unbounded
+        // degraded shutdown, letting F3b's forced-drain evict the blob we just
+        // made durable). `pin_key_indefinite` returns `false` on eviction race
+        // OR indefinite-cap refusal — the spill treats either as a failed spill
+        // (kept in failed_slow_writes for retry), never as durable. NOT the
+        // time-bounded fallback (`pin_digest_indefinite_or_time_bounded`): a
+        // 120 s pin does NOT give until-restart durability.
+        digests
+            .iter()
+            .map(|d| self.pin_digest_indefinite_with_result(d))
+            .collect()
+    }
+
     /// #334 Fix C: trait-method form of the existing public
     /// [`Self::unpin_digest`] (singular). Routed through the
     /// `pin_delegation` chain so the server-side BIS broadcast loop

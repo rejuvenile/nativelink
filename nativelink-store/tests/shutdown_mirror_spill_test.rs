@@ -36,9 +36,8 @@
 //!
 //! * `c2star_mirror_spilled_to_disk_and_pinned` (primary, red→green): a
 //!   mirror-only C2\* blob IS on the local `FilesystemStore` (disk) after the
-//!   spill AND is pinned; the degraded slow store was NEVER written. Carries
-//!   the bespoke messages for BOTH the drain-to-server mutation and the
-//!   enumeration-source mutation.
+//!   spill AND is held under an INDEFINITE pin that SURVIVES a real
+//!   `expire_stale_pins` sweep; the degraded slow store was NEVER written.
 //! * `plain_mirror_not_in_failed_writes_is_not_spilled` (over-action /
 //!   confirm-necessity of `∩ failed_slow_writes`): a PLAIN mirror blob (NOT in
 //!   `failed_slow_writes`) is NOT spilled to disk and is counted skipped — the
@@ -49,18 +48,30 @@
 //!
 //! ## Mutations (TDD step 5) — all verified to red-fail with the bespoke msg
 //!
-//! 1. Drain-to-server-only (route C2\* through `slow_store.update_oneshot`
-//!    instead of `materialize_mirror_to_fast`) → the C2\* blob never lands on
-//!    disk → `c2star_mirror_spilled_to_disk_and_pinned` reds with "C2* mirror
-//!    blob not spilled to disk — lost on restart".
-//! 2. Spill-without-pin (drop the `pin_digests` after the disk write) → the
+//! 1. Drain-to-server-only (route C2\* through `slow_store.update_oneshot` and
+//!    mask its Err as success) → the C2\* blob never lands on disk. NOTE: when
+//!    the masked slow write is allowed to Err (not masked), the test reds FIRST
+//!    at the `errored == 0` guard (test:~383); with the Err masked it reds at
+//!    the on-disk assertion (test:~396) with "C2* mirror blob not spilled to
+//!    disk — lost on restart".
+//! 2. Spill-without-pin (drop the pin after the disk write) → the
 //!    freshly-materialized entry is plain-LRU-evictable →
-//!    `c2star_mirror_spilled_to_disk_and_pinned` reds with "C2* blob spilled
-//!    but NOT pinned — F3b eviction-drain can evict it before restart".
+//!    `c2star_mirror_spilled_to_disk_and_pinned` reds at the FIRST pin check
+//!    with "C2* blob spilled but NOT pinned — F3b eviction-drain can evict it
+//!    before restart".
 //! 3. Enumeration-source bug (enumerate `fast_store.list()` instead of
 //!    `mirror_blob_digests()`) → C2\* is not on disk → never enumerated →
-//!    `c2star_mirror_spilled_to_disk_and_pinned` reds with "C2* mirror blob not
-//!    spilled to disk — lost on restart".
+//!    reds at the on-disk assertion with "C2* mirror blob not spilled to disk —
+//!    lost on restart".
+//! 4. Non-indefinite pin (pair-a MAJOR; revert the spill to the time-bounded
+//!    `fast_store.pin_digests`) → the pin SURVIVES the first check but
+//!    `expire_stale_pins` DEMOTES it (non-indefinite, >120s) → the post-sweep
+//!    check reds with "C2* spill pin demoted by expire_stale_pins — would be
+//!    re-lost on a >120s shutdown; must be INDEFINITE".
+//! 5. Remove-on-ENOSPC (remove the digest from `failed_slow_writes` on a
+//!    per-entry failure) → `spill_enospc_is_tolerated_per_entry` reds with
+//!    "ENOSPC'd C2* digest must REMAIN in failed_slow_writes after a tolerated
+//!    spill failure".
 
 use core::pin::Pin;
 use core::time::Duration;
@@ -399,14 +410,33 @@ async fn c2star_mirror_spilled_to_disk_and_pinned() -> Result<(), Error> {
         "C2* mirror blob not spilled to disk — lost on restart"
     );
 
-    // ---- The pin assertion (Mutation 2 reds here) ----
-    // The spill MUST pin the freshly-written entry (distsys F5-1). A pinned
-    // entry lives in the side `pinned` map; `test_force_pin_expired` returns
-    // true iff the digest is pinned there. Without the spill's re-pin the
-    // entry sits in the plain LRU cache (evictable) and this is false.
+    // ---- The pin assertion: the spill must take an INDEFINITE pin that
+    // SURVIVES the 120s expire_stale_pins sweep (pair-a MAJOR + F5-1). ----
+    //
+    // Step 1: the entry is pinned at all (Mutation: no pin → false here). A
+    // pinned entry lives in the side `pinned` map; `test_force_pin_expired`
+    // returns true iff present AND rewinds its `pinned_at` to >120s ago so the
+    // very next sweep would demote a NON-indefinite pin (an indefinite pin is
+    // exempt and ignores `pinned_at`).
     assert!(
         h.fs_store.test_force_pin_expired(&digest),
         "C2* blob spilled but NOT pinned — F3b eviction-drain can evict it before restart"
+    );
+
+    // Step 2: run the REAL pin-expiry sweep (the same call the 10s background
+    // eviction loop makes during shutdown). An INDEFINITE pin is exempt and
+    // remains pinned; a time-bounded pin (the bug) is DEMOTED to plain LRU.
+    tokio::time::timeout(NO_DEADLOCK_TIMEOUT, h.fs_store.test_expire_stale_pins())
+        .await
+        .expect("DEADLOCK: expire_stale_pins did not return");
+
+    // Step 3: STILL pinned after the sweep == the indefinite pin survived. A
+    // non-indefinite pin (Mutation: revert to fast_store.pin_digests) is now
+    // demoted → this is false → the blob would be evicted on a >120s shutdown.
+    assert!(
+        h.fs_store.test_force_pin_expired(&digest),
+        "C2* spill pin demoted by expire_stale_pins — would be re-lost on a >120s shutdown; \
+         must be INDEFINITE"
     );
 
     // ---- The spill went to DISK, not the server ----
