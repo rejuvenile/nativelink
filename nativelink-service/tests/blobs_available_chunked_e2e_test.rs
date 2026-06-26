@@ -276,6 +276,8 @@ fn build_notification(
         swap_used_bytes: 0,
         memory_pressure_level: 0,
         memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
     }
 }
 
