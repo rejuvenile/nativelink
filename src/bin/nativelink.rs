@@ -1554,6 +1554,19 @@ async fn inner_main(
         .as_ref()
         .and_then(WorkerApiServer::shutdown_puller);
 
+    // (#sigkill-gap) Capture the WORKER-INTAKE quiesce latch's WRITE handle
+    // BEFORE the `WorkerApiServer` is consumed by `into_service`. The SIGTERM
+    // closure flips this at the new Phase 0b — BEFORE the unbounded flush — so
+    // the handler-invoked backfill / pinned-mirror-pull feeds stop soliciting
+    // new worker uploads and the drain converges instead of being storm-fed.
+    // Distinct from `bazel_reapi_quiesce` (which gates the public :50051 Bazel
+    // listener); this gates the worker-facing intake the Bazel latch leaves
+    // open. `None` when there is no worker_api entry. See
+    // `WorkerApiServer::shutdown_quiesce_handle`.
+    let worker_intake_quiesce = pre_built_worker_api_holder
+        .as_ref()
+        .map(WorkerApiServer::shutdown_quiesce_handle);
+
     // (#58 directive-3) Capture the locality-persist handle BEFORE the
     // `WorkerApiServer` is consumed by `into_service`. Holds cheap clones of the
     // shared {locality_map, endpoint_state} the persist snapshots + the reload
@@ -2735,6 +2748,9 @@ async fn inner_main(
         // (#58 directive-2) The Bazel-REAPI quiesce latch (flipped first) and
         // the worker-pull handle (driven before eviction), captured by move.
         let shutdown_quiesce = bazel_reapi_quiesce.clone();
+        // (#sigkill-gap) Worker-intake quiesce latch, flipped at the new
+        // Phase 0b (before the unbounded flush). Moved into the SIGTERM closure.
+        let worker_intake_quiesce = worker_intake_quiesce;
         let shutdown_puller = shutdown_puller;
         // (#58 directive-3) Locality-persist handle, driven at Phase 3.5 (after
         // the pull, before eviction). Moved into the SIGTERM closure.
@@ -2757,6 +2773,33 @@ async fn inner_main(
             // needs them OPEN. In-flight requests still drain.
             shutdown_quiesce.quiesce();
             info!("Bazel REAPI quiesced; new client requests will get UNAVAILABLE");
+
+            // Phase 0b (#sigkill-gap): QUIESCE the WORKER-FACING work-intake.
+            // Phase 0a only gates the public :50051 Bazel listener; the
+            // worker-facing listeners (:50061/:50071/:50072) stay OPEN (the
+            // worker-PULL below needs them). But the already-open worker
+            // connections keep ticking BlobsAvailable every ~100 ms, and each
+            // tick's HANDLER-invoked backfill + pinned-mirror-pull feeds solicit
+            // new worker uploads + run has_with_results/has_durably scans — the
+            // storm that re-feeds the at-risk set the drain is trying to
+            // converge (observed live: `total=11887 missing=11887`, 111% CPU).
+            // Flip the worker-intake latch HERE, BEFORE the unbounded flush, so
+            // those handler-invoked feeds early-return (solicit nothing, run no
+            // CAS scans). The server-INITIATED ShutdownPuller (Phase 3) passes
+            // no latch, so the shutdown PULL is unaffected — it IS the drain.
+            // OBSERVABILITY-ONLY backstop: store_manager's per-size-class
+            // progress + stall detector make a wedged slow tier visible; nothing
+            // auto-kills (hard constraint: data loss is an operator decision).
+            if let Some(ref q) = worker_intake_quiesce {
+                q.quiesce();
+                info!(
+                    "worker-intake quiesced (Phase 0b); handler-invoked backfill / \
+                     pinned-mirror-pull suppressed so the unbounded drain converges \
+                     (the shutdown worker-PULL stays open)"
+                );
+            } else {
+                info!("no worker_api entry; skipping worker-intake quiesce (Phase 0b)");
+            }
 
             // Phase 1+2 (#210, moved up): flush in-flight slow writes + drain
             // every MemoryStore-only CAS blob to the durable slow tier, BEFORE

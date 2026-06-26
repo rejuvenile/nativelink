@@ -1574,6 +1574,32 @@ impl FastSlowStore {
         self.in_flight_slow_writes_bytes.load(Ordering::Relaxed)
     }
 
+    /// (#sigkill-gap) Cardinality of the NOT-YET-DURABLE at-risk digest set —
+    /// the EXACT set `flush_fast_to_slow_at_shutdown` drains:
+    /// `in_flight_slow_writes ∪ chunked_in_flight_digests ∪ failed_slow_writes`
+    /// (deduped by digest). This is the "remaining in-memory blobs" the shutdown
+    /// drain progress poller reports per size class so an operator can see the
+    /// residue fall to zero (or stall). Counts the UNION (not the sum) because a
+    /// digest can be in more than one map; the union is the true number of blobs
+    /// still needing a durable slow-tier write. Three short `parking_lot` locks,
+    /// no `.await`; safe to call from the 2 s progress tick.
+    #[must_use]
+    pub fn at_risk_count(&self) -> usize {
+        let mut set: HashSet<DigestInfo> = HashSet::new();
+        for k in self.in_flight_slow_writes.lock().keys() {
+            if let StoreKey::Digest(d) = k.borrow() {
+                set.insert(d);
+            }
+        }
+        for d in self.chunked_in_flight_digests.lock().keys() {
+            set.insert(*d);
+        }
+        for d in self.failed_slow_writes.lock().iter() {
+            set.insert(*d);
+        }
+        set.len()
+    }
+
     /// #334 Fix B: cap on `in_flight_slow_write_bytes`. Zero means
     /// "no cap" (preserves the historic unbounded behavior). Used by
     /// the admission gate immediately before a `tokio::spawn` that

@@ -65,6 +65,8 @@ use uuid::Uuid;
 
 use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 
+use crate::worker_quiesce::ShutdownQuiesce;
+
 pub type ConnectWorkerStream =
     Pin<Box<dyn Stream<Item = Result<UpdateForWorker, Status>> + Send + Sync + 'static>>;
 
@@ -225,6 +227,18 @@ pub struct WorkerApiServer {
     /// `mark_stable_has_with_results_failures` counter.
     #[metric(group = "worker_api")]
     metrics: Arc<WorkerApiMetrics>,
+    /// (#sigkill-gap) Worker-intake quiesce latch, flipped at SIGTERM Phase 0b
+    /// (`src/bin/nativelink.rs`) BEFORE the unbounded flush phases. Cloned into
+    /// every `WorkerConnection`; read at the entry of the HANDLER-invoked
+    /// `request_missing_blob_uploads` (the backfill + pinned-mirror-pull feeds)
+    /// to suppress NEW worker-upload solicitation during the shutdown drain so
+    /// it converges to a fixed point instead of being storm-fed. The
+    /// server-initiated `ShutdownPuller::run` does NOT consult this (it passes
+    /// `None`) — the shutdown PULL stays open. Constructed internally (like
+    /// `metrics` / `endpoint_state`) so the public constructors' arg lists are
+    /// unchanged; the bin obtains the write handle via
+    /// `shutdown_quiesce_handle`.
+    shutdown_quiesce: ShutdownQuiesce,
     // #212 v4.5: WriteChunked moved off `WorkerApi` to the new
     // `CasExtensions` service so it can be registered on the same
     // listener as `cas` / `bytestream` (see
@@ -363,6 +377,25 @@ pub struct WorkerApiMetrics {
     #[metric(group = "chunked_blobs_available")]
     pub chunked_blobs_available_drop_counts:
         Arc<crate::blobs_available_accumulator::ChunkDropCounts>,
+
+    /// (#sigkill-gap) Total worker-upload solicitations SUPPRESSED by the
+    /// shutdown worker-intake quiesce latch (Phase 0b). Incremented at the
+    /// HANDLER-invoked `request_missing_blob_uploads` entry whenever the latch
+    /// is set — i.e. the count of backfill / pinned-mirror-pull feeds the
+    /// quiesce would have run during the shutdown drain. A NON-ZERO and STILL
+    /// RISING value during shutdown confirms the latch is doing its job (the
+    /// storm is being suppressed). A non-zero value paired with the shutdown
+    /// drain failing to converge would indicate a quiesce ESCAPE (a
+    /// worker-solicited feed that bypasses this gate). Observability only; the
+    /// latch never auto-acts. Server-initiated `ShutdownPuller::run` does NOT
+    /// increment this — it passes no latch and is the drain, not the storm.
+    #[metric(
+        help = "Total worker-upload solicitations suppressed by the shutdown \
+                worker-intake quiesce latch (SIGTERM Phase 0b). Rising during \
+                shutdown = the latch is suppressing the backfill storm so the \
+                unbounded flush can converge."
+    )]
+    pub shutdown_suppressed_backfill_solicitations_total: AtomicU64,
 }
 
 /// (#387) Flap-detection thresholds. Three boot_epoch_id changes for
@@ -559,7 +592,19 @@ impl WorkerApiServer {
             flap_history: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             compatible_build_shas,
             metrics: Arc::new(WorkerApiMetrics::default()),
+            shutdown_quiesce: ShutdownQuiesce::new(),
         })
+    }
+
+    /// (#sigkill-gap) Returns a clone of the worker-intake quiesce latch's
+    /// WRITE handle. The bin captures this into the SIGTERM closure and calls
+    /// `.quiesce()` at Phase 0b — BEFORE the unbounded flush — so the
+    /// handler-invoked backfill / pinned-mirror-pull feeds stop soliciting new
+    /// worker uploads and the drain converges. Cheap to clone (one
+    /// `Arc<AtomicBool>`); observes the SAME latch the `WorkerConnection`s read.
+    #[must_use]
+    pub fn shutdown_quiesce_handle(&self) -> ShutdownQuiesce {
+        self.shutdown_quiesce.clone()
     }
 
     /// Returns a clone of the metrics handle so callers (e.g. tests,
@@ -1043,6 +1088,7 @@ impl WorkerApiServer {
             self.endpoint_state.clone(),
             worker_tx,
             self.metrics.clone(),
+            self.shutdown_quiesce.clone(),
             update_stream,
         );
 
@@ -1383,6 +1429,12 @@ impl ShutdownPuller {
                     // send_uploads_if_missing: the pull MUST send (no cooldown).
                     true,
                     &self.metrics,
+                    // (#sigkill-gap) `None` = NOT subject to the worker-intake
+                    // quiesce latch: ShutdownPuller IS the shutdown drain (the
+                    // server-initiated pull), not the storm. It must keep
+                    // soliciting worker uploads even after Phase 0b set the
+                    // latch — that is the whole point of the pull phase.
+                    None,
                 )
                 .await;
             }
@@ -1959,6 +2011,12 @@ struct WorkerConnection {
     backfill_inflight: Arc<parking_lot::Mutex<HashMap<DigestInfo, Instant>>>,
     /// Shared metrics handle (cloned from `WorkerApiServer::metrics`).
     metrics: Arc<WorkerApiMetrics>,
+    /// (#sigkill-gap) Worker-intake quiesce latch (cloned from
+    /// `WorkerApiServer::shutdown_quiesce`). Read at the entry of the
+    /// HANDLER-invoked `request_missing_blob_uploads` so the backfill +
+    /// pinned-mirror-pull feeds stop soliciting new worker uploads once SIGTERM
+    /// Phase 0b flips it.
+    shutdown_quiesce: ShutdownQuiesce,
     /// (#99) Per-connection accumulator for chunked
     /// `BlobsAvailableChunk` envelopes. Path A semantics: chunks
     /// buffer here until `is_last=true` lands; the accumulator then
@@ -1989,6 +2047,7 @@ impl WorkerConnection {
         endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
         worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
         metrics: Arc<WorkerApiMetrics>,
+        shutdown_quiesce: ShutdownQuiesce,
         mut connection: impl Stream<Item = Result<UpdateForScheduler, Status>> + Unpin + Send + 'static,
     ) {
         let instance = Self {
@@ -2021,6 +2080,7 @@ impl WorkerConnection {
                     Arc::clone(&metrics.chunked_blobs_available_drop_counts),
                 ),
             metrics,
+            shutdown_quiesce,
         };
 
         background_spawn!("worker_api", async move {
@@ -2987,6 +3047,11 @@ impl WorkerConnection {
                 let worker_id = self.worker_id.clone();
                 let inflight = self.backfill_inflight.clone();
                 let metrics = self.metrics.clone();
+                // (#sigkill-gap) Handler-invoked pinned-mirror-pull feed: pass
+                // the worker-intake latch so SIGTERM Phase 0b suppresses it
+                // (the convergent BLOCK pair-a/red-team flagged this cooldown-
+                // bypassing feed as a quiesce escape if left ungated).
+                let quiesce = self.shutdown_quiesce.clone();
                 background_spawn!("pull_pinned_mirror_blobs", async move {
                     Self::request_missing_blob_uploads(
                         &cas,
@@ -2999,6 +3064,7 @@ impl WorkerConnection {
                         // matters more than the throttle.
                         true,
                         &metrics,
+                        Some(&quiesce),
                     )
                     .await;
                 });
@@ -3045,6 +3111,11 @@ impl WorkerConnection {
                 let worker_id = self.worker_id.clone();
                 let inflight = self.backfill_inflight.clone();
                 let metrics = self.metrics.clone();
+                // (#sigkill-gap) Handler-invoked backfill + mark_stable feed:
+                // pass the worker-intake latch so SIGTERM Phase 0b suppresses
+                // it (this is the `total=11887 missing=11887` storm observed
+                // mid-shutdown).
+                let quiesce = self.shutdown_quiesce.clone();
                 // Drop the locality map write lock before spawning.
                 drop(map);
                 // A2 fold: ack field-16 entries strictly AFTER the
@@ -3068,6 +3139,7 @@ impl WorkerConnection {
                             &inflight,
                             cooldown_passed,
                             &metrics,
+                            Some(&quiesce),
                         )
                         .await;
                     }
@@ -3126,6 +3198,17 @@ impl WorkerConnection {
     /// within the last `BACKFILL_INFLIGHT_TIMEOUT_SECS` are skipped to avoid
     /// redundant uploads. Digests that have since appeared in the CAS (or
     /// whose requests have timed out) are removed from the in-flight set.
+    /// `quiesce` is the worker-intake shutdown latch. The HANDLER-invoked feeds
+    /// (the `handle_blobs_available` backfill spawn + the pinned-mirror-pull
+    /// spawn) pass `Some(&self.shutdown_quiesce)`; the server-INITIATED
+    /// `ShutdownPuller::run` passes `None`. When the latch is set this fn
+    /// early-returns at the very entry — soliciting NOTHING and running NO CAS
+    /// existence work (`has_with_results` / `has_durably`) — so the shutdown
+    /// drain converges instead of being storm-fed AND the 111% mid-shutdown CPU
+    /// (the per-tick existence scans) stops. The mark_stable / BIS-unpin oath is
+    /// also suppressed for shutdown: the server is exiting, so post-restart BIS
+    /// re-acks (same as the evict/GoingAway path today); workers stay pinned
+    /// (failed_slow_writes + FS pin) until the restarted server re-acks.
     async fn request_missing_blob_uploads(
         cas_store: &Store,
         worker_tx: &mpsc::UnboundedSender<UpdateForWorker>,
@@ -3134,7 +3217,23 @@ impl WorkerConnection {
         inflight: &parking_lot::Mutex<HashMap<DigestInfo, Instant>>,
         send_uploads_if_missing: bool,
         metrics: &WorkerApiMetrics,
+        quiesce: Option<&ShutdownQuiesce>,
     ) {
+        // Phase 0b worker-intake quiesce (handler-invoked feeds only). The
+        // shutdown PULL passes `quiesce = None` and is therefore never
+        // suppressed — it IS the drain, not the storm. See the type-level
+        // `ShutdownQuiesce` doc + the SIGTERM Phase 0b in `src/bin/nativelink.rs`.
+        if quiesce.is_some_and(ShutdownQuiesce::is_quiesced) {
+            // Count the suppressed solicitation so an operator can confirm the
+            // latch is doing its job during shutdown (a rising value = the
+            // storm is being suppressed) and so a quiesce ESCAPE (a feed that
+            // bypasses this gate) is detectable. Observability only.
+            metrics
+                .shutdown_suppressed_backfill_solicitations_total
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         if digests.is_empty() {
             return;
         }
