@@ -136,6 +136,19 @@ pub struct Worker {
     #[metric(help = "CPU load percentage reported by the worker.")]
     pub cpu_load_pct: u32,
 
+    /// (#sched-zeroload) Whether this worker has EVER reported a load reading
+    /// (via `update_worker_load`). `false` at construction and until the first
+    /// report. The load fields default to `(0,0,0)`, which in `capacity_score`
+    /// is INDISTINGUISHABLE from a genuinely-idle "all-zero" reading: both read
+    /// as 100% free → max `weighted_free` → ZERO `load_penalty` → the worker
+    /// wins every Tier-1 min-load tie. This flag lets the selector treat a
+    /// NEVER-reported worker as fully busy (max penalty) — so it does NOT win a
+    /// min-load tie over a worker with known spare capacity — while a worker
+    /// that HAS reported a genuine all-zero reading (`has_reported_load == true`,
+    /// load `(0,0,0)`) stays the most-free worker and remains selectable.
+    /// Set to `true` (never back to `false`) the first time the worker reports.
+    pub has_reported_load: bool,
+
     /// Performance-core CPU utilization (0-100). 0 means unknown.
     #[metric(help = "P-core load percentage reported by the worker.")]
     pub p_core_load_pct: u32,
@@ -323,6 +336,7 @@ impl Worker {
             cpu_load_pct: 0,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            has_reported_load: false,
             p_core_count,
             e_core_count,
             indefinite_pin_saturated: false,

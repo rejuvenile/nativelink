@@ -1203,15 +1203,39 @@ impl ApiWorkerSchedulerImpl {
         let load_byte_cost = self.load_byte_cost;
         let assume_core_count = self.assume_core_count;
         let cap_score = |w: &Worker| -> CapacityScore {
-            capacity_score(
-                w.p_core_load_pct,
-                w.e_core_load_pct,
-                w.cpu_load_pct,
-                w.p_core_count,
-                w.e_core_count,
-                assume_core_count,
-                load_byte_cost,
-            )
+            // (#sched-zeroload) A worker that has NEVER reported load is at the
+            // construction-default `(0,0,0)`, which `capacity_score` would read
+            // as 100% FREE (max `weighted_free` → ZERO penalty) — making it win
+            // every Tier-1 min-load tie despite carrying no load signal. Treat
+            // it as FULLY BUSY instead: route its real (P,E) counts (or the
+            // assume-N fallback) through `capacity_score` at 100% load, yielding
+            // `weighted_free == 0` (saturated) and MAX penalty. It thus loses a
+            // min-load tie to any worker with known spare capacity, but on a
+            // fleet where EVERY candidate is never-reported the saturation
+            // fall-through (below) still routes the action via LRU/MRU, so a
+            // fresh fleet is not wedged. A worker that HAS reported a genuine
+            // all-zero (idle) reading skips this branch and keeps penalty 0.
+            if w.has_reported_load {
+                capacity_score(
+                    w.p_core_load_pct,
+                    w.e_core_load_pct,
+                    w.cpu_load_pct,
+                    w.p_core_count,
+                    w.e_core_count,
+                    assume_core_count,
+                    load_byte_cost,
+                )
+            } else {
+                capacity_score(
+                    100,
+                    100,
+                    100,
+                    w.p_core_count,
+                    w.e_core_count,
+                    assume_core_count,
+                    load_byte_cost,
+                )
+            }
         };
 
         // (#sched-blend, backstop (a) / §R5.1) The cache tiers must FALL
@@ -2820,6 +2844,24 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| w.indefinite_pin_saturated)
+    }
+
+    /// (#sched-zeroload) Reads a worker's `has_reported_load` flag. Test-only —
+    /// lets the `worker_api_server` ingest-seam test assert that an all-zero
+    /// (genuinely idle) keepalive/blobs/execute report reaches the scheduler and
+    /// flips the flag (the gate-removal contract). `None` when the worker is
+    /// absent.
+    #[must_use]
+    pub async fn worker_has_reported_load_for_test(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Option<bool> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .0
+            .peek(worker_id)
+            .map(|w| w.has_reported_load)
     }
 
     /// (#sched-blend) Reads a worker's stored (P, E) logical-CPU counts.
@@ -5064,6 +5106,11 @@ impl WorkerScheduler for ApiWorkerScheduler {
         worker.cpu_load_pct = cpu_load_pct;
         worker.p_core_load_pct = p_core_load_pct;
         worker.e_core_load_pct = e_core_load_pct;
+        // (#sched-zeroload) Record that this worker has now reported a load
+        // reading. A genuine all-zero (truly idle) report sets this `true`, so
+        // the selector can distinguish it from a NEVER-reported worker still at
+        // the construction-default `(0,0,0)`. Never reset to `false`.
+        worker.has_reported_load = true;
         debug!(%worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Worker load updated");
         Ok(())
     }
@@ -8944,6 +8991,112 @@ mod b1_lock_decouple_tests {
                  an idle cold peer (S_warm = 90K - 102K < 0). The binary-floor mutation \
                  (8@90% → penalty 0) keeps WARM — a DIFFERENT selection, proving the \
                  penalty is continuous, not binary"
+            );
+        }
+
+        /// Register a Tier-1 root-holding pool worker that has NEVER reported
+        /// load (no `update_worker_load` call) — the production state of a
+        /// pre-first-heartbeat worker (or, before the gate fix, a Linux/Intel
+        /// worker whose readings were all-zero and gated out). Its stored load
+        /// fields stay at the construction default `(0,0,0)` AND its
+        /// `has_reported_load` flag stays `false`.
+        async fn add_tier1_worker_never_reported(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            p_count: u32,
+            e_count: u32,
+        ) {
+            let _rx = add_worker_in_pool(scheduler, name).await;
+            scheduler
+                .set_worker_core_counts(&WorkerId(name.to_string()), p_count, e_count)
+                .await
+                .expect("set core counts");
+            // Deliberately NO update_worker_load — this worker is in the
+            // never-reported initial state.
+            let mut cached = HashSet::new();
+            cached.insert(input_root());
+            scheduler
+                .update_cached_directories(&WorkerId(name.to_string()), cached)
+                .await
+                .expect("set cached dirs");
+        }
+
+        // ── T-unreported: a never-reported worker does NOT win a min-load tie ──
+        // BUG (zero-load over-selection): a worker that has NEVER reported load
+        // keeps the construction-default `(0,0,0)` load fields. In
+        // `capacity_score` that all-zero load reads as `100 - 0 = 100`% FREE on
+        // every core → max `weighted_free` → `busy_core_equiv = 0` → ZERO
+        // `load_penalty` → it wins EVERY Tier-1 min-load tie against workers
+        // with known spare capacity, biasing dispatch toward workers we have no
+        // load signal for. The fix distinguishes "never reported" (treated as
+        // fully busy / max penalty) from "reported genuinely idle".
+        //
+        // Production composition (via `select` → `find_and_reserve_worker`):
+        //   - FRESH         : never reported load (no update_worker_load), 8 P.
+        //   - KNOWN_CAPACITY: reported real load 90% (8-P → penalty 102K), 8 P.
+        // Both are Tier-1 root holders → the exact-root tier ranks by
+        // `load_penalty`. KNOWN_CAPACITY has a real, finite penalty (102K).
+        // FRESH is treated as fully busy (MAX penalty, 512K) because it never
+        // reported → KNOWN_CAPACITY wins (102K < 512K). WITHOUT the fix FRESH
+        // reads all-zero load = fully free → penalty 0 < 102K → FRESH WINS — a
+        // DIFFERENT selection (and FRESH would win regardless of candidate-set
+        // iteration order, since 0 strictly beats 102K). The selection outcome
+        // differs deterministically → the fix is proven.
+        #[nativelink_test]
+        async fn t_unreported_loses_min_load_tie_to_known_capacity() {
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            add_tier1_worker_never_reported(&scheduler, "FRESH", 8, 0).await;
+            // KNOWN_CAPACITY: reported real load 90% → finite penalty 102K.
+            add_tier1_worker(&scheduler, "KNOWN_CAPACITY", 8, 0, 90, 90, 0).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("KNOWN_CAPACITY".to_string())),
+                "zero-load over-selection: a worker that has NEVER reported load \
+                 must NOT win the min-load selection over a worker with KNOWN spare \
+                 capacity (8-P @90%, penalty 102K). Without the never-reported-vs-idle \
+                 distinction the unreported worker reads as fully free (penalty 0) and \
+                 wins — biasing dispatch toward workers we have no load signal for"
+            );
+        }
+
+        // ── T-reported-idle: a genuinely-idle reported worker stays selectable ──
+        // The dual of T-unreported: the fix must NOT penalize a worker that HAS
+        // reported an all-zero (genuinely idle) reading — that worker is the
+        // most-free worker in the fleet and must remain selectable. Guards
+        // against an over-broad fix that treats every all-zero reading (idle OR
+        // never-reported) as busy.
+        //
+        // Production composition: KNOWN_IDLE (reported all-zero, 8 P-cores) is
+        // the ONLY viable Tier-1 holder competing against a saturated busy peer.
+        // It must be chosen (penalty 0, not max). Mutation guard: if the fix
+        // forced ALL all-zero stored loads to max penalty (ignoring the
+        // has-reported distinction), KNOWN_IDLE would be saturated too and the
+        // selection would change.
+        #[nativelink_test]
+        async fn t_reported_all_zero_idle_is_selectable() {
+            // Direct arithmetic: a reported all-zero 8-P worker is fully free.
+            let cs = super::super::capacity_score(0, 0, 0, 8, 0, 8, 512 * 1024);
+            assert_eq!(
+                cs.load_penalty, 0,
+                "a reported genuinely-idle 8-P worker (all-zero load) must pay ZERO \
+                 penalty — it is the most-free worker, not a never-reported one"
+            );
+
+            let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+            // KNOWN_IDLE reported all-zero (genuinely idle) → must be selectable.
+            add_tier1_worker(&scheduler, "KNOWN_IDLE", 8, 0, 0, 0, 0).await;
+            // BUSY: count-reporting 8-P box fully saturated (penalty max).
+            add_tier1_worker(&scheduler, "BUSY", 8, 0, 100, 100, 100).await;
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("KNOWN_IDLE".to_string())),
+                "a worker that HAS reported a genuinely-idle (all-zero) reading must \
+                 remain selectable as the most-free worker — the never-reported-vs-idle \
+                 fix must let a real all-zero reading through, not penalize it"
             );
         }
     }

@@ -2367,11 +2367,16 @@ impl WorkerConnection {
         let cpu_load_pct = keep_alive_request.cpu_load_pct;
         let p_core_load_pct = keep_alive_request.p_core_load_pct;
         let e_core_load_pct = keep_alive_request.e_core_load_pct;
-        if cpu_load_pct > 0 || p_core_load_pct > 0 || e_core_load_pct > 0 {
-            debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "KeepAlive received with CPU load");
-            if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
-                warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
-            }
+        // (#sched-zeroload) UNCONDITIONAL update (previously gated on
+        // `> 0`): a genuine all-zero (truly idle) reading is the load-bearing
+        // signal that distinguishes a reported-idle worker from a never-reported
+        // one. Gating it left a truly-idle worker indistinguishable from
+        // pre-first-heartbeat — both stuck at the construction-default `(0,0,0)`
+        // → max free-capacity → zero load penalty → over-selection. Recording
+        // the zero sets `has_reported_load = true` in the scheduler.
+        debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "KeepAlive received with CPU load");
+        if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
+            warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
         }
         Ok(())
     }
@@ -2664,11 +2669,12 @@ impl WorkerConnection {
         let cpu_load_pct = notification.cpu_load_pct;
         let p_core_load_pct = notification.p_core_load_pct;
         let e_core_load_pct = notification.e_core_load_pct;
-        if cpu_load_pct > 0 || p_core_load_pct > 0 || e_core_load_pct > 0 {
-            debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "BlobsAvailable received with CPU load");
-            if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
-                warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
-            }
+        // (#sched-zeroload) UNCONDITIONAL update (previously gated on `> 0`) —
+        // see `inner_keep_alive`: a genuine all-zero reading must be recorded so
+        // a truly-idle worker is distinguished from a never-reported one.
+        debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "BlobsAvailable received with CPU load");
+        if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
+            warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
         }
 
         // (FL-681 re-saturation gate) Plumb the worker's indefinite-pin-cap
@@ -3328,11 +3334,12 @@ impl WorkerConnection {
         let cpu_load_pct = execute_complete.cpu_load_pct;
         let p_core_load_pct = execute_complete.p_core_load_pct;
         let e_core_load_pct = execute_complete.e_core_load_pct;
-        if cpu_load_pct > 0 || p_core_load_pct > 0 || e_core_load_pct > 0 {
-            debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "ExecuteComplete received with CPU load");
-            if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
-                warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
-            }
+        // (#sched-zeroload) UNCONDITIONAL update (previously gated on `> 0`) —
+        // see `inner_keep_alive`: a genuine all-zero reading must be recorded so
+        // a truly-idle worker is distinguished from a never-reported one.
+        debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "ExecuteComplete received with CPU load");
+        if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
+            warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
         }
         let operation_id = OperationId::from(execute_complete.operation_id);
         info!(

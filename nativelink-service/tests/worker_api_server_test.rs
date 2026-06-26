@@ -368,6 +368,73 @@ pub async fn server_does_not_timeout_if_keep_alive_test() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// (#sched-zeroload) Gate-removal seam test (producer → scheduler). A genuine
+/// ALL-ZERO keepalive (a truly-idle worker) must now reach the scheduler and
+/// flip `has_reported_load` from `false` to `true`. Previously the
+/// `if cpu_load_pct > 0 || p_core_load_pct > 0 || e_core_load_pct > 0` gate in
+/// `inner_keep_alive` dropped an all-zero report, leaving a truly-idle worker
+/// INDISTINGUISHABLE from a never-reported one — both stuck at the
+/// construction-default `(0,0,0)` → max free-capacity → zero load penalty →
+/// over-selection.
+///
+/// Seam crossed: `KeepAliveRequest` (wire) → `inner_keep_alive` (gate-removed)
+/// → `update_worker_load` → `Worker.has_reported_load`.
+///
+/// Mutation guidance (TDD step 5): re-introduce the `> 0` gate around the
+/// `update_worker_load` call in `inner_keep_alive`; this test then red-fails
+/// because the all-zero report is dropped and `has_reported_load` stays `false`.
+#[nativelink_test]
+pub async fn all_zero_keepalive_records_has_reported_load_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let test_context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
+    let worker_id = test_context.worker_id.clone();
+
+    // Pre-condition: a freshly-connected worker has NEVER reported load.
+    assert_eq!(
+        test_context
+            .scheduler
+            .worker_has_reported_load_for_test(&worker_id)
+            .await,
+        Some(false),
+        "a freshly-connected worker must start in the never-reported state"
+    );
+
+    // The worker reports it is genuinely IDLE — all-zero load.
+    test_context
+        .worker_stream
+        .send(Update::KeepAliveRequest(KeepAliveRequest {
+            cpu_load_pct: 0,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending keep alive {e}"))?;
+
+    // Poll until the scheduler records the report — bounded so a re-introduced
+    // gate surfaces as a clean failure rather than a hang.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if test_context
+            .scheduler
+            .worker_has_reported_load_for_test(&worker_id)
+            .await
+            == Some(true)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an all-zero (genuinely idle) keepalive did not flip has_reported_load \
+             within 5s — the `inner_keep_alive` `> 0` gate is dropping the report, \
+             leaving a truly-idle worker indistinguishable from a never-reported \
+             one (zero-load over-selection)"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    Ok(())
+}
+
 #[nativelink_test]
 pub async fn worker_receives_keep_alive_request_test() -> Result<(), Box<dyn core::error::Error>> {
     let mut test_context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
@@ -921,6 +988,8 @@ pub async fn mirror_capacity_report_plumbed_to_picker_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1003,6 +1072,8 @@ pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test(
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1055,6 +1126,8 @@ pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test(
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1116,6 +1189,8 @@ pub async fn zero_mirror_max_does_not_record_capacity_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1175,6 +1250,8 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -1241,6 +1318,8 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1280,6 +1359,8 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1342,6 +1423,8 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1372,6 +1455,8 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1426,6 +1511,8 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1456,6 +1543,8 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1515,6 +1604,8 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1604,6 +1695,8 @@ pub async fn blobs_available_with_malformed_digests_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1662,6 +1755,8 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1831,6 +1926,8 @@ async fn send_blobs_and_wait(
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -2964,6 +3061,8 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -3145,6 +3244,8 @@ pub async fn handle_blobs_available_a2_fold_merged_field13_and_field16_test()
             swap_used_bytes: 0,
             memory_pressure_level: 0,
             memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
