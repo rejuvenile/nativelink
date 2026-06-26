@@ -381,6 +381,50 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         self.existence_cache.remove(digest).await;
     }
 
+    /// Shared skip-gate probe for the write paths (`update` /
+    /// `update_oneshot`). Decides whether an incoming write may be SKIPPED
+    /// because the blob is already DURABLY present in the inner store.
+    ///
+    /// FL-688 OPT-1 (2026-06-26): this probes `inner_store.has_durably` —
+    /// the slow-tier-only query — NOT `has_with_results`. A blob present
+    /// only in a RAM tier (`FastSlowStore` fast tier / `in_flight_slow_writes`
+    /// / the RAM-only `mirror_blobs` map) is NOT durable, so it MUST NOT be
+    /// skipped: the write has to flow through to `inner_store.update`, whose
+    /// `FastSlowStore` normal path spawns the background slow-write that lands
+    /// the durable copy. Probing `has_with_results` (RAM-INCLUSIVE) was the
+    /// backfill non-convergence defect — a re-uploaded pinned-mirror blob hit
+    /// the skip branch, drained + `Ok`'d without writing the durable tier, and
+    /// `has_durably` stayed `None` so the worker-API pull feed re-solicited
+    /// the upload forever.
+    ///
+    /// This intentionally bypasses the moka existence cache (it queries the
+    /// inner store directly via the `Inner` durable-delegation route): the
+    /// cache only records "the inner store has this blob" regardless of tier,
+    /// so a cache hit is not proof of durability. `has_durably ⊆
+    /// has_with_results`, so every stale-positive the old `has_with_results`
+    /// bypass healed is still healed (cache-yes / inner-evicted), plus the
+    /// fast-only / not-yet-durable case now heals — strictly safer.
+    ///
+    /// Returns `Some(size)` when the blob is durably present (caller skips +
+    /// drains + refreshes the cache); `None` when the write must flow through
+    /// (caller runs the stale-positive heal then writes).
+    ///
+    /// Extracting this into one helper called by BOTH write paths keeps the
+    /// RAM-vs-durable skip semantics from re-diverging between `update` and
+    /// `update_oneshot` (the two sites that previously carried the identical
+    /// gate, where the `update_oneshot` copy is live via `BatchUpdateBlobs`).
+    async fn should_skip_for_durable_presence(
+        self: Pin<&Self>,
+        digest: &DigestInfo,
+    ) -> Result<Option<u64>, Error> {
+        let mut durable = [None];
+        self.inner_store
+            .has_durably(&[(*digest).into()], &mut durable)
+            .await
+            .err_tip(|| "In ExistenceCacheStore::should_skip_for_durable_presence")?;
+        Ok(durable[0])
+    }
+
     async fn inner_has_with_results(
         self: Pin<&Self>,
         keys: &[DigestInfo],
@@ -510,31 +554,36 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         // evicted from the inner store (the async eviction callback may not
         // have fired yet). Trusting the cache here would skip the upload,
         // causing Bazel's "Lost inputs no longer available remotely" error.
-        let mut exists = [None];
+        //
+        // FL-688 OPT-1: the skip-gate probes DURABLE presence (has_durably,
+        // slow-tier-only) — NOT has_with_results (RAM-inclusive). A blob held
+        // only in a RAM tier (mirror_blobs / fast / in-flight) is NOT durable
+        // and MUST flow through so the FastSlowStore background slow-write
+        // forms the durable copy. See should_skip_for_durable_presence.
         // (Probe #6) Wall-clock for the bypass-cache inner has-check.
         // Surfaces in the existing slow-log paths below so we can
         // separate inner-has latency from inner-update latency when
         // the update step shows up as slow.
         let inner_has_start = Instant::now();
-        self.inner_store
-            .has_with_results(&[digest.into()], &mut exists)
+        let durable = self
+            .should_skip_for_durable_presence(&digest)
             .await
             .err_tip(|| "In ExistenceCacheStore::update")?;
         let existence_cache_inner_has_elapsed_us =
             inner_has_start.elapsed().as_micros() as u64;
-        if exists[0].is_some() {
-            // Blob genuinely exists in the inner store — safe to skip.
+        if let Some(durable_size) = durable {
+            // Blob is already DURABLY present in the inner store — safe to skip.
             reader
                 .drain()
                 .await
                 .err_tip(|| "In ExistenceCacheStore::update")?;
             // Refresh the existence cache since we verified it exists.
             if debug_digest_match(&digest) {
-                info!(?digest, size = exists[0].unwrap(), source = "update_refresh_after_inner_has_some", "DEBUG: ExistenceCacheStore inserting wedge digest (update path: inner says present)");
+                info!(?digest, size = durable_size, source = "update_refresh_after_inner_has_some", "DEBUG: ExistenceCacheStore inserting wedge digest (update path: inner says durably present)");
             }
             let _ = self
                 .existence_cache
-                .insert(digest, ExistenceItem(exists[0].unwrap()))
+                .insert(digest, ExistenceItem(durable_size))
                 .await;
             return Ok(());
         }
@@ -670,19 +719,24 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         let digest = key.into_digest();
         // Bypass the existence cache and check inner store directly.
         // Same stale-positive prevention as update().
-        let mut exists = [None];
-        self.inner_store
-            .has_with_results(&[digest.into()], &mut exists)
+        //
+        // FL-688 OPT-1: the skip-gate probes DURABLE presence (has_durably,
+        // slow-tier-only), NOT has_with_results (RAM-inclusive). Identical
+        // gate to update(); this site is LIVE in production via
+        // BatchUpdateBlobs (cas_server is_mirror=false). See
+        // should_skip_for_durable_presence.
+        let durable = self
+            .should_skip_for_durable_presence(&digest)
             .await
             .err_tip(|| "In ExistenceCacheStore::update_oneshot")?;
-        if exists[0].is_some() {
-            // Blob genuinely exists in the inner store — safe to skip.
+        if let Some(durable_size) = durable {
+            // Blob is already DURABLY present in the inner store — safe to skip.
             if debug_digest_match(&digest) {
-                info!(?digest, size = exists[0].unwrap(), source = "update_oneshot_refresh_after_inner_has_some", "DEBUG: ExistenceCacheStore inserting wedge digest (update_oneshot path: inner says present)");
+                info!(?digest, size = durable_size, source = "update_oneshot_refresh_after_inner_has_some", "DEBUG: ExistenceCacheStore inserting wedge digest (update_oneshot path: inner says durably present)");
             }
             let _ = self
                 .existence_cache
-                .insert(digest, ExistenceItem(exists[0].unwrap()))
+                .insert(digest, ExistenceItem(durable_size))
                 .await;
             return Ok(());
         }
