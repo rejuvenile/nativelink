@@ -48,6 +48,28 @@ const PIN_CAP_FRACTION: f64 = 0.25;
 /// literal. See `chunked_write_handler::CHUNKED_COMMIT_SOFT_WARN_SECS`
 /// for the derived value (`PIN_TIMEOUT_SECS / 4 = 30`).
 pub const PIN_TIMEOUT_SECS: u64 = 120;
+/// #605: cadence of the periodic forced-drain tick in the background
+/// `drain_evictions` loop. moka's weight-based eviction is
+/// EVENTUALLY-CONSISTENT — it only enforces the byte cap on `insert` or
+/// an explicit `run_pending_tasks`. A cache that took its overshoot via
+/// the startup `insert_with_time` path (which defers `run_pending_tasks`
+/// for throughput) and then sees no further runtime `insert` would trail
+/// its cap indefinitely (the production #605 overshoot: a 40 GiB worker
+/// fast tier observed at ~162 GB). This tick periodically calls
+/// `run_pending_tasks_and_drain` so the cache converges to cap during
+/// runtime, bounding the worst-case overshoot duration to one interval.
+///
+/// Value: aligned with the sibling pin-expiry maintenance tick in the
+/// same loop (`Duration::from_secs(10)` at the `pin_check_interval`).
+/// One shared maintenance heartbeat keeps the cadence reasoning in one
+/// place; 10 s is short enough that a runtime overshoot is corrected
+/// promptly yet long enough that the periodic `run_pending_tasks` walk
+/// (which fires eviction unref/listener callbacks) is negligible
+/// overhead on an at-or-under-cap cache (where it produces no eviction
+/// events and returns after a single iteration). NOT a per-entry TTL —
+/// it adds no `time_to_live`/`time_to_idle` to cache entries; it is a
+/// loop-driven maintenance call exactly like `expire_stale_pins`.
+const DRAIN_INTERVAL_SECS: u64 = 10;
 // Eviction channel is unbounded (mpsc::unbounded_channel). Each EvictionEvent
 // is ~64 bytes (Arc<K> + T). At 1M entries that's ~64MB, well within budget.
 // Unbounded avoids blocking moka's internal lock during burst eviction
@@ -1694,6 +1716,27 @@ where
         let mut pin_check_interval = tokio::time::interval(Duration::from_secs(10));
         pin_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // #605: periodic forced-drain tick. moka's weight-based eviction is
+        // eventually-consistent — it only enforces the byte cap on `insert`
+        // or an explicit `run_pending_tasks`. A cache that took its
+        // overshoot via the startup `insert_with_time` path (which defers
+        // `run_pending_tasks`) and then sees no further runtime `insert`
+        // trails its cap indefinitely (production: a 40 GiB worker fast tier
+        // observed at ~162 GB). This tick periodically calls
+        // `run_pending_tasks_and_drain` so the cache converges to cap during
+        // runtime, bounding the worst-case overshoot to one interval.
+        // Pin-safe by construction: pinned entries were MOVED OUT of the
+        // moka cache into the side `pinned` DashMap (`pin_key_with_mode`'s
+        // `cache.invalidate`), so a forced drain over `self.cache` cannot
+        // evict them. On an at-or-under-cap cache the drain produces no
+        // eviction events and returns after a single iteration — negligible
+        // overhead. NOT a per-entry TTL: no `time_to_live`/`time_to_idle` is
+        // added to entries; this is a loop-driven maintenance call like
+        // `expire_stale_pins`.
+        let mut drain_interval =
+            tokio::time::interval(Duration::from_secs(DRAIN_INTERVAL_SECS));
+        drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 Some(()) = rx.recv() => {
@@ -1705,6 +1748,13 @@ where
                 }
                 _ = pin_check_interval.tick() => {
                     self.expire_stale_pins().await;
+                }
+                _ = drain_interval.tick() => {
+                    // Force moka's capacity check + drain the resulting
+                    // eviction events on THIS task (the sole owner of the
+                    // shared `pending_evictions` queue) — never a parallel
+                    // task, which would double-drain the queue.
+                    self.run_pending_tasks_and_drain().await;
                 }
             }
         }
@@ -2329,6 +2379,205 @@ mod tests {
              is bounded by DEFAULT_EVICTION_BATCH_SIZE; only the loop in run_pending_tasks_and_drain brings \
              the cache fully under cap.",
         );
+    }
+
+    /// #605 (F3b) composite-invariant regression: the worker
+    /// `FilesystemStore`'s eviction corner must drive the moka cache
+    /// under cap *during runtime* (not just at startup), via the
+    /// periodic forced-drain arm wired into the live `drain_evictions`
+    /// `select!` loop. This is what closes the real #605 overshoot
+    /// (worker-06 hit ~162 GB on a 40 GiB cap): moka's weight-based
+    /// eviction is EVENTUALLY-CONSISTENT and only kicks its capacity
+    /// check on `insert` / explicit `run_pending_tasks`, so a cache
+    /// that took its overshoot via `insert_with_time` (the startup
+    /// path, which defers `run_pending_tasks` for throughput) and then
+    /// sees no further runtime `insert` trails the cap indefinitely.
+    ///
+    /// Composite invariant (admission/eviction/pin triangle,
+    /// `.claude/rules/admission-eviction-pin.md`):
+    ///   `cap-set ⇒ (periodic forced-drain converges weighted_size→cap
+    ///              OR admission rejects)`.
+    /// This test DEGRADES TWO corners and proves the third compensates:
+    ///   - admission gate: ABSENT (a bare `MokaEvictingMap` has no
+    ///     `ResourceExhausted` admission path — over-cap `insert_with_time`
+    ///     always succeeds via the LRU policy), AND
+    ///   - pin: PRESENT (one entry is pinned INDEFINITELY — the
+    ///     pending-BIS-ack case, the strongest pin, EXEMPT from the TTL
+    ///     sweep).
+    /// With admission gone, the eviction corner (the new periodic drain)
+    /// is the SOLE defense and MUST bring the UNPINNED bytes under cap
+    /// while leaving the pinned bytes untouched.
+    ///
+    /// Determinism: `start_paused = true` + `current_thread` freezes the
+    /// clock; the test fires the `drain_interval` tick by explicitly
+    /// `advance`-ing past `DRAIN_INTERVAL` and yields the single runtime
+    /// thread so the spawned `drain_evictions` task runs the arm to
+    /// completion. No wall-clock sleep is used for synchronization — the
+    /// advance is deterministic and the bounded iteration count is the
+    /// deadlock detector.
+    ///
+    /// Mutation step 1 (remove the new arm): delete the
+    /// `drain_interval.tick()` arm from `drain_evictions` → the cache
+    /// never converges, the bounded advance loop exhausts, and the
+    /// post-loop assertion red-fails with the bespoke "#605: periodic
+    /// forced-drain missing — cache stays over cap" message.
+    /// Mutation step 2 (drain evicts pinned): make the forced drain able
+    /// to evict pinned entries → the pin-survival assertion red-fails.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn periodic_forced_drain_arm_converges_unpinned_under_cap() {
+        // moka's effective max_capacity in the same KB-WEIGHT units the
+        // weigher produces: `(max_bytes / 1024).max(1) = (100/1024).max(1)
+        // = 1`. Each 10-byte entry weighs `10.div_ceil(1024) = 1`
+        // KB-WEIGHT, so the cap holds at most ONE unpinned resident entry.
+        // Convergence is asserted via the EVICTION LISTENER firing (see the
+        // advance loop below), NOT via `weighted_size()`/`entry_count()`:
+        // moka's size accessors only refresh after a `run_pending_tasks`,
+        // which we deliberately never call from the test (calling it would
+        // BE the fix's job and defeat the precondition).
+        let cfg = policy(100, 0);
+        let effective_capacity = 1u64; // matches with_anchor's floor-at-1.
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+
+        // Pin ONE entry INDEFINITELY (the pending-BIS-ack F2 case) BEFORE
+        // taking the overshoot. Order matters: `pin_key_with_mode` ends
+        // with `cache.invalidate(key); cache.run_pending_tasks()`
+        // (moka_evicting_map.rs:1227-1228) — that `run_pending_tasks`
+        // WOULD enforce the cap. Pinning while the cache is small (1 entry
+        // at cap) keeps that enforcement a no-op, and MOVES the pinned
+        // entry OUT of the moka cache into the side `pinned` DashMap, so by
+        // construction the later forced drain — which only operates on
+        // `self.cache` — cannot evict it.
+        map.insert(0u64, BytesEntry(10)).await;
+        assert!(
+            map.pin_key_indefinite(0),
+            "indefinite pin should succeed for a present key"
+        );
+
+        // NOW take the overshoot via the STARTUP path (`insert_with_time`
+        // → `insert_startup`), which by contract skips `run_pending_tasks`
+        // for throughput (moka_evicting_map.rs:850, "deferred to caller").
+        // 19 × 10-byte entries = 19 KB-WEIGHT, 19× the 1-unit cap, with
+        // NOTHING calling `run_pending_tasks`. This is the production
+        // failure precondition: moka has NOT enforced the cap and (absent
+        // a runtime insert) never will on its own.
+        for k in 1..20u64 {
+            map.insert_with_time(k, BytesEntry(10), 0).await;
+        }
+
+        // Precondition: moka has NOT enforced the cap yet — the eviction
+        // listener has fired ZERO times. This is the exact production
+        // failure mode (worker-06: 162 GB on a 40 GiB cap, zero evict
+        // log lines): the startup load via `insert_with_time` deferred
+        // `run_pending_tasks`, so moka is over cap and stays there. We
+        // do NOT call `run_pending_tasks` here — that would BE the fix and
+        // defeat the test.
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "#605 precondition: insert_with_time must NOT have fired eviction \
+             (moka is over cap and un-enforced — the runtime-overshoot being \
+             fixed)",
+        );
+
+        // Start the live background loop (the production composition:
+        // `FilesystemStore::new` calls this after the startup load).
+        map.start_background_eviction();
+
+        // Drive the periodic drain arm deterministically: advance past
+        // `DRAIN_INTERVAL` to fire `drain_interval.tick()`, then yield the
+        // single runtime thread so the spawned task runs the drain. Bound
+        // the loop (deadlock detector); wrap in a `timeout` that becomes a
+        // REAL detector because we advance the clock each iteration.
+        //
+        // Convergence signal: the EVICTION LISTENER firing
+        // (`removal_count`), NOT `entry_count()`/`weighted_size()`. moka's
+        // size accessors are eventually-consistent (they only refresh after
+        // a `run_pending_tasks`) and can transiently read low even when no
+        // eviction has happened — so they are NOT arm-dependent and would
+        // green spuriously. The eviction listener fires ONLY when a moka op
+        // actually runs pending tasks; with the startup load un-enforced and
+        // NO runtime insert, the ONLY thing that runs pending tasks is the
+        // periodic drain arm. 19 unpinned entries over a 1-unit cap MUST
+        // evict 18 (the cap keeps exactly one), so `removal_count == 18` is
+        // the deterministic, fully arm-dependent end-state.
+        const EXPECTED_EVICTIONS: u64 = 18; // 19 unpinned − 1 kept at cap.
+        const MAX_TICKS: u32 = 50;
+        let drain_period = core::time::Duration::from_secs(super::DRAIN_INTERVAL_SECS);
+        // Deadlock-detector budget must exceed the bounded advance loop's
+        // total virtual time (`MAX_TICKS × DRAIN_INTERVAL` = 500 s) so that
+        // the BOUNDED LOOP — not this timeout — is what trips when the
+        // drain arm is absent (giving the bespoke convergence message, not
+        // a misleading "deadlock"). Under `start_paused` this virtual
+        // budget costs zero wall-clock; it only fires if a real hang stalls
+        // the advance loop itself.
+        let converged = tokio::time::timeout(core::time::Duration::from_secs(3600), async {
+            for _ in 0..MAX_TICKS {
+                tokio::time::advance(drain_period).await;
+                // Let the spawned `drain_evictions` task run the arm to
+                // completion (all its awaits resolve immediately on the
+                // test callback). A few yields guarantee progress on the
+                // current-thread runtime regardless of `select!` ordering.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                if removal_count.load(Ordering::Relaxed) >= EXPECTED_EVICTIONS {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("deadlock: forced-drain convergence loop did not finish");
+
+        assert!(
+            converged,
+            "#605: periodic forced-drain missing — cache stays over cap \
+             (eviction listener fired {} times, expected {} after {} drain \
+             ticks). The `drain_evictions` loop must call \
+             `run_pending_tasks_and_drain` on a periodic tick so moka's \
+             eventually-consistent eviction converges under sustained \
+             runtime ingest.",
+            removal_count.load(Ordering::Relaxed),
+            EXPECTED_EVICTIONS,
+            MAX_TICKS,
+        );
+
+        // The UNPINNED resident entries converged to ≤ cap (exactly one
+        // unpinned entry survives the 1-unit cap). `entry_count()` is
+        // reliable HERE because the drain just ran `run_pending_tasks`.
+        assert!(
+            map.cache.entry_count() <= effective_capacity,
+            "#605: post-drain UNPINNED entry_count must be ≤ cap \
+             (got {}, cap {})",
+            map.cache.entry_count(),
+            effective_capacity,
+        );
+
+        // The INDEFINITELY-PINNED entry MUST survive the forced drain —
+        // pinning moved it out of moka; the drain only touches the cache.
+        assert!(
+            map.pinned.contains_key(&0u64),
+            "#605 pin-survival: indefinitely-pinned (pending-BIS) entry was \
+             evicted by the periodic forced-drain — the drain must only \
+             evict UNPINNED cache entries, never the side `pinned` map"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            10,
+            "#605 pin-survival: pinned byte accounting must be intact after \
+             the forced drain (the pinned blob is held until BIS-ack, never \
+             dropped by eviction)"
+        );
+        assert!(
+            map.get(&0).await.is_some(),
+            "#605 pin-survival: indefinitely-pinned blob must remain \
+             reachable after the periodic forced-drain"
+        );
+
+        map.unpin_key(&0);
     }
 
     // ---------------------------------------------------------------
