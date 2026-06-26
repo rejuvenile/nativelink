@@ -59,7 +59,7 @@ use nativelink_store::ac_utils::{
 };
 use nativelink_store::cas_utils::is_zero_digest;
 use nativelink_store::fast_slow_store::FastSlowStore;
-use nativelink_store::filesystem_store::{FileEntry, FilesystemStore, IndefinitePinOutcome};
+use nativelink_store::filesystem_store::{FileEntry, FilesystemStore};
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::action_messages::{
@@ -1329,6 +1329,43 @@ const fn plan_retry_step(
 /// function red-fails the test).
 fn should_requeue_on_giveup(e: &Error, give_up_flag: bool) -> bool {
     !give_up_flag && classify_upload_error(e) == UploadRetryDecision::Retry
+}
+
+/// (FL-688 v3 Stage B) Take the anti-eviction pin for ONE output digest on the
+/// upload path, per mode. Single source of truth for the four deferred-mode
+/// durability pin sites in `spawn_upload_to_remote_impl` + the schedule-time
+/// `pin_one` closure (a mutation of this body red-fails the Stage B contract
+/// test).
+///
+/// - **Deferred (F2 durability) mode** — pin INDEFINITELY (held until the
+///   server's BlobsInStableStorage ack, exempt from the `PIN_TIMEOUT_SECS` TTL
+///   sweep). There is NO time-bounded fallback: in deferred mode the slow-store
+///   write is the AUTHORITATIVE upload and bypasses `FastSlowStore::update`, so
+///   the digest never enters `in_flight_slow_writes` and the
+///   `on_pin_expired`→`failed_slow_writes` retry path is dark — a time-bounded
+///   pin would be DEMOTED at the 120s TTL and silently lost. On indefinite
+///   cap-refusal the blob is left FULLY evictable (the accepted saturated-cap
+///   loss class; producer backpressure is the worker's
+///   `indefinite_pin_saturated()` NAK, tracked as a separate FL-681 admission-
+///   gating follow-up). Returns `false` on cap-refusal OR eviction race so the
+///   caller can warn.
+/// - **Synchronous mode** — time-bounded `pin_digest_with_result`: the
+///   schedule-time pin whose 120s-TTL→`failed_slow_writes` backstop is LIVE.
+///
+/// This is a NON-BLOCKING synchronous call (no await, no lock held across an
+/// await, no channel send) — converting the deferred-mode fallback from
+/// time-bounded to indefinite changes ONLY the eviction-exemption of the pinned
+/// entry. It cannot deadlock.
+fn pin_deferred_output_digest(
+    filesystem_store: &FilesystemStore,
+    deferred: bool,
+    digest: &DigestInfo,
+) -> bool {
+    if deferred {
+        filesystem_store.pin_digest_indefinite_with_result(digest)
+    } else {
+        filesystem_store.pin_digest_with_result(digest)
+    }
 }
 
 /// FL-681 Q1+Q2: per-digest retry control for the deferred upload loop.
@@ -4944,31 +4981,7 @@ impl RunningActionImpl {
                 .running_actions_manager
                 .deferred_output_uploads_enabled;
             let pin_one = |digest: &DigestInfo| -> bool {
-                if deferred {
-                    // FL-681 MAJOR-1b: on an indefinite cap-refusal, fall
-                    // back to a TIME-BOUNDED pin so the F2 output is never
-                    // left fully evictable (the saturated-cap loss class).
-                    // The fallback warns separately; `true` here means SOME
-                    // pin was taken (indefinite OR time-bounded), so the
-                    // generic "blob not in fast store" warn fires only on a
-                    // genuine eviction-race `Refused`.
-                    match filesystem_store.pin_digest_indefinite_or_time_bounded(digest) {
-                        IndefinitePinOutcome::Indefinite => true,
-                        IndefinitePinOutcome::TimeBoundedFallback => {
-                            warn!(
-                                %digest,
-                                "FL-681 MAJOR-1b: indefinite-pin cap exhausted at F2 schedule \
-                                 time; took a TIME-BOUNDED fallback pin (pre-FL-681 ~120s floor, \
-                                 NOT held-until-BIS). Sustained-outage loss window is open — \
-                                 see indefinite_pin_cap headroom",
-                            );
-                            true
-                        }
-                        IndefinitePinOutcome::Refused => false,
-                    }
-                } else {
-                    filesystem_store.pin_digest_with_result(digest)
-                }
+                pin_deferred_output_digest(filesystem_store, deferred, digest)
             };
             let warn_pin_miss = |digest: &DigestInfo| {
                 warn!(
@@ -6389,17 +6402,19 @@ impl RunningActionsManagerImpl {
         let deferred_pin = self.deferred_output_uploads_enabled;
         for digest in &digests {
             if deferred_pin {
-                // FL-681 MAJOR-1b: fall back to a time-bounded pin on
-                // indefinite cap-refusal so the F2 output is never left
-                // fully evictable (the saturated-cap loss class).
-                if filesystem_store.pin_digest_indefinite_or_time_bounded(digest)
-                    == IndefinitePinOutcome::TimeBoundedFallback
-                {
+                // FL-688 v3 Stage B: indefinite-ONLY (held-until-BIS). The
+                // time-bounded fallback was the deferred-mode loss window (F2
+                // bypasses in_flight_slow_writes/failed_slow_writes, so a
+                // 120s-demoted pin is silently lost). On indefinite cap-refusal
+                // the blob is left fully evictable (the accepted saturated-cap
+                // loss class; producer backpressure is the worker
+                // indefinite_pin_saturated NAK).
+                if !filesystem_store.pin_digest_indefinite_with_result(digest) {
                     warn!(
                         %digest,
-                        "FL-681 MAJOR-1b: indefinite-pin cap exhausted scheduling F2 upload; \
-                         took a TIME-BOUNDED fallback pin (pre-FL-681 ~120s floor, NOT \
-                         held-until-BIS) — sustained-outage loss window is open",
+                        "FL-688 v3 Stage B: indefinite-pin cap exhausted (or eviction race) \
+                         scheduling F2 upload; the held-until-BIS pin was REFUSED and the F2 \
+                         output is now fully evictable — see indefinite_pin_cap headroom",
                     );
                 }
             } else {
@@ -6606,18 +6621,18 @@ impl RunningActionsManagerImpl {
                         // BIS-ack.
                         for digest in &file_digests {
                             if deferred_pin {
-                                // FL-681 MAJOR-1b: time-bounded fallback on
-                                // indefinite cap-refusal — never leave the
-                                // F2 output fully evictable.
-                                if filesystem_store
-                                    .pin_digest_indefinite_or_time_bounded(digest)
-                                    == IndefinitePinOutcome::TimeBoundedFallback
-                                {
+                                // FL-688 v3 Stage B: indefinite-ONLY
+                                // (held-until-BIS) for tree-extracted F2 outputs;
+                                // the time-bounded fallback was the deferred-mode
+                                // loss window. Cap-refusal → fully evictable
+                                // (accepted saturated-cap loss class).
+                                if !filesystem_store.pin_digest_indefinite_with_result(digest) {
                                     warn!(
                                         %digest,
-                                        "FL-681 MAJOR-1b: indefinite-pin cap exhausted pinning \
-                                         tree-extracted F2 output; took a TIME-BOUNDED fallback \
-                                         pin (pre-FL-681 ~120s floor, NOT held-until-BIS)",
+                                        "FL-688 v3 Stage B: indefinite-pin cap exhausted (or \
+                                         eviction race) pinning tree-extracted F2 output; the \
+                                         held-until-BIS pin was REFUSED and the output is now \
+                                         fully evictable",
                                     );
                                 }
                             } else {
@@ -6896,14 +6911,20 @@ impl RunningActionsManagerImpl {
                                         MAX_BACKOFF,
                                         |mode| match mode {
                                             RepinMode::Indefinite => {
-                                                // FL-681 MAJOR-1b: the
-                                                // re-pin before a read-race
-                                                // retry must also fall back
-                                                // to time-bounded on cap
-                                                // refusal — never leave the
-                                                // re-read source unprotected.
+                                                // FL-688 v3 Stage B: indefinite-
+                                                // ONLY re-pin (held-until-BIS),
+                                                // matching the schedule-time
+                                                // deferred pin. The time-bounded
+                                                // fallback was the deferred-mode
+                                                // loss window; on cap-refusal the
+                                                // source is left fully evictable
+                                                // (the read-race retry's slow-tier
+                                                // re-read self-heals if the source
+                                                // survives). Aligns with the
+                                                // RepinMode::Indefinite contract
+                                                // doc (pin_digest_indefinite_with_result).
                                                 let _ = filesystem_store
-                                                    .pin_digest_indefinite_or_time_bounded(&digest);
+                                                    .pin_digest_indefinite_with_result(&digest);
                                             }
                                             RepinMode::TimeBounded => {
                                                 filesystem_store.pin_digest(&digest);
@@ -9075,6 +9096,193 @@ mod upload_retry_classification_tests {
                  remote ramp must stay second-scale"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod deferred_pin_indefinite_only_tests {
+    //! (FL-688 v3 Stage B) The four `deferred_output_uploads_enabled` durability
+    //! pin sites switch from `pin_digest_indefinite_or_time_bounded` (TTL
+    //! fallback on cap-refusal) to `pin_digest_indefinite_with_result`
+    //! (indefinite-ONLY) via the single-source-of-truth helper
+    //! [`super::pin_deferred_output_digest`]. This module drives that EXACT
+    //! production helper against a real `FilesystemStore` + the real
+    //! `PIN_TIMEOUT_SECS` sweep, so a mutation of the helper body red-fails.
+    //!
+    //! Asymmetric coverage: the deferred admit direction (indefinite, survives
+    //! the sweep) AND the deferred cap-refusal direction (fully evictable, NO
+    //! time-bounded fallback) AND the synchronous direction (time-bounded
+    //! `pin_digest_with_result`, untouched by Stage B).
+
+    use std::sync::Arc;
+
+    use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
+    use nativelink_macro::nativelink_test;
+    use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::store_trait::StoreLike;
+
+    use super::pin_deferred_output_digest;
+
+    async fn make_store(indefinite_cap_bytes: u64) -> (Arc<FilesystemStore>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content_path = tmp.path().join("content");
+        let temp_path = tmp.path().join("temp");
+        std::fs::create_dir_all(&content_path).expect("mk content_path");
+        std::fs::create_dir_all(&temp_path).expect("mk temp_path");
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.to_string_lossy().into_owned(),
+            temp_path: temp_path.to_string_lossy().into_owned(),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: 1024 * 1024,
+                ..Default::default()
+            }),
+            pending_bis_pin_max_bytes: indefinite_cap_bytes,
+            ..Default::default()
+        })
+        .await
+        .expect("FilesystemStore::new");
+        (store, tmp)
+    }
+
+    /// DEFERRED ADMIT: `pin_deferred_output_digest(store, deferred=true, d)`
+    /// takes an INDEFINITE pin that SURVIVES the `PIN_TIMEOUT_SECS` sweep
+    /// (held-until-BIS). The OLD `_or_time_bounded` helper, with the indefinite
+    /// cap below the blob size, would have fallen to a TIME-BOUNDED pin and been
+    /// demoted by this sweep.
+    ///
+    /// MUTATION: revert `pin_deferred_output_digest`'s deferred arm to
+    /// `pin_digest_indefinite_or_time_bounded` AND set the cap below the blob
+    /// (e.g. `make_store(1)`) → the fallback takes a time-bounded pin →
+    /// rewind+sweep demotes it → this test red-fails with the bespoke message.
+    #[nativelink_test]
+    async fn deferred_pin_is_indefinite_and_survives_ttl_sweep() {
+        let (fs_store, _tmp) = make_store(1024 * 1024).await;
+        let output = DigestInfo::new([7u8; 32], 6);
+        fs_store
+            .as_pin()
+            .update_oneshot(output, "hello!".into())
+            .await
+            .expect("write F2 output blob");
+
+        assert!(
+            pin_deferred_output_digest(fs_store.as_ref(), /* deferred */ true, &output),
+            "deferred-mode durability pin should admit under an unsaturated indefinite cap"
+        );
+
+        // Confirm the indefinite pin is held (non-zero indefinite accounting).
+        assert!(
+            fs_store.indefinite_pinned_bytes() > 0,
+            "the deferred durability pin must be an INDEFINITE pin (counts against indefinite \
+             accounting)"
+        );
+        // Rewind the deadline past PIN_TIMEOUT_SECS and run the real sweep with
+        // NO BIS-ack.
+        assert!(
+            fs_store.test_force_pin_expired(&output),
+            "the durability pin must be present before the sweep"
+        );
+        fs_store.test_expire_stale_pins().await;
+
+        // SURVIVAL = held-until-BIS. The sweep `continue`s indefinite pins, so
+        // the entry is STILL in the pinned map afterwards
+        // (`test_force_pin_expired` finds it again). A time-bounded fallback pin
+        // would have been REMOVED (demoted to LRU) by the sweep.
+        assert!(
+            fs_store.test_force_pin_expired(&output),
+            "deferred-mode durability pin was DEMOTED by the PIN_TIMEOUT_SECS sweep: \
+             pin_deferred_output_digest's deferred arm must be indefinite-ONLY \
+             (pin_digest_indefinite_with_result, held-until-BIS), exempt from the TTL sweep — a \
+             time-bounded fallback is the deferred-mode loss window (F2 bypasses \
+             in_flight_slow_writes/failed_slow_writes)"
+        );
+        assert!(
+            fs_store.indefinite_pinned_bytes() > 0,
+            "deferred-mode durability pin lost its indefinite accounting across the sweep — it \
+             must remain indefinitely pinned until the BIS-ack"
+        );
+
+        fs_store.unpin_digest(&output);
+    }
+
+    /// DEFERRED CAP-REFUSAL (asymmetric): with the indefinite cap exhausted,
+    /// `pin_deferred_output_digest` returns `false` and takes NO fallback pin —
+    /// the blob is FULLY evictable (the accepted saturated-cap loss class). The
+    /// OLD `_or_time_bounded` helper would have taken a TIME-BOUNDED pin here
+    /// (non-zero pinned bytes).
+    ///
+    /// MUTATION: revert the deferred arm to `pin_digest_indefinite_or_time_bounded`
+    /// → on cap-refusal it takes a time-bounded pin → `pinned_bytes() != 0` and
+    /// `test_force_pin_expired` returns true → this test red-fails.
+    #[nativelink_test]
+    async fn deferred_cap_refusal_is_fully_evictable_not_time_bounded() {
+        // Indefinite cap = 1 byte: the 6-byte blob's indefinite pin is REFUSED.
+        let (fs_store, _tmp) = make_store(1).await;
+        let output = DigestInfo::new([8u8; 32], 6);
+        fs_store
+            .as_pin()
+            .update_oneshot(output, "hello!".into())
+            .await
+            .expect("write F2 output blob");
+
+        assert!(
+            !pin_deferred_output_digest(fs_store.as_ref(), /* deferred */ true, &output),
+            "deferred indefinite-only pin must be REFUSED when the indefinite cap (1 byte) cannot \
+             fit the 6-byte blob"
+        );
+        assert_eq!(
+            fs_store.indefinite_pinned_bytes(),
+            0,
+            "a cap-refused indefinite pin must hold ZERO indefinite bytes"
+        );
+        assert!(
+            !fs_store.test_force_pin_expired(&output),
+            "cap-refusal must leave the F2 blob FULLY evictable (NO time-bounded fallback pin): \
+             pin_deferred_output_digest accepts the saturated-cap loss class (producer backpressure \
+             is the worker indefinite_pin_saturated NAK); it must NOT silently take a time-bounded \
+             pin the way the removed _or_time_bounded helper did"
+        );
+    }
+
+    /// SYNCHRONOUS mode is UNTOUCHED by Stage B: `deferred=false` takes a
+    /// time-bounded `pin_digest_with_result` whose TTL→failed_slow_writes
+    /// backstop is live, so it is DEMOTED by the sweep (the pre-existing
+    /// synchronous behavior). Guards against accidentally making the
+    /// synchronous arm indefinite.
+    #[nativelink_test]
+    async fn synchronous_pin_stays_time_bounded() {
+        let (fs_store, _tmp) = make_store(1024 * 1024).await;
+        let output = DigestInfo::new([9u8; 32], 6);
+        fs_store
+            .as_pin()
+            .update_oneshot(output, "hello!".into())
+            .await
+            .expect("write output blob");
+
+        assert!(
+            pin_deferred_output_digest(fs_store.as_ref(), /* deferred */ false, &output),
+            "synchronous-mode pin should succeed for a present blob"
+        );
+        // Time-bounded: zero indefinite bytes (it is NOT an indefinite pin).
+        assert_eq!(
+            fs_store.indefinite_pinned_bytes(),
+            0,
+            "synchronous-mode pin must NOT count against the indefinite-pin accounting"
+        );
+        assert!(
+            fs_store.test_force_pin_expired(&output),
+            "synchronous-mode time-bounded pin must be present (and time-bounded) before the sweep"
+        );
+        fs_store.test_expire_stale_pins().await;
+        // A time-bounded pin is DEMOTED (removed from the pinned map) by the
+        // sweep — so it is no longer pinned afterwards. An indefinite pin would
+        // have survived. This guards against accidentally making the synchronous
+        // arm indefinite.
+        assert!(
+            !fs_store.test_force_pin_expired(&output),
+            "synchronous-mode pin must remain TIME-BOUNDED (demoted by the PIN_TIMEOUT_SECS sweep) \
+             — Stage B must not make the synchronous arm indefinite"
+        );
     }
 }
 
