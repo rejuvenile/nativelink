@@ -717,7 +717,7 @@ async fn inner_main(
                 let blocking_threads = metrics.num_blocking_threads();
                 let idle_blocking = metrics.num_idle_blocking_threads();
                 let blocking_depth = metrics.blocking_queue_depth();
-                if blocking_depth > 0 || (blocking_threads > 0 && idle_blocking == 0) {
+                if blocking_pressure_gate(blocking_depth, blocking_threads, idle_blocking) {
                     warn!(
                         workers,
                         blocking_threads,
@@ -3055,6 +3055,24 @@ const HEARTBEAT_FILE: &str = "/dev/shm/nativelink-heartbeat";
 #[cfg(target_os = "macos")]
 const HEARTBEAT_FILE: &str = "/tmp/nativelink-heartbeat";
 
+/// Thread-pool-pressure gate predicate for the tokio metrics checker.
+///
+/// Fires (returns `true`) when the blocking pool is saturated:
+/// - `blocking_depth > 0`: tasks are queued waiting for a blocking thread, OR
+/// - `blocking_threads > 0 && idle_blocking == 0`: every currently-alive
+///   blocking thread is busy.
+///
+/// Does NOT fire when no blocking threads are alive (`blocking_threads == 0`
+/// with empty queue) — that is the false-positive case the stall-dump fix
+/// addresses (dumps now run on plain OS threads, invisible to this metric).
+const fn blocking_pressure_gate(
+    blocking_depth: usize,
+    blocking_threads: usize,
+    idle_blocking: usize,
+) -> bool {
+    blocking_depth > 0 || (blocking_threads > 0 && idle_blocking == 0)
+}
+
 /// Dump all thread stacks to a timestamped file for post-mortem analysis.
 /// Reads /proc/self/task/*/comm, status, wchan, and stack (if permitted).
 fn dump_thread_stacks() {
@@ -3398,7 +3416,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::HEARTBEAT_FILE;
+    use super::{HEARTBEAT_FILE, blocking_pressure_gate};
 
     /// Guards against regressing the macOS watchdog fix from task #101.
     /// Linux must keep the `/dev/shm` tmpfs path so the heartbeat write
@@ -3418,5 +3436,70 @@ mod tests {
         );
         // Sanity: never empty, never relative.
         assert!(HEARTBEAT_FILE.starts_with('/'), "must be absolute");
+    }
+
+    /// Invariant: the thread-pool-pressure warn fires IFF
+    /// `blocking_queue_depth > 0` OR all blocking-pool threads are busy
+    /// (`blocking_threads > 0 AND idle_blocking == 0`). It must NOT fire
+    /// when there are no blocking threads alive (`blocking_threads == 0`).
+    ///
+    /// This test calls the PRODUCTION predicate `super::blocking_pressure_gate`
+    /// (the same `const fn` invoked by the metrics checker `if` at
+    /// nativelink.rs ~line 720), not a test-local copy — so reverting or
+    /// mutating the production gate red-fails here.
+    ///
+    /// Mutation: comment out the `blocking_threads > 0` guard in
+    /// `blocking_pressure_gate` — this test MUST red-fail with the bespoke
+    /// message "gate must NOT fire when no blocking threads exist".
+    #[test]
+    fn blocking_pressure_gate_predicate() {
+        // No blocking threads at all → gate MUST be silent even when idle=0.
+        // This is the false-positive case: infra dump thread gone from blocking pool.
+        assert!(
+            !blocking_pressure_gate(0, 0, 0),
+            "gate must NOT fire when no blocking threads exist — \
+             false-positive regression: dump-on-std-thread scenario"
+        );
+
+        // One blocking thread, idle (keepalive window) → no pressure.
+        assert!(
+            !blocking_pressure_gate(0, 1, 1),
+            "gate must NOT fire when blocking thread is idle — \
+             one thread alive but not busy is normal keepalive"
+        );
+
+        // No queue depth, zero threads → no pressure.
+        assert!(
+            !blocking_pressure_gate(0, 0, 1),
+            "gate must NOT fire with zero blocking threads (idle count irrelevant)"
+        );
+
+        // Real pressure: one blocking thread busy, none idle.
+        assert!(
+            blocking_pressure_gate(0, 1, 0),
+            "gate MUST fire when blocking thread is busy with no idle capacity — \
+             genuine spawn_blocking saturation"
+        );
+
+        // Real pressure: multiple blocking threads all busy.
+        assert!(
+            blocking_pressure_gate(0, 4, 0),
+            "gate MUST fire when all blocking threads are busy — \
+             genuine spawn_blocking saturation"
+        );
+
+        // Queue depth alone triggers gate (tasks waiting for a thread).
+        assert!(
+            blocking_pressure_gate(1, 0, 0),
+            "gate MUST fire when blocking queue has depth — \
+             tasks waiting for a blocking thread to become available"
+        );
+
+        // Queue depth + idle threads: still fires (depth is the signal).
+        assert!(
+            blocking_pressure_gate(2, 3, 2),
+            "gate MUST fire when queue has depth even if some threads are idle — \
+             queue depth is the definitive saturation signal"
+        );
     }
 }

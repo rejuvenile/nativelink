@@ -184,6 +184,33 @@ pub fn force_dump_thread_stacks(label: &str) -> bool {
     true
 }
 
+/// Run a thread-stack dump closure on a plain OS thread, NOT on tokio's
+/// blocking pool.
+///
+/// All three dump call-sites (StallGuard verdict, SIGUSR2 listener,
+/// streaming_blob deadline) route through this single helper so one
+/// property test guards every site. The dump closure
+/// (`dump_thread_stacks` / `force_dump_thread_stacks`) is fully sync
+/// (signal dispatch, file I/O, symbol resolution; bounded ~5s on Linux,
+/// up to 30s on macOS via `sample`) and requires no tokio context.
+///
+/// **Why a plain OS thread and not `spawn_blocking`.** Tokio counts a
+/// `spawn_blocking` worker in `num_blocking_threads()` and reports
+/// `idle_blocking == 0` while it runs. The thread-pool-pressure gate in
+/// nativelink.rs (`blocking_threads > 0 && idle_blocking == 0`) then
+/// fires a false-positive "pressure detected" warn for the whole dump
+/// duration — even with no genuine `spawn_blocking` work enqueued. A
+/// plain OS thread is invisible to tokio's blocking-pool metrics, so the
+/// gate stays silent during dumps and only fires on real saturation.
+///
+/// **Why not a tokio worker.** The dump's sync wait would starve a
+/// runtime worker for the full dump duration — the runtime-starvation
+/// anti-pattern (Incident 2026-04-25).
+pub(crate) fn spawn_dump_thread<F: FnOnce() + Send + 'static>(name: &str, dump: F) {
+    // Spawn failure (EAGAIN/ENOMEM) is non-fatal — dump is best-effort.
+    let _ = std::thread::Builder::new().name(name.to_string()).spawn(dump);
+}
+
 /// A guard that spawns a background task to detect stalls. When the
 /// guarded operation completes (i.e., the guard is dropped), the
 /// background task is cancelled. If the operation exceeds `threshold`,
@@ -351,16 +378,9 @@ impl StallGuard {
                     } else {
                         format!("{label}{ctx_suffix}")
                     };
-                    // dump_thread_stacks does in-process work (signal
-                    // dispatch + symbol resolution + file I/O) bounded
-                    // at 5s. We run it on the blocking pool because
-                    // dump_thread_stacks is fully sync (signal
-                    // dispatch, file I/O, symbol resolution) and would
-                    // block this verdict-task's runtime worker for
-                    // ~5s. The 1ms polling-sleep loop referenced in
-                    // earlier revisions of this comment was removed in
-                    // commit f6779f3a; spawn_blocking is retained
-                    // because the underlying sync work is unchanged.
+                    // Dump the stacks off the runtime on a plain OS thread
+                    // (sync work, bounded ~5s). Rationale for not using the
+                    // blocking pool lives in `spawn_dump_thread`.
                     #[cfg(test)]
                     {
                         let _ = dump_label;
@@ -368,7 +388,7 @@ impl StallGuard {
                     }
                     #[cfg(not(test))]
                     {
-                        let _ = tokio::task::spawn_blocking(move || {
+                        spawn_dump_thread("stall-dump", move || {
                             dump_thread_stacks(&dump_label);
                         });
                     }
@@ -621,15 +641,10 @@ pub fn spawn_external_dump_listener() {
                 );
                 continue;
             }
-            // force_dump_thread_stacks ultimately calls
-            // capture_all_backtraces, which polls for handler completion
-            // via `std::thread::sleep(1ms)` for up to 5s. Running this
-            // inline on the listener task would block one tokio worker
-            // for the full dump duration — exactly the runtime-starvation
-            // anti-pattern the deleted `sample`-subprocess wedge
-            // represented. Wrap in spawn_blocking to mirror the
-            // StallGuard pattern (see `new_inner` above).
-            let _ = tokio::task::spawn_blocking(|| {
+            // Dump off the listener task on a plain OS thread (sync work,
+            // bounded ~5s). Rationale for not using the blocking pool / a
+            // tokio worker lives in `spawn_dump_thread`.
+            spawn_dump_thread("stall-dump", || {
                 force_dump_thread_stacks("external SIGUSR2");
             });
         }
@@ -2090,6 +2105,7 @@ mod tests {
         MIN_DUMP_INTERVAL_SECS, MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict,
         TEST_DUMPS_FIRED, TEST_RATE_LIMITED_HITS, bump_progress_handle, classify_stall,
         force_dump_should_proceed, force_dump_thread_stacks, rearm_loop_dump_should_proceed,
+        spawn_dump_thread,
     };
 
     /// Serialize tests that read or assert on the process-global
@@ -3257,5 +3273,72 @@ mod tests {
                 ))
             }
         });
+    }
+
+    /// Spec: the stall dump (dump_thread_stacks / force_dump_thread_stacks)
+    /// MUST NOT run on tokio's blocking thread pool. Running it on the
+    /// blocking pool causes the tokio thread-pool-pressure gate in
+    /// nativelink.rs to fire a false positive: the dump occupies a
+    /// blocking-pool slot, and the gate sees `blocking_threads=1,
+    /// idle_blocking=0` → "pressure detected" even when no real
+    /// spawn_blocking work is enqueued.
+    ///
+    /// This test crosses the REAL production spawn primitive: it calls
+    /// [`super::spawn_dump_thread`], the single helper that all three
+    /// production dump sites (StallGuard verdict, SIGUSR2 listener,
+    /// streaming_blob deadline) route through. A probe closure parks on a
+    /// barrier so the dump thread is provably ALIVE while we sample
+    /// `num_blocking_threads()`; the count must not increase.
+    ///
+    /// Mutation: change `std::thread::Builder::spawn` to
+    /// `tokio::task::spawn_blocking` INSIDE `spawn_dump_thread` — this
+    /// test MUST red-fail with "spawn_dump_thread must not increase tokio
+    /// blocking thread count".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stall_dump_does_not_use_blocking_pool() {
+        // `num_blocking_threads` is tokio_unstable. The workspace always
+        // compiles with `--cfg tokio_unstable` (see .cargo/config.toml),
+        // so this API is always available in production and test builds.
+        // The #[allow] suppresses the unexpected-cfgs lint that fires when
+        // the crate is checked in isolation (without the workspace rustflags).
+        #[allow(unexpected_cfgs)]
+        let blocking_before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_blocking_threads();
+
+        // Two barriers gate the probe closure's lifetime deterministically
+        // (NOT sleep-as-synchronization): `alive` releases once the closure
+        // is running so we sample with the dump thread provably live;
+        // `release` keeps the closure parked until the test has sampled, so
+        // a spawn_blocking mutation cannot exit before we observe the pool.
+        let alive = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let alive_in = alive.clone();
+        let release_in = release.clone();
+
+        // Cross the REAL production spawn primitive.
+        spawn_dump_thread("stall-dump-test", move || {
+            alive_in.wait(); // signal: "I'm alive and running"
+            release_in.wait(); // park until the test has sampled the pool
+        });
+
+        // Wait until the dump closure is active, then sample the pool.
+        alive.wait();
+
+        #[allow(unexpected_cfgs)]
+        let blocking_during = tokio::runtime::Handle::current()
+            .metrics()
+            .num_blocking_threads();
+
+        // Let the probe closure exit now that the observation is taken.
+        release.wait();
+
+        assert_eq!(
+            blocking_during,
+            blocking_before,
+            "spawn_dump_thread must not increase tokio blocking thread count — \
+             std::thread::Builder::spawn must be used, not spawn_blocking; \
+             before={blocking_before} during={blocking_during}"
+        );
     }
 }

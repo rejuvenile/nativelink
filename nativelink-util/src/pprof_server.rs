@@ -66,6 +66,14 @@ async fn profile_handler(Query(params): Query<ProfileParams>) -> Response {
     let seconds = params.seconds.unwrap_or(DEFAULT_PROFILE_SECONDS);
     let format = params.format.unwrap_or_default();
 
+    // `collect_profile` is CPU-bound and its result is `.await`ed by this
+    // async handler, so it correctly runs on the blocking pool. NOTE: a
+    // manual pprof run holds a blocking-pool thread for ~`seconds` (default
+    // 10s); during that window the tokio thread-pool-pressure gate in
+    // nativelink.rs may emit "tokio thread pool pressure detected". That is
+    // EXPECTED during an operator-initiated profile — not a regression. (The
+    // stall-dump path was moved off the blocking pool; this on-demand path
+    // intentionally stays on it. See deferred_tasks.md.)
     let result = tokio::task::spawn_blocking(move || collect_profile(seconds, &format)).await;
     match result {
         Ok(Ok(resp)) => resp,
