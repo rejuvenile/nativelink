@@ -149,6 +149,15 @@ pub struct SchedulerMetrics {
         help = "(#sched-b1) cumulative completions whose op was already removed during the B1 lock-free update_operation window (expected post-unlock race; slowly-growing is benign)"
     )]
     pub update_action_op_already_finalized: AtomicU64,
+    /// (#sched-zeroload) Number of workers currently registered that have NEVER
+    /// reported a load reading (`has_reported_load == false`). A non-zero value
+    /// on a steady-state fleet indicates a stalled keepalive path (workers
+    /// connecting but not reporting load) → silent UNDER-selection in the
+    /// effective_load_score paths. Alerts on stalled worker heartbeat.
+    #[metric(
+        help = "(#sched-zeroload) workers currently registered that have never reported load; non-zero on steady-state fleet means stalled keepalive → silent under-selection"
+    )]
+    pub workers_never_reported_load: AtomicU64,
 }
 
 /// Point-in-time intersection of an action's `file_digests` and the
@@ -451,7 +460,19 @@ fn capacity_score(
 /// Workers with idle P-cores always beat workers with only idle E-cores,
 /// creating a two-tier preference. Workers reporting only aggregate load
 /// (Linux, old workers) compete in the P-core tier.
-fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32) -> u64 {
+///
+/// `has_reported_load` distinguishes two cases that produce identical field
+/// values but opposite scheduling intent:
+///   - `has_reported_load == false`: worker has NEVER sent a load reading;
+///     all fields are the construction-default `(0,0,0)` → sort WORST (u64::MAX).
+///   - `has_reported_load == true`, all fields `(0,0,0)`: genuinely-idle
+///     worker → sort BEST (0).
+///
+/// Without this flag both cases score `u64::MAX` (the pre-#sched-zeroload
+/// behaviour), making a reported-idle worker LOSE to any loaded-but-reporting
+/// worker in the LRU/MRU and locality tiebreak paths — a mild asymmetry
+/// with `cap_score`, which already uses `has_reported_load` correctly.
+fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32, has_reported_load: bool) -> u64 {
     if p_load > 0 || e_load > 0 {
         // Has per-core-type data.
         if p_load < 100 {
@@ -464,8 +485,11 @@ fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32) -> u64 {
     } else if aggregate_load > 0 {
         // Aggregate only (Linux / old worker): treat as P-core tier.
         aggregate_load as u64
+    } else if has_reported_load {
+        // Genuinely-idle reported worker (all fields 0, has reported): best score.
+        0
     } else {
-        // Unknown: sort last.
+        // Never reported: sort last.
         u64::MAX
     }
 }
@@ -1006,12 +1030,12 @@ impl ApiWorkerSchedulerImpl {
                 .rev()
                 .filter(|(worker_id, _)| candidates.contains(worker_id))
                 .filter(|pair| worker_matches(pair))
-                .map(|(_, w)| (w.id.clone(), effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct)))
+                .map(|(_, w)| (w.id.clone(), effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load)))
                 .collect(),
             WorkerAllocationStrategy::MostRecentlyUsed => workers_iter
                 .filter(|(worker_id, _)| candidates.contains(worker_id))
                 .filter(|pair| worker_matches(pair))
-                .map(|(_, w)| (w.id.clone(), effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct)))
+                .map(|(_, w)| (w.id.clone(), effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load)))
                 .collect(),
         };
 
@@ -1446,7 +1470,7 @@ impl ApiWorkerSchedulerImpl {
                 let mut sorted: Vec<_> = scores.into_iter().collect();
                 let load_score_for_worker = |wid: &WorkerId| -> u64 {
                     self.workers.0.peek(wid)
-                        .map(|w| effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct))
+                        .map(|w| effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load))
                         .unwrap_or(u64::MAX)
                 };
                 sorted.sort_by(|a, b| {
@@ -2880,6 +2904,18 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| (w.p_core_count, w.e_core_count))
+    }
+
+    /// (#sched-zeroload) Returns the current `workers_never_reported_load` gauge
+    /// value. Test-only — asserts that the gauge tracks `has_reported_load`
+    /// transitions correctly across `add_worker` / `update_worker_load` /
+    /// `remove_worker`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn workers_never_reported_load_for_test(&self) -> u64 {
+        self.metrics
+            .workers_never_reported_load
+            .load(Ordering::Relaxed)
     }
 
     /// A unit test function used to send the keep alive message to the worker from the server.
@@ -4784,6 +4820,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // stale endpoint scores influencing locality decisions.
 
         self.metrics.workers_added.fetch_add(1, Ordering::Relaxed);
+        // (#sched-zeroload) Every new worker starts with has_reported_load=false.
+        self.metrics
+            .workers_never_reported_load
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -4906,15 +4946,19 @@ impl WorkerScheduler for ApiWorkerScheduler {
 
         // scores_cache is cleared by immediate_evict_worker on the inner struct.
 
-        // Grab the worker's CAS endpoint before eviction so we can clean
-        // up prefetch state after the lock is released.
-        let cas_endpoint: Option<Arc<str>> = {
+        // Grab the worker's CAS endpoint and has_reported_load before eviction.
+        let (cas_endpoint, was_never_reported): (Option<Arc<str>>, bool) = {
             let inner = self.inner.read().await;
-            inner
-                .workers
-                .peek(worker_id)
-                .filter(|w| !w.cas_endpoint.is_empty())
-                .map(|w| Arc::from(w.cas_endpoint.as_str()))
+            if let Some(w) = inner.workers.peek(worker_id) {
+                let endpoint = if w.cas_endpoint.is_empty() {
+                    None
+                } else {
+                    Some(Arc::from(w.cas_endpoint.as_str()))
+                };
+                (endpoint, !w.has_reported_load)
+            } else {
+                (None, false)
+            }
         };
 
         let result = {
@@ -4927,6 +4971,13 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 )
                 .await
         };
+
+        // (#sched-zeroload) If this worker never reported load, decrement the gauge.
+        if was_never_reported {
+            self.metrics
+                .workers_never_reported_load
+                .fetch_sub(1, Ordering::Relaxed);
+        }
 
         // Clean up prefetch connection and semaphore for this endpoint.
         if let Some(ep) = cas_endpoint {
@@ -5110,7 +5161,16 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // reading. A genuine all-zero (truly idle) report sets this `true`, so
         // the selector can distinguish it from a NEVER-reported worker still at
         // the construction-default `(0,0,0)`. Never reset to `false`.
+        let previously_unreported = !worker.has_reported_load;
         worker.has_reported_load = true;
+        drop(inner);
+        // (#sched-zeroload) Decrement the gauge on the first-ever load report:
+        // the worker is no longer in the "never-reported" category.
+        if previously_unreported {
+            self.metrics
+                .workers_never_reported_load
+                .fetch_sub(1, Ordering::Relaxed);
+        }
         debug!(%worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Worker load updated");
         Ok(())
     }
@@ -5343,56 +5403,74 @@ mod tests {
     #[test]
     fn test_effective_load_score_per_type_p_cores_available() {
         // P-cores not saturated: score equals p_load.
-        assert_eq!(effective_load_score(50, 30, 70), 50);
-        assert_eq!(effective_load_score(1, 100, 80), 1);
-        assert_eq!(effective_load_score(99, 0, 50), 99);
+        assert_eq!(effective_load_score(50, 30, 70, true), 50);
+        assert_eq!(effective_load_score(1, 100, 80, true), 1);
+        assert_eq!(effective_load_score(99, 0, 50, true), 99);
     }
 
     #[test]
     fn test_effective_load_score_per_type_p_cores_saturated() {
         // P-cores at 100%: score = 100 + e_load, always worse than any
         // worker with available P-cores.
-        assert_eq!(effective_load_score(100, 50, 95), 150);
-        assert_eq!(effective_load_score(100, 0, 100), 100);
-        assert_eq!(effective_load_score(100, 100, 100), 200);
+        assert_eq!(effective_load_score(100, 50, 95, true), 150);
+        assert_eq!(effective_load_score(100, 0, 100, true), 100);
+        assert_eq!(effective_load_score(100, 100, 100, true), 200);
     }
 
     #[test]
     fn test_effective_load_score_aggregate_only() {
         // Old worker or Linux: p=0, e=0, aggregate>0 → use aggregate.
-        assert_eq!(effective_load_score(0, 0, 60), 60);
-        assert_eq!(effective_load_score(0, 0, 1), 1);
-        assert_eq!(effective_load_score(0, 0, 100), 100);
+        assert_eq!(effective_load_score(0, 0, 60, true), 60);
+        assert_eq!(effective_load_score(0, 0, 1, true), 1);
+        assert_eq!(effective_load_score(0, 0, 100, true), 100);
     }
 
     #[test]
     fn test_effective_load_score_unknown() {
-        // All zeros: unknown → sort last.
-        assert_eq!(effective_load_score(0, 0, 0), u64::MAX);
+        // All zeros, never reported: unknown → sort last.
+        assert_eq!(effective_load_score(0, 0, 0, false), u64::MAX);
+    }
+
+    /// (#sched-zeroload) A worker that HAS reported load and is genuinely
+    /// idle (all fields 0) must score 0 (BEST) — not u64::MAX (WORST).
+    /// Pre-fix: the all-zero branch fell through to `u64::MAX` regardless
+    /// of `has_reported_load`, so a reported-idle worker was penalised
+    /// identically to a never-reported one in LRU/MRU and locality tiebreak.
+    /// Mutation: remove the `has_reported_load` branch (revert to always
+    /// returning u64::MAX for the all-zero case) → this test red-fails with
+    /// "reported-idle worker must score 0 (best), not u64::MAX (worst)".
+    #[test]
+    fn test_effective_load_score_reported_idle_scores_zero() {
+        assert_eq!(
+            effective_load_score(0, 0, 0, true),
+            0,
+            "reported-idle worker must score 0 (best), not u64::MAX (worst) — \
+             has_reported_load=true with all-zero fields is genuinely idle"
+        );
     }
 
     #[test]
     fn test_effective_load_score_p_core_only_idle() {
         // P-core-only Apple Silicon (no E-cores): reports p=0, e=100.
         // Machine is idle → score should be 0 (best).
-        assert_eq!(effective_load_score(0, 100, 0), 0);
+        assert_eq!(effective_load_score(0, 100, 0, true), 0);
     }
 
     #[test]
     fn test_effective_load_score_p_core_only_saturated() {
         // P-core-only fully loaded: p=100, e=100.
         // Score = 100 + 100 = 200 (worst among per-type reporters).
-        assert_eq!(effective_load_score(100, 100, 100), 200);
+        assert_eq!(effective_load_score(100, 100, 100, true), 200);
     }
 
     #[test]
     fn test_effective_load_score_ordering() {
         // Verify the two-tier preference: idle P-cores always beat
         // workers with only idle E-cores.
-        let idle_p = effective_load_score(30, 80, 50);
-        let saturated_p = effective_load_score(100, 20, 90);
-        let aggregate = effective_load_score(0, 0, 40);
-        let unknown = effective_load_score(0, 0, 0);
+        let idle_p = effective_load_score(30, 80, 50, true);
+        let saturated_p = effective_load_score(100, 20, 90, true);
+        let aggregate = effective_load_score(0, 0, 40, true);
+        let unknown = effective_load_score(0, 0, 0, false);
 
         assert!(idle_p < saturated_p, "idle P-cores should beat saturated P-cores");
         assert!(aggregate < saturated_p, "aggregate-only in P-tier should beat E-core-only");
@@ -9099,5 +9177,188 @@ mod b1_lock_decouple_tests {
                  fix must let a real all-zero reading through, not penalize it"
             );
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (#sched-zeroload) effective_load_score + all-never-reported fleet +
+    // workers_never_reported_load gauge tests (follow-up from 2de99912).
+    // ════════════════════════════════════════════════════════════════════
+
+    /// (#sched-zeroload) A reported-idle worker (has_reported_load=true,
+    /// all fields 0) must score 0 in the LRU/MRU fallback path, beating a
+    /// never-reported worker (u64::MAX) when `viable.iter().any(score < u64::MAX)`.
+    ///
+    /// Invariant: `effective_load_score(0,0,0,true) < effective_load_score(0,0,0,false)`.
+    ///
+    /// Mutation: change the `has_reported_load` branch in `effective_load_score`
+    /// to always return `u64::MAX` (revert to pre-fix behaviour) → the
+    /// `min_by_key` in `inner_find_worker_for_action` sees BOTH as `u64::MAX`
+    /// → `viable.iter().any(score < u64::MAX)` is false → falls through to
+    /// `viable.first()` → still returns SOME worker (the LRU/MRU position
+    /// wins the tie), so the bespoke message
+    /// "reported-idle worker must score 0 (best)" from
+    /// `test_effective_load_score_reported_idle_scores_zero` is the
+    /// load-bearing mutation signal (that unit test catches the score
+    /// regression before we ever hit this integration test).
+    #[nativelink_test]
+    async fn t_reported_idle_scores_best_in_lru_fallback() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+
+        // IDLE: has reported a genuinely all-zero load.
+        let _rx_idle = add_worker_in_pool(&scheduler, "IDLE").await;
+        scheduler
+            .update_worker_load(&WorkerId("IDLE".to_string()), 0, 0, 0)
+            .await
+            .expect("mark IDLE as load-reported");
+
+        // UNKNOWN: never reported → effective_load_score = u64::MAX.
+        let _rx_unknown = add_worker_in_pool(&scheduler, "UNKNOWN").await;
+
+        // With LRU strategy (default), the selection picks min load score.
+        // IDLE scores 0 (best); UNKNOWN scores u64::MAX (worst).
+        // So IDLE must win regardless of LRU position.
+        let chosen = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang");
+
+        assert_eq!(
+            chosen,
+            Some(WorkerId("IDLE".to_string())),
+            "reported-idle worker (effective_load_score=0) must beat never-reported \
+             worker (effective_load_score=u64::MAX) in LRU/MRU fallback selection"
+        );
+    }
+
+    /// (#sched-zeroload) A fleet of 3 workers, all never-reported, with a
+    /// dispatched action MUST return SOME worker — not None. This pins the
+    /// `saturation_fall_through` backstop: never-reported workers get
+    /// `cap_score(100,100,100)` → `weighted_free == 0` → `all_viable_saturated
+    /// == true` → `saturation_fall_through` fires → LRU/MRU fallback selects
+    /// a worker.
+    ///
+    /// Invariant: a fresh fleet (no workers have reported load) is selectable;
+    /// never-reported workers do NOT wedge the scheduler.
+    ///
+    /// Mutation: comment out the `saturation_fall_through` fall-through block
+    /// (the `if saturation_fall_through { viable.first() }` arm in
+    /// `inner_find_worker_for_action`) → the saturation_fall_through fires but
+    /// returns None → this test red-fails with the bespoke message below.
+    #[nativelink_test]
+    async fn t_all_never_reported_fleet_selectable() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+
+        // Three workers in the same capability class, none ever reporting load.
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool(&scheduler, "WC").await;
+
+        // Do NOT call update_worker_load on any of them: all three have
+        // has_reported_load=false (construction default).
+
+        let chosen = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang on all-never-reported fleet");
+
+        assert!(
+            chosen.is_some(),
+            "all-never-reported fleet must be selectable via saturation_fall_through \
+             backstop — a fresh fleet must not wedge on restart; got None instead of \
+             a worker"
+        );
+    }
+
+    /// (#sched-zeroload) The `workers_never_reported_load` gauge tracks the
+    /// count of workers that have NEVER reported a load reading. It must:
+    ///   - increment on `add_worker` (every new worker starts unreported),
+    ///   - decrement on the first `update_worker_load` call (first-ever report),
+    ///   - NOT decrement on subsequent `update_worker_load` calls (idempotent),
+    ///   - decrement on `remove_worker` when the removed worker was unreported.
+    ///
+    /// Mutation: remove `workers_never_reported_load.fetch_sub(1)` from
+    /// `remove_worker` → gauge stays at 1 after removing an unreported worker
+    /// → test red-fails with "gauge must reach 0 after removing unreported worker".
+    #[nativelink_test]
+    async fn t_never_reported_count_gauge() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+
+        // Initially gauge is 0.
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            0,
+            "gauge must start at 0 before any workers are added"
+        );
+
+        // Add 3 workers: all never-reported → gauge == 3.
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool(&scheduler, "WC").await;
+
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            3,
+            "gauge must be 3 after adding 3 never-reported workers"
+        );
+
+        // Report load on WA (first-ever report) → gauge == 2.
+        scheduler
+            .update_worker_load(&WorkerId("WA".to_string()), 50, 30, 0)
+            .await
+            .expect("update WA load");
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            2,
+            "gauge must drop to 2 after WA reports load for the first time"
+        );
+
+        // Report load on WA again (idempotent — already reported) → gauge still 2.
+        scheduler
+            .update_worker_load(&WorkerId("WA".to_string()), 60, 40, 0)
+            .await
+            .expect("update WA load again");
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            2,
+            "gauge must stay at 2 on a second update_worker_load for WA (idempotent)"
+        );
+
+        // Remove WB (still never-reported) → gauge == 1.
+        scheduler
+            .remove_worker(&WorkerId("WB".to_string()))
+            .await
+            .expect("remove WB");
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            1,
+            "gauge must reach 1 after removing unreported worker WB — \
+             remove_worker must decrement the gauge for never-reported workers"
+        );
+
+        // Remove WA (already reported — gauge must NOT change further).
+        scheduler
+            .remove_worker(&WorkerId("WA".to_string()))
+            .await
+            .expect("remove WA");
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            1,
+            "removing a reported worker (WA) must not change the gauge (still 1)"
+        );
+
+        // Remove WC (never-reported) → gauge == 0.
+        scheduler
+            .remove_worker(&WorkerId("WC".to_string()))
+            .await
+            .expect("remove WC");
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            0,
+            "gauge must reach 0 after removing unreported worker WC"
+        );
     }
 }

@@ -1886,4 +1886,52 @@ mod tests {
              missing)"
         );
     }
+
+    /// (c18ace44 guard) Compile-time litmus: explicitly constructs
+    /// `BlobsAvailableNotification` naming EVERY field without
+    /// `..Default::default()`. If a new field is added to the proto
+    /// without updating this test, it fails to compile with:
+    ///   "missing field `<new_field>` in initializer of
+    ///    `BlobsAvailableNotification`"
+    /// This catches the c18ace44 incident class at build time rather
+    /// than at runtime or code-review time. The test body only needs to
+    /// compile — the `let _` discards the value.
+    ///
+    /// HOW TO UPDATE: when the proto gains a new field, add it here.
+    /// If a field is removed, remove it here. Do NOT add
+    /// `..Default::default()` — that re-opens the gap.
+    #[test]
+    fn proto_fields_exhaustive_bans_missing() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            BlobsAvailableNotification, MirrorPinEntry,
+        };
+        use nativelink_proto::build::bazel::remote::execution::v2::Digest;
+
+        let _: BlobsAvailableNotification = BlobsAvailableNotification {
+            worker_cas_endpoint: String::new(),
+            digests: Vec::<Digest>::new(),
+            is_full_snapshot: false,
+            evicted_digests: Vec::<Digest>::new(),
+            digest_infos: Vec::new(),
+            cpu_load_pct: 0,
+            cached_directory_digests: Vec::<Digest>::new(),
+            added_subtree_digests: Vec::<Digest>::new(),
+            removed_subtree_digests: Vec::<Digest>::new(),
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: Vec::<Digest>::new(),
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+            pinned_mirror_entries: Vec::<MirrorPinEntry>::new(),
+            pinned_ac_mirror_entries: Vec::<MirrorPinEntry>::new(),
+            indefinite_pin_saturated: false,
+            swap_used_bytes: 0,
+            memory_pressure_level: 0,
+            memory_pressured: false,
+            available_disk_bytes: 0,
+            disk_pressured: false,
+        };
+        // The test is a compile-time check; no runtime assertions needed.
+    }
 }
