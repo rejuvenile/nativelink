@@ -167,6 +167,15 @@ name = "backfill_upload_requeue_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (#FL-688 B) End-to-end wire-header seam: drives the production backfill
+# handler over FastSlowStore{slow: real GrpcStore → in-proc tonic server} and
+# asserts the upload RPC carries `x-nativelink-worker=1`. Uses the same
+# `handle_upload_missing_blobs_for_test` / `MockRunningActionsManager` seams
+# (gated behind `test-utils`).
+name = "backfill_is_worker_header_seam_test"
+required-features = ["test-utils"]
+
+[[test]]
 # `bis_ac_routing_test` constructs `BlobsAvailableState::from_test_args` with an
 # `ac_mirror_target`, gated behind `cfg(any(test, feature = "test-utils"))`.
 # Without this `[[test]]` entry the default `cargo test -p nativelink-worker`

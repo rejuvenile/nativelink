@@ -48,7 +48,7 @@ use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    IS_WORKER_REQUEST, ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use nativelink_util::task::JoinHandleDropGuard;
 use nativelink_util::{spawn, tls_utils};
@@ -3363,7 +3363,37 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 // per-blob Err arm can re-queue the digest into the shared
                 // `failed_slow_writes` set instead of dropping it.
                 let cas_store = cas_store.clone();
-                async move {
+                // #FL-688 (B): set IS_WORKER_REQUEST=true for the whole per-blob
+                // upload so GrpcStore stamps `x-nativelink-worker` on the wire
+                // (GrpcStore::write :1801 / ::update_action_result gate the header
+                // on this task-local). The server's bytestream G1 carve-out (A,
+                // bytestream_server.rs:3364) and the batch carve-out
+                // (cas_server.rs:458) BOTH key on is_worker; with the header absent
+                // the upload arrives is_worker=false and the server skips it (G1) /
+                // ack-gates it (batch) — never persisting the worker's sole-copy
+                // backfill blob, so the server re-requests it every BlobsAvailable
+                // tick forever.
+                //
+                // Production chain is SPAWN-FREE so this scope alone carries the
+                // header: `slow_store` here is the WorkerProxyStore-wrapped slow
+                // tier (local_worker.rs:5758, when cas_server_port.is_some()). WPS
+                // has no `update_oneshot` override → StoreDriver default
+                // `update_oneshot` (store_trait.rs:1215) = inline `try_join!(send,
+                // self.update(..))` → `WPS::update` (:4638) inline passthrough →
+                // `GrpcStore::update` (:3475) which for a <CHUNK_SIZE blob falls
+                // through to the legacy ByteStream `write` (reads IS_WORKER_REQUEST
+                // inline). It NEVER reaches `GrpcStore::update_oneshot`'s
+                // BatchUpdateBlobs coalesce-queue spawn (the only spawn that would
+                // strip the task-local) — so no GrpcStore-side change is needed.
+                //
+                // Per-FUTURE scoping (not wrapping the drain) is still the
+                // spawn-safe placement: if this body is later refactored to spawn,
+                // the scope still encloses the `.update_oneshot`/`.update` calls.
+                // is_worker only — backfill is a worker upload, not a mirror push
+                // (do NOT set IS_MIRROR_REQUEST). Mirrors the
+                // `IS_WORKER_REQUEST.scope(captured, fut)` pattern at
+                // batch_read_coalescer.rs:528.
+                IS_WORKER_REQUEST.scope(true, async move {
                     let _permit = upload_counters.acquire(&upload_sem).await;
                     // Use in-memory transfer for small blobs, streaming for
                     // large ones to avoid OOM on multi-GB blobs. Reads go
@@ -3470,7 +3500,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             false
                         }
                     }
-                }
+                })
             })
             .collect();
 
