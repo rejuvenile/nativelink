@@ -1433,20 +1433,13 @@ impl StreamingBlobReader {
                         self.inner.digest,
                         producer_tid,
                     );
-                    // force_dump_thread_stacks is fully sync (up to 5s on
-                    // Linux, up to 30s on macOS via `sample` subprocess).
-                    // Do NOT run on a tokio worker (runtime starvation) and
-                    // do NOT run on tokio's blocking pool (triggers the
-                    // thread-pool-pressure gate false-positive in nativelink.rs
-                    // — the gate sees blocking_threads=1, idle_blocking=0 and
-                    // fires "pressure detected" during the dump). Use a plain
-                    // OS thread: invisible to tokio's blocking-pool metrics,
-                    // no tokio context needed (force_dump is fully sync).
-                    let _ = std::thread::Builder::new()
-                        .name("stall-dump".to_string())
-                        .spawn(move || {
-                            crate::stall_detector::force_dump_thread_stacks(&label);
-                        });
+                    // Dump off the runtime on a plain OS thread (sync work,
+                    // up to 5s on Linux / 30s on macOS). Rationale for not
+                    // using the blocking pool / a tokio worker lives in
+                    // `spawn_dump_thread`.
+                    crate::stall_detector::spawn_dump_thread("stall-dump", move || {
+                        crate::stall_detector::force_dump_thread_stacks(&label);
+                    });
                 }
                 return Err(make_err!(
                     Code::DeadlineExceeded,
