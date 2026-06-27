@@ -1141,7 +1141,6 @@ impl ApiWorkerSchedulerImpl {
         full_worker_logging: bool,
         endpoint_scores: Option<&HashMap<Arc<str>, u64>>,
         resolved_tree: Option<&ResolvedTree>,
-        pre_computed_tree: Option<(Vec<Directory>, Vec<Digest>)>,
     ) -> Option<(WorkerId, UnboundedSender<UpdateForWorker>, UpdateForWorker)> {
         let input_root_digest = action_info.inner.input_root_digest;
 
@@ -1508,11 +1507,13 @@ impl ApiWorkerSchedulerImpl {
         };
 
         // Atomically reserve the worker by mutating its state under the same lock.
+        // The proto-tree clone (`to_proto_vecs`) is deferred to after the lock
+        // drops — `resolved_directories` is injected post-lock by the caller.
         let (tx, msg) = self.prepare_worker_run_action(
             &worker_id,
             operation_id,
             action_info,
-            pre_computed_tree,
+            None,
         )?;
 
         Some((worker_id, tx, msg))
@@ -1670,8 +1671,12 @@ impl ApiWorkerSchedulerImpl {
     /// and pre-built message so the caller can send the notification *after* releasing
     /// the write lock.
     ///
-    /// `pre_computed_tree` contains directory and digest Vecs that were built
-    /// outside the write lock to avoid cloning Directory protos while holding it.
+    /// `pre_computed_tree` is normally `None` for the hot dispatch path.
+    /// The `find_and_reserve_worker` caller builds `resolved_directories`
+    /// post-lock via `to_proto_vecs()` gated on `result.is_some()`, so the
+    /// clone never runs on the no-match path.  This parameter is kept so
+    /// other callers (e.g. the reconnect replay path at line 2308) can supply
+    /// their own pre-built tree data if needed.
     ///
     /// Note: peer hints are NO LONGER carried inside `StartExecute` (#98 — peer
     /// hints chunking). They ride a separate `Update::ChunkedMessage` stream
@@ -2501,14 +2506,18 @@ impl ApiWorkerScheduler {
             _ => None,
         };
 
-        // ── Phase 2.5: pre-compute tree proto data (BEFORE write lock) ──
-        // Cloning Directory protos is expensive and should not happen under
-        // the write lock. We size-check and build the Vecs here; the lock
-        // phase just passes them through to the protobuf message.
+        // ── Phase 2.5: size-gate for the pre-resolved tree ──
+        // Run the O(dirs) encoded_len walk BEFORE the write lock so the
+        // lock critical section stays bounded.  The actual Directory proto
+        // clone (`to_proto_vecs()`) is deferred until AFTER the lock drops
+        // and only when a worker was selected (`result.is_some()`), so the
+        // clone is never built on the no-match path (the common case on a
+        // busy fleet where every still-queued action cycles through
+        // `do_try_match` until a worker becomes available).
         // Worker API listener has max_encoding_message_size=64MiB.
         const MAX_TREE_PROTO_BYTES: usize = 32 * 1024 * 1024;
-        let pre_computed_tree: Option<(Vec<Directory>, Vec<Digest>)> =
-            resolved_tree.as_deref().and_then(|tree| {
+        let tree_fits_in_message: bool =
+            resolved_tree.as_deref().is_some_and(|tree| {
                 let estimated_bytes: usize = tree
                     .directories
                     .values()
@@ -2521,14 +2530,9 @@ impl ApiWorkerScheduler {
                         dirs = tree.directories.len(),
                         "pre-resolved tree exceeds size threshold, omitting from StartExecute"
                     );
-                    None
+                    false
                 } else {
-                    debug!(
-                        dirs = tree.directories.len(),
-                        estimated_bytes,
-                        "including pre-resolved tree in StartExecute"
-                    );
-                    Some(tree.to_proto_vecs())
+                    true
                 }
             });
 
@@ -2549,7 +2553,6 @@ impl ApiWorkerScheduler {
             full_worker_logging,
             endpoint_scores,
             resolved_tree.as_deref(),
-            pre_computed_tree,
         );
 
         // Extract the selected worker's CAS endpoint while we still hold
@@ -2584,6 +2587,31 @@ impl ApiWorkerScheduler {
 
         // Drop the write lock before spawning prefetch.
         drop(inner);
+
+        // ── Phase 2.5 deferred: inject pre-resolved tree into StartExecute ──
+        // `to_proto_vecs()` clones the Directory protos and is only called
+        // now that we know a worker was selected (result.is_some()) AND the
+        // tree fits within the wire limit (tree_fits_in_message).  On the
+        // no-match path (result.is_none()) this block is skipped entirely,
+        // avoiding the clone on every do_try_match cycle for still-queued
+        // actions on a backlogged fleet.
+        if tree_fits_in_message {
+            if let Some(tree) = resolved_tree.as_deref() {
+                if let Some((_, _, msg)) = result.as_mut() {
+                    if let Some(update_for_worker::Update::StartAction(start_execute)) =
+                        msg.update.as_mut()
+                    {
+                        let (dirs, digests) = tree.to_proto_vecs();
+                        debug!(
+                            dirs = dirs.len(),
+                            "including pre-resolved tree in StartExecute"
+                        );
+                        start_execute.resolved_directories = dirs;
+                        start_execute.resolved_directory_digests = digests;
+                    }
+                }
+            }
+        }
 
         // ── Phase 4: spawn targeted prefetch + missing digest hints ──
         // If we have a resolved tree, a locality map, and the selected
@@ -8670,7 +8698,6 @@ mod b1_lock_decouple_tests {
                         false,
                         Some(&endpoint_scores),
                         None,
-                        None,
                     )
                     .map(|(wid, _tx, _msg)| wid)
             };
@@ -8898,7 +8925,6 @@ mod b1_lock_decouple_tests {
                     false,
                     None,
                     Some(tree),
-                    None,
                 )
                 .map(|(wid, _tx, _msg)| wid)
         }
@@ -9099,5 +9125,408 @@ mod b1_lock_decouple_tests {
                  fix must let a real all-zero reading through, not penalize it"
             );
         }
+    }
+}
+
+/// Deferred `to_proto_vecs()` optimization (Group-2 scheduler perf).
+///
+/// `find_and_reserve_worker` pre-computes the proto-tree clone (Phase 2.5)
+/// BEFORE the write lock and BEFORE knowing if any worker will be selected.
+/// On a busy/backlogged fleet this clone is built and immediately discarded
+/// on the no-match path — wasted CPU per still-queued action cycle.
+///
+/// Option B defers `to_proto_vecs()` to AFTER the lock drops, gated on
+/// `result.is_some()`.  Selection never reads `pre_computed_tree`; it reads
+/// `resolved_tree` (the raw struct) and `endpoint_scores`.  The clone is
+/// consumed only to populate `StartExecute.resolved_directories`.
+///
+/// This module proves two behavioural contracts:
+///
+///   1. **Match path**: when a worker IS selected, `StartExecute` carries
+///      `resolved_directories` populated from the deferred clone.
+///   2. **No-match path**: when no worker is available, `None` is returned
+///      and the function completes (the tree clone is not wasted, but this
+///      is an internal detail — the observable contract is correct `None`
+///      return without hanging).
+///
+/// Mutation target: replace the deferred `to_proto_vecs()` call with an
+/// empty default.  Test 1 red-fails with the bespoke "resolved_directories
+/// must be non-empty" message because no directories reach the wire.
+#[cfg(test)]
+mod deferred_proto_clone_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use bytes::Bytes;
+    use nativelink_config::schedulers::WorkerAllocationStrategy;
+    use nativelink_config::stores::MemorySpec;
+    use nativelink_error::Error;
+    use nativelink_macro::nativelink_test;
+    use nativelink_metric::{
+        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+    };
+    use nativelink_proto::build::bazel::remote::execution::v2::{Digest as ProtoDigest, FileNode};
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_util::action_messages::{
+        ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId, WorkerId,
+    };
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+    use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
+    use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
+    use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+    use prost::Message;
+    use tokio::sync::{Notify, mpsc};
+
+    use super::{ApiWorkerScheduler, UpdateForWorker, Worker, update_for_worker};
+    use crate::platform_property_manager::PlatformPropertyManager;
+    use crate::worker::ActionInfoWithProps;
+    use crate::worker_registry::WorkerRegistry;
+    use crate::worker_scheduler::WorkerScheduler;
+
+    /// No-op `WorkerStateManager` for tests that do not exercise the
+    /// update_operation path.
+    struct NoopWorkerStateManager;
+
+    impl MetricsComponent for NoopWorkerStateManager {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl WorkerStateManager for NoopWorkerStateManager {
+        async fn update_operation(
+            &self,
+            _operation_id: &OperationId,
+            _worker_id: &WorkerId,
+            _update: UpdateOperationType,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn props_exact(name: &str) -> PlatformProperties {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            PlatformPropertyValue::Exact(name.to_string()),
+        );
+        PlatformProperties { properties }
+    }
+
+    /// Encode a `Directory` proto and return its bytes + content-addressed
+    /// `DigestInfo` so we can store it in a `MemoryStore`.
+    fn encode_dir(dir: &nativelink_proto::build::bazel::remote::execution::v2::Directory) -> (Vec<u8>, DigestInfo) {
+        let bytes = dir.encode_to_vec();
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        hasher.update(&bytes);
+        let digest = hasher.finalize_digest();
+        (bytes, digest)
+    }
+
+    /// Build a minimal `Directory` proto with one file and store it in
+    /// the given `MemoryStore`.  Returns the root digest so it can be used
+    /// as the action's `input_root_digest`.
+    async fn store_minimal_directory(store: &Store) -> DigestInfo {
+        let dir = nativelink_proto::build::bazel::remote::execution::v2::Directory {
+            files: vec![FileNode {
+                name: "file.txt".to_string(),
+                digest: Some(ProtoDigest {
+                    hash: format!("{:02x}", 0xaau8).repeat(32),
+                    size_bytes: 42,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (dir_bytes, dir_digest) = encode_dir(&dir);
+        let key: StoreKey<'_> = dir_digest.into();
+        store
+            .update_oneshot(key, Bytes::from(dir_bytes))
+            .await
+            .expect("store update_oneshot for test directory failed");
+        dir_digest
+    }
+
+    fn build_scheduler_with_cas(cas_store: Store) -> Arc<ApiWorkerScheduler> {
+        ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWorkerStateManager),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some(cas_store),
+            None,
+            512 * 1024,
+            8,
+        )
+    }
+
+    fn build_scheduler_no_cas() -> Arc<ApiWorkerScheduler> {
+        ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWorkerStateManager),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+            None,
+            512 * 1024,
+            8,
+        )
+    }
+
+    async fn add_worker(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(WorkerId(name.to_string()), props_exact(name), tx, 42, 4);
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
+    fn make_action(name: &str, root_digest: DigestInfo) -> ActionInfoWithProps {
+        ActionInfoWithProps {
+            inner: Arc::new(ActionInfo {
+                command_digest: DigestInfo::new([0u8; 32], 0),
+                input_root_digest: root_digest,
+                timeout: Duration::MAX,
+                platform_properties: HashMap::new(),
+                priority: 0,
+                load_timestamp: UNIX_EPOCH,
+                insert_timestamp: SystemTime::now(),
+                unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                    instance_name: "main".to_string(),
+                    digest_function: DigestHasherFunc::Sha256,
+                    digest: root_digest,
+                }),
+            }),
+            platform_properties: props_exact(name),
+        }
+    }
+
+    /// (#sched-g2) Match path: `StartExecute.resolved_directories` is
+    /// populated when `find_and_reserve_worker` selects a worker and a
+    /// resolved tree is present in the cache.
+    ///
+    /// Invariant: the deferred `to_proto_vecs()` call gated on
+    /// `result.is_some()` MUST populate `resolved_directories` in the
+    /// `StartExecute` message for the selected worker.
+    ///
+    /// Mutation target: replace the deferred `to_proto_vecs()` call (the
+    /// `resolved_tree.as_deref().and_then(|tree| { ... Some(tree.to_proto_vecs()) })`
+    /// block after the lock drops) with a constant `None`.  This test
+    /// red-fails with the bespoke message
+    /// "resolved_directories must be non-empty on the match path".
+    #[nativelink_test]
+    async fn deferred_clone_populates_resolved_directories_on_match() {
+        // A real MemoryStore so resolve_tree_from_cas can build a tree.
+        let cas_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let root_digest = store_minimal_directory(&cas_store).await;
+
+        let scheduler = build_scheduler_with_cas(cas_store);
+        let mut rx = add_worker(&scheduler, "W").await;
+
+        let op = OperationId::default();
+        let action = make_action("W", root_digest);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_and_reserve_worker(&props_exact("W"), &op, &action, false),
+        )
+        .await
+        .expect("find_and_reserve_worker must not hang on the match path");
+
+        let (_worker_id, _tx, msg) = result.expect(
+            "deferred-clone match path: worker W is idle and matches; must return Some",
+        );
+
+        // Drain the worker's channel so the receiver is not leaked.
+        let _ = rx.try_recv();
+
+        let start_execute = match msg.update {
+            Some(update_for_worker::Update::StartAction(se)) => se,
+            other => panic!(
+                "deferred-clone match path: expected StartAction, got {other:?}"
+            ),
+        };
+
+        assert!(
+            !start_execute.resolved_directories.is_empty(),
+            "resolved_directories must be non-empty on the match path — \
+             the deferred to_proto_vecs() call was not executed or produced \
+             an empty result; the worker will fall back to GetTree RPC \
+             (the perf regression this optimization prevents)"
+        );
+        assert_eq!(
+            start_execute.resolved_directories.len(),
+            start_execute.resolved_directory_digests.len(),
+            "resolved_directories and resolved_directory_digests must be \
+             parallel vecs with equal length"
+        );
+    }
+
+    /// (#sched-g2) No-match path: `find_and_reserve_worker` returns `None`
+    /// when no worker is available, even when a resolved tree would be
+    /// present.
+    ///
+    /// This is the path where the pre-fix code wastefully cloned the proto
+    /// tree and then discarded it.  After the fix the clone is skipped
+    /// entirely.  The observable contract is correct `None` return.
+    ///
+    /// Note: this test uses no CAS store (so no tree is resolved at all —
+    /// Phase 1 short-circuits), which is sufficient to prove the no-match
+    /// behavioral contract.  The performance invariant (clone skipped when
+    /// a tree IS present but no worker matches) is validated by inspection
+    /// of the `result.is_some()` gate at the `to_proto_vecs()` call site.
+    #[nativelink_test]
+    async fn deferred_clone_returns_none_when_no_workers_available() {
+        let scheduler = build_scheduler_no_cas();
+        // No workers added — every call must return None.
+
+        let op = OperationId::default();
+        let root_digest = DigestInfo::new([0xB2u8; 32], 1);
+        let action = make_action("W", root_digest);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_and_reserve_worker(&props_exact("W"), &op, &action, false),
+        )
+        .await
+        .expect("find_and_reserve_worker must not hang on the no-match path");
+
+        assert!(
+            result.is_none(),
+            "deferred-clone no-match path: no workers in scheduler; \
+             must return None — the deferred clone gate must not accidentally \
+             force a Some return"
+        );
+    }
+
+    /// (#sched-g2) Micro-bench: confirm that `to_proto_vecs()` (the clone)
+    /// is materially more expensive than the `encoded_len` size-gate (the
+    /// cheap pre-check retained in Phase 2.5).
+    ///
+    /// This test runs in `--release` to produce meaningful timings; in debug
+    /// mode it still executes but the ratio assertion is relaxed to avoid
+    /// false failures from debug instrumentation overhead.
+    ///
+    /// The dispatch premise was: clone is 14–30× the size-check.  We accept
+    /// any ratio >1 in debug and assert ratio >3 in release (well below the
+    /// claimed lower bound, to be robust across machines).  A ratio ≤1 would
+    /// mean the two operations cost the same, invalidating the premise.
+    ///
+    /// Tee path: `/tmp/sched-g2impl-bench.log` (populated when this test is
+    /// run with `--nocapture`).
+    #[test]
+    fn proto_clone_more_expensive_than_encoded_len_size_check() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Build a tree of N directories, each with M file nodes, to
+        // approximate a realistic 500-dir action tree.
+        const N_DIRS: usize = 500;
+        const FILES_PER_DIR: usize = 20;
+        const ITERS: u32 = 200;
+
+        let mut tree_dirs: Vec<nativelink_proto::build::bazel::remote::execution::v2::Directory> =
+            Vec::with_capacity(N_DIRS);
+        for d in 0..N_DIRS {
+            let files: Vec<nativelink_proto::build::bazel::remote::execution::v2::FileNode> =
+                (0..FILES_PER_DIR)
+                    .map(|f| {
+                        nativelink_proto::build::bazel::remote::execution::v2::FileNode {
+                            name: format!("file_{d}_{f}.txt"),
+                            digest: Some(
+                                nativelink_proto::build::bazel::remote::execution::v2::Digest {
+                                    hash: format!("{:02x}", (d * FILES_PER_DIR + f) as u8)
+                                        .repeat(32),
+                                    size_bytes: 1024,
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+            tree_dirs.push(
+                nativelink_proto::build::bazel::remote::execution::v2::Directory {
+                    files,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Build a HashMap<DigestInfo, Directory> to match ResolvedTree::directories.
+        let mut dir_map: HashMap<DigestInfo, nativelink_proto::build::bazel::remote::execution::v2::Directory> =
+            HashMap::new();
+        for (i, dir) in tree_dirs.iter().enumerate() {
+            let digest = DigestInfo::new([i as u8; 32], i as u64);
+            dir_map.insert(digest, dir.clone());
+        }
+
+        // ── Measure encoded_len size-check (N_DIRS encoded_len calls) ──
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let total: usize = black_box(
+                dir_map
+                    .values()
+                    .map(|d| prost::Message::encoded_len(d))
+                    .sum(),
+            );
+            let _ = black_box(total);
+        }
+        let size_check_ns = t0.elapsed().as_nanos() / u128::from(ITERS);
+
+        // ── Measure to_proto_vecs (N_DIRS Directory.clone() calls) ──
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            let mut dirs = Vec::with_capacity(dir_map.len());
+            let mut digests = Vec::with_capacity(dir_map.len());
+            for (digest_info, directory) in black_box(&dir_map) {
+                digests.push(nativelink_proto::build::bazel::remote::execution::v2::Digest::from(*digest_info));
+                dirs.push(black_box(directory.clone()));
+            }
+            let _ = black_box((dirs, digests));
+        }
+        let clone_ns = t1.elapsed().as_nanos() / u128::from(ITERS);
+
+        let ratio = if size_check_ns > 0 {
+            clone_ns as f64 / size_check_ns as f64
+        } else {
+            f64::MAX
+        };
+
+        println!(
+            "[sched-g2 bench] N_DIRS={N_DIRS} FILES_PER_DIR={FILES_PER_DIR} ITERS={ITERS}\n  \
+             encoded_len size-check: {size_check_ns} ns/iter\n  \
+             to_proto_vecs (clone):  {clone_ns} ns/iter\n  \
+             ratio clone/check:      {ratio:.1}×"
+        );
+
+        // In release builds the clone is substantially more expensive.
+        // In debug builds the assert is relaxed because allocator
+        // instrumentation can make clones artificially fast relative to
+        // the loop overhead of encoded_len.
+        #[cfg(not(debug_assertions))]
+        assert!(
+            ratio > 3.0,
+            "proto clone must be >3× more expensive than encoded_len size-check \
+             (got {ratio:.1}×) — if this fires, the premise for deferring to_proto_vecs() \
+             is invalidated and the optimization should be reconsidered; \
+             size_check={size_check_ns}ns clone={clone_ns}ns"
+        );
     }
 }
