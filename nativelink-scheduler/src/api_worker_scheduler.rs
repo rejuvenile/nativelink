@@ -815,6 +815,19 @@ impl ApiWorkerSchedulerImpl {
         }
 
         self.workers.put(worker_id.clone(), worker);
+        // (#sched-zeroload) Count the worker as never-reported HERE, the instant
+        // it ENTERS `self.workers`, symmetric with the decrement at the pop in
+        // inner `remove_worker` (`:864`). Every worker entering the map is at the
+        // construction default `has_reported_load == false` (`worker.rs:339`,
+        // never set true before `add_worker` — only `update_worker_load` flips it,
+        // on a worker already in the pool), so the increment is unconditional.
+        // Collocating it with the put means any error/evict path that pops the
+        // worker (e.g. `send_initial_connection_result` failing below → the outer
+        // `add_worker` error branch → `immediate_evict_worker` → `remove_worker`)
+        // ALWAYS has a matching increment — no `u64` underflow.
+        self.metrics
+            .workers_never_reported_load
+            .fetch_add(1, Ordering::Relaxed);
 
         // Add to capability index for fast matching
         self.capability_index
@@ -4852,10 +4865,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // stale endpoint scores influencing locality decisions.
 
         self.metrics.workers_added.fetch_add(1, Ordering::Relaxed);
-        // (#sched-zeroload) Every new worker starts with has_reported_load=false.
-        self.metrics
-            .workers_never_reported_load
-            .fetch_add(1, Ordering::Relaxed);
+        // (#sched-zeroload) The never-reported gauge increment lives in INNER
+        // `add_worker`, collocated with `self.workers.put` (`:817`), so it is
+        // symmetric with the choke-point decrement at the pop in inner
+        // `remove_worker` and the error/evict path can't underflow the gauge.
         Ok(())
     }
 
@@ -9477,6 +9490,90 @@ mod b1_lock_decouple_tests {
              remove_worker), not only via the public remove_worker — the decrement \
              must live at the eviction choke point or the gauge leaks every \
              stalled-keepalive worker"
+        );
+    }
+
+    /// (#sched-zeroload) The never-reported gauge must NOT underflow on the
+    /// `add_worker` ERROR path. Inner `add_worker` puts the worker into
+    /// `self.workers` BEFORE `send_initial_connection_result`; if that send
+    /// fails (the worker dropped its `UpdateForWorker` channel mid-registration
+    /// — a real production race: a worker disconnecting during connect), inner
+    /// `add_worker` returns Err and the OUTER `add_worker` error branch calls
+    /// `immediate_evict_worker` → inner `remove_worker`, which finds the worker
+    /// still in the map and decrements the gauge (`!has_reported_load`).
+    ///
+    /// If the increment lives in the outer success-only branch (after
+    /// `drop(inner)`), the error path NEVER reaches it — decrement-without-
+    /// increment underflows the `u64` gauge to `u64::MAX`, which reads as
+    /// ~1.8e19 for the rest of the process lifetime and permanently destroys
+    /// the stalled-keepalive alert this gauge exists to drive. The fix
+    /// collocates the increment with `self.workers.put` in inner `add_worker`,
+    /// symmetric with the decrement at `self.workers.pop` in inner
+    /// `remove_worker`.
+    ///
+    /// Drives the REAL error path (not a synthetic `remove_worker`): build a
+    /// Worker whose `UpdateForWorker` receiver is dropped BEFORE `add_worker`,
+    /// so the unbounded `tx.send` inside `send_initial_connection_result`
+    /// returns Err.
+    ///
+    /// Mutation: move the increment back to the outer success-only branch →
+    /// this test red-fails with the bespoke underflow message below.
+    #[nativelink_test]
+    async fn t_never_reported_gauge_no_underflow_on_add_error() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+
+        // Gauge starts at 0 before the add.
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            0,
+            "gauge must start at 0 before the failing add_worker"
+        );
+
+        // Build a worker whose receiver is already dropped, so the unbounded
+        // `tx.send` inside `send_initial_connection_result` fails (an
+        // UnboundedSender::send errors ONLY when the receiver is dropped).
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let worker = Worker::new(
+            WorkerId("WDROP".to_string()),
+            props_pool(),
+            tx,
+            42,
+            0,
+        );
+
+        // add_worker must return Err (connection-closed): inner add_worker puts
+        // the worker, then send_initial_connection_result fails → outer error
+        // branch evicts via immediate_evict_worker → inner remove_worker.
+        let res = scheduler.add_worker(worker).await;
+        assert!(
+            res.is_err(),
+            "add_worker on a worker with a dropped receiver must return Err \
+             (send_initial_connection_result fails)"
+        );
+
+        let gauge = scheduler.workers_never_reported_load_for_test();
+        // Distinct assert for the underflow itself, so a wrap-to-u64::MAX is
+        // diagnosed separately from an off-by-one.
+        assert_ne!(
+            gauge,
+            u64::MAX,
+            "workers_never_reported_load underflowed to u64::MAX on the \
+             add_worker error path — the increment is NOT collocated with the \
+             choke-point decrement, so a worker that drops its channel during \
+             registration is decremented at the evict without ever being \
+             incremented at the put"
+        );
+        assert_eq!(
+            gauge,
+            0,
+            "add_worker error path (send_initial_connection_result failed → \
+             immediate_evict) must leave workers_never_reported_load at its \
+             pre-add value — the increment must be symmetric with the \
+             choke-point decrement (collocated at workers.put / workers.pop) or \
+             the gauge underflows to u64::MAX on every worker that drops its \
+             channel during registration, permanently destroying the \
+             stalled-keepalive alert"
         );
     }
 }
