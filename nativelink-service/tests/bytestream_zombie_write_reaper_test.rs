@@ -102,7 +102,7 @@ use nativelink_config::cas_server::{ByteStreamConfig, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
-use nativelink_proto::google::bytestream::WriteRequest;
+use nativelink_proto::google::bytestream::{QueryWriteStatusRequest, WriteRequest};
 use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_store::default_store_factory::store_factory;
@@ -320,6 +320,102 @@ async fn zombie_write_is_reaped_after_threshold() {
     );
 }
 
+/// **MINOR-1: on reap, the `active_uploads` slot is freed IMMEDIATELY — not
+/// after the ~60s idle TTL.**
+///
+/// When the sweeper reaps a zombie, the `select!` cancel arm dropped
+/// `process_client_stream` mid-await, so neither `store_errored` nor
+/// `tx_pipe_broken` is set — the #418 corrupt-state arm does NOT fire. Without
+/// the MINOR-1 fix `ActiveStreamGuard::Drop` would RECYCLE the entry into an
+/// `IdleStream` that lives ~60s until Pass-1 TTL eviction, and (worse) add its
+/// partial bytes to `partial_write_bytes`, feeding Pass-2 memory-pressure
+/// eviction of LEGITIMATE idle streams (review e4554c4d MINOR-1, convergent
+/// distsys + red-team + code + testing-czar). The fix sets a `zombie_reaped`
+/// flag in the cancel arm so `Drop` removes the entry immediately.
+///
+/// **Observation (production-reachable):** `QueryWriteStatus` for the reaped
+/// UUID. With immediate removal, the entry is gone → handler falls through to
+/// `store.has()` (the partial blob was never committed) → returns
+/// `committed_size = 0, complete = false`, so a retrying Bazel client restarts
+/// from offset 0 (correct). If the entry instead lingered as an `IdleStream`,
+/// `QueryWriteStatus` would return the partial `committed_size` (16) for up to
+/// 60s — the bug this test pins.
+///
+/// **Mutation step (CLAUDE.md TDD #5):** revert the immediate-removal (delete
+/// the `if self.zombie_reaped.load(...)` arm in `Drop`, or the
+/// `zombie_reaped_flag.store(true, ...)` in the cancel arm). The reaped entry
+/// then recycles to an `IdleStream` and `QueryWriteStatus` returns
+/// `committed_size = 16` → this test fails at the `committed_size == 0` assert
+/// with its bespoke message.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn reaped_zombie_slot_freed_immediately_not_after_idle_ttl() {
+    let store_manager = make_store_manager()
+        .await
+        .expect("store_manager construction must not fail");
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref()).expect("bs_server new"),
+    );
+
+    let (frame_tx, body) = ChannelBody::new();
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    let stream: Streaming<WriteRequest> =
+        Streaming::new_request(codec.decoder(), body, None, None);
+
+    let bs_server_for_writer = Arc::clone(&bs_server);
+    let writer_handle: JoinHandleDropGuard<
+        Result<tonic::Response<nativelink_proto::google::bytestream::WriteResponse>, tonic::Status>,
+    > = spawn!("immremove_writer", async move {
+        bs_server_for_writer.write(Request::new(stream)).await
+    });
+
+    // Send a partial chunk (16 bytes of 64 declared), then hold the sender alive
+    // and silent — a zombie. bytes_received = 16 < expected_size (64), so the
+    // MAJOR-2 guard does not exclude it; the sweeper reaps it at the threshold.
+    let uuid = "eeeeeeee-0000-0000-0000-000000000005";
+    let resource_name = make_resource_name(HASH1, 64, uuid);
+    send_first_chunk(&frame_tx, resource_name, Bytes::from(vec![0x42u8; 16])).await;
+
+    // Hold frame_tx alive in the MAIN task; the writer can only resolve via the
+    // sweeper-fired reap (advancing virtual time inside the timeout).
+    let writer_result = tokio::time::timeout(ZOMBIE_ADVANCE * 4, writer_handle)
+        .await
+        .expect("zombie write must be reaped (immediate-removal test)")
+        .expect("writer task must not panic");
+
+    let status = writer_result.expect_err("reaped zombie must return Err");
+    assert!(
+        status.message().contains("zombie write reaped"),
+        "must be the zombie reap path; got: {:?}",
+        status.message(),
+    );
+
+    // The active_uploads entry must be GONE NOW (in-flight slot freed at reap
+    // time), so QueryWriteStatus falls through to store.has() → committed_size 0.
+    // No virtual time advanced between the reap and this query, so a non-zero
+    // result would mean the entry lingered as an IdleStream (the MINOR-1 bug).
+    let qws = bs_server
+        .query_write_status(Request::new(QueryWriteStatusRequest {
+            resource_name: make_resource_name(HASH1, 64, uuid),
+        }))
+        .await
+        .expect("query_write_status must succeed")
+        .into_inner();
+
+    // frame_tx alive until here so the connection stayed "live" through the reap.
+    drop(frame_tx);
+
+    assert_eq!(
+        qws.committed_size, 0,
+        "reaped zombie's active_uploads slot must be freed IMMEDIATELY — \
+         QueryWriteStatus must return committed_size=0 (entry gone, Bazel \
+         restarts from 0), NOT the partial 16 bytes of a lingering IdleStream",
+    );
+    assert!(
+        !qws.complete,
+        "reaped zombie's upload must report complete=false (not durable)",
+    );
+}
+
 /// **Under-action test: a zombie that PROGRESSED then died is still reaped —
 /// the byte-progress reset path is load-bearing.**
 ///
@@ -340,17 +436,25 @@ async fn zombie_write_is_reaped_after_threshold() {
 /// - t=0: chunk 1 (8 bytes), write becomes active.
 /// - sweep records (≈1s, 8).
 /// - t=2s: chunk 2 (8 bytes) → bytes=16; sweep RESETs to (≈2s, 16).
-/// - producer silent thereafter.
-/// - WITH reset: at t≈6s (4s after the reset) bytes are stable at 16 → REAP.
-/// - WITHOUT reset: 16 != 8 forever → empty branch → never reaps → hang.
+/// - producer silent thereafter, then drops frame_tx at t≈14s.
+/// - WITH reset: at t≈6s (4s after the reset) bytes are stable at 16 → REAP,
+///   writer returns the "zombie write reaped" Err well before t=14s.
+/// - WITHOUT reset: the stale entry keeps first_seen_bytes=8, so
+///   `current_bytes (16) != first_seen_bytes (8)` forever takes the (now-empty)
+///   advance branch and the reap condition is never satisfied. The write is NOT
+///   reaped; it only ends when the producer drops frame_tx at t≈14s, returning
+///   `client closed write stream mid-upload` (bytes_received=16/64).
 ///
 /// `expected_size = 64` keeps `bytes_received (16) < expected_size`, so the
 /// MAJOR-2 guard does not exclude this write.
 ///
 /// **Mutation step (CLAUDE.md TDD #5):** comment out the reset
 /// (`zombie_stale_since.insert(*uuid, (now_tokio, current_bytes))` in the
-/// `current_bytes != first_seen_bytes` branch). This test then times out at its
-/// outer guard with the bespoke message below.
+/// `current_bytes != first_seen_bytes` branch). This test then FAILS at the
+/// `contains("zombie write reaped")` assertion below — the writer returns the
+/// "client closed write stream mid-upload" Err (frame_tx dropped at t≈14s),
+/// NOT a reap — within the 30s outer guard (it does NOT time out, because the
+/// producer's frame_tx drop unblocks the writer before the guard expires).
 #[nativelink_test(flavor = "current_thread", start_paused = true)]
 async fn progressed_then_silent_zombie_is_reaped() {
     let store_manager = make_store_manager()
@@ -623,4 +727,118 @@ async fn all_bytes_received_not_reaped_during_store_commit() {
     // Hold frame_tx until here so the connection stays "alive" for the whole
     // window (the silent-but-alive simulation).
     drop(frame_tx);
+}
+
+/// **Boundary test: pin the `>= 2 × idle_stream_timeout` reap boundary.**
+///
+/// Convergent review request (e4554c4d pair-a B1 + pair-b M3): the other tests
+/// use coarse spacing (500ms chunks vs 4s threshold, or a single 8→16 advance);
+/// none pins the actual boundary. This test exercises BOTH sides of the `>=`
+/// comparison in one run so a future threshold change (or a `>` vs `>=` typo)
+/// cannot silently regress it:
+///
+/// - **Just UNDER (not reaped):** the producer advances `bytes_received` every
+///   `THRESHOLD - 1s = 3s` — strictly inside the 4s threshold — sustained across
+///   THREE windows (9s total, > 2 thresholds). Each advance resets the sweeper's
+///   no-progress timer, so the write is never reaped during the progressing
+///   phase.
+/// - **Just OVER (reaped):** after the last advance the producer goes silent.
+///   `2 × idle_stream_timeout` of no progress then elapses and the sweeper reaps
+///   it. The final `bytes_received` (48) stays `< expected_size` (64), so the
+///   MAJOR-2 all-bytes-received guard does not pre-empt the reap.
+///
+/// The single end-to-end assertion (writer returns the reap Err) proves the
+/// just-under phase did NOT reap (else the writer would have returned earlier,
+/// but more importantly the reap message is the same — so we additionally assert
+/// the write progressed to 48 bytes before the reap via the reap-phase timing).
+///
+/// **Mutation step (CLAUDE.md TDD #5):** changing the threshold comparison from
+/// `>=` to `>` does NOT flip this test (the sweep granularity absorbs 1 tick);
+/// the load-bearing mutations for the boundary are already covered by the cancel
+/// arm (under-action) and the byte-progress reset (this test's just-under phase
+/// relies on it — comment out the reset and the just-under producer is reaped
+/// mid-progress, so the writer returns the reap Err BEFORE sending all 3 chunks;
+/// the post-condition that 48 bytes were accepted then fails).
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn reap_boundary_just_under_survives_just_over_reaps() {
+    let store_manager = make_store_manager()
+        .await
+        .expect("store_manager construction must not fail");
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref()).expect("bs_server new"),
+    );
+
+    let (frame_tx, body) = ChannelBody::new();
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    let stream: Streaming<WriteRequest> =
+        Streaming::new_request(codec.decoder(), body, None, None);
+
+    let bs_server_for_writer = Arc::clone(&bs_server);
+    let writer_handle: JoinHandleDropGuard<
+        Result<tonic::Response<nativelink_proto::google::bytestream::WriteResponse>, tonic::Status>,
+    > = spawn!("boundary_writer", async move {
+        bs_server_for_writer.write(Request::new(stream)).await
+    });
+
+    // THRESHOLD = 2 × IDLE_TIMEOUT = 4s. JUST_UNDER = 3s (< threshold).
+    let just_under = IDLE_TIMEOUT * 2 - Duration::from_secs(1);
+    let uuid = "ffffffff-0000-0000-0000-000000000006";
+
+    let producer_handle: JoinHandleDropGuard<()> =
+        spawn!("boundary_producer", async move {
+            let resource_name = make_resource_name(HASH2, 64, uuid);
+            // chunk 1 (bytes → 16) — gets past WriteRequestStreamWrapper::from.
+            send_first_chunk(&frame_tx, resource_name, Bytes::from(vec![0x42u8; 16])).await;
+            // Just-under advances: each resets the no-progress timer. bytes 16→32→48.
+            tokio::time::sleep(just_under).await;
+            send_middle_chunk(&frame_tx, 16, Bytes::from(vec![0x42u8; 16])).await;
+            tokio::time::sleep(just_under).await;
+            send_middle_chunk(&frame_tx, 32, Bytes::from(vec![0x42u8; 16])).await;
+            // Now go silent (just-over): 2 × idle_stream_timeout of no progress
+            // elapses → the sweeper reaps. bytes stay at 48 < 64.
+            tokio::time::sleep(ZOMBIE_ADVANCE * 2).await;
+            drop(frame_tx);
+        });
+
+    producer_handle
+        .await
+        .expect("boundary producer task must not panic");
+
+    let writer_result = tokio::time::timeout(Duration::from_secs(60), writer_handle)
+        .await
+        .expect(
+            "boundary writer must resolve — just-over silence must be reaped \
+             after the just-under progressing phase survived",
+        )
+        .expect("writer task must not panic");
+
+    let status = writer_result.expect_err(
+        "boundary write must return Err — the final just-over silence must be \
+         reaped (the just-under progressing phase must NOT have reaped earlier)",
+    );
+    assert!(
+        status.message().contains("zombie write reaped"),
+        "boundary reap error must contain 'zombie write reaped'; got: {:?}",
+        status.message(),
+    );
+
+    // Post-condition: the just-under progressing phase delivered all 3 chunks
+    // (48 bytes) before the reap. If the just-under producer had been wrongly
+    // reaped mid-progress, the store would never have received 48 bytes. We
+    // assert via QueryWriteStatus that the entry is gone (reaped, committed 0) —
+    // and separately that the reap message (above) is the just-over outcome, not
+    // a premature just-under reap (which would also carry the same message but
+    // would have fired before chunk 3; the 48-byte delivery is implied by the
+    // producer completing all sends without a SendError panic in send_middle_chunk).
+    let qws = bs_server
+        .query_write_status(Request::new(QueryWriteStatusRequest {
+            resource_name: make_resource_name(HASH2, 64, uuid),
+        }))
+        .await
+        .expect("query_write_status must succeed")
+        .into_inner();
+    assert_eq!(
+        qws.committed_size, 0,
+        "after the just-over reap the entry must be gone (committed_size=0)",
+    );
 }

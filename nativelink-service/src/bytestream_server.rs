@@ -904,6 +904,17 @@ struct ActiveStreamGuard {
     /// "zombie write reaped ...")` when cancelled. `None` for resumed writes
     /// until the new channel is stored at resume time.
     zombie_reap_rx: Option<oneshot::Receiver<()>>,
+    /// Set to `true` by `inner_write`'s `select!` cancel arm when a zombie is
+    /// reaped. `Drop` reads it FIRST: a reaped zombie must NOT recycle into an
+    /// `IdleStream` (its partial bytes are garbage — the producer is dead). It
+    /// is removed from `active_uploads` IMMEDIATELY so the in-flight slot frees
+    /// at reap time, not after the ~60s idle TTL — preventing a burst of dead
+    /// IdleStreams from feeding memory-pressure eviction of LEGITIMATE idle
+    /// streams (review e4554c4d MINOR-1, convergent distsys + red-team + code +
+    /// testing-czar). Shared via `Arc` because `inner_write` holds a `&mut`
+    /// borrow of `stream_state` (via `active_stream`) while the cancel arm
+    /// fires, so the arm cannot touch the guard directly.
+    zombie_reaped: Arc<AtomicBool>,
 }
 
 impl ActiveStreamGuard {
@@ -931,6 +942,34 @@ impl Drop for ActiveStreamGuard {
             );
             return;
         };
+
+        // Zombie-reap arm (review e4554c4d MINOR-1). Checked BEFORE the #418
+        // corrupt-state arm: when the sweeper reaps a zombie, the `select!`
+        // cancel arm dropped `process_client_stream` mid-await, so neither
+        // `store_errored` nor `tx_pipe_broken` is set — the #418 arm would NOT
+        // fire and this guard would otherwise recycle into an `IdleStream`. That
+        // is wrong for a zombie: the producer is dead, the partial bytes are
+        // garbage, and a ~60s backlog of dead IdleStreams (under the real burst
+        // of 20+ simultaneous zombies) can feed Pass-2 memory-pressure eviction
+        // of LEGITIMATE idle streams. Remove the entry IMMEDIATELY so the
+        // in-flight slot frees at reap time. Dropping `stream_state` here cancels
+        // the incomplete `store_update_fut` — correct, an incomplete blob must
+        // not be stored. A retrying client (Aborted → QueryWriteStatus → no
+        // entry → committed_size 0) restarts cleanly from offset 0. Do NOT add
+        // to `partial_write_bytes`: no IdleStream is created, so there is nothing
+        // to memory-pressure-evict.
+        if self.zombie_reaped.load(Ordering::Acquire) {
+            warn!(
+                uuid = format!("{:032x}", uuid),
+                bytes_received = self.bytes_received.load(Ordering::Acquire),
+                "zombie reaped — removing active_uploads entry immediately \
+                 (in-flight slot freed now, not after idle TTL); incomplete \
+                 store write cancelled"
+            );
+            active_uploads.remove(&uuid);
+            self.metrics.active_uploads.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
 
         // #418: corrupt-state arm. Lifecycle invariant: a StreamState
         // is resumable iff its `store_update_fut` is paused mid-await
@@ -1051,6 +1090,7 @@ impl IdleStream {
             metrics: instance_info.metrics.clone(),
             partial_write_bytes: instance_info.partial_write_bytes.clone(),
             zombie_reap_rx: Some(zombie_reap_rx),
+            zombie_reaped: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1443,7 +1483,8 @@ impl ByteStreamServer {
                             // all-bytes-received case and prune any stale tracking entry.
                             // (`expected_size == 0` empty-blob uploads never enter
                             // process_client_stream's data loop and complete synchronously,
-                            // so `current_bytes >= 0` correctly excludes them too.)
+                            // so `current_bytes >= expected_size (== 0)` holds trivially and
+                            // correctly excludes them too.)
                             if current_bytes >= *expected_size {
                                 zombie_stale_since.remove(uuid);
                                 continue;
@@ -1730,6 +1771,7 @@ impl ByteStreamServer {
             metrics: instance.metrics.clone(),
             partial_write_bytes: instance.partial_write_bytes.clone(),
             zombie_reap_rx: Some(zombie_reap_rx),
+            zombie_reaped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2756,6 +2798,10 @@ impl ByteStreamServer {
         // for >= 2 × idle_stream_timeout — signalling a zombie stream on a
         // live h2 connection (see Pass 3 in `bytestream_idle_stream_sweeper`).
         let zombie_reap_rx = active_stream_guard.zombie_reap_rx.take();
+        // Clone the reaped-flag handle BEFORE the `&mut` borrow of
+        // `stream_state` below: the `select!` cancel arm sets it so `Drop`
+        // takes the immediate-remove path (review e4554c4d MINOR-1).
+        let zombie_reaped_flag = Arc::clone(&active_stream_guard.zombie_reaped);
 
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
         let write_start = std::time::Instant::now();
@@ -2785,6 +2831,12 @@ impl ByteStreamServer {
         // `active_stream_guard` drop recycles the `ActiveStreamGuard`
         // into an `IdleStream` (or discards on store error), same as
         // if the caller dropped mid-upload.
+        // Both `ActiveStreamGuard` constructors (`into_active_stream` for resume,
+        // and the vacant/collision path in `create_or_join_upload_stream`) set
+        // `zombie_reap_rx: Some(...)`, so in practice this is always the `select!`
+        // branch. The `else` (plain `try_join!`) is kept defensively for any
+        // future guard construction that leaves the receiver unset — it is not
+        // expected to run today (review e4554c4d M4, OPTIONAL: left conservative).
         let write_result = if let Some(mut cancel_rx) = zombie_reap_rx {
             tokio::select! {
                 result = async {
@@ -2806,11 +2858,16 @@ impl ByteStreamServer {
                     )
                 } => result,
                 _ = &mut cancel_rx => {
+                    // Mark the guard so `Drop` removes the active_uploads entry
+                    // IMMEDIATELY (does not recycle to IdleStream) and cancels
+                    // the incomplete store write (review e4554c4d MINOR-1).
+                    zombie_reaped_flag.store(true, Ordering::Release);
                     Err(make_err!(
                         Code::Aborted,
                         "zombie write reaped — no bytes received for \
                          >= 2 × idle_stream_timeout on a live h2 connection; \
-                         StallGuard and in-flight slot released",
+                         in-flight slot and StallGuard removed immediately, \
+                         incomplete store write cancelled",
                     ))
                 }
             }
