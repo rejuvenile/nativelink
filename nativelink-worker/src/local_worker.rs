@@ -2183,11 +2183,13 @@ pub(crate) enum PeriodicTickMemoReset {
 /// forced memo clear). The out-of-band server-mutation classes that heartbeat
 /// guarded (AcProxy NotFound-eviction / BIS-ack sweep / cap-truncation) now
 /// re-converge via the reconnect full snapshot + the Stage-2B replay-until-
-/// acked reader (`replay_unacked_chunks`) + the over-cap force-snapshot EVENT —
-/// all event-driven, no timer. Returns which path fired so the caller can emit
-/// the matching log. Takes only the one piece of `BlobsAvailableState` the
-/// helper touches so the T6 test can drive the contract directly without
-/// constructing a full state.
+/// acked reader (`replay_unacked_chunks`) + the over-cap force-snapshot EVENT
+/// + the SERVER-PUSHED [`Update::AcPinResync`] signal (the Stage A fix for the
+/// pair-a BLOCK: reconnect alone is unbounded on a stable connection — see
+/// [`force_ac_pin_resync`]). All event-driven, no timer. Returns which path
+/// fired so the caller can emit the matching log. Takes only the one piece of
+/// `BlobsAvailableState` the helper touches so the T6 test can drive the
+/// contract directly without constructing a full state.
 pub(crate) fn apply_periodic_tick_memo_resets(
     last_sent_ac_pin_set: &Mutex<HashSet<DigestInfo>>,
     is_first: bool,
@@ -2197,6 +2199,32 @@ pub(crate) fn apply_periodic_tick_memo_resets(
         return PeriodicTickMemoReset::ReconnectClear;
     }
     PeriodicTickMemoReset::None
+}
+
+/// (FL-688 v3 Stage A fix) Force the worker to re-advertise its FULL current
+/// AC-pin set on the next periodic tick, in response to a server-pushed
+/// [`Update::AcPinResync`]. The server sends that signal immediately after it
+/// removes AC-pin entries for this worker's endpoint from its `AcPinRegistry`
+/// OUT-OF-BAND (BIS-ack sweep / AcProxy peer-NotFound eviction /
+/// cap-truncation). After such a removal the server's per-endpoint set has
+/// FEWER entries than the worker's `last_sent_ac_pin_set`; the worker's own
+/// AC-pin set is unchanged, so the next tick computes an EMPTY delta and the
+/// skip-gate ([`should_skip_blobs_available_tick`]) SUPPRESSES it — leaving the
+/// divergence to persist until the next reconnect (rare on a stable
+/// connection). This is the BLOCK pair-a found: removing the periodic heartbeat
+/// left no bounded-time convergence path for server-side removals.
+///
+/// The fix CLEARS `last_sent_ac_pin_set` (the exact mechanism the reconnect
+/// `is_first` clear uses): the next tick's delta then reports the whole current
+/// set as `added`, so `ac_pin_delta_empty=false`, the skip-gate no longer
+/// suppresses, and field 17 (`pinned_ac_mirror_entries`, REPLACE-semantics) is
+/// re-sent in full — the server's `replace_endpoint_ac_pins` restores parity.
+/// Idempotent: multiple signals before the next tick collapse to one
+/// re-snapshot (the clear is idempotent and the tick re-sends the same full
+/// set), which is why the hot BIS-ack sweep can fire the push once per endpoint
+/// per sweep cycle without coalescing.
+pub(crate) fn force_ac_pin_resync(last_sent_ac_pin_set: &Mutex<HashSet<DigestInfo>>) {
+    last_sent_ac_pin_set.lock().clear();
 }
 
 /// Counts how many AC-pin digests have been added (in `current` but not
@@ -2467,6 +2495,39 @@ impl BlobsAvailableState {
     #[doc(hidden)]
     pub fn test_record_added_digest(&self, digest: DigestInfo) {
         self.tracker.on_insert(StoreKey::Digest(digest), 0);
+    }
+
+    /// Test-only: seed `last_sent_ac_pin_set` to a known set. Models the
+    /// post-ack state where the server has acked the worker's AC-pin
+    /// advertisement, so the worker's memo records what it believes the server
+    /// holds. Used by the AC-pin resync convergence test to arm the skip-gate
+    /// (memo == current set ⇒ delta empty ⇒ tick suppressed) before simulating
+    /// the server's out-of-band removal.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_seed_last_sent_ac_pin_set(&self, digests: &[DigestInfo]) {
+        let mut set = self.last_sent_ac_pin_set.lock();
+        set.clear();
+        set.extend(digests.iter().copied());
+    }
+
+    /// Test-only: snapshot of the current `last_sent_ac_pin_set` memo.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_last_sent_ac_pin_set(&self) -> HashSet<DigestInfo> {
+        self.last_sent_ac_pin_set.lock().clone()
+    }
+
+    /// Test-only: drive the `Update::AcPinResync` worker handler's core effect
+    /// (clear the AC-pin memo) without standing up the full `run()` stream loop.
+    /// Mirrors the production arm in `LocalWorkerImpl::run`. The mutation guard
+    /// for the convergence test comments out the body of [`force_ac_pin_resync`];
+    /// this seam keeps the test pinned to the production function.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_handle_ac_pin_resync(&self) {
+        force_ac_pin_resync(&self.last_sent_ac_pin_set);
     }
 }
 
@@ -4517,6 +4578,39 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     broadcast_id = ack.broadcast_id,
                                     sequence = ack.sequence,
                                     "BlobsAvailableAck received but blobs_available_state is None (BUG?)"
+                                );
+                            }
+                        }
+                        Update::AcPinResync(_) => {
+                            // (FL-688 v3 Stage A fix) The server removed AC-pin
+                            // entries for our endpoint OUT-OF-BAND (BIS-ack
+                            // sweep / AcProxy peer-NotFound / cap-truncation) and
+                            // is asking us to FORCE a full re-advertisement of
+                            // our AC-pin set so its `AcPinRegistry` reconverges
+                            // WITHOUT waiting for a reconnect. Clear
+                            // `last_sent_ac_pin_set` (the reconnect-clear path):
+                            // the next tick reports the full set as `added` so
+                            // the skip-gate no longer suppresses, and field 17 is
+                            // re-sent (replace-semantics) → server parity
+                            // restored. See `force_ac_pin_resync`.
+                            if let Some(ref state) = self.blobs_available_state {
+                                force_ac_pin_resync(&state.last_sent_ac_pin_set);
+                                // Wake the periodic loop so the resync rides the
+                                // NEXT tick promptly rather than waiting out the
+                                // current interval.
+                                state.notify.notify_one();
+                                debug!(
+                                    target: "nativelink::ac_pin_resync",
+                                    "AcPinResync received — cleared last_sent_ac_pin_set; \
+                                     next tick re-advertises full AC-pin snapshot"
+                                );
+                            } else {
+                                // No BlobsAvailable reporting on this worker (no
+                                // FilesystemStore fast tier) ⇒ we never advertise
+                                // AC pins, so a resync request is a no-op.
+                                trace!(
+                                    target: "nativelink::ac_pin_resync",
+                                    "AcPinResync received but blobs_available_state is None; no-op"
                                 );
                             }
                         }

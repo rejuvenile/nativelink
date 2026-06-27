@@ -123,6 +123,15 @@ name = "blobs_available_no_heartbeat_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (FL-688 v3 Stage A fix) Worker-side AC-pin resync convergence: a
+# server-pushed AcPinResync forces a full AC-pin re-advertisement on the
+# next tick even when the local set is unchanged (the skip-gate-suppressed
+# case). Uses MockWorkerApiClient + the AC-mirror test seam, all gated
+# behind `cfg(any(test, feature = "test-utils"))`.
+name = "ac_pin_resync_convergence_test"
+required-features = ["test-utils"]
+
+[[test]]
 name = "bis_chunk_handler_test"
 required-features = ["test-utils"]
 

@@ -859,9 +859,60 @@ message UpdateForWorker {
         /// reconcile/eviction-gate self-heal (v3 §3.4) relies on this ack
         /// to close.
         BlobsAvailableAck blobs_available_ack = 12;
+
+        /// (FL-688 v3 Stage A fix) Instructs the worker to FORCE a full
+        /// re-advertisement of its current AC-pin set on the next periodic
+        /// tick. Sent by the server immediately after it removes AC-pin
+        /// entries for this worker's endpoint from its `AcPinRegistry`
+        /// OUT-OF-BAND (i.e. not in response to a worker advertisement):
+        ///   (1) the BIS-ack sweep (`src/bin/nativelink.rs`
+        ///       `remove_digests_for_endpoint_batch`, fires continuously on
+        ///       every stable-digest drain),
+        ///   (2) AcProxy peer-NotFound eviction
+        ///       (`nativelink-store/src/ac_proxy_store.rs`
+        ///       `remove_digests_for_endpoint`), and
+        ///   (3) cap-truncation when an incoming AC-pin snapshot exceeds the
+        ///       per-endpoint cap (`worker_api_server.rs` field-17 handling).
+        ///
+        /// After any of these the server's per-endpoint registry has FEWER
+        /// entries than the worker's `last_sent_ac_pin_set`. The worker's
+        /// skip-gate (`should_skip_blobs_available_tick`) sees no LOCAL delta
+        /// (its own AC-pin set is unchanged) and SUPPRESSES the tick, so the
+        /// divergence would otherwise PERSIST until the next reconnect (rare on
+        /// a stable long-lived connection), degrading AC read routing (reads
+        /// mis-route to upstream → latency/cache-miss; not data loss). The
+        /// periodic full-snapshot heartbeat that previously reconciled this was
+        /// removed in v3 Stage A; this push is its event-driven replacement.
+        ///
+        /// FORCE-RE-SNAPSHOT (not a removed-digest list): field 17
+        /// (`pinned_ac_mirror_entries`) is REPLACE-semantics — the worker
+        /// always sends its FULL current AC-pin set, which the server REPLACES.
+        /// A targeted removed-digest list would be dead precision (the worker
+        /// can only re-send the whole set), so a no-payload force signal is
+        /// BOTH simpler AND correct. The worker clears `last_sent_ac_pin_set`
+        /// (reusing the reconnect-clear path) so the next tick reports the full
+        /// set as `added` → the skip-gate no longer suppresses → field 17 is
+        /// re-sent → server replace restores parity. Idempotent (multiple
+        /// signals before the next tick collapse to one re-snapshot), which is
+        /// why the hot BIS-ack sweep can fire it once per endpoint per sweep
+        /// cycle without coalescing concern.
+        ///
+        /// Backward compatibility: workers built before this variant treat the
+        /// unknown oneof tag as ignorable (the `None`/catch-all in
+        /// `local_worker.rs`'s `Update` match `continue`s rather than
+        /// `?`-propagating). NO capability flag is required.
+        AcPinResyncRequest ac_pin_resync = 13;
     }
     reserved 6; // Previously NextId, now reserved.
 }
+
+/// (FL-688 v3 Stage A fix) Force-re-snapshot signal for the worker's
+/// AC-pin set. Carries no payload: the affected endpoint is implicit (it
+/// is the worker this message is routed to over its own server→worker
+/// `UpdateForWorker` stream), and the worker re-advertises its FULL
+/// current AC-pin set (field 17 is replace-semantics), so a removed-digest
+/// list would be dead precision. See `UpdateForWorker.ac_pin_resync`.
+message AcPinResyncRequest {}
 
 /// (FL-688 v3 §3.8) Acknowledgement of one `BlobsAvailableChunk` the
 /// worker sent the scheduler. Symmetric to `BisAck` but in the

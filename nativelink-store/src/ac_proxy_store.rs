@@ -101,7 +101,22 @@ pub struct AcProxyStore {
     /// Optional TLS config for connecting to worker AC endpoints.
     /// `None` means plaintext (`grpc://`).
     worker_tls_config: Option<ClientTlsConfig>,
+    /// (FL-688 v3 Stage A fix) Optional callback fired AFTER a peer-NotFound
+    /// removes this endpoint's AC-pin registry entry (an OUT-OF-BAND removal).
+    /// The bin wires it to push an `AcPinResync` to the worker so its AC-pin
+    /// set re-advertises on the next tick and the registry reconverges WITHOUT
+    /// a reconnect. A CALLBACK (not a direct scheduler handle) keeps
+    /// `nativelink-store` free of a `nativelink-scheduler` dependency — the same
+    /// injection pattern as `AcPinRegistry::on_endpoint_wipe`. `None` in tests /
+    /// standalone (the removal still happens; only the push is skipped).
+    ac_pin_resync_notify: parking_lot::Mutex<Option<AcPinResyncNotify>>,
 }
+
+/// (FL-688 v3 Stage A fix) Callback to push an AC-pin resync to the worker
+/// owning a CAS endpoint, after an out-of-band registry removal. Injected by
+/// the bin so the store layer stays scheduler-agnostic. Mirrors
+/// [`nativelink_util::ac_pin_registry::EndpointWipeCallback`].
+pub type AcPinResyncNotify = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl core::fmt::Debug for AcProxyStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -121,6 +136,7 @@ impl AcProxyStore {
             registry,
             worker_connections: RwLock::new(HashMap::new()),
             worker_tls_config: None,
+            ac_pin_resync_notify: parking_lot::Mutex::new(None),
         })
     }
 
@@ -136,7 +152,18 @@ impl AcProxyStore {
             registry,
             worker_connections: RwLock::new(HashMap::new()),
             worker_tls_config: Some(tls_config),
+            ac_pin_resync_notify: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// (FL-688 v3 Stage A fix) Register the callback fired after a peer-NotFound
+    /// removes an endpoint's AC-pin registry entry. The bin wires this to push
+    /// an `AcPinResync` to the worker (via the scheduler) so its AC-pin set
+    /// re-advertises WITHOUT a reconnect. Set once at startup, after the
+    /// schedulers exist (they are constructed after this store). Keeps the store
+    /// crate scheduler-agnostic (the closure crosses the layer, not a handle).
+    pub fn set_ac_pin_resync_notify(&self, notify: AcPinResyncNotify) {
+        *self.ac_pin_resync_notify.lock() = Some(notify);
     }
 
     /// Inner AC chain accessor (used by the bin's wiring to verify the
@@ -370,6 +397,26 @@ impl AcProxyStore {
                             endpoint = %endpoint,
                             "AcProxyStore: peer NotFound — evicted AC pin entry"
                         );
+                        // (FL-688 v3 Stage A fix) This was an OUT-OF-BAND
+                        // registry removal (not driven by a worker
+                        // advertisement). If the worker still holds the digest
+                        // in its AC-pin set (transient peer-NotFound, or a
+                        // store_id sibling on this endpoint the worker still
+                        // pins), the server's registry is now SHORT vs the
+                        // worker's `last_sent_ac_pin_set` and the worker's
+                        // skip-gate would suppress re-advertisement until
+                        // reconnect. Push an `AcPinResync` so the worker
+                        // re-advertises its full AC-pin set on the next tick.
+                        // (When the worker GENUINELY evicted the blob its own
+                        // eviction delta also re-syncs — both move toward the
+                        // same {without D} state — so this push is the narrow
+                        // transient-NotFound backstop; harmless + idempotent
+                        // when redundant.) Callback keeps the store crate
+                        // scheduler-agnostic; `None` in tests.
+                        let notify = self.ac_pin_resync_notify.lock().clone();
+                        if let Some(notify) = notify {
+                            notify(endpoint);
+                        }
                     } else {
                         warn!(
                             ?digest,
