@@ -560,6 +560,17 @@ struct ApiWorkerSchedulerImpl {
     /// so stale endpoint scores don't persist.
     scores_cache: Arc<tokio::sync::Mutex<LruCache<DigestInfo, Arc<ScoringResult>>>>,
 
+    /// (#sched-zeroload) Shared handle to the same `SchedulerMetrics` the
+    /// outer `ApiWorkerScheduler.metrics` publishes. Held here (NOT
+    /// `#[metric]`-annotated, mirroring `worker_change_notify` /
+    /// `worker_registry`, so it is not double-registered) so the inner
+    /// `remove_worker` eviction CHOKE POINT — through which EVERY eviction
+    /// path funnels (`immediate_evict_worker` → `remove_worker`) — can
+    /// decrement `workers_never_reported_load` for a never-reported worker.
+    /// Decrementing only in the outer public `remove_worker` leaked the
+    /// gauge for the dominant `remove_timedout_workers` eviction path.
+    metrics: Arc<SchedulerMetrics>,
+
     /// Index for fast worker capability lookup.
     /// Used to accelerate `find_worker_for_action` by filtering candidates
     /// based on properties before doing linear scan.
@@ -840,6 +851,20 @@ impl ApiWorkerSchedulerImpl {
         if let Some(ref worker) = result {
             if !worker.cas_endpoint.is_empty() {
                 self.endpoint_to_worker.remove(worker.cas_endpoint.as_str());
+            }
+            // (#sched-zeroload) Decrement the never-reported gauge HERE — the
+            // single eviction choke point. EVERY eviction path
+            // (`remove_timedout_workers`, dispatch-error disconnects, the
+            // op-not-running branch, the public `remove_worker`, shutdown)
+            // funnels through `immediate_evict_worker` → this `remove_worker`.
+            // Decrementing only in the outer public `remove_worker` leaked the
+            // gauge monotonically for the dominant timeout path. Read straight
+            // off the popped `Worker` — no TOCTOU. Mirrors the increment in the
+            // single add path (`add_worker`).
+            if !worker.has_reported_load {
+                self.metrics
+                    .workers_never_reported_load
+                    .fetch_sub(1, Ordering::Relaxed);
             }
         }
 
@@ -2210,6 +2235,12 @@ impl ApiWorkerScheduler {
             NonZeroUsize::new(TREE_CACHE_CAPACITY).unwrap(),
         )));
 
+        // (#sched-zeroload) One `SchedulerMetrics` shared between the outer
+        // (publisher) and the inner struct (where the eviction choke point
+        // decrements `workers_never_reported_load`). Single allocation —
+        // both `metrics` fields below point at the same counters.
+        let metrics = Arc::new(SchedulerMetrics::default());
+
         // (#sched-blend) Zero-guard the assume-N fallback at STORE time. A
         // worker reporting no core count (legacy / Linux / Intel) substitutes
         // `assume_core_count` as its P-core denominator in `capacity_score`.
@@ -2243,12 +2274,13 @@ impl ApiWorkerScheduler {
                 capability_index: WorkerCapabilityIndex::new(),
                 endpoint_to_worker: HashMap::new(),
                 scores_cache: scores_cache.clone(),
+                metrics: metrics.clone(),
                 bis_resend_buffers: HashMap::new(),
             }),
             platform_property_manager,
             worker_timeout_s,
             worker_registry,
-            metrics: Arc::new(SchedulerMetrics::default()),
+            metrics,
             locality_map,
             cas_store,
             tree_cache: Arc::new(tokio::sync::Mutex::new(ByteBoundedTreeCache::new(
@@ -4946,19 +4978,20 @@ impl WorkerScheduler for ApiWorkerScheduler {
 
         // scores_cache is cleared by immediate_evict_worker on the inner struct.
 
-        // Grab the worker's CAS endpoint and has_reported_load before eviction.
-        let (cas_endpoint, was_never_reported): (Option<Arc<str>>, bool) = {
+        // Grab the worker's CAS endpoint before eviction (used to clean up
+        // the prefetch maps below). The never-reported gauge decrement now
+        // lives at the eviction choke point — inner `remove_worker` (reached
+        // via `immediate_evict_worker`) — so EVERY eviction path decrements,
+        // not just this public one. (#sched-zeroload)
+        let cas_endpoint: Option<Arc<str>> = {
             let inner = self.inner.read().await;
-            if let Some(w) = inner.workers.peek(worker_id) {
-                let endpoint = if w.cas_endpoint.is_empty() {
+            inner.workers.peek(worker_id).and_then(|w| {
+                if w.cas_endpoint.is_empty() {
                     None
                 } else {
                     Some(Arc::from(w.cas_endpoint.as_str()))
-                };
-                (endpoint, !w.has_reported_load)
-            } else {
-                (None, false)
-            }
+                }
+            })
         };
 
         let result = {
@@ -4971,13 +5004,6 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 )
                 .await
         };
-
-        // (#sched-zeroload) If this worker never reported load, decrement the gauge.
-        if was_never_reported {
-            self.metrics
-                .workers_never_reported_load
-                .fetch_sub(1, Ordering::Relaxed);
-        }
 
         // Clean up prefetch connection and semaphore for this endpoint.
         if let Some(ep) = cas_endpoint {
@@ -9233,19 +9259,24 @@ mod b1_lock_decouple_tests {
     }
 
     /// (#sched-zeroload) A fleet of 3 workers, all never-reported, with a
-    /// dispatched action MUST return SOME worker — not None. This pins the
-    /// `saturation_fall_through` backstop: never-reported workers get
-    /// `cap_score(100,100,100)` → `weighted_free == 0` → `all_viable_saturated
-    /// == true` → `saturation_fall_through` fires → LRU/MRU fallback selects
-    /// a worker.
+    /// dispatched action MUST return SOME worker — not None. This test calls
+    /// `find_worker_for_action` → `inner_find_worker_for_action`, whose
+    /// selectability mechanism for an all-never-reported fleet is the
+    /// `viable.first()` fallback (`api_worker_scheduler.rs:1076`): every
+    /// candidate scores `effective_load_score(..., has_reported_load=false)
+    /// == u64::MAX`, so `viable.iter().any(score < u64::MAX)` is FALSE and the
+    /// `min_by_key` arm is skipped in favour of `viable.first()`, which returns
+    /// the LRU/MRU-leading worker. (`saturation_fall_through` lives in the
+    /// DIFFERENT function `inner_find_and_reserve_worker`, which this path does
+    /// not exercise.)
     ///
     /// Invariant: a fresh fleet (no workers have reported load) is selectable;
     /// never-reported workers do NOT wedge the scheduler.
     ///
-    /// Mutation: comment out the `saturation_fall_through` fall-through block
-    /// (the `if saturation_fall_through { viable.first() }` arm in
-    /// `inner_find_worker_for_action`) → the saturation_fall_through fires but
-    /// returns None → this test red-fails with the bespoke message below.
+    /// Mutation: change the `viable.first()` arm (`:1076`) to `None` → the
+    /// all-u64::MAX fleet takes the `else` branch, gets `None`, and (no
+    /// pressure-gated candidates exist to trigger the swap fail-open) this test
+    /// red-fails with the bespoke message below.
     #[nativelink_test]
     async fn t_all_never_reported_fleet_selectable() {
         let scheduler = build_scheduler(BarrierWorkerStateManager::new());
@@ -9267,9 +9298,11 @@ mod b1_lock_decouple_tests {
 
         assert!(
             chosen.is_some(),
-            "all-never-reported fleet must be selectable via saturation_fall_through \
-             backstop — a fresh fleet must not wedge on restart; got None instead of \
-             a worker"
+            "all-never-reported fleet must remain selectable — \
+             find_worker_for_action's viable.first() fallback \
+             (api_worker_scheduler.rs:1076) returns a worker when every candidate \
+             scores u64::MAX (never-reported), so a fresh fleet does not wedge on \
+             restart; got None instead of a worker"
         );
     }
 
@@ -9359,6 +9392,91 @@ mod b1_lock_decouple_tests {
             scheduler.workers_never_reported_load_for_test(),
             0,
             "gauge must reach 0 after removing unreported worker WC"
+        );
+    }
+
+    /// (#sched-zeroload) The never-reported gauge must decrement when a worker
+    /// is evicted via the TIMEOUT path (`remove_timedout_workers`), NOT only
+    /// via the public `remove_worker`. The timeout path is the DOMINANT
+    /// production eviction for a stalled-keepalive never-reported worker — the
+    /// exact failure mode this gauge is meant to alert on. It evicts via
+    /// `inner.immediate_evict_worker` → inner `remove_worker` directly,
+    /// bypassing the public `remove_worker`. Before the fix the decrement lived
+    /// only in the public `remove_worker`, so a timeout-evicted never-reported
+    /// worker leaked the gauge monotonically.
+    ///
+    /// Drives a REAL timeout eviction (not the public remove): `build_scheduler`
+    /// sets `worker_timeout_s = 100`; workers are added with
+    /// `last_update_timestamp = 42` and registered in the registry at the same
+    /// instant. WLIVE then sends a keepalive at t=250 (refreshes BOTH the
+    /// in-pool timestamp and the registry heartbeat). Calling
+    /// `remove_timedout_workers(300)`: WGONE is past `evict_threshold =
+    /// 300-200 = 100` AND the registry deadline (42+100=142) ≤ 300 → evicted;
+    /// WLIVE is locally alive (250 > `timeout_threshold = 200`) → survives.
+    /// Neither ever reported load.
+    ///
+    /// Mutation: comment out the `fetch_sub` in INNER `remove_worker` → the
+    /// timeout eviction does not decrement → gauge stays 2 → this test
+    /// red-fails with the bespoke message below.
+    #[nativelink_test]
+    async fn t_never_reported_gauge_decrements_on_timeout_eviction() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+
+        // Two never-reported workers (no update_worker_load on either).
+        // add_worker_in_pool uses Worker::new(..., timestamp=42, ...), so both
+        // have last_update_timestamp == 42 and are registered at UNIX_EPOCH+42s.
+        let _rx_gone = add_worker_in_pool(&scheduler, "WGONE").await;
+        let _rx_live = add_worker_in_pool(&scheduler, "WLIVE").await;
+
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            2,
+            "gauge must be 2 after adding 2 never-reported workers to the pool"
+        );
+
+        // Refresh WLIVE so the timeout sweep at t=300 spares it: keepalive at
+        // t=250 advances BOTH the in-pool last_update_timestamp (250 > the
+        // timeout_threshold of 200) and the registry heartbeat. Keepalive does
+        // NOT set has_reported_load — WLIVE stays never-reported.
+        scheduler
+            .worker_keep_alive_received(&WorkerId("WLIVE".to_string()), 250)
+            .await
+            .expect("WLIVE keepalive at t=250");
+
+        // Drive the timeout sweep at t=300. WGONE (last_update 42) is past the
+        // double-timeout evict_threshold (300 - 200 = 100) and the registry
+        // deadline (142 ≤ 300) → evicted via remove_timedout_workers →
+        // immediate_evict_worker → inner remove_worker (NOT the public one).
+        scheduler
+            .remove_timedout_workers(300)
+            .await
+            .expect("remove_timedout_workers(300)");
+
+        // WGONE must actually be gone (not a vacuously-green assertion): it was
+        // evicted, WLIVE was spared.
+        assert!(
+            scheduler
+                .worker_has_reported_load_for_test(&WorkerId("WGONE".to_string()))
+                .await
+                .is_none(),
+            "WGONE must have been evicted by the timeout sweep (absent from the pool)"
+        );
+        assert!(
+            scheduler
+                .worker_has_reported_load_for_test(&WorkerId("WLIVE".to_string()))
+                .await
+                .is_some(),
+            "WLIVE must survive the timeout sweep (refreshed keepalive at t=250)"
+        );
+
+        assert_eq!(
+            scheduler.workers_never_reported_load_for_test(),
+            1,
+            "never-reported gauge must decrement when a worker is evicted via the \
+             TIMEOUT path (remove_timedout_workers → immediate_evict_worker → inner \
+             remove_worker), not only via the public remove_worker — the decrement \
+             must live at the eviction choke point or the gauge leaks every \
+             stalled-keepalive worker"
         );
     }
 }
