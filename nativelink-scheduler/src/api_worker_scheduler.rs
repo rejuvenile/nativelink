@@ -1671,12 +1671,12 @@ impl ApiWorkerSchedulerImpl {
     /// and pre-built message so the caller can send the notification *after* releasing
     /// the write lock.
     ///
-    /// `pre_computed_tree` is normally `None` for the hot dispatch path.
-    /// The `find_and_reserve_worker` caller builds `resolved_directories`
+    /// `pre_computed_tree` is always `None` at current call sites.  The hot
+    /// dispatch path (`find_and_reserve_worker`) builds `resolved_directories`
     /// post-lock via `to_proto_vecs()` gated on `result.is_some()`, so the
-    /// clone never runs on the no-match path.  This parameter is kept so
-    /// other callers (e.g. the reconnect replay path at line 2308) can supply
-    /// their own pre-built tree data if needed.
+    /// clone is never built on the no-match path.  The reconnect-notify path
+    /// (`worker_notify_run_action`, line 2312) also passes `None` — workers
+    /// re-fetch the tree via GetTree if they need it.
     ///
     /// Note: peer hints are NO LONGER carried inside `StartExecute` (#98 — peer
     /// hints chunking). They ride a separate `Update::ChunkedMessage` stream
@@ -2516,8 +2516,11 @@ impl ApiWorkerScheduler {
         // `do_try_match` until a worker becomes available).
         // Worker API listener has max_encoding_message_size=64MiB.
         const MAX_TREE_PROTO_BYTES: usize = 32 * 1024 * 1024;
-        let tree_fits_in_message: bool =
-            resolved_tree.as_deref().is_some_and(|tree| {
+        // Compute the size-gate check and capture estimated_bytes for the
+        // deferred success-path debug log (symmetric with the over-threshold
+        // warning, which still logs estimated_bytes).
+        let (tree_fits_in_message, tree_estimated_bytes): (bool, usize) =
+            resolved_tree.as_deref().map_or((false, 0), |tree| {
                 let estimated_bytes: usize = tree
                     .directories
                     .values()
@@ -2530,9 +2533,9 @@ impl ApiWorkerScheduler {
                         dirs = tree.directories.len(),
                         "pre-resolved tree exceeds size threshold, omitting from StartExecute"
                     );
-                    false
+                    (false, estimated_bytes)
                 } else {
-                    true
+                    (true, estimated_bytes)
                 }
             });
 
@@ -2604,6 +2607,7 @@ impl ApiWorkerScheduler {
                         let (dirs, digests) = tree.to_proto_vecs();
                         debug!(
                             dirs = dirs.len(),
+                            estimated_bytes = tree_estimated_bytes,
                             "including pre-resolved tree in StartExecute"
                         );
                         start_execute.resolved_directories = dirs;
