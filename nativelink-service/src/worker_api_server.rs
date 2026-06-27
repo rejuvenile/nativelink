@@ -1584,11 +1584,39 @@ const SHUTDOWN_PULL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// loop would hang forever (a restart-wedge strictly worse than the NotFound
 /// window the pull replaces — design §7). If this many consecutive poll
 /// iterations reduce the residual by ZERO, the pull escalates the entire
-/// remaining residual to at-risk-skip and exits. The window
-/// (`SHUTDOWN_PULL_POLL_INTERVAL` × this) is a small multiple of the
-/// `BACKFILL_INFLIGHT_TIMEOUT_SECS = 60` re-request window so a transiently
-/// slow (but live) upload is NOT prematurely abandoned: 280 × 250 ms = 70 s.
-const SHUTDOWN_PULL_NO_PROGRESS_ITERS: u32 = 280;
+/// remaining residual to at-risk-skip and exits.
+///
+/// Unlike the steady-state backfill path, `ShutdownPuller` creates a FRESH
+/// in-flight map on every outer loop iteration — there is no
+/// `BACKFILL_INFLIGHT_TIMEOUT_SECS = 60` dedup window here. The original
+/// 280-iter / 70-second window was calibrated against that dedup window and
+/// is unjustified for this code path; it caused an unnecessary ~70-second
+/// stall when workers cannot find blobs locally (evicted from their
+/// `FilesystemStore`).
+///
+/// 20 × 250 ms = 5 s is sufficient because the watchdog counts only
+/// CONSECUTIVE zero-progress polls (`no_progress_iters` resets to 0 the
+/// instant ANY blob lands — `landed > 0` below), and progress is gated by the
+/// FAST tier: `drop_present_from_residual` calls `has_with_results`, which
+/// returns `Some` as soon as a pulled blob is in the server's MemoryStore /
+/// in-flight map — it does NOT wait for the slow-tier (ZFS `tank`) write
+/// (durability is the Phase-3.6 post-pull flush's job, not the pull's). So a
+/// worker that is actually uploading registers progress within ~1 poll
+/// interval of its small-blob gRPC round-trip, not within a ZFS-txg latency.
+/// The watchdog therefore fires only after 5 s in which NO connected worker
+/// landed ANY blob in the fast tier — i.e. all sources are genuinely silent.
+/// Phase 2 has already returned (sequential, `nativelink.rs`) so the pull is
+/// not contending with the memory-flush for write bandwidth.
+///
+/// Skipping the residual when the watchdog fires is safe NOT because of the
+/// `at_risk` log counter (that field is the running `at_risk_skipped` count —
+/// at iteration 190 in the live incident it was 0 only because the watchdog
+/// had not yet fired) but because of the ≥2-replica / mirror_blobs invariant:
+/// a blob whose sole holder is a connected-but-silent worker is the FL-688
+/// surface the pull tries to close, and at-risk-skip merely falls back to the
+/// pre-#58 behavior (worker re-backfill on reconnect) rather than wedging the
+/// restart forever.
+const SHUTDOWN_PULL_NO_PROGRESS_ITERS: u32 = 20;
 
 /// Outcome of `WorkerApiServer::pull_all_worker_blobs_at_shutdown`.
 ///
