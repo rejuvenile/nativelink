@@ -3353,7 +3353,15 @@ impl ByteStreamServer {
                 store.as_store_driver(),
             )
             .is_some_and(|fss| fss.is_chunked_in_flight(&digest));
-        if has_result.is_some() && !is_chunked_in_flight {
+        // #FL-688 Shape-1: worker/mirror uploads ARE the durability push —
+        // they must not be skipped on the strength of the uploader's own
+        // locality advertisement. The sibling carve-outs at
+        // `cas_server.rs:458`, `cas_server.rs:544`, and
+        // `bytestream_server.rs:2489`/`:3088`/`:3111` all gate on
+        // `!is_worker && !is_mirror`; G1 is now consistent with them.
+        // The Bazel-client fast-path (`!is_worker && !is_mirror` = true for
+        // clients) is provably unchanged.
+        if has_result.is_some() && !is_chunked_in_flight && !is_worker && !is_mirror {
             debug!(
                 %digest,
                 size_bytes = expected_size,

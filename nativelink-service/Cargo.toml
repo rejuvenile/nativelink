@@ -286,6 +286,20 @@ name = "ac_server_h4_registration_test"
 [[test]]
 name = "ac_server_h4_seam_test"
 
+# #FL-688 ≥2-replica ack-gate — production-composition end-to-end tests for
+# the CAS write handlers (ByteStream + BatchUpdateBlobs). Wraps the real
+# handlers over a production-shaped WorkerProxyStore; exercises ack-gate,
+# mirror-confirm, backpressure, retry, and no-peer-degraded paths.
+[[test]]
+name = "fl688_two_replica_ack_gate_test"
+
+# #FL-688 Shape-1 G1 carve-out: ByteStream write G1 already-exists gate must
+# not fire for is_worker/is_mirror uploads — worker/mirror ByteStream uploads
+# ARE the durability push and must write through to the inner store.
+# Asymmetric (client-preserved) coverage is included.
+[[test]]
+name = "fl688_g1_worker_write_through_test"
+
 # #44 Layer C — server-side `inner_read` unfold cap exercised at the
 # AT-REST branch (`:1768`) — the production hot path for Bazel parallel
 # `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a
