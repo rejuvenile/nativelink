@@ -88,6 +88,7 @@
 //! (because the cancel arm is absent, slow producers are never killed — the
 //! test asserts the upload SUCCEEDS, which it does in the absence of a cancel).
 
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -840,5 +841,97 @@ async fn reap_boundary_just_under_survives_just_over_reaps() {
     assert_eq!(
         qws.committed_size, 0,
         "after the just-over reap the entry must be gone (committed_size=0)",
+    );
+}
+
+/// **Forensics: the `zombie_writes_reaped_*` metric counters increment on reap.**
+///
+/// Requirement (review e4554c4d-zombie-reaper diag pass): once the reaper auto-
+/// cleans zombies, the RATE/trend must be visible on `/metrics` for alerting,
+/// and the worker-vs-client split lets an alert distinguish a worker-fleet
+/// problem from a Bazel-client problem without log scraping.
+///
+/// This test reaps ONE client zombie (not worker, not mirror — the default
+/// metadata-less path) and asserts:
+/// - `zombie_writes_reaped_total == 1`
+/// - `zombie_writes_reaped_client_total == 1` (client origin)
+/// - `zombie_writes_reaped_worker_total == 0` (NOT a worker)
+///
+/// **Mutation step (CLAUDE.md TDD #5):** comment out the
+/// `m.zombie_writes_reaped_total.fetch_add(1, ...)` block in Pass 3 of the
+/// sweeper. The reap still fires (the cancel arm is independent) but the
+/// counters stay 0 → this test fails at the `total == 1` assert with its
+/// bespoke message.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn zombie_reap_increments_metric_counters() {
+    let store_manager = make_store_manager()
+        .await
+        .expect("store_manager construction must not fail");
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref()).expect("bs_server new"),
+    );
+
+    let metrics = bs_server
+        .metrics(INSTANCE_NAME)
+        .expect("metrics must exist for the configured instance");
+    assert_eq!(
+        metrics.zombie_writes_reaped_total.load(Ordering::Relaxed),
+        0,
+        "counter must start at zero before any reap",
+    );
+
+    let (frame_tx, body) = ChannelBody::new();
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    let stream: Streaming<WriteRequest> =
+        Streaming::new_request(codec.decoder(), body, None, None);
+
+    // No x-nativelink-worker / x-nativelink-mirror metadata → client-origin
+    // write (is_worker=false, is_mirror=false). The bare `write()` tonic entry
+    // is what a Bazel client hits.
+    let bs_server_for_writer = Arc::clone(&bs_server);
+    let writer_handle: JoinHandleDropGuard<
+        Result<tonic::Response<nativelink_proto::google::bytestream::WriteResponse>, tonic::Status>,
+    > = spawn!("metric_writer", async move {
+        bs_server_for_writer.write(Request::new(stream)).await
+    });
+
+    // Partial chunk (16 of 64), then hold sender alive and silent → reaped.
+    let resource_name =
+        make_resource_name(HASH1, 64, "abababab-0000-0000-0000-00000000000a");
+    send_first_chunk(&frame_tx, resource_name, Bytes::from(vec![0x42u8; 16])).await;
+
+    let writer_result = tokio::time::timeout(ZOMBIE_ADVANCE * 4, writer_handle)
+        .await
+        .expect("zombie write must be reaped (metric test)")
+        .expect("writer task must not panic");
+
+    drop(frame_tx);
+
+    let status = writer_result.expect_err("reaped zombie must return Err");
+    assert!(
+        status.message().contains("zombie write reaped"),
+        "must be the zombie reap path; got: {:?}",
+        status.message(),
+    );
+
+    assert_eq!(
+        metrics.zombie_writes_reaped_total.load(Ordering::Relaxed),
+        1,
+        "zombie_writes_reaped_total must increment exactly once per reap — \
+         the metric is the RATE/trend signal for post-deploy alerting",
+    );
+    assert_eq!(
+        metrics
+            .zombie_writes_reaped_client_total
+            .load(Ordering::Relaxed),
+        1,
+        "client-origin reap must increment zombie_writes_reaped_client_total",
+    );
+    assert_eq!(
+        metrics
+            .zombie_writes_reaped_worker_total
+            .load(Ordering::Relaxed),
+        0,
+        "a client (not worker) reap must NOT increment the worker counter",
     );
 }
