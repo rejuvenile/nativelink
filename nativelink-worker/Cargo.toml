@@ -237,3 +237,18 @@ required-features = ["test-utils"]
 # `cargo test -p nativelink-worker` builds the auto-discovered target and fails.
 name = "kill_upload_tail_publish_seam_test"
 required-features = ["test-utils"]
+
+[[test]]
+# (#FL-688 A follow-up) Seam test: `spawn_upload_to_remote_impl` fresh-output
+# upload MUST carry `x-nativelink-worker=1` on the wire. Uses
+# `spawn_upload_to_remote_for_test` which is gated behind `test-utils`.
+name = "fresh_output_is_worker_header_seam_test"
+required-features = ["test-utils"]
+
+[[test]]
+# (#FL-688 D) End-to-end integration: fresh-output worker upload crosses the
+# entire A+A-follow-up chain — IS_WORKER_REQUEST scope → wire header →
+# NlByteStreamServer G1 carve-out → inner MemoryStore.has(digest).
+# Uses `spawn_upload_to_remote_for_test` gated behind `test-utils`.
+name = "g1_fresh_output_e2e_write_through_test"
+required-features = ["test-utils"]
