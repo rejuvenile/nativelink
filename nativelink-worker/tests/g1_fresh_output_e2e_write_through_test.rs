@@ -56,6 +56,8 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::time::timeout;
+
 use nativelink_config::cas_server::{ByteStreamConfig, WithInstanceName};
 use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec};
 use nativelink_error::ResultExt;
@@ -75,7 +77,6 @@ use nativelink_util::store_trait::{Store, StoreLike};
 use nativelink_worker::running_actions_manager::{
     ExecutionConfiguration, RunningActionsManagerArgs, RunningActionsManagerImpl,
 };
-use tokio::time::timeout;
 
 const DEADLOCK_DETECTOR: Duration = Duration::from_secs(15);
 const CAS_STORE_NAME: &str = "cas_STORE";

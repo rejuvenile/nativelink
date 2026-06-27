@@ -72,6 +72,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use tokio::time::timeout;
+
 use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
@@ -88,7 +90,6 @@ use nativelink_util::store_trait::{Store, StoreLike};
 use nativelink_worker::running_actions_manager::{
     ExecutionConfiguration, RunningActionsManagerArgs, RunningActionsManagerImpl,
 };
-use tokio::time::timeout;
 
 mod utils {
     pub(crate) mod local_worker_test_utils;
