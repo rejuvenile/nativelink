@@ -300,6 +300,13 @@ name = "fl688_two_replica_ack_gate_test"
 [[test]]
 name = "fl688_g1_worker_write_through_test"
 
+# Zombie write reaper: sweeper-based detection + cancel for active
+# ByteStream writes whose producer has gone silent (alive h2 connection,
+# no bytes for >= 2 × idle_stream_timeout). Tests both under-action
+# (zombie IS reaped) and over-action (slow-but-alive is NOT killed).
+[[test]]
+name = "bytestream_zombie_write_reaper_test"
+
 # #44 Layer C — server-side `inner_read` unfold cap exercised at the
 # AT-REST branch (`:1768`) — the production hot path for Bazel parallel
 # `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a

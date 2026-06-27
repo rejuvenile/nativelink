@@ -68,6 +68,7 @@ use nativelink_util::zero_copy_codec::{
 use opentelemetry::context::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument, Level, debug, error, error_span, info, instrument, trace, warn};
@@ -383,7 +384,19 @@ impl MetricsComponent for ByteStreamMetrics {
     }
 }
 
-type BytesWrittenAndIdleStream = (Arc<AtomicU64>, Option<IdleStream>);
+/// Map entry for active and idle uploads. Fields:
+/// 0: bytes received so far (bumped on each chunk by `process_client_stream`).
+/// 1: `Some(IdleStream)` when the upload is idle (waiting for resume), `None`
+///    while a write is in progress.
+/// 2: zombie-reap cancel sender. `Some` while a write is active; the sweeper
+///    fires it when `bytes_received` has not advanced for `>= 2 ×
+///    idle_stream_timeout` (zombie stream on a live h2 connection). `None` while
+///    idle (no active write to cancel).
+// UNBOUNDED-OK: one entry per in-flight UUID (same as before); the `oneshot::Sender`
+// is ~100 B. h2 concurrency is unbounded in production (no
+// `experimental_http2_max_concurrent_streams` cap set), but the byte-budget
+// is negligible: at 10K concurrent writes, total ≈ 1 MB.
+type BytesWrittenAndIdleStream = (Arc<AtomicU64>, Option<IdleStream>, Option<oneshot::Sender<()>>);
 
 /// Type alias for the UUID key used in `active_uploads` `HashMap`.
 /// Using u128 instead of String reduces memory allocations and improves
@@ -870,6 +883,13 @@ struct ActiveStreamGuard {
     metrics: Arc<ByteStreamMetrics>,
     /// Shared counter tracking total bytes held in idle streams.
     partial_write_bytes: Arc<AtomicU64>,
+    /// Zombie-reap cancel receiver. The sweeper fires the corresponding
+    /// `oneshot::Sender` when `bytes_received` has not advanced for >=
+    /// `2 × idle_stream_timeout`. `inner_write` races the `try_join!` against
+    /// this receiver via `tokio::select!` and returns `Err(Code::Aborted,
+    /// "zombie write reaped ...")` when cancelled. `None` for resumed writes
+    /// until the new channel is stored at resume time.
+    zombie_reap_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl ActiveStreamGuard {
@@ -979,6 +999,12 @@ impl Drop for ActiveStreamGuard {
             stream_state,
             idle_since: Instant::now(),
         });
+        // Clear the zombie-reap cancel sender: no active write to cancel while
+        // the stream is idle. Dropping the Sender here is a safe no-op — the
+        // corresponding Receiver was already consumed by `inner_write` (or was
+        // never claimed if this guard was constructed but never entered `inner_write`).
+        // The next resume creates a fresh channel pair.
+        active_uploads_slot.2 = None;
     }
 }
 
@@ -997,6 +1023,7 @@ impl IdleStream {
         self,
         bytes_received: Arc<AtomicU64>,
         instance_info: &InstanceInfo,
+        zombie_reap_rx: oneshot::Receiver<()>,
     ) -> ActiveStreamGuard {
         // Decrement partial_write_bytes since this stream is no longer idle.
         let stream_bytes = bytes_received.load(Ordering::Acquire);
@@ -1009,6 +1036,7 @@ impl IdleStream {
             active_uploads: instance_info.active_uploads.clone(),
             metrics: instance_info.metrics.clone(),
             partial_write_bytes: instance_info.partial_write_bytes.clone(),
+            zombie_reap_rx: Some(zombie_reap_rx),
         }
     }
 }
@@ -1175,6 +1203,33 @@ impl ByteStreamServer {
         let sweeper_partial_write_bytes = Arc::downgrade(&partial_write_bytes);
         let sweep_interval = idle_stream_timeout / 2; // Check every half-timeout period
         let sweeper_handle = spawn!("bytestream_idle_stream_sweeper", async move {
+            // Pass 3 zombie detection: track the first time we observe a
+            // write with no byte progress. Key = UUID, value = (first_seen_at,
+            // bytes_received_at_first_seen). When `bytes_received` hasn't
+            // changed for `>= 2 × idle_stream_timeout`, the write is a zombie
+            // on a live h2 connection and we fire the cancel signal.
+            //
+            // Threshold safety: 2 × idle_stream_timeout ≥ 2 × 60s = 120s in
+            // production, exceeding the keepalive dead-peer window (30s PING +
+            // 60s PONG timeout + 5s hyper stall-grace = 95s). Any write killed
+            // here CANNOT be on a live TCP connection with a legitimately slow
+            // producer — if TCP were alive AND the producer were alive,
+            // keepalive would have detected and killed it within 95s.
+            //
+            // The tracking map is cleared of entries whose write went idle or
+            // was completed between sweeps (UUIDs not in `active_uploads` or
+            // entries where `maybe_idle.is_some()` are absent below).
+            // UNBOUNDED-OK: at most one entry per concurrently-active write;
+            // bounded by h2 stream concurrency (same as active_uploads).
+            //
+            // Uses `tokio::time::Instant` (not `std::time::Instant`) so that
+            // the threshold check works correctly under tokio's virtual-time
+            // clock (used in tests with `start_paused = true`). In production
+            // the two clocks are equivalent; in tests only tokio::time::Instant
+            // advances when `tokio::time::sleep` fires.
+            let mut zombie_stale_since: HashMap<UuidKey, (tokio::time::Instant, u64)> =
+                HashMap::new();
+
             loop {
                 sleep(sweep_interval).await;
 
@@ -1192,7 +1247,7 @@ impl ByteStreamServer {
                 // Pass 1: evict streams that exceeded idle_stream_timeout
                 {
                     let mut uploads = active_uploads.lock();
-                    uploads.retain(|uuid, (bytes_received, maybe_idle)| {
+                    uploads.retain(|uuid, (bytes_received, maybe_idle, _cancel_tx)| {
                         if let Some(idle_stream) = maybe_idle {
                             if now.duration_since(idle_stream.idle_since) >= idle_stream_timeout {
                                 debug!(
@@ -1239,7 +1294,7 @@ impl ByteStreamServer {
                         let mut idle_entries: Vec<(UuidKey, Instant, u64)> = Vec::new();
                         {
                             let uploads = active_uploads.lock();
-                            for (uuid, (bytes_received, maybe_idle)) in uploads.iter() {
+                            for (uuid, (bytes_received, maybe_idle, _cancel_tx)) in uploads.iter() {
                                 if let Some(idle_stream) = maybe_idle {
                                     idle_entries.push((
                                         *uuid,
@@ -1273,7 +1328,7 @@ impl ByteStreamServer {
                             let mut actually_evicted = 0u64;
                             let mut actually_evicted_bytes = 0u64;
                             for uuid in &uuids_to_evict {
-                                if let Some((bytes_counter, maybe_idle)) = uploads.get(uuid) {
+                                if let Some((bytes_counter, maybe_idle, _cancel_tx)) = uploads.get(uuid) {
                                     if maybe_idle.is_some() {
                                         let bytes = bytes_counter.load(Ordering::Acquire);
                                         uploads.remove(uuid);
@@ -1305,6 +1360,93 @@ impl ByteStreamServer {
                                 atomic_saturating_sub(&m.active_uploads, memory_evicted_count);
                             }
                         }
+                    }
+                }
+
+                // Pass 3: zombie-write detection.
+                //
+                // A "zombie" write is an active (non-idle) write whose
+                // `bytes_received` counter has not advanced for >=
+                // `2 × idle_stream_timeout`. This pattern indicates the h2
+                // producer has silently abandoned the stream without sending
+                // RST_STREAM or END_STREAM — the connection is keepalive-ACKing
+                // (so keepalive won't detect it) but the worker has stopped
+                // sending DATA frames. `process_client_stream` parks at
+                // `stream.next().await` indefinitely, holding a StallGuard
+                // that fires every 30s.
+                //
+                // We collect cancel senders under lock, then drop the lock
+                // and fire them outside. Firing under lock would be incorrect:
+                // the `oneshot::Sender::send` is infallible-but-fast, but we
+                // prefer not to hold the mutex while doing ANY I/O-adjacent
+                // work. Collecting senders clears `.2` in the map entry,
+                // preventing double-fire across sweeps.
+                {
+                    let zombie_threshold = idle_stream_timeout * 2;
+                    // Use tokio's virtual-time clock so that zombie detection
+                    // works correctly under `start_paused = true` in tests.
+                    // In production the two clocks are equivalent.
+                    let now_tokio = tokio::time::Instant::now();
+                    let mut cancel_senders: Vec<oneshot::Sender<()>> = Vec::new();
+                    {
+                        let mut uploads = active_uploads.lock();
+                        // Prune stale entries from zombie_stale_since: UUIDs that
+                        // are no longer in `active_uploads` or have gone idle.
+                        zombie_stale_since.retain(|uuid, _| {
+                            uploads
+                                .get(uuid)
+                                .is_some_and(|(_, maybe_idle, _)| maybe_idle.is_none())
+                        });
+                        // Scan active (non-idle) writes.
+                        for (uuid, (bytes_received, maybe_idle, cancel_tx)) in uploads.iter_mut() {
+                            if maybe_idle.is_some() {
+                                // Idle: not an active write; zombie_stale_since
+                                // entry (if any) was pruned above.
+                                continue;
+                            }
+                            let current_bytes = bytes_received.load(Ordering::Acquire);
+                            match zombie_stale_since.get(uuid) {
+                                None => {
+                                    // First time we see this active write. Record it.
+                                    zombie_stale_since.insert(*uuid, (now_tokio, current_bytes));
+                                }
+                                Some(&(first_seen_at, first_seen_bytes)) => {
+                                    if current_bytes != first_seen_bytes {
+                                        // Bytes advanced since we first saw this write.
+                                        // Reset: it is alive.
+                                        zombie_stale_since.insert(*uuid, (now_tokio, current_bytes));
+                                    } else if now_tokio.duration_since(first_seen_at)
+                                        >= zombie_threshold
+                                    {
+                                        // No byte progress for >= 2 × idle_stream_timeout.
+                                        // This write is a zombie. Take the cancel sender.
+                                        if let Some(tx) = cancel_tx.take() {
+                                            warn!(
+                                                uuid = format!("{:032x}", uuid),
+                                                bytes_received = current_bytes,
+                                                stale_secs = now_tokio
+                                                    .duration_since(first_seen_at)
+                                                    .as_secs(),
+                                                threshold_secs = zombie_threshold.as_secs(),
+                                                "zombie write detected — no bytes received for \
+                                                 threshold; firing cancel to release StallGuard \
+                                                 and in-flight slot",
+                                            );
+                                            cancel_senders.push(tx);
+                                        }
+                                        // Remove from tracking so we don't double-fire.
+                                        zombie_stale_since.remove(uuid);
+                                    }
+                                    // else: stale but not yet past threshold; wait.
+                                }
+                            }
+                        }
+                    }
+                    // Fire all collected cancel signals outside the lock.
+                    for tx in cancel_senders {
+                        // `send` fails only if the receiver was already dropped
+                        // (write completed naturally). That is benign.
+                        let _ = tx.send(());
                     }
                 }
             }
@@ -1384,7 +1526,7 @@ impl ByteStreamServer {
         // on parking_lot::Mutex since it is not reentrant).
         enum UploadAction {
             Resume(Box<ActiveStreamGuard>),
-            New(u128, Arc<AtomicU64>),
+            New(u128, Arc<AtomicU64>, oneshot::Receiver<()>),
             Collision(u128),
         }
 
@@ -1411,20 +1553,26 @@ impl ByteStreamServer {
                             );
                             drop(idle_stream);
                             let bytes_received = Arc::new(AtomicU64::new(0));
-                            *maybe_idle_stream = (bytes_received.clone(), None);
-                            UploadAction::New(uuid_key, bytes_received)
+                            let (cancel_tx, cancel_rx) = oneshot::channel();
+                            *maybe_idle_stream = (bytes_received.clone(), None, Some(cancel_tx));
+                            UploadAction::New(uuid_key, bytes_received, cancel_rx)
                         } else {
                             let bytes_received = maybe_idle_stream.0.clone();
+                            // Create a fresh cancel channel for the resumed write.
+                            // The previous channel was cleared when the write went idle
+                            // (see `ActiveStreamGuard::drop`).
+                            let (cancel_tx, cancel_rx) = oneshot::channel();
+                            maybe_idle_stream.2 = Some(cancel_tx);
                             debug!(
                                 msg = "Joining existing stream",
-                                uuid = format!("{:032x}", entry.key())
+                                uuid = format!("{:032x}", uuid_key),
                             );
                             instance
                                 .metrics
                                 .resumed_uploads
                                 .fetch_add(1, Ordering::Relaxed);
                             UploadAction::Resume(Box::new(
-                                idle_stream.into_active_stream(bytes_received, instance),
+                                idle_stream.into_active_stream(bytes_received, instance, cancel_rx),
                             ))
                         }
                     } else {
@@ -1443,20 +1591,22 @@ impl ByteStreamServer {
                     // Case 1: UUID doesn't exist, create new stream
                     let bytes_received = Arc::new(AtomicU64::new(0));
                     let uuid = *entry.key();
-                    entry.insert((bytes_received.clone(), None));
-                    UploadAction::New(uuid, bytes_received)
+                    let (cancel_tx, cancel_rx) = oneshot::channel();
+                    entry.insert((bytes_received.clone(), None, Some(cancel_tx)));
+                    UploadAction::New(uuid, bytes_received, cancel_rx)
                 }
             }
         }; // First lock guard dropped here.
 
-        let (uuid, bytes_received, is_collision) = match action {
+        let (uuid, bytes_received, is_collision, zombie_reap_rx) = match action {
             UploadAction::Resume(guard) => return *guard,
-            UploadAction::New(uuid, bytes_received) => (uuid, bytes_received, false),
+            UploadAction::New(uuid, bytes_received, cancel_rx) => (uuid, bytes_received, false, cancel_rx),
             UploadAction::Collision(unique_key) => {
                 let bytes_received = Arc::new(AtomicU64::new(0));
                 let mut active_uploads = instance.active_uploads.lock();
-                active_uploads.insert(unique_key, (bytes_received.clone(), None));
-                (unique_key, bytes_received, true)
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                active_uploads.insert(unique_key, (bytes_received.clone(), None, Some(cancel_tx)));
+                (unique_key, bytes_received, true, cancel_rx)
             }
         };
 
@@ -1532,6 +1682,7 @@ impl ByteStreamServer {
             active_uploads: instance.active_uploads.clone(),
             metrics: instance.metrics.clone(),
             partial_write_bytes: instance.partial_write_bytes.clone(),
+            zombie_reap_rx: Some(zombie_reap_rx),
         }
     }
 
@@ -2553,6 +2704,12 @@ impl ByteStreamServer {
             None
         };
 
+        // Extract the zombie-reap cancel receiver before entering the write
+        // loop. The sweeper fires this when `bytes_received` has not advanced
+        // for >= 2 × idle_stream_timeout — signalling a zombie stream on a
+        // live h2 connection (see Pass 3 in `bytestream_idle_stream_sweeper`).
+        let zombie_reap_rx = active_stream_guard.zombie_reap_rx.take();
+
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
         let write_start = std::time::Instant::now();
         let mut mirror_dropped_any = false;
@@ -2563,22 +2720,71 @@ impl ByteStreamServer {
         // former is recoverable (size validated explicitly, fail-stop),
         // the latter is the #320 production observation.
         let mut finish_write_seen = false;
-        let write_result = try_join!(
-            process_client_stream(
-                stream,
-                &mut active_stream.tx,
-                &mut mirror_tx_opt,
-                &mut mirror_dropped_any,
-                &instance_info.metrics,
-                &streaming_blob_writer,
-                &active_stream_guard.bytes_received,
-                &mut finish_write_seen,
-                expected_size,
-                &progress_handle,
-            ),
-            (&mut active_stream.store_update_fut)
-                .map_err(|err| { err.append("Error updating inner store") })
-        );
+        // Race the write future against the zombie-cancel receiver.
+        // If the sweeper fires the cancel (zombie detected), return
+        // Code::Aborted so the caller propagates the error. The
+        // StallGuard and active_uploads entry are cleaned up by
+        // `active_stream_guard` drop at end of `bytestream_write`.
+        //
+        // Slow-but-alive producers: the sweeper resets zombie tracking
+        // whenever `bytes_received` advances, so any producer that sends
+        // bytes within `2 × idle_stream_timeout` is unaffected.
+        //
+        // Cancel-safety: `tokio::select!` on these futures is safe.
+        // `try_join!` is a single future that can be polled from scratch
+        // without losing progress — both inner futures are pinned inside
+        // `active_stream` which lives for the scope of this fn. If the
+        // cancel arm fires, neither inner future is polled again; the
+        // `active_stream_guard` drop recycles the `ActiveStreamGuard`
+        // into an `IdleStream` (or discards on store error), same as
+        // if the caller dropped mid-upload.
+        let write_result = if let Some(mut cancel_rx) = zombie_reap_rx {
+            tokio::select! {
+                result = async {
+                    try_join!(
+                        process_client_stream(
+                            stream,
+                            &mut active_stream.tx,
+                            &mut mirror_tx_opt,
+                            &mut mirror_dropped_any,
+                            &instance_info.metrics,
+                            &streaming_blob_writer,
+                            &active_stream_guard.bytes_received,
+                            &mut finish_write_seen,
+                            expected_size,
+                            &progress_handle,
+                        ),
+                        (&mut active_stream.store_update_fut)
+                            .map_err(|err| { err.append("Error updating inner store") })
+                    )
+                } => result,
+                _ = &mut cancel_rx => {
+                    Err(make_err!(
+                        Code::Aborted,
+                        "zombie write reaped — no bytes received for \
+                         >= 2 × idle_stream_timeout on a live h2 connection; \
+                         StallGuard and in-flight slot released",
+                    ))
+                }
+            }
+        } else {
+            try_join!(
+                process_client_stream(
+                    stream,
+                    &mut active_stream.tx,
+                    &mut mirror_tx_opt,
+                    &mut mirror_dropped_any,
+                    &instance_info.metrics,
+                    &streaming_blob_writer,
+                    &active_stream_guard.bytes_received,
+                    &mut finish_write_seen,
+                    expected_size,
+                    &progress_handle,
+                ),
+                (&mut active_stream.store_update_fut)
+                    .map_err(|err| { err.append("Error updating inner store") })
+            )
+        };
         if mirror_dropped_any {
             // Single per-blob summary so we can correlate mirror gaps to specific
             // digests without spamming once per chunk. The chunk-level counter
@@ -3166,7 +3372,7 @@ impl ByteStreamServer {
 
         {
             let active_uploads = instance.active_uploads.lock();
-            if let Some((received_bytes, _maybe_idle_stream)) = active_uploads.get(&uuid_key) {
+            if let Some((received_bytes, _maybe_idle_stream, _cancel_tx)) = active_uploads.get(&uuid_key) {
                 return Ok(Response::new(QueryWriteStatusResponse {
                     committed_size: received_bytes.load(Ordering::Acquire) as i64,
                     // If we are in the active_uploads map, but the value is None,
