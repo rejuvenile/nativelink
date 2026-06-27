@@ -197,6 +197,33 @@ fn register_disconnected_source(
     locality_map.write().register_blobs(endpoint, &[digest]);
 }
 
+/// Register a worker in BOTH the dispatcher (so it appears as a connected
+/// source) AND the locality map, but its channel handler silently drops every
+/// `UploadMissingBlobs` message without uploading anything.
+///
+/// Models the production scenario where a worker is connected (TCP alive,
+/// `worker_tx` send succeeds) but cannot find the requested blobs locally
+/// (already evicted from its FilesystemStore) — the server solicits uploads
+/// but nothing lands, and `pulled` stays 0.
+fn register_silent_connected_source(
+    locality_map: &SharedBlobLocalityMap,
+    dispatcher: &SmallBlobDispatcher,
+    endpoint: &str,
+    boot_epoch: u64,
+    digest: DigestInfo,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpdateForWorker>();
+    dispatcher.register_worker(endpoint, boot_epoch, tx);
+    locality_map.write().register_blobs(endpoint, &[digest]);
+    // Drain messages without acting on them — simulates "blob not found locally".
+    nativelink_util::background_spawn!("fake_silent_worker", async move {
+        while rx.recv().await.is_some() {
+            // Intentional no-op: the worker received UploadMissingBlobs but
+            // cannot find the blob on disk, so it uploads nothing.
+        }
+    });
+}
+
 async fn server_has(cas_store: &Store, digest: DigestInfo) -> Option<u64> {
     let keys = [StoreKey::from(digest)];
     let mut results = [None];
@@ -598,6 +625,97 @@ async fn post_pull_flush_makes_pulled_blob_durable_on_slow_tier()
         bytes.as_ref(),
         data.as_ref(),
         "the slow-tier bytes must match the pulled blob"
+    );
+    Ok(())
+}
+
+/// STALLED-SOURCE watchdog (live production bug: pulled=0, remaining=N,
+/// no_progress_iters climbing indefinitely). A worker is CONNECTED (appears in
+/// `connected_workers_with_senders`) but uploads NOTHING — simulating the
+/// common case where the worker has evicted the blob locally. The pull phase
+/// MUST exit via the no-progress watchdog in bounded time, NOT hang forever.
+///
+/// The production symptom: `pulled=0 remaining=11669 at_risk=0
+/// no_progress_iters=190` (and climbing), with the shutdown never completing
+/// without a manual SIGKILL. Root cause: the watchdog constant of 280 ×
+/// 250 ms = 70 s was calibrated against `BACKFILL_INFLIGHT_TIMEOUT_SECS = 60`
+/// in the design, but `ShutdownPuller` uses a FRESH in-flight map every
+/// iteration (no dedup), so the 70 s threshold is unjustified and causes an
+/// unnecessary ~70-second stall.
+///
+/// After the fix (reduced watchdog constant):
+///   - `at_risk_skipped == 1`: the stalled digest is escalated to at-risk and
+///     the loop exits. Skipping is safe via the ≥2-replica / mirror_blobs
+///     invariant, NOT via the live `at_risk=0` log (that field is the running
+///     `at_risk_skipped` count — it read 0 at iteration 190 only because the
+///     watchdog had not yet fired). At-risk-skip merely falls back to the
+///     pre-#58 worker-re-backfill-on-reconnect behavior.
+///   - `pulled == 0`: nothing uploaded.
+///   - The pull future resolves BEFORE this test's `STALL_WATCHDOG_DETECTOR`
+///     deadline (proving the new constant makes the watchdog exit in bounded
+///     time, not 70 s).
+///
+/// Mutation: raise `SHUTDOWN_PULL_NO_PROGRESS_ITERS` back to 280 → the pull
+/// takes 70 s → the `tokio::time::timeout` fires → red-fail with the bespoke
+/// "MUST NOT hang" message below.
+#[nativelink_test]
+async fn shutdown_pull_exits_on_stalled_connected_source()
+-> Result<(), Box<dyn core::error::Error>> {
+    // Deadline: must be longer than the new watchdog window
+    // (SHUTDOWN_PULL_NO_PROGRESS_ITERS × SHUTDOWN_PULL_POLL_INTERVAL) plus a
+    // small test-overhead buffer, but short enough to catch a regression to the
+    // old 70-second window. 7 s fits both constraints when the constant is 20
+    // iterations × 250 ms = 5 s.
+    const STALL_WATCHDOG_DETECTOR: Duration = Duration::from_secs(7);
+
+    let cas_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (server, locality_map, dispatcher) = make_server(cas_store.clone())?;
+
+    let digest = digest_a();
+    // Register a connected worker that never uploads anything — the blob stays
+    // absent from the server CAS regardless of how many times the pull solicits.
+    register_silent_connected_source(
+        &locality_map,
+        &dispatcher,
+        "grpc://stalled-worker:50071",
+        1,
+        digest,
+    );
+
+    // Pre-condition: blob absent from server (only on the stalled worker).
+    assert!(
+        server_has(&cas_store, digest).await.is_none(),
+        "pre-condition: blob must be worker-only before the pull"
+    );
+
+    let summary = tokio::time::timeout(
+        STALL_WATCHDOG_DETECTOR,
+        server.pull_all_worker_blobs_at_shutdown(),
+    )
+    .await
+    .expect(
+        "shutdown pull MUST NOT hang indefinitely when a connected worker uploads \
+         nothing — the no-progress watchdog MUST exit the loop in bounded time \
+         (mutation: raise SHUTDOWN_PULL_NO_PROGRESS_ITERS back to 280 → this \
+         takes 70 s and the deadline fires)",
+    );
+
+    // The stalled blob is at-risk-skipped (it has a connected source that simply
+    // won't upload), NOT pulled. Skipping is safe: at_risk=0 in the live
+    // observation confirms these blobs are covered by the ≥2-replica invariant.
+    assert_eq!(
+        summary.at_risk_skipped, 1,
+        "the stalled-source blob MUST be at-risk-skipped by the no-progress \
+         watchdog — it has a connected source that will not upload"
+    );
+    assert_eq!(
+        summary.pulled, 0,
+        "nothing was uploaded by the silent worker"
+    );
+    // The blob is still absent (the pull could not localize it).
+    assert!(
+        server_has(&cas_store, digest).await.is_none(),
+        "a blob the worker will not upload cannot appear on the server"
     );
     Ok(())
 }
