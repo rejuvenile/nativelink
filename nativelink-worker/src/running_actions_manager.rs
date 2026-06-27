@@ -6699,7 +6699,29 @@ impl RunningActionsManagerImpl {
                 // retry-forever and `false` as the finite `SYNC_MAX_RETRIES`
                 // bound.
                 const SYNC_MAX_RETRIES: u32 = 4;
-                uploads.push(async move {
+                // #FL-688 (A follow-up): set IS_WORKER_REQUEST=true for the
+                // whole per-digest retry future so GrpcStore stamps
+                // `x-nativelink-worker` on the wire.
+                //
+                // This path runs inside `tokio::spawn` (:6461) which STRIPS
+                // task-locals: without this scope the spawned task has no
+                // IS_WORKER_REQUEST → GrpcStore stamps NO header → the server
+                // sees is_worker=false → if the digest is locality-advertised,
+                // the G1 short-circuit phantom-acks it (same data-loss window
+                // the G1 (B) fix closed for backfill; here it is only
+                // *recovered* later by backfill).
+                //
+                // Per-FUTURE scoping (not wrapping the spawn body). CORRECT
+                // because the chain from this point through to GrpcStore is
+                // SPAWN-FREE: `slow_store` here is WorkerProxyStore (default
+                // `update_oneshot` → inline `update` → GrpcStore::update →
+                // ByteStream `write`; no nested `tokio::spawn`). If any link
+                // is later refactored to spawn, IS_WORKER_REQUEST is SILENTLY
+                // lost → FL-688 re-opens. Any new spawn MUST re-establish the
+                // scope INSIDE the spawned task.
+                // is_worker only — fresh outputs are a worker upload, not a
+                // mirror push (do NOT set IS_MIRROR_REQUEST).
+                uploads.push(IS_WORKER_REQUEST.scope(true, async move {
                     // FL-681 Q1+Q2: the retry controller owns the attempt
                     // counter + the remote ramp and performs the re-pin +
                     // side-sized backoff (`DeferredUploadRetry`).
@@ -6956,7 +6978,7 @@ impl RunningActionsManagerImpl {
                             }
                         }
                     }
-                });
+                }));
             }
             while let Some(ok) = uploads.next().await {
                 if ok {
