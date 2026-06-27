@@ -1509,12 +1509,7 @@ impl ApiWorkerSchedulerImpl {
         // Atomically reserve the worker by mutating its state under the same lock.
         // The proto-tree clone (`to_proto_vecs`) is deferred to after the lock
         // drops — `resolved_directories` is injected post-lock by the caller.
-        let (tx, msg) = self.prepare_worker_run_action(
-            &worker_id,
-            operation_id,
-            action_info,
-            None,
-        )?;
+        let (tx, msg) = self.prepare_worker_run_action(&worker_id, operation_id, action_info)?;
 
         Some((worker_id, tx, msg))
     }
@@ -1671,12 +1666,13 @@ impl ApiWorkerSchedulerImpl {
     /// and pre-built message so the caller can send the notification *after* releasing
     /// the write lock.
     ///
-    /// `pre_computed_tree` is always `None` at current call sites.  The hot
-    /// dispatch path (`find_and_reserve_worker`) builds `resolved_directories`
-    /// post-lock via `to_proto_vecs()` gated on `result.is_some()`, so the
-    /// clone is never built on the no-match path.  The reconnect-notify path
-    /// (`worker_notify_run_action`, line 2312) also passes `None` — workers
-    /// re-fetch the tree via GetTree if they need it.
+    /// The `StartExecute` message is built with EMPTY `resolved_directories`.
+    /// The hot dispatch path (`find_and_reserve_worker`) injects the
+    /// pre-resolved tree post-lock via `to_proto_vecs()` gated on
+    /// `result.is_some()`, so the proto clone is never built on the no-match
+    /// path. The reconnect-notify path (`worker_notify_run_action`) leaves
+    /// `resolved_directories` empty — those workers re-fetch the tree via
+    /// GetTree if they need it.
     ///
     /// Note: peer hints are NO LONGER carried inside `StartExecute` (#98 — peer
     /// hints chunking). They ride a separate `Update::ChunkedMessage` stream
@@ -1690,24 +1686,22 @@ impl ApiWorkerSchedulerImpl {
         worker_id: &WorkerId,
         operation_id: &OperationId,
         action_info: &ActionInfoWithProps,
-        pre_computed_tree: Option<(Vec<Directory>, Vec<Digest>)>,
     ) -> Option<(UnboundedSender<UpdateForWorker>, UpdateForWorker)> {
         let worker = self.workers.get_mut(worker_id)?;
         // Clone the tx so we can send outside the lock.
         let tx = worker.tx.clone();
 
-        let (resolved_directories, resolved_directory_digests) =
-            pre_computed_tree.unwrap_or_default();
-
         // Build the protobuf message while we still have access to worker state.
+        // `resolved_directories` is left empty here; the dispatch path injects
+        // the pre-resolved tree post-lock (see `find_and_reserve_worker`).
         let start_execute = StartExecute {
             execute_request: Some(action_info.inner.as_ref().into()),
             operation_id: operation_id.to_string(),
             queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
             platform: Some((&action_info.platform_properties).into()),
             worker_id: worker.id.clone().into(),
-            resolved_directories,
-            resolved_directory_digests,
+            resolved_directories: Vec::new(),
+            resolved_directory_digests: Vec::new(),
             missing_digests: Vec::new(),
         };
         let msg = UpdateForWorker {
@@ -2081,6 +2075,25 @@ const CACHE_WARM_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum number of blobs to warm in a single cache warm pass.
 const CACHE_WARM_MAX_BLOBS: usize = 4096;
 
+/// Maximum encoded size of the pre-resolved Directory tree carried inside
+/// a `StartExecute` message. Trees larger than this are omitted (the worker
+/// falls back to its own GetTree RPC). Bounded at 32 MiB — the Worker API
+/// listener has `max_encoding_message_size = 64MiB`, so 32 MiB leaves
+/// headroom for the rest of the message.
+///
+/// Test override: in `#[cfg(test)]` builds the cap is reduced to 4 KiB so a
+/// production-composition test can exercise the over-size-gate path (tree
+/// present + worker matched ⇒ `resolved_directories` omitted) with a small
+/// (~200-file, ~20 KiB) tree instead of building a literal >32 MiB proto.
+/// 4 KiB is comfortably above a single-file directory (~90 bytes, so the
+/// fits-the-message tests stay green) and below the ~20 KiB over-size
+/// fixture. The gate mechanism (`estimated_bytes > cap` ⇒ skip the clone)
+/// is identical at any cap value.
+#[cfg(not(test))]
+const MAX_TREE_PROTO_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(test)]
+const MAX_TREE_PROTO_BYTES: usize = 4 * 1024;
+
 /// Base backoff duration after a failed tree resolution (first attempt).
 const FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -2309,7 +2322,7 @@ impl ApiWorkerScheduler {
         let prepare_result = {
             let mut inner = self.inner.write().await;
             let result =
-                inner.prepare_worker_run_action(&worker_id, &operation_id, &action_info, None);
+                inner.prepare_worker_run_action(&worker_id, &operation_id, &action_info);
             if result.is_none() {
                 // Worker not found - handle under the lock since we need worker_state_manager.
                 warn!(
@@ -2514,8 +2527,10 @@ impl ApiWorkerScheduler {
         // clone is never built on the no-match path (the common case on a
         // busy fleet where every still-queued action cycles through
         // `do_try_match` until a worker becomes available).
-        // Worker API listener has max_encoding_message_size=64MiB.
-        const MAX_TREE_PROTO_BYTES: usize = 32 * 1024 * 1024;
+        // `MAX_TREE_PROTO_BYTES` (module const, 32 MiB in prod, 4 KiB in test)
+        // caps the encoded tree size against the worker API listener's
+        // 64 MiB max_encoding_message_size.
+        //
         // Compute the size-gate check and capture estimated_bytes for the
         // deferred success-path debug log (symmetric with the over-threshold
         // warning, which still logs estimated_bytes).
@@ -9163,6 +9178,9 @@ mod deferred_proto_clone_tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use bytes::Bytes;
+    use prost::Message;
+    use tokio::sync::{Notify, mpsc};
+
     use nativelink_config::schedulers::WorkerAllocationStrategy;
     use nativelink_config::stores::MemorySpec;
     use nativelink_error::Error;
@@ -9180,10 +9198,10 @@ mod deferred_proto_clone_tests {
     use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
     use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
     use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
-    use prost::Message;
-    use tokio::sync::{Notify, mpsc};
 
-    use super::{ApiWorkerScheduler, UpdateForWorker, Worker, update_for_worker};
+    use super::{
+        ApiWorkerScheduler, MAX_TREE_PROTO_BYTES, UpdateForWorker, Worker, update_for_worker,
+    };
     use crate::platform_property_manager::PlatformPropertyManager;
     use crate::worker::ActionInfoWithProps;
     use crate::worker_registry::WorkerRegistry;
@@ -9256,6 +9274,43 @@ mod deferred_proto_clone_tests {
             .update_oneshot(key, Bytes::from(dir_bytes))
             .await
             .expect("store update_oneshot for test directory failed");
+        dir_digest
+    }
+
+    /// Build a `Directory` proto with enough FileNodes that its encoded size
+    /// exceeds the test `MAX_TREE_PROTO_BYTES` (4 KiB), store it, and return
+    /// the root digest.  Used by the over-size-gate test: a tree this large
+    /// must be OMITTED from `StartExecute` even when a worker is matched.
+    async fn store_oversize_directory(store: &Store) -> DigestInfo {
+        // Each FileNode encodes to ~90 bytes (8-char name + 64-char hash +
+        // size). 200 files ⇒ ~18 KiB, comfortably over the 4 KiB test cap.
+        let files: Vec<FileNode> = (0..200u32)
+            .map(|i| FileNode {
+                name: format!("f{i:06}.txt"),
+                digest: Some(ProtoDigest {
+                    hash: format!("{:02x}", (i % 256) as u8).repeat(32),
+                    size_bytes: 1024,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let dir = nativelink_proto::build::bazel::remote::execution::v2::Directory {
+            files,
+            ..Default::default()
+        };
+        let (dir_bytes, dir_digest) = encode_dir(&dir);
+        assert!(
+            dir.encode_to_vec().len() > MAX_TREE_PROTO_BYTES,
+            "over-size fixture must exceed the test cap ({} bytes) — got {}",
+            MAX_TREE_PROTO_BYTES,
+            dir.encode_to_vec().len()
+        );
+        let key: StoreKey<'_> = dir_digest.into();
+        store
+            .update_oneshot(key, Bytes::from(dir_bytes))
+            .await
+            .expect("store update_oneshot for oversize test directory failed");
         dir_digest
     }
 
@@ -9380,6 +9435,45 @@ mod deferred_proto_clone_tests {
             "resolved_directories and resolved_directory_digests must be \
              parallel vecs with equal length"
         );
+
+        // (T-1) Content assertion: the single directory's FILE CONTENT must
+        // survive the clone — a ghost-Directory bug (right count, empty
+        // fields) would pass the count check above.  The source tree had
+        // exactly one Directory with one FileNode named "file.txt" size 42.
+        assert_eq!(
+            start_execute.resolved_directories.len(),
+            1,
+            "the single-directory test tree must clone to exactly one directory"
+        );
+        let cloned_dir = &start_execute.resolved_directories[0];
+        assert_eq!(
+            cloned_dir.files.len(),
+            1,
+            "the cloned Directory must carry its one FileNode — empty files \
+             would mean to_proto_vecs() cloned a hollow proto (ghost-Directory)"
+        );
+        assert_eq!(
+            cloned_dir.files[0].name, "file.txt",
+            "the cloned FileNode must preserve its name through to_proto_vecs()"
+        );
+        let cloned_file_digest = cloned_dir.files[0]
+            .digest
+            .as_ref()
+            .expect("the cloned FileNode must preserve its digest");
+        assert_eq!(
+            cloned_file_digest.size_bytes, 42,
+            "the cloned FileNode digest must preserve size_bytes through the clone"
+        );
+
+        // The directory digest in the parallel vec must match the source
+        // root digest — proving the clone is keyed correctly, not just
+        // carrying arbitrary content.
+        let expected_root: ProtoDigest = root_digest.into();
+        assert_eq!(
+            start_execute.resolved_directory_digests[0], expected_root,
+            "resolved_directory_digests[0] must equal the source input_root \
+             digest — the clone must preserve the digest→Directory mapping"
+        );
     }
 
     /// (#sched-g2) No-match path: `find_and_reserve_worker` returns `None`
@@ -9416,6 +9510,64 @@ mod deferred_proto_clone_tests {
             "deferred-clone no-match path: no workers in scheduler; \
              must return None — the deferred clone gate must not accidentally \
              force a Some return"
+        );
+    }
+
+    /// (#sched-g2, T-2) Over-size gate on the MATCH path: when a worker is
+    /// selected but the resolved tree exceeds `MAX_TREE_PROTO_BYTES`, the
+    /// deferred clone must be SKIPPED and `resolved_directories` must be
+    /// empty (the worker falls back to its own GetTree RPC).
+    ///
+    /// This guards against an inverted-gate regression (e.g. `>` → `<`, or
+    /// dropping the `tree_fits_in_message` guard) that the other tests would
+    /// miss — they all use sub-cap trees, so an inverted gate would still
+    /// populate `resolved_directories` for them.
+    ///
+    /// Composition: real `MemoryStore` holding a ~18 KiB directory (200
+    /// files), test cap = 4 KiB, one matching worker.  Selection succeeds
+    /// (Some returned) but the size gate omits the tree.
+    #[nativelink_test]
+    async fn deferred_clone_skips_oversize_tree_on_match() {
+        let cas_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let root_digest = store_oversize_directory(&cas_store).await;
+
+        let scheduler = build_scheduler_with_cas(cas_store);
+        let mut rx = add_worker(&scheduler, "W").await;
+
+        let op = OperationId::default();
+        let action = make_action("W", root_digest);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_and_reserve_worker(&props_exact("W"), &op, &action, false),
+        )
+        .await
+        .expect("find_and_reserve_worker must not hang on the oversize-tree path");
+
+        let (_worker_id, _tx, msg) = result.expect(
+            "oversize-tree path: worker W matches; selection must still succeed \
+             (the size gate omits the tree but does NOT block the dispatch)",
+        );
+        let _ = rx.try_recv();
+
+        let start_execute = match msg.update {
+            Some(update_for_worker::Update::StartAction(se)) => se,
+            other => panic!("oversize-tree path: expected StartAction, got {other:?}"),
+        };
+
+        assert!(
+            start_execute.resolved_directories.is_empty(),
+            "resolved_directories must be EMPTY when the tree exceeds \
+             MAX_TREE_PROTO_BYTES — the size gate must skip the clone so the \
+             StartExecute message stays under the worker API encoding limit; \
+             an inverted gate would populate it here and risk a 64 MiB-cap \
+             message rejection at the worker"
+        );
+        assert!(
+            start_execute.resolved_directory_digests.is_empty(),
+            "resolved_directory_digests must also be empty when the tree is \
+             over-size — the parallel vec must not leak digests for an \
+             omitted tree"
         );
     }
 
@@ -9487,7 +9639,7 @@ mod deferred_proto_clone_tests {
             let total: usize = black_box(
                 dir_map
                     .values()
-                    .map(|d| prost::Message::encoded_len(d))
+                    .map(|d| Message::encoded_len(d))
                     .sum(),
             );
             let _ = black_box(total);
