@@ -474,6 +474,13 @@ async fn inner_main(
     //
     // The wrapper is a no-op when no AC pin registry is wired (tests
     // / standalone). Production always supplies one.
+    // (FL-688 v3 Stage A fix) Collect Weak handles to the AcProxyStore
+    // wrappers so the AC-pin resync-notify callback can be wired AFTER the
+    // schedulers are constructed below (the schedulers do not exist yet here).
+    // Weak so the callback wiring never keeps a proxy alive past
+    // store_manager's lifetime.
+    let mut ac_proxy_weaks: Vec<std::sync::Weak<nativelink_store::ac_proxy_store::AcProxyStore>> =
+        Vec::new();
     for store_name in &ac_store_names {
         if let Some(original_store) = store_manager.get_store(store_name) {
             let proxy_arc = if let Some(ref tls) = worker_proxy_tls {
@@ -501,6 +508,7 @@ async fn inner_main(
                     }
                 },
             ));
+            ac_proxy_weaks.push(std::sync::Arc::downgrade(&proxy_arc));
             let proxy_store = nativelink_util::store_trait::Store::new(proxy_arc);
             store_manager.add_store(store_name, proxy_store);
             info!(
@@ -523,6 +531,38 @@ async fn inner_main(
         }
         if let Some(worker_scheduler) = maybe_worker_scheduler {
             worker_schedulers.insert(name.clone(), worker_scheduler.clone());
+        }
+    }
+
+    // (FL-688 v3 Stage A fix) Now that the worker schedulers exist, wire the
+    // AcProxyStore peer-NotFound resync-notify callback. On a peer-NotFound
+    // the proxy removes the endpoint's AC-pin registry entry OUT-OF-BAND; the
+    // callback fans an `AcPinResync` push to every worker scheduler so the
+    // worker owning the endpoint re-advertises its AC-pin set WITHOUT a
+    // reconnect. Each scheduler routes to its own worker (endpoint→worker_id)
+    // and the rest no-op. The closure holds Arc<dyn WorkerScheduler> clones
+    // (the schedulers live for the process), and is invoked from the proxy via
+    // a Weak upgrade, so it adds no cross-crate dependency to nativelink-store.
+    if !ac_proxy_weaks.is_empty() && !worker_schedulers.is_empty() {
+        let resync_schedulers: Vec<
+            Arc<dyn nativelink_scheduler::worker_scheduler::WorkerScheduler>,
+        > = worker_schedulers.values().cloned().collect();
+        let resync_notify: nativelink_store::ac_proxy_store::AcPinResyncNotify =
+            std::sync::Arc::new(move |endpoint: &str| {
+                let endpoint = endpoint.to_string();
+                let schedulers = resync_schedulers.clone();
+                // The proxy's NotFound path is sync; spawn the async fan-out so
+                // the resync send does not block the AC read path.
+                background_spawn!("ac_pin_resync_from_proxy", async move {
+                    for scheduler in &schedulers {
+                        scheduler.notify_ac_pin_resync_for_endpoint(&endpoint).await;
+                    }
+                });
+            });
+        for proxy_weak in &ac_proxy_weaks {
+            if let Some(proxy) = proxy_weak.upgrade() {
+                proxy.set_ac_pin_resync_notify(resync_notify.clone());
+            }
         }
     }
 
@@ -1235,8 +1275,39 @@ async fn inner_main(
                         let endpoints: Vec<String> =
                             registry_for_loop.endpoint_counts().keys().cloned().collect();
                         for endpoint in &endpoints {
-                            registry_for_loop
+                            // Gate the AcPinResync push on whether any registry
+                            // entries were actually removed for THIS endpoint.
+                            // An endpoint with no pins matching the draining
+                            // digests gets `false` here — its registry is
+                            // unchanged, so no convergence gap exists and no
+                            // push is needed. O(N_workers × BIS_rate) spurious
+                            // resyncs eliminated (M1/C8/P3 convergent fix,
+                            // `.claude/reviews/58940c18-v3-acpinresync/`).
+                            let removed = registry_for_loop
                                 .remove_digests_for_endpoint_batch(endpoint, &drains_for_batch);
+                            if !removed {
+                                continue;
+                            }
+                            // (FL-688 v3 Stage A fix) The BIS-ack sweep just
+                            // removed AC-pin entries for this endpoint OUT-OF-BAND
+                            // — the server's registry now has FEWER entries than
+                            // the worker's `last_sent_ac_pin_set`, and the worker's
+                            // skip-gate would suppress the next tick (its own
+                            // AC-pin set is unchanged), leaving the divergence to
+                            // persist until reconnect (pair-a BLOCK). PUSH an
+                            // `AcPinResync` so the worker re-advertises its full
+                            // AC-pin set on the next tick and the registry
+                            // reconverges WITHOUT a reconnect. Coalesced: ONE push
+                            // per endpoint per sweep cycle (the signal is a
+                            // payload-free force-re-snapshot — idempotent — so no
+                            // per-digest push is needed even though this sweep is
+                            // the hot path). Fanned to all schedulers; the one
+                            // owning the endpoint routes it, the rest no-op.
+                            for scheduler in &schedulers {
+                                scheduler
+                                    .notify_ac_pin_resync_for_endpoint(endpoint)
+                                    .await;
+                            }
                         }
                     }
 

@@ -32,8 +32,8 @@ use nativelink_metric::{
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BlobsInStableStorage, KillOperationRequest, PeerHint, StartExecute, UpdateForWorker,
-    update_for_worker,
+    AcPinResyncRequest, BlobsInStableStorage, KillOperationRequest, PeerHint, StartExecute,
+    UpdateForWorker, update_for_worker,
 };
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -4104,6 +4104,61 @@ impl ApiWorkerScheduler {
         }
     }
 
+    /// (FL-688 v3 Stage A fix) Push an `Update::AcPinResync` to the worker
+    /// owning `cas_endpoint`, so it FORCES a full re-advertisement of its
+    /// AC-pin set on the next tick. Called immediately after an OUT-OF-BAND
+    /// removal of AC-pin entries for this endpoint from the server's
+    /// `AcPinRegistry` (BIS-ack sweep / AcProxy peer-NotFound / cap-truncation).
+    ///
+    /// Resolves the endpoint to a `WorkerId` via the `endpoint_to_worker`
+    /// reverse map (the same map the locality scorer uses), then sends on the
+    /// worker's `tx`. An empty endpoint, an unknown endpoint (no connected
+    /// worker), or a dropped `tx` are silent no-ops — the worker's eventual
+    /// reconnect full snapshot is the backstop. The signal carries no payload
+    /// (the worker re-advertises its FULL set; field 17 is replace-semantics),
+    /// so it is idempotent — the hot BIS-ack sweep fires it once per endpoint
+    /// per sweep cycle without coalescing concern.
+    pub async fn notify_ac_pin_resync_for_endpoint(&self, cas_endpoint: &str) {
+        if cas_endpoint.is_empty() {
+            return;
+        }
+        // Read lock held across the send: worker.tx.send is sync
+        // (UnboundedSender) — no .await, O(1), no upgrade to write.
+        // Lock released at fn return.
+        let inner = self.inner.read().await;
+        let Some(worker_id) = inner.endpoint_to_worker.get(cas_endpoint) else {
+            // No connected worker for this endpoint (e.g. it disconnected
+            // between the registry removal and this push). The worker's
+            // reconnect full snapshot will reconcile when it returns.
+            return;
+        };
+        let Some(worker) = inner.workers.0.peek(worker_id) else {
+            // endpoint_to_worker is stale relative to workers — should not
+            // happen (both are mutated under the same write lock), but be
+            // defensive rather than panic.
+            return;
+        };
+        let msg = UpdateForWorker {
+            update: Some(update_for_worker::Update::AcPinResync(AcPinResyncRequest {})),
+        };
+        if worker.tx.send(msg).is_err() {
+            // Worker dropped already — its reconnect snapshot is the backstop.
+            debug!(
+                target: "nativelink::ac_pin_resync",
+                cas_endpoint,
+                %worker_id,
+                "AcPinResync send failed (worker tx closed); reconnect snapshot will reconcile"
+            );
+        } else {
+            trace!(
+                target: "nativelink::ac_pin_resync",
+                cas_endpoint,
+                %worker_id,
+                "pushed AcPinResync after out-of-band AC-pin registry removal"
+            );
+        }
+    }
+
     /// (#97) Drop the matching `(broadcast_id, sequence)` chunk from this
     /// worker's BIS resend buffer. Called when the worker sends a `BisAck`
     /// for a chunk we previously dispatched. Idempotent: an ack for an
@@ -5460,6 +5515,12 @@ impl WorkerScheduler for ApiWorkerScheduler {
 
     async fn clear_bis_resend_buffer_for_endpoint(&self, cas_endpoint: &str) {
         self.clear_bis_resend_buffer_for_endpoint(cas_endpoint).await;
+    }
+
+    async fn notify_ac_pin_resync_for_endpoint(&self, cas_endpoint: &str) {
+        // Inherent impl on ApiWorkerScheduler is the source of truth for
+        // endpoint→worker routing; the trait impl just forwards.
+        self.notify_ac_pin_resync_for_endpoint(cas_endpoint).await;
     }
 
     fn cas_store(&self) -> Option<&Store> {

@@ -456,18 +456,26 @@ impl AcPinRegistry {
     /// `(store_id, digests)` tuples for one `endpoint` under a SINGLE
     /// `inner.write()` lock acquisition. With N AC stores per endpoint
     /// the per-tick lock count collapses from N to 1.
+    ///
+    /// Returns `true` when at least one entry was actually removed for
+    /// this endpoint, `false` when nothing changed (endpoint unknown or
+    /// its pins do not overlap the drain set). Callers use this to gate
+    /// an `AcPinResync` push: an endpoint whose registry was unchanged
+    /// needs no resync signal.
+    #[must_use]
     pub fn remove_digests_for_endpoint_batch(
         &self,
         endpoint: &str,
         drains: &[(Arc<str>, &[DigestInfo])],
-    ) {
+    ) -> bool {
         if drains.is_empty() {
-            return;
+            return false;
         }
         let mut guard = self.inner.write();
         let Some(set) = guard.get_mut(endpoint) else {
-            return;
+            return false;
         };
+        let before_len = set.len();
         if drains.len() == 1 {
             // Fast path: one (store_id, digests) tuple — same shape as
             // remove_digests_for_endpoint_in_store but reuses the
@@ -495,9 +503,11 @@ impl AcPinRegistry {
                 });
             }
         }
+        let removed_any = set.len() < before_len;
         if set.is_empty() {
             guard.remove(endpoint);
         }
+        removed_any
     }
 
     /// Wipe every AC pin recorded for `endpoint`. Called on worker
@@ -1034,7 +1044,13 @@ mod tests {
             (s2.clone(), &s2_d as &[_]),
             (s3.clone(), &s3_d as &[_]),
         ];
-        reg.remove_digests_for_endpoint_batch(endpoint, &drains);
+        let removed = reg.remove_digests_for_endpoint_batch(endpoint, &drains);
+        assert!(
+            removed,
+            "remove_digests_for_endpoint_batch MUST return true when entries \
+             are actually removed — false means the gate would suppress the \
+             AcPinResync push for a real removal",
+        );
 
         assert_eq!(
             reg.snapshot_endpoint(endpoint),
@@ -1072,7 +1088,7 @@ mod tests {
         // Drain d(7) ONLY for s2.
         let s2_d = [d(7)];
         let drains: Vec<(Arc<str>, &[DigestInfo])> = vec![(s2.clone(), &s2_d as &[_])];
-        reg.remove_digests_for_endpoint_batch(endpoint, &drains);
+        let _ = reg.remove_digests_for_endpoint_batch(endpoint, &drains);
 
         // s1's pin for d(7) MUST survive.
         let snap = reg

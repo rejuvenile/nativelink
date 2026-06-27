@@ -445,7 +445,7 @@ async fn bis_drain_removes_pending_entry() -> Result<(), Error> {
     // BIS loop calls `remove_digests_for_endpoint_batch` with
     // [(store_id="", &[digest])].
     let drains = vec![(store_id, std::slice::from_ref(&digest))];
-    registry.remove_digests_for_endpoint_batch(LIVE_ENDPOINT, &drains);
+    let _ = registry.remove_digests_for_endpoint_batch(LIVE_ENDPOINT, &drains);
 
     let after = registry.snapshot_endpoint(LIVE_ENDPOINT);
     assert!(

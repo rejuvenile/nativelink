@@ -208,6 +208,23 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     /// digests that no longer exist in its CAS. Default impl is a no-op.
     async fn clear_bis_resend_buffer_for_endpoint(&self, _cas_endpoint: &str) {}
 
+    /// (FL-688 v3 Stage A fix) Push an [`Update::AcPinResync`] to the worker
+    /// owning `cas_endpoint`, instructing it to FORCE a full re-advertisement
+    /// of its AC-pin set on the next periodic tick. Called immediately after
+    /// the server removes AC-pin entries for that endpoint from its
+    /// `AcPinRegistry` OUT-OF-BAND (the BIS-ack sweep, AcProxy peer-NotFound
+    /// eviction, and cap-truncation sites). Without this push the worker's
+    /// skip-gate suppresses the next tick (its own AC-pin set is unchanged), so
+    /// the server↔worker registry divergence would persist until the next
+    /// reconnect — the convergence hole pair-a BLOCKed Stage A on. The
+    /// `ApiWorkerScheduler` impl resolves the endpoint via `endpoint_to_worker`
+    /// and sends on the worker's `tx`; a no-payload signal (the worker
+    /// re-advertises its FULL set, field 17 is replace-semantics). Default impl
+    /// is a no-op for schedulers with no worker streams (e.g. test doubles).
+    ///
+    /// [`Update::AcPinResync`]: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update::AcPinResync
+    async fn notify_ac_pin_resync_for_endpoint(&self, _cas_endpoint: &str) {}
+
     /// Returns the captured `cas_store` Arc the scheduler uses for tree
     /// resolution (see `resolve_tree_from_cas`). Default impl returns
     /// `None`. The production `ApiWorkerScheduler` overrides this to
