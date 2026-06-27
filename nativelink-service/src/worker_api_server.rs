@@ -2715,6 +2715,16 @@ impl WorkerConnection {
                     );
                 }
                 let registered = entries.len();
+                // Site C — no AcPinResync push emitted here intentionally.
+                // Cap-truncation via replace is convergence-inert: a
+                // force-re-advertise would clear the worker's memo → the
+                // worker re-sends the same over-cap set → the server
+                // truncates again → same tail lost every cycle → cannot
+                // converge. The removed periodic heartbeat never converged
+                // it either. Correct steady-state: the over-cap tail is
+                // simply not registered on the server; the worker re-emits
+                // it on every BlobsAvailable tick and it is always
+                // truncated. See `.claude/reviews/58940c18-v3-acpinresync/`.
                 ac_pin_registry.replace_endpoint_ac_pins(endpoint, &entries);
                 debug!(
                     worker_id=?self.worker_id,

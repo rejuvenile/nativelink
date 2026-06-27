@@ -60,7 +60,9 @@ use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::Worker;
 use nativelink_scheduler::worker_registry::WorkerRegistry;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
+use nativelink_util::ac_pin_registry::AcPinRegistry;
 use nativelink_util::action_messages::{OperationId, WorkerId};
+use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
 use nativelink_util::platform_properties::PlatformProperties;
 use tokio::sync::{Notify, mpsc};
@@ -172,6 +174,116 @@ async fn resync_routes_to_owning_worker_only() {
         "resync routing leaked to a non-owning worker: notify_ac_pin_resync_for_endpoint(A) pushed \
          an AcPinResync to worker B's tx — the push must be scoped to the endpoint's worker, not a \
          broadcast"
+    );
+}
+
+/// Test 3: the BIS-ack sweep gate — `remove_digests_for_endpoint_batch` returns
+/// `false` when NOTHING was removed for that endpoint (no-op), and `true` when
+/// entries were actually removed. The BIS sweep MUST gate the
+/// `notify_ac_pin_resync_for_endpoint` push on `true`; a no-op removal MUST NOT
+/// trigger a push to the endpoint's worker.
+///
+/// (M1/C8/P3 convergent fix — 4 reviewers flagged unconditional push for all
+/// endpoints even when none of their pins matched the draining digests.)
+///
+/// Setup: endpoint_a has digest_a pinned; endpoint_b has digest_b (DIFFERENT).
+/// Drain carries digest_a only. When BIS sweep processes endpoint_b:
+/// `remove_digests_for_endpoint_batch(endpoint_b, [digest_a])` returns `false`
+/// (digest_a not in endpoint_b's set), so no push fires for endpoint_b.
+/// endpoint_b's worker (rx_b) must see NO AcPinResync.
+///
+/// Mutation guard: in `remove_digests_for_endpoint_batch`, change the
+/// `removed_any` return to always `true` (e.g. `let removed_any = true;`).
+/// The no-op arm now returns `true` → push fires to endpoint_b → rx_b sees
+/// a spurious AcPinResync → test red-fails with the bespoke message:
+/// "gate missing: no-op removal (endpoint B has digest_b, drain carries only
+/// digest_a) triggered AcPinResync push to worker B ..."
+#[nativelink_test]
+async fn noop_removal_does_not_trigger_resync_push() {
+    let scheduler = make_scheduler();
+    let endpoint_a = "grpc://worker-a:50081";
+    let endpoint_b = "grpc://worker-b:50081";
+
+    // Register BOTH workers so endpoint_b's rx can detect spurious pushes.
+    let mut rx_a = register_worker_endpoint(&scheduler, "worker-a", endpoint_a).await;
+    let mut rx_b = register_worker_endpoint(&scheduler, "worker-b", endpoint_b).await;
+
+    // AcPinRegistry: endpoint_a has digest_a; endpoint_b has digest_b (different).
+    // Drain carries only digest_a → endpoint_b's set is UNCHANGED by this drain.
+    let registry = AcPinRegistry::new();
+    let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+    let digest_a = DigestInfo::new([0x01u8; 32], 100);
+    let digest_b = DigestInfo::new([0x02u8; 32], 100);
+    registry.register_ac_pin(endpoint_a, store_id.clone(), digest_a);
+    registry.register_ac_pin(endpoint_b, store_id.clone(), digest_b);
+
+    let drain_a = [digest_a];
+    let drains: &[(Arc<str>, &[DigestInfo])] = &[(store_id.clone(), drain_a.as_slice())];
+
+    // 1. No-op path: drain digest_a for endpoint_b (endpoint_b only has digest_b).
+    //    Endpoint_b's set is unchanged → must return false.
+    //    Gate: no push. Mutation (removed_any = true): fires push → rx_b gets resync.
+    let removed_b = registry.remove_digests_for_endpoint_batch(endpoint_b, drains);
+    assert!(
+        !removed_b,
+        "remove_digests_for_endpoint_batch must return false when the drain \
+         digests do not overlap the endpoint's pinned set — no-op removal must \
+         not gate a push (endpoint_b has digest_b; drain carries only digest_a)"
+    );
+    if removed_b {
+        // Production gate: only push when removed_b is true. With the gate broken
+        // (mutation forces true), this fires and rx_b sees a spurious AcPinResync.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.notify_ac_pin_resync_for_endpoint(endpoint_b),
+        )
+        .await
+        .expect("notify must not hang");
+    }
+    assert!(
+        !received_ac_pin_resync(&mut rx_b).await,
+        "gate missing: no-op removal (endpoint B has digest_b, drain carries only \
+         digest_a) triggered AcPinResync push to worker B — \
+         remove_digests_for_endpoint_batch must return false when the drain does \
+         not overlap the endpoint's pinned set; the BIS sweep must skip the push \
+         (mutation: force removed_any = true in remove_digests_for_endpoint_batch)"
+    );
+    // endpoint_a must also be clean — no push was intended for it yet.
+    assert!(
+        !received_ac_pin_resync(&mut rx_a).await,
+        "endpoint A received an AcPinResync during the no-op endpoint_b step — \
+         no push should have fired for A before the real removal step"
+    );
+
+    // 2. Real removal path: drain digest_a for endpoint_a (endpoint_a has digest_a).
+    //    Entry is removed → must return true → push fires.
+    let removed_a = registry.remove_digests_for_endpoint_batch(endpoint_a, drains);
+    assert!(
+        removed_a,
+        "remove_digests_for_endpoint_batch must return true when entries were \
+         actually removed — real removal must enable the push so the worker \
+         re-advertises its full AC-pin set and the registry reconverges"
+    );
+    if removed_a {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.notify_ac_pin_resync_for_endpoint(endpoint_a),
+        )
+        .await
+        .expect("notify must not hang");
+    }
+    assert!(
+        received_ac_pin_resync(&mut rx_a).await,
+        "push missing: real removal for endpoint A did not trigger AcPinResync — \
+         after remove_digests_for_endpoint_batch returned true the sweep MUST push \
+         so the worker re-advertises its full AC-pin set and the registry reconverges"
+    );
+    // endpoint_b must NOT have received a resync from endpoint_a's push.
+    assert!(
+        !received_ac_pin_resync(&mut rx_b).await,
+        "endpoint B received an AcPinResync from endpoint A's push — routing \
+         leaked to a non-owning worker; notify_ac_pin_resync_for_endpoint must \
+         be endpoint-scoped, not a broadcast"
     );
 }
 

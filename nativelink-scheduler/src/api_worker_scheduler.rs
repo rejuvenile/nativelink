@@ -3994,6 +3994,9 @@ impl ApiWorkerScheduler {
         if cas_endpoint.is_empty() {
             return;
         }
+        // Read lock held across the send: worker.tx.send is sync
+        // (UnboundedSender) — no .await, O(1), no upgrade to write.
+        // Lock released at fn return.
         let inner = self.inner.read().await;
         let Some(worker_id) = inner.endpoint_to_worker.get(cas_endpoint) else {
             // No connected worker for this endpoint (e.g. it disconnected

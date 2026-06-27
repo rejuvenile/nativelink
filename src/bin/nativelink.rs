@@ -1275,8 +1275,19 @@ async fn inner_main(
                         let endpoints: Vec<String> =
                             registry_for_loop.endpoint_counts().keys().cloned().collect();
                         for endpoint in &endpoints {
-                            registry_for_loop
+                            // Gate the AcPinResync push on whether any registry
+                            // entries were actually removed for THIS endpoint.
+                            // An endpoint with no pins matching the draining
+                            // digests gets `false` here — its registry is
+                            // unchanged, so no convergence gap exists and no
+                            // push is needed. O(N_workers × BIS_rate) spurious
+                            // resyncs eliminated (M1/C8/P3 convergent fix,
+                            // `.claude/reviews/58940c18-v3-acpinresync/`).
+                            let removed = registry_for_loop
                                 .remove_digests_for_endpoint_batch(endpoint, &drains_for_batch);
+                            if !removed {
+                                continue;
+                            }
                             // (FL-688 v3 Stage A fix) The BIS-ack sweep just
                             // removed AC-pin entries for this endpoint OUT-OF-BAND
                             // — the server's registry now has FEWER entries than
