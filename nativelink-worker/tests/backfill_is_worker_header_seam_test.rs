@@ -237,10 +237,12 @@ fn mk_digest(seed: u8, size: usize) -> DigestInfo {
     DigestInfo::new(h, size as u64)
 }
 
-/// Build a `GrpcSpec` pointing at `addr`, with the production-default
-/// BatchUpdateBlobs coalesce route ENABLED (`batch_update_threshold_bytes` =
-/// 1 MiB) so the small-blob test crosses the SAME coalesce-spawn seam the real
-/// backfill crosses. `retry.max_retries = 0` so a single RPC is observed.
+/// Build a `GrpcSpec` pointing at `addr`. `batch_update_threshold_bytes` is left
+/// at the production default (1 MiB) for fidelity, but it is INERT on this path:
+/// in the WPS-wrapped topology the small-blob upload reaches `GrpcStore::update`
+/// (streaming ByteStream), NOT `GrpcStore::update_oneshot`, so the BatchUpdateBlobs
+/// coalesce-queue spawn is never entered — the chain streams in-task and (B)'s
+/// scope alone carries the header. `retry.max_retries = 0` so a single RPC is observed.
 fn make_grpc_spec(addr: String) -> nativelink_config::stores::GrpcSpec {
     nativelink_config::stores::GrpcSpec {
         instance_name: String::new(),

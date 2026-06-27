@@ -3386,9 +3386,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 // BatchUpdateBlobs coalesce-queue spawn (the only spawn that would
                 // strip the task-local) — so no GrpcStore-side change is needed.
                 //
-                // Per-FUTURE scoping (not wrapping the drain) is still the
-                // spawn-safe placement: if this body is later refactored to spawn,
-                // the scope still encloses the `.update_oneshot`/`.update` calls.
+                // Per-FUTURE scoping (not wrapping the drain). CORRECT ONLY
+                // because the chain above is spawn-free: tokio task-locals do
+                // NOT propagate across `tokio::spawn`. If any link (here, WPS, or
+                // GrpcStore) is later refactored to spawn the upload,
+                // IS_WORKER_REQUEST is SILENTLY lost → the wire header drops →
+                // FL-688 re-opens. Any new spawn MUST re-establish the scope
+                // INSIDE the spawned task (see batch_read_coalescer.rs:528).
                 // is_worker only — backfill is a worker upload, not a mirror push
                 // (do NOT set IS_MIRROR_REQUEST). Mirrors the
                 // `IS_WORKER_REQUEST.scope(captured, fut)` pattern at
