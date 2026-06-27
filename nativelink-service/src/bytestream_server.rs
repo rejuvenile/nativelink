@@ -393,10 +393,24 @@ impl MetricsComponent for ByteStreamMetrics {
 ///    idle_stream_timeout` (zombie stream on a live h2 connection). `None` while
 ///    idle (no active write to cancel).
 // UNBOUNDED-OK: one entry per in-flight UUID (same as before); the `oneshot::Sender`
-// is ~100 B. h2 concurrency is unbounded in production (no
-// `experimental_http2_max_concurrent_streams` cap set), but the byte-budget
-// is negligible: at 10K concurrent writes, total ≈ 1 MB.
-type BytesWrittenAndIdleStream = (Arc<AtomicU64>, Option<IdleStream>, Option<oneshot::Sender<()>>);
+// is ~100 B and the `u64` expected_size is 8 B. h2 concurrency is unbounded in
+// production (no `experimental_http2_max_concurrent_streams` cap set), but the
+// byte-budget is negligible: at 10K concurrent writes, total ≈ 1 MB.
+//
+// Tuple layout:
+//   .0 = bytes_received counter (Arc<AtomicU64>)
+//   .1 = idle stream (Some when paused waiting for resume; None when active)
+//   .2 = zombie-reap cancel sender (Some only while a write is active)
+//   .3 = expected_size for this upload (u64). The sweeper's zombie detection
+//        (Pass 3) only fires when bytes_received has NOT reached expected_size:
+//        once all declared bytes are received, the write is in its store-commit
+//        phase (process_client_stream has returned Ok; store_update_fut is
+//        draining the buf_channel), NOT parked at stream.next() waiting for a
+//        silent producer. Firing the reaper there would bypass the FL-688 ≥2-
+//        replica mirror ack-gate. See review c2a06843 MAJOR-2 (convergent
+//        distsys + red-team).
+type BytesWrittenAndIdleStream =
+    (Arc<AtomicU64>, Option<IdleStream>, Option<oneshot::Sender<()>>, u64);
 
 /// Type alias for the UUID key used in `active_uploads` `HashMap`.
 /// Using u128 instead of String reduces memory allocations and improves
@@ -1209,12 +1223,17 @@ impl ByteStreamServer {
             // changed for `>= 2 × idle_stream_timeout`, the write is a zombie
             // on a live h2 connection and we fire the cancel signal.
             //
-            // Threshold safety: 2 × idle_stream_timeout ≥ 2 × 60s = 120s in
-            // production, exceeding the keepalive dead-peer window (30s PING +
-            // 60s PONG timeout + 5s hyper stall-grace = 95s). Any write killed
-            // here CANNOT be on a live TCP connection with a legitimately slow
-            // producer — if TCP were alive AND the producer were alive,
-            // keepalive would have detected and killed it within 95s.
+            // Threshold safety: 2 × idle_stream_timeout = 2 × 60s = 120s in
+            // production (DEFAULT_PERSIST_STREAM_ON_DISCONNECT_TIMEOUT = 60s;
+            // buildcache config leaves persist_stream_on_disconnect_timeout unset),
+            // exceeding the h2 keepalive dead-peer window. That window is
+            // http2_keep_alive_interval (30s) + experimental_http2_keep_alive_timeout
+            // (20s) = 50s in the buildcache config (verified vs
+            // ~/fl/bld/infra/nativelink/prod-server.json5 lines 301-302). Any write
+            // killed here CANNOT be on a live TCP connection with a legitimately
+            // slow producer — if TCP were alive AND the producer were alive,
+            // keepalive would have detected and killed it within 50s, long
+            // before the 120s reaper threshold.
             //
             // The tracking map is cleared of entries whose write went idle or
             // was completed between sweeps (UUIDs not in `active_uploads` or
@@ -1247,7 +1266,7 @@ impl ByteStreamServer {
                 // Pass 1: evict streams that exceeded idle_stream_timeout
                 {
                     let mut uploads = active_uploads.lock();
-                    uploads.retain(|uuid, (bytes_received, maybe_idle, _cancel_tx)| {
+                    uploads.retain(|uuid, (bytes_received, maybe_idle, _cancel_tx, _expected)| {
                         if let Some(idle_stream) = maybe_idle {
                             if now.duration_since(idle_stream.idle_since) >= idle_stream_timeout {
                                 debug!(
@@ -1294,7 +1313,9 @@ impl ByteStreamServer {
                         let mut idle_entries: Vec<(UuidKey, Instant, u64)> = Vec::new();
                         {
                             let uploads = active_uploads.lock();
-                            for (uuid, (bytes_received, maybe_idle, _cancel_tx)) in uploads.iter() {
+                            for (uuid, (bytes_received, maybe_idle, _cancel_tx, _expected)) in
+                                uploads.iter()
+                            {
                                 if let Some(idle_stream) = maybe_idle {
                                     idle_entries.push((
                                         *uuid,
@@ -1328,7 +1349,9 @@ impl ByteStreamServer {
                             let mut actually_evicted = 0u64;
                             let mut actually_evicted_bytes = 0u64;
                             for uuid in &uuids_to_evict {
-                                if let Some((bytes_counter, maybe_idle, _cancel_tx)) = uploads.get(uuid) {
+                                if let Some((bytes_counter, maybe_idle, _cancel_tx, _expected)) =
+                                    uploads.get(uuid)
+                                {
                                     if maybe_idle.is_some() {
                                         let bytes = bytes_counter.load(Ordering::Acquire);
                                         uploads.remove(uuid);
@@ -1395,16 +1418,36 @@ impl ByteStreamServer {
                         zombie_stale_since.retain(|uuid, _| {
                             uploads
                                 .get(uuid)
-                                .is_some_and(|(_, maybe_idle, _)| maybe_idle.is_none())
+                                .is_some_and(|(_, maybe_idle, _, _)| maybe_idle.is_none())
                         });
                         // Scan active (non-idle) writes.
-                        for (uuid, (bytes_received, maybe_idle, cancel_tx)) in uploads.iter_mut() {
+                        for (uuid, (bytes_received, maybe_idle, cancel_tx, expected_size)) in
+                            uploads.iter_mut()
+                        {
                             if maybe_idle.is_some() {
                                 // Idle: not an active write; zombie_stale_since
                                 // entry (if any) was pruned above.
                                 continue;
                             }
                             let current_bytes = bytes_received.load(Ordering::Acquire);
+                            // MAJOR-2 guard (review c2a06843, convergent distsys +
+                            // red-team): once all declared bytes have been received,
+                            // `bytes_received` is STABLE at `expected_size` while the
+                            // write is in its store-commit phase — `process_client_stream`
+                            // has already returned Ok and `store_update_fut` is draining
+                            // the buf_channel into the store + mirror. That stable counter
+                            // is NOT a silent-producer zombie; firing the reaper here would
+                            // bypass the FL-688 ≥2-replica mirror ack-gate. A genuine
+                            // zombie is parked at `stream.next()` BEFORE all bytes arrive,
+                            // so its counter is strictly below `expected_size`. Skip the
+                            // all-bytes-received case and prune any stale tracking entry.
+                            // (`expected_size == 0` empty-blob uploads never enter
+                            // process_client_stream's data loop and complete synchronously,
+                            // so `current_bytes >= 0` correctly excludes them too.)
+                            if current_bytes >= *expected_size {
+                                zombie_stale_since.remove(uuid);
+                                continue;
+                            }
                             match zombie_stale_since.get(uuid) {
                                 None => {
                                     // First time we see this active write. Record it.
@@ -1554,7 +1597,8 @@ impl ByteStreamServer {
                             drop(idle_stream);
                             let bytes_received = Arc::new(AtomicU64::new(0));
                             let (cancel_tx, cancel_rx) = oneshot::channel();
-                            *maybe_idle_stream = (bytes_received.clone(), None, Some(cancel_tx));
+                            *maybe_idle_stream =
+                                (bytes_received.clone(), None, Some(cancel_tx), digest.size_bytes());
                             UploadAction::New(uuid_key, bytes_received, cancel_rx)
                         } else {
                             let bytes_received = maybe_idle_stream.0.clone();
@@ -1592,7 +1636,7 @@ impl ByteStreamServer {
                     let bytes_received = Arc::new(AtomicU64::new(0));
                     let uuid = *entry.key();
                     let (cancel_tx, cancel_rx) = oneshot::channel();
-                    entry.insert((bytes_received.clone(), None, Some(cancel_tx)));
+                    entry.insert((bytes_received.clone(), None, Some(cancel_tx), digest.size_bytes()));
                     UploadAction::New(uuid, bytes_received, cancel_rx)
                 }
             }
@@ -1605,7 +1649,10 @@ impl ByteStreamServer {
                 let bytes_received = Arc::new(AtomicU64::new(0));
                 let mut active_uploads = instance.active_uploads.lock();
                 let (cancel_tx, cancel_rx) = oneshot::channel();
-                active_uploads.insert(unique_key, (bytes_received.clone(), None, Some(cancel_tx)));
+                active_uploads.insert(
+                    unique_key,
+                    (bytes_received.clone(), None, Some(cancel_tx), digest.size_bytes()),
+                );
                 (unique_key, bytes_received, true, cancel_rx)
             }
         };
@@ -3372,7 +3419,9 @@ impl ByteStreamServer {
 
         {
             let active_uploads = instance.active_uploads.lock();
-            if let Some((received_bytes, _maybe_idle_stream, _cancel_tx)) = active_uploads.get(&uuid_key) {
+            if let Some((received_bytes, _maybe_idle_stream, _cancel_tx, _expected)) =
+                active_uploads.get(&uuid_key)
+            {
                 return Ok(Response::new(QueryWriteStatusResponse {
                     committed_size: received_bytes.load(Ordering::Acquire) as i64,
                     // If we are in the active_uploads map, but the value is None,

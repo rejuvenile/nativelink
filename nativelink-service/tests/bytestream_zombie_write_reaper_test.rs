@@ -48,19 +48,32 @@
 //!
 //! ## Threshold safety argument
 //!
-//! `2 × idle_stream_timeout` (≥ 2 × 60s = 120s in production) exceeds the
-//! keepalive dead-peer detection window (30s ping + 60s timeout + 5s hyper
-//! stall-grace = 95s). Any write killed by the sweeper CANNOT be on a live
-//! connection with a legitimately slow producer — if the connection were alive
-//! and the producer were alive, keepalive would have killed it within 95s.
-//! Slow-but-alive producers sending any bytes within the window are unaffected
-//! (the sweeper resets on any progress).
+//! `2 × idle_stream_timeout` (= 2 × 60s = 120s in production) exceeds the
+//! keepalive dead-peer detection window: http2_keep_alive_interval (30s) +
+//! experimental_http2_keep_alive_timeout (20s) = 50s in the buildcache config.
+//! Any write killed by the sweeper CANNOT be on a live connection with a
+//! legitimately slow producer — if the connection were alive and the producer
+//! were alive, keepalive would have killed it within 50s, well before the 120s
+//! reaper threshold. Slow-but-alive producers sending any bytes within the
+//! window are unaffected (the sweeper resets on any progress).
 //!
 //! ## Asymmetric contract coverage (CLAUDE.md)
 //!
-//! Two directions:
-//! - Under-action: zombie write IS reaped — `zombie_write_is_reaped_after_threshold`
-//! - Over-action: slow-but-alive write is NOT killed — `slow_alive_producer_not_killed`
+//! Four directions:
+//! - Under-action (simple): zombie write stuck at first observation IS reaped —
+//!   `zombie_write_is_reaped_after_threshold`
+//! - Under-action (reset path): a zombie that advanced bytes once then went
+//!   silent IS still reaped (the byte-progress reset re-arms the no-progress
+//!   timer) — `progressed_then_silent_zombie_is_reaped`
+//! - Over-action (slow producer): slow-but-alive write is NOT killed —
+//!   `slow_alive_producer_not_killed`
+//! - Over-action (all-bytes-received): a write whose `bytes_received` has reached
+//!   `expected_size` is NOT killed even when stable past the threshold —
+//!   `all_bytes_received_not_reaped_during_store_commit`. This protects the
+//!   store-commit phase (`process_client_stream` returned Ok; `store_update_fut`
+//!   still draining) from being misclassified as a silent-producer zombie, which
+//!   would bypass the FL-688 ≥2-replica mirror ack-gate. See review c2a06843
+//!   MAJOR-2 (convergent distsys + red-team + testing-czar T5).
 //!
 //! ## Mutation step (CLAUDE.md TDD #5)
 //!
@@ -80,6 +93,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use hyper::body::Frame;
+use pretty_assertions::assert_eq;
+use tonic::codec::Codec;
+use tonic::{Request, Streaming};
+use tonic_prost::ProstCodec;
+
 use nativelink_config::cas_server::{ByteStreamConfig, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::Error;
@@ -93,11 +111,6 @@ use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
 use nativelink_util::store_trait::StoreLike;
 use nativelink_util::{spawn, task::JoinHandleDropGuard};
-use pretty_assertions::assert_eq;
-use tonic::Request;
-use tonic::Streaming;
-use tonic::codec::Codec;
-use tonic_prost::ProstCodec;
 
 const INSTANCE_NAME: &str = "foo_instance_name";
 const HASH1: &str = "0123456789abcdef000000000000000000000000000000000123456789abcdef";
@@ -112,8 +125,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(IDLE_TIMEOUT_SECS as u64);
 /// Must exceed `2 * IDLE_TIMEOUT + sweep_interval` = `2 * 2 + 1 = 5s`.
 const ZOMBIE_ADVANCE: Duration = Duration::from_secs(6);
 
-/// How long the slow-but-alive producer delays between chunks (< IDLE_TIMEOUT).
-/// Each chunk advances the `bytes_received` counter, preventing zombie detection.
+/// How long the slow-but-alive producer delays between chunks (< the zombie
+/// threshold `2 × IDLE_TIMEOUT = 4s`, so each chunk's byte-advance resets the
+/// sweeper's no-progress timer before it can fire). The byte-progress RESET path
+/// is exercised as a LOAD-BEARING contract in the dedicated
+/// `progressed_then_silent_zombie_is_reaped` test (under-action direction); this
+/// over-action test only asserts an alive producer's upload completes.
 const ALIVE_CHUNK_DELAY: Duration = Duration::from_millis(500);
 
 /// Chunk parameters for the slow-alive test.
@@ -272,47 +289,25 @@ async fn zombie_write_is_reaped_after_threshold() {
     let first_chunk = Bytes::from(vec![0x42u8; 8]);
     send_first_chunk(&frame_tx, resource_name, first_chunk).await;
 
-    // Producer side: hold sender alive (zombie), advance virtual time past
-    // the zombie reap threshold. The sweeper fires the cancel at
-    // `2 × idle_stream_timeout = 4s`. With `ZOMBIE_ADVANCE = 6s`, the
-    // cancel fires on the sweep at ~3s (i.e., after 3 sweep intervals of 1s
-    // each once the sweeper first sees the write as stale) and the writer
-    // returns by ~4s of virtual time.
+    // Hold `frame_tx` alive in the MAIN task for the entire window (testing-czar
+    // T4): the connection stays alive and the producer stays silent. The ONLY
+    // way `writer_handle` resolves is the sweeper-fired reap — never a sender
+    // drop. We advance virtual time directly via the outer `tokio::time::timeout`
+    // (under start_paused, awaiting it advances the virtual clock past the 4s
+    // zombie threshold while the writer is parked at stream.next()).
     //
-    // NOTE: `frame_tx` is moved into this block to keep the sender alive
-    // during the sleep, simulating the zombie connection scenario.
-    let zombie_producer_handle: JoinHandleDropGuard<()> =
-        spawn!("zombie_producer", async move {
-            // Zombie: sender alive, sending nothing.
-            // The server is blocked at stream.next().await.
-            tokio::time::sleep(ZOMBIE_ADVANCE).await;
-            // Sender dropped here — but the writer should have returned Err
-            // already due to the sweeper-fired cancel.
-            drop(frame_tx);
-        });
-
-    zombie_producer_handle
+    // The outer guard's `.expect` is the bespoke mutation-failure message:
+    // without the cancel arm the writer never resolves and this Elapses.
+    let writer_result = tokio::time::timeout(ZOMBIE_ADVANCE * 4, writer_handle)
         .await
-        .expect("zombie producer task must not panic");
+        .expect(
+            "zombie write must be reaped — StallGuard and in-flight slot must not \
+             leak when producer goes silent on a live h2 connection",
+        )
+        .expect("writer task must not panic");
 
-    // The writer must have returned Err(Code::Aborted) with the zombie-reap
-    // message. The outer `tokio::time::timeout` guards against an infinite
-    // hang if the fix is absent or the cancel never fires.
-    //
-    // NOTE: With `start_paused = true`, the virtual time advances inside the
-    // zombie_producer_handle sleep above. By the time we await writer_handle,
-    // the sweeper has already run (virtual time is in the future), so the
-    // writer_handle should resolve immediately.
-    let writer_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        writer_handle,
-    )
-    .await
-    .expect(
-        "zombie write must be reaped — StallGuard and in-flight slot must not \
-         leak when producer goes silent on a live h2 connection",
-    )
-    .expect("writer task must not panic");
+    // frame_tx is still alive here — the writer resolved purely from the reap.
+    drop(frame_tx);
 
     let status = writer_result.expect_err(
         "zombie write must return Err — a silent producer on a live connection \
@@ -325,21 +320,115 @@ async fn zombie_write_is_reaped_after_threshold() {
     );
 }
 
+/// **Under-action test: a zombie that PROGRESSED then died is still reaped —
+/// the byte-progress reset path is load-bearing.**
+///
+/// `zombie_write_is_reaped_after_threshold` covers the simplest zombie: bytes
+/// stuck at the first observation. This test covers a zombie that advanced its
+/// `bytes_received` once (8 → 16) BEFORE going silent. The sweeper observes the
+/// advance and RESETs `(first_seen_at, first_seen_bytes)`; the no-progress timer
+/// must then accumulate from the reset point so the reap still fires.
+///
+/// This is the test that makes the reset line load-bearing (testing-czar T3).
+/// WITHOUT the reset, after bytes advance to 16 the stale entry keeps its
+/// original `first_seen_bytes = 8`, so the reap condition
+/// (`current_bytes == first_seen_bytes`) is never satisfied again — the write is
+/// NEVER reaped and the writer hangs forever. (The simple zombie test cannot
+/// catch this because its counter never advances past the first observation.)
+///
+/// Timing (threshold = 4s, sweep = 1s):
+/// - t=0: chunk 1 (8 bytes), write becomes active.
+/// - sweep records (≈1s, 8).
+/// - t=2s: chunk 2 (8 bytes) → bytes=16; sweep RESETs to (≈2s, 16).
+/// - producer silent thereafter.
+/// - WITH reset: at t≈6s (4s after the reset) bytes are stable at 16 → REAP.
+/// - WITHOUT reset: 16 != 8 forever → empty branch → never reaps → hang.
+///
+/// `expected_size = 64` keeps `bytes_received (16) < expected_size`, so the
+/// MAJOR-2 guard does not exclude this write.
+///
+/// **Mutation step (CLAUDE.md TDD #5):** comment out the reset
+/// (`zombie_stale_since.insert(*uuid, (now_tokio, current_bytes))` in the
+/// `current_bytes != first_seen_bytes` branch). This test then times out at its
+/// outer guard with the bespoke message below.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn progressed_then_silent_zombie_is_reaped() {
+    let store_manager = make_store_manager()
+        .await
+        .expect("store_manager construction must not fail");
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref()).expect("bs_server new"),
+    );
+
+    let (frame_tx, body) = ChannelBody::new();
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    let stream: Streaming<WriteRequest> =
+        Streaming::new_request(codec.decoder(), body, None, None);
+
+    let bs_server_for_writer = Arc::clone(&bs_server);
+    let writer_handle: JoinHandleDropGuard<
+        Result<tonic::Response<nativelink_proto::google::bytestream::WriteResponse>, tonic::Status>,
+    > = spawn!("progressed_zombie_writer", async move {
+        bs_server_for_writer.write(Request::new(stream)).await
+    });
+
+    // Producer: chunk 1 at t=0 (bytes→8), chunk 2 at t=2s (bytes→16, advancing
+    // the counter so the sweeper RESETs), then hold the sender alive and silent.
+    let zombie_producer_handle: JoinHandleDropGuard<()> =
+        spawn!("progressed_zombie_producer", async move {
+            let resource_name =
+                make_resource_name(HASH2, 64, "dddddddd-0000-0000-0000-000000000004");
+            send_first_chunk(&frame_tx, resource_name, Bytes::from(vec![0x42u8; 8])).await;
+
+            // Advance bytes once (8 → 16) at t=2s so the sweeper observes
+            // progress and resets its no-progress timer. 2s < 4s threshold, so
+            // the write is still alive at this point.
+            tokio::time::sleep(IDLE_TIMEOUT).await; // 2s
+            send_middle_chunk(&frame_tx, 8, Bytes::from(vec![0x42u8; 8])).await;
+
+            // Now go silent past the threshold measured FROM THE RESET. The
+            // reaper must fire ~4s after the reset (t≈6s). Sleep well past that.
+            tokio::time::sleep(ZOMBIE_ADVANCE * 2).await; // +12s → t≈14s
+            drop(frame_tx);
+        });
+
+    zombie_producer_handle
+        .await
+        .expect("progressed zombie producer task must not panic");
+
+    let writer_result = tokio::time::timeout(Duration::from_secs(30), writer_handle)
+        .await
+        .expect(
+            "progressed-then-silent zombie must be reaped — the byte-progress \
+             reset must re-arm the no-progress timer so a zombie that advanced \
+             once is still reaped after going silent",
+        )
+        .expect("writer task must not panic");
+
+    let status = writer_result.expect_err(
+        "progressed-then-silent zombie must return Err — a producer that advanced \
+         bytes once then went silent on a live connection must still be reaped",
+    );
+    assert!(
+        status.message().contains("zombie write reaped"),
+        "zombie reap error must contain 'zombie write reaped'; got: {:?}",
+        status.message(),
+    );
+}
+
 /// **Over-action test: slow-but-alive producer is NOT killed.**
 ///
 /// A producer sends chunks every `ALIVE_CHUNK_DELAY = 500ms` of virtual time —
-/// well within the `IDLE_TIMEOUT = 2s` threshold. The sweeper sees `bytes_received`
-/// advancing on each sweep and MUST NOT fire the zombie cancel. The upload
+/// inside the zombie threshold (`2 × IDLE_TIMEOUT = 4s`). The sweeper sees
+/// `bytes_received` advancing and MUST NOT fire the zombie cancel. The upload
 /// completes successfully.
 ///
-/// This guards the asymmetric over-action contract: the zombie detector must
-/// not misidentify a legitimately slow-but-alive producer as a zombie.
-///
-/// **Mutation step:** if the zombie threshold were set to 0 (or to
-/// `< ALIVE_CHUNK_DELAY`), this test would fail because the cancel fires before
-/// each new chunk arrives. The test uses `ALIVE_CHUNK_DELAY` deliberately to
-/// exceed any reasonably fine-grained "timeout per chunk" while staying within
-/// the coarser zombie-sweep window.
+/// This guards the over-action contract from the OPPOSITE end of the
+/// `progressed_then_silent_zombie_is_reaped` test: a producer that keeps making
+/// progress is never reaped. (The reset path's load-bearing under-action
+/// coverage lives in `progressed_then_silent_zombie_is_reaped`; removing the
+/// reset makes the reaper strictly more lenient, so this over-action test is
+/// correctly insensitive to that mutation.)
 #[nativelink_test(flavor = "current_thread", start_paused = true)]
 async fn slow_alive_producer_not_killed() {
     let store_manager = make_store_manager()
@@ -363,8 +452,8 @@ async fn slow_alive_producer_not_killed() {
     });
 
     // Spawn the producer. It sends CHUNK_COUNT chunks every ALIVE_CHUNK_DELAY
-    // apart (much less than the zombie threshold = 4s). Each chunk advances
-    // `bytes_received`, resetting zombie detection in the sweeper.
+    // (500ms) apart — well inside the 4s zombie threshold. Each chunk advances
+    // `bytes_received`, so the sweeper never sees a no-progress window.
     let producer_handle: JoinHandleDropGuard<()> = spawn!("alive_producer", async move {
         let resource_name = make_resource_name(HASH2, TOTAL_SIZE, "bbbbbbbb-0000-0000-0000-000000000002");
         let chunk_data: Bytes = Bytes::from(vec![0xCDu8; CHUNK_SIZE]);
@@ -421,4 +510,117 @@ async fn slow_alive_producer_not_killed() {
             .is_some(),
         "blob must be present in MemoryStore after slow-but-alive upload",
     );
+}
+
+/// **Over-action test: a write that has received all declared bytes is NOT
+/// reaped, even when its `bytes_received` counter is stable past the threshold.**
+///
+/// This is the MAJOR-2 regression (review c2a06843, convergent distsys +
+/// red-team + testing-czar T5). `bytes_received` is stable in TWO distinct
+/// states: (a) a genuine zombie parked at `stream.next()` with `bytes_received <
+/// expected_size`, and (b) a write that has received ALL declared bytes and is
+/// in its store-commit phase (`process_client_stream` returned Ok;
+/// `store_update_fut` draining the buf_channel into the store + mirror). If the
+/// store-commit phase outlasts `2 × idle_stream_timeout` (ZFS pressure, lock
+/// contention, slow GrpcStore mirror), the OLD code misclassified state (b) as a
+/// zombie and fired `Code::Aborted`, BYPASSING the FL-688 ≥2-replica mirror
+/// ack-gate.
+///
+/// The fix gates Pass 3 on `current_bytes >= expected_size`: once all declared
+/// bytes are received, the write is never reaped.
+///
+/// **Simulation:** a producer sends exactly `expected_size` bytes across two
+/// chunks WITHOUT `finish_write=true`, then holds the sender alive (silent).
+/// `bytes_received` reaches `expected_size` and stays there. The server parks at
+/// `stream.next()` awaiting the finish_write chunk — but because all declared
+/// bytes were received, the MAJOR-2 guard excludes it from zombie reaping. The
+/// test advances virtual time well past `2 × idle_stream_timeout` and asserts
+/// the writer has NOT returned `Code::Aborted "zombie write reaped"`. (It stays
+/// parked, so the outer `tokio::time::timeout` resolves to `Elapsed`, which is
+/// the EXPECTED outcome here — distinguished from a reaper-fired Err by the
+/// assertion below.)
+///
+/// **Mutation step (CLAUDE.md TDD #5):** removing the
+/// `if current_bytes >= *expected_size { ...; continue; }` guard in Pass 3
+/// causes the all-bytes-received write to be reaped at the threshold; the writer
+/// then resolves to `Err(Code::Aborted, "zombie write reaped ...")` within the
+/// window and this test fails at the `must_not_reap` assertion.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn all_bytes_received_not_reaped_during_store_commit() {
+    let store_manager = make_store_manager()
+        .await
+        .expect("store_manager construction must not fail");
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref()).expect("bs_server new"),
+    );
+
+    let (frame_tx, body) = ChannelBody::new();
+    let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+    let stream: Streaming<WriteRequest> =
+        Streaming::new_request(codec.decoder(), body, None, None);
+
+    let bs_server_for_writer = Arc::clone(&bs_server);
+    let writer_handle: JoinHandleDropGuard<
+        Result<tonic::Response<nativelink_proto::google::bytestream::WriteResponse>, tonic::Status>,
+    > = spawn!("commit_writer", async move {
+        bs_server_for_writer.write(Request::new(stream)).await
+    });
+
+    // declared_size is the FULL upload size. We send exactly this many bytes
+    // across two NON-terminal chunks (no finish_write), so bytes_received
+    // reaches declared_size while the server stays parked at stream.next().
+    let declared_size: usize = 32;
+    let half = declared_size / 2;
+    let resource_name =
+        make_resource_name(HASH1, declared_size, "cccccccc-0000-0000-0000-000000000003");
+
+    // First chunk (16 bytes, write_offset=0, finish_write=false): gets past
+    // WriteRequestStreamWrapper::from and advances bytes_received to 16.
+    send_first_chunk(&frame_tx, resource_name, Bytes::from(vec![0x55u8; half])).await;
+
+    // Second chunk (16 bytes, write_offset=16, finish_write=false): advances
+    // bytes_received to 32 == declared_size. Still NO finish_write, so the
+    // server loops back to stream.next() and parks. bytes_received is now stable
+    // at declared_size — this is the store-commit-phase / all-bytes-received
+    // shape that MUST NOT be reaped.
+    send_middle_chunk(&frame_tx, half, Bytes::from(vec![0x55u8; half])).await;
+
+    // Hold the sender alive (do NOT drop frame_tx) while we advance virtual time
+    // well past the zombie threshold (2 × IDLE_TIMEOUT = 4s). Keeping frame_tx
+    // in scope here is the load-bearing simulation: the connection is alive, all
+    // declared bytes were received, but no finish_write arrives.
+    let advance = IDLE_TIMEOUT * 4; // 8s >> 4s threshold + sweep interval.
+
+    // The writer MUST NOT resolve with a zombie-reap Err during this window.
+    // It stays parked, so timeout returns Elapsed — the EXPECTED outcome. A
+    // reaper misfire would instead resolve writer_handle to Err(Aborted).
+    let outcome = tokio::time::timeout(advance, writer_handle).await;
+
+    match outcome {
+        Err(_elapsed) => {
+            // Parked as expected — all-bytes-received write was NOT reaped.
+        }
+        Ok(join_result) => {
+            let writer_result = join_result.expect("writer task must not panic");
+            match writer_result {
+                Err(status) => {
+                    let msg = status.message();
+                    assert!(
+                        !msg.contains("zombie write reaped"),
+                        "must_not_reap: all-bytes-received write (bytes_received == \
+                         expected_size, store-commit phase) was wrongly reaped — \
+                         this bypasses the FL-688 >=2-replica mirror ack-gate; got: {msg:?}",
+                    );
+                }
+                Ok(_response) => {
+                    // Also acceptable: if the server somehow completed without a
+                    // finish_write it would not be a reap. Not the reaper firing.
+                }
+            }
+        }
+    }
+
+    // Hold frame_tx until here so the connection stays "alive" for the whole
+    // window (the silent-but-alive simulation).
+    drop(frame_tx);
 }
