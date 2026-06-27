@@ -1327,7 +1327,15 @@ async fn inner_main(
                             let pending_endpoints: Vec<String> =
                                 pending_registry_for_loop.endpoint_counts().keys().cloned().collect();
                             for endpoint in &pending_endpoints {
-                                pending_registry_for_loop
+                                // Pending-output-locality is a server-internal
+                                // CAS-locality hint (populated via
+                                // inject_h4_pending_registry_into_ac_chains /
+                                // AcServer), NOT worker-advertised AC-pins — no
+                                // worker `last_sent_ac_pin_set` mirrors it, so a
+                                // removal here cannot diverge a worker and needs
+                                // no AcPinResync push (unlike the AC-pin registry
+                                // at the stable-drain site above). Return ignored.
+                                let _ = pending_registry_for_loop
                                     .remove_digests_for_endpoint_batch(endpoint, &pending_drains);
                             }
                         }
