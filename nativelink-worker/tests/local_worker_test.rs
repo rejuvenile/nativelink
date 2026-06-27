@@ -162,6 +162,10 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
             cas_endpoint: String::new(),
             boot_epoch_id: 0,
             build_sha: String::new(),
+            // On Linux, p/e core detection returns (0,0); scheduler falls
+            // back to assume_core_count. (#sched-blend c355fb77)
+            p_core_count: 0,
+            e_core_count: 0,
         }
     );
 
