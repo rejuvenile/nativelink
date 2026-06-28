@@ -1930,6 +1930,51 @@ mod tests {
         );
     }
 
+    /// (#37 re-enable follow-up) The memory-gate NAK counters must render on the
+    /// REAL `/metrics` path (`MetricsRegistry::register` + `render_prometheus`),
+    /// not just `MetricsComponent::publish` in isolation — the canary soak alerts
+    /// on the rendered Prometheus line. This test PINS the exact rendered name:
+    /// the value line is the BARE `memory_gate_nak_free_floor_total` (NO `_counter`
+    /// suffix — verified empirically here; do not assume a suffix from other
+    /// counters' output). Stops an operator / the soak runbook from alerting on a
+    /// name that does not exist on the wire (the worker-metrics-exposure trap).
+    #[test]
+    fn memory_gate_render_prometheus_exposes_nak_counters() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // LOCAL Arc (not the process static) for the 'static register() lifetime
+        // + to avoid cross-test interference with MEMORY_GATE_COUNTERS. The
+        // blanket `Arc<T: MetricsComponent>` impl delegates to
+        // `MemoryGateCounters::publish` — the same path the registered handle uses.
+        let counters = Arc::new(MemoryGateCounters::new());
+        counters.nak_free_floor.fetch_add(7, Ordering::Relaxed);
+        counters.nak_refault.fetch_add(3, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        // Prefix "memory_gate" — the exact key production nativelink.rs registers.
+        registry.register("memory_gate", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("memory_gate_nak_free_floor_total", 7u64),
+            ("memory_gate_nak_refault_total", 3),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "#37 dark on /metrics: expected exact line `{name} {value}` from the \
+                 render_prometheus walk, but it is ABSENT — the canary soak alerts on this \
+                 EXACT rendered name. body=\n{body}"
+            );
+        }
+        // Guard the doubled-prefix trap (as the dir_cache test does).
+        assert!(
+            !body.contains("memory_gate_memory_gate"),
+            "#37 doubled metric name: rendered output contains `memory_gate_memory_gate` \
+             — the register key and an inner group!() are concatenating. body=\n{body}"
+        );
+    }
+
     /// #DC3 (scope ext): phase-observe increment test on a LOCAL
     /// `DirCacheCounters`. Each `record_construct_*` / `record_hit_assemble_ms`
     /// must accumulate sum + count on its own phase only.
