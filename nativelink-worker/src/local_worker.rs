@@ -7864,11 +7864,19 @@ mod tests {
             "REFAULT_CONFIRM_RATE must be 10000/s (conservative re-fault \
              confirm threshold)"
         );
-        // And the gate ships ENABLED (the whole point of this change).
+        // The gate is intentionally DISABLED per incident 5132d6c9
+        // ("incident(worker): disable mis-calibrated memory gate"): the raw
+        // free_count floor false-tripped fleet-wide on macOS (busy-worker
+        // free is normally a few hundred MiB → 3.6k-NAK/min storm).
+        // Re-enable only after the floor reads `available`
+        // (free+inactive+speculative+purgeable), not raw free_count.
+        // The floor-calculation constants above are still correct and are
+        // tested here so a doc-comment rewrite cannot drift them silently.
         assert!(
-            MEMORY_GATE_ENABLED,
-            "MEMORY_GATE_ENABLED must be true — the operator directed this \
-             gate shipped ENABLED with the conservative free-floor"
+            !MEMORY_GATE_ENABLED,
+            "MEMORY_GATE_ENABLED must be false — the gate is DISABLED per \
+             incident 5132d6c9 (mis-calibrated floor false-tripped fleet-wide); \
+             do NOT re-enable without fixing the floor metric first"
         );
     }
 
