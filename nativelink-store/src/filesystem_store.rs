@@ -995,6 +995,18 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             spec.pending_bis_pin_max_bytes,
         ));
 
+        // (FL-688 v3 Stage C — BLOCK-2) Arm the startup reconcile gate
+        // BEFORE `add_files_to_cache` so the boot drain below cannot race
+        // reconcile-pin calls.  Only done for worker stores that opt in via
+        // `startup_reconcile_gate: true` in config; server stores leave this
+        // `false` (default) so their eviction is never suppressed.
+        // The gate is released by `release_startup_reconcile_gate()` when
+        // the server's `ReconcileCompleteRequest` arrives (or by the 20s
+        // fail-open timer in the worker's `ReconcileComplete` handler).
+        if spec.startup_reconcile_gate {
+            evicting_map.set_startup_reconcile_gate();
+        }
+
         // Create temp and content directories and the s and d subdirectories.
 
         create_subdirs(&spec.temp_path).await?;
@@ -1036,7 +1048,18 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // side `pinned` map), so the residual must come from on-disk regions
         // outside moka's authority (rename-failure orphans, etc — tracked
         // separately).
-        evicting_map.run_pending_tasks_and_drain().await;
+        //
+        // (FL-688 v3 Stage C — BLOCK-2) When the startup reconcile gate is
+        // armed (worker stores with `startup_reconcile_gate: true`), skip the
+        // boot drain here. The gate suppresses the periodic LRU drain tick;
+        // this guards the one-shot boot drain. Consequence: the overshoot
+        // bleed is DEFERRED to after `ReconcileCompleteRequest` releases the
+        // gate — at which point needed blobs are already reconcile-pinned and
+        // safe from eviction. The drain then runs normally on the next
+        // background tick.
+        if !spec.startup_reconcile_gate {
+            evicting_map.run_pending_tasks_and_drain().await;
+        }
         prune_temp_path(&shared_context.temp_path).await?;
 
         // #212 Phase 2.2-3 B1 fixup: GC any leftover `.holding` files
@@ -1184,11 +1207,16 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.unpin_key(&key);
     }
 
-    /// (FL-688 v3 Stage C) Arm the startup reconcile gate. Call this ONCE
-    /// at worker boot, before any `add_files_to_cache` calls and before
-    /// starting background eviction. While the gate is armed the background
-    /// `drain_interval` tick (every `DRAIN_INTERVAL_SECS = 10s`) is skipped,
-    /// preventing the explicit LRU drain from racing the reconcile-pin calls.
+    /// (FL-688 v3 Stage C) Arm the startup reconcile gate. Called at
+    /// construction time inside `new_with_timeout_and_rename_fn` BEFORE
+    /// `add_files_to_cache` when `spec.startup_reconcile_gate = true`.
+    /// While the gate is armed the background `drain_interval` tick
+    /// (every `DRAIN_INTERVAL_SECS = 10s`) is skipped and the one-shot
+    /// boot drain is also suppressed, preventing the LRU from racing the
+    /// reconcile-pin calls in the `UploadMissingBlobs` handler.
+    ///
+    /// Also exposed as a public method for tests that need to arm the gate
+    /// on a store that was constructed without `startup_reconcile_gate: true`.
     pub fn set_startup_reconcile_gate(&self) {
         self.evicting_map.set_startup_reconcile_gate();
     }

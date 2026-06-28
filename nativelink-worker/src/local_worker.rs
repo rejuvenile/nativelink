@@ -4325,24 +4325,30 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // Set to true when shutting down, this stops any new StartAction.
         let mut shutting_down = false;
 
-        // (FL-688 v3 Stage C — Ordering A) Startup reconcile gate. Starts
-        // `false` when a FilesystemStore fast tier is present (gate armed by
-        // `set_startup_reconcile_gate` below); stays `true` otherwise.
-        // The StartAction handler checks this BEFORE accepting work so that
-        // reconcile-pin calls in UploadMissingBlobs fire BEFORE any runtime
-        // insert can race a per-insert moka eviction. Flipped to `true` by
-        // the ReconcileComplete handler when the server sends tag-14.
+        // (FL-688 v3 Stage C — Ordering A) Startup reconcile gate.
+        // The gate is armed AT CONSTRUCTION TIME when `startup_reconcile_gate:
+        // true` is set in the FilesystemSpec (BLOCK-2 fix). This means the gate
+        // is active before `add_files_to_cache` runs, before `start_background_
+        // eviction` starts, and before this code runs — eliminating the race
+        // window between construction-time boot drain and the former call to
+        // `set_startup_reconcile_gate()` here (which was after the boot drain).
         //
-        // NOTE: `set_startup_reconcile_gate` arms BOTH this local flag AND the
-        // `MokaEvictingMap::reconcile_complete` flag (which gates the drain
-        // loop). They are derived from the same `Arc<AtomicBool>` via
-        // `FilesystemStore::reconcile_complete_flag`.
+        // The local `reconcile_complete` Arc is the SAME Arc that the evicting
+        // map uses; `reconcile_complete_flag()` returns a clone of it. When the
+        // ReconcileComplete handler calls `release_startup_reconcile_gate()` it
+        // stores `true` into this Arc, which both:
+        //  (a) unblocks the background drain tick in MokaEvictingMap, and
+        //  (b) allows StartAction to proceed (the Acquire load below).
+        //
+        // MAJOR-1 fix (no per-reconnect re-arm): removing the explicit
+        // `set_startup_reconcile_gate()` call here ensures that a reconnect
+        // (another `run()` call after the first completes) does NOT re-arm
+        // the gate on a store that was already released — which would permanently
+        // suppress eviction if ReconcileComplete is never sent again.
         let reconcile_complete: Arc<AtomicBool> =
             if let Some(ref state) = self.blobs_available_state {
-                // Arm the gate before the background eviction loop starts
-                // (background eviction was started during store construction
-                // before we get here, so we gate via the Arc flag directly).
-                state.fs_store.set_startup_reconcile_gate();
+                // Gate was armed at construction (via startup_reconcile_gate:
+                // true in config) and will be released by ReconcileComplete.
                 state.fs_store.reconcile_complete_flag()
             } else {
                 // No FilesystemStore fast tier — gate not needed; default true.
@@ -4365,6 +4371,32 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // loop iterations exactly like the swap state above.
         let mut disk_first_idle_gated_at: Option<Instant> = None;
         let mut disk_fail_open_latched = false;
+
+        // (FL-688 v3 Stage C — MAJOR-2) Bounded fail-open for the startup
+        // reconcile gate. R3's "no-timeout liveness" argument assumed the server
+        // controls dispatch and never sends StartAction while the gate is armed.
+        // That assumption breaks on a rolling deploy: an OLD server (pre-v3)
+        // dispatches StartAction without ever sending ReconcileComplete → gate
+        // stuck forever (action NAKs burn scheduler retries until max_retries,
+        // then the job is lost).
+        //
+        // Fix: release the gate after 2 × DRAIN_INTERVAL_SECS (= 20s) if
+        // ReconcileComplete has not arrived. The gate is already released in the
+        // `true` (unneeded) case — the sleep fires but the load returns `true`
+        // and no release is needed. This is FAIL-OPEN, not data-loss: durable
+        // blobs stay reconcile-pinned until BIS-ack; only the LRU-suppression
+        // window is lifted (blobs not specifically pinned become LRU-evictable
+        // after 20s if the server never validates them).
+        //
+        // NOTE: the outer select! is `futures::select!` (not tokio::select!).
+        // futures::select! does NOT support the `, if condition` guard syntax;
+        // we use FutureExt::fuse() to make the timer a one-shot that is NEVER
+        // re-polled after it fires.
+        //
+        // DRAIN_INTERVAL_SECS = 10 (moka_evicting_map.rs:72); 2× = 20s.
+        const RECONCILE_FAIL_OPEN_SECS: u64 = 20;
+        let reconcile_fail_open = sleep(core::time::Duration::from_secs(RECONCILE_FAIL_OPEN_SECS)).fuse();
+        tokio::pin!(reconcile_fail_open);
 
         loop {
             select! {
@@ -4663,34 +4695,48 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             // time-bounded fallback applies); this is the
                             // acknowledged item-D residual (R3).
                             if let Some(ref state) = self.blobs_available_state {
-                                let mut over_cap_count: u64 = 0;
+                                // (MINOR-1) Split counters: TimeBoundedFallback is
+                                // recoverable backpressure (cap full); Refused is the
+                                // actionable FL-688 data-loss signal (blob evicted
+                                // before reconcile-pin).
+                                let mut time_bounded_count: u64 = 0;
+                                let mut refused_count: u64 = 0;
                                 for d in &digests {
                                     match state.fs_store.pin_digest_indefinite_or_time_bounded(d) {
                                         IndefinitePinOutcome::Indefinite => {}
                                         IndefinitePinOutcome::TimeBoundedFallback => {
-                                            warn!(
-                                                digest = ?d,
-                                                "reconcile-pin: indefinite cap exhausted, \
-                                                 falling back to time-bounded pin (blob exposed \
-                                                 after PIN_TIMEOUT_SECS if cap stays saturated)"
-                                            );
-                                            over_cap_count += 1;
+                                            time_bounded_count += 1;
                                         }
                                         IndefinitePinOutcome::Refused => {
-                                            warn!(
-                                                digest = ?d,
-                                                "reconcile-pin: blob absent from eviction map \
-                                                 (already evicted or never inserted); \
-                                                 upload will fail and server will re-request"
-                                            );
-                                            over_cap_count += 1;
+                                            refused_count += 1;
                                         }
                                     }
                                 }
-                                if over_cap_count > 0 {
+                                // Collapse per-digest warns into ONE per-batch summary
+                                // to avoid flooding logs on a sustained over-cap worker.
+                                if time_bounded_count > 0 {
+                                    warn!(
+                                        time_bounded_count,
+                                        "reconcile-pin: indefinite cap exhausted for \
+                                         {time_bounded_count} blob(s), fell back to \
+                                         time-bounded pin (exposed after PIN_TIMEOUT_SECS \
+                                         if cap stays saturated)"
+                                    );
                                     self.metrics
-                                        .reconcile_needed_but_over_cap
-                                        .add(over_cap_count);
+                                        .reconcile_pin_time_bounded_fallback_total
+                                        .add(time_bounded_count);
+                                }
+                                if refused_count > 0 {
+                                    warn!(
+                                        refused_count,
+                                        "reconcile-pin: {refused_count} blob(s) absent from \
+                                         eviction map (evicted before reconcile-pin or never \
+                                         inserted); uploads will fail — this is the FL-688 \
+                                         data-loss signal"
+                                    );
+                                    self.metrics
+                                        .reconcile_pin_refused_total
+                                        .add(refused_count);
                                 }
                             }
                             let ram = self.running_actions_manager.clone();
@@ -4743,9 +4789,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             // otherwise suppress all traffic and wedge an over-cap
                             // worker forever (DOC-FIX-1).
                             if let Some(ref state) = self.blobs_available_state {
+                                // `release_startup_reconcile_gate()` stores `true`
+                                // to the shared `reconcile_complete` Arc — the same
+                                // Arc that `reconcile_complete` here is cloned from
+                                // (`reconcile_complete_flag()`). No second store needed.
                                 state.fs_store.release_startup_reconcile_gate();
-                                reconcile_complete
-                                    .store(true, Ordering::Release);
                                 info!(
                                     "ReconcileComplete received: startup reconcile gate released, \
                                      action executor unblocked"
@@ -4779,7 +4827,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         ExecuteResult{
                                             instance_name,
                                             operation_id: start_execute.operation_id,
-                                            result: Some(execute_result::Result::InternalError(make_err!(Code::Unavailable, "Worker startup reconcile in progress").into())),
+                                            // ResourceExhausted is the scheduler's
+                                            // backpressure-exempt code: it does NOT
+                                            // count as an attempt (simple_scheduler_state_manager.rs:817).
+                                            // Code::Unavailable WOULD burn the retry budget.
+                                            result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker startup reconcile in progress").into())),
                                         }
                                     ).await?;
                                 }
@@ -5598,6 +5650,38 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     };
                     futures.push(shutdown_future.boxed());
                     shutting_down = true;
+                },
+                () = &mut reconcile_fail_open => {
+                    // (FL-688 v3 Stage C — MAJOR-2) Bounded fail-open for the
+                    // startup reconcile gate. Fires after 2 × DRAIN_INTERVAL_SECS
+                    // (= 20s) if ReconcileComplete has not been received. Protects
+                    // against a rolling deploy where the old server (pre-v3) sends
+                    // StartAction without sending ReconcileComplete — the gate would
+                    // otherwise block action execution permanently and the NAKs
+                    // (Code::ResourceExhausted) burn scheduler retries until the
+                    // action is abandoned.
+                    //
+                    // `FutureExt::fuse()` ensures this arm fires EXACTLY ONCE and is
+                    // never re-polled (futures::select! semantics). If ReconcileComplete
+                    // was already received (gate released before the timer), the load
+                    // returns `true` and the release calls are no-ops.
+                    //
+                    // FAIL-OPEN semantics: resume normal pinned-LRU eviction. Blobs
+                    // that were reconcile-pinned (via UploadMissingBlobs) stay pinned
+                    // until BIS-ack. Only blobs NOT pinned become LRU-evictable. No
+                    // data loss beyond the acknowledged item-D residual (R3).
+                    if !reconcile_complete.load(Ordering::Acquire) {
+                        warn!(
+                            "startup reconcile gate fail-open after {}s: ReconcileComplete \
+                             not received from server (rolling deploy?); releasing gate to \
+                             prevent permanent action-execution blockage",
+                            RECONCILE_FAIL_OPEN_SECS
+                        );
+                        reconcile_complete.store(true, Ordering::Release);
+                        if let Some(ref state) = self.blobs_available_state {
+                            state.fs_store.release_startup_reconcile_gate();
+                        }
+                    }
                 },
             };
         }
@@ -6804,15 +6888,25 @@ pub struct Metrics {
         help = "Count of currently-in-flight detached AC writes spawned by O15; should track tail of AC-store update latency."
     )]
     ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
-    /// (FL-688 v3 Stage C) Count of blobs in `UploadMissingBlobs` where
-    /// the reconcile-pin fell back to time-bounded or was fully refused
-    /// because the indefinite-pin cap was saturated at reconcile time.
-    /// Non-zero = an over-cap worker processed at least one reconcile
-    /// cycle with inadequate pin headroom; the item-D residual is active.
+    /// (FL-688 v3 Stage C — MINOR-1) Count of blobs in `UploadMissingBlobs`
+    /// where the reconcile-pin fell back to a time-bounded pin because the
+    /// indefinite-pin cap was saturated. These blobs have 120s protection;
+    /// non-zero indicates the cap is too small for the workload but the blobs
+    /// are not immediately at risk (recoverable backpressure).
     #[metric(
-        help = "Blobs in UploadMissingBlobs that could not get an indefinite reconcile-pin (cap exhausted or blob absent); non-zero means item-D residual is active."
+        help = "Blobs reconcile-pinned with time-bounded fallback (indefinite cap full); 120s protection window, non-zero = cap saturation backpressure."
     )]
-    reconcile_needed_but_over_cap: Counter,
+    reconcile_pin_time_bounded_fallback_total: Counter,
+
+    /// (FL-688 v3 Stage C — MINOR-1) Count of blobs in `UploadMissingBlobs`
+    /// where reconcile-pin was fully refused because the blob was absent from
+    /// the eviction map (evicted before reconcile-pin or never inserted).
+    /// Non-zero = FL-688 data-loss signal: these blobs will fail upload and
+    /// must be re-requested by the server.
+    #[metric(
+        help = "Blobs absent from eviction map at reconcile-pin time (evicted before pin or never inserted); non-zero = FL-688 data-loss signal — upload will fail."
+    )]
+    reconcile_pin_refused_total: Counter,
 }
 
 impl RootMetricsComponent for Metrics {}
@@ -6829,7 +6923,8 @@ impl Metrics {
             preconditions: AsyncCounterWrapper::default(),
             running_actions_manager_metrics,
             ac_write_detached_inflight_count,
-            reconcile_needed_but_over_cap: Counter::default(),
+            reconcile_pin_time_bounded_fallback_total: Counter::default(),
+            reconcile_pin_refused_total: Counter::default(),
         }
     }
 }

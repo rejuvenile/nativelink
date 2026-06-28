@@ -919,12 +919,12 @@ message UpdateForWorker {
         /// Backward compatibility: workers built before this variant treat
         /// the unknown oneof tag as ignorable (the `None`/catch-all in
         /// `local_worker.rs`'s `Update` match `continue`s). A server that
-        /// does NOT send this message leaves old workers in their prior
-        /// behaviour (no gate); a new worker connected to an old server stays
-        /// gated at startup but never wedges because the disk gate has no
-        /// timeout (R3) and the old server never sends `StartAction` either
-        /// (they share the same connection; the gate unblocks on reconnect to
-        /// a new server). NO capability flag required.
+        /// does NOT send this message leaves new workers gated at startup.
+        /// WARNING: an old server (pre-v3) WILL send `StartAction` to gated
+        /// workers; the worker NAKs with Code::ResourceExhausted (backpressure-
+        /// exempt) and the gate is released after 2 × DRAIN_INTERVAL_SECS
+        /// (20s) by the bounded fail-open timer in `local_worker.rs`
+        /// (MAJOR-2 fix). NO capability flag required.
         ReconcileCompleteRequest reconcile_complete = 14;
     }
     reserved 6; // Previously NextId, now reserved.

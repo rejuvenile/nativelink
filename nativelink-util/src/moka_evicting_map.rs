@@ -215,19 +215,20 @@ pub struct MokaEvictingMap<
     /// (FL-688 v3 Stage C) Worker-startup reconcile gate. When `false`,
     /// the background `drain_interval` tick that forces moka's capacity
     /// check (`run_pending_tasks_and_drain`) is SUPPRESSED. Set to `false`
-    /// at worker boot (via `FilesystemStore::set_startup_reconcile_gate`)
+    /// at construction time for worker stores (via `startup_reconcile_gate:
+    /// true` in FilesystemSpec → `FilesystemStore::set_startup_reconcile_gate`)
     /// and flipped to `true` by the server's `ReconcileCompleteRequest`
-    /// signal (via `FilesystemStore::release_reconcile_gate`), after which
-    /// normal periodic eviction resumes. Default: `true` (gate off — no
+    /// signal (via `FilesystemStore::release_startup_reconcile_gate`), after
+    /// which normal periodic eviction resumes. Default: `true` (gate off — no
     /// change for server-side FilesystemStores that never set it false).
     ///
     /// SAFETY: Only the background `drain_evictions` task reads this to
-    /// gate the drain tick. The writer (`release_reconcile_gate`) uses
-    /// `Release` ordering; the reader uses `Acquire`. This is the SECONDARY
-    /// protection (blocks the explicit LRU drain). The PRIMARY protection is
-    /// the reconcile-pin itself (`pin_digest_indefinite_with_result`), which
-    /// protects individual blobs from PER-INSERT moka eviction that this gate
-    /// cannot block.
+    /// gate the drain tick. The writer (`release_startup_reconcile_gate`)
+    /// uses `Release` ordering; the reader uses `Acquire`. This is the
+    /// SECONDARY protection (blocks the explicit LRU drain). The PRIMARY
+    /// protection is the reconcile-pin itself (`pin_digest_indefinite_with_result`),
+    /// which protects individual blobs from PER-INSERT moka eviction that
+    /// this gate cannot block.
     reconcile_complete: Arc<AtomicBool>,
     // Metrics
     evicted_bytes: Counter,
@@ -602,8 +603,9 @@ where
             max_count,
             background_running: AtomicBool::new(false),
             // Default `true`: gate is OFF by default. Server-side stores
-            // never gate reconcile; only workers set this to `false` via
-            // `set_startup_reconcile_gate(false)` at boot.
+            // never gate reconcile; only worker stores arm it (at construction
+            // time via `startup_reconcile_gate: true` in FilesystemSpec →
+            // `set_startup_reconcile_gate()` in `FilesystemStore::new`).
             reconcile_complete: Arc::new(AtomicBool::new(true)),
             evicted_bytes: Counter::default(),
             evicted_items: CounterWithTime::default(),
@@ -3009,5 +3011,114 @@ mod tests {
         );
 
         map.unpin_key(&0);
+    }
+
+    // ---------------------------------------------------------------
+    // FL-688 v3 Stage C — drain-tick suppressed while startup
+    // reconcile gate is armed; converges after release.
+    //
+    // Invariant: the periodic forced-drain arm MUST be skipped while
+    // `reconcile_complete == false` (gate armed). Premature drain evicts
+    // blobs before `reconcile_pin` can protect them, producing data loss
+    // at startup.
+    //
+    // Mutation: remove the `if !self.reconcile_complete.load(Ordering::Acquire)`
+    // + `continue` guard at `moka_evicting_map.rs:1811-1812`. Without it,
+    // drain fires during the gate-armed phase → 18 evictions observed →
+    // the "drain-tick suppression regression" assertion fires.
+    // ---------------------------------------------------------------
+
+    /// Gate armed → drain-tick `continue`s (0 evictions).
+    /// Gate released → drain-tick fires → cache converges (≥ 1 eviction).
+    ///
+    /// Uses the same setup as `periodic_forced_drain_arm_converges_unpinned_under_cap`
+    /// (19 entries at 1-unit cap, `start_paused` clock) but arms the startup
+    /// reconcile gate BEFORE starting `start_background_eviction`. No eviction
+    /// must occur while armed. After release, convergence must occur.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_tick_suppressed_while_startup_reconcile_gate_armed() {
+        // Same sizing as the convergence test: 19 over-cap entries + 1-unit cap.
+        let cfg = policy(100, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+
+        // Take the overshoot via the startup path.
+        for k in 0..19u64 {
+            map.insert_with_time(k, BytesEntry(10), 0).await;
+        }
+
+        // ARM the gate: sets reconcile_complete = false → drain tick will
+        // `continue` without running `run_pending_tasks_and_drain`.
+        map.set_startup_reconcile_gate();
+
+        // Start the background loop AFTER arming so the gate is definitely
+        // set before the first drain tick fires.
+        map.start_background_eviction();
+
+        let drain_period = core::time::Duration::from_secs(super::DRAIN_INTERVAL_SECS);
+
+        // Phase 1: Advance 10 drain ticks while gate armed. The drain arm
+        // must `continue` every time — ZERO evictions expected.
+        const ARMED_TICKS: u32 = 10;
+        let gated_drain_result = tokio::time::timeout(
+            core::time::Duration::from_secs(3600),
+            async {
+                for _ in 0..ARMED_TICKS {
+                    tokio::time::advance(drain_period).await;
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(gated_drain_result.is_ok(), "deadlock: gate-armed advance loop hung");
+
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "drain-tick suppression regression: {} evictions occurred while startup \
+             reconcile gate was armed (expected 0). MUTATION target: the \
+             `if !self.reconcile_complete.load(Ordering::Acquire)` + `continue` \
+             guard at moka_evicting_map.rs:1811-1812 prevents the periodic \
+             forced-drain from running before reconcile-pin has protected all \
+             worker blobs. Without it, blobs are evicted before being pinned.",
+            removal_count.load(Ordering::Relaxed),
+        );
+
+        // Phase 2: Release the gate, then advance until drain converges.
+        map.release_startup_reconcile_gate();
+
+        const EXPECTED_EVICTIONS: u64 = 18; // 19 entries − 1 kept at 1-unit cap.
+        const MAX_TICKS: u32 = 50;
+        let converged = tokio::time::timeout(core::time::Duration::from_secs(3600), async {
+            for _ in 0..MAX_TICKS {
+                tokio::time::advance(drain_period).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                if removal_count.load(Ordering::Relaxed) >= EXPECTED_EVICTIONS {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("deadlock: post-release convergence loop hung");
+
+        assert!(
+            converged,
+            "drain-tick suppression regression (post-release): after \
+             `release_startup_reconcile_gate` the periodic forced-drain must \
+             converge (eviction listener fired {} times, expected ≥ {} after \
+             {} drain ticks). Check that `release_startup_reconcile_gate` stores \
+             `true` with `Ordering::Release` matching the `Ordering::Acquire` \
+             load in the drain arm.",
+            removal_count.load(Ordering::Relaxed),
+            EXPECTED_EVICTIONS,
+            MAX_TICKS,
+        );
     }
 }

@@ -2063,8 +2063,11 @@ struct WorkerConnection {
     /// is processed. After that, the gate is released on the worker side and
     /// we never need to send it again (reconnects produce a new `WorkerConnection`
     /// with this flag reset to `false`, so the gate is re-armed per-connect).
-    /// Uses `AtomicBool` for interior mutability inside `&self` methods.
-    reconcile_complete_sent: AtomicBool,
+    /// Uses `Arc<AtomicBool>` so the flag can be shared into the
+    /// `blobs_available_mark_stable_and_backfill` background task and the
+    /// `ReconcileComplete` send can occur as the LAST statement of that task
+    /// (BLOCK-1 ordering fix: uploads BEFORE gate-release, same task).
+    reconcile_complete_sent: Arc<AtomicBool>,
 }
 
 impl WorkerConnection {
@@ -2118,7 +2121,7 @@ impl WorkerConnection {
                 ),
             metrics,
             shutdown_quiesce,
-            reconcile_complete_sent: AtomicBool::new(false),
+            reconcile_complete_sent: Arc::new(AtomicBool::new(false)),
         };
 
         background_spawn!("worker_api", async move {
@@ -2563,28 +2566,31 @@ impl WorkerConnection {
         Ok(())
     }
 
-    /// (FL-688 v3 Stage C — DOC-FIX-1) Send `ReconcileCompleteRequest` (tag 14)
-    /// to this worker exactly once: after the first full BlobsAvailable snapshot
-    /// is processed.  Called at every exit of `handle_blobs_available` when
-    /// `is_full_snapshot = true`.  Uses `compare_exchange` to ensure exactly-once
-    /// delivery even if two ticks race (should not happen since the
-    /// `WorkerConnection` background task is single-threaded, but the atomic is
-    /// free insurance).
+    /// (FL-688 v3 Stage C — BLOCK-1 fix) Static helper: send
+    /// `ReconcileCompleteRequest` (tag 14) exactly once.  Called from:
+    ///  - The 3 non-backfill exits (no_locality_map, empty_endpoint, fall-through)
+    ///    via `try_send_reconcile_complete` on the synchronous handler path —
+    ///    these paths send ZERO UploadMissingBlobs so ordering is trivially
+    ///    correct.
+    ///  - The backfill path INSIDE `background_spawn!`, as the LAST statement
+    ///    after the UploadMissingBlobs chunk loop — this is the BLOCK-1 ordering
+    ///    fix: uploads ≺ gate-release, guaranteed by program order in one task.
     ///
-    /// DOC-FIX-1 rationale: the original design attached the gate-release to the
-    /// `UploadMissingBlobs` REPLY.  That design is broken: when the worker holds
-    /// nothing missing (empty `digests` or all digests already on server), the
-    /// early-returns at `:3275` and `:3429` suppress the reply entirely, wedging
-    /// an over-cap worker's executor gate FOREVER.  This unconditional signal,
-    /// sent here regardless of whether we issued any UploadMissingBlobs, closes
-    /// that hole.
-    fn try_send_reconcile_complete(&self, is_full_snapshot: bool) {
+    /// `reconcile_sent` is `Arc<AtomicBool>` (shared with the struct field) so
+    /// the spawned task can take a clone without self capture.  `compare_exchange`
+    /// ensures exactly-once even if two full-snapshot ticks race (both reach this
+    /// fn before the first send completes; the second's CAS fails and returns).
+    fn send_reconcile_complete_static(
+        is_full_snapshot: bool,
+        reconcile_sent: &AtomicBool,
+        worker_tx: &mpsc::UnboundedSender<UpdateForWorker>,
+        worker_id: &WorkerId,
+    ) {
         if !is_full_snapshot {
             return;
         }
         // Exactly-once: flip false→true atomically.
-        if self
-            .reconcile_complete_sent
+        if reconcile_sent
             .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
@@ -2596,18 +2602,29 @@ impl WorkerConnection {
                 ReconcileCompleteRequest {},
             )),
         };
-        if self.worker_tx.send(msg).is_err() {
+        if worker_tx.send(msg).is_err() {
             warn!(
-                worker_id=?self.worker_id,
+                worker_id=?worker_id,
                 "ReconcileComplete: worker channel closed before send"
             );
         } else {
             info!(
-                worker_id=?self.worker_id,
+                worker_id=?worker_id,
                 "ReconcileComplete sent: first full BlobsAvailable snapshot processed, \
                  worker startup reconcile gate will be released"
             );
         }
+    }
+
+    /// Thin wrapper around `send_reconcile_complete_static` for use on `&self`
+    /// from the 3 non-backfill handler exits.
+    fn try_send_reconcile_complete(&self, is_full_snapshot: bool) {
+        Self::send_reconcile_complete_static(
+            is_full_snapshot,
+            &self.reconcile_complete_sent,
+            &self.worker_tx,
+            &self.worker_id,
+        );
     }
 
     async fn handle_blobs_available(
@@ -3218,6 +3235,19 @@ impl WorkerConnection {
                 // it (this is the `total=11887 missing=11887` storm observed
                 // mid-shutdown).
                 let quiesce = self.shutdown_quiesce.clone();
+                // (BLOCK-1 fix) Clone the pieces needed for try_send_reconcile_complete
+                // so the send can be the LAST statement of the spawned task — after the
+                // UploadMissingBlobs chunk loop. Before this fix, the send was on the
+                // synchronous handler path (fire-and-forget spawn + immediate send on the
+                // handler), which is NOT "after uploads": the spawned task may not have
+                // run yet when the handler-side send fires. The worker channel is
+                // unbounded, but the two sends are on DIFFERENT tasks — the handler's
+                // channel-send can be ordered before OR after the spawned task's sends.
+                // Fix: move it INSIDE the spawn so program order within a single task
+                // guarantees UploadMissingBlobs ≺ ReconcileComplete.
+                let reconcile_sent_flag = Arc::clone(&self.reconcile_complete_sent);
+                let reconcile_worker_tx = self.worker_tx.clone();
+                let reconcile_worker_id = self.worker_id.clone();
                 // Drop the locality map write lock before spawning.
                 drop(map);
                 // A2 fold: ack field-16 entries strictly AFTER the
@@ -3244,15 +3274,21 @@ impl WorkerConnection {
                             Some(&quiesce),
                         )
                         .await;
+                        // (BLOCK-1 fix) ReconcileComplete is sent HERE, as the LAST
+                        // statement of this task, AFTER all UploadMissingBlobs sends.
+                        // Program order within a single task guarantees the worker
+                        // channel receives uploads before the gate-release.
+                        // The 3 non-backfill paths (no_locality_map, empty_endpoint,
+                        // fall-through) keep their synchronous sends — those paths
+                        // send ZERO UploadMissingBlobs so order is irrelevant.
+                        Self::send_reconcile_complete_static(
+                            is_full_snapshot,
+                            &reconcile_sent_flag,
+                            &reconcile_worker_tx,
+                            &reconcile_worker_id,
+                        );
                     }
                 );
-                // (FL-688 v3 Stage C — DOC-FIX-1) Send gate-release AFTER the
-                // UploadMissingBlobs background spawn, so the worker receives
-                // all upload requests BEFORE the executor is unblocked.
-                // The background spawn is fire-and-forget; the reconcile
-                // signal rides the SAME unbounded channel, so order is
-                // preserved between UploadMissingBlobs and ReconcileComplete.
-                self.try_send_reconcile_complete(is_full_snapshot);
                 let handle_blobs_available_elapsed_ms =
                     handle_blobs_available_start.elapsed().as_millis() as u64;
                 debug!(

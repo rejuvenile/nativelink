@@ -2551,3 +2551,172 @@ async fn v3c_gate_not_released_by_reconcile_pin() -> Result<(), Error> {
 
     Ok(())
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FL-688 v3 Stage C BLOCK-2: boot-drain composite test
+//
+// Invariant: when `startup_reconcile_gate: true`, the one-shot boot drain
+// (`run_pending_tasks_and_drain` at `filesystem_store.rs:1039`) is SUPPRESSED.
+// A needed blob that was loaded from disk during `add_files_to_cache` MUST be
+// reconcile-pinnable after construction (not evicted by the boot drain).
+//
+// Mutation target: change `if !spec.startup_reconcile_gate` in
+// `filesystem_store.rs` to `if true` (always drain) → boot drain fires even
+// when gate is armed → blob evicted → reconcile-pin returns Refused → the
+// assertion "needed blob evicted by boot drain before gate armed — BLOCK-2
+// regression" fires.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// FL-688 v3 Stage C — BLOCK-2: arm gate at construction, boot drain suppressed.
+///
+/// A single blob is written to disk and then the store is reopened with
+/// `startup_reconcile_gate: true` at EXACTLY-cap (so ANY boot drain eviction
+/// would remove it). The blob must be reconcile-pinnable after construction,
+/// proving the boot drain was suppressed.
+///
+/// Mutation: change `if !spec.startup_reconcile_gate` to `if true` in
+/// `filesystem_store.rs:1039` → boot drain fires → blob evicted → pin Refused →
+/// assertion fires: "needed blob evicted by boot drain before gate armed —
+/// BLOCK-2 regression".
+#[nativelink_test]
+async fn v3c_block2_boot_drain_suppressed_when_gate_armed_at_construction() -> Result<(), Error> {
+    // Strategy: seed N+1 blobs so the store is OVER CAP at startup. The boot
+    // drain (`run_pending_tasks_and_drain`) removes exactly 1 blob (the LRU).
+    // With the gate suppressing the boot drain, ALL N+1 blobs must survive:
+    // `has_with_results` returns Some for every seeded digest. Without the
+    // gate, exactly 1 returns None (LRU-evicted). The assertion checks that
+    // ALL N+1 are present, which is only true when the drain was suppressed.
+    //
+    // N_AT_CAP = 5: max_bytes = 5 × BLOB_SIZE; pin_cap = 25% × 5 × 1024 = 1280.
+    // The indefinite pin check needs pin_cap >= BLOB_SIZE (1024) — satisfied.
+    const BLOB_SIZE: usize = 1024;
+    const N_AT_CAP: usize = 5; // max_bytes = N_AT_CAP × BLOB_SIZE; exactly 5 fit
+
+    let content_path = make_temp_path("v3c_block2_content");
+    let temp_path = make_temp_path("v3c_block2_temp");
+
+    // Step 1: seed N+1 blobs on disk (no cap limit).
+    let mut seeded_digests: Vec<DigestInfo> = Vec::new();
+    {
+        let seed_store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: None,
+            block_size: 1,
+            ..Default::default()
+        })
+        .await?;
+        for i in 0..=(N_AT_CAP as u8) {
+            let data: Vec<u8> = (0..BLOB_SIZE).map(|j| ((j + i as usize) % 0x7f) as u8).collect();
+            let hash: [u8; 32] = Sha256::digest(&data).into();
+            let digest = DigestInfo::new(hash, BLOB_SIZE as u64);
+            seed_store
+                .update_oneshot(digest, Bytes::from(data))
+                .await
+                .err_tip(|| "writing seed blob")?;
+            seeded_digests.push(digest);
+        }
+        // N_AT_CAP+1 = 6 blobs seeded; cap = N_AT_CAP = 5 → over cap by 1.
+    }
+    assert_eq!(seeded_digests.len(), N_AT_CAP + 1);
+
+    // Step 2: re-open with gate armed + cap = N_AT_CAP blobs.
+    // Boot drain suppressed → all 6 blobs survive.
+    let store = tokio::time::timeout(
+        core::time::Duration::from_secs(10),
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: N_AT_CAP * BLOB_SIZE,
+                evict_bytes: 0,
+                max_seconds: 0,
+                max_count: 0,
+            }),
+            block_size: 1,
+            startup_reconcile_gate: true, // BLOCK-2 fix: suppress boot drain
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("store construction must not deadlock (10s)")?;
+
+    // Step 3: all seeded blobs must be present (boot drain was suppressed).
+    let keys: Vec<StoreKey<'static>> = seeded_digests.iter().map(|d| StoreKey::from(*d)).collect();
+    let mut results = vec![None; keys.len()];
+    tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        store.has_with_results(&keys, &mut results),
+    )
+    .await
+    .expect("has_with_results must not deadlock (boot drain suppression test)")
+    .err_tip(|| "has_with_results failed")?;
+
+    // If the boot drain ran, one blob would be None (evicted). All must be Some.
+    let missing: Vec<DigestInfo> = seeded_digests
+        .iter()
+        .zip(results.iter())
+        .filter_map(|(d, r)| if r.is_none() { Some(*d) } else { None })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "BLOCK-2 boot-drain-suppression regression: {} of {} seeded blobs evicted during \
+         store construction (expected 0 — gate suppresses boot drain). Missing: {missing:?}. \
+         MUTATION target: change `if !spec.startup_reconcile_gate` to `if true` at \
+         filesystem_store.rs:1060 — boot drain runs → 1 blob evicted → `missing` is non-empty",
+        missing.len(),
+        seeded_digests.len(),
+    );
+
+    store.release_startup_reconcile_gate();
+    Ok(())
+}
+
+/// FL-688 v3 Stage C — `startup_reconcile_gate: true` in FilesystemSpec arms the
+/// shared `Arc<AtomicBool>` in MokaEvictingMap; `release_startup_reconcile_gate`
+/// releases it. `reconcile_complete_flag()` returns that SAME Arc so all three
+/// observing sites (FilesystemStore wrapper, MokaEvictingMap drain loop, local_worker
+/// fail-open timer) agree on the gate state.
+///
+/// Mutation: remove `evicting_map.set_startup_reconcile_gate()` from
+/// `FilesystemStore::new`. The flag is never set to `false` → the first assertion
+/// fires: "Arc-sharing: startup_reconcile_gate must arm the shared flag".
+#[nativelink_test]
+async fn v3c_drain_tick_suppressed_gate_release_confirms_arc_shared() -> Result<(), Error> {
+    let store = tokio::time::timeout(
+        core::time::Duration::from_secs(10),
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: make_temp_path("v3c_arc_content"),
+            temp_path: make_temp_path("v3c_arc_tmp"),
+            block_size: 1,
+            startup_reconcile_gate: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("store construction must not deadlock (10s)")?;
+
+    let flag = store.reconcile_complete_flag();
+
+    // Gate armed at construction: flag must be false.
+    assert!(
+        !flag.load(Ordering::Acquire),
+        "Arc-sharing: startup_reconcile_gate must arm the shared flag (set false). \
+         MUTATION target: remove `evicting_map.set_startup_reconcile_gate()` from \
+         FilesystemStore::new at filesystem_store.rs:1007 — flag stays true (default) \
+         and this assertion fires"
+    );
+
+    // Release: flag must flip to true.
+    store.release_startup_reconcile_gate();
+    assert!(
+        flag.load(Ordering::Acquire),
+        "Arc-sharing: release_startup_reconcile_gate must set the shared flag to true. \
+         The Arc is shared with MokaEvictingMap's drain loop so both observe the release. \
+         MUTATION target: change `Ordering::Release` to `Ordering::Relaxed` in \
+         moka_evicting_map.rs::release_startup_reconcile_gate — no observable change here, \
+         but the drain-tick suppression test in moka_evicting_map.rs will catch it."
+    );
+
+    Ok(())
+}

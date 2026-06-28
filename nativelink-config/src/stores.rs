@@ -715,6 +715,25 @@ pub struct FilesystemSpec {
     /// Default: 0 (use `pin_cap`).
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
     pub pending_bis_pin_max_bytes: u64,
+
+    /// (FL-688 v3 Stage C — BLOCK-2) Arm the startup reconcile gate at
+    /// construction time, BEFORE the on-disk content scan (`add_files_to_cache`)
+    /// and the post-scan boot drain (`run_pending_tasks_and_drain`).
+    ///
+    /// WORKER CAS STORE ONLY. Set this to `true` on the FilesystemStore
+    /// that backs the worker's fast CAS tier. The gate suppresses the periodic
+    /// background LRU drain (and the one-shot boot drain) until the server
+    /// sends `ReconcileCompleteRequest`, ensuring the reconcile-pin step in
+    /// the `UploadMissingBlobs` handler fires BEFORE any LRU eviction can race
+    /// it and remove needed blobs.
+    ///
+    /// SERVER FilesystemStores MUST leave this `false` (the default). A server
+    /// store never receives `ReconcileCompleteRequest`, so an armed server store
+    /// would suppress eviction FOREVER → server disk fills.
+    ///
+    /// Default: false (gate off — no change for server-side or non-reconcile stores).
+    #[serde(default)]
+    pub startup_reconcile_gate: bool,
 }
 
 fn default_large_read_threshold() -> u64 {
@@ -736,6 +755,7 @@ impl Default for FilesystemSpec {
             max_concurrent_large_reads: 0,
             large_read_threshold_bytes: 4 * 1024 * 1024,
             pending_bis_pin_max_bytes: 0,
+            startup_reconcile_gate: false,
         }
     }
 }

@@ -719,3 +719,344 @@ async fn mark_stable_fires_for_multi_digest_then_within_cooldown_test()
 
     Ok(())
 }
+
+/// FL-688 v3 Stage C — BLOCK-1 ordering seam test.
+///
+/// Ordering contract: on the backfill path, `UploadMissingBlobs` MUST arrive
+/// in the server→worker channel BEFORE `ReconcileComplete`. A regression at
+/// `worker_api_server.rs:3284` that moves `send_reconcile_complete_static` to
+/// BEFORE the `request_missing_blob_uploads` await (or to the synchronous
+/// handler context) violates this ordering.
+///
+/// Setup: server CAS does NOT have the blob the worker reports → server enters
+/// the backfill path (spawned task) → `UploadMissingBlobs` is sent inside the
+/// task, then `ReconcileComplete` is sent as the LAST statement.
+///
+/// Mutation: move `Self::send_reconcile_complete_static(...)` to BEFORE
+/// `Self::request_missing_blob_uploads(...)` in the `background_spawn!` task at
+/// `worker_api_server.rs:3266-3289`. The test panics with:
+/// "BLOCK-1 ordering regression: ReconcileComplete (tag 14) preceded
+///  UploadMissingBlobs (tag 9) in the server→worker channel"
+#[nativelink_test]
+async fn v3c_block1_reconcile_complete_follows_upload_missing_blobs()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker;
+
+    const CAS_ENDPOINT: &str = "grpc://192.168.55.8:50085";
+    const UUID_SIZE: usize = 36;
+    const ORDER_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // ----- Build the same production composition as setup_context -----
+    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) =
+        make_production_cas_store();
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager { _unused: 0 });
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager,
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+    let locality_map = new_shared_blob_locality_map();
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert("BLOCK1_ORDER_SCHEDULER".to_string(), scheduler);
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: "BLOCK1_ORDER_SCHEDULER".to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [2u8; 6],
+        Some(locality_map),
+        Some(cas_store.clone()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .err_tip(|| "Error creating WorkerApiServer for block-1 test")?;
+
+    // ----- Connect a worker (consume ConnectionResult) -----
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Update::ConnectWorkerRequest(ConnectWorkerRequest {
+        cas_endpoint: CAS_ENDPOINT.to_string(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut server_to_worker: Box<dyn futures::Stream<
+        Item = Result<UpdateForWorker, tonic::Status>,
+    > + Unpin + Send> = Box::new(
+        worker_api_server
+            .inner_connect_worker_for_testing(update_stream)
+            .await?
+            .into_inner(),
+    );
+
+    // Consume the ConnectionResult (first message).
+    let first = tokio::time::timeout(ORDER_TIMEOUT, server_to_worker.next())
+        .await
+        .expect("timed out waiting for ConnectionResult")
+        .expect("stream closed before ConnectionResult")
+        .err_tip(|| "ConnectionResult was an error")?;
+    match first.update.expect("ConnectionResult.update must be set") {
+        update_for_worker::Update::ConnectionResult(cr) => {
+            assert_eq!(cr.worker_id.len(), UUID_SIZE);
+        }
+        other => panic!("Expected ConnectionResult, got {other:?}"),
+    }
+
+    // ----- Send BlobsAvailable with a digest NOT in the server CAS -----
+    // The server CAS is empty → this digest will be "missing" → backfill
+    // path → UploadMissingBlobs is sent first, then ReconcileComplete.
+    // is_full_snapshot = true to trigger the reconcile gate release.
+    let missing_digest = DigestInfo::new([42u8; 32], 128);
+    tx.send(Update::BlobsAvailable(BlobsAvailableNotification {
+        worker_cas_endpoint: CAS_ENDPOINT.to_string(),
+        digests: vec![missing_digest.into()],
+        is_full_snapshot: true, // triggers reconcile gate path
+        evicted_digests: vec![],
+        digest_infos: vec![],
+        cpu_load_pct: 0,
+        cached_directory_digests: vec![],
+        added_subtree_digests: vec![],
+        removed_subtree_digests: vec![],
+        is_full_subtree_snapshot: false,
+        p_core_load_pct: 0,
+        e_core_load_pct: 0,
+        pinned_mirror_digests: vec![],
+        mirror_used_bytes: 0,
+        mirror_max_bytes: 0,
+        pinned_mirror_entries: vec![],
+        pinned_ac_mirror_entries: Vec::new(),
+        indefinite_pin_saturated: false,
+        swap_used_bytes: 0,
+        memory_pressure_level: 0,
+        memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
+    }))
+    .await
+    .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
+
+    // ----- Collect the next two messages: must be [UploadMissingBlobs, ReconcileComplete] -----
+    let first_msg = tokio::time::timeout(ORDER_TIMEOUT, server_to_worker.next())
+        .await
+        .expect(
+            "BLOCK-1 ordering test: timed out waiting for first post-BlobsAvailable message \
+             (expected UploadMissingBlobs); server did not write to worker channel within 5s",
+        )
+        .expect("stream closed before UploadMissingBlobs")
+        .err_tip(|| "first post-BlobsAvailable message was an error")?;
+
+    let second_msg = tokio::time::timeout(ORDER_TIMEOUT, server_to_worker.next())
+        .await
+        .expect(
+            "BLOCK-1 ordering test: timed out waiting for second post-BlobsAvailable message \
+             (expected ReconcileComplete); server did not write ReconcileComplete within 5s",
+        )
+        .expect("stream closed before ReconcileComplete")
+        .err_tip(|| "second post-BlobsAvailable message was an error")?;
+
+    // Assert UploadMissingBlobs came FIRST.
+    match first_msg.update.expect("first message update must be set") {
+        update_for_worker::Update::UploadMissingBlobs(_) => {} // correct
+        update_for_worker::Update::ReconcileComplete(_) => {
+            panic!(
+                "BLOCK-1 ordering regression: ReconcileComplete (tag 14) preceded \
+                 UploadMissingBlobs (tag 9) in the server→worker channel. \
+                 Fix: `send_reconcile_complete_static` must be the LAST statement \
+                 INSIDE the `background_spawn!` task at worker_api_server.rs:3284, \
+                 AFTER `request_missing_blob_uploads` completes."
+            );
+        }
+        other => {
+            panic!(
+                "BLOCK-1 ordering test: expected UploadMissingBlobs as first message, \
+                 got {other:?}",
+            );
+        }
+    }
+
+    // Assert ReconcileComplete came SECOND.
+    match second_msg.update.expect("second message update must be set") {
+        update_for_worker::Update::ReconcileComplete(_) => {} // correct
+        other => {
+            panic!(
+                "BLOCK-1 ordering test: expected ReconcileComplete as second message, \
+                 got {other:?}",
+            );
+        }
+    }
+
+    // Suppress unused-variable lint on kept-alive handles.
+    let _keep = (cas_store, store_manager, lower_fast_slow, upper_fast_slow);
+    Ok(())
+}
+
+/// FL-688 v3 Stage C — exactly-once `ReconcileComplete` on fall-through path.
+///
+/// The fall-through path (no digests, or no cas_store endpoint) must send
+/// `ReconcileComplete` exactly once when `is_full_snapshot: true`. The
+/// `AtomicBool` compare_exchange in `send_reconcile_complete_static` guards
+/// at-most-once globally; this test verifies at-least-once for the fall-through
+/// path specifically.
+///
+/// Mutation: remove `self.try_send_reconcile_complete(is_full_snapshot)` at
+/// `worker_api_server.rs:3320`. The test panics with:
+/// "exactly-once fall-through: timed out waiting for ReconcileComplete;
+///  the fall-through path must send ReconcileComplete on is_full_snapshot"
+#[nativelink_test]
+async fn v3c_reconcile_complete_exactly_once_fall_through_path()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker;
+
+    const CAS_ENDPOINT: &str = "grpc://192.168.55.9:50086";
+    const UUID_SIZE: usize = 36;
+    const RC_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // Build server with a CAS store that IS populated (so all blobs present →
+    // no missing blobs → fall-through after mark_stable). Actually, we use an
+    // EMPTY digest list in BlobsAvailable → direct fall-through (no backfill).
+    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) =
+        make_production_cas_store();
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager { _unused: 0 });
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager,
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+    let locality_map = new_shared_blob_locality_map();
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert("FALLTHROUGH_SCHEDULER".to_string(), scheduler);
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: "FALLTHROUGH_SCHEDULER".to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [3u8; 6],
+        Some(locality_map),
+        Some(cas_store.clone()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .err_tip(|| "Error creating WorkerApiServer for fall-through test")?;
+
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Update::ConnectWorkerRequest(ConnectWorkerRequest {
+        cas_endpoint: CAS_ENDPOINT.to_string(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut server_to_worker: Box<dyn futures::Stream<
+        Item = Result<UpdateForWorker, tonic::Status>,
+    > + Unpin + Send> = Box::new(
+        worker_api_server
+            .inner_connect_worker_for_testing(update_stream)
+            .await?
+            .into_inner(),
+    );
+
+    // Consume ConnectionResult.
+    let first = tokio::time::timeout(RC_TIMEOUT, server_to_worker.next())
+        .await
+        .expect("timed out waiting for ConnectionResult in fall-through test")
+        .expect("stream closed")
+        .err_tip(|| "ConnectionResult was error")?;
+    match first.update.expect("ConnectionResult.update must be set") {
+        update_for_worker::Update::ConnectionResult(cr) => {
+            assert_eq!(cr.worker_id.len(), UUID_SIZE);
+        }
+        other => panic!("Expected ConnectionResult, got {other:?}"),
+    }
+
+    // Send BlobsAvailable with EMPTY digest list → no backfill → fall-through.
+    // is_full_snapshot = true to trigger reconcile gate.
+    tx.send(Update::BlobsAvailable(BlobsAvailableNotification {
+        worker_cas_endpoint: CAS_ENDPOINT.to_string(),
+        digests: vec![], // empty → fall-through path
+        is_full_snapshot: true,
+        evicted_digests: vec![],
+        digest_infos: vec![],
+        cpu_load_pct: 0,
+        cached_directory_digests: vec![],
+        added_subtree_digests: vec![],
+        removed_subtree_digests: vec![],
+        is_full_subtree_snapshot: false,
+        p_core_load_pct: 0,
+        e_core_load_pct: 0,
+        pinned_mirror_digests: vec![],
+        mirror_used_bytes: 0,
+        mirror_max_bytes: 0,
+        pinned_mirror_entries: vec![],
+        pinned_ac_mirror_entries: Vec::new(),
+        indefinite_pin_saturated: false,
+        swap_used_bytes: 0,
+        memory_pressure_level: 0,
+        memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
+    }))
+    .await
+    .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
+
+    // The fall-through path sends ReconcileComplete synchronously before
+    // returning from handle_blobs_available.
+    let rc_msg = tokio::time::timeout(RC_TIMEOUT, server_to_worker.next())
+        .await
+        .expect(
+            "exactly-once fall-through: timed out waiting for ReconcileComplete; \
+             the fall-through path must send ReconcileComplete on is_full_snapshot=true. \
+             MUTATION target: `self.try_send_reconcile_complete(is_full_snapshot)` at \
+             worker_api_server.rs:3320 is the send site for the fall-through path.",
+        )
+        .expect("stream closed before ReconcileComplete")
+        .err_tip(|| "fall-through ReconcileComplete message was an error")?;
+
+    match rc_msg.update.expect("ReconcileComplete message update must be set") {
+        update_for_worker::Update::ReconcileComplete(_) => {} // correct
+        other => {
+            panic!(
+                "exactly-once fall-through: expected ReconcileComplete as first \
+                 post-BlobsAvailable message (fall-through path with empty digests), \
+                 got {other:?}. The fall-through path must call \
+                 `try_send_reconcile_complete(is_full_snapshot)` before returning.",
+            );
+        }
+    }
+
+    let _keep = (cas_store, store_manager, lower_fast_slow, upper_fast_slow);
+    Ok(())
+}
