@@ -346,6 +346,34 @@ pub(super) struct MemorySignals {
     pub(super) refault_cumulative: u64,
 }
 
+/// Compute available memory bytes from raw page counts and page size.
+/// `available = (free + inactive + purgeable) * page_size`.
+///
+/// `speculative_count` is NOT included — speculative pages are already
+/// accounted for in `free_count` (XNU vm_statistics.h:158-163). Adding
+/// them again would double-count by ~200 MiB on real workers.
+///
+/// This is the production formula for the #64 fix (raw `free_count *
+/// page_size` was the regression — it false-tripped on healthy workers
+/// where inactive+purgeable dominate). Extracted as a pure function so
+/// unit tests exercise THIS code path, not an inline replica, giving the
+/// mutation guard real production coverage.
+///
+/// Defined at this level (not inside the `cfg(target_os = "macos")`
+/// `mem_impl` block) so it is reachable by tests on all platforms.
+pub(super) const fn compute_available_bytes(
+    free_count: u64,
+    inactive_count: u64,
+    purgeable_count: u64,
+    page_size: u64,
+) -> u64 {
+    // speculative already in free_count (XNU vm_statistics.h:158-163)
+    free_count
+        .saturating_add(inactive_count)
+        .saturating_add(purgeable_count)
+        .saturating_mul(page_size)
+}
+
 /// Platform-specific host memory-pressure sampling. Mirrors `cpu_impl`:
 /// the macOS path reads `sysctl vm.swapusage` (observability) + a single
 /// mach `host_statistics64(HOST_VM_INFO64)` (free-floor + re-fault); the
@@ -605,10 +633,7 @@ mod mem_impl {
         let swapins = stats.swapins;
         let page_size = read_page_size()?;
         Some(MemorySignals {
-            free_bytes: free_count
-                .saturating_add(inactive_count)
-                .saturating_add(purgeable_count)
-                .saturating_mul(page_size),
+            free_bytes: super::compute_available_bytes(free_count, inactive_count, purgeable_count, page_size),
             refault_cumulative: decompressions.saturating_add(swapins),
         })
     }
@@ -665,11 +690,12 @@ static LAST_SAMPLE_INSTANT: AtomicU64 = AtomicU64::new(0);
 /// fresh-and-healthy, stale (fail-open), or sampler-unavailable.
 static MEMORY_PRESSURED: AtomicBool = AtomicBool::new(false);
 /// (#37 re-enable follow-up) Per-trip-source latch set by the sampler on
-/// every tick where the gate is pressured; cleared when not pressured. Lets
-/// the StartAction NAK warn log WHICH signal tripped so canary soak data
-/// distinguishes a free-floor NAK from a refault NAK unambiguously.
-/// Both are published independently — either or both can be set when
-/// `MEMORY_PRESSURED` is true.
+/// every tick where the gate is enabled AND pressured; cleared when not
+/// pressured, when the gate is disabled, or when the signal read fails
+/// (unreadable tick). Lets the StartAction NAK warn log WHICH signal tripped
+/// so canary soak data distinguishes a free-floor NAK from a refault NAK
+/// unambiguously. Both are published independently — either or both can be
+/// set when `MEMORY_PRESSURED` is true.
 static MEMORY_GATE_TRIP_FREE_FLOOR: AtomicBool = AtomicBool::new(false);
 /// See `MEMORY_GATE_TRIP_FREE_FLOOR` — refault-path trip source latch.
 static MEMORY_GATE_TRIP_REFAULT: AtomicBool = AtomicBool::new(false);
@@ -1138,6 +1164,11 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
         // entirely trips the age fail-open.)
         MEMORY_PRESSURE_LEVEL.store(0, Ordering::Relaxed);
         MEMORY_PRESSURED.store(false, Ordering::Relaxed);
+        // Clear per-source trip latches for consistency: an unreadable tick
+        // is not a tripped tick, and the NAK-path structured log would be
+        // misleading if a previous trip's latch remained set.
+        MEMORY_GATE_TRIP_FREE_FLOOR.store(false, Ordering::Relaxed);
+        MEMORY_GATE_TRIP_REFAULT.store(false, Ordering::Relaxed);
         return SwapSamplerState {
             prev: None,
             ewma: state.ewma,
@@ -4933,10 +4964,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     let trip_refault =
                                         MEMORY_GATE_TRIP_REFAULT.load(Ordering::Relaxed);
                                     if trip_free_floor {
-                                        self.metrics.memory_gate_nak_free_floor_total.inc();
+                                        ::nativelink_util::o11_probes::memory_gate_counters()
+                                            .nak_free_floor
+                                            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
                                     }
                                     if trip_refault {
-                                        self.metrics.memory_gate_nak_refault_total.inc();
+                                        ::nativelink_util::o11_probes::memory_gate_counters()
+                                            .nak_refault
+                                            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
                                     }
                                     warn!(
                                         memory_pressure_level = get_memory_pressure_level(),
@@ -6990,25 +7025,13 @@ pub struct Metrics {
     /// (#37 re-enable follow-up) NAKs issued to the scheduler because the
     /// available-memory free-floor PRIMARY was breached (available
     /// free+inactive+purgeable < `FREE_FLOOR_BYTES = 1 GiB`). Monotonic.
-    /// Non-zero in steady state = gate enabled and floor is genuinely low
-    /// OR a mis-calibrated threshold (distinguish via the refault counter
-    /// below). Alert on RATE, not level. A rate ≈ 0 during canary soak =
-    /// the re-enable is safe on the floor dimension.
-    #[metric(
-        help = "StartAction NAKs from memory gate free-floor trip (available < FREE_FLOOR_BYTES=1GiB); monotonic — alert on rate; zero = gate disabled or floor healthy."
-    )]
-    memory_gate_nak_free_floor_total: Counter,
-
-    /// (#37 re-enable follow-up) NAKs issued because the re-fault EWMA
-    /// CORROBORATION was over `REFAULT_CONFIRM_RATE = 10000/s` (active
-    /// thrash signal). Monotonic. Non-zero = box is actively compressing
-    /// evicted pages back in. A sustained non-zero rate with a zero
-    /// `memory_gate_nak_free_floor_total` rate = refault-only trip —
-    /// check busy-worker decompression baseline before concluding thrash.
-    #[metric(
-        help = "StartAction NAKs from memory gate refault CORROBORATION (ewma >= REFAULT_CONFIRM_RATE=10000/s); monotonic — non-zero+floor-zero = refault-only trip, check busy baseline."
-    )]
-    memory_gate_nak_refault_total: Counter,
+    // NOTE: memory_gate_nak_free_floor_total and memory_gate_nak_refault_total
+    // were previously here as per-instance Counter fields. They have been moved
+    // to the process-singleton `nativelink_util::o11_probes::memory_gate_counters()`
+    // and registered in nativelink.rs so they are visible on /metrics. The NAK
+    // path in `start_execute` now increments the singleton directly. The
+    // per-instance fields were never registered with MetricsRegistry (the
+    // worker-metrics-exposure trap); the singleton fixes that. See #37.
 
     /// (FL-688 v3 Stage C — over-cap metric) Counts how many times the
     /// startup reconcile gate was released by the fail-open timer
@@ -7040,8 +7063,6 @@ impl Metrics {
             preconditions: AsyncCounterWrapper::default(),
             running_actions_manager_metrics,
             ac_write_detached_inflight_count,
-            memory_gate_nak_free_floor_total: Counter::default(),
-            memory_gate_nak_refault_total: Counter::default(),
             reconcile_pin_time_bounded_fallback_total: Counter::default(),
             reconcile_pin_refused_total: Counter::default(),
             reconcile_gate_fail_open_total: Counter::default(),
@@ -7992,14 +8013,18 @@ mod tests {
     /// storm. With the corrected formula, those same workers would measure
     /// ~7.2-8.1 GiB available and the floor would NOT trip.
     ///
-    /// Mutation (CLAUDE.md TDD #5): the test also asserts BOTH directions —
+    /// The test calls `mem_impl::compute_available_bytes` — the SAME helper
+    /// that `read_memory_signals` calls on the production path. Any mutation
+    /// to the helper body therefore red-fails this test (mutation guard is on
+    /// production code, not an inline replica).
+    ///
+    /// Mutation (CLAUDE.md TDD #5): the test asserts BOTH directions —
     /// (a) the correct formula (available ≈ 7.3 GiB) does NOT trip, and
     /// (b) the wrong formula (raw free = 300 MiB) DOES trip. Both assertions
-    /// are bespoke-messaged. Mutation: flip the formula in `read_memory_signals`
-    /// back to `free_count * page_size` → on macOS, `read_memory_signals`
-    /// would return `free_bytes ≈ 300 MiB` → `free_floor_breached` returns
-    /// `true` → assertion (a) in any caller would fire with the bespoke message.
-    /// Assertion (b) proves the wrong formula IS detectable by this test.
+    /// are bespoke-messaged. Mutation: revert `compute_available_bytes` body to
+    /// `free_count.saturating_mul(page_size)` → `available_bytes` drops to
+    /// 300 MiB → `free_floor_breached` returns `true` → assertion (a) fires
+    /// with "#64 regression".
     #[test]
     fn available_floor_does_not_false_trip_when_raw_free_is_low() {
         // Fixture: raw free = 300 MiB (sub-floor), inactive = 7 GiB,
@@ -8013,19 +8038,17 @@ mod tests {
         let inactive_pages = (inactive_mib * mib) / page_size_bytes;
         let purgeable_pages = (purgeable_mib * mib) / page_size_bytes;
 
-        // (a) CORRECT formula: available = free + inactive + purgeable.
-        let available_bytes = free_pages
-            .saturating_add(inactive_pages)
-            .saturating_add(purgeable_pages)
-            .saturating_mul(page_size_bytes);
+        // (a) CORRECT formula via the production helper: available = free + inactive + purgeable.
+        let available_bytes =
+            compute_available_bytes(free_pages, inactive_pages, purgeable_pages, page_size_bytes);
         let tripped_correct = free_floor_breached(available_bytes, false);
         assert!(
             !tripped_correct,
             "raw-free floor false-trips at {raw_free_mib} MiB raw free \
              (the #64 regression): free_floor_breached returned true with \
              available≈{} MiB — correct formula must NOT trip. \
-             Mutation target: revert free_bytes to free_count * page_size in \
-             read_memory_signals",
+             Mutation target: revert compute_available_bytes body to \
+             free_count.saturating_mul(page_size)",
             available_bytes >> 20
         );
 
@@ -8047,12 +8070,16 @@ mod tests {
     ///
     /// This is the AA-6 auditor catch (3rd wrong-field error on this gate).
     ///
-    /// Mutation (CLAUDE.md TDD #5): add `speculative_count` to the formula in
-    /// `read_memory_signals`. The computed `available_bytes` will exceed the
-    /// expected value by `speculative_count * page_size` (~200 MiB on real
-    /// workers), causing the assert_eq below to fail with: "speculative pages
-    /// must NOT be added to available — they are already in free_count (XNU
-    /// vm_statistics.h:158-163); adding them double-counts by ~200 MiB".
+    /// The test calls `mem_impl::compute_available_bytes` — the SAME helper
+    /// that `read_memory_signals` calls on the production path. Any mutation
+    /// to the helper body therefore red-fails this test.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): add `speculative_count` to the signature
+    /// and body of `compute_available_bytes`. The `formula_result` will exceed
+    /// `expected_available` by `speculative_count * page_size` (~293 MiB),
+    /// causing the assert_eq below to fail with: "speculative pages must NOT
+    /// be added to available — they are already in free_count (XNU
+    /// vm_statistics.h:158-163); adding them double-counts by ~293 MiB".
     #[test]
     fn available_formula_excludes_speculative_count() {
         // Fixture modelling a real Apple Silicon M4 worker (worker-01 probe
@@ -8070,7 +8097,7 @@ mod tests {
         let inactive_count = (inactive_mib * mib) / page_size_bytes;
         let purgeable_count = (purgeable_mib * mib) / page_size_bytes;
         let speculative_count = (speculative_mib * mib) / page_size_bytes;
-        // Correct formula: free + inactive + purgeable (no speculative).
+        // Correct expected: free + inactive + purgeable (no speculative).
         let expected_available = free_count
             .saturating_add(inactive_count)
             .saturating_add(purgeable_count)
@@ -8081,7 +8108,7 @@ mod tests {
             .saturating_add(purgeable_count)
             .saturating_add(speculative_count)
             .saturating_mul(page_size_bytes);
-        // Verify the two differ by speculative_count * page_size.
+        // Verify the two differ by speculative_count * page_size (fixture sanity).
         let double_count_bytes = speculative_count.saturating_mul(page_size_bytes);
         assert_eq!(
             wrong_available - expected_available,
@@ -8089,27 +8116,25 @@ mod tests {
             "test fixture error: wrong_available - expected_available should \
              be exactly speculative_count * page_size"
         );
-        // The implementation must produce `expected_available`, not `wrong_available`.
-        // Since read_memory_signals is platform-specific (macOS only), we test the
-        // formula by replicating it here and asserting it matches expected.
-        let formula_result = free_count
-            .saturating_add(inactive_count)
-            .saturating_add(purgeable_count)
-            .saturating_mul(page_size_bytes);
+        // The production helper must produce `expected_available`, not `wrong_available`.
+        // Calls compute_available_bytes — the SAME function read_memory_signals uses —
+        // so a mutation to the helper body red-fails here (not an inline replica).
+        let formula_result =
+            compute_available_bytes(free_count, inactive_count, purgeable_count, page_size_bytes);
         assert_eq!(
             formula_result,
             expected_available,
             "speculative pages must NOT be added to available — they are already \
              in free_count (XNU vm_statistics.h:158-163); adding them double-counts \
              by ~{speculative_mib} MiB. Mutation target: add speculative_count to \
-             the saturating_add chain in read_memory_signals"
+             compute_available_bytes"
         );
         // Belt-and-suspenders: formula_result must differ from wrong_available.
         assert_ne!(
             formula_result,
             wrong_available,
-            "formula must exclude speculative_count — if this fires, the fixture \
-             or the implementation both have speculative_count, masking the mutation"
+            "formula must exclude speculative_count — if this fires, the production \
+             helper or the fixture both have speculative_count, masking the mutation"
         );
     }
 
@@ -8120,10 +8145,14 @@ mod tests {
     /// called) defaults to the gate being off.
     ///
     /// Mutation (CLAUDE.md TDD #5): change `#[serde(default)]` to
-    /// `#[serde(default = "default_true")]` (or change `AtomicBool::new(false)`
-    /// to `AtomicBool::new(true)`) on the field. The serde assert below
-    /// red-fails with: "memory_gate_enabled must default to false when absent
-    /// from config — gate must be DISABLED by default (no prod behavior change)".
+    /// `#[serde(default = "default_true")]` on the config field — the
+    /// `serde_json5::from_str(...).expect()` at the parse site panics because
+    /// the helper fn `default_true` does not exist, not because the assertion
+    /// fires. Removing `#[serde(default)]` entirely also panics at the parse
+    /// `expect()` (field absent with no default). For the `AtomicBool` path:
+    /// change `AtomicBool::new(false)` to `AtomicBool::new(true)` → the static
+    /// assertion in `free_floor_bytes_is_conservative_one_gib` red-fails with
+    /// "MEMORY_GATE_ENABLED must DEFAULT to false".
     #[test]
     fn memory_gate_config_defaults_off() {
         use nativelink_config::cas_server::LocalWorkerConfig;
@@ -8739,19 +8768,30 @@ mod tests {
         );
     }
 
-    /// (#37 re-enable follow-up) Verifies that `memory_gate_nak_free_floor_total`
-    /// and `memory_gate_nak_refault_total` are published by `Metrics::publish()`
-    /// with the literal metric names operators alert on. Without `#[metric(help=...)]`
-    /// on the fields, the counters are invisible to monitoring and the canary soak
-    /// cannot distinguish trip sources unambiguously.
+    /// (#37 re-enable follow-up) Singleton-aliasing test — `memory_gate_counters()`
+    /// and `memory_gate_counters_arc()` must observe the same underlying `AtomicU64`
+    /// state, and `MemoryGateCountersHandle::publish` must emit the literal metric
+    /// names operators alert on: `memory_gate_nak_free_floor_total` and
+    /// `memory_gate_nak_refault_total`.
     ///
-    /// Mutation: comment out `#[metric(help = "...")]` on either field in `Metrics`
-    /// → the corresponding `unwrap_or_else` panic fires with its bespoke message.
+    /// The counters were previously per-instance `Metrics` fields (never registered
+    /// with `MetricsRegistry` — the worker-metrics-exposure trap) and are now a
+    /// process-singleton in `o11_probes`. This test proves:
+    ///   1. `memory_gate_counters()` returns the same singleton the NAK path writes.
+    ///   2. `memory_gate_counters_arc()` (which `nativelink.rs` passes to
+    ///      `MetricsRegistry::register`) publishes the literal field names.
+    ///   3. The published value reflects the increment done via the singleton.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): comment out the `publish!(\"nak_free_floor_total\", ...)`
+    /// call in `MemoryGateCounters::publish` → the `unwrap_or_else` panic fires with
+    /// "expected metric memory_gate_nak_free_floor_total to be published — canary soak
+    /// cannot read trip-source signal". Same for `nak_refault_total`.
     #[test]
     fn memory_gate_nak_counters_visible_in_metric_tree() {
         use std::sync::Mutex;
 
         use nativelink_metric::{MetricFieldData, MetricKind, MetricsComponent};
+        use nativelink_util::o11_probes::{memory_gate_counters, memory_gate_counters_arc};
         use tracing_subscriber::layer::SubscriberExt;
 
         #[derive(Debug, Default, Clone)]
@@ -8807,25 +8847,37 @@ mod tests {
             }
         }
 
+        // Read the baseline values BEFORE incrementing so parallel tests don't
+        // interfere (the singleton is process-wide, shared across all tests in
+        // the suite — delta-based assertion avoids ordering sensitivity).
+        let before_free_floor = memory_gate_counters()
+            .nak_free_floor
+            .load(::core::sync::atomic::Ordering::Relaxed);
+        let before_refault = memory_gate_counters()
+            .nak_refault
+            .load(::core::sync::atomic::Ordering::Relaxed);
+
+        // Drive one NAK on each trip-source via the PRODUCTION singleton path.
+        memory_gate_counters()
+            .nak_free_floor
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+        memory_gate_counters()
+            .nak_refault
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
+
         let layer = MetricCaptureLayer::default();
         let captured = layer.events.clone();
         let subscriber = tracing_subscriber::Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let metrics = Metrics::new(
-            std::sync::Weak::new(),
-            Arc::new(core::sync::atomic::AtomicI64::new(0)),
-        );
-        // Drive one NAK on each trip-source counter.
-        metrics.memory_gate_nak_free_floor_total.inc();
-        metrics.memory_gate_nak_refault_total.inc();
-
+        // `memory_gate_counters_arc()` is what nativelink.rs passes to
+        // `MetricsRegistry::register` — publish via that handle.
         MetricsComponent::publish(
-            &metrics,
+            memory_gate_counters_arc().as_ref(),
             MetricKind::Component,
             MetricFieldData::default(),
         )
-        .expect("publish must succeed for derived MetricsComponent");
+        .expect("publish must succeed for MemoryGateCountersHandle");
 
         drop(_guard);
 
@@ -8833,38 +8885,52 @@ mod tests {
 
         let free_floor_metric = events
             .iter()
-            .find(|m| m.name == "memory_gate_nak_free_floor_total")
+            .find(|m| m.name == "nak_free_floor_total")
             .unwrap_or_else(|| {
                 panic!(
-                    "expected metric `memory_gate_nak_free_floor_total` to be published. \
-                     Captured events: {events:#?}. \
-                     Without #[metric(help=\"...\")] on the field, free-floor NAKs are \
-                     invisible and the canary soak cannot distinguish trip sources \
-                     (#37 re-enable follow-up)"
+                    "expected metric `nak_free_floor_total` to be published by \
+                     MemoryGateCountersHandle — canary soak cannot read free-floor trip \
+                     signal. Captured events: {events:#?}. \
+                     Mutation target: comment out publish!(\"nak_free_floor_total\", ...) \
+                     in MemoryGateCounters::publish (#37 re-enable follow-up)"
                 )
             });
+        let published_free_floor: u64 = free_floor_metric
+            .value
+            .parse()
+            .expect("nak_free_floor_total value must be numeric");
         assert_eq!(
-            free_floor_metric.value, "1",
-            "expected memory_gate_nak_free_floor_total = 1 after one inc(); got {:?}",
-            free_floor_metric.value
+            published_free_floor,
+            before_free_floor + 1,
+            "nak_free_floor_total must equal baseline+1 after one fetch_add — \
+             got {published_free_floor} (baseline was {before_free_floor}). \
+             Singleton aliasing broken: memory_gate_counters() and \
+             memory_gate_counters_arc() are not observing the same AtomicU64."
         );
 
         let refault_metric = events
             .iter()
-            .find(|m| m.name == "memory_gate_nak_refault_total")
+            .find(|m| m.name == "nak_refault_total")
             .unwrap_or_else(|| {
                 panic!(
-                    "expected metric `memory_gate_nak_refault_total` to be published. \
-                     Captured events: {events:#?}. \
-                     Without #[metric(help=\"...\")] on the field, refault NAKs are \
-                     invisible and a busy-baseline refault false-positive cannot be \
-                     distinguished from a floor NAK (#37 re-enable follow-up)"
+                    "expected metric `nak_refault_total` to be published by \
+                     MemoryGateCountersHandle — canary soak cannot read refault trip \
+                     signal. Captured events: {events:#?}. \
+                     Mutation target: comment out publish!(\"nak_refault_total\", ...) \
+                     in MemoryGateCounters::publish (#37 re-enable follow-up)"
                 )
             });
+        let published_refault: u64 = refault_metric
+            .value
+            .parse()
+            .expect("nak_refault_total value must be numeric");
         assert_eq!(
-            refault_metric.value, "1",
-            "expected memory_gate_nak_refault_total = 1 after one inc(); got {:?}",
-            refault_metric.value
+            published_refault,
+            before_refault + 1,
+            "nak_refault_total must equal baseline+1 after one fetch_add — \
+             got {published_refault} (baseline was {before_refault}). \
+             Singleton aliasing broken: memory_gate_counters() and \
+             memory_gate_counters_arc() are not observing the same AtomicU64."
         );
     }
 }

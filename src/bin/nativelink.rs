@@ -738,6 +738,20 @@ async fn inner_main(
         nativelink_util::o11_probes::dir_cache_counters_arc(),
     );
 
+    // #37 re-enable follow-up: register the memory gate NAK counters singleton
+    // so `memory_gate_nak_free_floor_total` and `memory_gate_nak_refault_total`
+    // appear on the /metrics endpoint. These counters were previously on the
+    // per-instance `LocalWorker.metrics` struct which is never registered with
+    // MetricsRegistry (the worker-metrics-exposure trap; same class as #86
+    // symlink_fix and #DC3 dir_cache). Prefix is "memory_gate" so the rendered
+    // names are `memory_gate_nak_free_floor_total` / `memory_gate_nak_refault_total`.
+    // Registered unconditionally (gate DEFAULT OFF; the counters read 0 when the
+    // gate is disabled — safe on server-only processes).
+    metrics_registry.register(
+        "memory_gate",
+        nativelink_util::o11_probes::memory_gate_counters_arc(),
+    );
+
     metrics_registry.register(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),

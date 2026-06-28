@@ -1104,6 +1104,106 @@ impl MetricsComponent for DirCacheCountersHandle {
 }
 
 // =====================================================================
+// #37 re-enable follow-up — memory gate NAK counters
+// =====================================================================
+
+/// (#37 re-enable follow-up) Process-wide memory gate NAK counters.
+/// Two monotonic counters, one per trip source (free-floor PRIMARY and
+/// refault CORROBORATION). Backed by `static`s so `const fn new()` suffices;
+/// incremented from the StartAction NAK path in `local_worker.rs`.
+///
+/// These were originally fields on `LocalWorker.metrics` (a per-instance
+/// struct that is never registered with `MetricsRegistry` — the
+/// worker-metrics-exposure trap). Moving them to a process singleton makes
+/// them visible on `/metrics` without adding per-instance registration.
+#[derive(Debug)]
+pub struct MemoryGateCounters {
+    /// StartAction NAKs from free-floor trip (available < FREE_FLOOR_BYTES).
+    pub nak_free_floor: AtomicU64,
+    /// StartAction NAKs from refault EWMA CORROBORATION trip.
+    pub nak_refault: AtomicU64,
+}
+
+impl MemoryGateCounters {
+    const fn new() -> Self {
+        Self {
+            nak_free_floor: AtomicU64::new(0),
+            nak_refault: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MetricsComponent for MemoryGateCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        // Registered under prefix "memory_gate" (nativelink.rs). The publish!
+        // name is the FULL field name so operators alert on the literal string.
+        // No inner group!() — the prefix already scopes these uniquely.
+        let v = self.nak_free_floor.load(Ordering::Relaxed);
+        publish!(
+            "nak_free_floor_total",
+            &v,
+            MetricKind::Counter,
+            "StartAction NAKs from memory gate free-floor trip (available < \
+             FREE_FLOOR_BYTES=1GiB); monotonic — alert on rate; zero = gate \
+             disabled or floor healthy."
+        );
+        let v = self.nak_refault.load(Ordering::Relaxed);
+        publish!(
+            "nak_refault_total",
+            &v,
+            MetricKind::Counter,
+            "StartAction NAKs from memory gate refault CORROBORATION \
+             (ewma >= REFAULT_CONFIRM_RATE=10000/s); monotonic — non-zero + \
+             floor-zero = refault-only trip, check busy baseline."
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// #37: process-wide memory gate NAK counters. Backed by a `static`
+/// so `const fn new()` suffices.
+static MEMORY_GATE_COUNTERS: MemoryGateCounters = MemoryGateCounters::new();
+/// #37: cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents
+/// a double-registration hazard if `memory_gate_counters_arc()` is called
+/// twice — both calls return a clone of the same `Arc`.
+static MEMORY_GATE_COUNTERS_ARC: OnceLock<Arc<MemoryGateCountersHandle>> = OnceLock::new();
+
+/// #37: process-wide memory gate NAK counters singleton. All calls within
+/// the process observe the same atomic state.
+#[must_use]
+pub fn memory_gate_counters() -> &'static MemoryGateCounters {
+    &MEMORY_GATE_COUNTERS
+}
+
+/// #37: `Arc` wrapper for `MetricsRegistry::register`. The singleton lives
+/// in a `static`; the `Arc` carries a zero-sized handle that delegates
+/// `publish` to the static so scrapes always read live state. `OnceLock`-
+/// cached so repeated calls return a clone of the same `Arc`.
+#[must_use]
+pub fn memory_gate_counters_arc() -> Arc<MemoryGateCountersHandle> {
+    Arc::clone(MEMORY_GATE_COUNTERS_ARC.get_or_init(|| Arc::new(MemoryGateCountersHandle)))
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an
+/// `Arc<T: MetricsComponent>` for the `static`-backed `#37` counters.
+#[derive(Debug)]
+pub struct MemoryGateCountersHandle;
+
+impl MetricsComponent for MemoryGateCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        MEMORY_GATE_COUNTERS.publish(kind, field_metadata)
+    }
+}
+
+// =====================================================================
 // P4 — System metrics sampler (macOS workers only)
 // =====================================================================
 
