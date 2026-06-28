@@ -2623,7 +2623,7 @@ async fn v3c_block2_boot_drain_suppressed_when_gate_armed_at_construction() -> R
     // Step 2: re-open with gate armed + cap = N_AT_CAP blobs.
     // Boot drain suppressed → all 6 blobs survive.
     let store = tokio::time::timeout(
-        core::time::Duration::from_secs(10),
+        Duration::from_secs(10),
         FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
             content_path: content_path.clone(),
             temp_path: temp_path.clone(),
@@ -2645,7 +2645,7 @@ async fn v3c_block2_boot_drain_suppressed_when_gate_armed_at_construction() -> R
     let keys: Vec<StoreKey<'static>> = seeded_digests.iter().map(|d| StoreKey::from(*d)).collect();
     let mut results = vec![None; keys.len()];
     tokio::time::timeout(
-        core::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         store.has_with_results(&keys, &mut results),
     )
     .await
@@ -2684,7 +2684,7 @@ async fn v3c_block2_boot_drain_suppressed_when_gate_armed_at_construction() -> R
 #[nativelink_test]
 async fn v3c_drain_tick_suppressed_gate_release_confirms_arc_shared() -> Result<(), Error> {
     let store = tokio::time::timeout(
-        core::time::Duration::from_secs(10),
+        Duration::from_secs(10),
         FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
             content_path: make_temp_path("v3c_arc_content"),
             temp_path: make_temp_path("v3c_arc_tmp"),

@@ -1005,6 +1005,16 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // fail-open timer in the worker's `ReconcileComplete` handler).
         if spec.startup_reconcile_gate {
             evicting_map.set_startup_reconcile_gate();
+            // Surface gate-armed state at construction so a MISSING
+            // `startup_reconcile_gate: true` in a worker config — which would
+            // silently disable the BLOCK-2 boot-drain protection and re-open
+            // FL-688 with no other signal — is visible by the presence/absence
+            // of this line in the worker log (the convergent "config silently
+            // inert" risk flagged by the Stage-C cadre).
+            info!(
+                content_path = %spec.content_path,
+                "filesystem store: startup reconcile gate ARMED — boot eviction suppressed until reconcile-complete"
+            );
         }
 
         // Create temp and content directories and the s and d subdirectories.
