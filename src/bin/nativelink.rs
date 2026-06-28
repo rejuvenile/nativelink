@@ -738,6 +738,23 @@ async fn inner_main(
         nativelink_util::o11_probes::dir_cache_counters_arc(),
     );
 
+    // #37 re-enable follow-up: register the memory gate NAK counters singleton
+    // so the memory-gate trip-source counters appear on the /metrics endpoint.
+    // These counters were previously on the per-instance `LocalWorker.metrics`
+    // struct which is never registered with MetricsRegistry (the
+    // worker-metrics-exposure trap; same class as #86 symlink_fix and #DC3
+    // dir_cache). Prefix is "memory_gate"; the rendered Prometheus names the
+    // operators/the canary soak alert on are the BARE
+    // `memory_gate_nak_free_floor_total` and `memory_gate_nak_refault_total`
+    // (no `_counter` suffix — empirically pinned by
+    // `memory_gate_render_prometheus_exposes_nak_counters` in o11_probes.rs).
+    // Registered unconditionally (gate DEFAULT OFF; the counters read 0 when the
+    // gate is disabled — safe on server-only processes).
+    metrics_registry.register(
+        "memory_gate",
+        nativelink_util::o11_probes::memory_gate_counters_arc(),
+    );
+
     metrics_registry.register(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),

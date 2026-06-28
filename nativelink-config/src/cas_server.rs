@@ -1174,6 +1174,34 @@ pub struct LocalWorkerConfig {
     /// Default: false (synchronous behavior; default-OFF kill-switch).
     #[serde(default)]
     pub deferred_output_uploads_enabled: bool,
+
+    /// (#37 re-enable follow-up) Worker memory-pressure admission gate.
+    ///
+    /// When `false` (default): the gate is DISABLED — the worker never NAKs
+    /// a `StartAction` on memory grounds. This matches the fleet state after
+    /// incident `5132d6c9` (#64), where the gate was disabled because the
+    /// old raw-`free_count` floor false-tripped fleet-wide (3.6k-NAK/min
+    /// storm). The gate mechanism has since been corrected to read `available`
+    /// (free+inactive+purgeable — the macOS reclaimable pool, ~7-8 GiB on a
+    /// healthy 16 GiB worker), but re-enabling requires a per-worker canary
+    /// soak to validate the refault EWMA threshold under multi-action build
+    /// load before fleet-wide rollout.
+    ///
+    /// When `true`: the gate NAKs `StartAction` with `ResourceExhausted` when
+    /// the available-memory floor (`1 GiB`) is breached OR the re-fault-rate
+    /// EWMA crosses `10000/s` (thrash corroboration). The gate fails OPEN on
+    /// a stale/dead sampler and via the 30s idle fleet fail-open.
+    ///
+    /// ROLLOUT: deploy the new binary fleet-wide FIRST (this field absent from
+    /// all configs → gate disabled). THEN add `memory_gate_enabled: true` to
+    /// the canary worker's INDIVIDUALIZED config. Do NOT add this field to the
+    /// shared canonical config until all workers run the new binary
+    /// (`deny_unknown_fields` causes old binaries to reject configs containing
+    /// this field — deploy-ops §13 two-phase sequence).
+    ///
+    /// Default: false (DISABLED — zero production behavior change).
+    #[serde(default)]
+    pub memory_gate_enabled: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
