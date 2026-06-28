@@ -5677,6 +5677,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                              prevent permanent action-execution blockage",
                             RECONCILE_FAIL_OPEN_SECS
                         );
+                        // (FL-688 v3 Stage C — over-cap metric) Count fail-opens so
+                        // operators can alert on rolling-deploy / version-mismatch events
+                        // where the 20s gate-armed window was exposed.
+                        self.metrics.reconcile_gate_fail_open_total.inc();
                         if let Some(ref state) = self.blobs_available_state {
                             // `release_startup_reconcile_gate()` stores `true` to the
                             // shared `reconcile_complete` Arc — the same Arc that
@@ -6916,6 +6920,17 @@ pub struct Metrics {
         help = "Blobs absent from eviction map at reconcile-pin time (evicted before pin or never inserted); non-zero = FL-688 data-loss signal — upload will fail."
     )]
     reconcile_pin_refused_total: Counter,
+
+    /// (FL-688 v3 Stage C — over-cap metric) Counts how many times the
+    /// startup reconcile gate was released by the fail-open timer
+    /// (`RECONCILE_FAIL_OPEN_SECS = 20`) rather than by a `ReconcileComplete`
+    /// from the server. Non-zero = rolling-deploy window where action execution
+    /// was blocked for up to 20s; gate-armed window's over-cap exposure was
+    /// invisible without this counter. Operators should alert if > 0.
+    #[metric(
+        help = "Times the startup reconcile gate released via fail-open timer (not ReconcileComplete); non-zero = rolling-deploy exposure / server version mismatch."
+    )]
+    reconcile_gate_fail_open_total: Counter,
 }
 
 impl RootMetricsComponent for Metrics {}
@@ -6934,6 +6949,7 @@ impl Metrics {
             ac_write_detached_inflight_count,
             reconcile_pin_time_bounded_fallback_total: Counter::default(),
             reconcile_pin_refused_total: Counter::default(),
+            reconcile_gate_fail_open_total: Counter::default(),
         }
     }
 }
@@ -8290,6 +8306,122 @@ mod tests {
              monotonic LAST_DISK_SAMPLE_INSTANT anchor on every tick (once \
              PROCESS_START is initialized) so the gate's stale→statvfs-fallback \
              decision sees a live sampler; anchor was {after}"
+        );
+    }
+
+    /// (FL-688 v3 Stage C — over-cap metric render test)
+    ///
+    /// Verifies that `Metrics::reconcile_gate_fail_open_total` is wired into the
+    /// `MetricsComponent` publish tree and emits its literal field name when the
+    /// metric exporter walks the tree. Without this, operators alerting on the
+    /// rolling-deploy fail-open event (RECONCILE_FAIL_OPEN_SECS = 20s window) see
+    /// nothing — the field is dark.
+    ///
+    /// Mutation: comment out the `#[metric(help = "...")]` attribute on
+    /// `reconcile_gate_fail_open_total` in the `Metrics` struct → this test must
+    /// red-fail with "expected metric `reconcile_gate_fail_open_total` to be
+    /// published".
+    #[test]
+    fn reconcile_gate_fail_open_total_visible_in_metric_tree() {
+        use std::sync::Mutex;
+
+        use nativelink_metric::{MetricFieldData, MetricKind, MetricsComponent};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Debug, Default, Clone)]
+        struct CapturedMetric {
+            name: String,
+            value: String,
+        }
+
+        #[derive(Default)]
+        struct MetricCaptureLayer {
+            events: Arc<Mutex<Vec<CapturedMetric>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MetricCaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "nativelink_metric" {
+                    return;
+                }
+                struct Grabber {
+                    name: String,
+                    value: String,
+                }
+                impl tracing::field::Visit for Grabber {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn core::fmt::Debug,
+                    ) {
+                        let s = format!("{value:?}").trim_matches('"').to_string();
+                        match field.name() {
+                            "__name" => self.name = s,
+                            "__value" => self.value = s,
+                            _ => {}
+                        }
+                    }
+                }
+                let mut g = Grabber {
+                    name: String::new(),
+                    value: String::new(),
+                };
+                event.record(&mut g);
+                if g.name.is_empty() {
+                    return;
+                }
+                self.events.lock().unwrap().push(CapturedMetric {
+                    name: g.name,
+                    value: g.value,
+                });
+            }
+        }
+
+        let layer = MetricCaptureLayer::default();
+        let captured = layer.events.clone();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Construct Metrics directly (same-module access to private constructor).
+        let metrics = Metrics::new(
+            std::sync::Weak::new(),
+            Arc::new(core::sync::atomic::AtomicI64::new(0)),
+        );
+        // Drive one fail-open event as the production code does.
+        metrics.reconcile_gate_fail_open_total.inc();
+
+        MetricsComponent::publish(
+            &metrics,
+            MetricKind::Component,
+            MetricFieldData::default(),
+        )
+        .expect("publish must succeed for derived MetricsComponent");
+
+        drop(_guard);
+
+        let events = captured.lock().unwrap().clone();
+        let metric = events
+            .iter()
+            .find(|m| m.name == "reconcile_gate_fail_open_total")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected metric `reconcile_gate_fail_open_total` to be published \
+                     when Metrics::publish() walks the tree. Captured events: {events:#?}. \
+                     Without #[metric(help = \"...\")] on the field, the counter stays \
+                     invisible to operators alerting on rolling-deploy fail-open events \
+                     (FL-688 v3 Stage C over-cap metric)."
+                )
+            });
+        assert_eq!(
+            metric.value, "1",
+            "expected counter value 1 to flow through the publish chain — got {:?}. \
+             If publish() returned Component without emitting Counter, the derive \
+             output is silently mis-routing the field.",
+            metric.value
         );
     }
 }
