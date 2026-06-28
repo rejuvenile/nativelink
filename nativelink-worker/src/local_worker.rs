@@ -5677,9 +5677,18 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                              prevent permanent action-execution blockage",
                             RECONCILE_FAIL_OPEN_SECS
                         );
-                        reconcile_complete.store(true, Ordering::Release);
                         if let Some(ref state) = self.blobs_available_state {
+                            // `release_startup_reconcile_gate()` stores `true` to the
+                            // shared `reconcile_complete` Arc — the same Arc that
+                            // `reconcile_complete` here is cloned from
+                            // (`reconcile_complete_flag()`). No second store needed
+                            // (matches the ReconcileComplete handler at :4796).
                             state.fs_store.release_startup_reconcile_gate();
+                        } else {
+                            // No FilesystemStore fast tier: gate was never armed via the
+                            // store, so write directly to the shared Arc (this is the
+                            // ONLY release path when blobs_available_state is None).
+                            reconcile_complete.store(true, Ordering::Release);
                         }
                     }
                 },

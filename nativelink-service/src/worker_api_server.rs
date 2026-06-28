@@ -2058,11 +2058,23 @@ struct WorkerConnection {
     /// per connection). Dropped on disconnect via `drop_all_inflight`.
     blobs_available_accumulator: Arc<crate::blobs_available_accumulator::BlobsAvailableAccumulator>,
     /// (FL-688 v3 Stage C — DOC-FIX-1) Whether we have already sent the
-    /// `ReconcileCompleteRequest` signal (tag 14) to this worker. We send it
-    /// exactly ONCE: after the first full-snapshot `BlobsAvailableNotification`
-    /// is processed. After that, the gate is released on the worker side and
-    /// we never need to send it again (reconnects produce a new `WorkerConnection`
-    /// with this flag reset to `false`, so the gate is re-armed per-connect).
+    /// `ReconcileCompleteRequest` signal (tag 14) to this worker on this
+    /// connection. We send it exactly ONCE per `WorkerConnection`: after the
+    /// first full-snapshot `BlobsAvailableNotification` is processed.
+    ///
+    /// Reconnects produce a new `WorkerConnection` with this SERVER-SIDE flag
+    /// reset to `false`, so the server will re-send `ReconcileComplete` on
+    /// every new connection — which is correct, because a reconnecting worker
+    /// needs its gate re-released.
+    ///
+    /// IMPORTANT: this flag controls only the SERVER side. The WORKER-SIDE gate
+    /// (`FilesystemStore::reconcile_complete` Arc<AtomicBool>) is armed ONCE at
+    /// `FilesystemStore::new` and is NOT re-armed on reconnect (see
+    /// `local_worker.rs:4343-4347`, MAJOR-1 fix). After first release the worker
+    /// gate stays released — subsequent `ReconcileComplete` signals from the
+    /// server are handled as no-ops on the worker side (load returns `true`,
+    /// no-op store).
+    ///
     /// Uses `Arc<AtomicBool>` so the flag can be shared into the
     /// `blobs_available_mark_stable_and_backfill` background task and the
     /// `ReconcileComplete` send can occur as the LAST statement of that task
