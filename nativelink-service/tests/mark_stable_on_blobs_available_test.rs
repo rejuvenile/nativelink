@@ -1060,3 +1060,414 @@ async fn v3c_reconcile_complete_exactly_once_fall_through_path()
     let _keep = (cas_store, store_manager, lower_fast_slow, upper_fast_slow);
     Ok(())
 }
+
+// -----------------------------------------------------------------------
+// GAP-1: no_locality_map and empty_endpoint paths each send exactly ONE
+// ReconcileComplete on is_full_snapshot=true.
+//
+// Both paths are early-return exits in handle_blobs_available that bypass
+// the backfill machinery entirely. DOC-FIX-1 (FL-688 v3 Stage C) added
+// `try_send_reconcile_complete` to BOTH exits. Without it the startup
+// reconcile gate on the worker side stays armed and all StartActions NAK
+// with ResourceExhausted.
+//
+// These tests verify the gate-release signal crosses the wire on those two
+// paths. They complement the fall-through test above (which uses a locality
+// map + valid endpoint but an empty digest list).
+// -----------------------------------------------------------------------
+
+/// GAP-1a: `no_locality_map` path — `WorkerApiServer` constructed WITHOUT a
+/// `locality_map` (i.e. `locality_map = None`). The first BlobsAvailable tick
+/// with `is_full_snapshot=true` MUST deliver exactly ONE `ReconcileComplete`
+/// (tag 14) into the server→worker channel.
+///
+/// Mutation: remove `self.try_send_reconcile_complete(notification.is_full_snapshot)`
+/// at `worker_api_server.rs:3018` (the `no_locality_map` exit). The test panics
+/// with:
+/// "GAP-1a no_locality_map: timed out waiting for ReconcileComplete;
+///  the no_locality_map path must send ReconcileComplete on is_full_snapshot=true"
+#[nativelink_test]
+async fn v3c_gap1a_no_locality_map_sends_reconcile_complete()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker;
+
+    const CAS_ENDPOINT: &str = "grpc://192.168.55.10:50087";
+    const UUID_SIZE: usize = 36;
+    const RC_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // Build server WITHOUT a locality_map. This means every BlobsAvailable
+    // hits the no_locality_map early-return at worker_api_server.rs:3006.
+    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) =
+        make_production_cas_store();
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager { _unused: 0 });
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager,
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert("GAP1A_SCHEDULER".to_string(), scheduler);
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: "GAP1A_SCHEDULER".to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [10u8; 6],
+        None, // no locality_map → triggers no_locality_map path
+        Some(cas_store.clone()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .err_tip(|| "Error creating WorkerApiServer for gap-1a test")?;
+
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Update::ConnectWorkerRequest(ConnectWorkerRequest {
+        cas_endpoint: CAS_ENDPOINT.to_string(),
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut server_to_worker: Box<
+        dyn futures::Stream<Item = Result<UpdateForWorker, tonic::Status>> + Unpin + Send,
+    > = Box::new(
+        worker_api_server
+            .inner_connect_worker_for_testing(update_stream)
+            .await?
+            .into_inner(),
+    );
+
+    // Consume ConnectionResult.
+    let first = tokio::time::timeout(RC_TIMEOUT, server_to_worker.next())
+        .await
+        .expect("timed out waiting for ConnectionResult in gap-1a test")
+        .expect("stream closed before ConnectionResult")
+        .err_tip(|| "ConnectionResult was error")?;
+    match first.update.expect("ConnectionResult.update must be set") {
+        update_for_worker::Update::ConnectionResult(cr) => {
+            assert_eq!(cr.worker_id.len(), UUID_SIZE);
+        }
+        other => panic!("Expected ConnectionResult, got {other:?}"),
+    }
+
+    // Send BlobsAvailable with is_full_snapshot=true. With no locality_map
+    // the server exits early at the no_locality_map check, but MUST still
+    // call try_send_reconcile_complete to release the worker's startup gate.
+    tx.send(Update::BlobsAvailable(BlobsAvailableNotification {
+        worker_cas_endpoint: CAS_ENDPOINT.to_string(),
+        digests: vec![],
+        is_full_snapshot: true,
+        evicted_digests: vec![],
+        digest_infos: vec![],
+        cpu_load_pct: 0,
+        cached_directory_digests: vec![],
+        added_subtree_digests: vec![],
+        removed_subtree_digests: vec![],
+        is_full_subtree_snapshot: false,
+        p_core_load_pct: 0,
+        e_core_load_pct: 0,
+        pinned_mirror_digests: vec![],
+        mirror_used_bytes: 0,
+        mirror_max_bytes: 0,
+        pinned_mirror_entries: vec![],
+        pinned_ac_mirror_entries: Vec::new(),
+        indefinite_pin_saturated: false,
+        swap_used_bytes: 0,
+        memory_pressure_level: 0,
+        memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
+    }))
+    .await
+    .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
+
+    let rc_msg = tokio::time::timeout(RC_TIMEOUT, server_to_worker.next())
+        .await
+        .expect(
+            "GAP-1a no_locality_map: timed out waiting for ReconcileComplete; \
+             the no_locality_map path must send ReconcileComplete on is_full_snapshot=true. \
+             MUTATION target: `self.try_send_reconcile_complete(notification.is_full_snapshot)` \
+             at worker_api_server.rs:3018 (no_locality_map exit).",
+        )
+        .expect("stream closed before ReconcileComplete in gap-1a test")
+        .err_tip(|| "gap-1a ReconcileComplete message was an error")?;
+
+    match rc_msg.update.expect("gap-1a message update must be set") {
+        update_for_worker::Update::ReconcileComplete(_) => {} // correct
+        other => {
+            panic!(
+                "GAP-1a no_locality_map: expected ReconcileComplete as first \
+                 post-BlobsAvailable message (no_locality_map exit path with \
+                 is_full_snapshot=true), got {other:?}. The no_locality_map exit \
+                 MUST call `try_send_reconcile_complete(notification.is_full_snapshot)` \
+                 before returning.",
+            );
+        }
+    }
+
+    // Second BlobsAvailable with is_full_snapshot=true must NOT produce a
+    // second ReconcileComplete (exactly-once: AtomicBool compare_exchange).
+    tx.send(Update::BlobsAvailable(BlobsAvailableNotification {
+        worker_cas_endpoint: CAS_ENDPOINT.to_string(),
+        digests: vec![],
+        is_full_snapshot: true,
+        evicted_digests: vec![],
+        digest_infos: vec![],
+        cpu_load_pct: 0,
+        cached_directory_digests: vec![],
+        added_subtree_digests: vec![],
+        removed_subtree_digests: vec![],
+        is_full_subtree_snapshot: false,
+        p_core_load_pct: 0,
+        e_core_load_pct: 0,
+        pinned_mirror_digests: vec![],
+        mirror_used_bytes: 0,
+        mirror_max_bytes: 0,
+        pinned_mirror_entries: vec![],
+        pinned_ac_mirror_entries: Vec::new(),
+        indefinite_pin_saturated: false,
+        swap_used_bytes: 0,
+        memory_pressure_level: 0,
+        memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
+    }))
+    .await
+    .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
+
+    // Give a short window for a spurious second ReconcileComplete to appear;
+    // the channel must remain empty (exactly-once guard).
+    let no_second = tokio::time::timeout(
+        Duration::from_millis(200),
+        server_to_worker.next(),
+    )
+    .await;
+    assert!(
+        no_second.is_err(),
+        "GAP-1a no_locality_map: received a SECOND ReconcileComplete on the \
+         second is_full_snapshot=true tick — exactly-once guarantee violated. \
+         The AtomicBool compare_exchange in send_reconcile_complete_static \
+         must prevent duplicate sends."
+    );
+
+    let _keep = (cas_store, store_manager, lower_fast_slow, upper_fast_slow);
+    Ok(())
+}
+
+/// GAP-1b: `empty_endpoint` path — `WorkerApiServer` constructed WITH a
+/// `locality_map` but with an EMPTY `cas_endpoint` (both the server's stored
+/// endpoint and the per-notification override are empty). The first
+/// BlobsAvailable tick with `is_full_snapshot=true` MUST deliver exactly ONE
+/// `ReconcileComplete` (tag 14) into the server→worker channel.
+///
+/// Mutation: remove `self.try_send_reconcile_complete(notification.is_full_snapshot)`
+/// at `worker_api_server.rs:3043` (the `empty_endpoint` exit). The test panics
+/// with:
+/// "GAP-1b empty_endpoint: timed out waiting for ReconcileComplete;
+///  the empty_endpoint path must send ReconcileComplete on is_full_snapshot=true"
+#[nativelink_test]
+async fn v3c_gap1b_empty_endpoint_sends_reconcile_complete()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker;
+
+    // Empty string → server's cas_endpoint stays empty; notification override
+    // is also empty → triggers the empty_endpoint early-return at
+    // worker_api_server.rs:3033.
+    const UUID_SIZE: usize = 36;
+    const RC_TIMEOUT: Duration = Duration::from_secs(5);
+
+    // Build server WITH a locality_map (so no_locality_map is not hit) but
+    // without a cas_endpoint (so empty_endpoint is hit after the locality_map
+    // check passes).
+    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) =
+        make_production_cas_store();
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager { _unused: 0 });
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager,
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+    let locality_map = new_shared_blob_locality_map();
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert("GAP1B_SCHEDULER".to_string(), scheduler);
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: "GAP1B_SCHEDULER".to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [11u8; 6],
+        Some(locality_map), // locality_map present so no_locality_map path is NOT hit
+        Some(cas_store.clone()),
+        None,
+        None,
+        None,
+        None,
+    )
+    .err_tip(|| "Error creating WorkerApiServer for gap-1b test")?;
+
+    let (tx, rx) = mpsc::channel(1);
+    // Connect with an empty cas_endpoint so `self.cas_endpoint` on the
+    // per-connection struct is set to "". The notification will also carry
+    // an empty worker_cas_endpoint → both empty → empty_endpoint path fires.
+    tx.send(Update::ConnectWorkerRequest(ConnectWorkerRequest {
+        cas_endpoint: String::new(), // "" → self.cas_endpoint on the connection is ""
+        ..Default::default()
+    }))
+    .await
+    .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut server_to_worker: Box<
+        dyn futures::Stream<Item = Result<UpdateForWorker, tonic::Status>> + Unpin + Send,
+    > = Box::new(
+        worker_api_server
+            .inner_connect_worker_for_testing(update_stream)
+            .await?
+            .into_inner(),
+    );
+
+    // Consume ConnectionResult.
+    let first = tokio::time::timeout(RC_TIMEOUT, server_to_worker.next())
+        .await
+        .expect("timed out waiting for ConnectionResult in gap-1b test")
+        .expect("stream closed before ConnectionResult")
+        .err_tip(|| "ConnectionResult was error")?;
+    match first.update.expect("ConnectionResult.update must be set") {
+        update_for_worker::Update::ConnectionResult(cr) => {
+            assert_eq!(cr.worker_id.len(), UUID_SIZE);
+        }
+        other => panic!("Expected ConnectionResult, got {other:?}"),
+    }
+
+    // Send BlobsAvailable with is_full_snapshot=true and empty endpoint
+    // override. Both self.cas_endpoint (from ConnectWorkerRequest) and
+    // notification.worker_cas_endpoint are empty → empty_endpoint exit.
+    tx.send(Update::BlobsAvailable(BlobsAvailableNotification {
+        worker_cas_endpoint: String::new(), // empty override → falls back to self.cas_endpoint = ""
+        digests: vec![],
+        is_full_snapshot: true,
+        evicted_digests: vec![],
+        digest_infos: vec![],
+        cpu_load_pct: 0,
+        cached_directory_digests: vec![],
+        added_subtree_digests: vec![],
+        removed_subtree_digests: vec![],
+        is_full_subtree_snapshot: false,
+        p_core_load_pct: 0,
+        e_core_load_pct: 0,
+        pinned_mirror_digests: vec![],
+        mirror_used_bytes: 0,
+        mirror_max_bytes: 0,
+        pinned_mirror_entries: vec![],
+        pinned_ac_mirror_entries: Vec::new(),
+        indefinite_pin_saturated: false,
+        swap_used_bytes: 0,
+        memory_pressure_level: 0,
+        memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
+    }))
+    .await
+    .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
+
+    let rc_msg = tokio::time::timeout(RC_TIMEOUT, server_to_worker.next())
+        .await
+        .expect(
+            "GAP-1b empty_endpoint: timed out waiting for ReconcileComplete; \
+             the empty_endpoint path must send ReconcileComplete on is_full_snapshot=true. \
+             MUTATION target: `self.try_send_reconcile_complete(notification.is_full_snapshot)` \
+             at worker_api_server.rs:3043 (empty_endpoint exit).",
+        )
+        .expect("stream closed before ReconcileComplete in gap-1b test")
+        .err_tip(|| "gap-1b ReconcileComplete message was an error")?;
+
+    match rc_msg.update.expect("gap-1b message update must be set") {
+        update_for_worker::Update::ReconcileComplete(_) => {} // correct
+        other => {
+            panic!(
+                "GAP-1b empty_endpoint: expected ReconcileComplete as first \
+                 post-BlobsAvailable message (empty_endpoint exit path with \
+                 is_full_snapshot=true), got {other:?}. The empty_endpoint exit \
+                 MUST call `try_send_reconcile_complete(notification.is_full_snapshot)` \
+                 before returning.",
+            );
+        }
+    }
+
+    // Second BlobsAvailable with is_full_snapshot=true must NOT produce a
+    // second ReconcileComplete (exactly-once guard).
+    tx.send(Update::BlobsAvailable(BlobsAvailableNotification {
+        worker_cas_endpoint: String::new(),
+        digests: vec![],
+        is_full_snapshot: true,
+        evicted_digests: vec![],
+        digest_infos: vec![],
+        cpu_load_pct: 0,
+        cached_directory_digests: vec![],
+        added_subtree_digests: vec![],
+        removed_subtree_digests: vec![],
+        is_full_subtree_snapshot: false,
+        p_core_load_pct: 0,
+        e_core_load_pct: 0,
+        pinned_mirror_digests: vec![],
+        mirror_used_bytes: 0,
+        mirror_max_bytes: 0,
+        pinned_mirror_entries: vec![],
+        pinned_ac_mirror_entries: Vec::new(),
+        indefinite_pin_saturated: false,
+        swap_used_bytes: 0,
+        memory_pressure_level: 0,
+        memory_pressured: false,
+        available_disk_bytes: 0,
+        disk_pressured: false,
+    }))
+    .await
+    .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
+
+    let no_second = tokio::time::timeout(
+        Duration::from_millis(200),
+        server_to_worker.next(),
+    )
+    .await;
+    assert!(
+        no_second.is_err(),
+        "GAP-1b empty_endpoint: received a SECOND ReconcileComplete on the \
+         second is_full_snapshot=true tick — exactly-once guarantee violated. \
+         The AtomicBool compare_exchange in send_reconcile_complete_static \
+         must prevent duplicate sends."
+    );
+
+    let _keep = (cas_store, store_manager, lower_fast_slow, upper_fast_slow);
+    Ok(())
+}
