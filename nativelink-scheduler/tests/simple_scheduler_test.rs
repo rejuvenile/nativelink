@@ -5037,3 +5037,195 @@ async fn dispatch_attribution_match_latency_emitted_at_info() -> Result<(), Erro
 
     Ok(())
 }
+
+/// (FL-688 v3 Stage C follow-up — BLOCK-3 NAK-seam e2e test)
+///
+/// Verifies the full NAK→scheduler seam: when a worker returns
+/// `Code::ResourceExhausted` via `UpdateWithError`, the scheduler's
+/// `due_to_backpressure` path at `simple_scheduler_state_manager.rs:817`
+/// must NOT increment `attempts`, so the action stays `Queued` and
+/// re-matchable indefinitely — regardless of `max_job_retries`.
+///
+/// Seam covered: `UpdateWithError(ResourceExhausted)` →
+/// `SimpleSchedulerStateManager::update_operation` →
+/// `due_to_backpressure = true` → `attempts` unchanged → `ActionStage::Queued`.
+///
+/// Mutation: change `Code::ResourceExhausted` to `Code::Unavailable` in the
+/// NAK — `due_to_backpressure` becomes `false` → `attempts` increments →
+/// action hard-fails after `max_job_retries`. The test panics with:
+/// "NAK-seam BLOCK-3: action reached Completed after ResourceExhausted NAK —
+///  attempts must NOT be incremented for Code::ResourceExhausted backpressure NAKs
+///  (simple_scheduler_state_manager.rs:817: due_to_backpressure check)"
+///
+/// Production seam: `local_worker.rs:4834` sends `Code::ResourceExhausted`
+/// for the startup-reconcile gate NAK; the scheduler at `:817` maps it to
+/// `due_to_backpressure = true` → re-queues without consuming the retry budget.
+/// Using `Code::Unavailable` instead burns the budget and hard-fails the action
+/// after `max_job_retries` NAKs — the regression BLOCK-3 fixed.
+#[nativelink_test]
+async fn v3c_block3_nak_resource_exhausted_does_not_increment_attempts_test()
+-> Result<(), Error> {
+    const NAK_TIMEOUT: Duration = Duration::from_secs(5);
+    let worker_id = WorkerId("nak_seam_worker".to_string());
+
+    // max_job_retries: 1 — a Code::Unavailable NAK would exhaust retries after
+    // 2 UpdateWithErrors; Code::ResourceExhausted must never exhaust them.
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            max_job_retries: 1,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+    let action_digest = DigestInfo::new([0xABu8; 32], 256);
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    let insert_timestamp = make_system_time(1);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    // ----- StartAction: wait for worker to receive it -----
+    let operation_id = {
+        let op_id = match tokio::time::timeout(NAK_TIMEOUT, rx_from_worker.recv())
+            .await
+            .expect(
+                "NAK-seam BLOCK-3: timed out waiting for StartAction — \
+                 action was not dispatched to worker within 5s",
+            )
+            .unwrap()
+            .update
+        {
+            Some(update_for_worker::Update::StartAction(exec)) => exec.operation_id,
+            v => panic!("NAK-seam BLOCK-3: expected StartAction, got: {v:?}"),
+        };
+        // Consume the Executing transition.
+        assert_eq!(
+            tokio::time::timeout(NAK_TIMEOUT, action_listener.changed())
+                .await
+                .expect(
+                    "NAK-seam BLOCK-3: timed out waiting for Executing transition — \
+                     listener did not fire within 5s",
+                )
+                .unwrap()
+                .0
+                .stage,
+            ActionStage::Executing,
+            "NAK-seam BLOCK-3: expected Executing after StartAction"
+        );
+        OperationId::from(op_id.as_str())
+    };
+
+    // ----- NAK #1 with Code::ResourceExhausted — must NOT burn attempts -----
+    scheduler
+        .update_action(
+            &worker_id,
+            &operation_id,
+            UpdateOperationType::UpdateWithError(make_err!(
+                Code::ResourceExhausted,
+                "Worker startup reconcile in progress"
+            )),
+        )
+        .await
+        .err_tip(|| "update_action NAK#1 failed")?;
+
+    {
+        // Action must return to Queued — ResourceExhausted does not count as attempt.
+        assert_eq!(
+            tokio::time::timeout(NAK_TIMEOUT, action_listener.changed())
+                .await
+                .expect(
+                    "NAK-seam BLOCK-3: timed out waiting for Queued after NAK#1 — \
+                     scheduler did not re-queue the action within 5s",
+                )
+                .unwrap()
+                .0
+                .stage,
+            ActionStage::Queued,
+            "NAK-seam BLOCK-3: action reached Completed after ResourceExhausted NAK — \
+             attempts must NOT be incremented for Code::ResourceExhausted backpressure NAKs \
+             (simple_scheduler_state_manager.rs:817: due_to_backpressure check)"
+        );
+    }
+
+    // ----- Re-dispatch to the same worker; NAK #2 — still must not burn attempts -----
+    // (max_job_retries=1; if attempts were incremented, the second NAK would hard-fail)
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+
+    let operation_id_2 = {
+        let op_id = match tokio::time::timeout(NAK_TIMEOUT, rx_from_worker.recv())
+            .await
+            .expect(
+                "NAK-seam BLOCK-3: timed out waiting for StartAction re-dispatch \
+                 after NAK#1 — action not re-dispatched within 5s",
+            )
+            .unwrap()
+            .update
+        {
+            Some(update_for_worker::Update::StartAction(exec)) => exec.operation_id,
+            v => panic!("NAK-seam BLOCK-3: expected StartAction on re-dispatch, got: {v:?}"),
+        };
+        assert_eq!(
+            tokio::time::timeout(NAK_TIMEOUT, action_listener.changed())
+                .await
+                .expect(
+                    "NAK-seam BLOCK-3: timed out waiting for Executing transition (re-dispatch)",
+                )
+                .unwrap()
+                .0
+                .stage,
+            ActionStage::Executing,
+            "NAK-seam BLOCK-3: expected Executing on re-dispatch"
+        );
+        OperationId::from(op_id.as_str())
+    };
+
+    scheduler
+        .update_action(
+            &worker_id,
+            &operation_id_2,
+            UpdateOperationType::UpdateWithError(make_err!(
+                Code::ResourceExhausted,
+                "Worker startup reconcile in progress"
+            )),
+        )
+        .await
+        .err_tip(|| "update_action NAK#2 failed")?;
+
+    {
+        // Still Queued — two ResourceExhausted NAKs with max_job_retries=1 must
+        // NOT hard-fail. If attempts were incremented, this would be Completed.
+        assert_eq!(
+            tokio::time::timeout(NAK_TIMEOUT, action_listener.changed())
+                .await
+                .expect(
+                    "NAK-seam BLOCK-3: timed out waiting for Queued after NAK#2 — \
+                     scheduler did not re-queue the action within 5s (second NAK)",
+                )
+                .unwrap()
+                .0
+                .stage,
+            ActionStage::Queued,
+            "NAK-seam BLOCK-3: action reached Completed after second ResourceExhausted NAK — \
+             attempts must NOT be incremented for Code::ResourceExhausted backpressure NAKs \
+             (simple_scheduler_state_manager.rs:817: due_to_backpressure check). \
+             Mutation target: change Code::ResourceExhausted to Code::Unavailable at \
+             local_worker.rs:4834 to reproduce — Unavailable DOES increment attempts."
+        );
+    }
+
+    Ok(())
+}

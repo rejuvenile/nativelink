@@ -195,5 +195,21 @@ pub(crate) fn update_eq(
             }
             _ => false,
         },
+        // (FL-688 v3 Stage C) AC pin resync. No scheduler test exercises this
+        // server→worker variant; added to keep this exhaustive match compiling.
+        update_for_worker::Update::AcPinResync(actual_update) => match expected_update {
+            update_for_worker::Update::AcPinResync(expected_update) => {
+                expected_update == actual_update
+            }
+            _ => false,
+        },
+        // (FL-688 v3 Stage C) Reconcile gate release signal. No scheduler test
+        // exercises this server→worker variant; added to keep exhaustive match compiling.
+        update_for_worker::Update::ReconcileComplete(actual_update) => match expected_update {
+            update_for_worker::Update::ReconcileComplete(expected_update) => {
+                expected_update == actual_update
+            }
+            _ => false,
+        },
     }
 }
