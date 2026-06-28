@@ -6926,9 +6926,13 @@ pub struct Metrics {
     /// (`RECONCILE_FAIL_OPEN_SECS = 20`) rather than by a `ReconcileComplete`
     /// from the server. Non-zero = rolling-deploy window where action execution
     /// was blocked for up to 20s; gate-armed window's over-cap exposure was
-    /// invisible without this counter. Operators should alert if > 0.
+    /// invisible without this counter. This is a MONOTONIC counter — alert on
+    /// the RATE (`rate(...[5m]) > 0` in steady state), NOT on the level: a
+    /// level alert (`> 0`) stays permanently triggered after any rollout that
+    /// legitimately fail-opened a worker, masking a later genuine
+    /// never-updated-server mismatch (red-team pre-mortem).
     #[metric(
-        help = "Times the startup reconcile gate released via fail-open timer (not ReconcileComplete); non-zero = rolling-deploy exposure / server version mismatch."
+        help = "Times the startup reconcile gate released via fail-open timer (not ReconcileComplete); monotonic — alert on RATE not level; sustained rate>0 post-rollout = server version mismatch."
     )]
     reconcile_gate_fail_open_total: Counter,
 }

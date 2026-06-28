@@ -5050,9 +5050,13 @@ async fn dispatch_attribution_match_latency_emitted_at_info() -> Result<(), Erro
 /// `SimpleSchedulerStateManager::update_operation` →
 /// `due_to_backpressure = true` → `attempts` unchanged → `ActionStage::Queued`.
 ///
-/// Mutation: change `Code::ResourceExhausted` to `Code::Unavailable` in the
-/// NAK — `due_to_backpressure` becomes `false` → `attempts` increments →
-/// action hard-fails after `max_job_retries`. The test panics with:
+/// Mutation: change `Code::ResourceExhausted` to `Code::Unavailable` at BOTH
+/// NAK send-sites (the two `Code::ResourceExhausted,` args in the test body) —
+/// mutating only ONE is a false-green: with `max_job_retries = 1`, one
+/// `Unavailable` NAK takes `attempts` to 1 (not `> 1`) so the action still
+/// re-queues; both must flip to drive `attempts` to 2 (`> max_job_retries`)
+/// and trip the hard-fail. Then `due_to_backpressure` becomes `false` →
+/// `attempts` increments → action hard-fails after `max_job_retries`. Panics:
 /// "NAK-seam BLOCK-3: action reached Completed after ResourceExhausted NAK —
 ///  attempts must NOT be incremented for Code::ResourceExhausted backpressure NAKs
 ///  (simple_scheduler_state_manager.rs:817: due_to_backpressure check)"
