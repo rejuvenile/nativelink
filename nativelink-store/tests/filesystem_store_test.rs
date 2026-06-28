@@ -2291,3 +2291,263 @@ async fn make_distinct_blob(
         .err_tip(|| "writing pinnable blob in FL-681 follow-up test")?;
     Ok(digest)
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FL-688 v3 Stage C: startup reconcile gate + reconcile-pin tests
+//
+// Three invariants tested:
+//
+// (a+b+c) RECONCILE-PIN SURVIVAL: a blob re-admitted UNPINNED at startup
+//   but then reconcile-pinned (indefinite) BEFORE a runtime insert fires moka's
+//   per-insert capacity check (which would evict the over-cap LRU entry) MUST
+//   survive — the pin moves it out of moka's evictable set.
+//
+// (d) GATE-SEMANTICS: `set_startup_reconcile_gate` arms the gate (flag=false);
+//   `release_startup_reconcile_gate` releases it (flag=true). The
+//   `reconcile_complete_flag()` Arc reflects both transitions. The background
+//   `drain_interval` tick in `drain_evictions` reads this flag; when false it
+//   skips `run_pending_tasks_and_drain`. This test verifies the flag
+//   transitions, which are the ONLY observable contract of the gate from
+//   outside the background task.
+//
+// (e) GATE-ONLY-RELEASED-BY-SIGNAL: the gate flag is NOT released by
+//   `pin_digest_indefinite_or_time_bounded` (the reconcile-pin call). Only
+//   `release_startup_reconcile_gate` releases it. Calling reconcile-pin while
+//   the gate is armed leaves the gate armed.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// FL-688 v3 Stage C — Tests (a)+(b)+(c): Reconcile-pin (indefinite) established
+/// BEFORE a runtime insert fires moka's per-insert capacity check.
+///
+/// Setup: store with `max_bytes = 2 × BLOB_SIZE` (two blobs fit). Two blobs
+/// are written (store is AT cap). Then:
+///
+///   1. The startup reconcile gate is armed (`set_startup_reconcile_gate`).
+///   2. `d0` is reconcile-pinned INDEFINITELY via `pin_digest_indefinite_with_result`.
+///      This moves d0 out of moka's evictable set into the pinned DashMap.
+///   3. A RUNTIME INSERT (`d2`, size = BLOB_SIZE) puts the cache OVER cap.
+///      Moka's per-insert capacity check fires. d0 is in the pinned DashMap
+///      so only d1 is evictable. d0 MUST survive.
+///   4. Assert `d0` is still pinned (indefinite pin bytes > 0) and readable.
+///
+/// Mutation: skip `pin_digest_indefinite_with_result` at step 2. Without the
+/// pin, d0 remains in moka's evictable set. The runtime insert may evict d0.
+/// The assertion "needed blob evicted before reconcile-pin: d0 must still be
+/// pinned after the runtime insert" fires.
+///
+/// The assertion tests the pin invariant: a PINNED entry cannot be evicted by
+/// moka's capacity check (pinned entries live in a side DashMap outside the
+/// moka cache). This is the production invariant, not a scheduling assumption.
+#[nativelink_test]
+async fn v3c_reconcile_pin_survives_runtime_insert() -> Result<(), Error> {
+    // N blobs fit; pin_cap = 25% x max_bytes. We need pin_cap >= BLOB_SIZE so
+    // that pin_digest_indefinite_with_result can admit at least one blob.
+    // With N_AT_CAP=5: pin_cap = 25% x (5 x BLOB_SIZE) = 1.25 x BLOB_SIZE >= BLOB_SIZE.
+    const BLOB_SIZE: usize = 1024;
+    const N_AT_CAP: u8 = 5; // store fits exactly 5 blobs; 6th triggers eviction
+
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: (N_AT_CAP as usize) * BLOB_SIZE,
+            evict_bytes: 0,
+            max_seconds: 0,
+            max_count: 0,
+        }),
+        block_size: 1,
+        // pending_bis_pin_max_bytes = 0 falls back to pin_cap = 1280 >= 1024.
+        ..Default::default()
+    })
+    .await?;
+
+    // Write N_AT_CAP blobs -> store is AT cap. d0 is inserted first (LRU target
+    // without pin; with pin it is protected from moka's capacity check).
+    let d0 = make_distinct_blob(&store, 0, BLOB_SIZE).await?;
+    for i in 1..N_AT_CAP {
+        let _ = make_distinct_blob(&store, i, BLOB_SIZE).await?;
+    }
+
+    // Step 1: arm the startup reconcile gate.
+    store.set_startup_reconcile_gate();
+
+    // MUTATION TARGET: comment out the next two lines to simulate
+    // "skip reconcile-pin". Without the pin, d0 remains in moka's evictable
+    // set. The runtime insert below puts the cache over cap and moka may
+    // evict d0. The assertion at step 4 fires:
+    // "needed blob evicted before reconcile-pin: d0 must still be pinned
+    //  after the runtime insert"
+    //
+    // Step 2: reconcile-pin d0 INDEFINITELY before any runtime insert.
+    let pinned = store.pin_digest_indefinite_with_result(&d0);
+    assert!(
+        pinned,
+        "reconcile-pin precondition: d0 must be in eviction map at pin time          (no runtime insert has happened; if this fails check max_bytes config)"
+    );
+
+    // Step 3: runtime insert (blob N_AT_CAP+1) fires moka's per-insert
+    // capacity check. Cache goes to N_AT_CAP+1 blobs (over cap). d0 is in
+    // the pinned DashMap so moka cannot evict it. d0 MUST survive.
+    let _ = make_distinct_blob(&store, N_AT_CAP, BLOB_SIZE).await?;
+
+    // Step 4: d0 must still be pinned.
+    let indef_bytes = store.indefinite_pinned_bytes();
+    assert!(
+        indef_bytes >= BLOB_SIZE as u64,
+        "needed blob evicted before reconcile-pin: d0 must still be pinned          after the runtime insert (indefinite_pinned_bytes = {}, expected >= {});          mutation: skip pin_digest_indefinite_with_result above and moka may          evict d0 as LRU, indef_bytes drops to 0 and this assertion fires",
+        indef_bytes,
+        BLOB_SIZE
+    );
+
+    // d0 must still be readable.
+    let key = StoreKey::Digest(d0);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.get_part_unchunked(key, 0, None),
+    )
+    .await
+    .expect("must not deadlock -- reconcile-pin survival contract")
+    .expect(
+        "needed blob evicted before reconcile-pin: d0 not readable after          runtime insert; pinning failed to protect it from moka per-insert eviction"
+    );
+
+    Ok(())
+}
+
+/// FL-688 v3 Stage C — Test (d): gate-semantics: arm → false, release → true.
+///
+/// `set_startup_reconcile_gate` must store `false` into the shared
+/// `Arc<AtomicBool>` (gate ARMED = drain blocked).
+/// `release_startup_reconcile_gate` must store `true` (gate RELEASED = drain
+/// runs normally).
+/// `reconcile_complete_flag()` must return the SAME Arc that reflects both
+/// transitions.
+///
+/// The background `drain_interval` tick in `drain_evictions` reads this
+/// `Arc<AtomicBool>` with `Ordering::Acquire` and skips
+/// `run_pending_tasks_and_drain` when it is `false`. This test verifies the
+/// observable contract of the gate (the flag transitions) without racing the
+/// 10-second tick interval.
+///
+/// Mutation: in `moka_evicting_map.rs::set_startup_reconcile_gate`, change
+/// `store(false, ...)` to `store(true, ...)`. The gate becomes a no-op (drain
+/// runs during reconcile window). The assertion "gate must be ARMED (false)
+/// after set_startup_reconcile_gate" fires.
+#[nativelink_test]
+async fn v3c_gate_arm_and_release_semantics() -> Result<(), Error> {
+    use core::sync::atomic::Ordering;
+
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 64 * 1024,
+            ..Default::default()
+        }),
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    // Before arming: flag is `true` (default = gate off = drain runs normally).
+    let flag = store.reconcile_complete_flag();
+    assert!(
+        flag.load(Ordering::Acquire),
+        "gate must start RELEASED (true) by default — server-side stores must \
+         never have their drain suppressed by an un-armed gate"
+    );
+
+    // MUTATION TARGET: set_startup_reconcile_gate must set flag to false.
+    store.set_startup_reconcile_gate();
+    assert!(
+        !flag.load(Ordering::Acquire),
+        "gate must be ARMED (false) after set_startup_reconcile_gate — the background \
+         drain_interval tick checks this flag; if it stays true, the drain runs during \
+         the reconcile window and can race the reconcile-pin calls"
+    );
+
+    // release_startup_reconcile_gate must flip flag back to true.
+    store.release_startup_reconcile_gate();
+    assert!(
+        flag.load(Ordering::Acquire),
+        "gate must be RELEASED (true) after release_startup_reconcile_gate — \
+         normal periodic eviction must resume; if this stays false the drain is \
+         permanently suppressed and the store never converges to cap after reconcile"
+    );
+
+    // The Arc returned by reconcile_complete_flag() must reflect live changes —
+    // arm/release again and verify via the same Arc handle.
+    store.set_startup_reconcile_gate();
+    assert!(
+        !flag.load(Ordering::Acquire),
+        "reconcile_complete_flag() Arc must reflect live gate transitions — \
+         the returned handle must NOT be a snapshot but a live shared reference"
+    );
+
+    Ok(())
+}
+
+/// FL-688 v3 Stage C — Test (e): the gate is NOT released by reconcile-pin.
+///
+/// Calling `pin_digest_indefinite_or_time_bounded` (the reconcile-pin
+/// primitive) while the gate is armed MUST leave the gate armed. Only
+/// `release_startup_reconcile_gate` releases the gate.
+///
+/// Ordering A requires: (1) arm gate, (2) pin blobs, (3) release gate.
+/// If pinning released the gate, the executor might unblock before all blobs
+/// are pinned, allowing runtime inserts to race the remaining pin calls.
+///
+/// Mutation: in `filesystem_store.rs::pin_digest_indefinite_or_time_bounded`,
+/// add `self.release_startup_reconcile_gate()` before returning. The assertion
+/// "gate must remain ARMED after reconcile-pin" fires.
+#[nativelink_test]
+async fn v3c_gate_not_released_by_reconcile_pin() -> Result<(), Error> {
+    use core::sync::atomic::Ordering;
+
+    const BLOB_SIZE: usize = 2048;
+
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 64 * 1024,
+            ..Default::default()
+        }),
+        block_size: 1,
+        pending_bis_pin_max_bytes: BLOB_SIZE as u64 * 4,
+        ..Default::default()
+    })
+    .await?;
+
+    let d0 = make_distinct_blob(&store, 0, BLOB_SIZE).await?;
+
+    // Arm the gate.
+    store.set_startup_reconcile_gate();
+    let flag = store.reconcile_complete_flag();
+    assert!(
+        !flag.load(Ordering::Acquire),
+        "precondition: gate must be ARMED before the pin call"
+    );
+
+    // MUTATION TARGET: call reconcile-pin. The gate must stay armed.
+    let outcome = store.pin_digest_indefinite_or_time_bounded(&d0);
+    assert!(
+        matches!(outcome, IndefinitePinOutcome::Indefinite),
+        "reconcile-pin must succeed (blob is in map, cap not saturated)"
+    );
+    assert!(
+        !flag.load(Ordering::Acquire),
+        "gate must remain ARMED after reconcile-pin: only release_startup_reconcile_gate \
+         releases the gate; pin calls must not release it (Ordering A: executor unblock \
+         must happen AFTER all blobs are pinned, not after each individual pin)"
+    );
+
+    // Verify the gate is released by the correct call.
+    store.release_startup_reconcile_gate();
+    assert!(
+        flag.load(Ordering::Acquire),
+        "gate must be RELEASED after release_startup_reconcile_gate"
+    );
+
+    Ok(())
+}

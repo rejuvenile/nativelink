@@ -38,13 +38,13 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     MirrorPinEntry, PeerHintsChunk, UpdateForWorker, chunked_message, execute_result,
 };
 use nativelink_store::fast_slow_store::{FastSlowStore, SlowTierMetricSink};
-use nativelink_store::filesystem_store::FilesystemStore;
+use nativelink_store::filesystem_store::{FilesystemStore, IndefinitePinOutcome};
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::DigestHasherFunc;
-use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
+use nativelink_util::metrics_utils::{AsyncCounterWrapper, Counter, CounterWithTime};
 use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::{
@@ -4325,6 +4325,30 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // Set to true when shutting down, this stops any new StartAction.
         let mut shutting_down = false;
 
+        // (FL-688 v3 Stage C — Ordering A) Startup reconcile gate. Starts
+        // `false` when a FilesystemStore fast tier is present (gate armed by
+        // `set_startup_reconcile_gate` below); stays `true` otherwise.
+        // The StartAction handler checks this BEFORE accepting work so that
+        // reconcile-pin calls in UploadMissingBlobs fire BEFORE any runtime
+        // insert can race a per-insert moka eviction. Flipped to `true` by
+        // the ReconcileComplete handler when the server sends tag-14.
+        //
+        // NOTE: `set_startup_reconcile_gate` arms BOTH this local flag AND the
+        // `MokaEvictingMap::reconcile_complete` flag (which gates the drain
+        // loop). They are derived from the same `Arc<AtomicBool>` via
+        // `FilesystemStore::reconcile_complete_flag`.
+        let reconcile_complete: Arc<AtomicBool> =
+            if let Some(ref state) = self.blobs_available_state {
+                // Arm the gate before the background eviction loop starts
+                // (background eviction was started during store construction
+                // before we get here, so we gate via the Arc flag directly).
+                state.fs_store.set_startup_reconcile_gate();
+                state.fs_store.reconcile_complete_flag()
+            } else {
+                // No FilesystemStore fast tier — gate not needed; default true.
+                Arc::new(AtomicBool::new(true))
+            };
+
         // (#37) Worker-local swap-gate state, main-loop-local (the gate
         // decision happens synchronously on each StartAction). `since`
         // anchors the time-bounded fleet fail-open (§5 case 3b): a worker
@@ -4629,6 +4653,46 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 valid_count = digests.len(),
                                 "UploadMissingBlobs: server requests blob backfill"
                             );
+                            // (FL-688 v3 Stage C — PRIMARY: reconcile-pin)
+                            // Pin each requested digest INDEFINITELY *before*
+                            // spawning the upload task. This fires while the
+                            // executor is still blocked (reconcile_complete=false
+                            // above), so no runtime insert has happened yet and
+                            // the per-insert moka eviction cannot race us.
+                            // Cap-refusal leaves the blob UNPROTECTED (only the
+                            // time-bounded fallback applies); this is the
+                            // acknowledged item-D residual (R3).
+                            if let Some(ref state) = self.blobs_available_state {
+                                let mut over_cap_count: u64 = 0;
+                                for d in &digests {
+                                    match state.fs_store.pin_digest_indefinite_or_time_bounded(d) {
+                                        IndefinitePinOutcome::Indefinite => {}
+                                        IndefinitePinOutcome::TimeBoundedFallback => {
+                                            warn!(
+                                                digest = ?d,
+                                                "reconcile-pin: indefinite cap exhausted, \
+                                                 falling back to time-bounded pin (blob exposed \
+                                                 after PIN_TIMEOUT_SECS if cap stays saturated)"
+                                            );
+                                            over_cap_count += 1;
+                                        }
+                                        IndefinitePinOutcome::Refused => {
+                                            warn!(
+                                                digest = ?d,
+                                                "reconcile-pin: blob absent from eviction map \
+                                                 (already evicted or never inserted); \
+                                                 upload will fail and server will re-request"
+                                            );
+                                            over_cap_count += 1;
+                                        }
+                                    }
+                                }
+                                if over_cap_count > 0 {
+                                    self.metrics
+                                        .reconcile_needed_but_over_cap
+                                        .add(over_cap_count);
+                                }
+                            }
                             let ram = self.running_actions_manager.clone();
                             let max_concurrent_uploads = effective_max_concurrent_uploads(
                                 self.config.max_concurrent_uploads,
@@ -4665,7 +4729,63 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     .and_then(|s| s.cas_server_fss.as_ref());
                             handle_batch_write_small_blobs(cas_server_fss, &batch.blobs);
                         }
+                        Update::ReconcileComplete(_) => {
+                            // (FL-688 v3 Stage C — Ordering A, item 4)
+                            // Server has processed the first full BlobsAvailable
+                            // snapshot and finished requesting any missing uploads.
+                            // Release the startup reconcile gate: unblock the
+                            // background LRU drain and allow action execution.
+                            //
+                            // This signal is SEPARATE from UploadMissingBlobs so
+                            // that a worker with NO missing blobs (nothing to
+                            // upload) still gets the gate released — the early-
+                            // return paths in `request_missing_blob_uploads` would
+                            // otherwise suppress all traffic and wedge an over-cap
+                            // worker forever (DOC-FIX-1).
+                            if let Some(ref state) = self.blobs_available_state {
+                                state.fs_store.release_startup_reconcile_gate();
+                                reconcile_complete
+                                    .store(true, Ordering::Release);
+                                info!(
+                                    "ReconcileComplete received: startup reconcile gate released, \
+                                     action executor unblocked"
+                                );
+                            } else {
+                                // No FilesystemStore fast tier; gate was never
+                                // armed, so this is a no-op.
+                                trace!(
+                                    "ReconcileComplete received but no FilesystemStore (no-op)"
+                                );
+                            }
+                        }
                         Update::StartAction(start_execute) => {
+                            // (FL-688 v3 Stage C — Ordering A, item 4)
+                            // Block new actions until the startup reconcile is
+                            // complete. This ensures reconcile-pin calls in the
+                            // UploadMissingBlobs handler fire before any runtime
+                            // insert can race a per-insert moka eviction.
+                            // The gate starts `false` at boot (set by
+                            // `set_startup_reconcile_gate`) and is flipped to
+                            // `true` by `ReconcileComplete`. For workers without
+                            // a FilesystemStore fast tier the gate is never armed
+                            // and starts `true` — no behavior change.
+                            if !reconcile_complete.load(Ordering::Acquire) {
+                                warn!(
+                                    "NAKing StartAction: startup reconcile gate still open \
+                                     (waiting for server ReconcileCompleteRequest)"
+                                );
+                                if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
+                                    self.grpc_client.clone().execution_response(
+                                        ExecuteResult{
+                                            instance_name,
+                                            operation_id: start_execute.operation_id,
+                                            result: Some(execute_result::Result::InternalError(make_err!(Code::Unavailable, "Worker startup reconcile in progress").into())),
+                                        }
+                                    ).await?;
+                                }
+                                continue;
+                            }
+
                             // Don't accept any new requests if we're shutting down.
                             if shutting_down {
                                 if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
@@ -6684,6 +6804,15 @@ pub struct Metrics {
         help = "Count of currently-in-flight detached AC writes spawned by O15; should track tail of AC-store update latency."
     )]
     ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
+    /// (FL-688 v3 Stage C) Count of blobs in `UploadMissingBlobs` where
+    /// the reconcile-pin fell back to time-bounded or was fully refused
+    /// because the indefinite-pin cap was saturated at reconcile time.
+    /// Non-zero = an over-cap worker processed at least one reconcile
+    /// cycle with inadequate pin headroom; the item-D residual is active.
+    #[metric(
+        help = "Blobs in UploadMissingBlobs that could not get an indefinite reconcile-pin (cap exhausted or blob absent); non-zero means item-D residual is active."
+    )]
+    reconcile_needed_but_over_cap: Counter,
 }
 
 impl RootMetricsComponent for Metrics {}
@@ -6700,6 +6829,7 @@ impl Metrics {
             preconditions: AsyncCounterWrapper::default(),
             running_actions_manager_metrics,
             ac_write_detached_inflight_count,
+            reconcile_needed_but_over_cap: Counter::default(),
         }
     }
 }

@@ -866,7 +866,7 @@ pub struct KillOperationRequest {
 pub struct UpdateForWorker {
     #[prost(
         oneof = "update_for_worker::Update",
-        tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13"
+        tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14"
     )]
     pub update: ::core::option::Option<update_for_worker::Update>,
 }
@@ -995,6 +995,12 @@ pub mod update_for_worker {
         /// / `?`-propagating). NO capability flag is required.
         #[prost(message, tag = "13")]
         AcPinResync(super::AcPinResyncRequest),
+        /// / (FL-688 v3 Stage C) Signals the worker that the server has processed
+        /// / its first full BlobsAvailable snapshot and has sent all necessary
+        /// / UploadMissingBlobs requests (or needs nothing). See
+        /// / `UpdateForWorker.reconcile_complete` for full semantics.
+        #[prost(message, tag = "14")]
+        ReconcileComplete(super::ReconcileCompleteRequest),
     }
 }
 /// / (FL-688 v3 Stage A fix) Force-re-snapshot signal for the worker's
@@ -1005,6 +1011,11 @@ pub mod update_for_worker {
 /// / list would be dead precision. See `UpdateForWorker.ac_pin_resync`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AcPinResyncRequest {}
+/// / (FL-688 v3 Stage C) Signals the worker that reconcile is complete.
+/// / Carries no payload. See `UpdateForWorker.reconcile_complete` for full
+/// / semantics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReconcileCompleteRequest {}
 /// / (FL-688 v3 §3.8) Acknowledgement of one `BlobsAvailableChunk` the
 /// / worker sent the scheduler. Symmetric to `BisAck` but in the
 /// / worker→server delta direction: the SERVER sends this after it has

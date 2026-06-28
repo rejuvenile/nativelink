@@ -17,7 +17,7 @@ use core::pin::Pin;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // (#216) Allowed build SHAs for stale-worker detection. When set and
@@ -40,7 +40,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     execute_result, BlobsAvailableAck, ExecuteComplete, ExecuteResult, GoingAwayRequest,
-    KeepAliveRequest, UpdateForScheduler, UpdateForWorker, UploadMissingBlobsRequest,
+    KeepAliveRequest, ReconcileCompleteRequest, UpdateForScheduler, UpdateForWorker,
+    UploadMissingBlobsRequest,
 };
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
 use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
@@ -2056,6 +2057,14 @@ struct WorkerConnection {
     /// `MAX_ACCUMULATED_ENTRIES_PER_CONN` entries (~20 MB worst-case
     /// per connection). Dropped on disconnect via `drop_all_inflight`.
     blobs_available_accumulator: Arc<crate::blobs_available_accumulator::BlobsAvailableAccumulator>,
+    /// (FL-688 v3 Stage C — DOC-FIX-1) Whether we have already sent the
+    /// `ReconcileCompleteRequest` signal (tag 14) to this worker. We send it
+    /// exactly ONCE: after the first full-snapshot `BlobsAvailableNotification`
+    /// is processed. After that, the gate is released on the worker side and
+    /// we never need to send it again (reconnects produce a new `WorkerConnection`
+    /// with this flag reset to `false`, so the gate is re-armed per-connect).
+    /// Uses `AtomicBool` for interior mutability inside `&self` methods.
+    reconcile_complete_sent: AtomicBool,
 }
 
 impl WorkerConnection {
@@ -2109,6 +2118,7 @@ impl WorkerConnection {
                 ),
             metrics,
             shutdown_quiesce,
+            reconcile_complete_sent: AtomicBool::new(false),
         };
 
         background_spawn!("worker_api", async move {
@@ -2553,6 +2563,53 @@ impl WorkerConnection {
         Ok(())
     }
 
+    /// (FL-688 v3 Stage C — DOC-FIX-1) Send `ReconcileCompleteRequest` (tag 14)
+    /// to this worker exactly once: after the first full BlobsAvailable snapshot
+    /// is processed.  Called at every exit of `handle_blobs_available` when
+    /// `is_full_snapshot = true`.  Uses `compare_exchange` to ensure exactly-once
+    /// delivery even if two ticks race (should not happen since the
+    /// `WorkerConnection` background task is single-threaded, but the atomic is
+    /// free insurance).
+    ///
+    /// DOC-FIX-1 rationale: the original design attached the gate-release to the
+    /// `UploadMissingBlobs` REPLY.  That design is broken: when the worker holds
+    /// nothing missing (empty `digests` or all digests already on server), the
+    /// early-returns at `:3275` and `:3429` suppress the reply entirely, wedging
+    /// an over-cap worker's executor gate FOREVER.  This unconditional signal,
+    /// sent here regardless of whether we issued any UploadMissingBlobs, closes
+    /// that hole.
+    fn try_send_reconcile_complete(&self, is_full_snapshot: bool) {
+        if !is_full_snapshot {
+            return;
+        }
+        // Exactly-once: flip false→true atomically.
+        if self
+            .reconcile_complete_sent
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            // Already sent; skip.
+            return;
+        }
+        let msg = UpdateForWorker {
+            update: Some(update_for_worker::Update::ReconcileComplete(
+                ReconcileCompleteRequest {},
+            )),
+        };
+        if self.worker_tx.send(msg).is_err() {
+            warn!(
+                worker_id=?self.worker_id,
+                "ReconcileComplete: worker channel closed before send"
+            );
+        } else {
+            info!(
+                worker_id=?self.worker_id,
+                "ReconcileComplete sent: first full BlobsAvailable snapshot processed, \
+                 worker startup reconcile gate will be released"
+            );
+        }
+    }
+
     async fn handle_blobs_available(
         &self,
         notification: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsAvailableNotification,
@@ -2926,6 +2983,10 @@ impl WorkerConnection {
                     dispatcher.broadcast_pinned_mirror_ack(entries);
                 }
             }
+            // (FL-688 v3 Stage C — DOC-FIX-1) Send gate-release even when
+            // no locality map is configured — a worker with only pinned-mirror
+            // blobs and no CAS endpoint still needs its executor unblocked.
+            self.try_send_reconcile_complete(notification.is_full_snapshot);
             let handle_blobs_available_elapsed_ms =
                 handle_blobs_available_start.elapsed().as_millis() as u64;
             debug!(
@@ -2948,6 +3009,9 @@ impl WorkerConnection {
                     dispatcher.broadcast_pinned_mirror_ack(entries);
                 }
             }
+            // (FL-688 v3 Stage C — DOC-FIX-1) Same as no_locality_map: send
+            // gate-release unconditionally on first full snapshot.
+            self.try_send_reconcile_complete(notification.is_full_snapshot);
             let handle_blobs_available_elapsed_ms =
                 handle_blobs_available_start.elapsed().as_millis() as u64;
             debug!(
@@ -3182,6 +3246,13 @@ impl WorkerConnection {
                         .await;
                     }
                 );
+                // (FL-688 v3 Stage C — DOC-FIX-1) Send gate-release AFTER the
+                // UploadMissingBlobs background spawn, so the worker receives
+                // all upload requests BEFORE the executor is unblocked.
+                // The background spawn is fire-and-forget; the reconcile
+                // signal rides the SAME unbounded channel, so order is
+                // preserved between UploadMissingBlobs and ReconcileComplete.
+                self.try_send_reconcile_complete(is_full_snapshot);
                 let handle_blobs_available_elapsed_ms =
                     handle_blobs_available_start.elapsed().as_millis() as u64;
                 debug!(
@@ -3205,6 +3276,12 @@ impl WorkerConnection {
                 dispatcher.broadcast_pinned_mirror_ack(entries);
             }
         }
+        // (FL-688 v3 Stage C — DOC-FIX-1) Fall-through: no digests or no
+        // cas_store, so no UploadMissingBlobs were sent. Still send the gate-
+        // release — this is the exact case the DOC-FIX-1 fix targets: a worker
+        // with all blobs already on server (or no blobs at all) must still get
+        // its executor unblocked.
+        self.try_send_reconcile_complete(is_full_snapshot);
         let handle_blobs_available_elapsed_ms =
             handle_blobs_available_start.elapsed().as_millis() as u64;
         debug!(

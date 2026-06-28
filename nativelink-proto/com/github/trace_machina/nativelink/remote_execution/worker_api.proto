@@ -902,9 +902,41 @@ message UpdateForWorker {
         /// `local_worker.rs`'s `Update` match `continue`s rather than
         /// `?`-propagating). NO capability flag is required.
         AcPinResyncRequest ac_pin_resync = 13;
+
+        /// (FL-688 v3 Stage C) Signals the worker that the server has
+        /// processed its first full BlobsAvailable snapshot and has sent all
+        /// necessary UploadMissingBlobs requests (or needs nothing). The
+        /// worker MUST NOT begin evicting blobs from its FilesystemStore
+        /// (`reconcile_complete` gate) and MUST NOT admit new actions
+        /// (`StartAction` executor gate) until this message is received.
+        ///
+        /// Sent UNCONDITIONALLY on the first full snapshot, even when the
+        /// server needs NO blobs from this worker (which would otherwise
+        /// cause the `:3096` early-return to suppress any reply and wedge a
+        /// boot-over-cap worker on the eviction gate forever — MINOR-first-
+        /// connect from v3 design).
+        ///
+        /// Backward compatibility: workers built before this variant treat
+        /// the unknown oneof tag as ignorable (the `None`/catch-all in
+        /// `local_worker.rs`'s `Update` match `continue`s). A server that
+        /// does NOT send this message leaves old workers in their prior
+        /// behaviour (no gate); a new worker connected to an old server stays
+        /// gated at startup but never wedges because the disk gate has no
+        /// timeout (R3) and the old server never sends `StartAction` either
+        /// (they share the same connection; the gate unblocks on reconnect to
+        /// a new server). NO capability flag required.
+        ReconcileCompleteRequest reconcile_complete = 14;
     }
     reserved 6; // Previously NextId, now reserved.
 }
+
+/// (FL-688 v3 Stage C) Signals the worker that reconcile is complete.
+/// Carries no payload: the affected worker is implicit (the message is
+/// sent over its own server→worker `UpdateForWorker` stream), and the
+/// signal itself is the payload — "I have now sent all needed
+/// UploadMissingBlobs requests (possibly zero)." See
+/// `UpdateForWorker.reconcile_complete` for full semantics.
+message ReconcileCompleteRequest {}
 
 /// (FL-688 v3 Stage A fix) Force-re-snapshot signal for the worker's
 /// AC-pin set. Carries no payload: the affected endpoint is implicit (it

@@ -14,7 +14,7 @@
 
 use core::fmt::{Debug, Formatter};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, Weak};
@@ -1182,6 +1182,29 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     pub fn unpin_digest(&self, digest: &DigestInfo) {
         let key: StoreKey<'static> = (*digest).into();
         self.evicting_map.unpin_key(&key);
+    }
+
+    /// (FL-688 v3 Stage C) Arm the startup reconcile gate. Call this ONCE
+    /// at worker boot, before any `add_files_to_cache` calls and before
+    /// starting background eviction. While the gate is armed the background
+    /// `drain_interval` tick (every `DRAIN_INTERVAL_SECS = 10s`) is skipped,
+    /// preventing the explicit LRU drain from racing the reconcile-pin calls.
+    pub fn set_startup_reconcile_gate(&self) {
+        self.evicting_map.set_startup_reconcile_gate();
+    }
+
+    /// (FL-688 v3 Stage C) Release the startup reconcile gate. Call this
+    /// exactly once when the server sends `ReconcileCompleteRequest`. After
+    /// this, the background LRU drain resumes normal operation.
+    pub fn release_startup_reconcile_gate(&self) {
+        self.evicting_map.release_startup_reconcile_gate();
+    }
+
+    /// (FL-688 v3 Stage C) Return a shared handle to the reconcile-complete
+    /// flag. `local_worker` uses this to gate `StartAction` processing and
+    /// to pass to `handle_upload_missing_blobs` for the reconcile-pin step.
+    pub fn reconcile_complete_flag(&self) -> Arc<AtomicBool> {
+        self.evicting_map.reconcile_complete_flag()
     }
 
     /// Test hook: drive the pin-expiry sweep deterministically. The

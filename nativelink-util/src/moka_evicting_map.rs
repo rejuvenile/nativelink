@@ -212,6 +212,23 @@ pub struct MokaEvictingMap<
     max_count: u64,
     /// Whether the background drainer has been started.
     background_running: AtomicBool,
+    /// (FL-688 v3 Stage C) Worker-startup reconcile gate. When `false`,
+    /// the background `drain_interval` tick that forces moka's capacity
+    /// check (`run_pending_tasks_and_drain`) is SUPPRESSED. Set to `false`
+    /// at worker boot (via `FilesystemStore::set_startup_reconcile_gate`)
+    /// and flipped to `true` by the server's `ReconcileCompleteRequest`
+    /// signal (via `FilesystemStore::release_reconcile_gate`), after which
+    /// normal periodic eviction resumes. Default: `true` (gate off — no
+    /// change for server-side FilesystemStores that never set it false).
+    ///
+    /// SAFETY: Only the background `drain_evictions` task reads this to
+    /// gate the drain tick. The writer (`release_reconcile_gate`) uses
+    /// `Release` ordering; the reader uses `Acquire`. This is the SECONDARY
+    /// protection (blocks the explicit LRU drain). The PRIMARY protection is
+    /// the reconcile-pin itself (`pin_digest_indefinite_with_result`), which
+    /// protects individual blobs from PER-INSERT moka eviction that this gate
+    /// cannot block.
+    reconcile_complete: Arc<AtomicBool>,
     // Metrics
     evicted_bytes: Counter,
     evicted_items: CounterWithTime,
@@ -584,6 +601,10 @@ where
             max_bytes,
             max_count,
             background_running: AtomicBool::new(false),
+            // Default `true`: gate is OFF by default. Server-side stores
+            // never gate reconcile; only workers set this to `false` via
+            // `set_startup_reconcile_gate(false)` at boot.
+            reconcile_complete: Arc::new(AtomicBool::new(true)),
             evicted_bytes: Counter::default(),
             evicted_items: CounterWithTime::default(),
             replaced_bytes: Counter::default(),
@@ -1685,6 +1706,33 @@ where
     // background eviction drainer
     // ---------------------------------------------------------------
 
+    /// (FL-688 v3 Stage C) Disable the periodic explicit drain until
+    /// `release_startup_reconcile_gate()` is called. Called once at worker
+    /// boot, before any `insert_startup` calls, before the background eviction
+    /// loop is started. The gate is `true` (drain enabled) by default; setting
+    /// it `false` here blocks ONLY the `drain_interval` tick in
+    /// `drain_evictions`. Per-insert eviction is unaffected — blobs must be
+    /// pinned via `pin_digest_indefinite_with_result` for full protection.
+    pub fn set_startup_reconcile_gate(&self) {
+        self.reconcile_complete
+            .store(false, Ordering::Release);
+    }
+
+    /// (FL-688 v3 Stage C) Release the reconcile gate. Called when the server
+    /// sends `ReconcileCompleteRequest`. After this, the background drain tick
+    /// runs normally. Returns an `Arc` clone of the flag so the filesystem
+    /// store can hand it to the worker without extra indirection.
+    pub fn release_startup_reconcile_gate(&self) {
+        self.reconcile_complete
+            .store(true, Ordering::Release);
+    }
+
+    /// (FL-688 v3 Stage C) Return a shared handle to the reconcile-complete
+    /// flag. `FilesystemStore` uses this to expose the gate to `local_worker`.
+    pub fn reconcile_complete_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reconcile_complete)
+    }
+
     pub fn start_background_eviction(self: &Arc<Self>) {
         if self
             .background_running
@@ -1750,6 +1798,17 @@ where
                     self.expire_stale_pins().await;
                 }
                 _ = drain_interval.tick() => {
+                    // (FL-688 v3 Stage C) Skip the forced drain during the
+                    // worker startup reconcile window. The PRIMARY protection
+                    // is reconcile-pin (`pin_digest_indefinite_with_result`);
+                    // this gate is SECONDARY — it prevents the EXPLICIT
+                    // periodic LRU sweep from racing the reconcile-pin call.
+                    // Per-insert moka eviction (in `insert_inner`) cannot be
+                    // gated here; pinning each blob handles that.
+                    // Acquire matches the Release in `release_startup_reconcile_gate`.
+                    if !self.reconcile_complete.load(Ordering::Acquire) {
+                        continue;
+                    }
                     // Force moka's capacity check + drain the resulting
                     // eviction events on THIS task (the sole owner of the
                     // shared `pending_evictions` queue) — never a parallel
