@@ -1202,6 +1202,22 @@ pub struct LocalWorkerConfig {
     /// Default: false (DISABLED — zero production behavior change).
     #[serde(default)]
     pub memory_gate_enabled: bool,
+
+    /// (#64 canary-soak addendum) Re-fault EWMA confirm threshold (events/sec).
+    ///
+    /// The refault-rate EWMA must reach or exceed this value for the refault
+    /// corroboration path to confirm memory pressure (design §0-rev4.3/.4). A
+    /// VERY HIGH value (e.g. `4294967295` = `u32::MAX`) effectively disables the
+    /// refault path so that only the free-floor PRIMARY can trip the gate —
+    /// enabling a free-floor-only canary soak without a rebuild.
+    ///
+    /// After the soak characterises the busy-worker refault baseline, this can
+    /// be re-calibrated downward from config to re-enable refault corroboration.
+    ///
+    /// Default: `10000` (the former compile-time const — zero behavior change;
+    /// an absent field behaves identically to the previous binary).
+    #[serde(default = "default_memory_gate_refault_confirm_rate")]
+    pub memory_gate_refault_confirm_rate: u32,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1247,6 +1263,10 @@ pub struct DirectoryCacheConfig {
     /// re-enable once a copy-on-write approach lands.
     #[serde(default = "default_direct_use_mode")]
     pub direct_use_mode: bool,
+}
+
+const fn default_memory_gate_refault_confirm_rate() -> u32 {
+    10_000
 }
 
 const fn default_direct_use_mode() -> bool {
