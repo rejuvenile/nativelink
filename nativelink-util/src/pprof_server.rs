@@ -37,8 +37,11 @@ const DEFAULT_PROFILE_SECONDS: u64 = 10;
 const DEFAULT_FREQUENCY: i32 = 99;
 
 /// CPU usage threshold (fraction of total cores) for auto-capture.
-/// On a 64-core machine, 0.05 = 320% CPU (3.2 cores busy).
-const AUTO_CAPTURE_CPU_THRESHOLD: f64 = 0.05;
+/// On a 64-core machine, 0.30 = 30% of total cores (≈19.2 cores busy) — a
+/// genuinely high-load moment worth profiling. Raised from the 0.05
+/// FL-688-debugging value (≈3.2 cores, ~5% util), which auto-captured
+/// non-actionable low-utilization profiles ~once/50min (2026-06-29 health sweep).
+const AUTO_CAPTURE_CPU_THRESHOLD: f64 = 0.30;
 
 /// How long to sample when auto-capturing.
 const AUTO_CAPTURE_DURATION_SECS: u64 = 10;
