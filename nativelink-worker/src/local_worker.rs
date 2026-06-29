@@ -1205,6 +1205,21 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     let ewma = update_swap_ewma(state.ewma, f64::from(rate));
     let refault_confirmed = ewma >= f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed));
 
+    // (#64 canary-soak) Publish EWMA + raw rate to the process-singleton so
+    // they appear on /metrics unconditionally (NOT gated on MEMORY_GATE_ENABLED).
+    // The sampler runs regardless of gate state (start_cpu_sampler is called
+    // unconditionally in new_local_worker), so these gauges populate on ALL
+    // workers and characterise the fleet baseline during the soak.
+    // `ewma.round()` → i64 → saturating u32 (negative ewma = 0; >u32::MAX =
+    // u32::MAX; both degenerate cases from fp arithmetic, not real load).
+    let ewma_rounded = u32::try_from(ewma.round() as i64).unwrap_or(u32::MAX);
+    nativelink_util::o11_probes::memory_gate_counters()
+        .refault_ewma
+        .store(ewma_rounded, Ordering::Relaxed);
+    nativelink_util::o11_probes::memory_gate_counters()
+        .refault_rate_last
+        .store(rate, Ordering::Relaxed);
+
     // Trip when the free-floor PRIMARY is breached OR the re-fault
     // CORROBORATION confirms thrash (design §0-rev4.4 OR logic).
     let gate_enabled = MEMORY_GATE_ENABLED.load(Ordering::Relaxed);

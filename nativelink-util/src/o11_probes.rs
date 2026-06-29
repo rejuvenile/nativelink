@@ -44,7 +44,7 @@
 //!   Exposes contention BELOW the existing 50 ms warn threshold so
 //!   trends are visible before they breach the warn.
 
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1122,6 +1122,19 @@ pub struct MemoryGateCounters {
     pub nak_free_floor: AtomicU64,
     /// StartAction NAKs from refault EWMA CORROBORATION trip.
     pub nak_refault: AtomicU64,
+    /// (#64 canary-soak) Current fast-attack/slow-release EWMA of the
+    /// refault rate, rounded to events/sec. Published as a gauge
+    /// (goes up AND down — NOT monotonic). Compare against
+    /// `memory_gate_refault_confirm_rate` (default 10000/s) to understand
+    /// how close the fleet baseline is to the trip threshold. Updated
+    /// unconditionally every sampler tick (~100 ms) regardless of gate-enable
+    /// state, so this gauge is observable on ALL workers.
+    pub refault_ewma: AtomicU32,
+    /// (#64 canary-soak) Raw per-second refault rate from the LAST sampler
+    /// tick (decompressions + swapins delta / elapsed). Published as a gauge
+    /// (non-monotonic). The EWMA `refault_ewma` smooths this; this raw field
+    /// lets operators see the instantaneous signal without the decay lag.
+    pub refault_rate_last: AtomicU32,
 }
 
 impl MemoryGateCounters {
@@ -1129,6 +1142,8 @@ impl MemoryGateCounters {
         Self {
             nak_free_floor: AtomicU64::new(0),
             nak_refault: AtomicU64::new(0),
+            refault_ewma: AtomicU32::new(0),
+            refault_rate_last: AtomicU32::new(0),
         }
     }
 }
@@ -1161,6 +1176,30 @@ impl MetricsComponent for MemoryGateCounters {
              operator-tunable per worker — a canary may set u32::MAX to suppress \
              refault); monotonic — non-zero + floor-zero = refault-only trip, \
              check busy baseline."
+        );
+        // (#64 canary-soak gauges) Published with MetricKind::Default so they
+        // render as `untyped` (Prometheus gauge semantics — goes up AND down).
+        // No `_total` suffix — these are NOT counters.
+        let v = self.refault_ewma.load(Ordering::Relaxed);
+        publish!(
+            "refault_ewma",
+            &v,
+            MetricKind::Default,
+            "Current fast-attack/slow-release EWMA of the refault rate \
+             (decompressions + swapins, events/sec). Gauge — not monotonic. \
+             Compare against memory_gate_refault_confirm_rate (default 10000/s) \
+             to gauge trip-threshold proximity. Updated every sampler tick (~100 ms) \
+             unconditionally — visible on all workers regardless of gate state."
+        );
+        let v = self.refault_rate_last.load(Ordering::Relaxed);
+        publish!(
+            "refault_rate_last",
+            &v,
+            MetricKind::Default,
+            "Raw per-second refault rate from the last sampler tick \
+             (decompressions + swapins delta / elapsed, events/sec). Gauge — not \
+             monotonic. The EWMA (refault_ewma) smooths this; this field exposes \
+             the instantaneous signal without decay lag."
         );
         Ok(MetricPublishKnownKindData::Component)
     }
@@ -2073,6 +2112,81 @@ mod tests {
             !body.contains("dir_cache_dir_cache"),
             "#DC3 doubled metric name (phase): rendered output contains `dir_cache_dir_cache`. \
              body=\n{body}"
+        );
+    }
+
+    /// (#64 canary-soak) The refault EWMA gauges must render on the real `/metrics`
+    /// path. This test pins the EXACT rendered names:
+    /// `memory_gate_refault_ewma` and `memory_gate_refault_rate_last` — NO
+    /// `_total` / `_counter` suffix (these are gauges, not counters; verified
+    /// empirically below; do not assume suffixes from other metrics' output).
+    /// Stops the soak runbook from alerting on names that do not exist on the wire.
+    ///
+    /// Mutation: drop one of the `publish!` calls in `MemoryGateCounters::publish`
+    /// (or rename its key) → test red-fails with "#64 refault gauge dark on
+    /// /metrics: expected exact line…".
+    #[test]
+    fn memory_gate_render_prometheus_exposes_refault_ewma_gauges() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(MemoryGateCounters::new());
+        // Sentinel values distinguishable from 0 and from each other.
+        counters.refault_ewma.store(42, Ordering::Relaxed);
+        counters.refault_rate_last.store(137, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        registry.register("memory_gate", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("memory_gate_refault_ewma", 42u64),
+            ("memory_gate_refault_rate_last", 137),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "#64 refault gauge dark on /metrics: expected exact line `{name} {value}` from \
+                 the render_prometheus walk, but it is ABSENT — the canary soak will be unable to \
+                 observe the refault EWMA signal. body=\n{body}"
+            );
+        }
+        // Guard the doubled-prefix trap.
+        assert!(
+            !body.contains("memory_gate_memory_gate"),
+            "#64 doubled metric name: rendered output contains `memory_gate_memory_gate`. \
+             body=\n{body}"
+        );
+    }
+
+    /// (#64 canary-soak) Storing a value into `refault_ewma` / `refault_rate_last`
+    /// must flow through to the rendered output (not silently published as 0).
+    ///
+    /// Mutation: in `MemoryGateCounters::publish`, hard-code the published value
+    /// to `0u32` instead of loading the atomic → test red-fails with
+    /// "#64 publish-value: refault_ewma published 0 not sentinel 99".
+    #[test]
+    fn memory_gate_refault_gauge_publish_emits_stored_value() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(MemoryGateCounters::new());
+        counters.refault_ewma.store(99, Ordering::Relaxed);
+        counters.refault_rate_last.store(7, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        registry.register("memory_gate", counters);
+        let body = render_prometheus(&registry);
+
+        let ewma_line = format!("\nmemory_gate_refault_ewma 99\n");
+        assert!(
+            body.contains(&ewma_line),
+            "#64 publish-value: refault_ewma published 0 not sentinel 99 — \
+             the atomic store is not flowing through publish(). body=\n{body}"
+        );
+        let rate_line = format!("\nmemory_gate_refault_rate_last 7\n");
+        assert!(
+            body.contains(&rate_line),
+            "#64 publish-value: refault_rate_last published 0 not sentinel 7 — \
+             the atomic store is not flowing through publish(). body=\n{body}"
         );
     }
 }
