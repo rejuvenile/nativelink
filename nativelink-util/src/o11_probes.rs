@@ -1177,9 +1177,12 @@ impl MetricsComponent for MemoryGateCounters {
              refault); monotonic — non-zero + floor-zero = refault-only trip, \
              check busy baseline."
         );
-        // (#64 canary-soak gauges) Published with MetricKind::Default so they
-        // render as `untyped` (Prometheus gauge semantics — goes up AND down).
-        // No `_total` suffix — these are NOT counters.
+        // (#64 canary-soak gauges) Published with MetricKind::Default, which the
+        // metrics library renders as Prometheus `# TYPE ... counter` (there is no
+        // gauge kind). These values are NON-MONOTONIC (the EWMA decays), so read
+        // the INSTANT value — do NOT apply `rate()` (decay reads as a counter
+        // reset). No `_total` suffix — name them as the gauges they semantically
+        // are, despite the `counter` TYPE line.
         let v = self.refault_ewma.load(Ordering::Relaxed);
         publish!(
             "refault_ewma",

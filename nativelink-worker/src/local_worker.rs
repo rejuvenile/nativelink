@@ -1210,15 +1210,15 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     // The sampler runs regardless of gate state (start_cpu_sampler is called
     // unconditionally in new_local_worker), so these gauges populate on ALL
     // workers and characterise the fleet baseline during the soak.
-    // `ewma.round()` → i64 → saturating u32 (negative ewma = 0; >u32::MAX =
-    // u32::MAX; both degenerate cases from fp arithmetic, not real load).
+    // `ewma.round()` → i64 → saturating u32. Both saturation cases are
+    // unreachable from real load: the EWMA folds non-negative `u32` samples with
+    // non-negative weights, so it never goes negative (a negative would map to
+    // u32::MAX via unwrap_or, not 0) and never exceeds u32::MAX. Observability
+    // only; a degenerate fp value would merely misreport, not affect the gate.
     let ewma_rounded = u32::try_from(ewma.round() as i64).unwrap_or(u32::MAX);
-    nativelink_util::o11_probes::memory_gate_counters()
-        .refault_ewma
-        .store(ewma_rounded, Ordering::Relaxed);
-    nativelink_util::o11_probes::memory_gate_counters()
-        .refault_rate_last
-        .store(rate, Ordering::Relaxed);
+    let counters = nativelink_util::o11_probes::memory_gate_counters();
+    counters.refault_ewma.store(ewma_rounded, Ordering::Relaxed);
+    counters.refault_rate_last.store(rate, Ordering::Relaxed);
 
     // Trip when the free-floor PRIMARY is breached OR the re-fault
     // CORROBORATION confirms thrash (design §0-rev4.4 OR logic).
