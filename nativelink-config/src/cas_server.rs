@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use nativelink_error::{Error, ResultExt};
 #[cfg(feature = "dev-schema")]
@@ -930,7 +931,7 @@ pub struct UploadActionResultConfig {
     pub failure_message_template: String,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct LocalWorkerConfig {
@@ -1189,8 +1190,9 @@ pub struct LocalWorkerConfig {
     ///
     /// When `true`: the gate NAKs `StartAction` with `ResourceExhausted` when
     /// the available-memory floor (`1 GiB`) is breached OR the re-fault-rate
-    /// EWMA crosses `10000/s` (thrash corroboration). The gate fails OPEN on
-    /// a stale/dead sampler and via the 30s idle fleet fail-open.
+    /// EWMA crosses `memory_gate_refault_confirm_rate` (default `10000/s`;
+    /// thrash corroboration). The gate fails OPEN on a stale/dead sampler and
+    /// via the 30s idle fleet fail-open.
     ///
     /// ROLLOUT: deploy the new binary fleet-wide FIRST (this field absent from
     /// all configs → gate disabled). THEN add `memory_gate_enabled: true` to
@@ -1211,13 +1213,60 @@ pub struct LocalWorkerConfig {
     /// refault path so that only the free-floor PRIMARY can trip the gate —
     /// enabling a free-floor-only canary soak without a rebuild.
     ///
+    /// `0` is rejected at deserialization (`NonZeroU32`). A zero threshold would
+    /// make the EWMA comparison always true, NAKing every action regardless of
+    /// actual memory state — the same NAK storm as incident `5132d6c9`, but
+    /// self-inflicted. Use `u32::MAX` (`4294967295`) to suppress the refault
+    /// path entirely.
+    ///
     /// After the soak characterises the busy-worker refault baseline, this can
     /// be re-calibrated downward from config to re-enable refault corroboration.
     ///
     /// Default: `10000` (the former compile-time const — zero behavior change;
     /// an absent field behaves identically to the previous binary).
+    ///
+    /// ROLLOUT: deploy the new binary fleet-wide FIRST (this field absent from
+    /// all configs → gate uses default 10000). THEN add
+    /// `memory_gate_refault_confirm_rate: 4294967295` to the canary worker's
+    /// INDIVIDUALIZED config. Do NOT add this field to the shared canonical
+    /// config until all workers run the new binary (`deny_unknown_fields` causes
+    /// old binaries to reject configs containing this field — deploy-ops §13
+    /// two-phase sequence).
     #[serde(default = "default_memory_gate_refault_confirm_rate")]
-    pub memory_gate_refault_confirm_rate: u32,
+    pub memory_gate_refault_confirm_rate: NonZeroU32,
+}
+
+impl Default for LocalWorkerConfig {
+    fn default() -> Self {
+        Self {
+            name: Default::default(),
+            worker_api_endpoint: Default::default(),
+            max_action_timeout: Default::default(),
+            max_upload_timeout: Default::default(),
+            max_inflight_tasks: Default::default(),
+            max_concurrent_uploads: Default::default(),
+            timeout_handled_externally: Default::default(),
+            entrypoint: Default::default(),
+            experimental_precondition_script: Default::default(),
+            cas_fast_slow_store: Default::default(),
+            upload_action_result: Default::default(),
+            work_directory: Default::default(),
+            platform_properties: Default::default(),
+            additional_environment: Default::default(),
+            directory_cache: Default::default(),
+            cas_server_port: Default::default(),
+            cas_server_tls: Default::default(),
+            blobs_available_interval_ms: Default::default(),
+            pprof_port: Default::default(),
+            bis_ack_timeout_secs: Default::default(),
+            deferred_output_uploads_enabled: Default::default(),
+            memory_gate_enabled: Default::default(),
+            // NonZeroU32 has no Default; use the serde default (10000 = the
+            // former compile-time const). This matches what serde produces for
+            // an absent field and is not a valid operator value (0 is rejected).
+            memory_gate_refault_confirm_rate: default_memory_gate_refault_confirm_rate(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1265,8 +1314,9 @@ pub struct DirectoryCacheConfig {
     pub direct_use_mode: bool,
 }
 
-const fn default_memory_gate_refault_confirm_rate() -> u32 {
-    10_000
+fn default_memory_gate_refault_confirm_rate() -> NonZeroU32 {
+    // SAFETY: 10_000 != 0.
+    NonZeroU32::new(10_000).unwrap()
 }
 
 const fn default_direct_use_mode() -> bool {

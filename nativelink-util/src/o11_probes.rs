@@ -1157,8 +1157,10 @@ impl MetricsComponent for MemoryGateCounters {
             &v,
             MetricKind::Counter,
             "StartAction NAKs from memory gate refault CORROBORATION \
-             (ewma >= REFAULT_CONFIRM_RATE=10000/s); monotonic — non-zero + \
-             floor-zero = refault-only trip, check busy baseline."
+             (ewma >= memory_gate_refault_confirm_rate; default 10000/s, \
+             operator-tunable per worker — a canary may set u32::MAX to suppress \
+             refault); monotonic — non-zero + floor-zero = refault-only trip, \
+             check busy baseline."
         );
         Ok(MetricPublishKnownKindData::Component)
     }

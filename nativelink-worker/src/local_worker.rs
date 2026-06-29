@@ -5957,7 +5957,7 @@ pub async fn new_local_worker(
     // also before the sampler starts. Same Relaxed justification as MEMORY_GATE_ENABLED
     // above: startup store happens-before the sampler-thread spawn. Default 10000 =
     // the old compile-time const, so zero behavior change when the field is absent.
-    REFAULT_CONFIRM_RATE.store(config.memory_gate_refault_confirm_rate, Ordering::Relaxed);
+    REFAULT_CONFIRM_RATE.store(config.memory_gate_refault_confirm_rate.get(), Ordering::Relaxed);
 
     // (F4) Pass work_directory so the disk-free sampler statvfs's the
     // CAS/work_directory volume (shared physical disk by config invariant).
@@ -7968,7 +7968,13 @@ mod tests {
     /// same workers) is now replaced by `available`. The floor constant itself
     /// is unchanged at 1 GiB; the formula that computes what is measured
     /// against it has changed.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: this test reads `REFAULT_CONFIRM_RATE`
+    /// and `MEMORY_GATE_ENABLED` — process-global statics mutated by
+    /// `refault_confirm_rate_high_suppresses_refault_path`. Serialized to prevent
+    /// a concurrent `store(u32::MAX)` racing this test's load+assert.
     #[test]
+    #[serial(swap_sampler_atomics)]
     fn free_floor_bytes_is_conservative_one_gib() {
         assert_eq!(
             FREE_FLOOR_BYTES,
@@ -8234,7 +8240,13 @@ mod tests {
     /// `|| refault_confirmed` disjunct (free-floor only). The thrash-confirm
     /// assertion below red-fails — and because `sample_mem_pressure` calls
     /// the same function, that mutation also breaks production.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: reads `REFAULT_CONFIRM_RATE` three
+    /// times in the inline EWMA check — a process-global static mutated by
+    /// `refault_confirm_rate_high_suppresses_refault_path`. Serialized to
+    /// prevent a concurrent `store(u32::MAX)` racing those reads.
     #[test]
+    #[serial(swap_sampler_atomics)]
     fn refault_corroboration_trips_gate_without_free_floor() {
         // Free-floor healthy, but re-fault confirmed (active thrash) ⇒ trip.
         assert!(
@@ -8279,11 +8291,16 @@ mod tests {
     ///
     /// Mutation (CLAUDE.md TDD #5):
     /// - Change `default_memory_gate_refault_confirm_rate` to return a different value (e.g.
-    ///   `9999`) → the `assert_eq!` fires with "refault_confirm_rate config default must be
-    ///   10000 — matches old const, zero behavior change".
+    ///   `NonZeroU32::new(9999).unwrap()`) → the `assert_eq!` fires with "refault_confirm_rate
+    ///   config default must be 10000 — matches old const, zero behavior change".
     /// - Change `AtomicU32::new(10_000)` to `AtomicU32::new(9_999)` → the static-value
     ///   assert fires with "REFAULT_CONFIRM_RATE static init must be 10000".
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: reads `REFAULT_CONFIRM_RATE` — a process-global
+    /// static mutated by `refault_confirm_rate_high_suppresses_refault_path`. Serialized
+    /// to prevent a concurrent `store(u32::MAX)` racing this test's load+assert.
     #[test]
+    #[serial(swap_sampler_atomics)]
     fn refault_confirm_rate_config_default_is_10000() {
         use nativelink_config::cas_server::LocalWorkerConfig;
         // Minimal JSON5 — no memory_gate_refault_confirm_rate field.
@@ -8297,7 +8314,7 @@ mod tests {
             "config parse must succeed for a valid minimal LocalWorkerConfig",
         );
         assert_eq!(
-            cfg.memory_gate_refault_confirm_rate, 10_000,
+            cfg.memory_gate_refault_confirm_rate.get(), 10_000,
             "refault_confirm_rate config default must be 10000 — matches old const, \
              zero behavior change. \
              Mutation target: change default_memory_gate_refault_confirm_rate to return \
@@ -8315,55 +8332,130 @@ mod tests {
         );
     }
 
-    /// (#64 canary-soak addendum) Free-floor-only suppression: setting
-    /// `memory_gate_refault_confirm_rate` to `u32::MAX` (or any value >> the actual
-    /// EWMA) causes `refault_confirmed` to be `false` even when the EWMA would trip
-    /// at the default 10000 threshold. A `memory_gate_verdict(enabled=true,
-    /// free_tripped=false, refault_confirmed=false)` therefore returns false — the
-    /// refault path is suppressed.
+    /// (#64 canary-soak addendum, FIX-2) `memory_gate_refault_confirm_rate: 0` MUST
+    /// be rejected at deserialization. A zero threshold makes `ewma >= 0.0` always
+    /// true — refault trips on every tick, NAKing all actions regardless of actual
+    /// memory state. `NonZeroU32` provides structural prevention at the serde layer.
     ///
-    /// This models the canary-soak operator intent: set the rate very high in config
-    /// → refault never confirms → only the free-floor PRIMARY can trip the gate.
+    /// Mutation (CLAUDE.md TDD #5): revert the field type from `NonZeroU32` back to
+    /// `u32` in `LocalWorkerConfig`. Serde now accepts `0` → this test's
+    /// `expect("rate=0 must be rejected…")` fires because `from_str` succeeds
+    /// instead of returning Err.
     ///
-    /// Mutation (CLAUDE.md TDD #5): revert `static REFAULT_CONFIRM_RATE: AtomicU32 = ...`
-    /// back to `const REFAULT_CONFIRM_RATE: u32 = 10_000` → this test fails to COMPILE
-    /// because `u32` has no `.store`/`.load` methods — the TDD red phase already proved
-    /// this (compilation error: "no method named `store` found for type `u32`"). That
-    /// compilation failure is the mutation signal: reverting from a runtime-settable
-    /// static to a compile-time const removes the config-tunability contract.
+    /// `#[serial(swap_sampler_atomics)]`: stateless test (no atomics read/written),
+    /// but grouped with the other config-field tests to maintain serial ordering.
     #[test]
+    #[serial(swap_sampler_atomics)]
+    fn refault_confirm_rate_zero_rejected_by_serde() {
+        use nativelink_config::cas_server::LocalWorkerConfig;
+        let json5 = r#"{
+            worker_api_endpoint: {uri: "grpc://localhost:50061"},
+            cas_fast_slow_store: "cas_fast_slow",
+            work_directory: "/tmp/work",
+            platform_properties: {},
+            memory_gate_refault_confirm_rate: 0
+        }"#;
+        let result: Result<LocalWorkerConfig, _> = serde_json5::from_str(json5);
+        assert!(
+            result.is_err(),
+            "memory_gate_refault_confirm_rate: 0 must be rejected at deserialization \
+             (NonZeroU32 — a zero threshold makes ewma >= 0.0 always true, causing \
+             a NAK storm identical to incident 5132d6c9). \
+             If this fires: the field type was reverted from NonZeroU32 to u32."
+        );
+    }
+
+    /// (#64 canary-soak addendum, FIX-2) `memory_gate_refault_confirm_rate: 4294967295`
+    /// (u32::MAX, the refault-suppression sentinel) MUST deserialize successfully.
+    /// `NonZeroU32::new(u32::MAX)` is valid — the suppression pattern still works.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: grouped with config-field tests.
+    #[test]
+    #[serial(swap_sampler_atomics)]
+    fn refault_confirm_rate_max_u32_accepted_by_serde() {
+        use nativelink_config::cas_server::LocalWorkerConfig;
+        let json5 = r#"{
+            worker_api_endpoint: {uri: "grpc://localhost:50061"},
+            cas_fast_slow_store: "cas_fast_slow",
+            work_directory: "/tmp/work",
+            platform_properties: {},
+            memory_gate_refault_confirm_rate: 4294967295
+        }"#;
+        let cfg: LocalWorkerConfig = serde_json5::from_str(json5).expect(
+            "memory_gate_refault_confirm_rate: 4294967295 (u32::MAX, the free-floor-only \
+             canary sentinel) must deserialize successfully — NonZeroU32::new(u32::MAX) is valid"
+        );
+        assert_eq!(
+            cfg.memory_gate_refault_confirm_rate.get(),
+            u32::MAX,
+            "u32::MAX must round-trip through serde as u32::MAX (4294967295)"
+        );
+    }
+
+    /// (#64 canary-soak addendum) Free-floor-only suppression: setting
+    /// `memory_gate_refault_confirm_rate` to `u32::MAX` causes the PRODUCTION
+    /// `sample_mem_pressure` function to NOT confirm refault even when the EWMA
+    /// would trip at the default 10000 threshold. Verified by calling the REAL
+    /// production function (not an inline formula re-implementation) and reading
+    /// the `MEMORY_GATE_TRIP_REFAULT` atomic it publishes.
+    ///
+    /// Setup: `SwapSamplerState` with `ewma = 20_000.0` (above the 10000 default
+    /// threshold). On the first tick (no prev anchor), `rate = 0`, so the EWMA
+    /// decays via `update_swap_ewma(20_000.0, 0.0)` ≈ 19_000 — still above 10000,
+    /// but below `u32::MAX = 4_294_967_295`. With `REFAULT_CONFIRM_RATE = u32::MAX`,
+    /// `refault_confirmed = 19_000 >= 4_294_967_295.0 = false`. With gate enabled,
+    /// `MEMORY_GATE_TRIP_REFAULT` stores `gate_enabled && refault_confirmed = false`.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): change `local_worker.rs:1206`
+    /// `ewma >= f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed))`
+    /// to `ewma >= 10_000_f64` (ignore the atomic). The decayed EWMA ≈ 19_000
+    /// satisfies `19_000 >= 10_000 = true`. With gate enabled, TRIP_REFAULT
+    /// stores true → the assertion below red-fails with its bespoke message.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: this test stores `u32::MAX` to
+    /// `REFAULT_CONFIRM_RATE` and `true` to `MEMORY_GATE_ENABLED` — both
+    /// process-global statics also read by `free_floor_bytes_is_conservative_one_gib`
+    /// and `refault_confirm_rate_config_default_is_10000`. Serialized with those
+    /// tests to prevent cross-test races under the default parallel runner.
+    #[test]
+    #[serial(swap_sampler_atomics)]
     fn refault_confirm_rate_high_suppresses_refault_path() {
-        // Save the current rate and restore at the end so test isolation is maintained.
-        let original = REFAULT_CONFIRM_RATE.load(Ordering::Relaxed);
+        // Save and restore both statics so this test cannot leak state.
+        let orig_rate = REFAULT_CONFIRM_RATE.load(Ordering::Relaxed);
+        let orig_gate = MEMORY_GATE_ENABLED.load(Ordering::Relaxed);
 
-        // Set to u32::MAX — simulating operator config of a very high threshold
-        // (free-floor-only canary soak).
+        // Simulate canary-soak config: refault threshold = u32::MAX (suppressed),
+        // gate enabled so MEMORY_GATE_TRIP_REFAULT reflects refault_confirmed.
         REFAULT_CONFIRM_RATE.store(u32::MAX, Ordering::Relaxed);
+        MEMORY_GATE_ENABLED.store(true, Ordering::Relaxed);
 
-        // EWMA value that WOULD trip at the default 10000 threshold.
-        let high_ewma: f64 = 20_000.0;
+        // Craft a SwapSamplerState whose EWMA (20_000) WOULD confirm at the
+        // default 10000 threshold. First tick (prev=None) → rate=0 → EWMA decays
+        // to ~19_000 via the slow-release path — still well above 10000 but far
+        // below u32::MAX.
+        let primed = SwapSamplerState {
+            prev: None,
+            ewma: 20_000.0,
+            free_tripped: false,
+        };
 
-        // The verdict site logic: ewma >= f64::from(REFAULT_CONFIRM_RATE.load(Relaxed)).
-        let threshold = f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed));
-        let refault_confirmed = high_ewma >= threshold;
+        // Call the REAL production function. It reads REFAULT_CONFIRM_RATE at
+        // local_worker.rs:1206 and publishes MEMORY_GATE_TRIP_REFAULT.
+        let _ = sample_mem_pressure(primed);
 
+        let tripped = MEMORY_GATE_TRIP_REFAULT.load(Ordering::Relaxed);
         assert!(
-            !refault_confirmed,
-            "refault confirmed despite the configured-high threshold \
-             (free-floor-only suppression broken — REFAULT_CONFIRM_RATE must be \
-             read from the atomic, not hardcoded): ewma={high_ewma} threshold={threshold}"
+            !tripped,
+            "sample_mem_pressure must NOT set MEMORY_GATE_TRIP_REFAULT when \
+             REFAULT_CONFIRM_RATE=u32::MAX (free-floor-only suppression): \
+             the production verdict site at local_worker.rs:1206 must read \
+             REFAULT_CONFIRM_RATE from the atomic, not a hardcoded 10000 literal. \
+             If this fires: the verdict site was mutated to ignore the config."
         );
 
-        // With free_tripped=false and refault_confirmed=false, the gate must not fire.
-        let verdict = memory_gate_verdict(true, false, refault_confirmed);
-        assert!(
-            !verdict,
-            "memory_gate_verdict must return false when free-floor is healthy \
-             and refault is suppressed by a high configured threshold"
-        );
-
-        // Restore so other tests see the expected value.
-        REFAULT_CONFIRM_RATE.store(original, Ordering::Relaxed);
+        // Restore statics.
+        REFAULT_CONFIRM_RATE.store(orig_rate, Ordering::Relaxed);
+        MEMORY_GATE_ENABLED.store(orig_gate, Ordering::Relaxed);
     }
 
     /// (#37) The gate MUST fail OPEN when the sampler is wedged/dead: a
