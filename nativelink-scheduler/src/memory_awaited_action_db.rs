@@ -257,7 +257,7 @@ struct SortedAwaitedActions {
 ///   scheduler_{name}_action_matching_engine_state_manager_action_db_sorted_action_infos_cache_check_count
 ///
 /// Computed at publish time from the live BTreeSets (no drift), inside
-/// the `parking_lot::Mutex::try_lock()` that the outer `MemoryAwaitedActionDb`
+/// the `async_lock::Mutex::try_lock()` that the outer `MemoryAwaitedActionDb`
 /// holds during publish — so this never blocks a tokio worker thread.
 impl MetricsComponent for SortedAwaitedActions {
     fn publish(
@@ -269,7 +269,7 @@ impl MetricsComponent for SortedAwaitedActions {
         nativelink_metric::publish!(
             "queued_count",
             &queued,
-            MetricKind::Counter,
+            MetricKind::Default,
             "point-in-time number of actions in Queued state awaiting a worker assignment; \
              non-zero while workers are saturated or unavailable"
         );
@@ -277,14 +277,14 @@ impl MetricsComponent for SortedAwaitedActions {
         nativelink_metric::publish!(
             "executing_count",
             &executing,
-            MetricKind::Counter,
+            MetricKind::Default,
             "point-in-time number of actions in Executing state (dispatched to workers)"
         );
         let cache_check = self.cache_check.len() as u64;
         nativelink_metric::publish!(
             "cache_check_count",
             &cache_check,
-            MetricKind::Counter,
+            MetricKind::Default,
             "point-in-time number of actions in CacheCheck state"
         );
         Ok(MetricPublishKnownKindData::Component)
