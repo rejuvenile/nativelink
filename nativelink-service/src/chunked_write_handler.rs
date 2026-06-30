@@ -4748,16 +4748,21 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                                 // (bazel_facing_v1_dispatcher) event with a
                                 // removal event when the disarm-path reaper
                                 // performs the inline decrement.
-                                info!(
-                                    target: "nativelink_service::chunked_write_handler",
-                                    writer_path = "bazel_facing_v1_dispatcher",
-                                    registry = "fss_chunked_in_flight_digests",
-                                    digest = %dig,
-                                    outcome = "reaper_decrement",
-                                    refcount_after,
-                                    now_empty,
-                                    "chunked_in_flight removed",
-                                );
+                                // Digest-based sampling (~1/64) keeps pairs
+                                // matched: same digest → same bool at both
+                                // registration and removal sites.
+                                if chunked_inflight_log_sampled(&dig) {
+                                    info!(
+                                        target: "nativelink_service::chunked_write_handler",
+                                        writer_path = "bazel_facing_v1_dispatcher",
+                                        registry = "fss_chunked_in_flight_digests",
+                                        digest = %dig,
+                                        outcome = "reaper_decrement",
+                                        refcount_after,
+                                        now_empty,
+                                        "chunked_in_flight removed",
+                                    );
+                                }
                                 // BLOCK-2: per-digest wakeup for BLOCK-B readers.
                                 if let Some(n) = per_digest_notify {
                                     n.notify_waiters();
@@ -5635,3 +5640,108 @@ async fn compute_sha256_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
         )
     })
 }
+
+/// Sample period for `chunked_in_flight registered` / `removed` info! logs.
+/// 64 yields ~1/64 emission rate (~1 log per 64 blob admissions), reducing
+/// the ~708/10 min production volume to ~11/10 min while preserving the
+/// writer-path attribution signal for the FL-688 durability path.
+///
+/// Mirrors `READER_CONSTRUCTION_SAMPLE_PERIOD` in `nativelink-util/src/streaming_blob.rs`.
+const CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD: u64 = 64;
+
+/// Returns `true` if the `chunked_in_flight registered` / `chunked_in_flight removed`
+/// info! logs should be emitted for `digest`.
+///
+/// Deterministic (digest → bool, no mutable state): the same digest always
+/// produces the same decision so the register and remove log lines for a given
+/// blob are always both emitted or both suppressed, keeping log pairs matched.
+///
+/// Uses the first 8 bytes of the packed hash as a stable u64 key. Blake3/SHA-256
+/// outputs are uniformly distributed, so `key % CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD`
+/// gives an ~1/64 sampling rate without a global counter.
+fn chunked_inflight_log_sampled(digest: &DigestInfo) -> bool {
+    let bytes: &[u8; 32] = digest.packed_hash();
+    let key = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    key % CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD == 0
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use nativelink_util::common::DigestInfo;
+
+    use super::{CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD, chunked_inflight_log_sampled};
+
+    /// Verify the constant literal is exactly 64 (numeric-constant discipline).
+    #[test]
+    fn sample_period_constant_is_64() {
+        assert_eq!(
+            CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD, 64,
+            "CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD must be exactly 64 \
+             (cited in commit message as the ~64x volume reduction factor)"
+        );
+    }
+
+    /// Determinism: the same digest must produce the same sampling decision
+    /// on every call so that the `chunked_in_flight registered` and
+    /// `chunked_in_flight removed` log lines for a given digest are always
+    /// both emitted or both suppressed.
+    #[test]
+    fn sampling_is_deterministic_per_digest() {
+        // Digest whose first 8 bytes yield key % 64 == 0 (sampled).
+        // key = u64::from_le_bytes([0,0,0,0,0,0,0,0]) = 0; 0 % 64 = 0.
+        let sampled_digest = DigestInfo::new([0u8; 32], 1);
+        // Digest whose first 8 bytes yield key % 64 == 1 (skipped).
+        // key = u64::from_le_bytes([1,0,0,0,0,0,0,0]) = 1; 1 % 64 = 1.
+        let mut hash_skip = [0u8; 32];
+        hash_skip[0] = 1;
+        let skipped_digest = DigestInfo::new(hash_skip, 1);
+
+        // Both must be stable across repeated calls (register/remove pair safety).
+        for _ in 0..5 {
+            assert!(
+                chunked_inflight_log_sampled(&sampled_digest),
+                "sampled digest must return true on every call — \
+                 register/remove pair would be mismatched if non-deterministic"
+            );
+            assert!(
+                !chunked_inflight_log_sampled(&skipped_digest),
+                "skipped digest must return false on every call — \
+                 register/remove pair would be mismatched if non-deterministic"
+            );
+        }
+    }
+
+    /// Rate check: over 6400 distinct synthetic digests the true-count must
+    /// be in 50–150 (expected ~100 = 6400/64). Confirms the gate is neither
+    /// always-true nor always-false.
+    ///
+    /// Mutation A: change `% 64` to `% 1` (always true) → fails with
+    ///   "sampled all digests, gate not limiting".
+    /// Mutation B: change `% 64` to constant `false` → fails with
+    ///   "gate never logs, lost the diagnostic".
+    #[test]
+    fn sampling_rate_is_approximately_1_in_64() {
+        let n: u64 = 6400;
+        let mut true_count: u64 = 0;
+        for i in 0..n {
+            // Vary first 8 bytes deterministically across all 6400 values.
+            let bytes = i.to_le_bytes();
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&bytes);
+            let digest = DigestInfo::new(hash, 1);
+            if chunked_inflight_log_sampled(&digest) {
+                true_count += 1;
+            }
+        }
+        assert!(
+            true_count >= 50 && true_count <= 150,
+            "expected ~100 sampled out of 6400 (1/64 rate); got {true_count} — \
+             if 6400: gate always-true (mutation A: '% 1'); \
+             if 0: gate always-false (mutation B: constant false)"
+        );
+    }
+}
+

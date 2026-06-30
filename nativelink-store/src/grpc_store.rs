@@ -1528,11 +1528,6 @@ impl GrpcStore {
                 tonic::metadata::MetadataValue::from_static("true"),
             );
         }
-        // #147 trace: capture the resource_name BEFORE the request
-        // moves into the gRPC call so we can log "channel X selected
-        // for resource Y" — the same resource_name appears in
-        // get_part_single_stream's logs, providing a join key.
-        let resource_for_log = grpc_request.get_ref().resource_name.clone();
         let (mut response, channel_id, post_conn_instant) = match &self.transport {
             Transport::Tcp(cm) => {
                 let channel = cm
@@ -1544,13 +1539,6 @@ impl GrpcStore {
                 // K2 fix: clock starts AFTER channel acquisition so the
                 // elapsed used in looks_like_latched_pool excludes queue wait.
                 let post_conn = std::time::Instant::now();
-                info!(
-                    resource_name = %resource_for_log,
-                    transport = "tcp",
-                    endpoint_index = ep_idx,
-                    connection_index = conn_idx,
-                    "GrpcStore::read_internal channel acquired (#147 trace)",
-                );
                 let resp = self.bs_client(channel)
                     .read(grpc_request)
                     .await
@@ -1562,11 +1550,6 @@ impl GrpcStore {
             #[cfg(feature = "quic")]
             Transport::Quic(ch) => {
                 let post_conn = std::time::Instant::now();
-                info!(
-                    resource_name = %resource_for_log,
-                    transport = "quic",
-                    "GrpcStore::read_internal channel acquired (#147 trace)",
-                );
                 let resp = self.bs_client(ch.clone())
                     .read(grpc_request)
                     .await
@@ -1587,13 +1570,6 @@ impl GrpcStore {
                         .map_err(|e| (e, None, std::time::Instant::now()))?;
                     let (ep_idx, conn_idx) = channel.channel_id_for_log();
                     let post_conn = std::time::Instant::now();
-                    info!(
-                        resource_name = %resource_for_log,
-                        transport = "dual/tcp",
-                        endpoint_index = ep_idx,
-                        connection_index = conn_idx,
-                        "GrpcStore::read_internal channel acquired (#147 trace)",
-                    );
                     let resp = self.bs_client(channel)
                         .read(grpc_request)
                         .await
@@ -1604,11 +1580,6 @@ impl GrpcStore {
                 } else {
                     // Single-stream reads: prefer QUIC (2.6x faster)
                     let post_conn = std::time::Instant::now();
-                    info!(
-                        resource_name = %resource_for_log,
-                        transport = "dual/quic",
-                        "GrpcStore::read_internal channel acquired (#147 trace)",
-                    );
                     let resp = self.bs_client(quic.clone())
                         .read(grpc_request)
                         .await
