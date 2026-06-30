@@ -321,3 +321,95 @@ async fn schedmetric_all_gauges_zero_when_idle() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #schedmetric: draining a worker updates `workers_at_capacity` immediately.
+///
+/// `set_drain_worker` sets `is_draining`, which is a direct input to
+/// `can_accept_work()`. Drain is precisely when an operator watches the
+/// saturation gauge (rolling deploy / fleet drain). The gauge must recompute at
+/// drain time, not lag until the next unrelated pool mutation.
+///
+/// Scenario:
+///   - 1 idle worker (unlimited capacity, no actions) → at_capacity=0.
+///   - Drain the worker → can_accept_work()=false → at_capacity=1, with NO
+///     intervening add/remove/dispatch mutation to mask a missing recompute.
+#[nativelink_test]
+async fn schedmetric_drain_updates_workers_at_capacity_immediately() -> Result<(), Error> {
+    let task_notify = Arc::new(Notify::new());
+    let awaited_action_db = memory_awaited_action_db_factory(
+        0,
+        &task_notify.clone(),
+        MockInstantWrapped::default,
+    );
+    let spec = SimpleSpec {
+        worker_timeout_s: 100,
+        ..Default::default()
+    };
+    let (scheduler, worker_scheduler) = SimpleScheduler::new(
+        &spec,
+        awaited_action_db,
+        task_notify.clone(),
+        None,
+    );
+
+    // One idle worker, unlimited capacity, no actions → can_accept_work()=true.
+    let (tx1, mut rx1) = mpsc::unbounded_channel::<UpdateForWorker>();
+    let worker_id = WorkerId("w1".to_string());
+    let worker1 = Worker::new(
+        worker_id.clone(),
+        PlatformProperties::default(),
+        tx1,
+        NOW_TIME,
+        0, // unlimited
+    );
+    worker_scheduler
+        .add_worker(worker1)
+        .await
+        .expect("add worker1 must succeed");
+    let conn1 = rx1.recv().await.expect("worker1 ConnectionResult must arrive");
+    assert!(
+        matches!(
+            conn1.update,
+            Some(update_for_worker::Update::ConnectionResult(ConnectionResult { .. }))
+        ),
+        "#schedmetric drain setup: worker1 initial message must be ConnectionResult"
+    );
+
+    // Before drain: idle worker is NOT at capacity.
+    {
+        let registry = make_and_register(scheduler.clone(), worker_scheduler.clone());
+        let body = render_prometheus(&registry);
+        assert!(
+            body.contains("\nscheduler_test_worker_scheduler_metrics_workers_at_capacity 0\n"),
+            "#schedmetric drain: pre-drain `workers_at_capacity` must be 0 \
+             (idle unlimited-capacity worker can accept work). \
+             body=\n{body}"
+        );
+    }
+
+    // Drain the worker — this is the ONLY mutation between the two renders, so
+    // it MUST be what flips workers_at_capacity to 1.
+    worker_scheduler
+        .set_drain_worker(&worker_id, true)
+        .await
+        .expect("set_drain_worker must succeed");
+
+    let registry = make_and_register(scheduler.clone(), worker_scheduler.clone());
+    let body = render_prometheus(&registry);
+    assert!(
+        body.contains("\nscheduler_test_worker_scheduler_metrics_workers_at_capacity 1\n"),
+        "#schedmetric drain: `workers_at_capacity` must be 1 immediately after \
+         set_drain_worker (is_draining → can_accept_work()=false). If this is 0, \
+         set_drain_worker did not call recompute_capacity_gauges() and the gauge \
+         is stale during exactly the fleet-drain window an operator watches it. \
+         body=\n{body}"
+    );
+    // workers_total is unchanged (worker still registered, just draining).
+    assert!(
+        body.contains("\nscheduler_test_worker_scheduler_metrics_workers_total 1\n"),
+        "#schedmetric drain: `workers_total` must remain 1 (draining ≠ removed). \
+         body=\n{body}"
+    );
+
+    Ok(())
+}

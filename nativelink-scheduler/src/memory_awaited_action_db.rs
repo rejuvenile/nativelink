@@ -225,6 +225,15 @@ where
 /// return early from a function.
 struct NoEarlyReturn;
 
+// (#schedmetric) `MetricsComponent` is hand-written below rather than derived.
+// The prior `#[derive(MetricsComponent)]` recursed into each `BTreeSet` via the
+// blanket `impl MetricsComponent for BTreeSet<T>` (nativelink-metric/src/lib.rs),
+// which publishes one INDEXED sub-group PER ELEMENT (`group!(i)`), each emitting
+// `SortedAwaitedAction`'s `sort_key` + `operation_id`. On the scheduler /metrics
+// path that is an unbounded-cardinality emission keyed by array position — a
+// per-queued-action series whose name shifts as the set mutates. It carried no
+// stable operator value (the index is meaningless across scrapes). The custom
+// impl replaces it with three bounded scalar counts.
 #[derive(Debug, Default)]
 struct SortedAwaitedActions {
     unknown: BTreeSet<SortedAwaitedAction>,

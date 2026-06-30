@@ -160,22 +160,32 @@ pub struct SchedulerMetrics {
     pub workers_never_reported_load: AtomicU64,
 
     /// (#schedmetric) Point-in-time total number of workers currently
-    /// registered in the pool. Maintained as a gauge: incremented in
-    /// `add_worker`, decremented in `remove_worker`. Recomputed from
-    /// the live pool in `recompute_capacity_gauges` for accuracy after
-    /// bulk evictions.
+    /// registered in the pool. Recomputed from the live `self.workers` map
+    /// (`workers.len()`) in `recompute_capacity_gauges` after any pool
+    /// mutation — not maintained as a running delta, so it stays correct
+    /// even after bulk evictions.
     #[metric(
         help = "point-in-time total workers registered in the scheduler pool"
     )]
     pub workers_total: AtomicU64,
 
     /// (#schedmetric) Point-in-time count of workers that CANNOT accept
-    /// more actions right now (`can_accept_work() == false`). Recomputed
-    /// in `recompute_capacity_gauges` after any pool mutation.
+    /// more actions right now (`can_accept_work() == false`, i.e. paused,
+    /// draining, or at `max_inflight_tasks`). Recomputed in
+    /// `recompute_capacity_gauges` after any pool mutation.
     /// Saturation ratio = workers_at_capacity / workers_total.
+    ///
+    /// TODO(#schedmetric): this counts only `can_accept_work()` exclusions.
+    /// Workers the matcher additionally skips — `quarantined_at`,
+    /// `indefinite_pin_saturated`, `swap_pressured`, `disk_pressured`
+    /// (see `inner_find_and_reserve_worker`'s `worker_is_viable`) — are NOT
+    /// counted here. An operator reading this as "workers not receiving
+    /// work / total" will undercount when those gates are active. A
+    /// separate `workers_excluded` gauge would capture the full criteria.
     #[metric(
-        help = "point-in-time workers at capacity (can_accept_work=false); \
-                saturation = workers_at_capacity / workers_total"
+        help = "point-in-time workers at capacity (can_accept_work=false: \
+                paused/draining/max-inflight); saturation = \
+                workers_at_capacity / workers_total"
     )]
     pub workers_at_capacity: AtomicU64,
 
@@ -960,6 +970,12 @@ impl ApiWorkerSchedulerImpl {
             .get_mut(worker_id)
             .err_tip(|| format!("Worker {worker_id} doesn't exist in the pool"))?;
         worker.is_draining = is_draining;
+        // (#schedmetric) is_draining is an input to can_accept_work(), so the
+        // workers_at_capacity gauge changes here. Drain is exactly when an
+        // operator watches the saturation gauge (rolling deploy / fleet drain),
+        // so recompute now rather than letting it lag until the next unrelated
+        // pool mutation.
+        self.recompute_capacity_gauges();
         self.worker_change_notify.notify_one();
         Ok(())
     }
