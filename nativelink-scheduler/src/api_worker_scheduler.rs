@@ -158,6 +158,45 @@ pub struct SchedulerMetrics {
         help = "(#sched-zeroload) workers currently registered that have never reported load; non-zero on steady-state fleet means stalled keepalive → silent under-selection"
     )]
     pub workers_never_reported_load: AtomicU64,
+
+    /// (#schedmetric) Point-in-time total number of workers currently
+    /// registered in the pool. Recomputed from the live `self.workers` map
+    /// (`workers.len()`) in `recompute_capacity_gauges` after any pool
+    /// mutation — not maintained as a running delta, so it stays correct
+    /// even after bulk evictions.
+    #[metric(
+        help = "point-in-time total workers registered in the scheduler pool"
+    )]
+    pub workers_total: AtomicU64,
+
+    /// (#schedmetric) Point-in-time count of workers that CANNOT accept
+    /// more actions right now (`can_accept_work() == false`, i.e. paused,
+    /// draining, or at `max_inflight_tasks`). Recomputed in
+    /// `recompute_capacity_gauges` after any pool mutation.
+    /// Saturation ratio = workers_at_capacity / workers_total.
+    ///
+    /// TODO(#schedmetric): this counts only `can_accept_work()` exclusions.
+    /// Workers the matcher additionally skips — `quarantined_at`,
+    /// `indefinite_pin_saturated`, `swap_pressured`, `disk_pressured`
+    /// (see `inner_find_and_reserve_worker`'s `worker_is_viable`) — are NOT
+    /// counted here. An operator reading this as "workers not receiving
+    /// work / total" will undercount when those gates are active. A
+    /// separate `workers_excluded` gauge would capture the full criteria.
+    #[metric(
+        help = "point-in-time workers at capacity (can_accept_work=false: \
+                paused/draining/max-inflight); saturation = \
+                workers_at_capacity / workers_total"
+    )]
+    pub workers_at_capacity: AtomicU64,
+
+    /// (#schedmetric) Point-in-time total in-flight actions across all
+    /// workers (sum of `running_action_infos.len()` per worker).
+    /// Recomputed in `recompute_capacity_gauges` after any pool mutation.
+    #[metric(
+        help = "point-in-time total in-flight actions across the fleet \
+                (sum of per-worker running_action_infos)"
+    )]
+    pub total_running_actions: AtomicU64,
 }
 
 /// Point-in-time intersection of an action's `file_digests` and the
@@ -758,6 +797,37 @@ impl core::fmt::Debug for ApiWorkerSchedulerImpl {
 }
 
 impl ApiWorkerSchedulerImpl {
+    /// (#schedmetric) Recomputes the three point-in-time fleet-saturation gauges
+    /// from the live worker pool and stores them into `SchedulerMetrics` atomics.
+    ///
+    /// Called after every pool mutation (`add_worker`, `remove_worker`,
+    /// `update_action_cs2`, `inner_unreserve_worker`) so the gauges reflect
+    /// the pool immediately after the change, not at the next scrape.
+    ///
+    /// O(N workers) scan — acceptable for typical fleet sizes (10-100 workers).
+    /// NEVER called inside the scoring hot path or any O(actions) loop.
+    ///
+    /// No lock acquisition: `self` is already behind the `inner` write lock,
+    /// so iterating `self.workers` is safe and non-blocking.
+    fn recompute_capacity_gauges(&self) {
+        let total = self.workers.len() as u64;
+        let mut at_capacity = 0u64;
+        let mut running = 0u64;
+        for (_, w) in self.workers.iter() {
+            if !w.can_accept_work() {
+                at_capacity += 1;
+            }
+            running += w.running_action_infos.len() as u64;
+        }
+        self.metrics.workers_total.store(total, Ordering::Relaxed);
+        self.metrics
+            .workers_at_capacity
+            .store(at_capacity, Ordering::Relaxed);
+        self.metrics
+            .total_running_actions
+            .store(running, Ordering::Relaxed);
+    }
+
     /// Refreshes the lifetime of the worker with the given timestamp.
     ///
     /// Instead of sending N keepalive messages (one per operation),
@@ -847,6 +917,8 @@ impl ApiWorkerSchedulerImpl {
                 "Worker connection appears to have been closed while adding to pool"
             );
         }
+        // (#schedmetric) Update fleet saturation gauges after pool change.
+        self.recompute_capacity_gauges();
         self.worker_change_notify.notify_one();
         res
     }
@@ -881,6 +953,8 @@ impl ApiWorkerSchedulerImpl {
             }
         }
 
+        // (#schedmetric) Update fleet saturation gauges after pool change.
+        self.recompute_capacity_gauges();
         self.worker_change_notify.notify_one();
         result
     }
@@ -896,6 +970,12 @@ impl ApiWorkerSchedulerImpl {
             .get_mut(worker_id)
             .err_tip(|| format!("Worker {worker_id} doesn't exist in the pool"))?;
         worker.is_draining = is_draining;
+        // (#schedmetric) is_draining is an input to can_accept_work(), so the
+        // workers_at_capacity gauge changes here. Drain is exactly when an
+        // operator watches the saturation gauge (rolling deploy / fleet drain),
+        // so recompute now rather than letting it lag until the next unrelated
+        // pool mutation.
+        self.recompute_capacity_gauges();
         self.worker_change_notify.notify_one();
         Ok(())
     }
@@ -1593,6 +1673,8 @@ impl ApiWorkerSchedulerImpl {
                 }
             }
         }
+        // (#schedmetric) Recompute after slot freed.
+        self.recompute_capacity_gauges();
     }
 
     // (#sched-b1) First critical section of `update_action`. Runs under
@@ -1715,6 +1797,9 @@ impl ApiWorkerSchedulerImpl {
             worker.paused_due_to_backpressure = due_to_backpressure;
         }
 
+        // (#schedmetric) Recompute fleet saturation gauges after the action
+        // slot is freed (running_action_infos shrunk, is_paused may have changed).
+        self.recompute_capacity_gauges();
         self.worker_change_notify.notify_one();
 
         match complete_action_res {
@@ -1842,6 +1927,9 @@ impl ApiWorkerSchedulerImpl {
             match_latency_ms,
             "scheduler assigned action to worker; latency is the accept→worker-assigned interval"
         );
+        // (#schedmetric) Recompute fleet saturation gauges after the action
+        // slot is filled (running_action_infos grew, worker may now be at capacity).
+        self.recompute_capacity_gauges();
         Some((tx, msg))
     }
 
@@ -4035,7 +4123,7 @@ impl ApiWorkerScheduler {
     pub async fn replay_bis_chunks_to_worker(
         &self,
         cas_endpoint: &str,
-        tx: &tokio::sync::mpsc::UnboundedSender<UpdateForWorker>,
+        tx: &UnboundedSender<UpdateForWorker>,
     ) -> usize {
         if cas_endpoint.is_empty() {
             return 0;

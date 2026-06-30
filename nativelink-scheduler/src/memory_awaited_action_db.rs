@@ -22,7 +22,7 @@ use async_lock::Mutex;
 use futures::{FutureExt, Stream};
 use nativelink_config::stores::EvictionPolicy;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
-use nativelink_metric::MetricsComponent;
+use nativelink_metric::{MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent};
 use nativelink_util::action_messages::{
     ActionInfo, ActionStage, ActionUniqueKey, ActionUniqueQualifier, OperationId,
 };
@@ -225,18 +225,70 @@ where
 /// return early from a function.
 struct NoEarlyReturn;
 
-#[derive(Debug, Default, MetricsComponent)]
+// (#schedmetric) `MetricsComponent` is hand-written below rather than derived.
+// The prior `#[derive(MetricsComponent)]` recursed into each `BTreeSet` via the
+// blanket `impl MetricsComponent for BTreeSet<T>` (nativelink-metric/src/lib.rs),
+// which publishes one INDEXED sub-group PER ELEMENT (`group!(i)`), each emitting
+// `SortedAwaitedAction`'s `sort_key` + `operation_id`. On the scheduler /metrics
+// path that is an unbounded-cardinality emission keyed by array position — a
+// per-queued-action series whose name shifts as the set mutates. It carried no
+// stable operator value (the index is meaningless across scrapes). The custom
+// impl replaces it with three bounded scalar counts.
+#[derive(Debug, Default)]
 struct SortedAwaitedActions {
-    #[metric(group = "unknown")]
     unknown: BTreeSet<SortedAwaitedAction>,
-    #[metric(group = "cache_check")]
     cache_check: BTreeSet<SortedAwaitedAction>,
-    #[metric(group = "queued")]
     queued: BTreeSet<SortedAwaitedAction>,
-    #[metric(group = "executing")]
     executing: BTreeSet<SortedAwaitedAction>,
-    #[metric(group = "completed")]
     completed: BTreeSet<SortedAwaitedAction>,
+}
+
+/// Publishes point-in-time counts for each action-stage bucket.
+///
+/// These gauges answer the fleet diagnostic question: are actions
+/// stacking up in Queued state (→ workers unavailable or at capacity)
+/// or moving to Executing instantly (→ scheduling efficiency fine)?
+///
+/// Published under `sorted_action_infos.*` (the group name on this
+/// field in `AwaitedActionDbImpl`). The final Prometheus names, given
+/// the production prefix `scheduler.{name}.action`, are:
+///   scheduler_{name}_action_matching_engine_state_manager_action_db_sorted_action_infos_queued_count
+///   scheduler_{name}_action_matching_engine_state_manager_action_db_sorted_action_infos_executing_count
+///   scheduler_{name}_action_matching_engine_state_manager_action_db_sorted_action_infos_cache_check_count
+///
+/// Computed at publish time from the live BTreeSets (no drift), inside
+/// the `parking_lot::Mutex::try_lock()` that the outer `MemoryAwaitedActionDb`
+/// holds during publish — so this never blocks a tokio worker thread.
+impl MetricsComponent for SortedAwaitedActions {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        let queued = self.queued.len() as u64;
+        nativelink_metric::publish!(
+            "queued_count",
+            &queued,
+            MetricKind::Counter,
+            "point-in-time number of actions in Queued state awaiting a worker assignment; \
+             non-zero while workers are saturated or unavailable"
+        );
+        let executing = self.executing.len() as u64;
+        nativelink_metric::publish!(
+            "executing_count",
+            &executing,
+            MetricKind::Counter,
+            "point-in-time number of actions in Executing state (dispatched to workers)"
+        );
+        let cache_check = self.cache_check.len() as u64;
+        nativelink_metric::publish!(
+            "cache_check_count",
+            &cache_check,
+            MetricKind::Counter,
+            "point-in-time number of actions in CacheCheck state"
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
 }
 
 impl SortedAwaitedActions {
