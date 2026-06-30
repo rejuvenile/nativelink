@@ -1227,12 +1227,18 @@ impl MetricsComponent for MemoryGateCounters {
              the instantaneous signal without decay lag."
         );
         // (#64 dark-signals) Two previously-dark sampler signals now exposed as
-        // gauges. MetricKind::Default renders as Prometheus `# TYPE ... untyped`
-        // (metrics_publisher.rs maps Default → "untyped"; the library has no
-        // gauge kind). These are non-monotonic instant values — consumers read
-        // the INSTANT value; do NOT apply `rate()`. Same convention as the
-        // `refault_ewma` gauge above. Cost: 2 extra AtomicLoad(Relaxed) per
-        // scrape — negligible.
+        // gauges, same convention as the `refault_ewma` gauge above. On the
+        // PRODUCTION /metrics endpoint MetricKind::Default renders as
+        // `# TYPE ... counter` (the nativelink-metric collector resolves Default
+        // via `into_known_kind(MetricKind::Counter)`; the library has no gauge
+        // kind — verified live: `# TYPE memory_gate_refault_ewma counter`). These
+        // values are NON-MONOTONIC (gauges) despite the `counter` TYPE line, so
+        // consumers read the INSTANT value; do NOT apply `rate()` (a decay reads
+        // as a counter reset). NOTE: the test-only `render_prometheus`/
+        // `format_prometheus` path (metrics_publisher.rs) maps Default → "untyped"
+        // instead — test and prod renderers diverge on the TYPE line, and the
+        // render tests assert only the value line, so they do not catch it.
+        // Cost: 2 extra AtomicLoad(Relaxed) per scrape — negligible.
         let v = self.swap_used_bytes.load(Ordering::Relaxed);
         publish!(
             "swap_used_bytes",
