@@ -1227,18 +1227,17 @@ impl MetricsComponent for MemoryGateCounters {
              the instantaneous signal without decay lag."
         );
         // (#64 dark-signals) Two previously-dark sampler signals now exposed as
-        // gauges, same convention as the `refault_ewma` gauge above. On the
-        // PRODUCTION /metrics endpoint MetricKind::Default renders as
-        // `# TYPE ... counter` (the nativelink-metric collector resolves Default
-        // via `into_known_kind(MetricKind::Counter)`; the library has no gauge
-        // kind — verified live: `# TYPE memory_gate_refault_ewma counter`). These
-        // values are NON-MONOTONIC (gauges) despite the `counter` TYPE line, so
-        // consumers read the INSTANT value; do NOT apply `rate()` (a decay reads
-        // as a counter reset). NOTE: the test-only `render_prometheus`/
-        // `format_prometheus` path (metrics_publisher.rs) maps Default → "untyped"
-        // instead — test and prod renderers diverge on the TYPE line, and the
-        // render tests assert only the value line, so they do not catch it.
-        // Cost: 2 extra AtomicLoad(Relaxed) per scrape — negligible.
+        // gauges, same convention as the `refault_ewma` gauge above. These render
+        // as `# TYPE ... counter` (verified live: `# TYPE memory_gate_refault_ewma
+        // counter`): the `publish!` macro resolves a numeric MetricKind::Default
+        // to Counter at publish time (`u64::publish` -> `into_known_kind(Counter)`
+        // -> the macro emits `__type = Counter`), so every renderer (prod collector
+        // AND the test-only render_prometheus/format_prometheus) sees Counter — the
+        // library has no gauge kind, and the `Default -> untyped` arm is dead for
+        // numeric metrics. These values are NON-MONOTONIC (gauges) despite the
+        // `counter` TYPE line, so consumers read the INSTANT value; do NOT apply
+        // `rate()` (a decay reads as a counter reset). Cost: 2 extra
+        // AtomicLoad(Relaxed) per scrape — negligible.
         let v = self.swap_used_bytes.load(Ordering::Relaxed);
         publish!(
             "swap_used_bytes",
