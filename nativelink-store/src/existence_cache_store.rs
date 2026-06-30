@@ -38,13 +38,13 @@ fn debug_digest_match(d: &DigestInfo) -> bool {
 }
 use nativelink_error::{Code, Error, ResultExt, error_if};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::o11_probes::ecs_hit_counters;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::evicting_map::LenEntry;
-use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
+use nativelink_util::moka_evicting_map::MokaEvictingMap;
+use nativelink_util::o11_probes::ecs_hit_counters;
 use nativelink_util::store_trait::{
     ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,

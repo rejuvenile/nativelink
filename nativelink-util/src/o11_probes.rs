@@ -674,6 +674,15 @@ impl MetricsComponent for SymlinkFixCounters {
 /// is the primary build-cache metric; sustained low hit rate signals cold cache,
 /// key-space mismatch, or excessive AC eviction.
 ///
+/// Counting scope: only `Code::NotFound` increments `miss`. Other error codes
+/// (`Internal`, `Unavailable`, `DeadlineExceeded`, etc.) are neither a hit nor
+/// a miss — they represent backend/transport failures, not cache decisions. During
+/// a backend error storm `hit + miss < total_rpcs` is expected and correct.
+///
+/// GrpcStore-shortcut RPCs (where `store.downcast_ref::<GrpcStore>` matches and
+/// the RPC is forwarded to the remote store directly) are NOT counted — the local
+/// process performs no cache lookup in that path. This is intentional.
+///
 /// Registered under prefix `"ac_get_action_result"` so the rendered names are:
 ///   `ac_get_action_result_hit_total`
 ///   `ac_get_action_result_miss_total`
