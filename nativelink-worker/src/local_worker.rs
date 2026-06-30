@@ -1143,10 +1143,13 @@ impl SwapSamplerState {
 fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     // swap-used is an absolute gauge — publish whatever we read (0 if
     // unavailable), no prev-state needed. Observability only.
-    SWAP_USED_BYTES.store(
-        mem_impl::read_swap_used_bytes().unwrap_or(0),
-        Ordering::Relaxed,
-    );
+    let swap_used = mem_impl::read_swap_used_bytes().unwrap_or(0);
+    SWAP_USED_BYTES.store(swap_used, Ordering::Relaxed);
+    // (#64 dark-signals) Mirror to the /metrics singleton. Cost: 1 extra
+    // AtomicStore(Relaxed) per ~100ms sampler tick, off the request path.
+    nativelink_util::o11_probes::memory_gate_counters()
+        .swap_used_bytes
+        .store(swap_used, Ordering::Relaxed);
 
     let now = Instant::now();
     // Publish the sample-age anchor on EVERY successful tick (BEFORE the
@@ -1171,6 +1174,11 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
         // not look like a dead sampler — only a sampler that stops ticking
         // entirely trips the age fail-open.)
         MEMORY_PRESSURE_LEVEL.store(0, Ordering::Relaxed);
+        // (#64 dark-signals) Signals unreadable → no pressure; mirror 0 so the
+        // gauge reads 0 on the unreadable path (consistent with the static).
+        nativelink_util::o11_probes::memory_gate_counters()
+            .pressure_level_mib
+            .store(0, Ordering::Relaxed);
         MEMORY_PRESSURED.store(false, Ordering::Relaxed);
         // Clear per-source trip latches for consistency: an unreadable tick
         // is not a tripped tick, and the NAK-path structured log would be
@@ -1188,10 +1196,13 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     let free_tripped = free_floor_breached(signals.free_bytes, state.free_tripped);
     // Publish the "how pressured" magnitude (MiB below the floor) for
     // observability + the server's least-pressured fail-open ranking.
-    MEMORY_PRESSURE_LEVEL.store(
-        memory_pressure_level_mib(signals.free_bytes),
-        Ordering::Relaxed,
-    );
+    let pressure_level = memory_pressure_level_mib(signals.free_bytes);
+    MEMORY_PRESSURE_LEVEL.store(pressure_level, Ordering::Relaxed);
+    // (#64 dark-signals) Mirror to the /metrics singleton. Cost: 1 extra
+    // AtomicStore(Relaxed) per ~100ms sampler tick, off the request path.
+    nativelink_util::o11_probes::memory_gate_counters()
+        .pressure_level_mib
+        .store(pressure_level, Ordering::Relaxed);
 
     // CORROBORATION (secondary): re-fault rate → fast-attack/slow-release
     // EWMA, on the existing delta/elapsed pipeline.
@@ -9078,6 +9089,21 @@ mod tests {
             .nak_refault
             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
 
+        // (#64 dark-signals) Drive the two new gauge fields through the SAME
+        // production singleton the sampler writes to in `sample_mem_pressure`.
+        // These are gauges (store, not fetch_add) — distinct sentinels so the
+        // publish path proves the field-to-name wiring (not a stale 0). The
+        // sampler thread does not run in unit tests, so no concurrent writer
+        // overwrites these between the store and the publish below.
+        const SWAP_SENTINEL: u64 = 8_123_456_789;
+        const PRESSURE_SENTINEL: u32 = 4242;
+        memory_gate_counters()
+            .swap_used_bytes
+            .store(SWAP_SENTINEL, ::core::sync::atomic::Ordering::Relaxed);
+        memory_gate_counters()
+            .pressure_level_mib
+            .store(PRESSURE_SENTINEL, ::core::sync::atomic::Ordering::Relaxed);
+
         let layer = MetricCaptureLayer::default();
         let captured = layer.events.clone();
         let subscriber = tracing_subscriber::Registry::default().with(layer);
@@ -9144,6 +9170,60 @@ mod tests {
              got {published_refault} (baseline was {before_refault}). \
              Singleton aliasing broken: memory_gate_counters() and \
              memory_gate_counters_arc() are not observing the same AtomicU64."
+        );
+
+        // (#64 dark-signals) The two new gauges must reach /metrics through the
+        // SAME MemoryGateCountersHandle path the sampler-written singleton feeds.
+        // Proves the singleton-aliasing for swap_used_bytes / pressure_level_mib
+        // (the o11_probes render tests use a fresh Arc<MemoryGateCounters>, which
+        // does NOT exercise the static-backed handle delegation the worker uses).
+        let swap_metric = events
+            .iter()
+            .find(|m| m.name == "swap_used_bytes")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected metric `swap_used_bytes` to be published by \
+                     MemoryGateCountersHandle — the sampler-written swap gauge is \
+                     dark on /metrics. Captured events: {events:#?}. \
+                     Mutation target: comment out publish!(\"swap_used_bytes\", ...) \
+                     in MemoryGateCounters::publish (#64 dark-signals)"
+                )
+            });
+        let published_swap: u64 = swap_metric
+            .value
+            .parse()
+            .expect("swap_used_bytes value must be numeric");
+        assert_eq!(
+            published_swap, SWAP_SENTINEL,
+            "swap_used_bytes must equal the sentinel stored via the singleton — \
+             got {published_swap}, expected {SWAP_SENTINEL}. Singleton aliasing \
+             broken: the sampler's memory_gate_counters().swap_used_bytes.store() \
+             is not observed through memory_gate_counters_arc()'s publish."
+        );
+
+        let pressure_metric = events
+            .iter()
+            .find(|m| m.name == "pressure_level_mib")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected metric `pressure_level_mib` to be published by \
+                     MemoryGateCountersHandle — the sampler-written pressure gauge is \
+                     dark on /metrics. Captured events: {events:#?}. \
+                     Mutation target: comment out publish!(\"pressure_level_mib\", ...) \
+                     in MemoryGateCounters::publish (#64 dark-signals)"
+                )
+            });
+        let published_pressure: u32 = pressure_metric
+            .value
+            .parse()
+            .expect("pressure_level_mib value must be numeric");
+        assert_eq!(
+            published_pressure, PRESSURE_SENTINEL,
+            "pressure_level_mib must equal the sentinel stored via the singleton — \
+             got {published_pressure}, expected {PRESSURE_SENTINEL}. Singleton \
+             aliasing broken: the sampler's \
+             memory_gate_counters().pressure_level_mib.store() is not observed \
+             through memory_gate_counters_arc()'s publish."
         );
     }
 }

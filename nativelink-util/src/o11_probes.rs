@@ -1116,6 +1116,12 @@ impl MetricsComponent for DirCacheCountersHandle {
 /// struct that is never registered with `MetricsRegistry` — the
 /// worker-metrics-exposure trap). Moving them to a process singleton makes
 /// them visible on `/metrics` without adding per-instance registration.
+///
+/// (#64 dark-signals) `swap_used_bytes` and `pressure_level_mib` are
+/// additionally added here alongside the refault EWMA gauges: both were
+/// already computed and stored to process statics (`SWAP_USED_BYTES` /
+/// `MEMORY_PRESSURE_LEVEL`) every sampler tick but had no `/metrics` publish
+/// path. Mirrored here using the same pattern as `refault_ewma`.
 #[derive(Debug)]
 pub struct MemoryGateCounters {
     /// StartAction NAKs from free-floor trip (available < FREE_FLOOR_BYTES).
@@ -1135,6 +1141,20 @@ pub struct MemoryGateCounters {
     /// (non-monotonic). The EWMA `refault_ewma` smooths this; this raw field
     /// lets operators see the instantaneous signal without the decay lag.
     pub refault_rate_last: AtomicU32,
+    /// (#64 dark-signals) host swap bytes in use (macOS `vm.swapusage` /
+    /// Linux `/proc/meminfo`), published as a gauge. Updated unconditionally
+    /// every sampler tick (~100 ms) before the signal-read early-return —
+    /// visible on all WORKER processes. Zero when the OS reports no swap, the
+    /// read fails (best-effort), or no sampler runs (server-only processes
+    /// have no worker). Non-monotonic.
+    pub swap_used_bytes: AtomicU64,
+    /// (#64 dark-signals) MiB below the free-floor (0 = at or above the
+    /// floor; positive = pressured). The magnitude the memory gate's
+    /// least-pressured fail-open ranks on. Updated every sampler tick:
+    /// set to 0 on the unreadable-signals early-return path (no pressure
+    /// can be inferred), set to the computed level on the readable path.
+    /// Non-monotonic gauge.
+    pub pressure_level_mib: AtomicU32,
 }
 
 impl MemoryGateCounters {
@@ -1144,6 +1164,8 @@ impl MemoryGateCounters {
             nak_refault: AtomicU64::new(0),
             refault_ewma: AtomicU32::new(0),
             refault_rate_last: AtomicU32::new(0),
+            swap_used_bytes: AtomicU64::new(0),
+            pressure_level_mib: AtomicU32::new(0),
         }
     }
 }
@@ -1203,6 +1225,36 @@ impl MetricsComponent for MemoryGateCounters {
              (decompressions + swapins delta / elapsed, events/sec). Gauge — not \
              monotonic. The EWMA (refault_ewma) smooths this; this field exposes \
              the instantaneous signal without decay lag."
+        );
+        // (#64 dark-signals) Two previously-dark sampler signals now exposed as
+        // gauges. MetricKind::Default renders as Prometheus `# TYPE ... untyped`
+        // (metrics_publisher.rs maps Default → "untyped"; the library has no
+        // gauge kind). These are non-monotonic instant values — consumers read
+        // the INSTANT value; do NOT apply `rate()`. Same convention as the
+        // `refault_ewma` gauge above. Cost: 2 extra AtomicLoad(Relaxed) per
+        // scrape — negligible.
+        let v = self.swap_used_bytes.load(Ordering::Relaxed);
+        publish!(
+            "swap_used_bytes",
+            &v,
+            MetricKind::Default,
+            "host swap bytes in use (macOS vm.swapusage / Linux /proc/meminfo), \
+             gauge. Updated every sampler tick (~100 ms) on worker processes; 0 \
+             when OS reports no swap, the read fails, OR no sampler runs (server-only \
+             processes have no worker, so the gauge stays 0). Non-monotonic — read \
+             instant value only; do not write a `== 0` healthy-signal alert."
+        );
+        let v = u64::from(self.pressure_level_mib.load(Ordering::Relaxed));
+        publish!(
+            "pressure_level_mib",
+            &v,
+            MetricKind::Default,
+            "this worker's locally-computed MiB below the free-floor (0 = above \
+             floor), gauge. Same raw value the worker transmits to the server's \
+             least-pressured fail-open ranking — this gauge is the worker-LOCAL \
+             view, before transmission. Set to 0 when signals are unreadable or no \
+             sampler runs (server-only processes stay 0). Non-monotonic; per-worker \
+             only — do NOT sum across processes."
         );
         Ok(MetricPublishKnownKindData::Component)
     }
@@ -2115,6 +2167,86 @@ mod tests {
             !body.contains("dir_cache_dir_cache"),
             "#DC3 doubled metric name (phase): rendered output contains `dir_cache_dir_cache`. \
              body=\n{body}"
+        );
+    }
+
+    /// (#64 dark-signals) `swap_used_bytes` and `pressure_level_mib` gauges must
+    /// render on the REAL `/metrics` path via the same `MetricsRegistry` +
+    /// `render_prometheus` walk the worker `/metrics` handler uses. Pins EXACT
+    /// rendered names: `memory_gate_swap_used_bytes` and
+    /// `memory_gate_pressure_level_mib` — NO `_total` / `_counter` suffix (these
+    /// are instant-value gauges, not monotone counters; verified empirically here).
+    ///
+    /// Absence = the signal is DARK on `/metrics`, preventing operator alerting.
+    /// Also guards the doubled-prefix trap (`memory_gate_memory_gate_*`).
+    ///
+    /// Mutation: drop one of the two new `publish!` blocks in
+    /// `MemoryGateCounters::publish` (or rename its key) → test red-fails with
+    /// "#64 swap/pressure gauge dark on /metrics: expected exact line `<name> <sentinel>`".
+    #[test]
+    fn memory_gate_render_prometheus_exposes_swap_and_pressure_gauges() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(MemoryGateCounters::new());
+        // Distinct sentinels so we catch a publish that emits the wrong field.
+        counters.swap_used_bytes.store(9_876_543_210, Ordering::Relaxed);
+        counters.pressure_level_mib.store(256, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        // Prefix "memory_gate" — the exact key production nativelink.rs uses.
+        registry.register("memory_gate", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("memory_gate_swap_used_bytes", 9_876_543_210u64),
+            ("memory_gate_pressure_level_mib", 256u64),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "#64 swap/pressure gauge dark on /metrics: expected exact line \
+                 `{name} {value}` from the render_prometheus walk, but it is \
+                 ABSENT — the signal is dark on /metrics. body=\n{body}"
+            );
+        }
+        // Guard doubled-prefix trap.
+        assert!(
+            !body.contains("memory_gate_memory_gate"),
+            "#64 doubled metric name: rendered output contains `memory_gate_memory_gate`. \
+             body=\n{body}"
+        );
+    }
+
+    /// (#64 dark-signals) Storing a value into `swap_used_bytes` /
+    /// `pressure_level_mib` must flow through to the rendered output (not
+    /// silently published as 0).
+    ///
+    /// Mutation: in `MemoryGateCounters::publish`, hard-code the published
+    /// value to `0u64` / `0u32` instead of loading the atomic → test red-fails
+    /// with "#64 publish-value: swap_used_bytes published 0 not sentinel …".
+    #[test]
+    fn memory_gate_swap_pressure_gauges_emit_stored_value() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(MemoryGateCounters::new());
+        counters.swap_used_bytes.store(1_234_567_890, Ordering::Relaxed);
+        counters.pressure_level_mib.store(512, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        registry.register("memory_gate", counters);
+        let body = render_prometheus(&registry);
+
+        let swap_line = "\nmemory_gate_swap_used_bytes 1234567890\n".to_string();
+        assert!(
+            body.contains(&swap_line),
+            "#64 publish-value: swap_used_bytes published 0 not sentinel 1234567890 — \
+             the atomic store is not flowing through publish(). body=\n{body}"
+        );
+        let pressure_line = "\nmemory_gate_pressure_level_mib 512\n".to_string();
+        assert!(
+            body.contains(&pressure_line),
+            "#64 publish-value: pressure_level_mib published 0 not sentinel 512 — \
+             the atomic store is not flowing through publish(). body=\n{body}"
         );
     }
 
