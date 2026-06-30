@@ -38,6 +38,7 @@ fn debug_digest_match(d: &DigestInfo) -> bool {
 }
 use nativelink_error::{Code, Error, ResultExt, error_if};
 use nativelink_metric::MetricsComponent;
+use nativelink_util::o11_probes::ecs_hit_counters;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::evicting_map::LenEntry;
@@ -439,6 +440,13 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
             .zip(results.iter())
             .filter_map(|(digest, result)| result.map_or_else(|| Some(digest.into()), |_| None))
             .collect();
+
+        // Record per-key hit/miss counts: keys NOT in not_cached_keys were
+        // served from the moka cache (hits); keys IN not_cached_keys missed.
+        let miss_count = not_cached_keys.len() as u64;
+        let hit_count = keys.len() as u64 - miss_count;
+        ecs_hit_counters().record_hits(hit_count);
+        ecs_hit_counters().record_misses(miss_count);
 
         // Hot path optimization when all keys are cached.
         if not_cached_keys.is_empty() {

@@ -760,6 +760,22 @@ async fn inner_main(
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),
     );
 
+    // AC + ECS hit/miss counters (server-side observability).
+    // Registered under "ac_get_action_result" → rendered names:
+    //   ac_get_action_result_hit_total, ac_get_action_result_miss_total
+    // Registered under "ecs" → rendered names:
+    //   ecs_has_hit_total, ecs_has_miss_total
+    // Counters are server-side only; worker-only processes read 0
+    // (no AC RPCs, no ExistenceCacheStore has() on the worker path).
+    metrics_registry.register(
+        "ac_get_action_result",
+        nativelink_util::o11_probes::ac_hit_counters_arc(),
+    );
+    metrics_registry.register(
+        "ecs",
+        nativelink_util::o11_probes::ecs_hit_counters_arc(),
+    );
+
     // Periodically log tokio runtime metrics to detect thread pool exhaustion.
     // Requires tokio_unstable cfg for blocking thread metrics.
     #[cfg(tokio_unstable)]

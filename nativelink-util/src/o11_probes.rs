@@ -663,6 +663,222 @@ impl MetricsComponent for SymlinkFixCounters {
 }
 
 // =====================================================================
+// AC get_action_result hit/miss counters
+// =====================================================================
+
+/// Process-global counters for `get_action_result` cache hits and misses.
+///
+/// A hit = the AC store returned `Ok(ActionResult)` — Bazel gets the cached
+/// result and does NOT re-execute the action. A miss = the AC store returned
+/// `Code::NotFound` — Bazel must re-execute. The hit rate `hit / (hit + miss)`
+/// is the primary build-cache metric; sustained low hit rate signals cold cache,
+/// key-space mismatch, or excessive AC eviction.
+///
+/// Registered under prefix `"ac_get_action_result"` so the rendered names are:
+///   `ac_get_action_result_hit_total`
+///   `ac_get_action_result_miss_total`
+#[derive(Debug)]
+pub struct AcHitCounters {
+    /// Monotone count of `get_action_result` RPCs returning `Ok(ActionResult)`.
+    pub hit: AtomicU64,
+    /// Monotone count of `get_action_result` RPCs returning `Code::NotFound`.
+    pub miss: AtomicU64,
+}
+
+impl AcHitCounters {
+    const fn new() -> Self {
+        Self {
+            hit: AtomicU64::new(0),
+            miss: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one AC cache hit.
+    pub fn record_hit(&self) {
+        self.hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one AC cache miss (NotFound).
+    pub fn record_miss(&self) {
+        self.miss.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl MetricsComponent for AcHitCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        let v = self.hit.load(Ordering::Relaxed);
+        publish!(
+            "hit_total",
+            &v,
+            MetricKind::Counter,
+            "Count of get_action_result RPCs that returned Ok(ActionResult) — Bazel \
+             used the cached result and did NOT re-execute the action. Numerator for \
+             the AC hit rate (hit / (hit + miss))."
+        );
+        let v = self.miss.load(Ordering::Relaxed);
+        publish!(
+            "miss_total",
+            &v,
+            MetricKind::Counter,
+            "Count of get_action_result RPCs that returned Code::NotFound — Bazel \
+             must re-execute the action. Denominator counterpart to hit_total; \
+             sustained high miss rate signals cold cache, key-space mismatch, or \
+             excessive AC eviction."
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// Process-wide AC hit/miss counters. Backed by a `static` so `const fn new()`
+/// suffices; incremented from `ac_server.rs::inner_get_action_result`.
+static AC_HIT_COUNTERS: AcHitCounters = AcHitCounters::new();
+/// Cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents double-
+/// registration; both calls return a clone of the same `Arc`.
+static AC_HIT_COUNTERS_ARC: OnceLock<Arc<AcHitCountersHandle>> = OnceLock::new();
+
+/// Process-wide AC hit/miss counters singleton.
+#[must_use]
+pub fn ac_hit_counters() -> &'static AcHitCounters {
+    &AC_HIT_COUNTERS
+}
+
+/// `Arc` wrapper for `MetricsRegistry::register`. `OnceLock`-cached.
+#[must_use]
+pub fn ac_hit_counters_arc() -> Arc<AcHitCountersHandle> {
+    Arc::clone(AC_HIT_COUNTERS_ARC.get_or_init(|| Arc::new(AcHitCountersHandle)))
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an
+/// `Arc<T: MetricsComponent>` for the `static`-backed AC counters.
+#[derive(Debug)]
+pub struct AcHitCountersHandle;
+
+impl MetricsComponent for AcHitCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        AC_HIT_COUNTERS.publish(kind, field_metadata)
+    }
+}
+
+// =====================================================================
+// ExistenceCache has() hit/miss counters
+// =====================================================================
+
+/// Process-global counters for `ExistenceCacheStore::has_with_results` cache
+/// hits and misses, aggregated PER KEY (one observation per key per call).
+///
+/// A hit = the key was found in the in-process moka cache (the backend
+/// existence check was skipped). A miss = the key was absent from the moka
+/// cache and the inner store was queried. Hit rate `hit / (hit + miss)` tells
+/// operators how effectively the 50M-entry moka cache is absorbing FindMissingBlobs
+/// traffic.
+///
+/// Registered under prefix `"ecs"` so the rendered names are:
+///   `ecs_has_hit_total`
+///   `ecs_has_miss_total`
+#[derive(Debug)]
+pub struct EcsHitCounters {
+    /// Monotone count of per-key `has_with_results` lookups satisfied from
+    /// the moka cache (backend not queried).
+    pub hit: AtomicU64,
+    /// Monotone count of per-key `has_with_results` lookups that missed the
+    /// moka cache and required an inner-store query.
+    pub miss: AtomicU64,
+}
+
+impl EcsHitCounters {
+    const fn new() -> Self {
+        Self {
+            hit: AtomicU64::new(0),
+            miss: AtomicU64::new(0),
+        }
+    }
+
+    /// Record `n` cache hits (keys satisfied from moka without inner-store query).
+    pub fn record_hits(&self, n: u64) {
+        if n > 0 {
+            self.hit.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Record `n` cache misses (keys that required an inner-store query).
+    pub fn record_misses(&self, n: u64) {
+        if n > 0 {
+            self.miss.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+impl MetricsComponent for EcsHitCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        let v = self.hit.load(Ordering::Relaxed);
+        publish!(
+            "has_hit_total",
+            &v,
+            MetricKind::Counter,
+            "Count of per-key has_with_results lookups satisfied from the moka \
+             existence cache (inner store NOT queried). Numerator for the \
+             ExistenceCacheStore hit rate (hit / (hit + miss))."
+        );
+        let v = self.miss.load(Ordering::Relaxed);
+        publish!(
+            "has_miss_total",
+            &v,
+            MetricKind::Counter,
+            "Count of per-key has_with_results lookups that missed the moka cache \
+             and required an inner-store query. Denominator counterpart to \
+             has_hit_total; sustained high miss rate with a full 50M-entry cache \
+             signals a key-space larger than the cache capacity."
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// Process-wide ExistenceCache hit/miss counters.
+static ECS_HIT_COUNTERS: EcsHitCounters = EcsHitCounters::new();
+/// Cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents double-
+/// registration; both calls return a clone of the same `Arc`.
+static ECS_HIT_COUNTERS_ARC: OnceLock<Arc<EcsHitCountersHandle>> = OnceLock::new();
+
+/// Process-wide ExistenceCache hit/miss counters singleton.
+#[must_use]
+pub fn ecs_hit_counters() -> &'static EcsHitCounters {
+    &ECS_HIT_COUNTERS
+}
+
+/// `Arc` wrapper for `MetricsRegistry::register`. `OnceLock`-cached.
+#[must_use]
+pub fn ecs_hit_counters_arc() -> Arc<EcsHitCountersHandle> {
+    Arc::clone(ECS_HIT_COUNTERS_ARC.get_or_init(|| Arc::new(EcsHitCountersHandle)))
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an
+/// `Arc<T: MetricsComponent>` for the `static`-backed ECS counters.
+#[derive(Debug)]
+pub struct EcsHitCountersHandle;
+
+impl MetricsComponent for EcsHitCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        ECS_HIT_COUNTERS.publish(kind, field_metadata)
+    }
+}
+
+// =====================================================================
 // Process-global singletons
 // =====================================================================
 
@@ -2294,6 +2510,154 @@ mod tests {
         assert!(
             !body.contains("memory_gate_memory_gate"),
             "#64 doubled metric name: rendered output contains `memory_gate_memory_gate`. \
+             body=\n{body}"
+        );
+    }
+
+    // =====================================================================
+    // AcHitCounters tests
+    // =====================================================================
+
+    /// AC hit/miss: increment-observable test on a LOCAL `AcHitCounters`.
+    /// `record_hit` must bump `hit`; `record_miss` must bump `miss`; no cross-talk.
+    ///
+    /// Mutation: comment out `self.hit.fetch_add(1, ...)` in `record_hit` →
+    /// `hit` stays at 0; test red-fails with
+    /// "ac-hit increment: record_hit x4 must yield hit==4".
+    #[test]
+    fn ac_hit_counters_increment_observable() {
+        let c = AcHitCounters::new();
+        assert_eq!(c.hit.load(Ordering::Relaxed), 0,
+            "ac-hit increment: hit must initialize to 0");
+        assert_eq!(c.miss.load(Ordering::Relaxed), 0,
+            "ac-hit increment: miss must initialize to 0");
+
+        for _ in 0..4 { c.record_hit(); }
+        for _ in 0..2 { c.record_miss(); }
+
+        assert_eq!(c.hit.load(Ordering::Relaxed), 4,
+            "ac-hit increment: record_hit x4 must yield hit==4 (got {})",
+            c.hit.load(Ordering::Relaxed));
+        assert_eq!(c.miss.load(Ordering::Relaxed), 2,
+            "ac-hit increment: record_miss x2 must yield miss==2 (got {})",
+            c.miss.load(Ordering::Relaxed));
+    }
+
+    /// AC hit/miss: end-to-end render test. Verifies that `AcHitCounters`
+    /// registered under prefix `"ac_get_action_result"` emits EXACTLY
+    /// `ac_get_action_result_hit_total` and `ac_get_action_result_miss_total`
+    /// via the real `render_prometheus` walk.
+    ///
+    /// Pins the EXACT line so a prefix or field-name regression (including
+    /// the doubled-prefix trap) is caught immediately.
+    ///
+    /// Mutation: drop one `publish!` call in `AcHitCounters::publish` (or
+    /// rename its key) → test red-fails with "ac-hit dark on /metrics:
+    /// expected exact line `ac_get_action_result_hit_total 7`".
+    #[test]
+    fn ac_hit_counters_render_prometheus_exposes_hit_and_miss() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(AcHitCounters::new());
+        for _ in 0..7 { counters.record_hit(); }
+        for _ in 0..3 { counters.record_miss(); }
+
+        let registry = MetricsRegistry::new();
+        // Prefix "ac_get_action_result" — the exact key production nativelink.rs
+        // will use. The rendered names must be:
+        //   ac_get_action_result_hit_total
+        //   ac_get_action_result_miss_total
+        registry.register("ac_get_action_result", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("ac_get_action_result_hit_total", 7u64),
+            ("ac_get_action_result_miss_total", 3u64),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "ac-hit dark on /metrics: expected exact line `{name} {value}` \
+                 from render_prometheus walk, but it is ABSENT — the AC hit/miss \
+                 counter is not exposed. body=\n{body}"
+            );
+        }
+
+        // Guard doubled-prefix trap.
+        assert!(
+            !body.contains("ac_get_action_result_ac_get_action_result"),
+            "ac-hit doubled metric name: rendered output contains doubled prefix. \
+             body=\n{body}"
+        );
+    }
+
+    // =====================================================================
+    // EcsHitCounters tests
+    // =====================================================================
+
+    /// ECS hit/miss: increment-observable test on a LOCAL `EcsHitCounters`.
+    /// `record_hits(n)` must add `n` to `hit`; `record_misses(n)` to `miss`.
+    ///
+    /// Mutation: comment out `self.hit.fetch_add(n, ...)` in `record_hits` →
+    /// `hit` stays 0; test red-fails with
+    /// "ecs-hit increment: record_hits(5) must yield hit==5".
+    #[test]
+    fn ecs_hit_counters_increment_observable() {
+        let c = EcsHitCounters::new();
+        assert_eq!(c.hit.load(Ordering::Relaxed), 0,
+            "ecs-hit increment: hit must initialize to 0");
+        assert_eq!(c.miss.load(Ordering::Relaxed), 0,
+            "ecs-hit increment: miss must initialize to 0");
+
+        c.record_hits(5);
+        c.record_misses(3);
+
+        assert_eq!(c.hit.load(Ordering::Relaxed), 5,
+            "ecs-hit increment: record_hits(5) must yield hit==5 (got {})",
+            c.hit.load(Ordering::Relaxed));
+        assert_eq!(c.miss.load(Ordering::Relaxed), 3,
+            "ecs-hit increment: record_misses(3) must yield miss==3 (got {})",
+            c.miss.load(Ordering::Relaxed));
+    }
+
+    /// ECS hit/miss: end-to-end render test. Verifies that `EcsHitCounters`
+    /// registered under prefix `"ecs"` emits EXACTLY `ecs_has_hit_total` and
+    /// `ecs_has_miss_total` via the real `render_prometheus` walk.
+    ///
+    /// Mutation: drop one `publish!` call in `EcsHitCounters::publish` (or
+    /// rename its key) → test red-fails with "ecs-hit dark on /metrics:
+    /// expected exact line `ecs_has_hit_total 9`".
+    #[test]
+    fn ecs_hit_counters_render_prometheus_exposes_hit_and_miss() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(EcsHitCounters::new());
+        counters.record_hits(9);
+        counters.record_misses(4);
+
+        let registry = MetricsRegistry::new();
+        // Prefix "ecs" — the exact key production nativelink.rs will use.
+        // Rendered names: ecs_has_hit_total, ecs_has_miss_total.
+        registry.register("ecs", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("ecs_has_hit_total", 9u64),
+            ("ecs_has_miss_total", 4u64),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "ecs-hit dark on /metrics: expected exact line `{name} {value}` \
+                 from render_prometheus walk, but it is ABSENT — the ECS hit/miss \
+                 counter is not exposed. body=\n{body}"
+            );
+        }
+
+        // Guard doubled-prefix trap.
+        assert!(
+            !body.contains("ecs_ecs"),
+            "ecs-hit doubled metric name: rendered output contains `ecs_ecs`. \
              body=\n{body}"
         );
     }

@@ -34,6 +34,7 @@ use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::log_utils::throughput_mbps;
+use nativelink_util::o11_probes::ac_hit_counters;
 use nativelink_util::stall_detector::StallGuard;
 use nativelink_util::store_trait::{IS_AC_PEER_FETCH, IS_MIRROR_REQUEST, Store, StoreLike};
 use opentelemetry::context::FutureExt;
@@ -327,6 +328,7 @@ impl AcServer {
                     throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes, elapsed)),
                     "AC read completed",
                 );
+                ac_hit_counters().record_hit();
                 Ok(Response::new(action_result))
             }
             Err(mut e) => {
@@ -339,6 +341,7 @@ impl AcServer {
                         elapsed_us = elapsed.as_micros() as u64,
                         "AC read NotFound",
                     );
+                    ac_hit_counters().record_miss();
                 }
                 Err(e)
             }
