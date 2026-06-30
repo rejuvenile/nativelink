@@ -5641,20 +5641,26 @@ async fn compute_sha256_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
     })
 }
 
-/// Sample period for `chunked_in_flight registered` / `removed` info! logs.
-/// 64 yields ~1/64 emission rate (~1 log per 64 blob admissions), reducing
-/// the ~708/10 min production volume to ~11/10 min while preserving the
-/// writer-path attribution signal for the FL-688 durability path.
+/// Sample period for the `chunked_in_flight removed` (`outcome="reaper_decrement"`)
+/// info! log — the ONLY such log live in the release binary (the paired
+/// `registered` and Drop-removal sites are `debug!`, compiled out by
+/// `release_max_level_info`). 64 yields ~1/64 emission rate (~1 log per 64 blob
+/// admissions), reducing the ~708/10 min production volume to ~11/10 min while
+/// preserving the writer-path attribution signal for the FL-688 durability path.
 ///
-/// Mirrors `READER_CONSTRUCTION_SAMPLE_PERIOD` in `nativelink-util/src/streaming_blob.rs`.
+/// Same digest-sampling pattern as `READER_CONSTRUCTION_SAMPLE_PERIOD`
+/// (`nativelink-util/src/streaming_blob.rs`), independently tuned — that one is 1024.
 const CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD: u64 = 64;
 
-/// Returns `true` if the `chunked_in_flight registered` / `chunked_in_flight removed`
-/// info! logs should be emitted for `digest`.
+/// Returns `true` if the sampled `chunked_in_flight` info! log should be emitted
+/// for `digest`.
 ///
 /// Deterministic (digest → bool, no mutable state): the same digest always
-/// produces the same decision so the register and remove log lines for a given
-/// blob are always both emitted or both suppressed, keeping log pairs matched.
+/// produces the same decision. In the current release binary only the
+/// `reaper_decrement` removal site is `info!` (the `registered` and Drop-removal
+/// sites are `debug!`/compiled-out), so there is no live pair to match today; the
+/// determinism guarantees the register/remove lines would BOTH emit or BOTH
+/// suppress IF those sites are ever restored to `info!`.
 ///
 /// Uses the first 8 bytes of the packed hash as a stable u64 key. Blake3/SHA-256
 /// outputs are uniformly distributed, so `key % CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD`
