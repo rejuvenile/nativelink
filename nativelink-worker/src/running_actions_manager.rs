@@ -385,6 +385,16 @@ struct CalibStagingRecord {
     /// (auditor Claim 3 / §6). `input_tree_bytes` below is proto-structure size,
     /// a cheap SECONDARY covariate, NOT the fetch-cost axis.
     input_payload_bytes: u64,
+    /// NETWORK-FETCH byte axis: sum of the digest sizes NOT already cached
+    /// locally (= `missing_bytes` in staging scope). `input_payload_bytes` above
+    /// is the FULL payload (cached + missing), which conflates network-fetch
+    /// volume with local-hardlink volume; `missing_bytes` is the bytes the
+    /// network transfer actually moves. Carrying both lets the §6
+    /// `load_byte_cost` fit separate the (dominant) fetch cost from the hardlink
+    /// cost — with a fully cache-cold miss `input_missing_bytes ≈
+    /// input_payload_bytes`, but under server missing-digest hints / partial
+    /// cache it is smaller (auditor Claim 3 residual).
+    input_missing_bytes: u64,
     /// Sum of `size_bytes()` over the resolved tree's directory digests (proto
     /// structure size, scales with directory COUNT not payload VOLUME). Kept as
     /// a secondary regressor; NOT the per-byte fetch-cost axis (see above).
@@ -404,6 +414,8 @@ impl CalibStagingRecord {
             dir_cache_hit = self.dir_cache_hit,
             // primary regressor: file-payload bytes moved by the fetch/hardlink.
             input_payload_bytes = self.input_payload_bytes,
+            // network-fetch axis: bytes NOT already cached (the transfer volume).
+            input_missing_bytes = self.input_missing_bytes,
             // secondary covariate: proto-structure size, NOT the fetch-cost axis.
             input_tree_bytes = self.input_tree_bytes,
             input_tree_files = self.input_tree_files,
@@ -428,30 +440,59 @@ fn calib_tree_totals(tree: &HashMap<DigestInfo, ProtoDirectory>) -> (u64, u64) {
 /// action forks a fork-bomb-shaped tree.
 // CAPPED AT 8: max descendant recursion depth. Real toolchain trees are shallow
 // (process-wrapper → compiler → linker ≈ 3 levels); 8 is generous headroom and
-// bounds the recursion regardless of a runaway action.
-#[cfg(target_os = "macos")]
+// bounds the recursion regardless of a runaway action. `test`-gated in addition
+// to macOS so `constants_match_spec` can pin it on the Linux build box.
+#[cfg(any(target_os = "macos", test))]
 const CALIB_SUBTREE_MAX_DEPTH: u32 = 8;
 // CAPPED AT 512: max total pids summed per poll tick, bounding both the
 // `proc_listchildpids` buffer and the per-tick syscall count. A compile/link
 // action's descendant set is tens of pids; 512 caps a runaway fan-out without
 // truncating any realistic tree.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const CALIB_SUBTREE_MAX_PIDS: usize = 512;
+
+/// Pure tick→ns conversion, factored out so it is cross-platform
+/// unit-testable (the timebase source is injected). `pti_total_*` are raw
+/// **mach-timebase ticks**; ns = `ticks * numer / denom`.
+///
+/// **Drop-don't-fabricate:** returns `None` when the timebase is absent
+/// (`mach_timebase_info` failed) OR its `denom` is 0. A `None` here propagates
+/// to `cpu_time_ms = None` (dropped offline), NOT a fabricated 1:1 scale — a
+/// 1:1 fallback would silently under-report CPU ~40× on the M-series fleet
+/// (numer/denom ≈ 125/3) and misclassify every action `io_bound` with no marker
+/// to drop the poisoned samples (auditor + red-team: the probe's whole purpose
+/// is a valid ratio, so no code path may emit a knowingly-wrong one). The
+/// `u128` intermediate keeps `ticks * numer` from wrapping u64 on a multi-hour
+/// action; the final narrow saturates rather than panics.
+#[cfg(any(target_os = "macos", test))]
+fn calib_ticks_to_ns(ticks: u64, timebase: Option<(u32, u32)>) -> Option<u64> {
+    let (numer, denom) = timebase?;
+    if denom == 0 {
+        return None;
+    }
+    Some(
+        u64::try_from(u128::from(ticks) * u128::from(numer) / u128::from(denom))
+            .unwrap_or(u64::MAX),
+    )
+}
 
 /// Read the macOS `mach_timebase_info` ratio ONCE (it is constant per boot) and
 /// cache it. `proc_pidinfo`'s `pti_total_*` fields are raw **mach-timebase
 /// ticks**, NOT nanoseconds (see `calib_capture_cpu_ns`); converting a tick
 /// count to ns requires `ticks * numer / denom`. Cached in a `OnceLock` so the
-/// syscall runs at most once for the whole process.
+/// syscall runs at most once for the whole process. Returns `None` (NOT a 1:1
+/// fabrication) if the syscall fails or reports `denom == 0`, and `warn!`s once
+/// — so a silent 40× regression can never recur unobserved (auditor + red-team).
 #[cfg(target_os = "macos")]
-fn calib_mach_timebase() -> (u64, u64) {
+fn calib_mach_timebase() -> Option<(u32, u32)> {
     use std::sync::OnceLock;
-    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+    static TIMEBASE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *TIMEBASE.get_or_init(|| {
-        // `mach_timebase_info` (and its struct) are `#[deprecated]` in `libc`
-        // ("use the mach2 crate"), but adding a whole crate for one constant is
-        // not worth it; the ABI is stable. Read numer/denom at RUNTIME — do NOT
-        // hardcode 125/3, future silicon differs.
+        // `mach_timebase_info` — BOTH the struct AND the fn — are `#[deprecated]`
+        // in `libc` 0.2.182 ("use the mach2 crate"), so the struct-literal below
+        // AND the fn call both need `#[allow(deprecated)]`. Adding a whole crate
+        // for one boot constant is not worth it; the ABI is stable. Read
+        // numer/denom at RUNTIME — do NOT hardcode 125/3, future silicon differs.
         #[allow(deprecated)]
         let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
         // SAFETY: `mach_timebase_info` fills the `mach_timebase_info` struct we
@@ -460,12 +501,20 @@ fn calib_mach_timebase() -> (u64, u64) {
         #[allow(deprecated)]
         let rc = unsafe { libc::mach_timebase_info(core::ptr::from_mut(&mut info)) };
         if rc != 0 || info.denom == 0 {
-            // Fall back to 1:1 (ns == tick) if the syscall failed — a wrong
-            // scale is preferable to a divide-by-zero, and this path is
-            // effectively unreachable on real hardware.
-            (1, 1)
+            // Refuse, don't fabricate. This is effectively unreachable on real
+            // hardware (`mach_timebase_info` is a boot constant that does not
+            // fail), so the `warn!` fires at most once per process via the
+            // OnceLock and converts a would-be silent 40×-wrong scale into a
+            // visible signal; the caller records `cpu_time_ms = None`.
+            warn!(
+                rc,
+                denom = info.denom,
+                "calib: mach_timebase_info unavailable — cpu_time_ms will be None \
+                 (refusing a fabricated 1:1 ns scale)"
+            );
+            None
         } else {
-            (u64::from(info.numer), u64::from(info.denom))
+            Some((info.numer, info.denom))
         }
     })
 }
@@ -529,15 +578,13 @@ fn calib_capture_cpu_ns(pid: u32) -> Option<u64> {
         // ESRCH (reaped/exited), permission denied, or partial write.
         return None;
     }
-    // Raw mach-timebase ticks (see UNITS above) → ns via the cached ratio.
+    // Raw mach-timebase ticks (see UNITS above) → ns via the cached ratio. A
+    // `None` timebase propagates to `None` here (drop-don't-fabricate — the
+    // `?`), so a would-be 40×-wrong sample is dropped rather than emitted.
     let ticks = info
         .pti_total_user
         .saturating_add(info.pti_total_system);
-    let (numer, denom) = calib_mach_timebase();
-    // u128 intermediate: a long multi-hour multithreaded action can accumulate
-    // enough ticks that `ticks * numer` (numer=125 on M4) would risk a u64
-    // wrap; u128 makes the multiply safe before the divide narrows back to u64.
-    Some(u64::try_from(u128::from(ticks) * u128::from(numer) / u128::from(denom)).unwrap_or(u64::MAX))
+    calib_ticks_to_ns(ticks, calib_mach_timebase())
 }
 
 // Non-macOS single-pid stub: reachable only via `calib_capture_cpu_time_ms`,
@@ -593,12 +640,32 @@ fn calib_accumulate_subtree_cpu(map: &mut HashMap<libc::pid_t, u64>, pid: libc::
 /// cares about (auditor Claim 1 / red-team A1-2). We enumerate descendants and
 /// sum them.
 ///
-/// **Residual limitation:** a descendant that spawns AND exits entirely within
-/// one poll interval is never observed → its CPU is missed (rare for
-/// CPU-significant subprocesses; the 250 ms interval reduces the window).
-/// PID-recycle WITHIN one action is assumed impossible (macOS PID space vs an
-/// action's seconds-to-minutes duration), so a pid in the map is assumed to
-/// remain the same process for the action's lifetime.
+/// **Known residuals (all bias the ratio DOWN — documented, NOT solved in code;
+/// the analyst must caveat the §6 short-action-fraction / Q2 shape-mix
+/// conclusions accordingly; on-worker validation is the canary grep, not a unit
+/// test — see `deferred_tasks.md`):**
+/// - **Within-one-interval spawn+die:** a descendant that both spawns AND exits
+///   inside one 250 ms tick is never sampled → its CPU is missed. The shorter
+///   250 ms interval reduces but does not close this window.
+/// - **Reparent-orphan:** the walk roots at the direct child and stops when the
+///   ROOT returns ESRCH. If an INTERMEDIATE process exits while a descendant
+///   keeps running, that descendant reparents to launchd (pid 1) and LEAVES the
+///   subtree — `proc_listchildpids` no longer finds it, and its CPU after the
+///   reparent point is lost. For the target RBE toolchains this is RARE because
+///   the root driver waits for all real work (a `process-wrapper` / `rustc`
+///   waits for its `rust-lld`, so the fork-heavy case that motivates this walk
+///   IS captured), but a detached/orphaned descendant (e.g. a wrapper that
+///   fork-and-exits leaving a long-running compiler) is under-counted. The
+///   `live_child_subtree...` test deliberately tests the parent-OUTLIVES-child
+///   shape (the `& wait` keeps the parent alive) and does NOT exercise this
+///   orphan shape — it is validated on-worker via the canary ratio grep.
+/// - **PID-reuse within one action:** the map keys on pid with `max()`, so if
+///   pid P is descendant A (CPU X), P exits, and P is REUSED by descendant B
+///   (CPU Y), the map keeps `max(X, Y)` — the smaller of the two is dropped
+///   (a SUM error, not a swap). Rare for a normal action (macOS PID space vs
+///   seconds-to-minutes), but a fork-storm action (thousands of short
+///   `cc`/`as`/`ld`) inside one action CAN wrap the pid space; such actions
+///   under-count and should be excluded from the `>1.5` band conclusions.
 #[cfg(target_os = "macos")]
 fn calib_capture_subtree_cpu_ns(pid: u32, map: &mut HashMap<libc::pid_t, u64>) -> Option<u64> {
     let root = pid as libc::pid_t;
@@ -3165,6 +3232,11 @@ pub fn download_to_directory<'a>(
                 input_staging_ms: total_ms as u64,
                 dir_cache_hit: false,
                 input_payload_bytes: total_bytes,
+                // network-fetch axis: bytes not already cached locally, i.e. the
+                // volume the network transfer moved (in scope from the batch
+                // existence check above). Separates fetch cost from hardlink cost
+                // in the §6 fit (auditor Claim 3 residual).
+                input_missing_bytes: missing_bytes,
                 input_tree_bytes: calib_tree_bytes,
                 input_tree_files: calib_tree_files,
             }
@@ -4903,17 +4975,28 @@ impl RunningActionImpl {
         // (only its summed value crosses the atom); it survives child exits so
         // sequential subprocesses are all counted.
         //
-        // Overhead (recompute for 250 ms + subtree fan-out): only 1/16 of actions
-        // arm the poll; each sampled action holds at most ONE inflight
-        // `spawn_blocking` at a time (the loop awaits before re-issuing), and that
-        // one call does the WHOLE subtree walk (1 `proc_listchildpids` size + 1
-        // fetch + N `proc_pidinfo`, N = descendant count ≈ tens, each a µs-scale
-        // read-only syscall → tens of µs total) at 4/s. At the 2026-06-16 incident
-        // peak (~352 in-flight → ~22 sampled poll tasks) that is ≤22 blocking-pool
-        // slots held ~tens-of-µs each per 250 ms window ≈ 22 × 40µs / 250ms ≈
-        // 0.0035% time-averaged occupancy of the 1024-thread pool — an order of
-        // magnitude under 500 ms/single-syscall and still ~4000× below the 157
-        // threads (~15%) the isotope wedge consumed. Negligible.
+        // Overhead (honest syscall count for 250 ms + subtree fan-out): only
+        // 1/16 of actions arm the poll; each sampled action holds at most ONE
+        // inflight `spawn_blocking` at a time (the loop awaits before re-issuing).
+        // That one call does the WHOLE subtree walk: per internal node TWO
+        // `proc_listchildpids` calls (a NULL sizing call + a fetch) plus one
+        // `proc_pidinfo` per pid. A realistic ~30-pid toolchain tree (~10 internal
+        // + 20 leaf) is ~70 read-only syscalls at ~2-5 µs each ≈ 140-350 µs per
+        // walk, at 4/s. At the 2026-06-16 incident peak (~352 in-flight → ~22
+        // sampled poll tasks) that is ≤22 blocking-pool slots held ~250 µs each
+        // per 250 ms window ≈ 22 × 250µs / 250ms ≈ 2.2% time-averaged occupancy
+        // of the 1024-thread pool — call it ~1-3% typical. That clears the 15.3%
+        // (157/1024) the isotope wedge consumed by ~5-13×, AND unlike those
+        // recursive `remove_dir_all` deletes these syscalls are FAST read-only
+        // queries that do NOT go uninterruptible D-state — they hold a thread for
+        // µs, not the unbounded D-state stalls that actually starved the isotope
+        // data plane. What bounds the PATHOLOGICAL tail (a fork-bomb-shaped action
+        // that also lands in the 1/16 sample) is NOT this point estimate but the
+        // caps: CALIB_SUBTREE_MAX_PIDS=512 / _DEPTH=8. The 512-pid worst case is
+        // ~1.5k syscalls ≈ 3-8 ms/walk → ~27-68% occupancy — still cap-terminated,
+        // non-D-state, 1/16-sampled, and per-action-scoped, so real-world risk is
+        // low; the caps, not the ~2% figure, are the tail guarantee. Negligible in
+        // the common case.
         //
         // The task is bounded: it self-terminates on the first `None` (ROOT child
         // reaped/gone) and only runs for the 1/16 sampled actions; the `spawn!`
@@ -4933,6 +5016,12 @@ impl RunningActionImpl {
             // only to hand it into each per-tick `spawn_blocking` closure — no
             // other task touches it, so the mutex is uncontended (task-local by
             // usage, not shared state).
+            // UNBOUNDED-OK: task-local pid→cpu-ns accumulator, freed when the poll
+            // task ends (action completion — the Arc drops on guard-abort or the
+            // None-break; verified it does not outlive the action). It grows with
+            // distinct-pids-forked-per-action (tens for a real toolchain tree,
+            // ~48 B/entry), NOT process-lifetime, and only 1/16 of actions arm it;
+            // the per-tick fan-out is separately capped at CALIB_SUBTREE_MAX_PIDS.
             let subtree_map: Arc<Mutex<HashMap<libc::pid_t, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             Some(spawn!("calib_cpu_time_poll", async move {
@@ -10341,9 +10430,10 @@ mod calib_probe_tests {
 
     use super::{
         CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_TREE_BYTES_THRESHOLD, CALIB_SAMPLE_PERIOD,
-        CalibActionShape, CalibActionRecord, CalibStagingRecord, calib_action_sampled,
-        calib_build_action_record, calib_classify, calib_digest_sample_key,
-        calib_poll_cpu_time_loop, calib_staging_sampled, calib_tree_totals, calib_uniformly_sampled,
+        CALIB_SUBTREE_MAX_DEPTH, CALIB_SUBTREE_MAX_PIDS, CalibActionShape, CalibActionRecord,
+        CalibStagingRecord, calib_action_sampled, calib_build_action_record, calib_classify,
+        calib_digest_sample_key, calib_poll_cpu_time_loop, calib_staging_sampled,
+        calib_tree_totals, calib_uniformly_sampled,
     };
 
     /// Build a digest whose first-8-byte LE sampling key is exactly `key`.
@@ -10370,6 +10460,61 @@ mod calib_probe_tests {
             CALIB_LARGE_TREE_BYTES_THRESHOLD,
             100 * 1024 * 1024,
             "spec §9 B4 P-B 1/1 override fires at input_tree_bytes > 100 MiB"
+        );
+        // Subtree-walk defensive caps: pin both so a silent bump (which would
+        // change the fan-out bound the perf argument rests on) is a deliberate,
+        // reviewed test change, not an invisible edit (testing-czar G1).
+        assert_eq!(
+            CALIB_SUBTREE_MAX_DEPTH, 8,
+            "descendant-walk depth cap = 8 (shallow toolchain trees are ~3 levels; \
+             8 is headroom); a change here alters the pathological fan-out bound"
+        );
+        assert_eq!(
+            CALIB_SUBTREE_MAX_PIDS, 512,
+            "descendant-walk per-tick pid cap = 512 (bounds the proc_listchildpids \
+             buffer + per-tick syscall count); a change here alters the worst-case \
+             blocking-pool occupancy"
+        );
+    }
+
+    // --- P-A mach-timebase tick→ns conversion (drop-don't-fabricate) -------
+
+    #[test]
+    fn ticks_to_ns_refuses_on_absent_or_bad_timebase() {
+        // An unavailable timebase (mach_timebase_info failed) or a zero denom
+        // MUST yield None — the probe drops the sample rather than emitting a
+        // fabricated scale. A 1:1 fallback would silently under-report ~40× on
+        // the M-series fleet and misclassify every action io_bound with no None
+        // marker to drop it offline (auditor + red-team).
+        assert_eq!(
+            super::calib_ticks_to_ns(74_134_725, None),
+            None,
+            "absent timebase must refuse (None), never fabricate a 1:1 ns scale \
+             that under-reports ~40× on Apple Silicon"
+        );
+        assert_eq!(
+            super::calib_ticks_to_ns(74_134_725, Some((125, 0))),
+            None,
+            "denom == 0 must refuse (None) — no divide-by-zero, no fabricated scale"
+        );
+    }
+
+    #[test]
+    fn ticks_to_ns_converts_m4_empirical_ratio() {
+        // The empirical M4 anchor: a 3.002 s single-threaded spin on worker-01
+        // reported 74_134_725 mach-timebase ticks; ×125/3 = 3_088_946_875 ns
+        // (3.089 s ✓). Raw ticks read as ns would be 0.074 s — the ~40× bug.
+        assert_eq!(
+            super::calib_ticks_to_ns(74_134_725, Some((125, 3))),
+            Some(3_088_946_875),
+            "74_134_725 ticks × 125/3 = 3_088_946_875 ns (3.089 s); this is the \
+             empirical M4 conversion the units fix restores"
+        );
+        // A 1:1 timebase (x86 / Rosetta) passes ticks through unchanged.
+        assert_eq!(
+            super::calib_ticks_to_ns(1_000, Some((1, 1))),
+            Some(1_000),
+            "a 1:1 timebase (x86/Rosetta) leaves ticks == ns"
         );
     }
 
@@ -10794,6 +10939,14 @@ mod calib_probe_tests {
     /// grandchild's CPU. Asserts the summed subtree ns is a plausible fraction of
     /// wall — i.e. the grandchild's burn IS counted.
     ///
+    /// **Shape scope (deliberate):** this tests the parent-OUTLIVES-child shape —
+    /// the `& wait` keeps the parent alive so the grandchild stays IN the subtree
+    /// on every tick, the one shape the walk handles perfectly. It does NOT
+    /// exercise the reparent-orphan shape (intermediate exits, descendant
+    /// reparents to launchd and leaves the walk — see the
+    /// `calib_capture_subtree_cpu_ns` residuals), which is a known under-count
+    /// validated on-worker via the canary ratio grep, not by this test.
+    ///
     /// macOS-only (same reason as the value test).
     #[cfg(target_os = "macos")]
     #[nativelink_test]
@@ -11036,13 +11189,27 @@ mod calib_probe_tests {
             worker_running_actions_at_start: 1,
         };
         assert_eq!(a.clone(), a);
+        // Distinct values per byte axis so a field swap (payload↔missing↔tree)
+        // is caught: payload (full) > missing (fetch-only) > tree (proto), the
+        // physically-expected ordering for a partially-cached miss.
         let s = CalibStagingRecord {
             input_staging_ms: 7,
             dir_cache_hit: false,
             input_payload_bytes: 42,
+            input_missing_bytes: 30,
             input_tree_bytes: 9,
             input_tree_files: 3,
         };
         assert_eq!(s.clone(), s);
+        assert_eq!(
+            s.input_missing_bytes, 30,
+            "input_missing_bytes (network-fetch axis) must carry the missing-byte \
+             value, distinct from input_payload_bytes (full payload)"
+        );
+        assert_ne!(
+            s.input_missing_bytes, s.input_payload_bytes,
+            "missing bytes (fetch-only) and payload bytes (fetch+hardlink) are \
+             distinct axes; a swap would collapse the §6 fetch-vs-hardlink split"
+        );
     }
 }
