@@ -143,6 +143,292 @@ pub fn install_batch_read_test_gate() -> std::sync::Arc<BatchReadTestGate> {
     gate
 }
 
+// =============================================================================
+// Scheduler-rebalance calibration probes (P-A action-shape, P-B input-staging).
+//
+// Observability-only instrumentation per
+// `.claude/audits/scheduler-calibration-instrumentation-spec-v2-2026-06-30.md`
+// §3/§4/§6/§9. Two sampled structured-log records, both `info!`-level (so they
+// survive `release_max_level_info` in the prod worker binary), both OFF the
+// per-RPC hot path:
+//
+//   P-A (`tag="calib_action"`): per-action execution shape, emitted AFTER
+//     `inner_upload_results` so `output_bytes` is known and the probe cannot
+//     inflate the `exec_duration` it reports.
+//   P-B (`tag="calib_staging"`): per-action input-staging cost, emitted at the
+//     `download_to_directory` tail (the miss path) where the resolved tree and
+//     byte totals are in scope.
+//
+// All decision logic (sampling, classification, record building) is factored
+// into the pure functions below so it is unit-testable without driving a real
+// action; the `info!` emit is a thin wrapper over the populated record struct.
+// =============================================================================
+
+/// Uniform digest-hash sampling period for the calibration probes (1/16).
+///
+/// Chosen smaller than `chunked_inflight_log_sampled`'s 1/64 because the
+/// per-action record volume is far lower than per-chunk (one record per
+/// action, not per 64 KiB chunk), so 1/16 keeps a usable sample density for
+/// the offline regression fits in §6 without flooding the log.
+const CALIB_SAMPLE_PERIOD: u64 = 16;
+
+/// P-A 1/1 override: any action whose `exec_duration_ms` exceeds this is
+/// recorded unconditionally (§3, §9 B4). LTO links are rare; uniform 1/16
+/// sampling would lose the regression-risk tail. 60 s in milliseconds.
+const CALIB_LARGE_EXEC_MS_THRESHOLD: i64 = 60_000;
+
+/// P-B 1/1 override: any input tree larger than this is recorded
+/// unconditionally (§4, §9 B4 — the override MUST carry a size threshold or it
+/// never fires). 100 MiB; sizes the miss-cost curve's large-tree tail.
+const CALIB_LARGE_TREE_BYTES_THRESHOLD: u64 = 100 * 1024 * 1024;
+
+/// Extract a stable u64 sampling key from a digest's packed hash (first 8
+/// bytes, little-endian). Blake3/SHA-256 outputs are uniformly distributed, so
+/// `key % period == 0` gives an alloc-free ~1/period rate without a global
+/// counter, identical to the `chunked_inflight_log_sampled` pattern.
+fn calib_digest_sample_key(digest: &DigestInfo) -> u64 {
+    let bytes: &[u8; 32] = digest.packed_hash();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+/// P-A sampling decision: uniform 1/`CALIB_SAMPLE_PERIOD` by digest-hash key,
+/// EXCEPT actions with `exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD` are
+/// always sampled (1/1 large-action override, §3).
+///
+/// Pure function of (`sample_key`, `exec_duration_ms`) so the boundary
+/// (exactly 60 s = not over-threshold; 60_001 ms = over) is unit-testable.
+const fn calib_action_sampled(sample_key: u64, exec_duration_ms: i64) -> bool {
+    exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD || sample_key % CALIB_SAMPLE_PERIOD == 0
+}
+
+/// P-B sampling decision: uniform 1/`CALIB_SAMPLE_PERIOD` by digest-hash key,
+/// EXCEPT trees with `input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD` are
+/// always sampled (1/1 large-tree override, §4/§9 B4).
+const fn calib_staging_sampled(sample_key: u64, input_tree_bytes: u64) -> bool {
+    input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD || sample_key % CALIB_SAMPLE_PERIOD == 0
+}
+
+/// CPU-vs-wall shape classification of an action (§3, auditor-required bands).
+///
+/// `IoBound` (`ratio < 0.5`): mostly waiting on I/O, leaves cores idle.
+/// `Ambiguous` (`[0.5, 1.5]`): single-threaded CPU-bound is indistinguishable
+///   from I/O-bound by ratio alone — reported separately, never folded into
+///   either tail.
+/// `MultiCoreCpuBound` (`ratio > 1.5`): used more CPU-seconds than wall-seconds,
+///   so genuinely parallel across cores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibActionShape {
+    IoBound,
+    Ambiguous,
+    MultiCoreCpuBound,
+}
+
+impl CalibActionShape {
+    /// Stable lowercase label emitted into the log (offline analysis keys on
+    /// this string).
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IoBound => "io_bound",
+            Self::Ambiguous => "ambiguous",
+            Self::MultiCoreCpuBound => "multi_core_cpu_bound",
+        }
+    }
+}
+
+/// Classify by `cpu_wall_ratio` into the three §3 bands. Pure function so the
+/// band boundaries (0.49 / 0.5 / 1.5 / 1.51) are unit-testable. `0.5` and `1.5`
+/// fall in the ambiguous band (closed interval `[0.5, 1.5]`).
+fn calib_classify(cpu_wall_ratio: f64) -> CalibActionShape {
+    if cpu_wall_ratio < 0.5 {
+        CalibActionShape::IoBound
+    } else if cpu_wall_ratio <= 1.5 {
+        CalibActionShape::Ambiguous
+    } else {
+        CalibActionShape::MultiCoreCpuBound
+    }
+}
+
+/// Populated P-A record. Built from already-computed values at the post-upload
+/// site; `emit()` is the thin `info!` wrapper. All byte/time fields are scalar
+/// `u64`/`i64`/`f64` — no owned-bytes buffers, so no cap annotation applies.
+#[derive(Debug, Clone, PartialEq)]
+struct CalibActionRecord {
+    /// Reused `execution_ms` (from `execution_start/completed_timestamp`).
+    exec_duration_ms: i64,
+    /// Child CPU time (user+system) in ms, or `None` when the per-OS query was
+    /// unavailable (see `calib_capture_cpu_time_ms`). Kept distinct from `0`
+    /// so offline analysis can drop unavailable samples rather than mistake
+    /// them for a zero-CPU action.
+    cpu_time_ms: Option<u64>,
+    /// `cpu_time_ms / exec_duration_ms`; `None` when CPU time was unavailable
+    /// or `exec_duration_ms <= 0` (clock skew / instantaneous action).
+    cpu_wall_ratio: Option<f64>,
+    /// Total resolved input-tree bytes for this action (carried from staging).
+    input_bytes: u64,
+    /// Total output-blob bytes (output files + output folder tree digests).
+    output_bytes: u64,
+    /// Worker-side count of in-flight actions at execute start (includes self,
+    /// so always >= 1). NOT the scheduler dispatch-count.
+    worker_running_actions_at_start: usize,
+}
+
+impl CalibActionRecord {
+    /// Compute the cpu_wall_ratio and shape from this record's fields. Returns
+    /// `None` shape when the ratio is unavailable.
+    fn shape(&self) -> Option<CalibActionShape> {
+        self.cpu_wall_ratio.map(calib_classify)
+    }
+
+    /// Thin `info!` wrapper. `tag="calib_action"`; `sample_period` is recorded
+    /// so offline analysis can scale the 1/16-sampled counts back up.
+    fn emit(&self, operation_id: &OperationId) {
+        let shape = self.shape().map(CalibActionShape::as_str);
+        info!(
+            tag = "calib_action",
+            operation_id = ?operation_id,
+            sample_period = CALIB_SAMPLE_PERIOD,
+            exec_duration_ms = self.exec_duration_ms,
+            cpu_time_ms = ?self.cpu_time_ms,
+            cpu_wall_ratio = ?self.cpu_wall_ratio,
+            shape = ?shape,
+            input_bytes = self.input_bytes,
+            output_bytes = self.output_bytes,
+            // worker-side in-flight count, includes self (>=1); NOT the
+            // scheduler dispatch-count.
+            worker_running_actions_at_start = self.worker_running_actions_at_start,
+            "calib: action-shape execution record"
+        );
+    }
+}
+
+/// Build a P-A record from raw inputs, computing `cpu_wall_ratio` once.
+/// `exec_duration_ms <= 0` (clock skew) or absent CPU time yields `None` ratio.
+fn calib_build_action_record(
+    exec_duration_ms: i64,
+    cpu_time_ms: Option<u64>,
+    input_bytes: u64,
+    output_bytes: u64,
+    worker_running_actions_at_start: usize,
+) -> CalibActionRecord {
+    let cpu_wall_ratio = match cpu_time_ms {
+        Some(cpu) if exec_duration_ms > 0 => Some(cpu as f64 / exec_duration_ms as f64),
+        _ => None,
+    };
+    CalibActionRecord {
+        exec_duration_ms,
+        cpu_time_ms,
+        cpu_wall_ratio,
+        input_bytes,
+        output_bytes,
+        worker_running_actions_at_start,
+    }
+}
+
+/// Populated P-B record. All fields scalar; no owned-bytes buffer.
+#[derive(Debug, Clone, PartialEq)]
+struct CalibStagingRecord {
+    /// `phase_start.elapsed()` over the whole `download_to_directory` body.
+    input_staging_ms: u64,
+    /// Always `false` at the `download_to_directory` emit site: this function
+    /// IS the directory-cache miss/fallback path (a directory-cache hardlink
+    /// hit returns before reaching here). Recorded for schema stability and to
+    /// document the miss-path-only nature of the curve.
+    dir_cache_hit: bool,
+    /// Sum of `size_bytes()` over the resolved tree's directory digests.
+    input_tree_bytes: u64,
+    /// Sum of file counts over the resolved tree's directories.
+    input_tree_files: u64,
+}
+
+impl CalibStagingRecord {
+    /// Thin `info!` wrapper. `tag="calib_staging"`.
+    fn emit(&self, digest: &DigestInfo) {
+        info!(
+            tag = "calib_staging",
+            root = ?digest,
+            sample_period = CALIB_SAMPLE_PERIOD,
+            input_staging_ms = self.input_staging_ms,
+            dir_cache_hit = self.dir_cache_hit,
+            input_tree_bytes = self.input_tree_bytes,
+            input_tree_files = self.input_tree_files,
+            "calib: input-staging locality record"
+        );
+    }
+}
+
+/// Compute the P-B byte/file totals from a resolved input tree (the
+/// `tree.keys()/tree.values()` map produced by `download_to_directory`). Pure
+/// over a `HashMap<DigestInfo, ProtoDirectory>` so the sums are unit-testable.
+/// `input_tree_bytes` = sum of directory-digest sizes (the `:552-553` pattern,
+/// §9 B3); `input_tree_files` = sum of per-directory file counts.
+fn calib_tree_totals(tree: &HashMap<DigestInfo, ProtoDirectory>) -> (u64, u64) {
+    let bytes: u64 = tree.keys().map(DigestInfo::size_bytes).sum();
+    let files: u64 = tree.values().map(|d| d.files.len() as u64).sum();
+    (bytes, files)
+}
+
+/// Best-effort capture of a just-completed child's total CPU time (user+system)
+/// in milliseconds, for the P-A `cpu_time_ms` field. Returns `None` when the
+/// value is unavailable on this OS / in this window.
+///
+/// **macOS** (the production worker OS — see memory `reference-infrastructure`):
+/// `proc_pidinfo(pid, PROC_PIDTASKALLINFO, …)` is a READ-ONLY query (it does
+/// NOT reap), so it is safe to call alongside tokio's SIGCHLD reaper. It is
+/// called in `spawn_blocking` immediately after the child's `wait()` future
+/// resolves. Two caveats, both acceptable for a sampled best-effort calibration
+/// probe: (1) tokio may have already reaped the zombie by the time this runs,
+/// in which case `proc_pidinfo` returns 0/ESRCH and we yield `None`; (2) the
+/// reported time is user+system CPU-ns summed across the child's threads.
+///
+/// **Linux**: deliberately yields `None`. The thread-safe per-child accounting
+/// primitive is `wait4(pid, …, &rusage)`, but tokio's process reaper already
+/// owns `waitpid` on this PID — calling `wait4` ourselves would DOUBLE-REAP
+/// (ESRCH at best, reaping a recycled unrelated PID at worst), a correctness
+/// hazard and a behavior change. There is no zero-behavior-change Linux path
+/// for a tokio-managed child, and production workers are macOS, so Linux is
+/// left unavailable rather than made unsafe. (Design-drift vs spec §3/§9 B5,
+/// which named `wait4` for Linux without accounting for tokio's reaper.)
+#[cfg(target_os = "macos")]
+fn calib_capture_cpu_time_ms(pid: u32) -> Option<u64> {
+    // SAFETY: `proc_pidinfo` with `PROC_PIDTASKALLINFO` fills a
+    // `proc_taskallinfo` we own; we pass its exact size and only read the
+    // returned bytes when the syscall reports it wrote the full struct. The
+    // call is read-only (no reaping). `pid` is the child's OS PID captured
+    // before reap; a stale/recycled PID can only yield a smaller-than-struct
+    // return (→ None) or unrelated task info, which is dropped by the size
+    // check, never UB.
+    let mut info: libc::proc_taskallinfo = unsafe { core::mem::zeroed() };
+    let size = core::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKALLINFO,
+            0,
+            core::ptr::from_mut(&mut info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written != size {
+        // ESRCH (reaped/exited), permission denied, or partial write.
+        return None;
+    }
+    // pti_total_user / pti_total_system are CPU time in NANOSECONDS.
+    let total_ns = info
+        .ptinfo
+        .pti_total_user
+        .saturating_add(info.ptinfo.pti_total_system);
+    Some(total_ns / 1_000_000)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn calib_capture_cpu_time_ms(_pid: u32) -> Option<u64> {
+    // See doc-comment above: no zero-behavior-change path on non-macOS without
+    // double-reaping the tokio-managed child.
+    None
+}
+
 // CAPPED AT 32: process-wide limit on concurrent action-cleanup directory
 // deletes (`do_cleanup` -> `bounded_remove_dir_all` -> `fs::remove_dir_all`).
 // Justification: `remove_dir_all` runs on the tokio blocking pool (sized to
@@ -1828,6 +2114,13 @@ pub fn download_to_directory<'a>(
     current_directory: &'a str,
     pre_resolved_tree: Option<HashMap<DigestInfo, ProtoDirectory>>,
     server_missing_digests: Option<HashSet<DigestInfo>>,
+    // Calibration probe P-A sink (observability-only): when `Some`, the total
+    // resolved input-tree bytes this call staged are written here for the
+    // caller (`inner_prepare_action`) to carry into the post-upload P-A record.
+    // `None` for callers that don't feed P-A (directory-cache construct, tests).
+    // Written exactly once before this future resolves Ok; on the early
+    // directory-only return it is set to 0 (no input bytes staged).
+    calib_input_bytes_out: Option<&'a core::sync::atomic::AtomicU64>,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
         let phase_start = std::time::Instant::now();
@@ -1961,6 +2254,10 @@ pub fn download_to_directory<'a>(
                 root = ?digest,
                 "download_to_directory: no files to materialize (directory-only tree)",
             );
+            // Calibration P-A sink: directory-only tree staged zero input bytes.
+            if let Some(out) = calib_input_bytes_out {
+                out.store(0, core::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(());
         }
 
@@ -2547,6 +2844,33 @@ pub fn download_to_directory<'a>(
             "download_to_directory completed",
         );
 
+        // Calibration probe P-A sink: hand the staged input-file payload bytes
+        // (`total_bytes` = sum of unique input-file digest sizes) to the caller
+        // for the post-upload P-A record.
+        if let Some(out) = calib_input_bytes_out {
+            out.store(total_bytes, core::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Calibration probe P-B (`tag="calib_staging"`): per-action input-staging
+        // record on the MISS path (this function is the directory-cache
+        // miss/fallback/construct path; a cache hardlink hit returns before
+        // here). `input_tree_bytes`/`input_tree_files` are the resolved-tree
+        // directory-proto sizes + file counts (§9 B3, the :552-553 pattern) —
+        // distinct from `total_bytes` (input-file payload). Sampled uniform 1/16
+        // by root-digest hash, with the 1/1 large-tree override (§9 B4).
+        // `dir_cache_hit` is structurally `false` here (see CalibStagingRecord).
+        let (calib_tree_bytes, calib_tree_files) = calib_tree_totals(&tree);
+        let calib_key = calib_digest_sample_key(digest);
+        if calib_staging_sampled(calib_key, calib_tree_bytes) {
+            CalibStagingRecord {
+                input_staging_ms: total_ms as u64,
+                dir_cache_hit: false,
+                input_tree_bytes: calib_tree_bytes,
+                input_tree_files: calib_tree_files,
+            }
+            .emit(digest);
+        }
+
         Ok(())
     }
     .boxed()
@@ -2777,6 +3101,10 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
     pre_resolved_tree: Option<HashMap<DigestInfo, ProtoDirectory>>,
     server_missing_digests: Option<HashSet<DigestInfo>>,
+    // Calibration P-A sink, forwarded to `download_to_directory` (observability
+    // only). Only populated on the traditional/fallback staging path; on a
+    // directory-cache hit it stays unset (cache hits stage ~0 fetched bytes).
+    calib_input_bytes_out: Option<&core::sync::atomic::AtomicU64>,
 ) -> Result<Option<(DigestInfo, crate::directory_cache::DirectoryCachePinGuard)>, Error> {
     info!(?digest, work_directory, "prepare_action_inputs: entered");
     // Try cache first if available
@@ -2850,7 +3178,7 @@ pub async fn prepare_action_inputs(
 
     // Traditional path (cache disabled or failed)
     info!(?digest, work_directory, "prepare_action_inputs: falling back to download_to_directory");
-    let res = download_to_directory(cas_store, filesystem_store, digest, work_directory, pre_resolved_tree, server_missing_digests).await;
+    let res = download_to_directory(cas_store, filesystem_store, digest, work_directory, pre_resolved_tree, server_missing_digests, calib_input_bytes_out).await;
     info!(
         ?digest,
         ok = res.is_ok(),
@@ -3581,6 +3909,25 @@ struct RunningActionImplState {
     /// fetch_add to the hand-off at `state.direct_use_pin = Some(...)`).
     /// None means normal hardlink mode. #57 §2 hand-off seam.
     direct_use_pin: Option<(DigestInfo, crate::directory_cache::DirectoryCachePinGuard)>,
+    /// Calibration probe P-A field (observability-only): total resolved
+    /// input-tree bytes, carried from staging (`download_to_directory`'s
+    /// `total_bytes`) to the post-upload P-A emit site. `None` until staging
+    /// populates it (e.g. directory-only trees that early-return, or the
+    /// direct-use cache-hit path which never calls `download_to_directory`).
+    /// Scalar `u64`; no buffer, no cap annotation needed.
+    calib_input_bytes: Option<u64>,
+    /// Calibration probe P-A field (observability-only): the just-completed
+    /// child's CPU time (user+system) in ms, captured best-effort at child
+    /// `wait()` and carried to the post-upload P-A emit site (the child is
+    /// reaped by then, so it cannot be re-queried). `None` when the per-OS
+    /// query was unavailable. See `calib_capture_cpu_time_ms`. Scalar.
+    calib_cpu_time_ms: Option<u64>,
+    /// Calibration probe P-A field (observability-only): the worker-side
+    /// in-flight action count (`running_actions.lock().len()`) sampled at
+    /// execute start, carried to the post-upload P-A emit site. Includes self
+    /// (so >= 1); this is the WORKER's view, NOT the scheduler dispatch-count.
+    /// `None` until execute start populates it. Scalar.
+    calib_running_at_start: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -3679,6 +4026,9 @@ impl RunningActionImpl {
                 execution_metadata,
                 error: None,
                 direct_use_pin: None,
+                calib_input_bytes: None,
+                calib_cpu_time_ms: None,
+                calib_running_at_start: None,
             }),
             // Always need to ensure that we're removed from the manager on Drop.
             has_manager_entry: AtomicBool::new(true),
@@ -3825,6 +4175,13 @@ impl RunningActionImpl {
             .as_ref()
             .map_or(false, |c| c.is_direct_use_mode());
 
+        // Calibration probe P-A: sink for the staged input-tree bytes, written
+        // by `download_to_directory` on the fallback path and carried into
+        // `state.calib_input_bytes` after staging. Stays 0 on a directory-cache
+        // hit (no `download_to_directory` call → ~0 fetched bytes).
+        // Observability-only; nothing on the execution path reads it.
+        let calib_input_bytes = core::sync::atomic::AtomicU64::new(0);
+
         // [A]: Fetch the Command proto. In normal mode we need it before
         // launching [C] and [B2] separately; in direct-use mode we put it
         // back in a try_join with [B] (unchanged pre-O5 shape).
@@ -3875,6 +4232,7 @@ impl RunningActionImpl {
                         &self.work_directory,
                         pre_resolved_tree,
                         server_missing_digests,
+                        Some(&calib_input_bytes),
                     ))
                     .await;
                 info!(%op_id_for_inputs, ok = res.is_ok(), "inner_prepare_action: prepare_action_inputs branch complete (direct-use)");
@@ -3989,6 +4347,7 @@ impl RunningActionImpl {
                         &self.work_directory,
                         pre_resolved_tree,
                         server_missing_digests,
+                        Some(&calib_input_bytes),
                     ))
                     .await;
                 info!(%op_id_for_inputs, ok = res.is_ok(), "inner_prepare_action: prepare_action_inputs [B2] complete");
@@ -4067,16 +4426,29 @@ impl RunningActionImpl {
             state.command_proto = Some(command);
             state.execution_metadata.input_fetch_completed_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
+            // Calibration probe P-A: carry the staged input-tree bytes into
+            // state for the post-upload P-A record. `Relaxed` is sufficient —
+            // the staging future has completed (try_join awaited) before this
+            // read, establishing happens-before via the await point.
+            state.calib_input_bytes =
+                Some(calib_input_bytes.load(core::sync::atomic::Ordering::Relaxed));
         }
         Ok(self)
         })
     }
 
     async fn inner_execute(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+        // Calibration probe P-A: snapshot the worker-side in-flight action count
+        // at execute start. Taken BEFORE the `state` lock to avoid nesting the
+        // `running_actions` mutex under `state` (lock-ordering discipline —
+        // this file documents a Mutex/watch deadlock class). Includes self
+        // (>= 1); worker-side view, NOT the scheduler dispatch-count.
+        let calib_running_at_start = self.running_actions_manager.running_actions.lock().len();
         let (command_proto, mut kill_channel_rx) = {
             let mut state = self.state.lock();
             state.execution_metadata.execution_start_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
+            state.calib_running_at_start = Some(calib_running_at_start);
             (
                 state
                     .command_proto
@@ -4205,6 +4577,13 @@ impl RunningActionImpl {
             .take()
             .err_tip(|| "Expected stderr to exist on command this should never happen")?;
 
+        // Calibration probe P-A: capture the child's OS PID BEFORE the child is
+        // moved into the cleanup guard and (on completion) reaped by tokio's
+        // SIGCHLD reaper. The PID feeds the best-effort `cpu_time_ms` query in
+        // the `wait()` arm below; once the child is reaped the value is gone.
+        // Observability-only; `None` if the OS did not assign a queryable PID.
+        let calib_child_pid: Option<u32> = child_process.id();
+
         let mut child_process_guard = guard(child_process, |mut child_process| {
             let result: Result<Option<std::process::ExitStatus>, std::io::Error> =
                 child_process.try_wait();
@@ -4321,6 +4700,7 @@ impl RunningActionImpl {
                     } else {
                         None
                     };
+                    let calib_exec_start;
                     {
                         let mut state = self.state.lock();
                         state.error = Error::merge_option(state.error.take(), maybe_error_override);
@@ -4332,6 +4712,35 @@ impl RunningActionImpl {
                             exit_code,
                         });
                         state.execution_metadata.execution_completed_timestamp = (self.running_actions_manager.callbacks.now_fn)();
+                        calib_exec_start = state.execution_metadata.execution_start_timestamp;
+                    }
+                    // Calibration probe P-A: best-effort child CPU-time capture.
+                    // Only for sampled actions (uniform 1/16 by input-root-digest
+                    // hash, OR the 1/1 large-exec override now that the duration is
+                    // known), so the syscall is off the per-action common path. The
+                    // `proc_pidinfo` (macOS) query runs in `spawn_blocking` — never
+                    // on a tokio worker thread — and is read-only (no reap). The
+                    // captured value is stashed in state and read at the post-upload
+                    // P-A emit site (the child is reaped by then). Zero behavior
+                    // change: nothing downstream reads `calib_cpu_time_ms`.
+                    let calib_exec_ms = (self.running_actions_manager.callbacks.now_fn)()
+                        .duration_since(calib_exec_start)
+                        .map_or(0, |d| d.as_millis() as i64);
+                    if let Some(pid) = calib_child_pid {
+                        let calib_key =
+                            calib_digest_sample_key(&self.action_info.input_root_digest);
+                        if calib_action_sampled(calib_key, calib_exec_ms) {
+                            let cpu_ms = spawn_blocking!(
+                                "calib_capture_cpu_time",
+                                move || calib_capture_cpu_time_ms(pid)
+                            )
+                            .await
+                            .ok()
+                            .flatten();
+                            if cpu_ms.is_some() {
+                                self.state.lock().calib_cpu_time_ms = cpu_ms;
+                            }
+                        }
                     }
                     return Ok(self);
                 },
@@ -5008,6 +5417,21 @@ impl RunningActionImpl {
             }
         }
 
+        // Calibration probe P-A: total output-blob bytes (output-file digests +
+        // output-folder tree digests). Computed BEFORE `output_files`/
+        // `output_folders` are moved into `state.action_result` below; mirrors
+        // the existing pin-loop accessors (`file.digest`, `folder.tree_digest`).
+        let calib_output_bytes: u64 = output_files
+            .iter()
+            .map(|f| f.digest.size_bytes())
+            .chain(output_folders.iter().map(|d| d.tree_digest.size_bytes()))
+            .sum();
+
+        // P-A record, built inside the state lock (to read the carried calib
+        // fields) but EMITTED after the lock is released to keep the critical
+        // section minimal. `None` until populated.
+        let mut calib_action_record: Option<CalibActionRecord> = None;
+
         {
             let mut state = self.state.lock();
             execution_metadata.worker_completed_timestamp =
@@ -5020,16 +5444,36 @@ impl RunningActionImpl {
                     .unwrap_or_else(|e| -(e.duration().as_millis() as i64))
             };
             let em = &execution_metadata;
+            let calib_exec_ms =
+                duration_ms(em.execution_start_timestamp, em.execution_completed_timestamp);
             info!(
                 operation_id = ?self.operation_id,
                 queue_ms = duration_ms(em.queued_timestamp, em.worker_start_timestamp),
                 input_fetch_ms = duration_ms(em.input_fetch_start_timestamp, em.input_fetch_completed_timestamp),
-                execution_ms = duration_ms(em.execution_start_timestamp, em.execution_completed_timestamp),
+                execution_ms = calib_exec_ms,
                 output_upload_ms = duration_ms(em.output_upload_start_timestamp, em.output_upload_completed_timestamp),
                 worker_overhead_ms = duration_ms(em.worker_start_timestamp, em.input_fetch_start_timestamp),
                 total_worker_ms = duration_ms(em.worker_start_timestamp, em.worker_completed_timestamp),
                 "Action phase timing",
             );
+
+            // Calibration probe P-A: build the action-shape record from the
+            // already-computed exec duration + the calib fields carried in
+            // state (input bytes from staging, child CPU time from execute,
+            // worker in-flight count from execute start). Sampled uniform 1/16
+            // by input-root-digest hash, with the 1/1 large-exec override
+            // (§3). Only the populated `Option` is emitted (after the lock).
+            let calib_key =
+                calib_digest_sample_key(&self.action_info.input_root_digest);
+            if calib_action_sampled(calib_key, calib_exec_ms) {
+                calib_action_record = Some(calib_build_action_record(
+                    calib_exec_ms,
+                    state.calib_cpu_time_ms,
+                    state.calib_input_bytes.unwrap_or(0),
+                    calib_output_bytes,
+                    state.calib_running_at_start.unwrap_or(1),
+                ));
+            }
 
             state.action_result = Some(ActionResult {
                 output_files,
@@ -5044,6 +5488,10 @@ impl RunningActionImpl {
                 error: state.error.clone(),
                 message: String::new(), // Will be filled in on cache_action_result if needed.
             });
+        }
+        // Calibration probe P-A emit (`tag="calib_action"`), off the state lock.
+        if let Some(record) = calib_action_record {
+            record.emit(&self.operation_id);
         }
         debug!(
             operation_id = ?self.operation_id,
@@ -9503,5 +9951,311 @@ mod deferred_upload_retry_loop_tests {
              next remote wait is 2 s — an interleaved read race must neither reset it to 1 s nor \
              inflate it"
         );
+    }
+}
+
+#[cfg(test)]
+mod calib_probe_tests {
+    //! Unit tests for the calibration-probe decision logic (P-A action-shape,
+    //! P-B input-staging). Tests the PURE functions — sampling, classification,
+    //! tree-byte/file sums, record building — since the `info!` emit is a thin
+    //! wrapper over a populated record. Spec:
+    //! `.claude/audits/scheduler-calibration-instrumentation-spec-v2-2026-06-30.md`
+    //! §3/§4/§6/§9.
+    use std::collections::HashMap;
+
+    use nativelink_proto::build::bazel::remote::execution::v2::{
+        Directory as ProtoDirectory, FileNode,
+    };
+    use nativelink_util::common::DigestInfo;
+
+    use super::{
+        CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_TREE_BYTES_THRESHOLD, CALIB_SAMPLE_PERIOD,
+        CalibActionShape, CalibActionRecord, CalibStagingRecord, calib_action_sampled,
+        calib_build_action_record, calib_classify, calib_digest_sample_key, calib_staging_sampled,
+        calib_tree_totals,
+    };
+
+    /// Build a digest whose first-8-byte LE sampling key is exactly `key`.
+    fn digest_with_key(key: u64) -> DigestInfo {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&key.to_le_bytes());
+        DigestInfo::new(hash, 1)
+    }
+
+    // --- Numeric-constant pins (declaration-site authoritative) ------------
+
+    #[test]
+    fn constants_match_spec() {
+        assert_eq!(
+            CALIB_SAMPLE_PERIOD, 16,
+            "spec §3/§9 B4 fixes the uniform calibration sample period at 1/16; \
+             offline analysis scales counts by this exact value"
+        );
+        assert_eq!(
+            CALIB_LARGE_EXEC_MS_THRESHOLD, 60_000,
+            "spec §3 P-A 1/1 override fires at exec_duration > 60 s (= 60_000 ms)"
+        );
+        assert_eq!(
+            CALIB_LARGE_TREE_BYTES_THRESHOLD,
+            100 * 1024 * 1024,
+            "spec §9 B4 P-B 1/1 override fires at input_tree_bytes > 100 MiB"
+        );
+    }
+
+    // --- P-A sampling decision --------------------------------------------
+
+    #[test]
+    fn action_sampled_uniform_1_in_16() {
+        // key % 16 == 0 sampled; key % 16 != 0 skipped (when under the
+        // large-exec override).
+        assert!(
+            calib_action_sampled(0, 1_000),
+            "key 0 (0 % 16 == 0) must be sampled under the uniform 1/16 gate"
+        );
+        assert!(
+            !calib_action_sampled(1, 1_000),
+            "key 1 (1 % 16 == 1) must be skipped under the uniform 1/16 gate \
+             (no large-exec override at 1 s)"
+        );
+        assert!(
+            calib_action_sampled(32, 1_000),
+            "key 32 (32 % 16 == 0) must be sampled"
+        );
+        assert!(
+            !calib_action_sampled(17, 1_000),
+            "key 17 (17 % 16 == 1) must be skipped"
+        );
+    }
+
+    #[test]
+    fn action_sampled_rate_is_approximately_1_in_16() {
+        // Over 1600 distinct keys the true-count must be ~100 (1600/16),
+        // neither always-true nor always-false. Use sub-threshold exec so the
+        // override never masks the uniform rate.
+        let mut count: u64 = 0;
+        for k in 0..1600u64 {
+            if calib_action_sampled(k, 1_000) {
+                count += 1;
+            }
+        }
+        assert!(
+            (50..=150).contains(&count),
+            "expected ~100 sampled out of 1600 (1/16 rate); got {count} — \
+             if 1600: gate always-true (period became 1); if 0: gate always-false"
+        );
+    }
+
+    #[test]
+    fn action_large_exec_override_boundary() {
+        // Exactly 60 s (= 60_000 ms) is NOT over-threshold (strict >), so an
+        // unsampled key stays unsampled at the boundary.
+        assert!(
+            !calib_action_sampled(1, CALIB_LARGE_EXEC_MS_THRESHOLD),
+            "exec_duration == 60_000 ms is NOT over the threshold (strict >); \
+             an unsampled key must remain unsampled at the boundary"
+        );
+        // One millisecond over → 1/1 override fires even for an unsampled key.
+        assert!(
+            calib_action_sampled(1, CALIB_LARGE_EXEC_MS_THRESHOLD + 1),
+            "exec_duration == 60_001 ms is over the 60 s threshold; the 1/1 \
+             large-action override must force-sample even an unsampled key"
+        );
+    }
+
+    // --- P-B sampling decision --------------------------------------------
+
+    #[test]
+    fn staging_sampled_uniform_and_large_tree_boundary() {
+        assert!(
+            calib_staging_sampled(0, 1_000),
+            "key 0 sampled under uniform 1/16"
+        );
+        assert!(
+            !calib_staging_sampled(1, 1_000),
+            "key 1 skipped under uniform 1/16 (small tree, no override)"
+        );
+        // Exactly 100 MiB is NOT over-threshold (strict >).
+        assert!(
+            !calib_staging_sampled(1, CALIB_LARGE_TREE_BYTES_THRESHOLD),
+            "input_tree_bytes == 100 MiB is NOT over the threshold (strict >); \
+             an unsampled key must remain unsampled at the boundary"
+        );
+        // One byte over → 1/1 override fires.
+        assert!(
+            calib_staging_sampled(1, CALIB_LARGE_TREE_BYTES_THRESHOLD + 1),
+            "input_tree_bytes == 100 MiB + 1 is over the threshold; the 1/1 \
+             large-tree override must force-sample even an unsampled key"
+        );
+    }
+
+    #[test]
+    fn digest_sample_key_is_first_8_bytes_le() {
+        // The key extractor must round-trip the LE-packed key so the sampling
+        // gate keys on the digest hash deterministically.
+        assert_eq!(
+            calib_digest_sample_key(&digest_with_key(0)),
+            0,
+            "all-zero hash → key 0"
+        );
+        assert_eq!(
+            calib_digest_sample_key(&digest_with_key(0x0102_0304_0506_0708)),
+            0x0102_0304_0506_0708,
+            "first 8 hash bytes must decode LE into the sampling key"
+        );
+    }
+
+    // --- Classification (§3 bands) ----------------------------------------
+
+    #[test]
+    fn classify_band_boundaries() {
+        // < 0.5 → IoBound; [0.5, 1.5] → Ambiguous; > 1.5 → MultiCoreCpuBound.
+        assert_eq!(
+            calib_classify(0.49),
+            CalibActionShape::IoBound,
+            "0.49 < 0.5 is I/O-bound"
+        );
+        assert_eq!(
+            calib_classify(0.5),
+            CalibActionShape::Ambiguous,
+            "0.5 is the closed lower edge of the ambiguous band, NOT I/O-bound"
+        );
+        assert_eq!(
+            calib_classify(1.5),
+            CalibActionShape::Ambiguous,
+            "1.5 is the closed upper edge of the ambiguous band, NOT CPU-bound"
+        );
+        assert_eq!(
+            calib_classify(1.51),
+            CalibActionShape::MultiCoreCpuBound,
+            "1.51 > 1.5 is multi-core CPU-bound"
+        );
+    }
+
+    #[test]
+    fn shape_labels_are_stable() {
+        // Offline analysis keys on these literal strings.
+        assert_eq!(CalibActionShape::IoBound.as_str(), "io_bound");
+        assert_eq!(CalibActionShape::Ambiguous.as_str(), "ambiguous");
+        assert_eq!(
+            CalibActionShape::MultiCoreCpuBound.as_str(),
+            "multi_core_cpu_bound"
+        );
+    }
+
+    // --- P-A record builder -----------------------------------------------
+
+    #[test]
+    fn action_record_computes_ratio_and_shape() {
+        // cpu 200 ms / wall 100 ms = 2.0 → MultiCoreCpuBound.
+        let rec = calib_build_action_record(100, Some(200), 4_096, 512, 3);
+        assert_eq!(rec.exec_duration_ms, 100);
+        assert_eq!(rec.cpu_time_ms, Some(200));
+        assert_eq!(
+            rec.cpu_wall_ratio,
+            Some(2.0),
+            "ratio must be cpu_time_ms / exec_duration_ms = 200/100 = 2.0"
+        );
+        assert_eq!(rec.input_bytes, 4_096);
+        assert_eq!(rec.output_bytes, 512);
+        assert_eq!(rec.worker_running_actions_at_start, 3);
+        assert_eq!(
+            rec.shape(),
+            Some(CalibActionShape::MultiCoreCpuBound),
+            "ratio 2.0 > 1.5 classifies multi-core CPU-bound"
+        );
+    }
+
+    #[test]
+    fn action_record_ratio_absent_when_cpu_unavailable() {
+        let rec = calib_build_action_record(100, None, 0, 0, 1);
+        assert_eq!(
+            rec.cpu_wall_ratio, None,
+            "cpu_wall_ratio must be None when cpu_time_ms is unavailable — \
+             offline analysis must drop the sample, not read it as ratio 0"
+        );
+        assert_eq!(
+            rec.shape(),
+            None,
+            "no shape can be assigned without a cpu_wall_ratio"
+        );
+    }
+
+    #[test]
+    fn action_record_ratio_absent_on_nonpositive_wall() {
+        // Clock skew can make execution_completed precede execution_start →
+        // exec_duration_ms <= 0; a divide by that would be garbage/inf.
+        let rec = calib_build_action_record(0, Some(50), 0, 0, 1);
+        assert_eq!(
+            rec.cpu_wall_ratio, None,
+            "cpu_wall_ratio must be None when exec_duration_ms <= 0 (clock skew) \
+             — must not divide by zero or produce inf"
+        );
+    }
+
+    // --- P-B tree-totals sum ----------------------------------------------
+
+    #[test]
+    fn tree_totals_sums_dir_bytes_and_file_counts() {
+        // Two directories of sizes 1000 and 24 bytes; 2 + 1 = 3 files total.
+        let mut tree: HashMap<DigestInfo, ProtoDirectory> = HashMap::new();
+        tree.insert(
+            DigestInfo::new([1u8; 32], 1000),
+            ProtoDirectory {
+                files: vec![FileNode::default(), FileNode::default()],
+                ..ProtoDirectory::default()
+            },
+        );
+        tree.insert(
+            DigestInfo::new([2u8; 32], 24),
+            ProtoDirectory {
+                files: vec![FileNode::default()],
+                ..ProtoDirectory::default()
+            },
+        );
+        let (bytes, files) = calib_tree_totals(&tree);
+        assert_eq!(
+            bytes, 1024,
+            "input_tree_bytes must sum directory-digest sizes (1000 + 24 = 1024) \
+             — the :552-553 pattern (§9 B3)"
+        );
+        assert_eq!(
+            files, 3,
+            "input_tree_files must sum per-directory file counts (2 + 1 = 3)"
+        );
+    }
+
+    #[test]
+    fn tree_totals_empty_tree_is_zero() {
+        let tree: HashMap<DigestInfo, ProtoDirectory> = HashMap::new();
+        assert_eq!(
+            calib_tree_totals(&tree),
+            (0, 0),
+            "an empty resolved tree must yield (0 bytes, 0 files), not panic"
+        );
+    }
+
+    // --- Record equality sanity (emit is a thin wrapper) ------------------
+
+    #[test]
+    fn records_are_value_types() {
+        // Confirms the builder produces a fully-populated value; the emit()
+        // methods only format these fields.
+        let a = CalibActionRecord {
+            exec_duration_ms: 10,
+            cpu_time_ms: Some(5),
+            cpu_wall_ratio: Some(0.5),
+            input_bytes: 1,
+            output_bytes: 2,
+            worker_running_actions_at_start: 1,
+        };
+        assert_eq!(a.clone(), a);
+        let s = CalibStagingRecord {
+            input_staging_ms: 7,
+            dir_cache_hit: false,
+            input_tree_bytes: 9,
+            input_tree_files: 3,
+        };
+        assert_eq!(s.clone(), s);
     }
 }

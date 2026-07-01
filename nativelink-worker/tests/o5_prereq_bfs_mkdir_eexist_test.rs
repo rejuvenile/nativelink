@@ -181,6 +181,7 @@ async fn bfs_mkdir_succeeds_when_dir_pre_created_by_output_prep()
             &work_dir,
             None,
             None,
+            None,
         ),
     )
     .await
@@ -274,6 +275,7 @@ async fn bfs_mkdir_fails_when_file_pre_exists_at_dir_path()
             fast_store.as_pin(),
             &root_digest,
             &work_dir,
+            None,
             None,
             None,
         ),

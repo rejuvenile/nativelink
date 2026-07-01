@@ -501,6 +501,7 @@ mod tests {
                 &download_dir,
                 None,
                 None,
+                None,
             )
             .await?;
             download_dir
@@ -608,6 +609,7 @@ mod tests {
                 &download_dir,
                 None,
                 None,
+                None,
             )
             .await?;
             download_dir
@@ -682,6 +684,7 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
+                None,
                 None,
                 None,
             )
@@ -769,6 +772,7 @@ mod tests {
             &download_dir,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -837,6 +841,7 @@ mod tests {
             fast_store.as_pin(),
             &root_directory_digest,
             &download_dir,
+            None,
             None,
             None,
         )
@@ -922,6 +927,7 @@ mod tests {
             &download_dir,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -962,6 +968,7 @@ mod tests {
             fast_store.as_pin(),
             &root_directory_digest,
             &download_dir,
+            None,
             None,
             None,
         )
@@ -1037,6 +1044,7 @@ mod tests {
             &download_dir,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -1094,6 +1102,7 @@ mod tests {
             &download_dir,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1135,6 +1144,7 @@ mod tests {
             fast_store.as_pin(),
             &root_directory_digest,
             &download_dir,
+            None,
             None,
             None,
         )
@@ -1204,6 +1214,7 @@ mod tests {
             fast_store.as_pin(),
             &root_directory_digest,
             &download_dir,
+            None,
             None,
             None,
         )
@@ -5177,6 +5188,7 @@ exit 1
             &download_dir,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -5271,6 +5283,7 @@ exit 1
             &download_dir,
             None,
             Some(missing),
+            None,
         )
         .await?;
 
@@ -5335,6 +5348,7 @@ exit 1
             &download_dir,
             None,
             Some(missing),
+            None,
         )
         .await?;
 
@@ -5393,6 +5407,7 @@ exit 1
             &download_dir,
             None,
             Some(missing),
+            None,
         )
         .await?;
 
@@ -5444,6 +5459,7 @@ exit 1
             fast_store.as_pin(),
             &root_directory_digest,
             &download_dir,
+            None,
             None,
             None,
         )
@@ -5529,6 +5545,7 @@ exit 1
             &download_dir,
             None,
             Some(missing_set),
+            None,
         )
         .await?;
 
@@ -5611,6 +5628,7 @@ exit 1
             &download_dir,
             None,
             Some(missing_set),
+            None,
         )
         .await?;
         let elapsed = start.elapsed();

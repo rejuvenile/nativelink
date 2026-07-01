@@ -3758,6 +3758,7 @@ dependencies = [
  "tonic-h3",
  "tonic-prost",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
  "uuid",
 ]

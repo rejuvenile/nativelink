@@ -178,6 +178,7 @@ async fn mirror_only_blob_materialized_via_download_to_directory() {
         &work_dir,
         Some(pre_resolved),
         None,
+        None,
     )
     .await
     .expect("download_to_directory must succeed for mirror-only blob");

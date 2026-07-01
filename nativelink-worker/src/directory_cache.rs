@@ -2237,7 +2237,9 @@ impl DirectoryCache {
             );
             let construction_start = Instant::now();
             let result = crate::running_actions_manager::download_to_directory(
-                fss, fs_pin, digest, &temp_str, None, None,
+                // Last arg = calibration P-A input-bytes sink; `None` here (the
+                // directory-cache construct path does not feed the P-A record).
+                fss, fs_pin, digest, &temp_str, None, None, None,
             )
             .await;
             let elapsed = construction_start.elapsed();
