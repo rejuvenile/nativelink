@@ -85,15 +85,29 @@ const DEFAULT_MAX_JOB_RETRIES: usize = 3;
 /// snapshot of the pending set's `input_root_digest`s.
 ///
 /// Returns `(surplus, max_group)` where:
-/// - `surplus = n - distinct_roots` — the number of pending assignments that
-///   could reuse a *peer pending task's* dir-cache locality if a batch
-///   assignment grouped same-input-root tasks together. Greedy one-at-a-time
-///   assignment cannot exploit this because it never looks at a peer that is
-///   still queued. `surplus == 0` means every pending op has a unique root, so
-///   batch grouping buys nothing right now.
+/// - `surplus = n - distinct_roots` — a RAW UPPER BOUND on the pending
+///   assignments that could reuse a *peer pending task's* dir-cache locality if
+///   a batch assignment grouped same-input-root tasks together. It is an upper
+///   bound, NOT the realized benefit, because the worker-side cache signal
+///   (`cached_directory_digests` / `cached_subtree_digests`) is populated only
+///   by worker-reported `BlobsAvailable` AFTER an action materializes its
+///   inputs — never at dispatch. So the surplus is genuinely uncaptured only
+///   for the COLD subset (a build-startup burst of same-root peers, where no
+///   worker yet reports the root → they scatter via LRU/MRU); WARM steady-state
+///   roots are ALREADY Tier-1 co-located by the existing affinity routing, and
+///   this raw gauge cannot separate cold from warm. Greedy one-at-a-time
+///   assignment cannot co-locate a still-queued same-root peer WITHIN a single
+///   match cycle (cross-cycle, the worker's cache report may have already
+///   landed and the existing Tier-1 routing absorbs it). `surplus == 0` means
+///   every pending op has a unique root, so batch grouping buys nothing.
 /// - `max_group` — the size of the largest same-input-root group among the
 ///   pending ops (the biggest single batch a grouper could form). `0` for an
 ///   empty set, `1` when all roots are distinct.
+///
+/// Interpret ALONGSIDE the existing `find_worker_hits` / `find_worker_misses`
+/// baseline: a high surplus that is already fully absorbed by locality routing
+/// (high hit rate) is NOT a green light for batch scheduling — the cold-burst
+/// subset is the real signal.
 ///
 /// Pure function of the input slice so the surplus/max-group arithmetic is
 /// unit-testable at its boundaries (`[A,A,B,C] → (1,2)`, all-distinct `→ (0,1)`,
@@ -126,11 +140,19 @@ pub const AFFINITY_ARRIVAL_WINDOW: Duration = Duration::from_millis(250);
 /// accumulated for `window` have grouped an arrival at `now` with a peer last
 /// seen at `last_seen`? Closed interval — an arrival exactly `window` after the
 /// peer still counts (the delay would have just captured it). Saturating on the
-/// (impossible-in-practice) `last_seen > now` case so a monotonic-clock hiccup
-/// can never panic. Pure `(now, last_seen, window) → bool` so the boundary
-/// (`== window` in, `window + 1ns` out) is unit-testable.
-pub fn is_within_affinity_window(now: Instant, last_seen: Instant, window: Duration) -> bool {
-    now.saturating_duration_since(last_seen) <= window
+/// (impossible-in-practice) `last_seen > now` case so a clock hiccup can never
+/// panic. Pure `(now, last_seen, window) → bool` so the boundary (`== window`
+/// in, `window + 1ns` out) is unit-testable.
+///
+/// Timestamps are `SystemTime`, the type the scheduler's injectable clock
+/// (`now_fn().now()`) produces in BOTH prod (`SystemTime::now`) and tests
+/// (`MockInstantWrapped` → `UNIX_EPOCH + MockClock::time()`), so the dim-B
+/// counter is driven by the same mockable clock the rest of the scheduler uses
+/// — no wall-clock dependence in tests.
+pub fn is_within_affinity_window(now: SystemTime, last_seen: SystemTime, window: Duration) -> bool {
+    // `duration_since` errs when `last_seen > now`; treat that (a clock hiccup)
+    // as 0 elapsed → within window, mirroring `Instant::saturating_duration_since`.
+    now.duration_since(last_seen).unwrap_or(Duration::ZERO) <= window
 }
 
 /// (#batch-affinity, dimension B) Maximum number of distinct recently-seen
@@ -172,7 +194,9 @@ pub const RECENT_ROOTS_MAX_ENTRIES: usize = 4096;
 pub struct RecentRootsWindow {
     // CAPPED AT RECENT_ROOTS_MAX_ENTRIES: see the const's justification. Bounded
     // by evicting the FIFO-oldest key when the map would exceed the cap.
-    last_seen: HashMap<DigestInfo, Instant>,
+    // Timestamps are `SystemTime` (the injectable-clock type — see
+    // `is_within_affinity_window`), so window matching is mock-clock-driven.
+    last_seen: HashMap<DigestInfo, SystemTime>,
     // FIFO insertion order for O(1) oldest-key eviction. One entry per distinct
     // key (updates do not re-push), bounded to the same cap as `last_seen`.
     order: std::collections::VecDeque<DigestInfo>,
@@ -192,11 +216,11 @@ impl RecentRootsWindow {
         self.last_seen.is_empty()
     }
 
-    /// Record an arrival of `root` at `now`. Returns `true` iff a peer with the
-    /// same root was last seen within `AFFINITY_ARRIVAL_WINDOW` (a captured
-    /// batch opportunity). Always updates the entry to `now` and enforces the
-    /// entry cap.
-    pub fn record_arrival(&mut self, root: DigestInfo, now: Instant) -> bool {
+    /// Record an arrival of `root` at `now` (a `SystemTime` from the injectable
+    /// clock). Returns `true` iff a peer with the same root was last seen within
+    /// `AFFINITY_ARRIVAL_WINDOW` (a captured batch opportunity). Always updates
+    /// the entry to `now` and enforces the entry cap.
+    pub fn record_arrival(&mut self, root: DigestInfo, now: SystemTime) -> bool {
         let within_window = match self.last_seen.get(&root) {
             Some(&prev) => is_within_affinity_window(now, prev, AFFINITY_ARRIVAL_WINDOW),
             None => false,
@@ -227,19 +251,30 @@ impl RecentRootsWindow {
 
 /// (#batch-affinity) Maximum number of highest-priority pending ops the
 /// instantaneous co-location surplus (dimension A) is computed over per match
-/// cycle.
+/// cycle. `pub` so the sample cap can be pinned in a test and asserted at the
+/// `sampled_ops` saturation boundary.
 ///
 // CAPPED AT 512: `do_try_match` already owns the priority-sorted pending set;
-// the surplus pass calls `as_action_info()` (an in-memory `borrow().await`)
-// once per sampled op. Bounding to the first 512 (the highest-priority ops —
-// the ones a batch scheduler would assign imminently) keeps the per-cycle
-// probe cost O(512) even when a build-startup burst queues tens of thousands
-// of actions, while still covering far more than the number of workers. When
-// the pending set exceeds this, the surplus/max_group gauges describe the
-// sampled prefix (reported via the `sampled_ops` gauge so operators can see
-// saturation); this only UNDERCOUNTS the true surplus — a conservative bias
-// for an observability metric.
-const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
+// the surplus pass calls `as_action_info()` once per sampled op. On the
+// DEPLOYED memory backend that is a cheap in-memory `watch::borrow().clone()` —
+// the SAME kind of call the matcher makes anyway. On the (supported but not
+// deployed) Redis/store backend it would be a store round-trip per op, so the
+// whole dim-A pass is gated OFF for that backend (see
+// `pending_affinity_probe_enabled`); this cap only bounds the memory-backend
+// cost. Bounding to the first 512 (the highest-priority ops — the ones a batch
+// scheduler would assign imminently) keeps the per-cycle probe cost O(512) even
+// when a build-startup burst queues tens of thousands of actions, while still
+// covering far more than the number of workers. When the pending set exceeds
+// this, the surplus/max_group gauges describe the sampled prefix (reported via
+// the `sampled_ops` gauge so operators can see saturation); this only
+// UNDERCOUNTS the true surplus — a conservative bias for an observability metric.
+pub const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
+
+/// (#batch-affinity, dimension B) Type-erased injectable clock producing the
+/// `SystemTime` that timestamps arrivals. `SystemTime::now` in prod;
+/// `MockInstantWrapped`'s `now()` (mock-clock-driven) in tests. Erased so
+/// `SimpleScheduler` need not carry the `NowFn`/`InstantWrapper` generics.
+type AffinityClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// (#batch-affinity) OBSERVABILITY-ONLY scalar gauges/counter estimating the
 /// potential profitability of batch (multi-task) dir-cache-affinity scheduling.
@@ -248,10 +283,16 @@ const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
 /// `scheduler.<name>.action.batch_affinity.<field>` (the action-scheduler
 /// registration prefix — see `src/bin/nativelink.rs:591`).
 ///
-/// Interpretation: a persistently HIGH `colocation_surplus` (many pending ops
-/// share input roots) OR a steadily climbing `arrival_within_250ms_total`
-/// (related tasks keep arriving in tight bursts) is the signal that building
-/// real batch/delay scheduling would pay off. Values near zero refute it.
+/// Interpretation: `colocation_surplus` is a RAW UPPER BOUND, not a realized
+/// benefit — the worker cache signal is populated only POST-materialize, so the
+/// surplus is genuinely uncaptured only for the COLD (build-startup burst)
+/// subset; WARM steady-state roots are already Tier-1 co-located by existing
+/// routing and the gauge cannot separate them. So interpret it ALONGSIDE the
+/// existing `find_worker_hits`/`find_worker_misses` baseline: a high surplus
+/// fully absorbed by locality routing (high hit rate) is NOT a green light. A
+/// steadily climbing `arrival_within_250ms_total` (related tasks arriving in
+/// tight bursts a small delay would catch) is the cleaner cold-burst signal.
+/// Values near zero on both refute building batch/delay scheduling.
 ///
 /// These are per-key SCALAR aggregates on purpose: `MetricsComponent` cannot
 /// emit dynamic per-digest/per-worker labels, so we aggregate to gauges +
@@ -259,10 +300,12 @@ const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
 #[derive(Debug, Default, MetricsComponent)]
 pub struct BatchAffinityMetrics {
     /// Dimension A gauge: `pending_ops - distinct_input_roots` over the sampled
-    /// pending prefix at the last match cycle. The count of pending assignments
-    /// that could reuse a peer pending task's dir-cache locality if grouped.
+    /// pending prefix at the last match cycle. A RAW UPPER BOUND on pending
+    /// assignments that could reuse a peer pending task's dir-cache locality if
+    /// grouped — real signal is the cold-burst subset; read with the
+    /// `find_worker_hits`/`misses` baseline (see the struct doc).
     #[metric(
-        help = "pending co-location surplus (sampled pending ops minus distinct input roots) at last match cycle; high = batch scheduling could reuse peer dir-cache locality"
+        help = "pending co-location surplus (sampled pending ops minus distinct input roots) at last match cycle; RAW UPPER BOUND (real signal is cold-burst subset); read with find_worker_hits/misses"
     )]
     pub colocation_surplus: AtomicU64,
 
@@ -394,6 +437,22 @@ pub struct SimpleScheduler {
     /// `parking_lot::Mutex` acquired only for the synchronous `record_arrival`
     /// call in `inner_add_action` (never held across `.await`).
     recent_roots_window: Mutex<RecentRootsWindow>,
+
+    /// (#batch-affinity, dimension B) The scheduler's injectable clock,
+    /// type-erased to `SystemTime` at construction from the same `now_fn` the
+    /// state manager uses (`SystemTime::now` in prod, `MockInstantWrapped` in
+    /// tests). Used ONLY to timestamp arrivals in `inner_add_action` so the
+    /// dim-B window is driven by the mockable clock, not the wall clock.
+    affinity_clock: AffinityClock,
+
+    /// (#batch-affinity, dimension A) Gate for the dimension-A pending-set
+    /// surplus pass. `true` on the memory backend (cheap in-memory
+    /// `as_action_info()` per op) and `false` on the Redis/store backend (each
+    /// `as_action_info()` is a store round-trip, so up to
+    /// `MAX_PENDING_AFFINITY_SAMPLE` sequential GETs on the match-cycle critical
+    /// path — not worth it for an observability probe). Derived from
+    /// `spec.experimental_backend` at construction; does NOT change assignment.
+    pending_affinity_probe_enabled: bool,
 }
 
 impl core::fmt::Debug for SimpleScheduler {
@@ -430,10 +489,14 @@ impl SimpleScheduler {
         // let this task batch with a peer for dir-cache affinity. The lock is
         // held only for the synchronous `record_arrival` (no `.await` inside).
         {
+            // Timestamp via the injectable clock (mockable in tests) so the
+            // dim-B window is deterministic, not wall-clock-dependent. Captured
+            // before the lock so the clock closure is not called under it.
+            let now = (self.affinity_clock)();
             let matched = self
                 .recent_roots_window
                 .lock()
-                .record_arrival(action_info.input_root_digest, Instant::now());
+                .record_arrival(action_info.input_root_digest, now);
             if matched {
                 self.batch_affinity_metrics
                     .arrival_within_250ms_total
@@ -537,8 +600,12 @@ impl SimpleScheduler {
         // matching below still owns every op) and samples only the first
         // MAX_PENDING_AFFINITY_SAMPLE highest-priority ops to keep the probe
         // O(cap) under burst load. It does NOT change which worker is chosen or
-        // introduce any delay — it only records gauges.
-        self.record_pending_affinity_surplus(&queued_actions).await;
+        // introduce any delay — it only records gauges. Gated OFF on the
+        // Redis/store backend (each `as_action_info()` would be a store GET);
+        // see `pending_affinity_probe_enabled`.
+        if self.pending_affinity_probe_enabled {
+            self.record_pending_affinity_surplus(&queued_actions).await;
+        }
 
         let mut futures_set = futures::stream::FuturesUnordered::<
             std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>>,
@@ -594,8 +661,12 @@ impl SimpleScheduler {
     /// instantaneous co-location surplus over the (already-collected,
     /// priority-sorted) pending set and store it into the gauges. Samples at
     /// most `MAX_PENDING_AFFINITY_SAMPLE` highest-priority ops; each sampled op
-    /// costs one `as_action_info()` (an in-memory subscriber `borrow().await`,
-    /// the same call the matcher makes anyway). Ops whose `as_action_info()`
+    /// costs one `as_action_info()` call. On the memory backend (the deployed
+    /// topology, the only one this method runs on — the caller gates it OFF for
+    /// the Redis/store backend) that is a cheap in-memory
+    /// `watch::borrow().clone()`, the same KIND of call the matcher makes; it is
+    /// nonetheless a SEPARATE pass (the matcher does not reuse this result), so
+    /// it is a bounded ADDITIONAL read, not free. Ops whose `as_action_info()`
     /// fails (e.g. an `ErrorActionStateResult` from a stream decode error) are
     /// skipped — a best-effort probe must never fail the match cycle. This
     /// method has NO effect on assignment: it borrows `queued_actions`, mutates
@@ -959,6 +1030,23 @@ impl SimpleScheduler {
                 .unwrap_or_default(),
         ));
 
+        // (#batch-affinity) Capture the injectable clock (type-erased to
+        // `SystemTime`) BEFORE `now_fn` is moved into the state manager below.
+        // `now_fn` is `Clone`; `I::now()` yields `SystemTime` in prod
+        // (`SystemTime::now`) and mock-clock time in tests (`MockInstantWrapped`).
+        let affinity_clock: AffinityClock = {
+            let now_fn = now_fn.clone();
+            Arc::new(move || now_fn().now())
+        };
+        // (#batch-affinity, dim A) Gate the pending-set surplus pass ON only for
+        // the memory backend (cheap in-memory `as_action_info()`); OFF for the
+        // Redis/store backend where each would be a store round-trip. Observability
+        // only — does not affect assignment.
+        let pending_affinity_probe_enabled = !matches!(
+            spec.experimental_backend,
+            Some(nativelink_config::schedulers::ExperimentalSimpleSchedulerBackend::Redis(_))
+        );
+
         let mut worker_timeout_s = spec.worker_timeout_s;
         if worker_timeout_s == 0 {
             worker_timeout_s = DEFAULT_WORKER_TIMEOUT_S;
@@ -1307,6 +1395,8 @@ impl SimpleScheduler {
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
                 batch_affinity_metrics: BatchAffinityMetrics::default(),
                 recent_roots_window: Mutex::new(RecentRootsWindow::new()),
+                affinity_clock,
+                pending_affinity_probe_enabled,
             }
         });
         (action_scheduler, worker_scheduler_clone)

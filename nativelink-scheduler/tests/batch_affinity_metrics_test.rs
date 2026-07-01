@@ -22,25 +22,34 @@
 //!       small window of a peer — pure fn `is_within_affinity_window` +
 //!       the pinned window constant `AFFINITY_ARRIVAL_WINDOW`.
 //!
+//! Window timestamps are `SystemTime` (the type the scheduler's injectable
+//! clock — `now_fn().now()` — produces in both prod and mock-clock tests), so
+//! these tests drive fixed `SystemTime` values with no wall-clock dependence.
+//!
 //! These are pure functions so the exact arithmetic (surplus math, max-group,
 //! window boundary) is unit-testable WITHOUT driving a real scheduler. The
 //! metric is observability-only: nothing here asserts a scheduling behavior
 //! change (there is none).
 
 use core::time::Duration;
+use std::time::SystemTime;
 
 use nativelink_scheduler::simple_scheduler::{
-    AFFINITY_ARRIVAL_WINDOW, RECENT_ROOTS_MAX_ENTRIES, RecentRootsWindow, colocation_surplus,
-    is_within_affinity_window,
+    AFFINITY_ARRIVAL_WINDOW, MAX_PENDING_AFFINITY_SAMPLE, RECENT_ROOTS_MAX_ENTRIES,
+    RecentRootsWindow, colocation_surplus, is_within_affinity_window,
 };
-use std::time::Instant;
-
 use nativelink_util::common::DigestInfo;
 
 /// Build a distinct `DigestInfo` from a single discriminator byte, so
 /// `[A, A, B, C]`-style fixtures read clearly.
 fn root(discriminator: u8) -> DigestInfo {
     DigestInfo::new([discriminator; 32], 1)
+}
+
+/// A deterministic `SystemTime` base far enough above `UNIX_EPOCH` that
+/// subtracting the window never underflows.
+fn base_time() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(10_000)
 }
 
 // ────────────────────────────── (A) colocation_surplus ──────────────────────
@@ -120,11 +129,52 @@ fn colocation_surplus_single_op_is_zero() {
     );
 }
 
+/// (FIX 4 / F3) At exactly `MAX_PENDING_AFFINITY_SAMPLE` distinct roots the
+/// caller samples only the prefix; `colocation_surplus` over a 512-distinct
+/// prefix is 0 (all distinct). This pins the sample-cap constant and documents
+/// that at saturation the surplus is a LOWER BOUND on the true pending-set
+/// surplus (the caller reports `sampled_ops == cap` so operators see it).
+#[test]
+fn colocation_surplus_at_sample_cap_all_distinct() {
+    // The dim-A caller feeds at most MAX_PENDING_AFFINITY_SAMPLE roots. Build a
+    // fully-distinct prefix of exactly that length: surplus 0, max_group 1.
+    let mut roots = Vec::with_capacity(MAX_PENDING_AFFINITY_SAMPLE);
+    for i in 0u64..(MAX_PENDING_AFFINITY_SAMPLE as u64) {
+        let mut hash = [0u8; 32];
+        hash[0..8].copy_from_slice(&i.to_le_bytes());
+        roots.push(DigestInfo::new(hash, 1));
+    }
+    assert_eq!(
+        roots.len(),
+        MAX_PENDING_AFFINITY_SAMPLE,
+        "#batch-affinity: the dim-A sample cap must be {MAX_PENDING_AFFINITY_SAMPLE}"
+    );
+    let (surplus, max_group) = colocation_surplus(&roots);
+    assert_eq!(
+        surplus, 0,
+        "#batch-affinity: a fully-distinct 512-root sample has surplus 0"
+    );
+    assert_eq!(
+        max_group, 1,
+        "#batch-affinity: a fully-distinct 512-root sample has max_group 1"
+    );
+}
+
+#[test]
+fn sample_cap_const_is_512() {
+    // Pin the sample cap so a doc-comment edit cannot silently drift the value
+    // the dim-A `sampled_ops` saturation keys on.
+    assert_eq!(
+        MAX_PENDING_AFFINITY_SAMPLE, 512,
+        "#batch-affinity: MAX_PENDING_AFFINITY_SAMPLE must be 512"
+    );
+}
+
 // ─────────────────────── (B) is_within_affinity_window ───────────────────────
 
 #[test]
 fn window_boundary_exactly_at_window_is_within() {
-    let now = Instant::now();
+    let now = base_time();
     let last_seen = now - AFFINITY_ARRIVAL_WINDOW;
     assert!(
         is_within_affinity_window(now, last_seen, AFFINITY_ARRIVAL_WINDOW),
@@ -135,7 +185,7 @@ fn window_boundary_exactly_at_window_is_within() {
 
 #[test]
 fn window_just_past_is_not_within() {
-    let now = Instant::now();
+    let now = base_time();
     let last_seen = now - (AFFINITY_ARRIVAL_WINDOW + Duration::from_millis(1));
     assert!(
         !is_within_affinity_window(now, last_seen, AFFINITY_ARRIVAL_WINDOW),
@@ -146,11 +196,23 @@ fn window_just_past_is_not_within() {
 
 #[test]
 fn window_well_within_is_within() {
-    let now = Instant::now();
+    let now = base_time();
     let last_seen = now - Duration::from_millis(10);
     assert!(
         is_within_affinity_window(now, last_seen, AFFINITY_ARRIVAL_WINDOW),
         "#batch-affinity: a 10ms-apart arrival is comfortably within the 250ms window"
+    );
+}
+
+#[test]
+fn window_peer_in_future_is_within() {
+    // A monotonic-clock hiccup (peer stored AFTER `now`) must not panic and is
+    // treated as within-window (duration saturates to 0 <= window).
+    let now = base_time();
+    let last_seen = now + Duration::from_millis(5);
+    assert!(
+        is_within_affinity_window(now, last_seen, AFFINITY_ARRIVAL_WINDOW),
+        "#batch-affinity: a peer timestamp in the future must saturate to within-window, not panic"
     );
 }
 
@@ -170,7 +232,7 @@ fn affinity_window_const_is_250ms() {
 #[test]
 fn recent_roots_counts_within_window_arrival() {
     let mut window = RecentRootsWindow::new();
-    let t0 = Instant::now();
+    let t0 = base_time();
     // First arrival of A: no peer seen → no batch opportunity.
     assert!(
         !window.record_arrival(root(b'A'), t0),
@@ -187,7 +249,7 @@ fn recent_roots_counts_within_window_arrival() {
 #[test]
 fn recent_roots_stale_peer_does_not_count() {
     let mut window = RecentRootsWindow::new();
-    let t0 = Instant::now();
+    let t0 = base_time();
     assert!(!window.record_arrival(root(b'A'), t0));
     // Repeat of A but AFTER the window has elapsed → a 250ms delay would not
     // have captured it, so it must not count.
@@ -203,7 +265,7 @@ fn recent_roots_is_bounded() {
     // The map must never exceed its cap regardless of how many distinct roots
     // arrive (network-reachable path → mandatory bound).
     let mut window = RecentRootsWindow::new();
-    let t0 = Instant::now();
+    let t0 = base_time();
     for i in 0u64..(RECENT_ROOTS_MAX_ENTRIES as u64 + 500) {
         // Distinct 32-byte digest per iteration.
         let mut hash = [0u8; 32];

@@ -27,6 +27,12 @@
 //!   scheduler.test.action.batch_affinity.sampled_ops
 //!   scheduler.test.action.batch_affinity.arrival_within_250ms_total
 //!
+//! The dim-B counter is driven by the scheduler's INJECTABLE clock
+//! (`MockInstantWrapped` → thread-local `MockClock`), so this file advances the
+//! mock clock to place arrivals inside / outside the 250ms window
+//! DETERMINISTICALLY — no wall-clock dependence (FIX 1: was previously
+//! real-clock-flaky under a loaded build box).
+//!
 //! Mutation rule: comment out either compute site
 //! (`record_pending_affinity_surplus` for A, the `record_arrival` +
 //! `fetch_add` block in `inner_add_action` for B). The relevant test must
@@ -37,11 +43,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use nativelink_config::schedulers::SimpleSpec;
+use mock_instant::thread_local::MockClock;
+use nativelink_config::schedulers::{
+    ExperimentalRedisSchedulerBackend, ExperimentalSimpleSchedulerBackend, SimpleSpec,
+};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
-use nativelink_scheduler::simple_scheduler::SimpleScheduler;
+use nativelink_scheduler::simple_scheduler::{MAX_PENDING_AFFINITY_SAMPLE, SimpleScheduler};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId,
@@ -60,10 +69,10 @@ const NOW_TIME: u64 = 10_000;
 /// key). `action_disc` differentiates the ACTION digest so distinct ops with
 /// the SAME input root are distinct operations (not deduped/joined), while
 /// `input_root_disc` sets the co-location key.
-fn make_action_info(input_root_disc: u8, action_disc: u8, ts_offset: u64) -> Arc<ActionInfo> {
+fn make_action_info(input_root: DigestInfo, action_disc: u8, ts_offset: u64) -> Arc<ActionInfo> {
     Arc::new(ActionInfo {
         command_digest: DigestInfo::new([0u8; 32], 0),
-        input_root_digest: DigestInfo::new([input_root_disc; 32], 1),
+        input_root_digest: input_root,
         timeout: Duration::MAX,
         platform_properties: HashMap::new(),
         priority: 0,
@@ -79,16 +88,21 @@ fn make_action_info(input_root_disc: u8, action_disc: u8, ts_offset: u64) -> Arc
     })
 }
 
-fn new_scheduler() -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>, Arc<Notify>) {
+/// Single-byte-discriminated input root (readable [A,A,B,C] fixtures).
+fn root(disc: u8) -> DigestInfo {
+    DigestInfo::new([disc; 32], 1)
+}
+
+/// Build a scheduler over the given `SimpleSpec` with a memory awaited-action DB
+/// and the mock clock. The spec's `experimental_backend` decides the dim-A gate.
+fn new_scheduler_with_spec(
+    spec: &SimpleSpec,
+) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>, Arc<Notify>) {
     let task_notify = Arc::new(Notify::new());
     let awaited_action_db =
         memory_awaited_action_db_factory(0, &task_notify.clone(), MockInstantWrapped::default);
-    let spec = SimpleSpec {
-        worker_timeout_s: 100,
-        ..Default::default()
-    };
     let (scheduler, worker_scheduler) = SimpleScheduler::new_with_callback(
-        &spec,
+        spec,
         awaited_action_db,
         || async move {},
         task_notify.clone(),
@@ -99,6 +113,14 @@ fn new_scheduler() -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>, Arc<Notif
         None, // worker_tls_config
     );
     (scheduler, worker_scheduler, task_notify)
+}
+
+fn new_scheduler() -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>, Arc<Notify>) {
+    let spec = SimpleSpec {
+        worker_timeout_s: 100,
+        ..Default::default()
+    };
+    new_scheduler_with_spec(&spec)
 }
 
 fn register(
@@ -123,14 +145,9 @@ async fn batch_affinity_colocation_surplus_render() -> Result<(), Error> {
 
     // Roots: A, A, B, C → 4 ops, 3 distinct roots → surplus 1, max_group 2.
     // Distinct ACTION digests (1,2,3,4) so the ops are 4 separate operations.
-    for (input_root, action, off) in
-        [(b'A', 1u8, 0u64), (b'A', 2, 1), (b'B', 3, 2), (b'C', 4, 3)]
-    {
+    for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'A', 2, 1), (b'B', 3, 2), (b'C', 4, 3)] {
         scheduler
-            .add_action(
-                OperationId::default(),
-                make_action_info(input_root, action, off),
-            )
+            .add_action(OperationId::default(), make_action_info(root(input_root), action, off))
             .await
             .expect("#batch-affinity setup: add_action must succeed");
     }
@@ -175,10 +192,7 @@ async fn batch_affinity_all_distinct_surplus_zero_render() -> Result<(), Error> 
 
     for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'B', 2, 1), (b'C', 3, 2)] {
         scheduler
-            .add_action(
-                OperationId::default(),
-                make_action_info(input_root, action, off),
-            )
+            .add_action(OperationId::default(), make_action_info(root(input_root), action, off))
             .await
             .expect("#batch-affinity setup: add_action must succeed");
     }
@@ -204,39 +218,156 @@ async fn batch_affinity_all_distinct_surplus_zero_render() -> Result<(), Error> 
     Ok(())
 }
 
-/// (B) Two ops with the SAME input root added in quick succession (well within
-/// the 250ms real-clock window) → the arrival counter increments exactly once
-/// (the second arrival matches the first; the first has no peer). A third op
-/// with a DIFFERENT root does not increment it.
+/// (FIX 4 / F3) When the pending set exceeds `MAX_PENDING_AFFINITY_SAMPLE`, the
+/// dim-A pass samples only the cap and `sampled_ops` SATURATES at the cap — so
+/// operators can see the surplus is a lower bound. Adds `cap + 8` all-DISTINCT
+/// pending ops → sampled_ops == 512, and (because the sampled prefix is all
+/// distinct) surplus 0 / max_group 1.
 #[nativelink_test]
-async fn batch_affinity_arrival_window_counter_render() -> Result<(), Error> {
+async fn batch_affinity_sampled_ops_saturates_at_cap_render() -> Result<(), Error> {
     let (scheduler, worker_scheduler, _notify) = new_scheduler();
 
-    // First arrival of root A: no peer → counter stays 0.
+    let total = MAX_PENDING_AFFINITY_SAMPLE + 8;
+    for i in 0..total {
+        // Distinct input root AND distinct action per op.
+        let mut root_hash = [0u8; 32];
+        root_hash[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let mut action_hash = [0u8; 32];
+        action_hash[0..8].copy_from_slice(&(0xFFFF_0000u64 + i as u64).to_le_bytes());
+        let action_info = Arc::new(ActionInfo {
+            command_digest: DigestInfo::new([0u8; 32], 0),
+            input_root_digest: DigestInfo::new(root_hash, 1),
+            timeout: Duration::MAX,
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: UNIX_EPOCH,
+            insert_timestamp: UNIX_EPOCH
+                .checked_add(Duration::from_secs(NOW_TIME + i as u64))
+                .unwrap(),
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                instance_name: INSTANCE_NAME.to_string(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest: DigestInfo::new(action_hash, 0),
+            }),
+        });
+        scheduler
+            .add_action(OperationId::default(), action_info)
+            .await
+            .expect("#batch-affinity setup: add_action must succeed");
+    }
+
     scheduler
-        .add_action(OperationId::default(), make_action_info(b'A', 1, 0))
+        .do_try_match_for_test()
+        .await
+        .expect("#batch-affinity setup: do_try_match must succeed");
+
+    let registry = register(scheduler.clone(), worker_scheduler.clone());
+    let body = render_prometheus(&registry);
+
+    assert!(
+        body.contains(&format!(
+            "\nscheduler_test_action_batch_affinity_sampled_ops {MAX_PENDING_AFFINITY_SAMPLE}\n"
+        )),
+        "#batch-affinity MISSING or WRONG VALUE: sampled_ops must SATURATE at the sample cap \
+         {MAX_PENDING_AFFINITY_SAMPLE} when the pending set ({total}) exceeds it — the surplus \
+         gauge is then a lower bound and operators must be able to see the saturation. body=\n{body}"
+    );
+
+    Ok(())
+}
+
+/// (FIX 2) On the Redis/store backend the dim-A pass is GATED OFF (each
+/// `as_action_info()` would be a store round-trip). Verify a scheduler built
+/// with a Redis `experimental_backend` does NOT run the surplus pass:
+/// `sampled_ops` stays at its default 0 even after adding co-located pending
+/// ops and running a match cycle. (The awaited-action DB is still the in-memory
+/// fake — the gate keys on the SPEC, which is what the factory has.)
+#[nativelink_test]
+async fn batch_affinity_dim_a_gated_off_on_redis_backend() -> Result<(), Error> {
+    let spec = SimpleSpec {
+        worker_timeout_s: 100,
+        experimental_backend: Some(ExperimentalSimpleSchedulerBackend::Redis(
+            ExperimentalRedisSchedulerBackend {
+                redis_store: "unused_in_test".to_string(),
+            },
+        )),
+        ..Default::default()
+    };
+    let (scheduler, worker_scheduler, _notify) = new_scheduler_with_spec(&spec);
+
+    // Add co-located pending ops that WOULD produce surplus 1 if the pass ran.
+    for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'A', 2, 1), (b'B', 3, 2)] {
+        scheduler
+            .add_action(OperationId::default(), make_action_info(root(input_root), action, off))
+            .await
+            .expect("#batch-affinity setup: add_action must succeed");
+    }
+    scheduler
+        .do_try_match_for_test()
+        .await
+        .expect("#batch-affinity setup: do_try_match must succeed");
+
+    let registry = register(scheduler.clone(), worker_scheduler.clone());
+    let body = render_prometheus(&registry);
+
+    // The gauge is still PRESENT (BatchAffinityMetrics is always published) but
+    // never written → stays at default 0, proving the dim-A pass did not run.
+    assert!(
+        body.contains("\nscheduler_test_action_batch_affinity_sampled_ops 0\n"),
+        "#batch-affinity GATE FAILED: on the Redis backend the dim-A pass must be skipped, \
+         so sampled_ops must stay 0 even with 3 co-located pending ops. A non-zero value means \
+         the store-round-trip pass ran on the Redis critical path. body=\n{body}"
+    );
+    // Corroborate: surplus also stays 0 (would be 1 if the pass had run).
+    assert!(
+        body.contains("\nscheduler_test_action_batch_affinity_colocation_surplus 0\n"),
+        "#batch-affinity GATE FAILED: colocation_surplus must stay 0 on the gated Redis backend. \
+         body=\n{body}"
+    );
+
+    Ok(())
+}
+
+/// (B, FIX 1) Deterministic mock-clock arrival-window test. Two same-root
+/// arrivals placed 100ms apart (via `MockClock::advance`) fall INSIDE the 250ms
+/// window → counter 1. A third same-root arrival placed 300ms later falls
+/// OUTSIDE → counter stays 1. Fully deterministic: no wall-clock dependence.
+#[nativelink_test]
+async fn batch_affinity_arrival_window_counter_render() -> Result<(), Error> {
+    // Anchor the mock clock at a fixed base so arrivals are deterministic.
+    MockClock::set_time(Duration::from_secs(NOW_TIME));
+    let (scheduler, worker_scheduler, _notify) = new_scheduler();
+
+    // First arrival of root A at t=0: no peer → counter 0.
+    scheduler
+        .add_action(OperationId::default(), make_action_info(root(b'A'), 1, 0))
         .await
         .expect("#batch-affinity setup: add_action A1 must succeed");
-    // Second arrival of root A microseconds later: matches the first within the
-    // 250ms window → counter → 1.
+
+    // Advance 100ms (< 250ms window) and add root A again → within window → +1.
+    MockClock::advance(Duration::from_millis(100));
     scheduler
-        .add_action(OperationId::default(), make_action_info(b'A', 2, 1))
+        .add_action(OperationId::default(), make_action_info(root(b'A'), 2, 1))
         .await
         .expect("#batch-affinity setup: add_action A2 must succeed");
-    // Arrival of a DIFFERENT root B: no peer → counter unchanged.
+
+    // Advance 300ms (> 250ms window) and add root A a third time → stale peer →
+    // NO increment. Proves the window boundary is honored via the mock clock.
+    MockClock::advance(Duration::from_millis(300));
     scheduler
-        .add_action(OperationId::default(), make_action_info(b'B', 3, 2))
+        .add_action(OperationId::default(), make_action_info(root(b'A'), 3, 2))
         .await
-        .expect("#batch-affinity setup: add_action B must succeed");
+        .expect("#batch-affinity setup: add_action A3 must succeed");
 
     let registry = register(scheduler.clone(), worker_scheduler.clone());
     let body = render_prometheus(&registry);
 
     assert!(
         body.contains("\nscheduler_test_action_batch_affinity_arrival_within_250ms_total 1\n"),
-        "#batch-affinity MISSING or WRONG VALUE: arrival_within_250ms_total must be 1 \
-         (two same-root arrivals within 250ms → exactly one captured opportunity; \
-         the differently-rooted third arrival does not count). body=\n{body}"
+        "#batch-affinity MISSING or WRONG VALUE: arrival_within_250ms_total must be exactly 1 \
+         (A@0 and A@100ms are within the 250ms window → +1; A@400ms is 300ms after its peer → \
+         outside the window → no increment). Driven by the mock clock, so this is deterministic. \
+         body=\n{body}"
     );
 
     Ok(())
