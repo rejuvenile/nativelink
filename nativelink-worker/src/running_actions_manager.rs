@@ -722,14 +722,22 @@ fn calib_list_child_pids(ppid: libc::pid_t) -> Vec<libc::pid_t> {
     let mut buf: Vec<libc::pid_t> = vec![0; count];
     let buf_size = (count * core::mem::size_of::<libc::pid_t>()) as libc::c_int;
     // SAFETY: `buf` owns `count` `pid_t` slots; we pass its exact byte size and
-    // only trust the returned byte count. Read-only, does not retain the ptr.
+    // only read the returned pid slots. Read-only, does not retain the ptr.
     let written = unsafe {
         libc::proc_listchildpids(ppid, buf.as_mut_ptr().cast::<libc::c_void>(), buf_size)
     };
     if written <= 0 {
         return Vec::new();
     }
-    let got = (written as usize / core::mem::size_of::<libc::pid_t>()).min(count);
+    // The buffer fetch returns the COUNT of pids written, NOT a byte count —
+    // empirically confirmed on M4 (a 1-child parent returns 1). The earlier bug
+    // divided this by size_of::<pid_t>() (1/4 = 0), yielding an empty child list
+    // so the subtree walk silently degraded to a single-pid read of the ~idle
+    // parent (caught by the on-worker `live_child_subtree_cpu_includes_grandchild`
+    // test). The NULL sizing call above returns a generous byte-ish upper bound
+    // (so `/size_of` is correct THERE for the allocation), but the fetch return
+    // is a plain pid count.
+    let got = (written as usize).min(count);
     buf.truncate(got);
     // Filter out any 0/negative sentinel the kernel may leave.
     buf.retain(|&p| p > 0);
