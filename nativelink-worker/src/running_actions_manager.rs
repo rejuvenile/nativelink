@@ -193,6 +193,16 @@ fn calib_digest_sample_key(digest: &DigestInfo) -> u64 {
     ])
 }
 
+/// Uniform 1/`CALIB_SAMPLE_PERIOD` membership by digest-hash key, WITHOUT the
+/// large-exec override. This is the poll-start predicate: the CPU-time poll (see
+/// the execute loop) must be armed BEFORE the child runs, when `exec_duration_ms`
+/// is not yet known, so it can only key on the uniform sample — the >60 s
+/// override cannot participate. Factored out so `calib_action_sampled` composes
+/// it (behavior unchanged) and the poll-start decision is unit-testable alone.
+const fn calib_uniformly_sampled(sample_key: u64) -> bool {
+    sample_key % CALIB_SAMPLE_PERIOD == 0
+}
+
 /// P-A sampling decision: uniform 1/`CALIB_SAMPLE_PERIOD` by digest-hash key,
 /// EXCEPT actions with `exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD` are
 /// always sampled (1/1 large-action override, §3).
@@ -200,7 +210,7 @@ fn calib_digest_sample_key(digest: &DigestInfo) -> u64 {
 /// Pure function of (`sample_key`, `exec_duration_ms`) so the boundary
 /// (exactly 60 s = not over-threshold; 60_001 ms = over) is unit-testable.
 const fn calib_action_sampled(sample_key: u64, exec_duration_ms: i64) -> bool {
-    exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD || sample_key % CALIB_SAMPLE_PERIOD == 0
+    exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD || calib_uniformly_sampled(sample_key)
 }
 
 /// P-B sampling decision: uniform 1/`CALIB_SAMPLE_PERIOD` by digest-hash key,
@@ -369,18 +379,23 @@ fn calib_tree_totals(tree: &HashMap<DigestInfo, ProtoDirectory>) -> (u64, u64) {
     (bytes, files)
 }
 
-/// Best-effort capture of a just-completed child's total CPU time (user+system)
-/// in milliseconds, for the P-A `cpu_time_ms` field. Returns `None` when the
-/// value is unavailable on this OS / in this window.
+/// Best-effort capture of a LIVE child's total CPU time (user+system) in
+/// milliseconds, for the P-A `cpu_time_ms` field. Returns `None` when the value
+/// is unavailable on this OS / for this PID (child not yet running, or already
+/// reaped/gone).
 ///
 /// **macOS** (the production worker OS — see memory `reference-infrastructure`):
 /// `proc_pidinfo(pid, PROC_PIDTASKALLINFO, …)` is a READ-ONLY query (it does
 /// NOT reap), so it is safe to call alongside tokio's SIGCHLD reaper. It is
-/// called in `spawn_blocking` immediately after the child's `wait()` future
-/// resolves. Two caveats, both acceptable for a sampled best-effort calibration
-/// probe: (1) tokio may have already reaped the zombie by the time this runs,
-/// in which case `proc_pidinfo` returns 0/ESRCH and we yield `None`; (2) the
-/// reported time is user+system CPU-ns summed across the child's threads.
+/// polled DURING execution (see `calib_poll_cpu_time_loop` and the execute
+/// loop's poll-arming): it MUST be called while the child is still alive,
+/// because once the child exits and tokio's reaper collects the zombie,
+/// `proc_pidinfo` returns 0/ESRCH → this yields `None`. (This is exactly why an
+/// after-`wait()` capture was structurally always `None` — the reap had already
+/// happened.) The poll exploits that `None`-on-reap as its self-terminating
+/// stop condition. The reported time is user+system CPU-ns summed across the
+/// child's threads; the last live sample misses at most the final ~poll-interval
+/// slice of CPU, acceptable for a sampled best-effort calibration probe.
 ///
 /// **Linux**: deliberately yields `None`. The thread-safe per-child accounting
 /// primitive is `wait4(pid, …, &rusage)`, but tokio's process reaper already
@@ -427,6 +442,43 @@ const fn calib_capture_cpu_time_ms(_pid: u32) -> Option<u64> {
     // See doc-comment above: no zero-behavior-change path on non-macOS without
     // double-reaping the tokio-managed child.
     None
+}
+
+/// P-A CPU-time poll loop. Repeatedly awaits `capture()` (the per-OS live-PID
+/// CPU query, run off the tokio worker via `spawn_blocking` at the call site),
+/// keeping the LAST `Some` value in `last` and setting `has_value` once any
+/// `Some` is seen. Sleeps `interval` between samples. STOPS on the first `None`
+/// — which `calib_capture_cpu_time_ms` returns once the child is reaped/gone —
+/// so the task self-terminates without any external signal.
+///
+/// Factored generic over the capture future so the store-last / stop-on-None
+/// core is unit-testable with an injected closure (no real syscall, no real
+/// sleep — pass `Duration::ZERO`). `capture` returns a future so the production
+/// call can `spawn_blocking!(…).await` inside it, keeping `proc_pidinfo` off the
+/// tokio worker thread.
+///
+/// Capture-then-sleep order: the first sample is taken immediately so even a
+/// sub-`interval` action gets one live reading before its child exits.
+async fn calib_poll_cpu_time_loop<F, Fut>(
+    interval: Duration,
+    mut capture: F,
+    last: Arc<core::sync::atomic::AtomicU64>,
+    has_value: Arc<AtomicBool>,
+) where
+    F: FnMut() -> Fut + Send,
+    Fut: core::future::Future<Output = Option<u64>> + Send,
+{
+    loop {
+        match capture().await {
+            Some(ms) => {
+                last.store(ms, Ordering::Relaxed);
+                has_value.store(true, Ordering::Relaxed);
+            }
+            // Child reaped/gone (ESRCH) — nothing more to sample; self-terminate.
+            None => break,
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 // CAPPED AT 32: process-wide limit on concurrent action-cleanup directory
@@ -4579,10 +4631,61 @@ impl RunningActionImpl {
 
         // Calibration probe P-A: capture the child's OS PID BEFORE the child is
         // moved into the cleanup guard and (on completion) reaped by tokio's
-        // SIGCHLD reaper. The PID feeds the best-effort `cpu_time_ms` query in
-        // the `wait()` arm below; once the child is reaped the value is gone.
+        // SIGCHLD reaper. The PID feeds the `cpu_time_ms` poll below; once the
+        // child is reaped the value is gone (`proc_pidinfo` → ESRCH → `None`),
+        // which is why the poll runs DURING execution rather than after `wait()`.
         // Observability-only; `None` if the OS did not assign a queryable PID.
         let calib_child_pid: Option<u32> = child_process.id();
+
+        // Calibration probe P-A: arm the child CPU-time poll UPFRONT (the after-
+        // `wait()` capture was structurally always `None` — the reap had already
+        // happened by then). Eligible iff the child has a queryable PID AND the
+        // action is in the uniform 1/16 sample (`calib_uniformly_sampled` — the
+        // >60 s exec override cannot participate here, its duration is not yet
+        // known; large actions NOT in the uniform sample therefore emit P-A with
+        // `cpu_time_ms = None`, acceptable: the uniform 1/16 still yields a
+        // representative cpu-shape sample including large actions proportionally,
+        // and this is far cheaper than polling every action). While eligible we
+        // spawn a background task that every 500 ms reads the LIVE child's CPU
+        // time off the tokio worker (`spawn_blocking!`), keeping the last value
+        // in shared scalar atoms (no owned bytes → no cap annotation). The task
+        // is bounded: it self-terminates on the first `None` (child reaped/gone)
+        // and only runs for the 1/16 sampled actions; the `spawn!` drop-guard
+        // aborts it on every exit path from this method so it cannot linger.
+        let calib_cpu_last = Arc::new(core::sync::atomic::AtomicU64::new(0));
+        let calib_cpu_has_value = Arc::new(AtomicBool::new(false));
+        let calib_poll_guard = match calib_child_pid {
+            Some(pid)
+                if calib_uniformly_sampled(calib_digest_sample_key(
+                    &self.action_info.input_root_digest,
+                )) =>
+            {
+                let last = Arc::clone(&calib_cpu_last);
+                let has_value = Arc::clone(&calib_cpu_has_value);
+                Some(spawn!("calib_cpu_time_poll", async move {
+                    calib_poll_cpu_time_loop(
+                        Duration::from_millis(500),
+                        move || {
+                            // Off the tokio worker: `proc_pidinfo` is a blocking
+                            // syscall. Flatten the JoinError/None into a plain
+                            // `None` so a spawn failure ends the poll cleanly.
+                            async move {
+                                spawn_blocking!("calib_capture_cpu_time", move || {
+                                    calib_capture_cpu_time_ms(pid)
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            }
+                        },
+                        last,
+                        has_value,
+                    )
+                    .await;
+                }))
+            }
+            _ => None,
+        };
 
         let mut child_process_guard = guard(child_process, |mut child_process| {
             let result: Result<Option<std::process::ExitStatus>, std::io::Error> =
@@ -4700,7 +4803,6 @@ impl RunningActionImpl {
                     } else {
                         None
                     };
-                    let calib_exec_start;
                     {
                         let mut state = self.state.lock();
                         state.error = Error::merge_option(state.error.take(), maybe_error_override);
@@ -4712,36 +4814,21 @@ impl RunningActionImpl {
                             exit_code,
                         });
                         state.execution_metadata.execution_completed_timestamp = (self.running_actions_manager.callbacks.now_fn)();
-                        calib_exec_start = state.execution_metadata.execution_start_timestamp;
                     }
-                    // Calibration probe P-A: best-effort child CPU-time capture.
-                    // Only for sampled actions (uniform 1/16 by input-root-digest
-                    // hash, OR the 1/1 large-exec override now that the duration is
-                    // known), so the syscall is off the per-action common path. The
-                    // `proc_pidinfo` (macOS) query runs in `spawn_blocking` — never
-                    // on a tokio worker thread — and is read-only (no reap). The
-                    // captured value is stashed in state and read at the post-upload
-                    // P-A emit site (the child is reaped by then). Zero behavior
+                    // Calibration probe P-A: harvest the poll's last live CPU-time
+                    // sample. The poll (armed before this loop, for uniform-1/16
+                    // sampled actions) read `proc_pidinfo` on the LIVE child; the
+                    // after-`wait()` capture that used to live here was always
+                    // `None` because the child is reaped by now (ESRCH). The value
+                    // is `None` for unsampled/non-macOS actions (`has_value` never
+                    // set). Dropping the guard aborts the poll task at once so it
+                    // does not linger up to the 500 ms interval. Zero behavior
                     // change: nothing downstream reads `calib_cpu_time_ms`.
-                    let calib_exec_ms = (self.running_actions_manager.callbacks.now_fn)()
-                        .duration_since(calib_exec_start)
-                        .map_or(0, |d| d.as_millis() as i64);
-                    if let Some(pid) = calib_child_pid {
-                        let calib_key =
-                            calib_digest_sample_key(&self.action_info.input_root_digest);
-                        if calib_action_sampled(calib_key, calib_exec_ms) {
-                            let cpu_ms = spawn_blocking!(
-                                "calib_capture_cpu_time",
-                                move || calib_capture_cpu_time_ms(pid)
-                            )
-                            .await
-                            .ok()
-                            .flatten();
-                            if cpu_ms.is_some() {
-                                self.state.lock().calib_cpu_time_ms = cpu_ms;
-                            }
-                        }
+                    if calib_cpu_has_value.load(Ordering::Relaxed) {
+                        self.state.lock().calib_cpu_time_ms =
+                            Some(calib_cpu_last.load(Ordering::Relaxed));
                     }
+                    drop(calib_poll_guard);
                     return Ok(self);
                 },
                 _ = &mut kill_channel_rx => {
@@ -9962,8 +10049,10 @@ mod calib_probe_tests {
     //! wrapper over a populated record. Spec:
     //! `.claude/audits/scheduler-calibration-instrumentation-spec-v2-2026-06-30.md`
     //! §3/§4/§6/§9.
+    use core::sync::atomic::{AtomicBool, Ordering};
     use std::collections::HashMap;
 
+    use nativelink_macro::nativelink_test;
     use nativelink_proto::build::bazel::remote::execution::v2::{
         Directory as ProtoDirectory, FileNode,
     };
@@ -9972,8 +10061,8 @@ mod calib_probe_tests {
     use super::{
         CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_TREE_BYTES_THRESHOLD, CALIB_SAMPLE_PERIOD,
         CalibActionShape, CalibActionRecord, CalibStagingRecord, calib_action_sampled,
-        calib_build_action_record, calib_classify, calib_digest_sample_key, calib_staging_sampled,
-        calib_tree_totals,
+        calib_build_action_record, calib_classify, calib_digest_sample_key,
+        calib_poll_cpu_time_loop, calib_staging_sampled, calib_tree_totals, calib_uniformly_sampled,
     };
 
     /// Build a digest whose first-8-byte LE sampling key is exactly `key`.
@@ -10061,6 +10150,158 @@ mod calib_probe_tests {
             "exec_duration == 60_001 ms is over the 60 s threshold; the 1/1 \
              large-action override must force-sample even an unsampled key"
         );
+    }
+
+    #[test]
+    fn uniformly_sampled_is_the_1_in_16_gate_without_the_exec_override() {
+        // `calib_uniformly_sampled` is the poll-start decision: it must be the
+        // uniform 1/16 gate ONLY, with NO exec-duration override folded in (the
+        // duration is not known upfront when the poll is armed).
+        assert!(
+            calib_uniformly_sampled(0),
+            "key 0 (0 % 16 == 0) is in the uniform 1/16 sample"
+        );
+        assert!(
+            !calib_uniformly_sampled(1),
+            "key 1 (1 % 16 == 1) is NOT in the uniform 1/16 sample"
+        );
+        assert!(
+            calib_uniformly_sampled(32),
+            "key 32 (32 % 16 == 0) is in the uniform 1/16 sample"
+        );
+    }
+
+    #[test]
+    fn action_sampled_delegates_to_uniform_predicate_plus_override() {
+        // `calib_action_sampled` must equal `uniform || large-exec-override` for
+        // every combination — the extraction of `calib_uniformly_sampled` must
+        // not change `calib_action_sampled`'s decision. Cover both a uniform-in
+        // and a uniform-out key, sub- and over-threshold.
+        for &key in &[0u64, 1, 15, 16, 17, 32] {
+            for &exec_ms in &[0i64, 1_000, CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_EXEC_MS_THRESHOLD + 1] {
+                let expected =
+                    calib_uniformly_sampled(key) || exec_ms > CALIB_LARGE_EXEC_MS_THRESHOLD;
+                assert_eq!(
+                    calib_action_sampled(key, exec_ms),
+                    expected,
+                    "calib_action_sampled(key={key}, exec_ms={exec_ms}) must equal \
+                     uniform({key}) || exec>{CALIB_LARGE_EXEC_MS_THRESHOLD}; the \
+                     calib_uniformly_sampled extraction changed the decision"
+                );
+            }
+        }
+    }
+
+    // --- P-A CPU-time poll loop (state machine, platform-agnostic) ---------
+
+    #[nativelink_test]
+    async fn poll_loop_keeps_last_some_and_stops_on_first_none() {
+        // The poll loop's contract (the bug that shipped: capture ran AFTER the
+        // child was reaped so it was structurally always None). This drives the
+        // loop's core with an INJECTED capture returning Some(10), Some(20),
+        // Some(30), None — no real syscall, no real 500 ms sleep — and asserts:
+        //   (1) the stored last-value is the LAST Some seen (30), NOT the first;
+        //   (2) has_value is set (so completion reads Some);
+        //   (3) the loop TERMINATES on the first None (does not hang).
+        use core::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        let seq = Arc::new(parking_lot::Mutex::new(
+            vec![Some(30u64), Some(20), Some(10)], // popped from the back → 10,20,30
+        ));
+        let last = Arc::new(AtomicU64::new(0));
+        let has_value = Arc::new(AtomicBool::new(false));
+
+        let seq_c = Arc::clone(&seq);
+        // Zero interval so the loop runs to completion instantly; the injected
+        // capture yields None on the 4th call, which must break the loop.
+        tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            calib_poll_cpu_time_loop(
+                core::time::Duration::ZERO,
+                move || {
+                    let next = seq_c.lock().pop().flatten();
+                    core::future::ready(next)
+                },
+                Arc::clone(&last),
+                Arc::clone(&has_value),
+            ),
+        )
+        .await
+        .expect("poll loop must terminate on the first None — it did not stop, so it would leak/hang");
+
+        assert!(
+            has_value.load(Ordering::Relaxed),
+            "has_value must be set once any Some was captured — completion reads \
+             this to decide whether to store Some(cpu_time_ms)"
+        );
+        assert_eq!(
+            last.load(Ordering::Relaxed),
+            30,
+            "the stored value must be the LAST Some (30), not the first (10) — a \
+             mid-execution poll is meaningless if it keeps a stale early sample"
+        );
+    }
+
+    /// LIVE-PROCESS capture test — the one that would have caught the original
+    /// bug (capture-after-reap → structurally always None). Spawns a real short
+    /// child that BURNS CPU (a busy spin — `sleep` would accrue ~0 CPU and not
+    /// exercise the accounting), runs the poll loop against its live PID, waits
+    /// for the child to finish, and asserts a `Some(v)` was captured.
+    ///
+    /// macOS-only: `proc_pidinfo(PROC_PIDTASKALLINFO)` is the macOS accounting
+    /// primitive; on Linux `calib_capture_cpu_time_ms` is a `const None`, so this
+    /// can only be RUN on a macOS worker. It compiles-but-is-absent on Linux
+    /// (the build box), and its VALUE is the contrast: against the OLD
+    /// after-reap capture it fails (None); against the poll-during-execution
+    /// capture it passes (Some(v)).
+    #[cfg(target_os = "macos")]
+    #[nativelink_test]
+    async fn live_child_cpu_time_is_captured_by_poll_during_execution() {
+        use core::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+
+        use super::calib_capture_cpu_time_ms;
+
+        // A child that spins for ~1 s burning CPU (NOT sleeping — sleep accrues
+        // ~0 CPU-time and would not exercise proc_pidinfo's accounting).
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("end=$(( $(date +%s) + 1 )); while [ $(date +%s) -lt $end ]; do :; done")
+            .spawn()
+            .expect("must spawn the spinning child");
+        let pid = child.id().expect("live child must have a PID before reap");
+
+        let last = Arc::new(AtomicU64::new(0));
+        let has_value = Arc::new(AtomicBool::new(false));
+
+        // Poll against the LIVE pid at a short interval so several samples land
+        // inside the ~1 s spin window.
+        let last_c = Arc::clone(&last);
+        let has_c = Arc::clone(&has_value);
+        let poll = nativelink_util::background_spawn!("test_calib_poll", async move {
+            calib_poll_cpu_time_loop(
+                core::time::Duration::from_millis(50),
+                move || core::future::ready(calib_capture_cpu_time_ms(pid)),
+                last_c,
+                has_c,
+            )
+            .await;
+        });
+
+        child.wait().await.expect("child must exit");
+        // The loop self-terminates on the first None after reap; join it so the
+        // asserts see the final stored value.
+        poll.await.expect("poll task must join");
+
+        assert!(
+            has_value.load(Ordering::Relaxed),
+            "a live-process poll must capture at least one Some — capture-after-reap \
+             (the original bug) yields None for every action"
+        );
+        // v may be 0 on a very fast box if the spin's accounted CPU rounds down
+        // to <1 ms at the last live sample, so assert Some-ness (has_value),
+        // not v > 0 — the load-bearing contract is Some-vs-None.
     }
 
     // --- P-B sampling decision --------------------------------------------
