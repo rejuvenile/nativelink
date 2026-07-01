@@ -220,6 +220,37 @@ const fn calib_staging_sampled(sample_key: u64, input_tree_bytes: u64) -> bool {
     input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD || sample_key % CALIB_SAMPLE_PERIOD == 0
 }
 
+/// Poll-arm decision: arm the CPU-time poll iff the child has a queryable OS PID
+/// AND the action is in the uniform 1/16 sample. Pure `(pid, sample_key) → bool`
+/// so BOTH branches (including the FALSE branch that bounds the per-action
+/// background-task cost) are unit-testable without driving a real action. The
+/// >60 s exec override cannot participate here — the duration is unknown when
+/// the poll is armed, upfront of the child running.
+const fn calib_should_arm_poll(pid: Option<u32>, sample_key: u64) -> bool {
+    pid.is_some() && calib_uniformly_sampled(sample_key)
+}
+
+/// Completion-arm harvest gate: read the poll's last live sample IFF the poll
+/// actually captured one. Returns `None` when `has_value` is unset (the poll
+/// never captured: child died before the first tick / non-macOS / spawn
+/// failure) so the caller records `None`, NOT `Some(0)` — a never-sampled
+/// action must never masquerade as a real zero-CPU action (which would classify
+/// `io_bound` and poison the §6 fit). A genuine live-but-idle capture stores
+/// `Some(0)` with `has_value=true`, which this correctly returns as `Some(0)`.
+/// `Acquire` on the flag pairs with the poll loop's `Release` store so a reader
+/// observing `has_value=true` is guaranteed to observe the `last` that preceded
+/// it (the textbook flag-and-data pairing; `last` may stay `Relaxed`).
+fn calib_harvest_cpu_time(
+    has_value: &AtomicBool,
+    last: &core::sync::atomic::AtomicU64,
+) -> Option<u64> {
+    if has_value.load(Ordering::Acquire) {
+        Some(last.load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
 /// CPU-vs-wall shape classification of an action (§3, auditor-required bands).
 ///
 /// `IoBound` (`ratio < 0.5`): mostly waiting on I/O, leaves cores idle.
@@ -346,7 +377,17 @@ struct CalibStagingRecord {
     /// hit returns before reaching here). Recorded for schema stability and to
     /// document the miss-path-only nature of the curve.
     dir_cache_hit: bool,
-    /// Sum of `size_bytes()` over the resolved tree's directory digests.
+    /// PRIMARY regressor for the §6 locality fit: total input-FILE PAYLOAD bytes
+    /// (sum of unique input-file digest sizes = `total_bytes` in staging scope).
+    /// This is the byte volume the network fetch + hardlink actually move, so
+    /// `staging_ms ≈ a + b·input_payload_bytes` yields the ms-per-payload-byte
+    /// `load_byte_cost` the rebalance's locality-vs-load crossover needs
+    /// (auditor Claim 3 / §6). `input_tree_bytes` below is proto-structure size,
+    /// a cheap SECONDARY covariate, NOT the fetch-cost axis.
+    input_payload_bytes: u64,
+    /// Sum of `size_bytes()` over the resolved tree's directory digests (proto
+    /// structure size, scales with directory COUNT not payload VOLUME). Kept as
+    /// a secondary regressor; NOT the per-byte fetch-cost axis (see above).
     input_tree_bytes: u64,
     /// Sum of file counts over the resolved tree's directories.
     input_tree_files: u64,
@@ -361,6 +402,9 @@ impl CalibStagingRecord {
             sample_period = CALIB_SAMPLE_PERIOD,
             input_staging_ms = self.input_staging_ms,
             dir_cache_hit = self.dir_cache_hit,
+            // primary regressor: file-payload bytes moved by the fetch/hardlink.
+            input_payload_bytes = self.input_payload_bytes,
+            // secondary covariate: proto-structure size, NOT the fetch-cost axis.
             input_tree_bytes = self.input_tree_bytes,
             input_tree_files = self.input_tree_files,
             "calib: input-staging locality record"
@@ -379,23 +423,77 @@ fn calib_tree_totals(tree: &HashMap<DigestInfo, ProtoDirectory>) -> (u64, u64) {
     (bytes, files)
 }
 
-/// Best-effort capture of a LIVE child's total CPU time (user+system) in
-/// milliseconds, for the P-A `cpu_time_ms` field. Returns `None` when the value
-/// is unavailable on this OS / for this PID (child not yet running, or already
-/// reaped/gone).
+/// Defensive caps on the descendant-tree walk (`calib_capture_subtree_cpu_ns`).
+/// A calibration probe must never fan out unboundedly, even if a pathological
+/// action forks a fork-bomb-shaped tree.
+// CAPPED AT 8: max descendant recursion depth. Real toolchain trees are shallow
+// (process-wrapper → compiler → linker ≈ 3 levels); 8 is generous headroom and
+// bounds the recursion regardless of a runaway action.
+#[cfg(target_os = "macos")]
+const CALIB_SUBTREE_MAX_DEPTH: u32 = 8;
+// CAPPED AT 512: max total pids summed per poll tick, bounding both the
+// `proc_listchildpids` buffer and the per-tick syscall count. A compile/link
+// action's descendant set is tens of pids; 512 caps a runaway fan-out without
+// truncating any realistic tree.
+#[cfg(target_os = "macos")]
+const CALIB_SUBTREE_MAX_PIDS: usize = 512;
+
+/// Read the macOS `mach_timebase_info` ratio ONCE (it is constant per boot) and
+/// cache it. `proc_pidinfo`'s `pti_total_*` fields are raw **mach-timebase
+/// ticks**, NOT nanoseconds (see `calib_capture_cpu_ns`); converting a tick
+/// count to ns requires `ticks * numer / denom`. Cached in a `OnceLock` so the
+/// syscall runs at most once for the whole process.
+#[cfg(target_os = "macos")]
+fn calib_mach_timebase() -> (u64, u64) {
+    use std::sync::OnceLock;
+    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        // `mach_timebase_info` (and its struct) are `#[deprecated]` in `libc`
+        // ("use the mach2 crate"), but adding a whole crate for one constant is
+        // not worth it; the ABI is stable. Read numer/denom at RUNTIME — do NOT
+        // hardcode 125/3, future silicon differs.
+        #[allow(deprecated)]
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `mach_timebase_info` fills the `mach_timebase_info` struct we
+        // own by pointer; it is a pure read of a boot-constant, cannot fail in
+        // practice, and does not retain the pointer.
+        #[allow(deprecated)]
+        let rc = unsafe { libc::mach_timebase_info(core::ptr::from_mut(&mut info)) };
+        if rc != 0 || info.denom == 0 {
+            // Fall back to 1:1 (ns == tick) if the syscall failed — a wrong
+            // scale is preferable to a divide-by-zero, and this path is
+            // effectively unreachable on real hardware.
+            (1, 1)
+        } else {
+            (u64::from(info.numer), u64::from(info.denom))
+        }
+    })
+}
+
+/// Best-effort single-PID CPU time (user+system) in **nanoseconds**, or `None`
+/// when unavailable for this PID (not running / reaped / permission). This is
+/// the pure single-pid primitive; `calib_capture_cpu_time_ms` wraps it for the
+/// per-action helper and `calib_capture_subtree_cpu_ns` sums it over the tree.
 ///
 /// **macOS** (the production worker OS — see memory `reference-infrastructure`):
-/// `proc_pidinfo(pid, PROC_PIDTASKALLINFO, …)` is a READ-ONLY query (it does
-/// NOT reap), so it is safe to call alongside tokio's SIGCHLD reaper. It is
-/// polled DURING execution (see `calib_poll_cpu_time_loop` and the execute
-/// loop's poll-arming): it MUST be called while the child is still alive,
-/// because once the child exits and tokio's reaper collects the zombie,
-/// `proc_pidinfo` returns 0/ESRCH → this yields `None`. (This is exactly why an
-/// after-`wait()` capture was structurally always `None` — the reap had already
-/// happened.) The poll exploits that `None`-on-reap as its self-terminating
-/// stop condition. The reported time is user+system CPU-ns summed across the
-/// child's threads; the last live sample misses at most the final ~poll-interval
-/// slice of CPU, acceptable for a sampled best-effort calibration probe.
+/// `proc_pidinfo(pid, PROC_PIDTASKINFO, …)` is a READ-ONLY query (it does NOT
+/// reap), so it is safe to call alongside tokio's SIGCHLD reaper. It MUST be
+/// called while the child is still alive: once the child exits and tokio's
+/// reaper collects the zombie, `proc_pidinfo` returns 0/ESRCH → this yields
+/// `None` (which is why an after-`wait()` capture was structurally always
+/// `None`, and why the poll self-terminates on that `None`).
+///
+/// **UNITS (empirically verified — the struct field's `u64` type carries NO
+/// unit and Apple's docs mislabel it):** `pti_total_user`/`pti_total_system`
+/// are raw **mach-timebase ticks**, not nanoseconds, on Apple Silicon since the
+/// XNU "Recount" rewrite (macOS 15 Sequoia, the M4 minimum). A controlled 3.002 s
+/// single-threaded CPU spin on worker-01 (M4) reported `pti_total_user +
+/// pti_total_system = 74_134_725`: as ns that is 0.074 s (40× low); as ticks ×
+/// `mach_timebase_info` (numer/denom = 125/3 ≈ 41.6667 ns/tick) = 3.089 s ✓. So
+/// we convert `ticks * numer / denom` via the cached `calib_mach_timebase()`.
+/// (On x86 Macs and under Rosetta the timebase is 1:1, so a raw read would be
+/// accidentally correct there — masking the bug off the production fleet. See
+/// memory `proc-pidinfo-cpu-time-is-mach-timebase-not-ns`.)
 ///
 /// **Linux**: deliberately yields `None`. The thread-safe per-child accounting
 /// primitive is `wait4(pid, …, &rusage)`, but tokio's process reaper already
@@ -403,23 +501,25 @@ fn calib_tree_totals(tree: &HashMap<DigestInfo, ProtoDirectory>) -> (u64, u64) {
 /// (ESRCH at best, reaping a recycled unrelated PID at worst), a correctness
 /// hazard and a behavior change. There is no zero-behavior-change Linux path
 /// for a tokio-managed child, and production workers are macOS, so Linux is
-/// left unavailable rather than made unsafe. (Design-drift vs spec §3/§9 B5,
-/// which named `wait4` for Linux without accounting for tokio's reaper.)
+/// left unavailable rather than made unsafe.
 #[cfg(target_os = "macos")]
-fn calib_capture_cpu_time_ms(pid: u32) -> Option<u64> {
-    // SAFETY: `proc_pidinfo` with `PROC_PIDTASKALLINFO` fills a
-    // `proc_taskallinfo` we own; we pass its exact size and only read the
-    // returned bytes when the syscall reports it wrote the full struct. The
-    // call is read-only (no reaping). `pid` is the child's OS PID captured
-    // before reap; a stale/recycled PID can only yield a smaller-than-struct
-    // return (→ None) or unrelated task info, which is dropped by the size
-    // check, never UB.
-    let mut info: libc::proc_taskallinfo = unsafe { core::mem::zeroed() };
-    let size = core::mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
+fn calib_capture_cpu_ns(pid: u32) -> Option<u64> {
+    // SAFETY: `proc_pidinfo` with `PROC_PIDTASKINFO` fills a `proc_taskinfo` we
+    // own; we pass its exact size and only read the returned bytes when the
+    // syscall reports it wrote the full struct. The call is read-only (no
+    // reaping). `pid` is the child's OS PID captured before reap. Provenance
+    // caveat: the `written == size` check does NOT reject a recycled-live PID —
+    // if this PID were reaped AND recycled to a live unrelated process within
+    // one poll interval, `proc_pidinfo` returns the FULL struct and we would
+    // read THAT process's CPU. This is a bounded, vanishingly-rare data-quality
+    // risk (requires reap + PID-space wraparound within one ≤250 ms interval),
+    // accepted for a sampled best-effort probe — never UB.
+    let mut info: libc::proc_taskinfo = unsafe { core::mem::zeroed() };
+    let size = core::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let written = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
-            libc::PROC_PIDTASKALLINFO,
+            libc::PROC_PIDTASKINFO,
             0,
             core::ptr::from_mut(&mut info).cast::<libc::c_void>(),
             size,
@@ -429,33 +529,169 @@ fn calib_capture_cpu_time_ms(pid: u32) -> Option<u64> {
         // ESRCH (reaped/exited), permission denied, or partial write.
         return None;
     }
-    // pti_total_user / pti_total_system are CPU time in NANOSECONDS.
-    let total_ns = info
-        .ptinfo
+    // Raw mach-timebase ticks (see UNITS above) → ns via the cached ratio.
+    let ticks = info
         .pti_total_user
-        .saturating_add(info.ptinfo.pti_total_system);
-    Some(total_ns / 1_000_000)
+        .saturating_add(info.pti_total_system);
+    let (numer, denom) = calib_mach_timebase();
+    // u128 intermediate: a long multi-hour multithreaded action can accumulate
+    // enough ticks that `ticks * numer` (numer=125 on M4) would risk a u64
+    // wrap; u128 makes the multiply safe before the divide narrows back to u64.
+    Some(u64::try_from(u128::from(ticks) * u128::from(numer) / u128::from(denom)).unwrap_or(u64::MAX))
 }
 
-#[cfg(not(target_os = "macos"))]
-const fn calib_capture_cpu_time_ms(_pid: u32) -> Option<u64> {
+// Non-macOS single-pid stub: reachable only via `calib_capture_cpu_time_ms`,
+// which is itself test-only on every platform (production reads the SUBTREE via
+// `calib_capture_subtree_cpu_ns`, never this single-pid helper). Gate it to the
+// non-macOS test build so it neither warns dead in the Linux lib build nor
+// pretends to be a production path.
+#[cfg(all(not(target_os = "macos"), test))]
+const fn calib_capture_cpu_ns(_pid: u32) -> Option<u64> {
     // See doc-comment above: no zero-behavior-change path on non-macOS without
     // double-reaping the tokio-managed child.
     None
 }
 
-/// P-A CPU-time poll loop. Repeatedly awaits `capture()` (the per-OS live-PID
-/// CPU query, run off the tokio worker via `spawn_blocking` at the call site),
-/// keeping the LAST `Some` value in `last` and setting `has_value` once any
-/// `Some` is seen. Sleeps `interval` between samples. STOPS on the first `None`
-/// — which `calib_capture_cpu_time_ms` returns once the child is reaped/gone —
-/// so the task self-terminates without any external signal.
+/// Best-effort single-PID CPU time in **milliseconds** (the ns primitive
+/// truncated). Pure single-pid helper, kept unit-testable; `None` when the ns
+/// capture is unavailable. Production reads the whole subtree
+/// (`calib_capture_subtree_cpu_ns`), so this single-pid wrapper exists ONLY for
+/// the unit/live tests — `#[cfg(test)]` keeps it out of the shipped binary and
+/// silences the dead-code lint on the non-macOS build box.
+#[cfg(test)]
+fn calib_capture_cpu_time_ms(pid: u32) -> Option<u64> {
+    calib_capture_cpu_ns(pid).map(|ns| ns / 1_000_000)
+}
+
+/// Fold one pid's observed `cpu_ns` into a task-local `pid → max-cpu-ns` map.
+/// Pure (cross-platform, unit-testable): keeps the MAX per pid (a transient
+/// accounting glitch cannot lower a value; CPU is monotonic per LIVE process),
+/// and — because the map only ever grows and never removes — a descendant that
+/// exits between poll ticks KEEPS its last observed CPU, so sequential children
+/// (A runs then exits, B runs) are BOTH counted. Summing `map.values()` is then
+/// a monotonic non-decreasing subtree total across ticks. Gated to macOS (the
+/// production subtree walk uses it) OR any test build (the Linux unit test
+/// exercises it); it has no non-macOS production caller.
+#[cfg(any(target_os = "macos", test))]
+fn calib_accumulate_subtree_cpu(map: &mut HashMap<libc::pid_t, u64>, pid: libc::pid_t, cpu_ns: u64) {
+    map.entry(pid)
+        .and_modify(|prev| *prev = (*prev).max(cpu_ns))
+        .or_insert(cpu_ns);
+}
+
+/// Best-effort capture of the whole descendant-tree CPU (ns) rooted at `pid`,
+/// accumulated into a task-local `map` that survives across poll ticks. Sums
+/// the target pid AND every descendant's `cpu_ns` (via `proc_listchildpids`
+/// recursion), folding each into `map` (max-per-pid). Returns the summed subtree
+/// total, or `None` if the ROOT pid itself is gone (ESRCH) — the poll's
+/// self-terminating stop condition (a live root with dead children still returns
+/// `Some`).
+///
+/// **Why subtree, not single-process:** `proc_pidinfo` sums only the target
+/// TASK's threads, MISSING forked child processes (rustc → rust-lld, cc-wrapper
+/// → cc1) — exactly the fork-heavy link/compile CPU the shape classification
+/// cares about (auditor Claim 1 / red-team A1-2). We enumerate descendants and
+/// sum them.
+///
+/// **Residual limitation:** a descendant that spawns AND exits entirely within
+/// one poll interval is never observed → its CPU is missed (rare for
+/// CPU-significant subprocesses; the 250 ms interval reduces the window).
+/// PID-recycle WITHIN one action is assumed impossible (macOS PID space vs an
+/// action's seconds-to-minutes duration), so a pid in the map is assumed to
+/// remain the same process for the action's lifetime.
+#[cfg(target_os = "macos")]
+fn calib_capture_subtree_cpu_ns(pid: u32, map: &mut HashMap<libc::pid_t, u64>) -> Option<u64> {
+    let root = pid as libc::pid_t;
+    // Root gone → whole subtree gone; signal stop (self-terminating poll).
+    let root_ns = calib_capture_cpu_ns(pid)?;
+    calib_accumulate_subtree_cpu(map, root, root_ns);
+
+    // Breadth-first descendant walk, depth- and total-pid-capped. `pending`
+    // holds (pid, depth) frontier entries; each dequeued pid's CPU is folded
+    // and its immediate children enqueued until a cap trips.
+    let mut pending: VecDeque<(libc::pid_t, u32)> = VecDeque::new();
+    pending.push_back((root, 0));
+    let mut summed_pids: usize = 1; // root already counted
+    while let Some((parent, depth)) = pending.pop_front() {
+        if depth >= CALIB_SUBTREE_MAX_DEPTH || summed_pids >= CALIB_SUBTREE_MAX_PIDS {
+            break;
+        }
+        for child in calib_list_child_pids(parent) {
+            if summed_pids >= CALIB_SUBTREE_MAX_PIDS {
+                break;
+            }
+            // A child may have exited between the listing and the read → `None`;
+            // its earlier CPU (if any) is already retained in `map`, so skip.
+            if let Some(child_ns) = calib_capture_cpu_ns(child as u32) {
+                calib_accumulate_subtree_cpu(map, child, child_ns);
+            }
+            summed_pids += 1;
+            pending.push_back((child, depth + 1));
+        }
+    }
+
+    Some(map.values().sum())
+}
+
+/// Enumerate the immediate child pids of `ppid` via `proc_listchildpids`.
+/// Returns an empty vec on any error / no children. Bounded by
+/// `CALIB_SUBTREE_MAX_PIDS` so the buffer allocation is capped.
+#[cfg(target_os = "macos")]
+fn calib_list_child_pids(ppid: libc::pid_t) -> Vec<libc::pid_t> {
+    // First call with a null buffer returns the byte size needed (≈ count *
+    // size_of::<pid_t>()). Then fetch into a sized, capped buffer.
+    // SAFETY: `proc_listchildpids(ppid, NULL, 0)` is a read-only sizing query.
+    let needed = unsafe { libc::proc_listchildpids(ppid, core::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+    let mut count = (needed as usize) / core::mem::size_of::<libc::pid_t>();
+    // CAPPED AT CALIB_SUBTREE_MAX_PIDS: bound the buffer even if the kernel
+    // reports an implausibly large child count.
+    count = count.min(CALIB_SUBTREE_MAX_PIDS);
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut buf: Vec<libc::pid_t> = vec![0; count];
+    let buf_size = (count * core::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `buf` owns `count` `pid_t` slots; we pass its exact byte size and
+    // only trust the returned byte count. Read-only, does not retain the ptr.
+    let written = unsafe {
+        libc::proc_listchildpids(ppid, buf.as_mut_ptr().cast::<libc::c_void>(), buf_size)
+    };
+    if written <= 0 {
+        return Vec::new();
+    }
+    let got = (written as usize / core::mem::size_of::<libc::pid_t>()).min(count);
+    buf.truncate(got);
+    // Filter out any 0/negative sentinel the kernel may leave.
+    buf.retain(|&p| p > 0);
+    buf
+}
+
+#[cfg(not(target_os = "macos"))]
+fn calib_capture_subtree_cpu_ns(_pid: u32, _map: &mut HashMap<libc::pid_t, u64>) -> Option<u64> {
+    // See `calib_capture_cpu_ns`: no zero-behavior-change path on non-macOS.
+    None
+}
+
+/// P-A CPU-time poll loop. Repeatedly awaits `capture()` (in production the
+/// live-PID subtree CPU query in **nanoseconds**, `calib_capture_subtree_cpu_ns`
+/// run in the poll task), keeping the LAST `Some` value in `last` and setting
+/// `has_value` once any `Some` is seen. Sleeps `interval` between samples. STOPS
+/// on the first `None` — which the capture returns once the ROOT child is
+/// reaped/gone — so the task self-terminates without any external signal. The
+/// stored value is a monotonic non-decreasing subtree total (the task-local map
+/// only grows), so "keep the last `Some`" == "keep the accumulated total".
+///
+/// The value carried in `last` is unit-agnostic to this loop (production passes
+/// ns; the completion arm converts ns → ms once); the loop only ever moves a
+/// `u64` from `capture()` into `last`.
 ///
 /// Factored generic over the capture future so the store-last / stop-on-None
 /// core is unit-testable with an injected closure (no real syscall, no real
 /// sleep — pass `Duration::ZERO`). `capture` returns a future so the production
-/// call can `spawn_blocking!(…).await` inside it, keeping `proc_pidinfo` off the
-/// tokio worker thread.
+/// call can run its syscalls inside it without borrowing the loop's signature.
 ///
 /// Capture-then-sleep order: the first sample is taken immediately so even a
 /// sub-`interval` action gets one live reading before its child exits.
@@ -471,8 +707,16 @@ async fn calib_poll_cpu_time_loop<F, Fut>(
     loop {
         match capture().await {
             Some(ms) => {
+                // Flag-and-data pairing (FIX): the completion arm reads
+                // `has_value` then `last` from a DIFFERENT task with no other
+                // happens-before edge, so `Relaxed` on both would let it observe
+                // `has_value=true` with a stale `last=0` (a false `Some(0)`) —
+                // real on the ARM/M4 workers. `Release` here publishes the
+                // preceding `last` store; the reader's `Acquire` (see
+                // `calib_harvest_cpu_time`) then observes it. `last` may stay
+                // `Relaxed`; the Release/Acquire on the flag carries the order.
                 last.store(ms, Ordering::Relaxed);
-                has_value.store(true, Ordering::Relaxed);
+                has_value.store(true, Ordering::Release);
             }
             // Child reaped/gone (ESRCH) — nothing more to sample; self-terminate.
             None => break,
@@ -2906,17 +3150,21 @@ pub fn download_to_directory<'a>(
         // Calibration probe P-B (`tag="calib_staging"`): per-action input-staging
         // record on the MISS path (this function is the directory-cache
         // miss/fallback/construct path; a cache hardlink hit returns before
-        // here). `input_tree_bytes`/`input_tree_files` are the resolved-tree
-        // directory-proto sizes + file counts (§9 B3, the :552-553 pattern) —
-        // distinct from `total_bytes` (input-file payload). Sampled uniform 1/16
-        // by root-digest hash, with the 1/1 large-tree override (§9 B4).
-        // `dir_cache_hit` is structurally `false` here (see CalibStagingRecord).
+        // here). PRIMARY regressor `input_payload_bytes` = `total_bytes` (the
+        // unique input-file payload the fetch/hardlink actually moves — the axis
+        // the §6 locality `load_byte_cost` fit needs). `input_tree_bytes`/
+        // `input_tree_files` are the resolved-tree directory-PROTO sizes + file
+        // counts (§9 B3, the :552-553 pattern) — a secondary covariate, NOT the
+        // fetch-cost axis (auditor Claim 3). Sampled uniform 1/16 by root-digest
+        // hash, with the 1/1 large-tree override (§9 B4). `dir_cache_hit` is
+        // structurally `false` here (see CalibStagingRecord).
         let (calib_tree_bytes, calib_tree_files) = calib_tree_totals(&tree);
         let calib_key = calib_digest_sample_key(digest);
         if calib_staging_sampled(calib_key, calib_tree_bytes) {
             CalibStagingRecord {
                 input_staging_ms: total_ms as u64,
                 dir_cache_hit: false,
+                input_payload_bytes: total_bytes,
                 input_tree_bytes: calib_tree_bytes,
                 input_tree_files: calib_tree_files,
             }
@@ -4640,51 +4888,78 @@ impl RunningActionImpl {
         // Calibration probe P-A: arm the child CPU-time poll UPFRONT (the after-
         // `wait()` capture was structurally always `None` — the reap had already
         // happened by then). Eligible iff the child has a queryable PID AND the
-        // action is in the uniform 1/16 sample (`calib_uniformly_sampled` — the
+        // action is in the uniform 1/16 sample (`calib_should_arm_poll` — the
         // >60 s exec override cannot participate here, its duration is not yet
         // known; large actions NOT in the uniform sample therefore emit P-A with
         // `cpu_time_ms = None`, acceptable: the uniform 1/16 still yields a
         // representative cpu-shape sample including large actions proportionally,
         // and this is far cheaper than polling every action). While eligible we
-        // spawn a background task that every 500 ms reads the LIVE child's CPU
-        // time off the tokio worker (`spawn_blocking!`), keeping the last value
-        // in shared scalar atoms (no owned bytes → no cap annotation). The task
-        // is bounded: it self-terminates on the first `None` (child reaped/gone)
-        // and only runs for the 1/16 sampled actions; the `spawn!` drop-guard
-        // aborts it on every exit path from this method so it cannot linger.
+        // spawn a background task that every 250 ms reads the LIVE child's whole
+        // DESCENDANT-SUBTREE CPU (`calib_capture_subtree_cpu_ns`: the target task
+        // plus every forked descendant — rustc→rust-lld, cc-wrapper→cc1 — that
+        // `proc_pidinfo` alone would miss) off the tokio worker (`spawn_blocking!`),
+        // keeping the last accumulated ns in shared scalar atoms (no owned bytes
+        // → no cap annotation). The per-pid `HashMap` accumulator is task-LOCAL
+        // (only its summed value crosses the atom); it survives child exits so
+        // sequential subprocesses are all counted.
+        //
+        // Overhead (recompute for 250 ms + subtree fan-out): only 1/16 of actions
+        // arm the poll; each sampled action holds at most ONE inflight
+        // `spawn_blocking` at a time (the loop awaits before re-issuing), and that
+        // one call does the WHOLE subtree walk (1 `proc_listchildpids` size + 1
+        // fetch + N `proc_pidinfo`, N = descendant count ≈ tens, each a µs-scale
+        // read-only syscall → tens of µs total) at 4/s. At the 2026-06-16 incident
+        // peak (~352 in-flight → ~22 sampled poll tasks) that is ≤22 blocking-pool
+        // slots held ~tens-of-µs each per 250 ms window ≈ 22 × 40µs / 250ms ≈
+        // 0.0035% time-averaged occupancy of the 1024-thread pool — an order of
+        // magnitude under 500 ms/single-syscall and still ~4000× below the 157
+        // threads (~15%) the isotope wedge consumed. Negligible.
+        //
+        // The task is bounded: it self-terminates on the first `None` (ROOT child
+        // reaped/gone) and only runs for the 1/16 sampled actions; the `spawn!`
+        // drop-guard aborts it on every exit path from this method so it cannot
+        // linger.
         let calib_cpu_last = Arc::new(core::sync::atomic::AtomicU64::new(0));
         let calib_cpu_has_value = Arc::new(AtomicBool::new(false));
-        let calib_poll_guard = match calib_child_pid {
-            Some(pid)
-                if calib_uniformly_sampled(calib_digest_sample_key(
-                    &self.action_info.input_root_digest,
-                )) =>
-            {
-                let last = Arc::clone(&calib_cpu_last);
-                let has_value = Arc::clone(&calib_cpu_has_value);
-                Some(spawn!("calib_cpu_time_poll", async move {
-                    calib_poll_cpu_time_loop(
-                        Duration::from_millis(500),
-                        move || {
-                            // Off the tokio worker: `proc_pidinfo` is a blocking
-                            // syscall. Flatten the JoinError/None into a plain
-                            // `None` so a spawn failure ends the poll cleanly.
-                            async move {
-                                spawn_blocking!("calib_capture_cpu_time", move || {
-                                    calib_capture_cpu_time_ms(pid)
-                                })
-                                .await
-                                .ok()
-                                .flatten()
-                            }
-                        },
-                        last,
-                        has_value,
-                    )
-                    .await;
-                }))
-            }
-            _ => None,
+        let calib_poll_guard = if calib_should_arm_poll(
+            calib_child_pid,
+            calib_digest_sample_key(&self.action_info.input_root_digest),
+        ) {
+            let pid = calib_child_pid.expect("calib_should_arm_poll gated pid.is_some()");
+            let last = Arc::clone(&calib_cpu_last);
+            let has_value = Arc::clone(&calib_cpu_has_value);
+            // Task-LOCAL pid→max-cpu-ns accumulator, persisting across ticks so an
+            // exited descendant's CPU stays counted. Wrapped in an `Arc<Mutex>`
+            // only to hand it into each per-tick `spawn_blocking` closure — no
+            // other task touches it, so the mutex is uncontended (task-local by
+            // usage, not shared state).
+            let subtree_map: Arc<Mutex<HashMap<libc::pid_t, u64>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            Some(spawn!("calib_cpu_time_poll", async move {
+                calib_poll_cpu_time_loop(
+                    Duration::from_millis(250),
+                    move || {
+                        // Off the tokio worker: the subtree walk is a burst of
+                        // µs-scale blocking syscalls. Flatten the JoinError/None
+                        // into a plain `None` so a spawn failure ends the poll
+                        // cleanly.
+                        let map = Arc::clone(&subtree_map);
+                        async move {
+                            spawn_blocking!("calib_capture_cpu_time", move || {
+                                calib_capture_subtree_cpu_ns(pid, &mut map.lock())
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                    },
+                    last,
+                    has_value,
+                )
+                .await;
+            }))
+        } else {
+            None
         };
 
         let mut child_process_guard = guard(child_process, |mut child_process| {
@@ -4815,18 +5090,24 @@ impl RunningActionImpl {
                         });
                         state.execution_metadata.execution_completed_timestamp = (self.running_actions_manager.callbacks.now_fn)();
                     }
-                    // Calibration probe P-A: harvest the poll's last live CPU-time
-                    // sample. The poll (armed before this loop, for uniform-1/16
-                    // sampled actions) read `proc_pidinfo` on the LIVE child; the
-                    // after-`wait()` capture that used to live here was always
-                    // `None` because the child is reaped by now (ESRCH). The value
-                    // is `None` for unsampled/non-macOS actions (`has_value` never
-                    // set). Dropping the guard aborts the poll task at once so it
-                    // does not linger up to the 500 ms interval. Zero behavior
-                    // change: nothing downstream reads `calib_cpu_time_ms`.
-                    if calib_cpu_has_value.load(Ordering::Relaxed) {
-                        self.state.lock().calib_cpu_time_ms =
-                            Some(calib_cpu_last.load(Ordering::Relaxed));
+                    // Calibration probe P-A: harvest the poll's last live subtree
+                    // CPU sample (ns). The poll (armed before this loop, for
+                    // uniform-1/16 sampled actions) read the LIVE child's subtree
+                    // via `proc_pidinfo`; the after-`wait()` capture that used to
+                    // live here was always `None` because the child is reaped by
+                    // now (ESRCH). `calib_harvest_cpu_time` gates on `has_value`
+                    // (Acquire, pairing with the poll loop's Release) so a
+                    // never-captured poll harvests `None`, NOT a false `Some(0)`;
+                    // it also carries `last`'s happens-before. The stored ns is
+                    // converted to ms once here (the record's `cpu_time_ms`).
+                    // Dropping the guard aborts the poll task at once so it does
+                    // not linger up to the 250 ms interval. Zero behavior change:
+                    // no action-EXECUTION decision reads `calib_cpu_time_ms` (only
+                    // the P-A log emit consumes it).
+                    if let Some(cpu_ns) =
+                        calib_harvest_cpu_time(&calib_cpu_has_value, &calib_cpu_last)
+                    {
+                        self.state.lock().calib_cpu_time_ms = Some(cpu_ns / 1_000_000);
                     }
                     drop(calib_poll_guard);
                     return Ok(self);
@@ -10192,6 +10473,133 @@ mod calib_probe_tests {
         }
     }
 
+    // --- P-A completion-arm harvest gate (the fix's own failure mode) ------
+
+    #[test]
+    fn harvest_returns_none_when_never_captured() {
+        // The completion arm must record `None` (NOT `Some(0)`) when the poll
+        // never captured a sample (child died before the first tick / non-macOS
+        // / spawn failure). This is the symmetric hazard of the shipped bug:
+        // `Some(0)` would masquerade as a real zero-CPU action (ratio 0.0 →
+        // io_bound) instead of being dropped as unavailable (testing-czar C1).
+        let has_value = AtomicBool::new(false);
+        let last = core::sync::atomic::AtomicU64::new(0);
+        assert_eq!(
+            super::calib_harvest_cpu_time(&has_value, &last),
+            None,
+            "a poll that never captured (has_value=false) must harvest None so \
+             completion records None — a zero-CPU action must never masquerade \
+             as a real sample via Some(0)"
+        );
+    }
+
+    #[test]
+    fn harvest_returns_last_when_captured() {
+        // has_value=true → the harvest returns the last stored value (even when
+        // that value is 0, a genuine live-but-idle child capture, distinct from
+        // the never-captured None above).
+        let has_value = AtomicBool::new(true);
+        let last = core::sync::atomic::AtomicU64::new(1_234_000);
+        assert_eq!(
+            super::calib_harvest_cpu_time(&has_value, &last),
+            Some(1_234_000),
+            "has_value=true must harvest the last captured value verbatim"
+        );
+        let zero = core::sync::atomic::AtomicU64::new(0);
+        let flagged = AtomicBool::new(true);
+        assert_eq!(
+            super::calib_harvest_cpu_time(&flagged, &zero),
+            Some(0),
+            "a live-but-idle child that captured Some(0) must harvest Some(0), \
+             distinct from the never-captured None case"
+        );
+    }
+
+    // --- P-A single-pid capture (Linux `None` contract) -------------------
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn capture_cpu_time_ms_is_none_on_non_macos() {
+        // On non-macOS there is NO zero-behavior-change CPU-time path for a
+        // tokio-managed child (reading `wait4` ourselves would double-reap), so
+        // the single-pid helper deliberately yields `None` — the poll then never
+        // sets `has_value` and the P-A record carries `cpu_time_ms = None`
+        // (dropped in offline analysis, NOT counted as a zero-CPU sample). This
+        // pins that contract on the build box and keeps the pure helper (and its
+        // ns→ms truncation wrapper) unit-referenced there.
+        assert_eq!(
+            super::calib_capture_cpu_time_ms(1),
+            None,
+            "non-macOS calib_capture_cpu_time_ms must be a deliberate None (no \
+             double-reap of the tokio-managed child), so no false Some(0) is recorded"
+        );
+    }
+
+    // --- P-A poll-arm decision (bounds the probe's per-action cost) --------
+
+    #[test]
+    fn should_arm_poll_all_four_branches() {
+        // The poll is armed iff the child has a queryable PID AND the action is
+        // in the uniform 1/16 sample. All four (pid present/absent × sampled/
+        // not) must be covered — the FALSE branch bounds the background-task
+        // cost (testing-czar I2). key 0 is sampled (0 % 16 == 0); key 1 is not.
+        assert!(
+            super::calib_should_arm_poll(Some(42), 0),
+            "pid present + sampled key → arm the poll"
+        );
+        assert!(
+            !super::calib_should_arm_poll(Some(42), 1),
+            "pid present + UNsampled key → do NOT arm (bounds per-action cost)"
+        );
+        assert!(
+            !super::calib_should_arm_poll(None, 0),
+            "no queryable pid → do NOT arm even for a sampled key"
+        );
+        assert!(
+            !super::calib_should_arm_poll(None, 1),
+            "no pid + unsampled → do NOT arm"
+        );
+    }
+
+    // --- P-A subtree CPU accumulation (task-local pid→max-ns map) ----------
+
+    #[test]
+    fn subtree_accumulate_keeps_max_per_pid_and_survives_exit() {
+        // The task-local map must (a) keep the MAX cpu_ns per pid (guards a
+        // transient glitch; CPU is monotonic per live process), and (b) SURVIVE
+        // a pid dropping out of a later poll (a child that ran then exited) so
+        // its CPU stays counted — sequential children A-then-B are both summed
+        // (auditor Claim 1 / red-team A1-2 subtree fix).
+        let mut map: HashMap<i32, u64> = HashMap::new();
+
+        // Tick 1: parent 100 accrued 10 ns, child 200 accrued 5 ns.
+        super::calib_accumulate_subtree_cpu(&mut map, 100, 10);
+        super::calib_accumulate_subtree_cpu(&mut map, 200, 5);
+        assert_eq!(map.values().sum::<u64>(), 15, "tick 1 sum = 10 + 5");
+
+        // Tick 2: child 200 exited (not observed this tick); parent 100 grew to
+        // 25 ns; a new sequential child 300 accrued 7 ns. The exited child's 5
+        // ns must remain counted.
+        super::calib_accumulate_subtree_cpu(&mut map, 100, 25);
+        super::calib_accumulate_subtree_cpu(&mut map, 300, 7);
+        assert_eq!(
+            map.values().sum::<u64>(),
+            37,
+            "exited child 200's 5 ns must persist (map survives exit); \
+             25 (parent grown) + 5 (exited child) + 7 (new child) = 37"
+        );
+
+        // A transient glitch: pid 100 reports a SMALLER value than before. The
+        // max must be retained, not the glitch.
+        super::calib_accumulate_subtree_cpu(&mut map, 100, 3);
+        assert_eq!(
+            *map.get(&100).expect("pid 100 present"),
+            25,
+            "a smaller later reading is a glitch; max (25) must be retained — \
+             CPU is monotonic per live process"
+        );
+    }
+
     // --- P-A CPU-time poll loop (state machine, platform-agnostic) ---------
 
     #[nativelink_test]
@@ -10199,7 +10607,7 @@ mod calib_probe_tests {
         // The poll loop's contract (the bug that shipped: capture ran AFTER the
         // child was reaped so it was structurally always None). This drives the
         // loop's core with an INJECTED capture returning Some(10), Some(20),
-        // Some(30), None — no real syscall, no real 500 ms sleep — and asserts:
+        // Some(30), None — no real syscall, no real 250 ms sleep — and asserts:
         //   (1) the stored last-value is the LAST Some seen (30), NOT the first;
         //   (2) has_value is set (so completion reads Some);
         //   (3) the loop TERMINATES on the first None (does not hang).
@@ -10243,31 +10651,85 @@ mod calib_probe_tests {
         );
     }
 
-    /// LIVE-PROCESS capture test — the one that would have caught the original
-    /// bug (capture-after-reap → structurally always None). Spawns a real short
-    /// child that BURNS CPU (a busy spin — `sleep` would accrue ~0 CPU and not
-    /// exercise the accounting), runs the poll loop against its live PID, waits
-    /// for the child to finish, and asserts a `Some(v)` was captured.
-    ///
-    /// macOS-only: `proc_pidinfo(PROC_PIDTASKALLINFO)` is the macOS accounting
-    /// primitive; on Linux `calib_capture_cpu_time_ms` is a `const None`, so this
-    /// can only be RUN on a macOS worker. It compiles-but-is-absent on Linux
-    /// (the build box), and its VALUE is the contrast: against the OLD
-    /// after-reap capture it fails (None); against the poll-during-execution
-    /// capture it passes (Some(v)).
-    #[cfg(target_os = "macos")]
     #[nativelink_test]
-    async fn live_child_cpu_time_is_captured_by_poll_during_execution() {
+    async fn poll_loop_stores_some_zero_flagged_distinct_from_none() {
+        // A live-but-idle child (I/O-blocked, ~0 CPU-ns) captures `Some(0)`. The
+        // loop must STORE it and SET has_value — so the completion harvest reads
+        // `Some(0)` (a real zero-CPU sample), NOT `None`. This locks in that
+        // `Some(0)` (store + flag) is distinct from `None`→break; the two must
+        // never collapse (testing-czar R2).
         use core::sync::atomic::AtomicU64;
         use std::sync::Arc;
 
+        let seq = Arc::new(parking_lot::Mutex::new(vec![Some(0u64)])); // then None
+        let last = Arc::new(AtomicU64::new(0));
+        let has_value = Arc::new(AtomicBool::new(false));
+
+        let seq_c = Arc::clone(&seq);
+        tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            calib_poll_cpu_time_loop(
+                core::time::Duration::ZERO,
+                move || core::future::ready(seq_c.lock().pop().flatten()),
+                Arc::clone(&last),
+                Arc::clone(&has_value),
+            ),
+        )
+        .await
+        .expect("poll loop must terminate after the Some(0) then None");
+
+        assert!(
+            has_value.load(Ordering::Acquire),
+            "capturing Some(0) must SET has_value so the harvest reads Some(0), \
+             NOT leave it false (which would collapse Some(0) into the \
+             never-captured None case)"
+        );
+        assert_eq!(
+            last.load(Ordering::Relaxed),
+            0,
+            "the stored value must be the captured 0 (a real idle-child sample)"
+        );
+    }
+
+    /// LIVE-PROCESS VALUE test — the one that catches BOTH the original bug
+    /// (capture-after-reap → structurally always `None`) AND the mach-timebase
+    /// unit bug (raw ticks read as ns → CPU ~40× under-reported → every action
+    /// misclassified `io_bound`). Spawns a real child that BURNS CPU in a
+    /// FORK-FREE busy spin (pure `sh` arithmetic — no forked `date`/`expr`, so
+    /// the accounted CPU lands in the direct child the single-pid capture reads;
+    /// `sleep` would accrue ~0 CPU and not exercise the accounting), polls its
+    /// live PID during execution, and asserts the captured `cpu_time_ms` is a
+    /// PLAUSIBLE fraction of the child's measured wall time — NOT merely `Some`.
+    ///
+    /// The band is deliberately loose (scheduling noise, the ≤250 ms last-sample
+    /// undercount, and a shared build box all shave the ratio) but tight enough
+    /// to catch a 40× unit error: a single-thread busy spin burns CPU ≈ wall, so
+    /// a correct reading lands near the wall ms while a raw-ticks (unconverted)
+    /// reading lands at wall/~42 — far below the floor. See red-team's
+    /// "value-blind by construction" finding: the OLD assert (`has_value` only,
+    /// explicitly declining `v > 0`) stayed green with the value 40× wrong.
+    ///
+    /// macOS-only: `proc_pidinfo` accounting is the macOS primitive; on Linux
+    /// `calib_capture_cpu_time_ms` is a `const None`, so this can only be RUN on
+    /// a macOS worker (absent on the Linux build box).
+    #[cfg(target_os = "macos")]
+    #[nativelink_test]
+    async fn live_child_cpu_time_value_is_plausible_not_40x_off() {
+        use core::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        use std::time::Instant;
+
         use super::calib_capture_cpu_time_ms;
 
-        // A child that spins for ~1 s burning CPU (NOT sleeping — sleep accrues
-        // ~0 CPU-time and would not exercise proc_pidinfo's accounting).
+        // FORK-FREE busy spin: `[` and `$((…))` are `sh` builtins, so ALL the
+        // CPU burns in this direct child process (nothing forked), which is what
+        // the single-pid capture reads. A large fixed iteration count guarantees
+        // a multi-hundred-ms spin on any real box; the exact wall time is
+        // measured below rather than assumed.
+        let child_wall_start = Instant::now();
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
-            .arg("end=$(( $(date +%s) + 1 )); while [ $(date +%s) -lt $end ]; do :; done")
+            .arg("i=0; while [ $i -lt 40000000 ]; do i=$((i+1)); done")
             .spawn()
             .expect("must spawn the spinning child");
         let pid = child.id().expect("live child must have a PID before reap");
@@ -10275,8 +10737,8 @@ mod calib_probe_tests {
         let last = Arc::new(AtomicU64::new(0));
         let has_value = Arc::new(AtomicBool::new(false));
 
-        // Poll against the LIVE pid at a short interval so several samples land
-        // inside the ~1 s spin window.
+        // Poll the LIVE pid at a short interval so several samples land inside
+        // the spin window (single-pid capture — the spin is fork-free).
         let last_c = Arc::clone(&last);
         let has_c = Arc::clone(&has_value);
         let poll = nativelink_util::background_spawn!("test_calib_poll", async move {
@@ -10290,18 +10752,101 @@ mod calib_probe_tests {
         });
 
         child.wait().await.expect("child must exit");
+        let child_wall_ms = child_wall_start.elapsed().as_millis() as u64;
         // The loop self-terminates on the first None after reap; join it so the
         // asserts see the final stored value.
         poll.await.expect("poll task must join");
 
         assert!(
-            has_value.load(Ordering::Relaxed),
+            has_value.load(Ordering::Acquire),
             "a live-process poll must capture at least one Some — capture-after-reap \
              (the original bug) yields None for every action"
         );
-        // v may be 0 on a very fast box if the spin's accounted CPU rounds down
-        // to <1 ms at the last live sample, so assert Some-ness (has_value),
-        // not v > 0 — the load-bearing contract is Some-vs-None.
+        let cpu_ms = last.load(Ordering::Relaxed);
+
+        // Floor: a fork-free busy spin that ran `child_wall_ms` of wall time burns
+        // ≈ that much single-thread CPU. Require the reading to be at least ~30%
+        // of wall — comfortably above a 40×-under-reported raw-ticks reading
+        // (which would be ~wall/42 ≈ 2.4% of wall) yet below a correct reading.
+        let floor_ms = (child_wall_ms * 3) / 10;
+        assert!(
+            cpu_ms >= floor_ms,
+            "captured cpu_time_ms {cpu_ms} is implausibly low vs {child_wall_ms} ms wall \
+             (floor {floor_ms}); a fork-free single-thread spin burns CPU ≈ wall — a value \
+             this low means the mach-timebase ns conversion regressed (raw ticks read as ns \
+             under-report ~40×)"
+        );
+        // Ceiling: a single-thread spin cannot accrue much MORE CPU than wall;
+        // allow 2× for measurement slop / multi-core accounting quirks. Catches
+        // a wildly-scaled-up conversion.
+        assert!(
+            cpu_ms <= child_wall_ms * 2 + 500,
+            "captured cpu_time_ms {cpu_ms} exceeds 2× the {child_wall_ms} ms wall + slop; \
+             a single-thread spin cannot burn that much CPU — the conversion scaled up wrong"
+        );
+    }
+
+    /// LIVE SUBTREE test — proves FIX 3: `calib_capture_subtree_cpu_ns` sums the
+    /// FORKED-DESCENDANT CPU that a single-process `proc_pidinfo` read misses
+    /// (rustc→rust-lld, cc-wrapper→cc1). A thin parent `sh` forks a grandchild
+    /// that does the CPU spinning, then `wait`s (near-zero own CPU). Single-pid
+    /// capture on the parent would read ≈0; the subtree walk must pick up the
+    /// grandchild's CPU. Asserts the summed subtree ns is a plausible fraction of
+    /// wall — i.e. the grandchild's burn IS counted.
+    ///
+    /// macOS-only (same reason as the value test).
+    #[cfg(target_os = "macos")]
+    #[nativelink_test]
+    async fn live_child_subtree_cpu_includes_grandchild_burn() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        use super::calib_capture_subtree_cpu_ns;
+
+        // Parent `sh` forks a grandchild that runs the fork-free busy spin, then
+        // `wait`s for it (the parent itself burns ≈0 CPU — its work is the fork +
+        // wait). So the parent's OWN task CPU is near-zero and the interesting
+        // CPU lives entirely in the forked grandchild — exactly the shape a
+        // single-pid `proc_pidinfo` read would miss.
+        let child_wall_start = Instant::now();
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sh -c 'i=0; while [ $i -lt 40000000 ]; do i=$((i+1)); done' & wait")
+            .spawn()
+            .expect("must spawn the parent that forks a spinning grandchild");
+        let pid = child.id().expect("live child must have a PID before reap");
+
+        // Poll the subtree directly (not through the generic loop) so we exercise
+        // the descendant walk + the task-local accumulator across ticks. Keep the
+        // last non-None subtree total; stop on the first None (root reaped).
+        let mut map: HashMap<libc::pid_t, u64> = HashMap::new();
+        let mut last_subtree_ns: Option<u64> = None;
+        loop {
+            match calib_capture_subtree_cpu_ns(pid, &mut map) {
+                Some(ns) => last_subtree_ns = Some(ns),
+                None => break,
+            }
+            tokio::time::sleep(core::time::Duration::from_millis(50)).await;
+        }
+        child.wait().await.expect("child must exit");
+        let child_wall_ms = child_wall_start.elapsed().as_millis() as u64;
+
+        let subtree_ns =
+            last_subtree_ns.expect("subtree poll must have captured at least one live sample");
+        let subtree_ms = subtree_ns / 1_000_000;
+
+        // The grandchild burned CPU ≈ its wall time; the parent burned ≈0. If the
+        // subtree walk correctly summed the grandchild, subtree_ms is a large
+        // fraction of wall. A single-pid read of the parent alone would be ≈0 and
+        // FAIL this floor — that is the FIX-3 contract.
+        let floor_ms = (child_wall_ms * 3) / 10;
+        assert!(
+            subtree_ms >= floor_ms,
+            "subtree cpu {subtree_ms} ms is below the {floor_ms} ms floor for a \
+             {child_wall_ms} ms wall grandchild spin — the descendant CPU was NOT summed \
+             (a single-pid read of the ~idle parent would read ≈0; FIX 3 must count the \
+             forked grandchild)"
+        );
     }
 
     // --- P-B sampling decision --------------------------------------------
@@ -10494,6 +11039,7 @@ mod calib_probe_tests {
         let s = CalibStagingRecord {
             input_staging_ms: 7,
             dir_cache_hit: false,
+            input_payload_bytes: 42,
             input_tree_bytes: 9,
             input_tree_files: 3,
         };
