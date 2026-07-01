@@ -182,6 +182,19 @@ const CALIB_LARGE_EXEC_MS_THRESHOLD: i64 = 60_000;
 /// never fires). 100 MiB; sizes the miss-cost curve's large-tree tail.
 const CALIB_LARGE_TREE_BYTES_THRESHOLD: u64 = 100 * 1024 * 1024;
 
+/// P-A/P-B 1/1 override on the FETCHED-PAYLOAD byte axis (GAP-2 fix). Any action
+/// whose fetched payload exceeds this is recorded unconditionally, regardless of
+/// digest-hash, exec duration, or proto-tree size. Closes the M1 soak's GAP-2:
+/// `CALIB_LARGE_TREE_BYTES_THRESHOLD` keys on proto-structure size and
+/// `CALIB_LARGE_EXEC_MS_THRESHOLD` on wall time, so a large-payload /
+/// small-proto-tree / <60 s action (the LTO-link shape: one huge archive input,
+/// a shallow proto tree, a fast link) can slip both floors and be dropped by the
+/// unlucky uniform 1/16 — leaving a hole in R1 (re-fetch-storm) detection. 500
+/// MiB matches the M1 soak protocol's large-input threshold: LTO archives sit
+/// above it, and it is the byte scale at which a re-fetch is expensive enough
+/// that missing it corrupts the re-fetch-risk fit.
+const CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD: u64 = 500 * 1024 * 1024;
+
 /// Extract a stable u64 sampling key from a digest's packed hash (first 8
 /// bytes, little-endian). Blake3/SHA-256 outputs are uniformly distributed, so
 /// `key % period == 0` gives an alloc-free ~1/period rate without a global
@@ -204,20 +217,44 @@ const fn calib_uniformly_sampled(sample_key: u64) -> bool {
 }
 
 /// P-A sampling decision: uniform 1/`CALIB_SAMPLE_PERIOD` by digest-hash key,
-/// EXCEPT actions with `exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD` are
-/// always sampled (1/1 large-action override, §3).
+/// EXCEPT actions are always sampled (1/1) when EITHER
+/// `exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD` (large-action override, §3)
+/// OR `input_bytes > CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD` (large-payload
+/// override, GAP-2). The payload floor is checkable at THIS gate because
+/// `state.calib_input_bytes` is resolved during staging and read at the
+/// post-upload P-A site, so the fetched-payload total is in hand before the
+/// sampling decision — no emit-time fallback needed. The two overrides are
+/// independent axes: exec catches slow actions, payload catches the
+/// large-payload/small-tree/<60 s LTO-link shape the exec floor misses.
 ///
-/// Pure function of (`sample_key`, `exec_duration_ms`) so the boundary
-/// (exactly 60 s = not over-threshold; 60_001 ms = over) is unit-testable.
-const fn calib_action_sampled(sample_key: u64, exec_duration_ms: i64) -> bool {
-    exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD || calib_uniformly_sampled(sample_key)
+/// Pure function of (`sample_key`, `exec_duration_ms`, `input_bytes`) so both
+/// boundaries (exec == 60 s not over; payload == 500 MiB not over) are
+/// unit-testable.
+const fn calib_action_sampled(sample_key: u64, exec_duration_ms: i64, input_bytes: u64) -> bool {
+    exec_duration_ms > CALIB_LARGE_EXEC_MS_THRESHOLD
+        || input_bytes > CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD
+        || calib_uniformly_sampled(sample_key)
 }
 
 /// P-B sampling decision: uniform 1/`CALIB_SAMPLE_PERIOD` by digest-hash key,
-/// EXCEPT trees with `input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD` are
-/// always sampled (1/1 large-tree override, §4/§9 B4).
-const fn calib_staging_sampled(sample_key: u64, input_tree_bytes: u64) -> bool {
-    input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD || sample_key % CALIB_SAMPLE_PERIOD == 0
+/// EXCEPT staging records are always sampled (1/1) when EITHER
+/// `input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD` (large-tree override,
+/// §4/§9 B4) OR `input_missing_bytes > CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD`
+/// (large-fetch override, GAP-2). The GAP-2 axis is `input_missing_bytes` (the
+/// NETWORK-FETCH byte count = digests not already cached), not the full payload:
+/// a re-fetch storm (R1) is precisely large missing-bytes, and it is the volume
+/// that drives `input_staging_ms`. `input_tree_bytes` keys on proto-structure
+/// size, so an LTO archive (huge fetch, shallow proto tree) slips the tree floor
+/// — the missing-bytes floor catches it. `missing_bytes` is in scope at this
+/// gate (the batch existence check ran upstream), so no emit-time fallback.
+const fn calib_staging_sampled(
+    sample_key: u64,
+    input_tree_bytes: u64,
+    input_missing_bytes: u64,
+) -> bool {
+    input_tree_bytes > CALIB_LARGE_TREE_BYTES_THRESHOLD
+        || input_missing_bytes > CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD
+        || sample_key % CALIB_SAMPLE_PERIOD == 0
 }
 
 /// Poll-arm decision: arm the CPU-time poll iff the child has a queryable OS PID
@@ -3235,7 +3272,9 @@ pub fn download_to_directory<'a>(
         // structurally `false` here (see CalibStagingRecord).
         let (calib_tree_bytes, calib_tree_files) = calib_tree_totals(&tree);
         let calib_key = calib_digest_sample_key(digest);
-        if calib_staging_sampled(calib_key, calib_tree_bytes) {
+        // GAP-2: `missing_bytes` (the network-fetch axis) also drives the 1/1
+        // override, so a large-fetch/small-proto-tree LTO input is never dropped.
+        if calib_staging_sampled(calib_key, calib_tree_bytes, missing_bytes) {
             CalibStagingRecord {
                 input_staging_ms: total_ms as u64,
                 dir_cache_hit: false,
@@ -5926,15 +5965,19 @@ impl RunningActionImpl {
             // already-computed exec duration + the calib fields carried in
             // state (input bytes from staging, child CPU time from execute,
             // worker in-flight count from execute start). Sampled uniform 1/16
-            // by input-root-digest hash, with the 1/1 large-exec override
-            // (§3). Only the populated `Option` is emitted (after the lock).
+            // by input-root-digest hash, with the 1/1 large-exec override (§3)
+            // AND the 1/1 large-payload override (GAP-2) — the staged input
+            // bytes are already resolved into `state.calib_input_bytes` here, so
+            // the payload floor is applied at THIS gate (not emit-time). Only the
+            // populated `Option` is emitted (after the lock).
+            let calib_input_bytes = state.calib_input_bytes.unwrap_or(0);
             let calib_key =
                 calib_digest_sample_key(&self.action_info.input_root_digest);
-            if calib_action_sampled(calib_key, calib_exec_ms) {
+            if calib_action_sampled(calib_key, calib_exec_ms, calib_input_bytes) {
                 calib_action_record = Some(calib_build_action_record(
                     calib_exec_ms,
                     state.calib_cpu_time_ms,
-                    state.calib_input_bytes.unwrap_or(0),
+                    calib_input_bytes,
                     calib_output_bytes,
                     state.calib_running_at_start.unwrap_or(1),
                 ));
@@ -10437,11 +10480,11 @@ mod calib_probe_tests {
     use nativelink_util::common::DigestInfo;
 
     use super::{
-        CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_TREE_BYTES_THRESHOLD, CALIB_SAMPLE_PERIOD,
-        CALIB_SUBTREE_MAX_DEPTH, CALIB_SUBTREE_MAX_PIDS, CalibActionShape, CalibActionRecord,
-        CalibStagingRecord, calib_action_sampled, calib_build_action_record, calib_classify,
-        calib_digest_sample_key, calib_poll_cpu_time_loop, calib_staging_sampled,
-        calib_tree_totals, calib_uniformly_sampled,
+        CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD,
+        CALIB_LARGE_TREE_BYTES_THRESHOLD, CALIB_SAMPLE_PERIOD, CALIB_SUBTREE_MAX_DEPTH,
+        CALIB_SUBTREE_MAX_PIDS, CalibActionShape, CalibActionRecord, CalibStagingRecord,
+        calib_action_sampled, calib_build_action_record, calib_classify, calib_digest_sample_key,
+        calib_poll_cpu_time_loop, calib_staging_sampled, calib_tree_totals, calib_uniformly_sampled,
     };
 
     /// Build a digest whose first-8-byte LE sampling key is exactly `key`.
@@ -10468,6 +10511,13 @@ mod calib_probe_tests {
             CALIB_LARGE_TREE_BYTES_THRESHOLD,
             100 * 1024 * 1024,
             "spec §9 B4 P-B 1/1 override fires at input_tree_bytes > 100 MiB"
+        );
+        assert_eq!(
+            CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD,
+            500 * 1024 * 1024,
+            "GAP-2 fix: the fetched-payload 1/1 override fires at payload > 500 MiB \
+             (M1 soak large-input threshold); LTO archives sit above it and the \
+             large-payload/small-tree/<60 s shape must never be dropped from R1"
         );
         // Subtree-walk defensive caps: pin both so a silent bump (which would
         // change the fan-out bound the perf argument rests on) is a deliberate,
@@ -10530,23 +10580,24 @@ mod calib_probe_tests {
 
     #[test]
     fn action_sampled_uniform_1_in_16() {
-        // key % 16 == 0 sampled; key % 16 != 0 skipped (when under the
-        // large-exec override).
+        // key % 16 == 0 sampled; key % 16 != 0 skipped (when under BOTH the
+        // large-exec and large-payload overrides). Sub-threshold payload (0)
+        // isolates the uniform gate.
         assert!(
-            calib_action_sampled(0, 1_000),
+            calib_action_sampled(0, 1_000, 0),
             "key 0 (0 % 16 == 0) must be sampled under the uniform 1/16 gate"
         );
         assert!(
-            !calib_action_sampled(1, 1_000),
+            !calib_action_sampled(1, 1_000, 0),
             "key 1 (1 % 16 == 1) must be skipped under the uniform 1/16 gate \
-             (no large-exec override at 1 s)"
+             (no large-exec or large-payload override at 1 s / 0 B)"
         );
         assert!(
-            calib_action_sampled(32, 1_000),
+            calib_action_sampled(32, 1_000, 0),
             "key 32 (32 % 16 == 0) must be sampled"
         );
         assert!(
-            !calib_action_sampled(17, 1_000),
+            !calib_action_sampled(17, 1_000, 0),
             "key 17 (17 % 16 == 1) must be skipped"
         );
     }
@@ -10558,7 +10609,7 @@ mod calib_probe_tests {
         // override never masks the uniform rate.
         let mut count: u64 = 0;
         for k in 0..1600u64 {
-            if calib_action_sampled(k, 1_000) {
+            if calib_action_sampled(k, 1_000, 0) {
                 count += 1;
             }
         }
@@ -10574,15 +10625,57 @@ mod calib_probe_tests {
         // Exactly 60 s (= 60_000 ms) is NOT over-threshold (strict >), so an
         // unsampled key stays unsampled at the boundary.
         assert!(
-            !calib_action_sampled(1, CALIB_LARGE_EXEC_MS_THRESHOLD),
+            !calib_action_sampled(1, CALIB_LARGE_EXEC_MS_THRESHOLD, 0),
             "exec_duration == 60_000 ms is NOT over the threshold (strict >); \
              an unsampled key must remain unsampled at the boundary"
         );
         // One millisecond over → 1/1 override fires even for an unsampled key.
         assert!(
-            calib_action_sampled(1, CALIB_LARGE_EXEC_MS_THRESHOLD + 1),
+            calib_action_sampled(1, CALIB_LARGE_EXEC_MS_THRESHOLD + 1, 0),
             "exec_duration == 60_001 ms is over the 60 s threshold; the 1/1 \
              large-action override must force-sample even an unsampled key"
+        );
+    }
+
+    #[test]
+    fn action_large_payload_override_captures_lto_shape() {
+        // GAP-2: the LTO-link shape — huge fetched payload, small proto tree,
+        // <60 s exec, and an UNLUCKY digest-hash key (not in the uniform 1/16) —
+        // is dropped by BOTH the exec floor (1 s < 60 s) and the tree floor
+        // (which P-A never checks), so only the new payload floor can capture it.
+        // key 1 is out of the 1/16 sample (1 % 16 == 1); exec 1 s is sub-60 s;
+        // payload 500 MiB + 1 is over-threshold → MUST force-sample 1/1.
+        assert!(
+            calib_action_sampled(1, 1_000, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD + 1),
+            "large-payload/small-tree/<60 s LTO action (unsampled key, 1 s exec, \
+             500 MiB + 1 payload) MUST be force-sampled by the payload floor — \
+             it is dropped by the exec floor and invisible to the tree floor"
+        );
+        // A small-payload action at the same unlucky key + sub-60 s exec stays
+        // subject to the uniform 1/16 (NOT force-sampled) — the floor must not
+        // over-capture and flood the log with ordinary actions.
+        assert!(
+            !calib_action_sampled(1, 1_000, 4_096),
+            "a 4 KiB-payload action at an unsampled key + 1 s exec must stay \
+             subject to the uniform 1/16 gate — the payload floor must not \
+             force-sample small-payload actions"
+        );
+    }
+
+    #[test]
+    fn action_large_payload_override_boundary() {
+        // Exactly 500 MiB is NOT over-threshold (strict >), so an unsampled key
+        // with sub-60 s exec stays unsampled at the boundary.
+        assert!(
+            !calib_action_sampled(1, 1_000, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD),
+            "payload == 500 MiB is NOT over the threshold (strict >); an \
+             unsampled key + sub-60 s exec must remain unsampled at the boundary"
+        );
+        // One byte over → 1/1 override fires even for an unsampled key.
+        assert!(
+            calib_action_sampled(1, 1_000, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD + 1),
+            "payload == 500 MiB + 1 is over the threshold; the 1/1 large-payload \
+             override must force-sample even an unsampled key"
         );
     }
 
@@ -10607,21 +10700,38 @@ mod calib_probe_tests {
 
     #[test]
     fn action_sampled_delegates_to_uniform_predicate_plus_override() {
-        // `calib_action_sampled` must equal `uniform || large-exec-override` for
-        // every combination — the extraction of `calib_uniformly_sampled` must
-        // not change `calib_action_sampled`'s decision. Cover both a uniform-in
-        // and a uniform-out key, sub- and over-threshold.
+        // `calib_action_sampled` must equal
+        // `uniform || large-exec-override || large-payload-override` for every
+        // combination — the extraction of `calib_uniformly_sampled` must not
+        // change the decision, and neither the exec nor the payload override may
+        // mask or be masked by the other. Cover uniform-in/out keys, sub- and
+        // over-threshold exec, and sub- and over-threshold payload.
         for &key in &[0u64, 1, 15, 16, 17, 32] {
-            for &exec_ms in &[0i64, 1_000, CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_EXEC_MS_THRESHOLD + 1] {
-                let expected =
-                    calib_uniformly_sampled(key) || exec_ms > CALIB_LARGE_EXEC_MS_THRESHOLD;
-                assert_eq!(
-                    calib_action_sampled(key, exec_ms),
-                    expected,
-                    "calib_action_sampled(key={key}, exec_ms={exec_ms}) must equal \
-                     uniform({key}) || exec>{CALIB_LARGE_EXEC_MS_THRESHOLD}; the \
-                     calib_uniformly_sampled extraction changed the decision"
-                );
+            for &exec_ms in &[
+                0i64,
+                1_000,
+                CALIB_LARGE_EXEC_MS_THRESHOLD,
+                CALIB_LARGE_EXEC_MS_THRESHOLD + 1,
+            ] {
+                for &payload in &[
+                    0u64,
+                    1_000,
+                    CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD,
+                    CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD + 1,
+                ] {
+                    let expected = calib_uniformly_sampled(key)
+                        || exec_ms > CALIB_LARGE_EXEC_MS_THRESHOLD
+                        || payload > CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD;
+                    assert_eq!(
+                        calib_action_sampled(key, exec_ms, payload),
+                        expected,
+                        "calib_action_sampled(key={key}, exec_ms={exec_ms}, \
+                         payload={payload}) must equal uniform({key}) || \
+                         exec>{CALIB_LARGE_EXEC_MS_THRESHOLD} || \
+                         payload>{CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD}; a floor \
+                         changed or masked the decision"
+                    );
+                }
             }
         }
     }
@@ -11014,25 +11124,65 @@ mod calib_probe_tests {
 
     #[test]
     fn staging_sampled_uniform_and_large_tree_boundary() {
+        // Sub-threshold missing-bytes (0) isolates the uniform + large-tree gates.
         assert!(
-            calib_staging_sampled(0, 1_000),
+            calib_staging_sampled(0, 1_000, 0),
             "key 0 sampled under uniform 1/16"
         );
         assert!(
-            !calib_staging_sampled(1, 1_000),
-            "key 1 skipped under uniform 1/16 (small tree, no override)"
+            !calib_staging_sampled(1, 1_000, 0),
+            "key 1 skipped under uniform 1/16 (small tree, small fetch, no override)"
         );
         // Exactly 100 MiB is NOT over-threshold (strict >).
         assert!(
-            !calib_staging_sampled(1, CALIB_LARGE_TREE_BYTES_THRESHOLD),
+            !calib_staging_sampled(1, CALIB_LARGE_TREE_BYTES_THRESHOLD, 0),
             "input_tree_bytes == 100 MiB is NOT over the threshold (strict >); \
              an unsampled key must remain unsampled at the boundary"
         );
         // One byte over → 1/1 override fires.
         assert!(
-            calib_staging_sampled(1, CALIB_LARGE_TREE_BYTES_THRESHOLD + 1),
+            calib_staging_sampled(1, CALIB_LARGE_TREE_BYTES_THRESHOLD + 1, 0),
             "input_tree_bytes == 100 MiB + 1 is over the threshold; the 1/1 \
              large-tree override must force-sample even an unsampled key"
+        );
+    }
+
+    #[test]
+    fn staging_sampled_large_missing_bytes_captures_refetch_storm() {
+        // GAP-2 R1: a re-fetch storm — huge network-fetch (missing) bytes but a
+        // SMALL proto tree (< 100 MiB) — at an UNLUCKY digest-hash key is dropped
+        // by both the uniform 1/16 and the tree floor; only the missing-bytes
+        // floor captures it. key 1 is out of the sample; tree 1 KiB is sub-floor;
+        // missing 500 MiB + 1 is over-threshold → MUST force-sample 1/1.
+        assert!(
+            calib_staging_sampled(1, 1_000, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD + 1),
+            "large-fetch/small-tree staging (unsampled key, 1 KiB proto tree, \
+             500 MiB + 1 missing bytes) MUST be force-sampled by the missing-bytes \
+             floor — the R1 re-fetch storm the tree floor cannot see"
+        );
+        // A small-fetch staging at the same unlucky key + small tree stays
+        // subject to the uniform 1/16 (NOT force-sampled).
+        assert!(
+            !calib_staging_sampled(1, 1_000, 4_096),
+            "a 4 KiB-fetch staging at an unsampled key + small tree must stay \
+             subject to the uniform 1/16 gate — the missing-bytes floor must not \
+             force-sample small-fetch staging records"
+        );
+    }
+
+    #[test]
+    fn staging_sampled_large_missing_bytes_boundary() {
+        // Exactly 500 MiB missing is NOT over-threshold (strict >).
+        assert!(
+            !calib_staging_sampled(1, 1_000, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD),
+            "missing_bytes == 500 MiB is NOT over the threshold (strict >); an \
+             unsampled key + small tree must remain unsampled at the boundary"
+        );
+        // One byte over → 1/1 override fires even for an unsampled key.
+        assert!(
+            calib_staging_sampled(1, 1_000, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD + 1),
+            "missing_bytes == 500 MiB + 1 is over the threshold; the 1/1 \
+             large-fetch override must force-sample even an unsampled key"
         );
     }
 
