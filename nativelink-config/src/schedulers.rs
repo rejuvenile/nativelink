@@ -83,7 +83,7 @@ const fn default_worker_match_logging_interval_s() -> i64 {
     10
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct SimpleSpec {
@@ -239,6 +239,55 @@ pub struct SimpleSpec {
     /// or memory-gate effect.
     #[serde(default)]
     pub p_headroom_gate_enabled: bool,
+}
+
+/// Manual `Default` that mirrors the serde defaults EXACTLY.
+///
+/// `#[derive(Default)]` would ignore the `#[serde(default = "fn")]`
+/// attributes (they fire only on DEserialization), yielding
+/// `load_byte_cost == 0`, `assume_core_count == 0`, and
+/// `worker_match_logging_interval_s == 0` — none of which match a
+/// deserialized-empty config. That divergence made every test that builds a
+/// scheduler from `SimpleSpec::default()` run load-blind (`load_byte_cost == 0`
+/// ⇒ zero `load_penalty` for all workers ⇒ the load-aware selection blend was
+/// never exercised). This impl keeps `SimpleSpec::default()` byte-identical to
+/// `serde_json5::from_str::<SimpleSpec>("{}")`; the equivalence is pinned by
+/// `nativelink-config/tests/simple_spec_default_test.rs`. Each field below is
+/// annotated with the serde default it must match — a drift red-fails that
+/// test on the specific field.
+impl Default for SimpleSpec {
+    fn default() -> Self {
+        Self {
+            // No serde default → Option default (None).
+            supported_platform_properties: None,
+            // #[serde(default, deserialize_with)] → type default (0).
+            retain_completed_for_s: 0,
+            // #[serde(default, deserialize_with)] → type default (0).
+            client_action_timeout_s: 0,
+            // #[serde(default, deserialize_with)] → type default (0).
+            worker_timeout_s: 0,
+            // #[serde(default, deserialize_with)] → type default (0).
+            max_action_executing_timeout_s: 0,
+            // #[serde(default, deserialize_with)] → type default (0).
+            max_job_retries: 0,
+            // #[serde(default)] → WorkerAllocationStrategy::default().
+            allocation_strategy: WorkerAllocationStrategy::default(),
+            // No serde default → Option default (None).
+            experimental_backend: None,
+            // #[serde(default = "default_worker_match_logging_interval_s")] → 10.
+            worker_match_logging_interval_s: default_worker_match_logging_interval_s(),
+            // #[serde(default, deserialize_with)] → type default (0).
+            max_matches_per_client_per_cycle: 0,
+            // #[serde(default)] → Option default (None).
+            cas_store: None,
+            // #[serde(default = "default_load_byte_cost")] → 512 KiB.
+            load_byte_cost: default_load_byte_cost(),
+            // #[serde(default = "default_assume_core_count")] → 8.
+            assume_core_count: default_assume_core_count(),
+            // #[serde(default)] → bool default (false).
+            p_headroom_gate_enabled: false,
+        }
+    }
 }
 
 /// (#sched-blend) Default cache-vs-load crossover anchor (512 KiB).

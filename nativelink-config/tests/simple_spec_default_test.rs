@@ -1,0 +1,148 @@
+// Copyright 2026 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    See LICENSE file for details
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Pins `SimpleSpec::default()` to "deserialize of an empty config".
+//!
+//! `#[derive(Default)]` on `SimpleSpec` was LOAD-BLIND: derive ignores the
+//! `#[serde(default = "fn")]` attributes (those fire only on DEserialization),
+//! so `SimpleSpec::default()` yielded `load_byte_cost == 0`,
+//! `assume_core_count == 0`, `worker_match_logging_interval_s == 0` — none of
+//! which match a deserialized-empty config. ~47 scheduler tests build the
+//! scheduler with `SimpleSpec::default()` and therefore ran with
+//! `load_byte_cost == 0` → `load_penalty == 0` for every worker → the
+//! load-aware selection blend was never exercised (root cause of the flaky
+//! `cache_affinity_least_loaded_holder_wins_tier1_test`). Prod is unaffected
+//! (prod deserializes config → the serde defaults fire).
+//!
+//! The fix replaces `#[derive(Default)]` with a manual `impl Default` that
+//! mirrors the serde defaults exactly. This test is the LOAD-BEARING pin: it
+//! asserts, field by field, that `SimpleSpec::default()` equals
+//! `serde_json5::from_str::<SimpleSpec>("{}")`. If any field of the manual
+//! `impl Default` drifts from its `#[serde(default = ...)]`, this test
+//! red-fails on that specific field.
+
+use nativelink_config::schedulers::{SimpleSpec, WorkerAllocationStrategy};
+use pretty_assertions::assert_eq;
+
+/// `SimpleSpec::default()` MUST equal a deserialized empty config, field for
+/// field. Compared explicitly (not via a `PartialEq` derive) so that a drift
+/// in ANY single field names that field in the failure, and so we do not have
+/// to derive `PartialEq` across the sibling config enums.
+#[test]
+fn simple_spec_default_matches_deserialize_empty() {
+    let derived = SimpleSpec::default();
+    // Empty JSON5 object: every field falls to its serde default. This is the
+    // exact shape prod hits for a `{ "type": "simple" }` scheduler with no
+    // tuning keys set.
+    let deserialized: SimpleSpec =
+        serde_json5::from_str("{}").expect("empty SimpleSpec must deserialize");
+
+    assert_eq!(
+        derived.supported_platform_properties.is_none(),
+        deserialized.supported_platform_properties.is_none(),
+        "supported_platform_properties default drift (both should be None)"
+    );
+    assert_eq!(
+        derived.retain_completed_for_s, deserialized.retain_completed_for_s,
+        "retain_completed_for_s default drift"
+    );
+    assert_eq!(
+        derived.client_action_timeout_s, deserialized.client_action_timeout_s,
+        "client_action_timeout_s default drift"
+    );
+    assert_eq!(
+        derived.worker_timeout_s, deserialized.worker_timeout_s,
+        "worker_timeout_s default drift"
+    );
+    assert_eq!(
+        derived.max_action_executing_timeout_s, deserialized.max_action_executing_timeout_s,
+        "max_action_executing_timeout_s default drift"
+    );
+    assert_eq!(
+        derived.max_job_retries, deserialized.max_job_retries,
+        "max_job_retries default drift"
+    );
+    assert_eq!(
+        matches!(
+            derived.allocation_strategy,
+            WorkerAllocationStrategy::LeastRecentlyUsed
+        ),
+        matches!(
+            deserialized.allocation_strategy,
+            WorkerAllocationStrategy::LeastRecentlyUsed
+        ),
+        "allocation_strategy default drift (both should be LeastRecentlyUsed)"
+    );
+    assert_eq!(
+        derived.experimental_backend.is_none(),
+        deserialized.experimental_backend.is_none(),
+        "experimental_backend default drift (both should be None)"
+    );
+    assert_eq!(
+        derived.worker_match_logging_interval_s, deserialized.worker_match_logging_interval_s,
+        "worker_match_logging_interval_s default drift (serde default is 10, \
+         not the type default 0)"
+    );
+    assert_eq!(
+        derived.max_matches_per_client_per_cycle, deserialized.max_matches_per_client_per_cycle,
+        "max_matches_per_client_per_cycle default drift"
+    );
+    assert_eq!(
+        derived.cas_store, deserialized.cas_store,
+        "cas_store default drift (both should be None)"
+    );
+    assert_eq!(
+        derived.load_byte_cost, deserialized.load_byte_cost,
+        "load_byte_cost default drift — this is THE field the bug was about; \
+         serde default is 512*1024, the type default is 0"
+    );
+    assert_eq!(
+        derived.assume_core_count, deserialized.assume_core_count,
+        "assume_core_count default drift (serde default is 8, not the type \
+         default 0)"
+    );
+    assert_eq!(
+        derived.p_headroom_gate_enabled, deserialized.p_headroom_gate_enabled,
+        "p_headroom_gate_enabled default drift (both should be false)"
+    );
+}
+
+/// Direct assertions on the concrete default values, so the intent is legible
+/// without cross-referencing the serde attributes. These are the values a
+/// deserialized-empty config produces (verified by the equivalence test
+/// above); duplicating them here makes an accidental change to BOTH the serde
+/// default fn and the manual `impl Default` (which would slip past the
+/// equivalence test) still fail here.
+#[test]
+fn simple_spec_default_concrete_values() {
+    let spec = SimpleSpec::default();
+    assert_eq!(
+        spec.load_byte_cost,
+        512 * 1024,
+        "load_byte_cost default must be 512 KiB (default_load_byte_cost)"
+    );
+    assert_eq!(
+        spec.assume_core_count, 8,
+        "assume_core_count default must be 8 (default_assume_core_count)"
+    );
+    assert_eq!(
+        spec.worker_match_logging_interval_s, 10,
+        "worker_match_logging_interval_s default must be 10 \
+         (default_worker_match_logging_interval_s)"
+    );
+    assert!(
+        !spec.p_headroom_gate_enabled,
+        "p_headroom_gate_enabled default must be false (gate OFF until enabled)"
+    );
+}
