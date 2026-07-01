@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -40,6 +41,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::context::{Context, FutureExt as OtelFutureExt};
 use opentelemetry_semantic_conventions::attribute::ENDUSER_ID;
+use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tracing::{debug, error, info, info_span, warn};
@@ -66,6 +68,230 @@ const DEFAULT_CLIENT_ACTION_TIMEOUT_S: u64 = 60;
 /// Default times a job can retry before failing.
 /// If this changes, remember to change the documentation in the config.
 const DEFAULT_MAX_JOB_RETRIES: usize = 3;
+
+// ─────────────────────────── Batch-affinity probe ───────────────────────────
+//
+// (#batch-affinity) OBSERVABILITY-ONLY probe measuring the POTENTIAL
+// profitability of batch (multi-task) dir-cache-affinity scheduling. It does
+// NOT change assignment, does NOT add any delay, and does NOT influence which
+// worker is chosen — it only MEASURES whether looking at all pending tasks
+// together (dimension A) or briefly delaying to accumulate related tasks
+// (dimension B) WOULD improve dir-cache affinity. The emitted gauges/counter
+// justify (or refute) building real batch scheduling later. See the two pure
+// functions and `RecentRootsWindow` below; all three are `pub` so the exact
+// arithmetic and window boundary are unit-testable without a live scheduler.
+
+/// (#batch-affinity, dimension A) Instantaneous co-location surplus over a
+/// snapshot of the pending set's `input_root_digest`s.
+///
+/// Returns `(surplus, max_group)` where:
+/// - `surplus = n - distinct_roots` — the number of pending assignments that
+///   could reuse a *peer pending task's* dir-cache locality if a batch
+///   assignment grouped same-input-root tasks together. Greedy one-at-a-time
+///   assignment cannot exploit this because it never looks at a peer that is
+///   still queued. `surplus == 0` means every pending op has a unique root, so
+///   batch grouping buys nothing right now.
+/// - `max_group` — the size of the largest same-input-root group among the
+///   pending ops (the biggest single batch a grouper could form). `0` for an
+///   empty set, `1` when all roots are distinct.
+///
+/// Pure function of the input slice so the surplus/max-group arithmetic is
+/// unit-testable at its boundaries (`[A,A,B,C] → (1,2)`, all-distinct `→ (0,1)`,
+/// all-same `→ (n-1, n)`, empty `→ (0,0)`).
+pub fn colocation_surplus(pending_input_roots: &[DigestInfo]) -> (u64, u64) {
+    if pending_input_roots.is_empty() {
+        return (0, 0);
+    }
+    // Count occurrences per distinct root. Bounded by the caller's sample cap
+    // (see `MAX_PENDING_AFFINITY_SAMPLE`), so this is a bounded scratch map.
+    let mut counts: HashMap<DigestInfo, u64> = HashMap::new();
+    for root in pending_input_roots {
+        *counts.entry(*root).or_insert(0) += 1;
+    }
+    let n = pending_input_roots.len() as u64;
+    let distinct = counts.len() as u64;
+    let max_group = counts.values().copied().max().unwrap_or(0);
+    (n - distinct, max_group)
+}
+
+/// (#batch-affinity, dimension B) The accumulation window a hypothetical batch
+/// scheduler would use: if a related task arrives within this window of a peer,
+/// a delay of this length would have let them batch. 250ms is short enough that
+/// the added latency would be negligible against typical action execution
+/// times, yet long enough to catch the tight bursts Bazel emits at build
+/// startup. Pinned in `batch_affinity_metrics_test::affinity_window_const_is_250ms`.
+pub const AFFINITY_ARRIVAL_WINDOW: Duration = Duration::from_millis(250);
+
+/// (#batch-affinity, dimension B) Decision: would a batch scheduler that
+/// accumulated for `window` have grouped an arrival at `now` with a peer last
+/// seen at `last_seen`? Closed interval — an arrival exactly `window` after the
+/// peer still counts (the delay would have just captured it). Saturating on the
+/// (impossible-in-practice) `last_seen > now` case so a monotonic-clock hiccup
+/// can never panic. Pure `(now, last_seen, window) → bool` so the boundary
+/// (`== window` in, `window + 1ns` out) is unit-testable.
+pub fn is_within_affinity_window(now: Instant, last_seen: Instant, window: Duration) -> bool {
+    now.saturating_duration_since(last_seen) <= window
+}
+
+/// (#batch-affinity, dimension B) Maximum number of distinct recently-seen
+/// input roots retained by `RecentRootsWindow`.
+///
+// CAPPED AT 4096: `RecentRootsWindow` lives on the scheduler and is fed one
+// entry per arriving action (`inner_add_action`, a network-reachable path).
+// Without a cap a flood of distinct-input-root actions would grow it
+// unboundedly. 4096 distinct roots × (32-byte digest + Instant) ≈ 200 KiB —
+// negligible, and far more than the number of *distinct* input roots that can
+// plausibly arrive inside a 250ms window (each entry older than the window is
+// dead weight anyway). Over-cap behavior: the OLDEST entry (by insertion via
+// the FIFO `order` deque) is evicted, matching the observation that the window
+// only cares about recent arrivals. This is a probe-only structure — dropping
+// an entry can only *undercount* window matches (a conservative bias for an
+// observability metric), never corrupt scheduling state.
+pub const RECENT_ROOTS_MAX_ENTRIES: usize = 4096;
+
+/// (#batch-affinity, dimension B) Bounded map of
+/// `input_root_digest → last-arrival Instant`, used to estimate how many
+/// co-location opportunities a small accumulation delay would capture.
+///
+/// `record_arrival` returns `true` iff the arriving root was already present
+/// with a last-seen time inside `AFFINITY_ARRIVAL_WINDOW` — i.e. a
+/// `AFFINITY_ARRIVAL_WINDOW`-length delay would have let this task batch with a
+/// peer. It always updates the entry to the new arrival time.
+///
+/// Observability-only: this never influences assignment. It is intentionally
+/// NOT `MetricsComponent` (it holds per-digest keyed state, which the derive
+/// cannot emit as labels — the SCALAR counter derived from it lives in
+/// `BatchAffinityMetrics`).
+///
+/// Correctness note: a stale entry (last seen longer ago than the window) left
+/// in the map can NEVER produce a false within-window match, because
+/// `record_arrival` re-checks freshness via `is_within_affinity_window` against
+/// the stored time. Staleness therefore costs only memory, which the entry cap
+/// bounds — so no TTL sweep is required for correctness, only the cap.
+#[derive(Debug, Default)]
+pub struct RecentRootsWindow {
+    // CAPPED AT RECENT_ROOTS_MAX_ENTRIES: see the const's justification. Bounded
+    // by evicting the FIFO-oldest key when the map would exceed the cap.
+    last_seen: HashMap<DigestInfo, Instant>,
+    // FIFO insertion order for O(1) oldest-key eviction. One entry per distinct
+    // key (updates do not re-push), bounded to the same cap as `last_seen`.
+    order: std::collections::VecDeque<DigestInfo>,
+}
+
+impl RecentRootsWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current number of retained roots. Test/observability accessor.
+    pub fn len(&self) -> usize {
+        self.last_seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.last_seen.is_empty()
+    }
+
+    /// Record an arrival of `root` at `now`. Returns `true` iff a peer with the
+    /// same root was last seen within `AFFINITY_ARRIVAL_WINDOW` (a captured
+    /// batch opportunity). Always updates the entry to `now` and enforces the
+    /// entry cap.
+    pub fn record_arrival(&mut self, root: DigestInfo, now: Instant) -> bool {
+        let within_window = match self.last_seen.get(&root) {
+            Some(&prev) => is_within_affinity_window(now, prev, AFFINITY_ARRIVAL_WINDOW),
+            None => false,
+        };
+        // Insert-or-update. Push to the FIFO order deque only on FIRST insert so
+        // each distinct key appears exactly once; updates keep the original
+        // insertion slot (the deque tracks first-seen order for cap eviction,
+        // not last-seen — a refreshed entry is still cap-evictable, just biased
+        // toward oldest-first, which is the desired bound behavior).
+        if self.last_seen.insert(root, now).is_none() {
+            self.order.push_back(root);
+        }
+        // Cap enforcement only: evict FIFO-oldest keys until at/under cap.
+        // Bounded loop — runs at most (len - cap) iterations, which is 1 in
+        // steady state (we add one entry per call). Stale-but-uncapped entries
+        // are harmless (see the struct doc-comment) so no TTL sweep is needed.
+        while self.last_seen.len() > RECENT_ROOTS_MAX_ENTRIES {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.last_seen.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        within_window
+    }
+}
+
+/// (#batch-affinity) Maximum number of highest-priority pending ops the
+/// instantaneous co-location surplus (dimension A) is computed over per match
+/// cycle.
+///
+// CAPPED AT 512: `do_try_match` already owns the priority-sorted pending set;
+// the surplus pass calls `as_action_info()` (an in-memory `borrow().await`)
+// once per sampled op. Bounding to the first 512 (the highest-priority ops —
+// the ones a batch scheduler would assign imminently) keeps the per-cycle
+// probe cost O(512) even when a build-startup burst queues tens of thousands
+// of actions, while still covering far more than the number of workers. When
+// the pending set exceeds this, the surplus/max_group gauges describe the
+// sampled prefix (reported via the `sampled_ops` gauge so operators can see
+// saturation); this only UNDERCOUNTS the true surplus — a conservative bias
+// for an observability metric.
+const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
+
+/// (#batch-affinity) OBSERVABILITY-ONLY scalar gauges/counter estimating the
+/// potential profitability of batch (multi-task) dir-cache-affinity scheduling.
+/// None of these fields influence assignment; they only MEASURE whether a
+/// hypothetical batch/delay strategy would help. Emitted on `/metrics` under
+/// `scheduler.<name>.action.batch_affinity.<field>` (the action-scheduler
+/// registration prefix — see `src/bin/nativelink.rs:591`).
+///
+/// Interpretation: a persistently HIGH `colocation_surplus` (many pending ops
+/// share input roots) OR a steadily climbing `arrival_within_250ms_total`
+/// (related tasks keep arriving in tight bursts) is the signal that building
+/// real batch/delay scheduling would pay off. Values near zero refute it.
+///
+/// These are per-key SCALAR aggregates on purpose: `MetricsComponent` cannot
+/// emit dynamic per-digest/per-worker labels, so we aggregate to gauges +
+/// a counter. The `#[metric]` names are STABLE — dashboards key on them.
+#[derive(Debug, Default, MetricsComponent)]
+pub struct BatchAffinityMetrics {
+    /// Dimension A gauge: `pending_ops - distinct_input_roots` over the sampled
+    /// pending prefix at the last match cycle. The count of pending assignments
+    /// that could reuse a peer pending task's dir-cache locality if grouped.
+    #[metric(
+        help = "pending co-location surplus (sampled pending ops minus distinct input roots) at last match cycle; high = batch scheduling could reuse peer dir-cache locality"
+    )]
+    pub colocation_surplus: AtomicU64,
+
+    /// Dimension A gauge: size of the largest same-input-root group in the
+    /// sampled pending prefix at the last match cycle (the biggest single batch
+    /// a grouper could form).
+    #[metric(
+        help = "largest same-input-root pending group at last match cycle; the biggest single batch a grouper could form"
+    )]
+    pub max_group: AtomicU64,
+
+    /// Dimension A gauge: number of pending ops the surplus was computed over at
+    /// the last match cycle (== min(pending, MAX_PENDING_AFFINITY_SAMPLE)). If
+    /// this equals the sample cap, the surplus is a lower bound on the true
+    /// pending-set surplus.
+    #[metric(
+        help = "pending ops sampled for the co-location surplus at last match cycle; equals the sample cap when the pending set is larger (surplus then a lower bound)"
+    )]
+    pub sampled_ops: AtomicU64,
+
+    /// Dimension B counter: cumulative count of arriving actions whose input
+    /// root matched a peer seen within AFFINITY_ARRIVAL_WINDOW (250ms). Each
+    /// increment is one co-location opportunity a 250ms accumulation delay
+    /// would have captured.
+    #[metric(
+        help = "cumulative arrivals whose input root matched a peer within 250ms; each is a co-location opportunity a small accumulation delay would capture"
+    )]
+    pub arrival_within_250ms_total: AtomicU64,
+}
 
 struct SimpleSchedulerActionStateResult {
     client_operation_id: OperationId,
@@ -156,6 +382,18 @@ pub struct SimpleScheduler {
     /// (identified by `instance_name`) in one matching cycle.
     /// 0 means unlimited (fair scheduling disabled).
     max_matches_per_client_per_cycle: usize,
+
+    /// (#batch-affinity) OBSERVABILITY-ONLY scalar gauges/counter estimating
+    /// whether batch (multi-task) dir-cache-affinity scheduling would pay off.
+    /// Read-only w.r.t. assignment — see `BatchAffinityMetrics`.
+    #[metric(group = "batch_affinity")]
+    batch_affinity_metrics: BatchAffinityMetrics,
+
+    /// (#batch-affinity, dimension B) Bounded recent-arrival window feeding
+    /// `batch_affinity_metrics.arrival_within_250ms_total`. Guarded by a
+    /// `parking_lot::Mutex` acquired only for the synchronous `record_arrival`
+    /// call in `inner_add_action` (never held across `.await`).
+    recent_roots_window: Mutex<RecentRootsWindow>,
 }
 
 impl core::fmt::Debug for SimpleScheduler {
@@ -185,6 +423,23 @@ impl SimpleScheduler {
         client_operation_id: OperationId,
         action_info: Arc<ActionInfo>,
     ) -> Result<Box<dyn ActionStateResult>, Error> {
+        // (#batch-affinity, dimension B) OBSERVABILITY-ONLY: record this
+        // arrival's input root and count it if a peer arrived within the
+        // accumulation window. This does NOT delay or alter the add — it only
+        // measures whether a hypothetical small accumulation delay would have
+        // let this task batch with a peer for dir-cache affinity. The lock is
+        // held only for the synchronous `record_arrival` (no `.await` inside).
+        {
+            let matched = self
+                .recent_roots_window
+                .lock()
+                .record_arrival(action_info.input_root_digest, Instant::now());
+            if matched {
+                self.batch_affinity_metrics
+                    .arrival_within_250ms_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let action_state_result = self
             .client_state_manager
             .add_action(client_operation_id.clone(), action_info)
@@ -275,6 +530,16 @@ impl SimpleScheduler {
         // find_worker, etc.).
         let queued_actions: Vec<Box<dyn ActionStateResult>> = stream.collect().await;
 
+        // (#batch-affinity, dimension A) OBSERVABILITY-ONLY: over the current
+        // pending set, measure the co-location surplus a batch assignment could
+        // exploit that greedy one-at-a-time misses. This reuses the already-
+        // collected `queued_actions` (by reference — it is NOT consumed here;
+        // matching below still owns every op) and samples only the first
+        // MAX_PENDING_AFFINITY_SAMPLE highest-priority ops to keep the probe
+        // O(cap) under burst load. It does NOT change which worker is chosen or
+        // introduce any delay — it only records gauges.
+        self.record_pending_affinity_surplus(&queued_actions).await;
+
         let mut futures_set = futures::stream::FuturesUnordered::<
             std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>>,
         >::new();
@@ -323,6 +588,39 @@ impl SimpleScheduler {
         }
 
         result
+    }
+
+    /// (#batch-affinity, dimension A) OBSERVABILITY-ONLY: compute the
+    /// instantaneous co-location surplus over the (already-collected,
+    /// priority-sorted) pending set and store it into the gauges. Samples at
+    /// most `MAX_PENDING_AFFINITY_SAMPLE` highest-priority ops; each sampled op
+    /// costs one `as_action_info()` (an in-memory subscriber `borrow().await`,
+    /// the same call the matcher makes anyway). Ops whose `as_action_info()`
+    /// fails (e.g. an `ErrorActionStateResult` from a stream decode error) are
+    /// skipped — a best-effort probe must never fail the match cycle. This
+    /// method has NO effect on assignment: it borrows `queued_actions`, mutates
+    /// only the gauge atomics, and returns `()`.
+    async fn record_pending_affinity_surplus(
+        &self,
+        queued_actions: &[Box<dyn ActionStateResult>],
+    ) {
+        let mut pending_roots: Vec<DigestInfo> =
+            Vec::with_capacity(queued_actions.len().min(MAX_PENDING_AFFINITY_SAMPLE));
+        for action_state_result in queued_actions.iter().take(MAX_PENDING_AFFINITY_SAMPLE) {
+            if let Ok((action_info, _)) = action_state_result.as_action_info().await {
+                pending_roots.push(action_info.input_root_digest);
+            }
+        }
+        let (surplus, max_group) = colocation_surplus(&pending_roots);
+        self.batch_affinity_metrics
+            .colocation_surplus
+            .store(surplus, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .max_group
+            .store(max_group, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .sampled_ops
+            .store(pending_roots.len() as u64, Ordering::Relaxed);
     }
 
     /// Matches a single action to a worker, using a shared cache for computed
@@ -1007,6 +1305,8 @@ impl SimpleScheduler {
                 task_worker_matching_spawn,
                 worker_match_logging_interval,
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
+                batch_affinity_metrics: BatchAffinityMetrics::default(),
+                recent_roots_window: Mutex::new(RecentRootsWindow::new()),
             }
         });
         (action_scheduler, worker_scheduler_clone)
