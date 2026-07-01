@@ -1174,7 +1174,9 @@ impl ApiWorkerSchedulerImpl {
         //     dispatch-count gate would otherwise lose to the fallback's stale
         //     `p_load` ranking. When the flag is OFF the tier is unconditionally
         //     `false`, so the key reduces to `(false, load)` for every worker →
-        //     single-tier by load, BYTE-IDENTICAL to the pre-v2.2 path.
+        //     single-tier by load, behaviorally identical to the pre-v2.2 path
+        //     (one always-`else` branch + a byte-wider key, not literally
+        //     byte-identical machine code; perf-optimizer nit).
         //   - `effective_load_score`: the EXISTING within-tier ranking, unchanged
         //     (idle P-cores beat idle E-cores; aggregate-only competes in the
         //     P-core tier). Applied WITHIN each tier.

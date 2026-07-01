@@ -6973,10 +6973,15 @@ async fn v22_phase2_flag_on_equals_flag_off_test() -> Result<(), Error> {
         dispatch_and_hold_on_worker(&scheduler, &mut rx_light, dummy_root, [151u8; 32], 1).await?;
         dispatch_and_hold_on_worker(&scheduler, &mut rx_heavy, dummy_root, [152u8; 32], 2).await?;
 
-        // Distinct loads: `light` strictly lighter → wins on load in BOTH runs
-        // (ON: both tier 1, ranked by load; OFF: single tier, ranked by load).
-        scheduler.update_worker_load(&light, 10, 0, 10).await?;
-        scheduler.update_worker_load(&heavy, 90, 0, 90).await?;
+        // Distinct P-CORE loads (`update_worker_load` args are cpu, p_core,
+        // e_core): `light` p_load=10 < `heavy` p_load=90 → `light` wins on
+        // `effective_load_score` in BOTH runs (ON: both tier 1, ranked by load;
+        // OFF: single tier, ranked by load) — the LOAD decides, not iteration
+        // order. (A prior draft set p_core=0 for both → both scored 0 → the
+        // winner was iteration order, so the parity was only degenerate-load;
+        // testing-czar R1.)
+        scheduler.update_worker_load(&light, 10, 10, 0).await?;
+        scheduler.update_worker_load(&heavy, 90, 90, 0).await?;
 
         let action_digest = DigestInfo::new([153u8; 32], 512);
         let _l = setup_action(&scheduler, action_digest, HashMap::new(), make_system_time(3)).await?;
