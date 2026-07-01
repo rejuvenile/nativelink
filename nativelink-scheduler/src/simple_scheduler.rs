@@ -1100,6 +1100,10 @@ impl SimpleScheduler {
             // (#sched-blend) continuous cache-vs-load blend tunables.
             spec.load_byte_cost,
             spec.assume_core_count,
+            // (#sched M1 rebalance) dispatch-count P-headroom overflow gate;
+            // default OFF (byte-identical to the pre-gate matcher until an
+            // operator enables it).
+            spec.p_headroom_gate_enabled,
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();

@@ -221,6 +221,24 @@ pub struct SimpleSpec {
     /// Default: 8.
     #[serde(default = "default_assume_core_count", deserialize_with = "convert_numeric_with_shellexpand")]
     pub assume_core_count: u32,
+
+    /// (#sched M1 rebalance) When enabled, the worker matcher applies a
+    /// dispatch-count P-headroom overflow gate on the cache-affinity tiers
+    /// (exact-root / subtree-coverage / blob-locality): while ANY viable
+    /// worker still has P-headroom (fewer in-flight actions than its
+    /// advertised `p_core_count`), a worker WITHOUT P-headroom is excluded
+    /// from those tiers so a saturated cache holder's surplus overflows to a
+    /// P-headroom peer instead of piling onto already-full P cores (the
+    /// 2026-06-30 sole-holder domino). When NO viable worker has P-headroom
+    /// the gate lifts and selection proceeds over all viable workers via the
+    /// existing LRU/MRU fallback (no wedge). A worker advertising
+    /// `p_core_count == 0` is treated as ungated (never frozen out).
+    ///
+    /// Default: false (OFF) — the matcher behaves byte-identically to today
+    /// until an operator enables it. Selection-only; no data-plane, ack, pin,
+    /// or memory-gate effect.
+    #[serde(default)]
+    pub p_headroom_gate_enabled: bool,
 }
 
 /// (#sched-blend) Default cache-vs-load crossover anchor (512 KiB).

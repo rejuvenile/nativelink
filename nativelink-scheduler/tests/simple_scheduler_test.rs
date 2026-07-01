@@ -5984,3 +5984,633 @@ async fn quarantined_worker_skipped_then_selectable_after_keepalive_test() -> Re
 
     Ok(())
 }
+
+// ────────────────────────── (#sched M1 rebalance) ──────────────────────────
+// Dispatch-count P-headroom overflow gate. `SimpleSpec::p_headroom_gate_enabled`
+// (default OFF) gates the cache-affinity tiers: while ANY viable worker has
+// P-headroom (`running_action_infos.len() < p_core_count`), a worker WITHOUT
+// P-headroom is excluded from those tiers so its cached-input surplus overflows
+// to a P-headroom peer instead of piling onto full P cores. Design v2.1
+// (`.claude/audits/scheduler-pcore-first-rebalance-design-v2-2026-06-30.md`),
+// mechanisms M1 (gate in `worker_is_viable`) + M2 (fold the pre-scan into the
+// existing `all_viable_saturated` loop) + A5 (`p_core_count == 0` ungated).
+//
+// Helper: drive one action HELD in-flight (never completed) onto a specific
+// worker so its `running_action_infos` count climbs toward `p_core_count`. The
+// action is dispatched via `do_try_match_for_test` and left executing; the
+// worker rx is drained so a later assertion sees the NEXT dispatch cleanly.
+async fn dispatch_and_hold_on_worker(
+    scheduler: &SimpleScheduler,
+    rx: &mut mpsc::UnboundedReceiver<UpdateForWorker>,
+    input_root: DigestInfo,
+    action_hash: [u8; 32],
+    ts: u64,
+) -> Result<(), Error> {
+    let action_digest = DigestInfo::new(action_hash, 512);
+    let mut action_info = make_base_action_info(make_system_time(ts), action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let client_id = OperationId::default();
+    let _listener = scheduler.add_action(client_id, action_info).await?;
+    scheduler.do_try_match_for_test().await?;
+    // Consume the StartAction so the channel is empty for the next assertion.
+    // The action is intentionally NOT completed — it stays in-flight in the
+    // worker's `running_action_infos`, consuming a P-headroom slot.
+    match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+        Ok(Some(msg)) => match msg.update {
+            Some(update_for_worker::Update::StartAction(_)) => Ok(()),
+            v => panic!("dispatch_and_hold: expected StartAction, got: {v:?}"),
+        },
+        Ok(None) => panic!("dispatch_and_hold: worker channel closed"),
+        Err(_) => panic!(
+            "dispatch_and_hold: action did not dispatch to the intended worker \
+             (it was routed elsewhere or parked)"
+        ),
+    }
+}
+
+/// Test 2 (§7): the P-headroom gate (flag ON). A worker HOLDING the cached input
+/// root but AT its dispatch-count P-headroom limit (`running == p_core_count`)
+/// LOSES the next input-sharing action to a P-headroom NON-holder. Without the
+/// gate the saturated holder wins on cache affinity (Tier-1) — the 2026-06-30
+/// sole-holder domino.
+///
+/// Topology: holder H has `p_core_count = 1` and one in-flight action (so it has
+/// NO P-headroom), holds the input root, and reports HIGH p_load (so the LRU
+/// backstop — which is load-based, not dispatch-count, per design A3 — ranks it
+/// below the peer once the cache tiers are gated off). Peer P has
+/// `p_core_count = 8`, zero in-flight (P-headroom), no cache, and reports LOW
+/// p_load. Flag ON.
+///
+/// Mutation (TDD #5): comment out the `has_p_headroom`/`p_gate_active` exclusion
+/// in `inner_find_and_reserve_worker` so the cache tiers no longer skip a
+/// no-headroom worker. This red-fails: H (Tier-1 cache holder) wins the second
+/// action and P never receives it.
+#[nativelink_test]
+async fn p_headroom_gate_overflows_saturated_holder_to_peer_test() -> Result<(), Error> {
+    let holder = WorkerId("holder_no_headroom".to_string());
+    let peer = WorkerId("peer_with_headroom".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            // Flag ON — enable the dispatch-count P-headroom overflow gate.
+            p_headroom_gate_enabled: true,
+            // Non-zero so the continuous load penalty / LRU load score
+            // discriminate between the workers (default-derived spec is 0).
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // Holder: 1 P-core (saturated after a single in-flight action), e_count>0 so
+    // it stays non-saturated (weighted_free>0) and remains a viable candidate.
+    let mut rx_h = setup_new_worker_with_core_counts(
+        &scheduler,
+        holder.clone(),
+        PlatformProperties::default(),
+        1, // p_core_count — one in-flight action removes all P-headroom
+        6, // e_core_count
+    )
+    .await?;
+    // Peer: 8 P-cores → ample P-headroom.
+    let mut rx_p = setup_new_worker_with_core_counts(
+        &scheduler,
+        peer.clone(),
+        PlatformProperties::default(),
+        8,
+        6,
+    )
+    .await?;
+
+    let input_root = DigestInfo::new([70u8; 32], 2048);
+
+    // Holder caches the input root and reports a moderate load so it is the
+    // viable Tier-1 winner for the FIRST (priming) action.
+    scheduler
+        .update_cached_subtrees(&holder, true, vec![input_root], vec![], vec![])
+        .await?;
+    scheduler.update_worker_load(&holder, 40, 40, 40).await?;
+    // Peer reports moderate load too; it does NOT hold the root.
+    scheduler.update_worker_load(&peer, 40, 40, 40).await?;
+
+    // Prime: dispatch one action (input_root) — holder is the sole Tier-1 cache
+    // holder → it lands on the holder, held in-flight. Holder now has
+    // running_action_infos.len() == 1 == p_core_count → NO P-headroom.
+    dispatch_and_hold_on_worker(&scheduler, &mut rx_h, input_root, [71u8; 32], 1).await?;
+
+    // Now the holder is P-saturated (dispatch-count). Report it as heavily loaded
+    // and the peer as idle so that once the cache tiers are gated off, the
+    // load-based LRU backstop prefers the peer (design A3: Phase-fallthrough
+    // ranking is load-based). Holder still non-saturated (e-cores free) so it
+    // remains a *viable* candidate the gate must actively exclude.
+    scheduler.update_worker_load(&holder, 100, 20, 60).await?;
+    scheduler.update_worker_load(&peer, 5, 5, 5).await?;
+
+    // Second action, SAME input root. Gate ON: holder has no P-headroom, peer
+    // does → holder is excluded from the cache tiers → cache tiers decline (peer
+    // is cache-cold) → LRU backstop selects the lighter-loaded peer.
+    let action_digest = DigestInfo::new([72u8; 32], 512);
+    let mut action_info = make_base_action_info(make_system_time(2), action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let mut listener = scheduler.add_action(OperationId::default(), action_info).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let winner = tokio::select! {
+        msg = rx_h.recv() => {
+            match msg.unwrap().update {
+                Some(update_for_worker::Update::StartAction(_)) => holder.clone(),
+                v => panic!("holder produced non-StartAction: {v:?}"),
+            }
+        }
+        msg = rx_p.recv() => {
+            match msg.unwrap().update {
+                Some(update_for_worker::Update::StartAction(_)) => peer.clone(),
+                v => panic!("peer produced non-StartAction: {v:?}"),
+            }
+        }
+    };
+
+    assert_eq!(
+        winner, peer,
+        "P-headroom gate (flag ON): a cache-holding worker AT its dispatch-count \
+         P-headroom limit (running == p_core_count) must LOSE the next \
+         input-sharing action to a P-headroom peer — the surplus overflowed to \
+         the saturated holder instead (2026-06-30 sole-holder domino)"
+    );
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}
+
+/// Test 3 (§7): Phase-2 lift + no-wedge (flag ON). When EVERY viable worker is at
+/// its dispatch-count P-headroom limit, the gate LIFTS (Phase 2): the
+/// cache-affinity tiers are re-enabled over the fully-saturated fleet so a cache
+/// holder still wins (locality is free when every worker is equally P-full), and
+/// dispatch always proceeds (no wedge).
+///
+/// Topology: both workers are P-saturated (`p_core_count = 1`, one in-flight
+/// each). Holder H caches the input root. Peer P is cache-cold but reports a
+/// LIGHTER load. With the gate ACTIVE, H (cache-holding, no headroom) would be
+/// excluded and the action would fall to the load-ranked LRU → the lighter peer
+/// P. The Phase-1 condition (`any_viable_has_p_headroom == false` here) LIFTS the
+/// gate so the cache tier fires and H wins on locality instead.
+///
+/// Mutation (TDD #5): drop the `any_viable_has_p_headroom` term from
+/// `p_gate_active` (gate unconditionally while the flag is on). This red-fails:
+/// the gate never lifts, H is excluded from the cache tiers even when the whole
+/// fleet is saturated, and the action falls to the lighter-loaded cache-cold
+/// peer P — losing Phase-2 locality.
+#[nativelink_test]
+async fn p_headroom_gate_phase2_lift_dispatches_when_all_saturated_test() -> Result<(), Error> {
+    let holder = WorkerId("phase2_holder".to_string());
+    let peer = WorkerId("phase2_peer".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Both workers: p_core_count = 1 (P-headroom gone after one in-flight
+    // action), e_core_count = 6 (stays non-saturated → viable).
+    let mut rx_h = setup_new_worker_with_core_counts(
+        &scheduler,
+        holder.clone(),
+        PlatformProperties::default(),
+        1,
+        6,
+    )
+    .await?;
+    let mut rx_p = setup_new_worker_with_core_counts(
+        &scheduler,
+        peer.clone(),
+        PlatformProperties::default(),
+        1,
+        6,
+    )
+    .await?;
+
+    let input_root = DigestInfo::new([80u8; 32], 2048);
+    // Holder caches the root; report a moderate load so it is the priming
+    // action's Tier-1 winner.
+    scheduler
+        .update_cached_subtrees(&holder, true, vec![input_root], vec![], vec![])
+        .await?;
+    scheduler.update_worker_load(&holder, 40, 40, 40).await?;
+    scheduler.update_worker_load(&peer, 40, 40, 40).await?;
+
+    // Saturate BOTH workers' P-headroom (one held in-flight action each). The
+    // holder's priming action shares the cached root so Tier-1 places it on the
+    // holder; the peer is primed with a cacheless action via the LRU path.
+    dispatch_and_hold_on_worker(&scheduler, &mut rx_h, input_root, [81u8; 32], 1).await?;
+    // Prime the peer: a cacheless action. With the holder now P-saturated and
+    // the gate active, this action is gated off the holder and lands on the
+    // (P-headroom-at-this-instant) peer via the fallback.
+    let prime_peer = DigestInfo::new([84u8; 32], 512);
+    let _pl = setup_action(&scheduler, prime_peer, HashMap::new(), make_system_time(2)).await?;
+    scheduler.do_try_match_for_test().await?;
+    match tokio::time::timeout(Duration::from_millis(200), rx_p.recv()).await {
+        Ok(Some(msg)) => assert!(
+            matches!(msg.update, Some(update_for_worker::Update::StartAction(_))),
+            "priming action did not land on the peer"
+        ),
+        _ => panic!("peer was not primed to P-saturation"),
+    }
+
+    // Now BOTH workers are P-saturated (running == p_core_count == 1). Make the
+    // peer strictly lighter-loaded than the holder so that IF the gate failed to
+    // lift, the load-ranked LRU fallback would pick the peer, not the holder.
+    scheduler.update_worker_load(&holder, 90, 20, 60).await?;
+    scheduler.update_worker_load(&peer, 5, 5, 5).await?;
+
+    // Third action, SAME cached root. No viable worker has P-headroom → the gate
+    // LIFTS → the cache tier fires → the holder wins on locality (Phase-2 locality
+    // preserved). And of course it dispatches (no wedge).
+    let action_digest = DigestInfo::new([83u8; 32], 512);
+    let mut action_info = make_base_action_info(make_system_time(3), action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let mut listener = scheduler.add_action(OperationId::default(), action_info).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let winner = tokio::select! {
+        msg = rx_h.recv() => match msg.and_then(|m| m.update) {
+            Some(update_for_worker::Update::StartAction(_)) => Some(holder.clone()),
+            _ => None,
+        },
+        msg = rx_p.recv() => match msg.and_then(|m| m.update) {
+            Some(update_for_worker::Update::StartAction(_)) => Some(peer.clone()),
+            _ => None,
+        },
+        () = tokio::time::sleep(Duration::from_millis(300)) => None,
+    };
+
+    assert_eq!(
+        winner,
+        Some(holder.clone()),
+        "Phase-2 lift (flag ON): every viable worker is P-saturated, so the gate \
+         must LIFT and re-enable the cache tiers → the cache holder wins on \
+         locality. Instead the action was wedged or fell to the lighter-loaded \
+         cache-cold peer (the gate did not lift on a fully-saturated fleet)"
+    );
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "Phase-2 action stuck in a non-Executing stage — the gate wedged a \
+         fully-P-saturated fleet"
+    );
+
+    Ok(())
+}
+
+/// Test 4 (§7 + A5): `p_core_count == 0` guard. A worker advertising
+/// `p_core_count == 0` must be treated as UNGATED (always has_p_headroom) so it
+/// degrades to current behavior rather than being frozen out — otherwise
+/// `0 < 0 == false` would permanently exclude it from Phase-1 cache-tier work.
+///
+/// Topology (makes the A5 guard load-bearing): a count-0 cache HOLDER H plus a
+/// count>0 cache-cold peer P WITH P-headroom. P's headroom keeps the gate ACTIVE
+/// (`any_viable_has_p_headroom == true`), so the gate does NOT lift — the A5
+/// short-circuit is the ONLY thing keeping H (count-0) in the cache tiers. P is
+/// strictly lighter-loaded than H so that IF H were gated out, the action would
+/// fall to the load-ranked LRU and land on P (not H).
+///
+/// Mutation (TDD #5): drop the `w.p_core_count == 0` short-circuit in
+/// `has_p_headroom` so a count-0 worker computes `0 < 0 == false` (no headroom).
+/// This red-fails: with the gate still active (P has headroom), H is excluded
+/// from the cache tiers and the cached action falls to the lighter-loaded peer P
+/// instead of the count-0 holder H.
+#[nativelink_test]
+async fn p_headroom_gate_p_core_count_zero_is_ungated_test() -> Result<(), Error> {
+    let holder = WorkerId("count_zero_holder".to_string());
+    let peer = WorkerId("count_nonzero_peer".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Holder H: p_core_count == 0 (legacy / Linux / Intel-Mac shape), some
+    // e-cores so it is non-saturated (viable). Holds the cached input root.
+    let mut rx_h = setup_new_worker_with_core_counts(
+        &scheduler,
+        holder.clone(),
+        PlatformProperties::default(),
+        0, // p_core_count == 0 → must be treated as UNGATED (A5)
+        6,
+    )
+    .await?;
+    // Peer P: real P cores with headroom → keeps the gate ACTIVE. Cache-cold.
+    let mut rx_p = setup_new_worker_with_core_counts(
+        &scheduler,
+        peer.clone(),
+        PlatformProperties::default(),
+        8,
+        6,
+    )
+    .await?;
+
+    let input_root = DigestInfo::new([90u8; 32], 2048);
+    scheduler
+        .update_cached_subtrees(&holder, true, vec![input_root], vec![], vec![])
+        .await?;
+    // H heavier, P lighter: if H were (wrongly) gated out, the LRU fallback would
+    // pick the lighter-loaded P, not H.
+    scheduler.update_worker_load(&holder, 80, 20, 60).await?;
+    scheduler.update_worker_load(&peer, 5, 5, 5).await?;
+
+    let action_digest = DigestInfo::new([91u8; 32], 512);
+    let mut action_info = make_base_action_info(make_system_time(1), action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let mut listener = scheduler.add_action(OperationId::default(), action_info).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let winner = tokio::select! {
+        msg = rx_h.recv() => match msg.and_then(|m| m.update) {
+            Some(update_for_worker::Update::StartAction(_)) => Some(holder.clone()),
+            _ => None,
+        },
+        msg = rx_p.recv() => match msg.and_then(|m| m.update) {
+            Some(update_for_worker::Update::StartAction(_)) => Some(peer.clone()),
+            _ => None,
+        },
+        () = tokio::time::sleep(Duration::from_millis(300)) => None,
+    };
+
+    assert_eq!(
+        winner,
+        Some(holder.clone()),
+        "p_core_count == 0 guard (A5): a count-0 worker must be treated as \
+         UNGATED (always has P-headroom) so it stays in the cache tiers even \
+         while the gate is active — the count-0 cache holder was frozen out and \
+         the action fell to the cache-cold peer instead"
+    );
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}
+
+/// Test 5 (§7): production-composition — a 10-worker synthetic fleet with one
+/// cache holder and a burst exceeding its `p_core_count`. Asserts the burst
+/// spreads to P-headroom peers rather than piling onto the (P-saturated) holder
+/// (the incident scenario). Flag ON.
+///
+/// Mutation (TDD #5): remove the gate exclusion → every burst action lands on
+/// the holder (Tier-1 cache) and the peers receive none, red-failing the "spread"
+/// assertion.
+#[nativelink_test]
+async fn p_headroom_gate_burst_spreads_across_fleet_test() -> Result<(), Error> {
+    const FLEET: usize = 10;
+    const HOLDER_P_CORES: u32 = 2;
+    // Burst larger than the holder's P capacity so the surplus MUST overflow.
+    const BURST: usize = 6;
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Worker 0 is the cache holder; workers 1..10 are cache-cold P-headroom
+    // peers. All report a light load so all are viable (non-saturated).
+    let mut rxs: Vec<(WorkerId, mpsc::UnboundedReceiver<UpdateForWorker>)> = Vec::new();
+    for i in 0..FLEET {
+        let wid = WorkerId(format!("fleet_worker_{i}"));
+        // Holder: small P count so its P-headroom is exhausted mid-burst.
+        // Peers: ample P headroom.
+        let p_cores = if i == 0 { HOLDER_P_CORES } else { 8 };
+        let rx = setup_new_worker_with_core_counts(
+            &scheduler,
+            wid.clone(),
+            PlatformProperties::default(),
+            p_cores,
+            6,
+        )
+        .await?;
+        scheduler.update_worker_load(&wid, 20, 20, 20).await?;
+        rxs.push((wid, rx));
+    }
+
+    let holder = rxs[0].0.clone();
+    let input_root = DigestInfo::new([100u8; 32], 4096);
+    scheduler
+        .update_cached_subtrees(&holder, true, vec![input_root], vec![], vec![])
+        .await?;
+
+    // Fire a burst of BURST actions all sharing the holder's cached input root.
+    let mut listeners = Vec::new();
+    for j in 0..BURST {
+        let mut hash = [0u8; 32];
+        hash[0] = 200;
+        hash[1] = j as u8;
+        let action_digest = DigestInfo::new(hash, 512);
+        let mut action_info =
+            make_base_action_info(make_system_time(10 + j as u64), action_digest);
+        Arc::make_mut(&mut action_info).input_root_digest = input_root;
+        listeners.push(scheduler.add_action(OperationId::default(), action_info).await?);
+    }
+    // Drive matching until the whole burst is placed. Each cycle places up to
+    // MATCH_CONCURRENCY actions; a few cycles cover the burst as holder headroom
+    // is consumed and later actions overflow.
+    for _ in 0..(BURST + 2) {
+        scheduler.do_try_match_for_test().await?;
+    }
+
+    // Count how many StartActions each worker received.
+    let mut holder_count = 0usize;
+    let mut peer_count = 0usize;
+    for (idx, (_wid, rx)) in rxs.iter_mut().enumerate() {
+        let mut n = 0usize;
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            if matches!(msg.update, Some(update_for_worker::Update::StartAction(_))) {
+                n += 1;
+            }
+        }
+        if idx == 0 {
+            holder_count = n;
+        } else {
+            peer_count += n;
+        }
+    }
+
+    // The holder can absorb at most its P-headroom worth of the burst; the rest
+    // MUST spread to P-headroom peers.
+    assert!(
+        holder_count <= HOLDER_P_CORES as usize,
+        "burst spread (flag ON): the cache holder absorbed {holder_count} of the \
+         {BURST}-action burst but its P-headroom is only {HOLDER_P_CORES} — the \
+         gate failed to cap the holder at its P capacity"
+    );
+    assert!(
+        peer_count > 0,
+        "burst spread (flag ON): no burst action overflowed to a P-headroom peer \
+         (holder absorbed {holder_count}) — the surplus piled onto the saturated \
+         holder instead of spreading (the 2026-06-30 incident scenario)"
+    );
+    assert_eq!(
+        holder_count + peer_count,
+        BURST,
+        "burst spread (flag ON): {} of {BURST} burst actions were placed \
+         (holder {holder_count} + peers {peer_count}) — some action wedged",
+        holder_count + peer_count
+    );
+
+    Ok(())
+}
+
+/// Test 6 (§7): flag ON must NOT regress the FL-681 indefinite-pin gate. A worker
+/// reporting indefinite-pin saturation is skipped on the cache-affinity path
+/// regardless of the P-headroom gate — the two predicates compose (both exclude).
+/// (The zero-load and FL-681 OFF-path behaviors are already covered by the
+/// existing suite, which runs with the flag defaulting OFF — the flag-OFF
+/// zero-change safety property. This test adds the flag-ON leg for FL-681.)
+///
+/// Mutation (TDD #5): removing the FL-681 `indefinite_pin_saturated` skip in
+/// `worker_is_viable` red-fails this (the saturated worker is selected and the
+/// action dispatches instead of parking in Queued).
+#[nativelink_test]
+async fn p_headroom_gate_on_preserves_fl681_indefinite_pin_skip_test() -> Result<(), Error> {
+    let worker = WorkerId("fl681_with_gate_on".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut rx = setup_new_worker_with_cas_endpoint_and_cores(
+        &scheduler,
+        worker.clone(),
+        PlatformProperties::default(),
+        "fl681-gate:50081",
+        4, // ample P-headroom so the gate itself would NOT exclude it
+        6,
+    )
+    .await?;
+
+    let input_root = DigestInfo::new([110u8; 32], 4096);
+    let mut cached_dirs = std::collections::HashSet::new();
+    cached_dirs.insert(input_root);
+    scheduler.update_cached_directories(&worker, cached_dirs).await?;
+    scheduler.update_worker_load(&worker, 10, 10, 10).await?;
+
+    // Report indefinite-pin saturation → the worker must be skipped on the
+    // cache-affinity path even with the P-headroom gate ON (it has P-headroom,
+    // so ONLY the FL-681 predicate keeps it out).
+    scheduler
+        .update_worker_indefinite_pin_saturation(&worker, true)
+        .await?;
+    tokio::task::yield_now().await;
+
+    let action_digest = DigestInfo::new([111u8; 32], 512);
+    let mut listener = setup_action_with_input_root(
+        &scheduler,
+        action_digest,
+        input_root,
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+    scheduler.do_try_match_for_test().await?;
+
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued,
+        "FL-681 with P-gate ON: an indefinite-pin-saturated worker must still be \
+         skipped on the cache-affinity path (the P-headroom gate must not shadow \
+         or bypass the FL-681 re-saturation gate) — the action dispatched to the \
+         saturated worker instead of parking in Queued"
+    );
+
+    // Clearing saturation makes the (P-headroom) cache holder selectable again.
+    scheduler
+        .update_worker_indefinite_pin_saturation(&worker, false)
+        .await?;
+    tokio::task::yield_now().await;
+    scheduler.do_try_match_for_test().await?;
+
+    let mut saw_start = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(msg)) => match msg.update {
+                Some(update_for_worker::Update::StartAction(_)) => {
+                    saw_start = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            },
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        saw_start,
+        "FL-681 with P-gate ON: the cache holder must be re-selectable once \
+         indefinite-pin saturation clears (it has P-headroom, so the P-gate does \
+         not exclude it)"
+    );
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}

@@ -587,6 +587,12 @@ struct ApiWorkerSchedulerImpl {
     /// `p_core_count = 0` (legacy / Linux / Intel Mac). Config
     /// (`SimpleSpec::assume_core_count`).
     assume_core_count: u32,
+    /// (#sched M1 rebalance) When true, the cache-affinity tiers apply the
+    /// dispatch-count P-headroom overflow gate (see
+    /// `SimpleSpec::p_headroom_gate_enabled`). Default OFF: the matcher
+    /// behaves byte-identically to the pre-gate path until an operator flips
+    /// the config flag. Read once per dispatch under the same write lock.
+    p_headroom_gate_enabled: bool,
     /// A channel to notify the matching engine that the worker pool has changed.
     worker_change_notify: Arc<Notify>,
     /// Worker registry for tracking worker liveness.
@@ -1333,6 +1339,23 @@ impl ApiWorkerSchedulerImpl {
             platform_properties.is_satisfied_by(&w.platform_properties, false)
         };
 
+        // (#sched M1 rebalance) Dispatch-count P-headroom predicate. A worker
+        // has P-headroom while its in-flight action count (the scheduler's own
+        // fresh per-worker `running_action_infos`, updated synchronously under
+        // this write lock on assign + completion — no stale worker-reported
+        // load, closes red-team R3/I5) is below its advertised P-core count.
+        // (A5) A worker advertising `p_core_count == 0` (legacy / Linux /
+        // Intel-Mac / pre-populated) is treated as UNGATED (always has
+        // headroom) so it degrades to current behavior rather than being frozen
+        // out — otherwise `0 < 0 == false` would permanently exclude it. The
+        // `u64` cast (A5) matches `running_action_infos.len(): usize` against
+        // `p_core_count: u32` without truncation.
+        let has_p_headroom = |w: &Worker| -> bool {
+            w.p_core_count == 0
+                || (w.running_action_infos.len() as u64) < u64::from(w.p_core_count)
+        };
+        let p_headroom_gate_enabled = self.p_headroom_gate_enabled;
+
         // (#sched-blend) Per-candidate free-capacity score. Replaces the
         // binary `CACHE_AFFINITY_LOAD_CUTOFF` + `best_overloaded` soft-
         // fallback in Tier 1 / Tier 1.5 with a CONTINUOUS load penalty
@@ -1388,8 +1411,18 @@ impl ApiWorkerSchedulerImpl {
         // reuses the `peek`ed fields). `false` when there are no viable
         // candidates at all (the existing all-gated fall-through, §7, still
         // owns that case via `None` from the tiers).
+        //
+        // (#sched M1 rebalance, M2) The SAME single pass also folds the
+        // P-headroom pre-scan: `any_viable_has_p_headroom` records whether ANY
+        // VIABLE worker still has dispatch-count P-headroom (Phase-1 condition).
+        // It references VIABLE workers only — a non-viable P-headroom worker
+        // must NOT suppress Phase 2 (code-reviewer C1). O(candidates), no new
+        // lock, no second pass — reuses the already-`peek`ed worker. When the
+        // gate is OFF the fold is inert and the loop is byte-identical to the
+        // pre-gate path.
         let mut viable_count: usize = 0;
         let mut all_viable_saturated = true;
+        let mut any_viable_has_p_headroom = false;
         for wid in &candidates {
             if worker_is_viable(wid) {
                 viable_count += 1;
@@ -1397,12 +1430,83 @@ impl ApiWorkerSchedulerImpl {
                     if !cap_score(w).is_saturated() {
                         all_viable_saturated = false;
                     }
+                    if has_p_headroom(w) {
+                        any_viable_has_p_headroom = true;
+                    }
                 }
             }
         }
         // If no candidate is viable, leave the tiers to return `None` (the
         // existing all-gated path), not the saturation fall-through.
         let saturation_fall_through = viable_count > 0 && all_viable_saturated;
+
+        // (#sched M1 rebalance, M1) The P-headroom overflow gate is ACTIVE only
+        // when (a) the operator enabled it AND (b) some viable worker still has
+        // P-headroom (Phase 1). When no viable worker has P-headroom the gate
+        // LIFTS (Phase 2) — selection proceeds over all viable workers via the
+        // existing LRU/MRU fallback (I2 no-wedge). OFF by default → `false` →
+        // every tier's gated predicate below is identical to `worker_is_viable`.
+        let p_gate_active = p_headroom_gate_enabled && any_viable_has_p_headroom;
+
+        // (#sched M1 rebalance, M1) The gated viability predicate the cache
+        // tiers use. Adding `has_p_headroom` here (the single check all three
+        // cache tiers call) makes Tier-1 / Tier-1.5 / Tier-2 inherit the gate
+        // with no per-tier code (I3 — locality is bounded to the P-headroom
+        // set). When `p_gate_active` is false it collapses to `worker_is_viable`
+        // exactly (flag OFF, or Phase 2). The gate does NOT touch the LRU/MRU
+        // fallback (`inner_find_worker_for_action`, load-based ranking), so a
+        // fully-P-saturated fleet still dispatches (I2, A3/A4 — the P-gate and
+        // `saturation_fall_through` are independent predicates).
+        let worker_is_viable_gated = |worker_id: &WorkerId| -> bool {
+            if !worker_is_viable(worker_id) {
+                return false;
+            }
+            if !p_gate_active {
+                return true;
+            }
+            match self.workers.0.peek(worker_id) {
+                Some(w) => has_p_headroom(w),
+                None => false,
+            }
+        };
+
+        // (#sched M1 rebalance, A2) Observability: when the gate is active, emit
+        // ONE `info!` per viable-but-P-headroom-less worker it excludes, carrying
+        // the worker's reported `p_core_load_pct` snapshot. The dispatch-count
+        // proxy over-excludes I/O-bound-heavy workers (the incident's citizen ran
+        // ~10 actions at p_count=4 while p_load ≈ 20 % — P cores actually idle);
+        // logging `p_load` lets the soak operator tell correct spreading from
+        // I/O-bound over-exclusion, and gates the v2-after-data `p_load`-
+        // refinement decision (O5) on observed data. MUST be `info!`, not
+        // `debug!`: the release build pins `release_max_level_info`, so
+        // `debug!`/`trace!` are compiled out (see the sibling
+        // `phase6_scheduler_dispatch` probe) — a `debug!` here would leave the
+        // soak's over-exclusion / WARN-1 abort analysis with ZERO production
+        // data. Fires only when the flag is ON (inert by default); at most one
+        // line per excluded worker per dispatch (bounded by fleet size), and the
+        // gate only excludes on genuine P-saturation, so this is not a hot loop.
+        // `tag` lets the soak filter these lines cheaply.
+        if p_gate_active {
+            for wid in &candidates {
+                if worker_is_viable(wid) {
+                    if let Some(w) = self.workers.0.peek(wid) {
+                        if !has_p_headroom(w) {
+                            info!(
+                                tag = "p_headroom_gate_exclusion",
+                                worker_id = %wid.0,
+                                running_actions = w.running_action_infos.len(),
+                                p_core_count = w.p_core_count,
+                                p_load = w.p_core_load_pct,
+                                %input_root_digest,
+                                "p-headroom gate excluded worker from cache tiers \
+                                 (at dispatch-count P limit); p_load shows whether \
+                                 its P cores are truly full or it is I/O-bound"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if saturation_fall_through {
             // The real #52 signal: every viable candidate is fully
             // saturated. Rate-limited at the call rate is acceptable here
@@ -1436,7 +1540,7 @@ impl ApiWorkerSchedulerImpl {
                 if let Some(w) = self.workers.0.peek(wid) {
                     let has_root_match = w.cached_directory_digests.contains(&input_root_digest);
                     let has_subtree_match = w.cached_subtree_digests.contains(&input_root_digest);
-                    if (has_root_match || has_subtree_match) && worker_is_viable(wid) {
+                    if (has_root_match || has_subtree_match) && worker_is_viable_gated(wid) {
                         let penalty = cap_score(w).load_penalty;
                         let dominated = best
                             .as_ref()
@@ -1486,7 +1590,7 @@ impl ApiWorkerSchedulerImpl {
                 let mut best: Option<(WorkerId, i64, u64, u64)> = None;
                 for wid in &candidates {
                     if let Some(w) = self.workers.0.peek(wid) {
-                        if !worker_is_viable(wid) {
+                        if !worker_is_viable_gated(wid) {
                             continue;
                         }
                         // #52 (option b2) numerator: sum DIRECT (non-
@@ -1609,7 +1713,7 @@ impl ApiWorkerSchedulerImpl {
                 let best = sorted.first().map(|(_, s)| *s).unwrap_or(0);
                 if best > 0 {
                     sorted.into_iter()
-                        .find(|(wid, score)| *score > 0 && worker_is_viable(wid))
+                        .find(|(wid, score)| *score > 0 && worker_is_viable_gated(wid))
                         .map(|(wid, score)| {
                             debug!(
                                 ?wid,
@@ -2321,6 +2425,8 @@ impl ApiWorkerScheduler {
             // for the no-config constructor path.
             512 * 1024,
             8,
+            // (#sched M1 rebalance) P-headroom gate defaults OFF.
+            false,
         )
     }
 
@@ -2337,6 +2443,7 @@ impl ApiWorkerScheduler {
         worker_tls_config: Option<ClientTlsConfig>,
         load_byte_cost: u64,
         assume_core_count: u32,
+        p_headroom_gate_enabled: bool,
     ) -> Arc<Self> {
         let memory_store_threshold = cas_store
             .as_ref()
@@ -2387,6 +2494,7 @@ impl ApiWorkerScheduler {
                 allocation_strategy,
                 load_byte_cost,
                 assume_core_count,
+                p_headroom_gate_enabled,
                 worker_change_notify,
                 worker_registry: worker_registry.clone(),
                 shutting_down: false,
@@ -6720,6 +6828,7 @@ mod tests {
             None,
             512 * 1024,
             8,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         );
 
         // First call: cache miss, inline resolution succeeds and caches.
@@ -6849,6 +6958,7 @@ mod tests {
             None,
             512 * 1024,
             8,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         );
 
         // First, verify guard wiring against the real shared map. Pre-insert
@@ -6979,6 +7089,7 @@ mod tests {
             None,
             512 * 1024,
             8,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         )
     }
 
@@ -8019,6 +8130,7 @@ mod b1_lock_decouple_tests {
             None,
             load_byte_cost,
             8,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         )
     }
 
@@ -8042,6 +8154,7 @@ mod b1_lock_decouple_tests {
             None,
             512 * 1024,
             assume_core_count,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         )
     }
 
@@ -8939,6 +9052,7 @@ mod b1_lock_decouple_tests {
                 None,
                 512 * 1024,
                 8,
+                false, // (#sched M1 rebalance) p_headroom_gate OFF
             );
             // X_ROOT: Tier-1 root match (cached_directory_digests ∋ input_root),
             // moderately loaded.
@@ -9952,6 +10066,7 @@ mod deferred_proto_clone_tests {
             None,
             512 * 1024,
             8,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         )
     }
 
@@ -9968,6 +10083,7 @@ mod deferred_proto_clone_tests {
             None,
             512 * 1024,
             8,
+            false, // (#sched M1 rebalance) p_headroom_gate OFF
         )
     }
 

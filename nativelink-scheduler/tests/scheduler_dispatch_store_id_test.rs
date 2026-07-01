@@ -123,6 +123,7 @@ fn make_scheduler() -> Arc<ApiWorkerScheduler> {
         // (#sched-blend) blend tunables — defaults (this path doesn't score).
         512 * 1024,
         8,
+        false, // (#sched M1 rebalance) p_headroom_gate OFF
     )
 }
 

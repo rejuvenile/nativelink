@@ -105,6 +105,7 @@ fn make_scheduler() -> Arc<ApiWorkerScheduler> {
         None,
         512 * 1024,
         8,
+        false, // (#sched M1 rebalance) p_headroom_gate OFF
     )
 }
 
