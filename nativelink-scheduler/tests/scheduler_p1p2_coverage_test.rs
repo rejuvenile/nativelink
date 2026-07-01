@@ -468,17 +468,23 @@ async fn selection_uses_last_reported_load_after_reports_stop_test() -> Result<(
 
     let light = WorkerId("stale_light".to_string());
     let heavy = WorkerId("stale_heavy".to_string());
-    let mut rx_light = setup_new_worker_with_core_counts(
+    // Add HEAVY first so it is the LRU-OLDEST. This isolates the STALE-LOAD
+    // mechanism: under a load-blind selection the LRU tiebreak returns the
+    // oldest (heavy), so a load-blind regression red-fails; only a genuine
+    // stale-load ranking picks the lighter (newer) worker. If `light` were
+    // added first it would win on BOTH lower load AND LRU-oldest, so the
+    // assertion couldn't distinguish stale-load from LRU (testing-czar 0c299807).
+    let mut rx_heavy = setup_new_worker_with_core_counts(
         &scheduler,
-        light.clone(),
+        heavy.clone(),
         PlatformProperties::default(),
         4,
         6,
     )
     .await?;
-    let mut rx_heavy = setup_new_worker_with_core_counts(
+    let mut rx_light = setup_new_worker_with_core_counts(
         &scheduler,
-        heavy.clone(),
+        light.clone(),
         PlatformProperties::default(),
         4,
         6,
