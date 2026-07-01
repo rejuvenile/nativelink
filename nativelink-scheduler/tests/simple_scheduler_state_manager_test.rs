@@ -127,6 +127,28 @@ fn make_action_info(seed: u8, priority: i32) -> Arc<ActionInfo> {
     })
 }
 
+/// Like `make_action_info` but with an explicit `insert_timestamp` — used by
+/// the P1-1 priority/FIFO ordering test to give equal-priority actions
+/// DISTINCT insert times (the second-tier sort key, awaited_action.rs:232).
+fn make_action_info_ts(seed: u8, priority: i32, insert_timestamp: SystemTime) -> Arc<ActionInfo> {
+    let mut hash = [0u8; 32];
+    hash[0] = seed;
+    Arc::new(ActionInfo {
+        command_digest: DigestInfo::new([0u8; 32], 0),
+        input_root_digest: DigestInfo::new([0u8; 32], 0),
+        timeout: Duration::from_secs(1),
+        platform_properties: std::collections::HashMap::new(),
+        priority,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp,
+        unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+            instance_name: "test_instance".to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: DigestInfo::new(hash, 1),
+        }),
+    })
+}
+
 /// Test-only `AwaitedActionDb` wrapping a shared `Arc<MemoryAwaitedActionDb>`.
 ///
 /// Purpose: (1) let the test read `attempts` (a `pub` field on `AwaitedAction`,
@@ -273,6 +295,32 @@ impl Fixture {
             .add_action(
                 OperationId::default(),
                 make_action_info(seed, priority),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("seed add_action must succeed");
+        let awaited = subscriber.borrow().await.expect("seed borrow must succeed");
+        assert_eq!(
+            awaited.state().stage,
+            ActionStage::Queued,
+            "seeded action must start Queued"
+        );
+        awaited.operation_id().clone()
+    }
+
+    /// Like `seed_queued_with_priority` but with an explicit `insert_timestamp`
+    /// so the P1-1 test can distinguish equal-priority actions by insert order.
+    async fn seed_queued_full(
+        &self,
+        seed: u8,
+        priority: i32,
+        insert_timestamp: SystemTime,
+    ) -> OperationId {
+        let subscriber = self
+            .db
+            .add_action(
+                OperationId::default(),
+                make_action_info_ts(seed, priority, insert_timestamp),
                 Duration::from_secs(60),
             )
             .await
@@ -750,4 +798,79 @@ async fn drops_missing_actions() -> Result<(), Error> {
         "Unable to update action due to it being missing, probably dropped operation_id=c458c1f4-136e-486d-b9cd-cea07460cde4"
     ));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P1-1 — priority ordering + FIFO tiebreak (queue-front sort)
+// ---------------------------------------------------------------------------
+
+/// The Queued sort order is: (1) higher `priority` first, (2) among equal
+/// priorities, the EARLIER `insert_timestamp` first (FIFO). This is the order
+/// the matcher consumes (`SimpleScheduler::get_queued_operations` ->
+/// `filter_operations(Queued, Desc)` -> `get_range_of_actions(Queued, ...)`),
+/// so the first-served action is the queue front here.
+///
+/// `AwaitedActionSortKey` (awaited_action.rs:228-233,249-269) packs `priority`
+/// (bias-shifted) in the high bytes and the (bit-inverted) `insert_timestamp`
+/// in the low bytes, so priority dominates and, within a priority, a smaller
+/// timestamp yields a larger key (earlier = higher). We read the order back
+/// through the REAL `filter_operations` Desc sort path.
+#[nativelink_test]
+async fn queued_order_is_priority_then_fifo_by_insert_timestamp() {
+    let fx = Fixture::new(0);
+
+    // Seed OUT of final order to prove the sort, not insertion luck:
+    //   - high  (priority 100, ts=200)   -> must be FIRST (top priority)
+    //   - mid_late (priority 0, ts=300)  -> equal-priority peer, LATER insert
+    //   - mid_early (priority 0, ts=100) -> equal-priority peer, EARLIER insert
+    //   - low  (priority -50, ts=50)     -> must be LAST (lowest priority),
+    //                                       even though it was inserted earliest
+    let ts = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let high = fx.seed_queued_full(0x10, 100, ts(200)).await;
+    let mid_late = fx.seed_queued_full(0x11, 0, ts(300)).await;
+    let mid_early = fx.seed_queued_full(0x12, 0, ts(100)).await;
+    let low = fx.seed_queued_full(0x13, -50, ts(50)).await;
+
+    let order = fx.queued_order_desc().await;
+
+    // Priority dominates: high first, low last.
+    assert_eq!(
+        order.first(),
+        Some(&high),
+        "the highest-priority action (100) must be at the queue front — priority \
+         is the primary sort key (awaited_action.rs:231); got order {order:?}"
+    );
+    assert_eq!(
+        order.last(),
+        Some(&low),
+        "the lowest-priority action (-50) must be at the queue tail even though \
+         it was inserted earliest — priority outranks insert order; got {order:?}"
+    );
+
+    // FIFO tiebreak among the two equal-priority (0) actions: the EARLIER
+    // insert_timestamp (mid_early, ts=100) must precede the LATER (mid_late,
+    // ts=300).
+    let pos_early = order
+        .iter()
+        .position(|o| o == &mid_early)
+        .expect("mid_early must be in the queued order");
+    let pos_late = order
+        .iter()
+        .position(|o| o == &mid_late)
+        .expect("mid_late must be in the queued order");
+    assert!(
+        pos_early < pos_late,
+        "equal-priority actions must be ordered FIFO by insert_timestamp \
+         (earlier first): mid_early (ts=100, pos {pos_early}) must precede \
+         mid_late (ts=300, pos {pos_late}) — the second-tier sort key \
+         (awaited_action.rs:232) was not honored; order {order:?}"
+    );
+
+    // Full expected order, pinned exactly.
+    assert_eq!(
+        order,
+        vec![high.clone(), mid_early.clone(), mid_late.clone(), low.clone()],
+        "queued order must be [high(p100), mid_early(p0 ts100), \
+         mid_late(p0 ts300), low(p-50)] — priority-desc then insert-asc"
+    );
 }
