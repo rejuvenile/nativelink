@@ -6614,3 +6614,399 @@ async fn p_headroom_gate_on_preserves_fl681_indefinite_pin_skip_test() -> Result
 
     Ok(())
 }
+
+// ─────────────────────── (#sched M1 rebalance §11 v2.2) ───────────────────────
+// SOFT P-headroom-first fallback ranking. The M1 cache-tier gate excludes a
+// no-headroom holder on FRESH dispatch-count, but the overflow is PLACED by the
+// LRU/MRU fallback, which ranked purely on STALE p_load — so in the signal-
+// disagreement case (holder P-saturated by dispatch-count yet reporting LOWER
+// p_load than a P-headroom peer) the overflow routed BACK to the excluded holder
+// (red-team RECONSIDER-PREMISE). v2.2 makes the fallback sort key a tuple
+// `(no_p_headroom_tier, effective_load_score)` — a SOFT preference: P-headroom
+// workers rank first, but no-headroom workers stay eligible (win when the fleet
+// is fully P-saturated → no wedge). Flag OFF → tier always false → byte-identical.
+
+/// v2.2 Test 1 — THE disagreement test. Holder H holds the cached root, is
+/// P-saturated (running >= p_core_count), and reports a LOWER p_load than a
+/// P-headroom peer P. Flag ON. The M1 gate excludes H from the cache tiers; the
+/// overflow must land on the P-headroom peer P (tier 0), NOT route back to the
+/// lower-p_load holder H (tier 1) via the fallback's stale-p_load ranking.
+///
+/// Mutation (TDD #5): revert the fallback sort key to single-tier
+/// (`effective_load_score` only — drop the `no_p_headroom_tier` element). This
+/// red-fails: the fallback then prefers H's lower p_load and the overflow routes
+/// back to the excluded, dispatch-count-saturated holder.
+#[nativelink_test]
+async fn v22_fallback_prefers_p_headroom_peer_over_lower_pload_holder_test()
+-> Result<(), Error> {
+    let holder = WorkerId("v22_holder_low_pload".to_string());
+    let peer = WorkerId("v22_peer_high_pload".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Holder H: 1 P-core (saturated after one in-flight action), e_count>0 so it
+    // stays non-saturated (viable). Peer P: ample P-headroom.
+    let mut rx_h = setup_new_worker_with_core_counts(
+        &scheduler,
+        holder.clone(),
+        PlatformProperties::default(),
+        1,
+        6,
+    )
+    .await?;
+    let mut rx_p = setup_new_worker_with_core_counts(
+        &scheduler,
+        peer.clone(),
+        PlatformProperties::default(),
+        8,
+        6,
+    )
+    .await?;
+
+    let input_root = DigestInfo::new([120u8; 32], 2048);
+    scheduler
+        .update_cached_subtrees(&holder, true, vec![input_root], vec![], vec![])
+        .await?;
+    // Prime: dispatch one cached action → lands on H (sole Tier-1 holder), held
+    // in-flight → H now running==1==p_core_count → NO P-headroom.
+    scheduler.update_worker_load(&holder, 40, 40, 40).await?;
+    scheduler.update_worker_load(&peer, 40, 40, 40).await?;
+    dispatch_and_hold_on_worker(&scheduler, &mut rx_h, input_root, [121u8; 32], 1).await?;
+
+    // THE disagreement: holder reports LOWER p_load (20) than the P-headroom peer
+    // (60). Fresh dispatch-count says H is saturated; stale p_load says H is
+    // lighter. The M1 gate excludes H from the cache tiers; the fallback must
+    // steer the overflow to the P-headroom PEER (tier 0) despite its higher
+    // p_load — NOT back to H (tier 1) on its lower p_load.
+    // update_worker_load args are (cpu, p_core, e_core): set p_core so
+    // effective_load_score = holder 20 < peer 60 (the stale-p_load "H is lighter"
+    // signal the tier must override).
+    scheduler.update_worker_load(&holder, 20, 20, 0).await?;
+    scheduler.update_worker_load(&peer, 60, 60, 0).await?;
+
+    let action_digest = DigestInfo::new([122u8; 32], 512);
+    let mut action_info = make_base_action_info(make_system_time(2), action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let mut listener = scheduler.add_action(OperationId::default(), action_info).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let winner = tokio::select! {
+        msg = rx_h.recv() => match msg.and_then(|m| m.update) {
+            Some(update_for_worker::Update::StartAction(_)) => Some(holder.clone()),
+            _ => None,
+        },
+        msg = rx_p.recv() => match msg.and_then(|m| m.update) {
+            Some(update_for_worker::Update::StartAction(_)) => Some(peer.clone()),
+            _ => None,
+        },
+        () = tokio::time::sleep(Duration::from_millis(300)) => None,
+    };
+
+    assert_eq!(
+        winner,
+        Some(peer.clone()),
+        "v2.2 disagreement (flag ON): the M1 gate excludes the P-saturated cache \
+         holder on FRESH dispatch-count, but the holder reports a LOWER (stale) \
+         p_load than the P-headroom peer. The soft P-headroom-first fallback must \
+         steer the overflow to the P-headroom PEER (tier 0), not route it back to \
+         the excluded holder on its stale-lower p_load (tier 1)"
+    );
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    Ok(())
+}
+
+/// v2.2 Test 2 — no-wedge under the refinement. Every viable worker is
+/// P-saturated (running >= p_core_count), flag ON. The soft tier is NOT a filter:
+/// no-headroom workers stay eligible (all in tier 1), so the fallback still
+/// dispatches. This is the load-bearing constraint — a HARD filter here would
+/// reintroduce the TLC-proven Phase2NoLift wedge.
+///
+/// Mutation (TDD #5): turn the soft tier into a HARD filter (drop no-headroom
+/// workers from the fallback candidate `Vec` when the flag is on). This red-fails:
+/// the fully-saturated fleet yields zero fallback candidates → the action wedges.
+#[nativelink_test]
+async fn v22_fallback_no_wedge_when_all_p_saturated_test() -> Result<(), Error> {
+    let worker_a = WorkerId("v22_wedge_a".to_string());
+    let worker_b = WorkerId("v22_wedge_b".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // Both p_core_count=1, e_count=6: one in-flight action removes P-headroom
+    // while keeping them non-saturated (viable). No cache → pure fallback.
+    let mut rx_a = setup_new_worker_with_core_counts(
+        &scheduler,
+        worker_a.clone(),
+        PlatformProperties::default(),
+        1,
+        6,
+    )
+    .await?;
+    let mut rx_b = setup_new_worker_with_core_counts(
+        &scheduler,
+        worker_b.clone(),
+        PlatformProperties::default(),
+        1,
+        6,
+    )
+    .await?;
+    scheduler.update_worker_load(&worker_a, 40, 40, 40).await?;
+    scheduler.update_worker_load(&worker_b, 40, 40, 40).await?;
+
+    let dummy_root = DigestInfo::new([130u8; 32], 1024);
+    dispatch_and_hold_on_worker(&scheduler, &mut rx_a, dummy_root, [131u8; 32], 1).await?;
+    dispatch_and_hold_on_worker(&scheduler, &mut rx_b, dummy_root, [132u8; 32], 2).await?;
+
+    // Both are now P-saturated (running==1==p_core_count). A cacheless action
+    // must STILL dispatch via the soft tier-1 (no-headroom stays eligible).
+    let action_digest = DigestInfo::new([133u8; 32], 512);
+    let mut listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), make_system_time(3)).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let dispatched = tokio::select! {
+        msg = rx_a.recv() => matches!(
+            msg.and_then(|m| m.update),
+            Some(update_for_worker::Update::StartAction(_))
+        ),
+        msg = rx_b.recv() => matches!(
+            msg.and_then(|m| m.update),
+            Some(update_for_worker::Update::StartAction(_))
+        ),
+        () = tokio::time::sleep(Duration::from_millis(300)) => false,
+    };
+
+    assert!(
+        dispatched,
+        "v2.2 no-wedge (flag ON): every viable worker is P-saturated, so the soft \
+         P-headroom-first tier must keep them ELIGIBLE (tier 1) and the fallback \
+         must still dispatch — a HARD filter would wedge the fully-saturated fleet"
+    );
+    assert_eq!(
+        listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "v2.2 no-wedge: the fully-P-saturated fallback action stuck in a \
+         non-Executing stage"
+    );
+
+    Ok(())
+}
+
+/// v2.2 Test 3 (G1, testing-czar) — the A2 exclusion log actually EMITS at INFO
+/// with the `p_load` field, so a future info!→debug! demotion (which
+/// `release_max_level_info` would compile out of prod) is caught. Drives an M1
+/// exclusion (holder P-saturated + cache-holding + a P-headroom peer), then
+/// asserts the tagged line fired at INFO carrying `p_load=`.
+///
+/// Mutation (TDD #5): change the A2 `info!` to `debug!`, OR drop the `p_load`
+/// field. Either red-fails (no INFO-level line with the tag + p_load field).
+#[nativelink_test]
+async fn v22_a2_exclusion_log_emits_at_info_with_pload_test() -> Result<(), Error> {
+    let holder = WorkerId("v22_a2_holder".to_string());
+    let peer = WorkerId("v22_a2_peer".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            p_headroom_gate_enabled: true,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut rx_h = setup_new_worker_with_core_counts(
+        &scheduler,
+        holder.clone(),
+        PlatformProperties::default(),
+        1,
+        6,
+    )
+    .await?;
+    let _rx_p = setup_new_worker_with_core_counts(
+        &scheduler,
+        peer.clone(),
+        PlatformProperties::default(),
+        8,
+        6,
+    )
+    .await?;
+
+    let input_root = DigestInfo::new([140u8; 32], 2048);
+    scheduler
+        .update_cached_subtrees(&holder, true, vec![input_root], vec![], vec![])
+        .await?;
+    scheduler.update_worker_load(&holder, 40, 40, 40).await?;
+    scheduler.update_worker_load(&peer, 40, 40, 40).await?;
+    // Saturate H's P-headroom (holds the cached root).
+    dispatch_and_hold_on_worker(&scheduler, &mut rx_h, input_root, [141u8; 32], 1).await?;
+    // Keep peer with P-headroom (gate active), holder now excluded on next match.
+    scheduler.update_worker_load(&holder, 25, 0, 25).await?;
+    scheduler.update_worker_load(&peer, 5, 5, 5).await?;
+
+    // Second cached action → the gate is active and excludes H → A2 log emits.
+    let action_digest = DigestInfo::new([142u8; 32], 512);
+    let mut action_info = make_base_action_info(make_system_time(2), action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let _listener = scheduler.add_action(OperationId::default(), action_info).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    // Assert the A2 exclusion line fired AT INFO carrying the tag + p_load field.
+    // logs_assert hands us level-prefixed formatted lines; a single line must
+    // carry INFO, the tag, and the structured `p_load=` field (not just the
+    // message text) — so an info!→debug! demotion OR a dropped p_load field is
+    // caught.
+    logs_assert(|lines: &[&str]| {
+        if lines.iter().any(|line| {
+            line.contains("INFO")
+                && line.contains("p_headroom_gate_exclusion")
+                && line.contains("p_load=")
+        }) {
+            Ok(())
+        } else {
+            Err(
+                "A2 p_headroom_gate_exclusion line not emitted at INFO with p_load= field"
+                    .to_string(),
+            )
+        }
+    });
+
+    Ok(())
+}
+
+/// v2.2 Test 4 (G2, testing-czar) — flag-ON-but-Phase-2 == flag-OFF byte-
+/// identical. On a fully-P-saturated fleet (Phase 2, gate lifted) the SAME worker
+/// must be picked with the flag ON as with the flag OFF for an identical topology
+/// — proving the refinement collapses to the shipped behavior once no worker has
+/// P-headroom (the soft tier is uniform → key reduces to load only).
+///
+/// Mutation (TDD #5): none needed as a red-fail here — this is an equivalence
+/// assertion (ON == OFF under Phase 2). It is protected by the v2.2 Test-1
+/// disagreement mutation (which proves the tier is load-bearing in Phase 1) and
+/// the flag-OFF byte-identical property (the whole existing suite).
+#[nativelink_test]
+async fn v22_phase2_flag_on_equals_flag_off_test() -> Result<(), Error> {
+    // Identical topology, run once with flag ON and once with flag OFF; assert
+    // the same worker wins. Both workers P-saturated (Phase 2), distinct loads so
+    // the load ranking (not iteration order) decides deterministically.
+    async fn run(flag: bool) -> Result<WorkerId, Error> {
+        let light = WorkerId("v22_p2_light".to_string());
+        let heavy = WorkerId("v22_p2_heavy".to_string());
+        let task_change_notify = Arc::new(Notify::new());
+        let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+            &SimpleSpec {
+                p_headroom_gate_enabled: flag,
+                load_byte_cost: 512 * 1024,
+                ..Default::default()
+            },
+            memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+            || async move {},
+            task_change_notify,
+            MockInstantWrapped::default,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut rx_light = setup_new_worker_with_core_counts(
+            &scheduler,
+            light.clone(),
+            PlatformProperties::default(),
+            1,
+            6,
+        )
+        .await?;
+        let mut rx_heavy = setup_new_worker_with_core_counts(
+            &scheduler,
+            heavy.clone(),
+            PlatformProperties::default(),
+            1,
+            6,
+        )
+        .await?;
+        scheduler.update_worker_load(&light, 40, 40, 40).await?;
+        scheduler.update_worker_load(&heavy, 40, 40, 40).await?;
+
+        // Saturate BOTH P-headroom (Phase 2 for the flag-ON run).
+        let dummy_root = DigestInfo::new([150u8; 32], 1024);
+        dispatch_and_hold_on_worker(&scheduler, &mut rx_light, dummy_root, [151u8; 32], 1).await?;
+        dispatch_and_hold_on_worker(&scheduler, &mut rx_heavy, dummy_root, [152u8; 32], 2).await?;
+
+        // Distinct loads: `light` strictly lighter → wins on load in BOTH runs
+        // (ON: both tier 1, ranked by load; OFF: single tier, ranked by load).
+        scheduler.update_worker_load(&light, 10, 0, 10).await?;
+        scheduler.update_worker_load(&heavy, 90, 0, 90).await?;
+
+        let action_digest = DigestInfo::new([153u8; 32], 512);
+        let _l = setup_action(&scheduler, action_digest, HashMap::new(), make_system_time(3)).await?;
+        scheduler.do_try_match_for_test().await?;
+
+        let winner = tokio::select! {
+            msg = rx_light.recv() => match msg.and_then(|m| m.update) {
+                Some(update_for_worker::Update::StartAction(_)) => light.clone(),
+                v => panic!("light produced non-StartAction: {v:?}"),
+            },
+            msg = rx_heavy.recv() => match msg.and_then(|m| m.update) {
+                Some(update_for_worker::Update::StartAction(_)) => heavy.clone(),
+                v => panic!("heavy produced non-StartAction: {v:?}"),
+            },
+            () = tokio::time::sleep(Duration::from_millis(300)) => {
+                panic!("Phase-2 fallback wedged (no worker received the action)")
+            }
+        };
+        Ok(winner)
+    }
+
+    let winner_on = run(true).await?;
+    let winner_off = run(false).await?;
+    assert_eq!(
+        winner_on, winner_off,
+        "v2.2 G2 equivalence: on a fully-P-saturated fleet (Phase 2) the flag-ON \
+         fallback must pick the SAME worker as flag-OFF — the soft tier is uniform \
+         when no worker has P-headroom, so the key reduces to load only (both runs \
+         must pick the lighter-loaded worker)"
+    );
+
+    Ok(())
+}

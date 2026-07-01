@@ -533,6 +533,24 @@ fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32, has_repor
     }
 }
 
+/// (#sched M1 rebalance) Dispatch-count P-headroom predicate. A worker has
+/// P-headroom while its in-flight action count — the scheduler's own fresh
+/// per-worker `running_action_infos`, updated synchronously under the write
+/// lock on assign + completion (no stale worker-reported load, closes red-team
+/// R3 / invariant I5) — is below its advertised P-core count.
+///
+/// (A5) A worker advertising `p_core_count == 0` (legacy / Linux / Intel-Mac /
+/// pre-populated) is treated as UNGATED (always has headroom) so it degrades to
+/// current behavior rather than being frozen out — otherwise `0 < 0 == false`
+/// would permanently exclude it. The `u64` cast matches
+/// `running_action_infos.len(): usize` against `p_core_count: u32` without
+/// truncation. Shared by the cache-tier gate (`inner_find_and_reserve_worker`)
+/// and the fallback's soft P-headroom-first tier (`inner_find_worker_for_action`,
+/// §11 v2.2).
+fn worker_has_p_headroom(w: &Worker) -> bool {
+    w.p_core_count == 0 || (w.running_action_infos.len() as u64) < u64::from(w.p_core_count)
+}
+
 #[derive(Debug)]
 struct Workers(LruCache<WorkerId, Worker>);
 
@@ -1146,34 +1164,65 @@ impl ApiWorkerSchedulerImpl {
         // multiple consecutive actions all matching the same "least recently used" worker.
         let workers_iter = self.workers.iter();
 
-        // Collect viable candidates with their effective load score for selection.
-        // effective_load_score produces a two-tier ranking: idle P-cores beat
-        // idle E-cores, and aggregate-only workers compete in the P-core tier.
-        let viable: Vec<_> = match self.allocation_strategy {
+        // (#sched M1 rebalance §11 v2.2) SOFT P-headroom-first ranking. The
+        // per-worker sort key is a TUPLE `(p_gate_tier, effective_load_score)`:
+        //   - `p_gate_tier`: when the P-headroom gate is enabled, workers WITHOUT
+        //     dispatch-count P-headroom sort into tier `true`(=1), AFTER
+        //     P-headroom workers (tier `false`=0). This steers an M1 cache-tier
+        //     overflow to a P-headroom PEER even when the excluded holder reports
+        //     a LOWER (stale) `p_load` — the RECONSIDER-PREMISE the fresh
+        //     dispatch-count gate would otherwise lose to the fallback's stale
+        //     `p_load` ranking. When the flag is OFF the tier is unconditionally
+        //     `false`, so the key reduces to `(false, load)` for every worker →
+        //     single-tier by load, BYTE-IDENTICAL to the pre-v2.2 path.
+        //   - `effective_load_score`: the EXISTING within-tier ranking, unchanged
+        //     (idle P-cores beat idle E-cores; aggregate-only competes in the
+        //     P-core tier). Applied WITHIN each tier.
+        // SOFT, not a filter: tier-`true` workers stay in the candidate `Vec` and
+        // win when tier `false` is empty (fully-P-saturated fleet / Phase 2), so
+        // dispatch always proceeds — NO wedge (I2; the M1 gate's Phase-2 lift and
+        // this fallback are the two mechanisms that jointly guarantee no-wedge).
+        let p_gate_enabled = self.p_headroom_gate_enabled;
+        let sort_key = |w: &Worker| -> (bool, u64) {
+            let tier = if p_gate_enabled {
+                !worker_has_p_headroom(w)
+            } else {
+                false
+            };
+            (
+                tier,
+                effective_load_score(
+                    w.p_core_load_pct,
+                    w.e_core_load_pct,
+                    w.cpu_load_pct,
+                    w.has_reported_load,
+                ),
+            )
+        };
+        let viable: Vec<(WorkerId, (bool, u64))> = match self.allocation_strategy {
             WorkerAllocationStrategy::LeastRecentlyUsed => workers_iter
                 .rev()
                 .filter(|(worker_id, _)| candidates.contains(worker_id))
                 .filter(|pair| worker_matches(pair))
-                .map(|(_, w)| (w.id.clone(), effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load)))
+                .map(|(_, w)| (w.id.clone(), sort_key(w)))
                 .collect(),
             WorkerAllocationStrategy::MostRecentlyUsed => workers_iter
                 .filter(|(worker_id, _)| candidates.contains(worker_id))
                 .filter(|pair| worker_matches(pair))
-                .map(|(_, w)| (w.id.clone(), effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load)))
+                .map(|(_, w)| (w.id.clone(), sort_key(w)))
                 .collect(),
         };
 
-        // Pick the lightest-loaded worker among viable candidates.
-        // Workers with score == u64::MAX (unknown) are sorted last.
-        // Falls back to LRU/MRU order when no workers have reported load.
-        let mut worker_id = if viable.iter().any(|(_, score)| *score < u64::MAX) {
-            viable
-                .iter()
-                .min_by_key(|(_, score)| *score)
-                .map(|(id, _)| id.clone())
-        } else {
-            viable.first().map(|(id, _)| id.clone())
-        };
+        // Pick the best worker by the tuple key: P-headroom tier first, then
+        // lowest load within tier. `min_by_key` returns the FIRST minimum, so on
+        // an all-unknown-load fleet (every load score == u64::MAX) it degrades to
+        // LRU/MRU iteration order within the winning tier — identical to the
+        // prior `first()` fallback when the flag is OFF (all keys share the same
+        // `(false, u64::MAX)`, so the first candidate wins).
+        let mut worker_id = viable
+            .iter()
+            .min_by_key(|(_, key)| *key)
+            .map(|(id, _)| id.clone());
 
         // (#37 + F4 fleet fail-open, §5 case 3a) Nothing viable: if there ARE
         // otherwise-viable candidates that were excluded ONLY by a pressure
@@ -1229,22 +1278,24 @@ impl ApiWorkerSchedulerImpl {
 
         // Log load-aware selection decision.
         if let Some(ref wid) = worker_id {
+            // (§11 v2.2) each entry is (short_id, (no_p_headroom_tier, load_score)).
             let viable_loads: Vec<_> = viable
                 .iter()
-                .map(|(id, score)| {
+                .map(|(id, key)| {
                     let short_id = id.0.chars().take(12).collect::<String>();
-                    (short_id, *score)
+                    (short_id, *key)
                 })
                 .collect();
-            let winner_score = viable
+            let winner_key = viable
                 .iter()
                 .find(|(id, _)| id == wid)
-                .map(|(_, s)| *s)
-                .unwrap_or(0);
+                .map(|(_, k)| *k)
+                .unwrap_or((false, 0));
             debug!(
                 candidates = viable.len(),
                 worker_id = %wid,
-                winner_load_score = winner_score,
+                winner_no_p_headroom_tier = winner_key.0,
+                winner_load_score = winner_key.1,
                 ?viable_loads,
                 "load-aware worker selection"
             );
@@ -1339,21 +1390,9 @@ impl ApiWorkerSchedulerImpl {
             platform_properties.is_satisfied_by(&w.platform_properties, false)
         };
 
-        // (#sched M1 rebalance) Dispatch-count P-headroom predicate. A worker
-        // has P-headroom while its in-flight action count (the scheduler's own
-        // fresh per-worker `running_action_infos`, updated synchronously under
-        // this write lock on assign + completion — no stale worker-reported
-        // load, closes red-team R3/I5) is below its advertised P-core count.
-        // (A5) A worker advertising `p_core_count == 0` (legacy / Linux /
-        // Intel-Mac / pre-populated) is treated as UNGATED (always has
-        // headroom) so it degrades to current behavior rather than being frozen
-        // out — otherwise `0 < 0 == false` would permanently exclude it. The
-        // `u64` cast (A5) matches `running_action_infos.len(): usize` against
-        // `p_core_count: u32` without truncation.
-        let has_p_headroom = |w: &Worker| -> bool {
-            w.p_core_count == 0
-                || (w.running_action_infos.len() as u64) < u64::from(w.p_core_count)
-        };
+        // (#sched M1 rebalance) Dispatch-count P-headroom predicate (module fn
+        // `worker_has_p_headroom`, shared with the fallback's soft tier §11).
+        let has_p_headroom = worker_has_p_headroom;
         let p_headroom_gate_enabled = self.p_headroom_gate_enabled;
 
         // (#sched-blend) Per-candidate free-capacity score. Replaces the
@@ -1420,9 +1459,22 @@ impl ApiWorkerSchedulerImpl {
         // lock, no second pass — reuses the already-`peek`ed worker. When the
         // gate is OFF the fold is inert and the loop is byte-identical to the
         // pre-gate path.
+        //
+        // (#sched M1 rebalance, A2 fold) The same pass also BUFFERS the
+        // viable-but-no-P-headroom workers (id + observability snapshot) so the
+        // A2 exclusion log can be emitted below WITHOUT a third O(candidates)
+        // pass (perf S2 / code S2). Ordering caveat: `p_gate_active` is not known
+        // until this loop finishes (it depends on `any_viable_has_p_headroom`),
+        // so we buffer here and emit after. The buffer is only populated when the
+        // flag is ON (`p_headroom_gate_enabled`); flag OFF pushes nothing, so
+        // there is zero extra alloc on the default path.
+        // CAPPED AT candidates.len(): one entry per viable-no-headroom candidate,
+        // bounded by the platform-matched candidate set (fleet size); flag-ON,
+        // dev/soak-only observability, dropped at end of dispatch.
         let mut viable_count: usize = 0;
         let mut all_viable_saturated = true;
         let mut any_viable_has_p_headroom = false;
+        let mut p_gated_excluded: Vec<(WorkerId, usize, u32, u32)> = Vec::new();
         for wid in &candidates {
             if worker_is_viable(wid) {
                 viable_count += 1;
@@ -1432,6 +1484,16 @@ impl ApiWorkerSchedulerImpl {
                     }
                     if has_p_headroom(w) {
                         any_viable_has_p_headroom = true;
+                    } else if p_headroom_gate_enabled {
+                        // Buffer for the A2 exclusion log (emitted after
+                        // `p_gate_active` is known). Snapshot the fields now while
+                        // the worker is `peek`ed — cheap owned copies.
+                        p_gated_excluded.push((
+                            wid.clone(),
+                            w.running_action_infos.len(),
+                            w.p_core_count,
+                            w.p_core_load_pct,
+                        ));
                     }
                 }
             }
@@ -1482,29 +1544,24 @@ impl ApiWorkerSchedulerImpl {
         // `debug!`/`trace!` are compiled out (see the sibling
         // `phase6_scheduler_dispatch` probe) — a `debug!` here would leave the
         // soak's over-exclusion / WARN-1 abort analysis with ZERO production
-        // data. Fires only when the flag is ON (inert by default); at most one
-        // line per excluded worker per dispatch (bounded by fleet size), and the
-        // gate only excludes on genuine P-saturation, so this is not a hot loop.
-        // `tag` lets the soak filter these lines cheaply.
+        // data. Emitted from the `p_gated_excluded` buffer collected in the
+        // pre-scan above (no third pass — perf S2 / code S2). Fires only when the
+        // gate is active (flag ON AND Phase 1); at most one line per excluded
+        // worker per dispatch (bounded by fleet size). `tag` lets the soak filter
+        // these lines cheaply.
         if p_gate_active {
-            for wid in &candidates {
-                if worker_is_viable(wid) {
-                    if let Some(w) = self.workers.0.peek(wid) {
-                        if !has_p_headroom(w) {
-                            info!(
-                                tag = "p_headroom_gate_exclusion",
-                                worker_id = %wid.0,
-                                running_actions = w.running_action_infos.len(),
-                                p_core_count = w.p_core_count,
-                                p_load = w.p_core_load_pct,
-                                %input_root_digest,
-                                "p-headroom gate excluded worker from cache tiers \
-                                 (at dispatch-count P limit); p_load shows whether \
-                                 its P cores are truly full or it is I/O-bound"
-                            );
-                        }
-                    }
-                }
+            for (wid, running_actions, p_core_count, p_load) in &p_gated_excluded {
+                info!(
+                    tag = "p_headroom_gate_exclusion",
+                    worker_id = %wid.0,
+                    running_actions,
+                    p_core_count,
+                    p_load,
+                    %input_root_digest,
+                    "p-headroom gate excluded worker from cache tiers \
+                     (at dispatch-count P limit); p_load shows whether \
+                     its P cores are truly full or it is I/O-bound"
+                );
             }
         }
         if saturation_fall_through {
@@ -9533,17 +9590,17 @@ mod b1_lock_decouple_tests {
 
     /// (#sched-zeroload) A reported-idle worker (has_reported_load=true,
     /// all fields 0) must score 0 in the LRU/MRU fallback path, beating a
-    /// never-reported worker (u64::MAX) when `viable.iter().any(score < u64::MAX)`.
+    /// never-reported worker (u64::MAX) in the `min_by_key` tuple ranking.
     ///
     /// Invariant: `effective_load_score(0,0,0,true) < effective_load_score(0,0,0,false)`.
     ///
     /// Mutation: change the `has_reported_load` branch in `effective_load_score`
     /// to always return `u64::MAX` (revert to pre-fix behaviour) → the
-    /// `min_by_key` in `inner_find_worker_for_action` sees BOTH as `u64::MAX`
-    /// → `viable.iter().any(score < u64::MAX)` is false → falls through to
-    /// `viable.first()` → still returns SOME worker (the LRU/MRU position
-    /// wins the tie), so the bespoke message
-    /// "reported-idle worker must score 0 (best)" from
+    /// `min_by_key` in `inner_find_worker_for_action` (§11 v2.2: keyed on the
+    /// tuple `(no_p_headroom_tier, effective_load_score)`) sees BOTH load
+    /// scores as `u64::MAX` and, with the gate OFF here (both tier `false`),
+    /// returns the first candidate (the LRU/MRU position wins the tie), so the
+    /// bespoke message "reported-idle worker must score 0 (best)" from
     /// `test_effective_load_score_reported_idle_scores_zero` is the
     /// load-bearing mutation signal (that unit test catches the score
     /// regression before we ever hit this integration test).
@@ -9583,21 +9640,21 @@ mod b1_lock_decouple_tests {
     /// dispatched action MUST return SOME worker — not None. This test calls
     /// `find_worker_for_action` → `inner_find_worker_for_action`, whose
     /// selectability mechanism for an all-never-reported fleet is the
-    /// `viable.first()` fallback (`api_worker_scheduler.rs:1076`): every
-    /// candidate scores `effective_load_score(..., has_reported_load=false)
-    /// == u64::MAX`, so `viable.iter().any(score < u64::MAX)` is FALSE and the
-    /// `min_by_key` arm is skipped in favour of `viable.first()`, which returns
-    /// the LRU/MRU-leading worker. (`saturation_fall_through` lives in the
-    /// DIFFERENT function `inner_find_and_reserve_worker`, which this path does
-    /// not exercise.)
+    /// `viable.iter().min_by_key(...)` selection (§11 v2.2: keyed on the tuple
+    /// `(no_p_headroom_tier, effective_load_score)`): every candidate scores
+    /// `effective_load_score(..., has_reported_load=false) == u64::MAX` and,
+    /// with the gate OFF here, shares tier `false`, so `min_by_key` returns the
+    /// FIRST (LRU/MRU-leading) candidate — never `None` for a non-empty viable
+    /// set. (`saturation_fall_through` lives in the DIFFERENT function
+    /// `inner_find_and_reserve_worker`, which this path does not exercise.)
     ///
     /// Invariant: a fresh fleet (no workers have reported load) is selectable;
     /// never-reported workers do NOT wedge the scheduler.
     ///
-    /// Mutation: change the `viable.first()` arm (`:1076`) to `None` → the
-    /// all-u64::MAX fleet takes the `else` branch, gets `None`, and (no
-    /// pressure-gated candidates exist to trigger the swap fail-open) this test
-    /// red-fails with the bespoke message below.
+    /// Mutation: force the `viable.iter().min_by_key(...).map(...)` selection to
+    /// `None` (e.g. replace with `None`) → the all-u64::MAX fleet gets `None`,
+    /// and (no pressure-gated candidates exist to trigger the swap fail-open)
+    /// this test red-fails with the bespoke message below.
     #[nativelink_test]
     async fn t_all_never_reported_fleet_selectable() {
         let scheduler = build_scheduler(BarrierWorkerStateManager::new());
@@ -9620,10 +9677,9 @@ mod b1_lock_decouple_tests {
         assert!(
             chosen.is_some(),
             "all-never-reported fleet must remain selectable — \
-             find_worker_for_action's viable.first() fallback \
-             (api_worker_scheduler.rs:1076) returns a worker when every candidate \
-             scores u64::MAX (never-reported), so a fresh fleet does not wedge on \
-             restart; got None instead of a worker"
+             find_worker_for_action's min_by_key selection returns a worker when \
+             every candidate scores u64::MAX (never-reported), so a fresh fleet \
+             does not wedge on restart; got None instead of a worker"
         );
     }
 
