@@ -108,6 +108,43 @@ async fn setup_new_worker(
     Ok(rx)
 }
 
+/// Like `setup_new_worker`, but constructs the worker with realistic P/E
+/// logical-CPU counts so the continuous cache-vs-load blend
+/// (`capacity_score`) has a real per-core denominator instead of the
+/// `assume_core_count` fallback. In production the counts ride the connect
+/// hello frame (`Worker::new_with_cas_endpoint`); the `#[cfg(test)]`
+/// `set_worker_core_counts` scheduler helper is only visible to the src
+/// crate's own unit tests, NOT to this integration test — so integration
+/// tests that need a prod-shaped worker (reported load + real core counts)
+/// build one here via the public `new_with_cas_endpoint` with an empty CAS
+/// endpoint (no locality wiring, just the counts).
+async fn setup_new_worker_with_core_counts(
+    scheduler: &SimpleScheduler,
+    worker_id: WorkerId,
+    props: PlatformProperties,
+    p_core_count: u32,
+    e_core_count: u32,
+) -> Result<mpsc::UnboundedReceiver<UpdateForWorker>, Error> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let worker = Worker::new_with_cas_endpoint(
+        worker_id.clone(),
+        props,
+        tx,
+        NOW_TIME,
+        0,
+        String::new(), // no CAS endpoint — counts only, no locality wiring
+        p_core_count,
+        e_core_count,
+    );
+    scheduler
+        .add_worker(worker)
+        .await
+        .err_tip(|| "Failed to add worker")?;
+    tokio::task::yield_now().await; // Allow task<->worker matcher to run.
+    verify_initial_connection_message(worker_id, &mut rx).await;
+    Ok(rx)
+}
+
 async fn setup_action(
     scheduler: &SimpleScheduler,
     action_digest: DigestInfo,
@@ -3164,6 +3201,41 @@ async fn setup_new_worker_with_cas_endpoint(
     Ok(rx)
 }
 
+/// Like `setup_new_worker_with_cas_endpoint`, but also sets realistic P/E
+/// core counts. Locality (Tier-2) tests need the CAS endpoint for the
+/// `endpoint_to_worker` map AND real core counts so the worker is not
+/// treated as `assume_core_count`-only. A worker built this way still needs
+/// an `update_worker_load(...)` call to become a viable (non-saturated)
+/// candidate — a never-reported worker is treated as 100% busy per
+/// #sched-zeroload regardless of its core counts.
+async fn setup_new_worker_with_cas_endpoint_and_cores(
+    scheduler: &SimpleScheduler,
+    worker_id: WorkerId,
+    props: PlatformProperties,
+    cas_endpoint: &str,
+    p_core_count: u32,
+    e_core_count: u32,
+) -> Result<mpsc::UnboundedReceiver<UpdateForWorker>, Error> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let worker = Worker::new_with_cas_endpoint(
+        worker_id.clone(),
+        props,
+        tx,
+        NOW_TIME,
+        0,
+        cas_endpoint.to_string(),
+        p_core_count,
+        e_core_count,
+    );
+    scheduler
+        .add_worker(worker)
+        .await
+        .err_tip(|| "Failed to add worker")?;
+    tokio::task::yield_now().await;
+    verify_initial_connection_message(worker_id, &mut rx).await;
+    Ok(rx)
+}
+
 /// Helper: schedules an action with a custom `input_root_digest`.
 async fn setup_action_with_input_root(
     scheduler: &SimpleScheduler,
@@ -3795,9 +3867,17 @@ async fn locality_scoring_with_empty_map_and_no_cas_store_test() -> Result<(), E
 
 #[nativelink_test]
 async fn locality_scoring_partial_data_still_selects_best_worker_test() -> Result<(), Error> {
-    // Test: When only SOME workers have locality data, the scoring should
-    // still pick the one with the most cached bytes, and the worker with
-    // no cached data should get a score of 0 (falling behind).
+    // Test: When only SOME workers have locality data, Tier-2 blob-level
+    // locality scoring picks the worker holding the most cached input bytes,
+    // and the worker with no cached data (score 0) falls behind.
+    //
+    // (#sched-zeroload) BOTH workers must report load AND carry real core
+    // counts so they are NOT treated as never-reported (100% busy → saturated
+    // → the cache tiers decline and the cascade falls through to LRU/MRU,
+    // which would pick worker_a by LRU order and defeat the point of this
+    // test). With reported sub-100 load + real (P,E) counts, both are viable
+    // non-saturated candidates, so Tier 2 fires and worker_b (sole holder of
+    // file_digest1 = 8000 bytes) wins on cached bytes.
     let worker_id_a = WorkerId("worker_a".to_string());
     let worker_id_b = WorkerId("worker_b".to_string());
     let cas_endpoint_a = "worker-a:50081";
@@ -3870,20 +3950,35 @@ async fn locality_scoring_partial_data_still_selects_best_worker_test() -> Resul
 
     let action_digest = DigestInfo::new([99u8; 32], 512);
 
-    let mut rx_a = setup_new_worker_with_cas_endpoint(
+    // Prod-shaped: CAS endpoint (for the endpoint→worker map) + real (P,E)
+    // core counts. p=4, e=6 chosen to match the other prod-shaped tests.
+    let mut rx_a = setup_new_worker_with_cas_endpoint_and_cores(
         &scheduler,
         worker_id_a.clone(),
         PlatformProperties::default(),
         cas_endpoint_a,
+        4,
+        6,
     )
     .await?;
-    let mut rx_b = setup_new_worker_with_cas_endpoint(
+    let mut rx_b = setup_new_worker_with_cas_endpoint_and_cores(
         &scheduler,
         worker_id_b.clone(),
         PlatformProperties::default(),
         cas_endpoint_b,
+        4,
+        6,
     )
     .await?;
+
+    // Report a sub-100 load on BOTH so `has_reported_load = true` and
+    // `weighted_free > 0` (not saturated): load(30,30,30) with (4,6) counts
+    // gives weighted_free = 2*(4*70) + (6*70) = 980. Without this, both are
+    // never-reported → saturated → cache tiers decline (see the header
+    // comment). Identical load on both keeps the decision purely on cached
+    // bytes.
+    scheduler.update_worker_load(&worker_id_a, 30, 30, 30).await?;
+    scheduler.update_worker_load(&worker_id_b, 30, 30, 30).await?;
 
     let insert_timestamp = make_system_time(1);
     let mut action_listener = setup_action_with_input_root(
@@ -3909,7 +4004,7 @@ async fn locality_scoring_partial_data_still_selects_best_worker_test() -> Resul
 
     assert_eq!(
         selected_worker_id, worker_id_b,
-        "Locality scoring should select worker_b (8000 cached bytes vs. worker_a's 0)"
+        "Tier-2 locality scoring should select worker_b (8000 cached bytes vs. worker_a's 0)"
     );
 
     assert_eq!(
@@ -4434,22 +4529,50 @@ async fn cache_affinity_load_cutoff_test() -> Result<(), Error> {
 }
 
 #[nativelink_test]
-async fn cache_affinity_soft_fallback_test() -> Result<(), Error> {
-    // Two workers, BOTH have cache hits for the action's input_root_digest,
-    // and BOTH have effective_load_score > 99 (overloaded).
-    // The soft fallback should pick the one with the lower load score
-    // (least-loaded among overloaded cache matches).
+async fn cache_affinity_least_loaded_holder_wins_tier1_test() -> Result<(), Error> {
+    // (#sched-blend) Tier-1 exact-root cache affinity, continuous-blend
+    // semantics. BOTH workers have the action's `input_root_digest` cached
+    // (both are viable Tier-1 holders), and BOTH are genuinely busy (in
+    // weighted-free DEFICIT, `weighted_free < REF_FREE`). Tier 1 picks the
+    // holder with the SMALLEST `load_penalty` == the MOST free capacity.
     //
-    // Worker A: cache hit, p=100, e=50, agg=95 -> score = 100+50 = 150
-    // Worker B: cache hit, p=100, e=20, agg=90 -> score = 100+20 = 120
-    // Both > 99, so both go into best_overloaded tracking.
-    // Worker B (score 120) should win as the least-loaded overloaded match.
+    // This REPLACES the old binary `CACHE_AFFINITY_LOAD_CUTOFF` /
+    // `best_overloaded` soft-fallback framing (removed in #sched-blend): there
+    // is no cutoff and no "overloaded" bucket now — Tier 1 is a pure
+    // continuous min-`load_penalty` among viable holders.
+    //
+    // DETERMINISM ROOT-CAUSE (prior flake): the old test built the scheduler
+    // with `SimpleSpec::default()`, whose `#[derive(Default)]` yields
+    // `load_byte_cost == 0` (the serde `default = "default_load_byte_cost"`
+    // fires only on DEserialization, not on `Default::default()`). With
+    // `load_byte_cost == 0`, `capacity_score.load_penalty == 0` for EVERY
+    // worker, so both Tier-1 holders tied at penalty 0 and the winner was
+    // decided by `candidates` (a `HashSet`) iteration order — nondeterministic
+    // per process, hence ~2/3 failure. Fix: a NON-ZERO `load_byte_cost` plus
+    // REAL (P,E) core counts so the least-loaded holder pays a strictly-lower
+    // penalty and wins deterministically.
+    //
+    // Arithmetic (p_count=4, e_count=6, load_byte_cost=512 KiB, REF_FREE=200):
+    //   Worker A load(98,98,98): p_free=4*2=8, e_free=6*2=12,
+    //     weighted_free = 2*8 + 12 = 28 (>0, not saturated),
+    //     busy = (200-28) = 172, load_penalty = 512Ki*172/200 (larger).
+    //   Worker B load(90,90,90): p_free=4*10=40, e_free=6*10=60,
+    //     weighted_free = 2*40 + 60 = 140 (>0, not saturated),
+    //     busy = (200-140) = 60, load_penalty = 512Ki*60/200 (smaller).
+    // B has strictly more free capacity → strictly lower penalty → Tier 1
+    // selects B deterministically. Neither is saturated, so the cascade does
+    // NOT fall through to LRU/MRU; the cache tier owns the decision.
     let worker_id_a = WorkerId("worker_fallback_a".to_string());
     let worker_id_b = WorkerId("worker_fallback_b".to_string());
 
     let task_change_notify = Arc::new(Notify::new());
     let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
-        &SimpleSpec::default(),
+        &SimpleSpec {
+            // Non-zero so the continuous load penalty DISCRIMINATES between the
+            // two holders (default-derived spec has load_byte_cost == 0).
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
         memory_awaited_action_db_factory(
             0,
             &task_change_notify.clone(),
@@ -4464,35 +4587,39 @@ async fn cache_affinity_soft_fallback_test() -> Result<(), Error> {
         None, // worker_tls_config
     );
 
-    let mut rx_a = setup_new_worker(
+    // Prod-shaped workers: real (P,E) core counts so `capacity_score` uses a
+    // real denominator, not the `assume_core_count` fallback.
+    let mut rx_a = setup_new_worker_with_core_counts(
         &scheduler,
         worker_id_a.clone(),
         PlatformProperties::default(),
+        4, // p_core_count
+        6, // e_core_count
     )
     .await?;
-    let mut rx_b = setup_new_worker(
+    let mut rx_b = setup_new_worker_with_core_counts(
         &scheduler,
         worker_id_b.clone(),
         PlatformProperties::default(),
+        4,
+        6,
     )
     .await?;
 
-    // The action's input_root_digest.
+    // The action's input_root_digest — both workers hold it (Tier-1 viable).
     let input_root = DigestInfo::new([60u8; 32], 2048);
 
-    // Worker A: cache hit, heavily overloaded.
-    // effective_load_score(100, 50, 95) = 100 + 50 = 150
+    // Worker A: cache hit, more loaded (weighted_free 28).
     scheduler
-        .update_worker_load(&worker_id_a, 95, 100, 50)
+        .update_worker_load(&worker_id_a, 98, 98, 98)
         .await?;
     scheduler
         .update_cached_subtrees(&worker_id_a, true, vec![input_root], vec![], vec![])
         .await?;
 
-    // Worker B: cache hit, moderately overloaded (still > 99).
-    // effective_load_score(100, 20, 90) = 100 + 20 = 120
+    // Worker B: cache hit, less loaded (weighted_free 140 → lower penalty).
     scheduler
-        .update_worker_load(&worker_id_b, 90, 100, 20)
+        .update_worker_load(&worker_id_b, 90, 90, 90)
         .await?;
     scheduler
         .update_cached_subtrees(&worker_id_b, true, vec![input_root], vec![], vec![])
@@ -4505,7 +4632,11 @@ async fn cache_affinity_soft_fallback_test() -> Result<(), Error> {
     Arc::make_mut(&mut action_info).input_root_digest = input_root;
     let client_id = OperationId::default();
     let mut action_listener = scheduler.add_action(client_id, action_info).await?;
-    tokio::task::yield_now().await;
+
+    // Deterministic match: drive one match cycle inline rather than racing the
+    // spawned matcher via `yield_now`. The dispatch StartAction then already
+    // sits in exactly one worker's channel.
+    scheduler.do_try_match_for_test().await?;
 
     // Determine which worker received the action.
     let (selected_worker_id, _se) = tokio::select! {
@@ -4525,12 +4656,14 @@ async fn cache_affinity_soft_fallback_test() -> Result<(), Error> {
         }
     };
 
-    // Both workers are overloaded (score > 99), so neither enters `best`.
-    // Both enter `best_overloaded` tracking. The soft fallback picks the
-    // least-loaded: Worker B (score 120) beats Worker A (score 150).
+    // Tier 1 (continuous min-load_penalty among viable holders): Worker B has
+    // strictly more free capacity (weighted_free 140 vs 28) → strictly lower
+    // load_penalty → B wins. Deterministic now that the penalty is non-zero.
     assert_eq!(
         selected_worker_id, worker_id_b,
-        "Worker B (score=120) should be preferred over Worker A (score=150) among overloaded cache matches (soft fallback picks least-loaded)"
+        "Tier-1 cache affinity must pick the least-loaded holder: Worker B \
+         (weighted_free 140) has more free capacity than Worker A \
+         (weighted_free 28), so its load_penalty is strictly lower"
     );
 
     assert_eq!(
@@ -5230,6 +5363,624 @@ async fn v3c_block3_nak_resource_exhausted_does_not_increment_attempts_test()
              local_worker.rs:4834 to reproduce — Unavailable DOES increment attempts."
         );
     }
+
+    Ok(())
+}
+
+// ===============================================================
+// P0 fleet edge-case coverage (worker-selection permutations).
+// Each test uses prod-shaped workers (reported load + real (P,E) core
+// counts) UNLESS it is specifically about the never-reported path.
+// Synchronization is via `do_try_match_for_test()` (an inline, awaited
+// match cycle) or via a blocking `recv()` of the dispatch — never
+// sleep-as-synchronization.
+// ===============================================================
+
+/// #1 (#sched-zeroload) A fleet where EVERY worker has NEVER reported load
+/// is intentionally treated as 100%-busy (`weighted_free == 0` → saturated),
+/// so the cache-affinity tiers DECLINE and the cascade falls through to
+/// LRU/MRU. The action must still be DISPATCHED (no wedge). This pins the
+/// behavior that (incorrectly) surprised the old locality test: a
+/// never-reported worker holding a cached blob does NOT get a locality/cache
+/// placement — it competes only in the LRU fallback like any other
+/// never-reported worker. Over-selecting an unknown-load worker on a cache
+/// hit is exactly what #sched-zeroload prevents.
+#[nativelink_test]
+async fn never_reported_fleet_falls_through_to_lru_no_wedge_test() -> Result<(), Error> {
+    let worker_id_a = WorkerId("nr_worker_a".to_string());
+    let worker_id_b = WorkerId("nr_worker_b".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            // Non-zero so, IF the workers were viable, a cache hit COULD win —
+            // making the point that they still don't (they are saturated).
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // Real core counts, but NEITHER worker calls `update_worker_load` → both
+    // stay `has_reported_load == false` → treated as 100% busy.
+    let mut rx_a = setup_new_worker_with_core_counts(
+        &scheduler,
+        worker_id_a.clone(),
+        PlatformProperties::default(),
+        4,
+        6,
+    )
+    .await?;
+    let mut rx_b = setup_new_worker_with_core_counts(
+        &scheduler,
+        worker_id_b.clone(),
+        PlatformProperties::default(),
+        4,
+        6,
+    )
+    .await?;
+
+    // Worker B holds a cached subtree matching the action's input_root. If the
+    // workers were viable this would give B a Tier-1 cache win — but because B
+    // is never-reported (saturated), the cache tier declines and B gets NO
+    // preferential placement.
+    let input_root = DigestInfo::new([70u8; 32], 1024);
+    scheduler
+        .update_cached_subtrees(&worker_id_b, true, vec![input_root], vec![], vec![])
+        .await?;
+
+    let action_digest = DigestInfo::new([71u8; 32], 512);
+    let insert_timestamp = make_system_time(1);
+    let mut action_info = make_base_action_info(insert_timestamp, action_digest);
+    Arc::make_mut(&mut action_info).input_root_digest = input_root;
+    let client_id = OperationId::default();
+    let mut action_listener = scheduler.add_action(client_id, action_info).await?;
+
+    scheduler.do_try_match_for_test().await?;
+
+    // Load-bearing assertion: the action is DISPATCHED (no wedge) despite every
+    // candidate being never-reported/saturated — the cascade degrades to
+    // LRU/MRU rather than declining to place anything.
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "never-reported fleet wedged the action in Queued — the saturation \
+         fall-through must degrade to LRU/MRU placement, not decline to place"
+    );
+
+    // Confirm exactly one worker received a StartAction (a real dispatch, not
+    // just a stage flip). Do NOT assert WHICH worker: the point is that the
+    // cache hit on B did NOT steer the placement — LRU order owns it.
+    let mut saw_start = false;
+    for _ in 0..4 {
+        tokio::select! {
+            biased;
+            msg = rx_a.recv() => {
+                if let Some(update_for_worker::Update::StartAction(_)) = msg.expect("a closed").update {
+                    saw_start = true;
+                    break;
+                }
+            }
+            msg = rx_b.recv() => {
+                if let Some(update_for_worker::Update::StartAction(_)) = msg.expect("b closed").update {
+                    saw_start = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_start,
+        "no worker received a StartAction on the never-reported fleet (LRU \
+         fall-through selected nothing)"
+    );
+
+    Ok(())
+}
+
+/// #2 An empty fleet (0 workers) does not panic or wedge on `add_action`:
+/// the action stays Queued. When a viable worker later appears, the matcher
+/// dispatches it (Queued → Executing).
+#[nativelink_test]
+async fn empty_fleet_queues_then_dispatches_when_worker_appears_test() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // No workers yet. Submit an action.
+    let action_digest = DigestInfo::new([72u8; 32], 512);
+    let insert_timestamp = make_system_time(1);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    // A match cycle over an empty fleet must be a benign no-op (no panic).
+    scheduler.do_try_match_for_test().await?;
+
+    // The action stays Queued: nothing to dispatch to.
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Queued,
+        "action on an empty fleet must remain Queued (no viable worker), not \
+         wedge or error"
+    );
+
+    // Now a worker appears. The Queued action must transition to Executing.
+    let worker_id = WorkerId("late_worker".to_string());
+    let mut rx = setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "a Queued action must be dispatched once a viable worker appears \
+         (Queued → Executing)"
+    );
+
+    // And the worker actually received the StartAction.
+    let msg = rx.recv().await.expect("worker channel closed");
+    assert!(
+        matches!(msg.update, Some(update_for_worker::Update::StartAction(_))),
+        "the newly-added worker did not receive the queued action's StartAction"
+    );
+
+    Ok(())
+}
+
+/// #3 A fleet where EVERY worker genuinely reports ~100% load (real core
+/// counts, `weighted_free == 0` → saturated) must still make progress: the
+/// cache tiers decline via the saturation fall-through and the LRU/MRU path
+/// places the action. No permanent wedge under a fully-saturated fleet.
+#[nativelink_test]
+async fn all_saturated_fleet_still_dispatches_no_wedge_test() -> Result<(), Error> {
+    let worker_id_a = WorkerId("sat_worker_a".to_string());
+    let worker_id_b = WorkerId("sat_worker_b".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_a = setup_new_worker_with_core_counts(
+        &scheduler,
+        worker_id_a.clone(),
+        PlatformProperties::default(),
+        4,
+        6,
+    )
+    .await?;
+    let mut rx_b = setup_new_worker_with_core_counts(
+        &scheduler,
+        worker_id_b.clone(),
+        PlatformProperties::default(),
+        4,
+        6,
+    )
+    .await?;
+
+    // Both report 100% on every axis: p_free = 4*(100-100) = 0,
+    // e_free = 6*(100-100) = 0, weighted_free = 0 → saturated (but
+    // has_reported_load == true, so this is a GENUINE saturation, distinct
+    // from the never-reported case in #1).
+    scheduler.update_worker_load(&worker_id_a, 100, 100, 100).await?;
+    scheduler.update_worker_load(&worker_id_b, 100, 100, 100).await?;
+
+    let action_digest = DigestInfo::new([73u8; 32], 512);
+    let insert_timestamp = make_system_time(1);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+
+    scheduler.do_try_match_for_test().await?;
+
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "a fully-saturated fleet wedged the action — the saturation \
+         fall-through must place on the LRU/MRU worker (spread the \
+         unavoidable work), not stall forever"
+    );
+
+    let mut saw_start = false;
+    for _ in 0..4 {
+        tokio::select! {
+            biased;
+            msg = rx_a.recv() => {
+                if let Some(update_for_worker::Update::StartAction(_)) = msg.expect("a closed").update {
+                    saw_start = true;
+                    break;
+                }
+            }
+            msg = rx_b.recv() => {
+                if let Some(update_for_worker::Update::StartAction(_)) = msg.expect("b closed").update {
+                    saw_start = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_start,
+        "no worker received a StartAction on the fully-saturated fleet"
+    );
+
+    Ok(())
+}
+
+/// #4 A platform-partitioned fleet: only ONE of three workers carries the
+/// required Exact platform property. The action requires it, so only that
+/// worker is a candidate — the other two are filtered out of the capability
+/// index and are NEVER chosen.
+#[nativelink_test]
+async fn platform_partitioned_fleet_selects_only_matching_worker_test() -> Result<(), Error> {
+    let worker_match = WorkerId("gpu_worker".to_string());
+    let worker_no1 = WorkerId("cpu_worker_1".to_string());
+    let worker_no2 = WorkerId("cpu_worker_2".to_string());
+
+    let mut prop_defs = HashMap::new();
+    prop_defs.insert("gpu".to_string(), PropertyType::Exact);
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(prop_defs),
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // Only `worker_match` advertises gpu=true.
+    let mut gpu_props = PlatformProperties::default();
+    gpu_props.properties.insert(
+        "gpu".to_string(),
+        PlatformPropertyValue::Exact("true".to_string()),
+    );
+    let mut rx_match = setup_new_worker(&scheduler, worker_match.clone(), gpu_props).await?;
+    let mut rx_no1 =
+        setup_new_worker(&scheduler, worker_no1.clone(), PlatformProperties::default()).await?;
+    let mut rx_no2 =
+        setup_new_worker(&scheduler, worker_no2.clone(), PlatformProperties::default()).await?;
+
+    // The action requires gpu=true.
+    let action_digest = DigestInfo::new([74u8; 32], 512);
+    let mut required = HashMap::new();
+    required.insert("gpu".to_string(), "true".to_string());
+    let insert_timestamp = make_system_time(1);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, required, insert_timestamp).await?;
+
+    scheduler.do_try_match_for_test().await?;
+
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "the gpu-requiring action was not dispatched to the sole gpu worker"
+    );
+
+    // The matching worker got the StartAction.
+    let msg = rx_match.recv().await.expect("gpu worker channel closed");
+    assert!(
+        matches!(msg.update, Some(update_for_worker::Update::StartAction(_))),
+        "the sole capability-matching worker did not receive the action"
+    );
+
+    // The two non-matching workers got NOTHING (they were never candidates).
+    assert_eq!(
+        rx_no1.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "a non-gpu worker received work for a gpu-requiring action"
+    );
+    assert_eq!(
+        rx_no2.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "a non-gpu worker received work for a gpu-requiring action"
+    );
+
+    Ok(())
+}
+
+/// #5 Tie determinism: two workers identical on every axis (same core
+/// counts, same reported load, no cache) must yield a DETERMINISTIC, stable
+/// pick. The default `LeastRecentlyUsed` allocation strategy iterates workers
+/// LRU-first and `min_by_key` keeps the first element on an equal-score tie,
+/// so the first-added worker (the LRU one on a fresh fleet) wins every time.
+/// We rebuild a fresh scheduler each iteration to prove the pick is stable
+/// across process/HashSet-seed variation (the same nondeterminism that
+/// flaked the cache-affinity test would surface here if the tiebreak were
+/// unstable).
+#[nativelink_test]
+async fn identical_workers_tie_break_is_deterministic_lru_test() -> Result<(), Error> {
+    for iteration in 0..8 {
+        let worker_id_a = WorkerId("tie_worker_a".to_string());
+        let worker_id_b = WorkerId("tie_worker_b".to_string());
+
+        let task_change_notify = Arc::new(Notify::new());
+        let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+            &SimpleSpec {
+                load_byte_cost: 512 * 1024,
+                ..Default::default()
+            },
+            memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+            || async move {},
+            task_change_notify,
+            MockInstantWrapped::default,
+            None,
+            None, // cas_store
+            None, // locality_map
+            None, // worker_tls_config
+        );
+
+        // worker_a added FIRST → it is the least-recently-used on a fresh
+        // fleet. Both are otherwise identical (same counts, same load, no
+        // cache).
+        let mut rx_a =
+            setup_new_worker_with_core_counts(&scheduler, worker_id_a.clone(), PlatformProperties::default(), 4, 6)
+                .await?;
+        let mut rx_b =
+            setup_new_worker_with_core_counts(&scheduler, worker_id_b.clone(), PlatformProperties::default(), 4, 6)
+                .await?;
+        scheduler.update_worker_load(&worker_id_a, 40, 40, 40).await?;
+        scheduler.update_worker_load(&worker_id_b, 40, 40, 40).await?;
+
+        let action_digest = DigestInfo::new([75u8; 32], 512);
+        let insert_timestamp = make_system_time(1);
+        let mut action_listener =
+            setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+        scheduler.do_try_match_for_test().await?;
+
+        let selected = tokio::select! {
+            msg = rx_a.recv() => {
+                assert!(matches!(msg.unwrap().update, Some(update_for_worker::Update::StartAction(_))));
+                worker_id_a.clone()
+            }
+            msg = rx_b.recv() => {
+                assert!(matches!(msg.unwrap().update, Some(update_for_worker::Update::StartAction(_))));
+                worker_id_b.clone()
+            }
+        };
+
+        assert_eq!(
+            action_listener.changed().await.unwrap().0.stage,
+            ActionStage::Executing
+        );
+        // Stable tiebreak: the LRU (first-added) worker wins EVERY iteration.
+        assert_eq!(
+            selected, worker_id_a,
+            "identical-worker tiebreak was not stable on iteration {iteration}: \
+             expected the LRU (first-added) worker to win deterministically, \
+             but the pick varied — the tiebreak must not depend on HashSet \
+             iteration order"
+        );
+    }
+
+    Ok(())
+}
+
+/// #6 Eviction during dispatch: a worker is selected and running an action,
+/// then it is removed before the action completes. The scheduler must
+/// re-queue the action and re-dispatch it to another worker — no panic, no
+/// double-dispatch (the evicted worker gets exactly one StartAction then a
+/// Disconnect; the action ends up Executing on the surviving worker).
+#[nativelink_test]
+async fn worker_eviction_during_dispatch_requeues_to_other_worker_test() -> Result<(), Error> {
+    let worker_id_a = WorkerId("evict_worker_a".to_string());
+    let worker_id_b = WorkerId("evict_worker_b".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            worker_timeout_s: WORKER_TIMEOUT_S,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // Only worker_a is present when the action is dispatched, so it is the
+    // unambiguous first recipient. worker_b is added afterward to receive the
+    // requeued action.
+    let mut rx_a =
+        setup_new_worker_with_core_counts(&scheduler, worker_id_a.clone(), PlatformProperties::default(), 4, 6)
+            .await?;
+    scheduler.update_worker_load(&worker_id_a, 30, 30, 30).await?;
+
+    let action_digest = DigestInfo::new([76u8; 32], 512);
+    let insert_timestamp = make_system_time(1);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    // worker_a receives exactly one StartAction and the action is Executing.
+    let first = rx_a.recv().await.expect("worker_a channel closed");
+    assert!(
+        matches!(first.update, Some(update_for_worker::Update::StartAction(_))),
+        "worker_a did not receive the initial StartAction"
+    );
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+
+    // Add a second worker that can take the job once worker_a is evicted.
+    let mut rx_b =
+        setup_new_worker_with_core_counts(&scheduler, worker_id_b.clone(), PlatformProperties::default(), 4, 6)
+            .await?;
+    scheduler.update_worker_load(&worker_id_b, 30, 30, 30).await?;
+
+    // Evict worker_a mid-dispatch. Its in-flight action must be re-queued.
+    drop(scheduler.remove_worker(&worker_id_a).await);
+    scheduler.do_try_match_for_test().await?;
+
+    // worker_a should have received a Disconnect (and NOT a second
+    // StartAction — no double-dispatch to the evicted worker).
+    let disc = rx_a.recv().await.expect("worker_a channel closed before disconnect");
+    assert_eq!(
+        disc.update,
+        Some(update_for_worker::Update::Disconnect(())),
+        "evicted worker_a did not receive a Disconnect (or got an unexpected \
+         second dispatch — possible double-dispatch)"
+    );
+    assert_eq!(
+        rx_a.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected),
+        "evicted worker_a received a message after Disconnect (double-dispatch \
+         to an evicted worker)"
+    );
+
+    // The action is re-dispatched to worker_b and ends up Executing there.
+    let requeued = rx_b.recv().await.expect("worker_b channel closed");
+    let se = match requeued.update {
+        Some(update_for_worker::Update::StartAction(se)) => se,
+        v => panic!("worker_b expected the requeued StartAction, got: {v:?}"),
+    };
+    assert_eq!(
+        se.worker_id,
+        worker_id_b.to_string(),
+        "the requeued action's StartAction was not addressed to worker_b"
+    );
+    assert_eq!(
+        action_listener.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "after eviction the action did not resume Executing on the surviving \
+         worker"
+    );
+
+    Ok(())
+}
+
+/// #7 Quarantine skip + clear: a quarantined worker is excluded from
+/// selection; after it re-checks in (keepalive), it becomes selectable again.
+/// Quarantine is reached via the EXISTING seam (`remove_timedout_workers` at
+/// 1x the timeout quarantines a worker that has not checked in, while a
+/// kept-alive peer survives); clearing is via `worker_keep_alive_received`
+/// (refresh_lifetime takes the quarantine flag). No production change needed.
+#[nativelink_test]
+async fn quarantined_worker_skipped_then_selectable_after_keepalive_test() -> Result<(), Error> {
+    let worker_id_a = WorkerId("quar_worker_a".to_string());
+    let worker_id_b = WorkerId("quar_worker_b".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            worker_timeout_s: WORKER_TIMEOUT_S,
+            load_byte_cost: 512 * 1024,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_a =
+        setup_new_worker_with_core_counts(&scheduler, worker_id_a.clone(), PlatformProperties::default(), 4, 6)
+            .await?;
+    let mut rx_b =
+        setup_new_worker_with_core_counts(&scheduler, worker_id_b.clone(), PlatformProperties::default(), 4, 6)
+            .await?;
+    scheduler.update_worker_load(&worker_id_a, 30, 30, 30).await?;
+    scheduler.update_worker_load(&worker_id_b, 30, 30, 30).await?;
+
+    // Keep worker_b alive at 2x timeout so it survives the timeout sweep;
+    // worker_a is NOT kept alive → it will be quarantined at 1x timeout.
+    scheduler
+        .worker_keep_alive_received(&worker_id_b, NOW_TIME + 2 * WORKER_TIMEOUT_S)
+        .await?;
+    scheduler
+        .remove_timedout_workers(NOW_TIME + WORKER_TIMEOUT_S)
+        .await?;
+
+    // First action: worker_a is quarantined → it must go to worker_b.
+    let action_digest_1 = DigestInfo::new([77u8; 32], 512);
+    let insert_timestamp_1 = make_system_time(1);
+    let mut listener_1 =
+        setup_action(&scheduler, action_digest_1, HashMap::new(), insert_timestamp_1).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let msg_b = rx_b.recv().await.expect("worker_b channel closed");
+    assert!(
+        matches!(msg_b.update, Some(update_for_worker::Update::StartAction(_))),
+        "the action was not routed to the non-quarantined worker_b"
+    );
+    assert_eq!(
+        listener_1.changed().await.unwrap().0.stage,
+        ActionStage::Executing
+    );
+    // worker_a (quarantined) must NOT have received work.
+    assert_eq!(
+        rx_a.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "a quarantined worker was selected for new work"
+    );
+
+    // Clear worker_a's quarantine via keepalive, then remove worker_b so
+    // worker_a is the ONLY viable worker for the next action.
+    scheduler
+        .worker_keep_alive_received(&worker_id_a, NOW_TIME + WORKER_TIMEOUT_S)
+        .await?;
+    drop(scheduler.remove_worker(&worker_id_b).await);
+
+    // Second action: worker_a is un-quarantined and is now selectable.
+    let action_digest_2 = DigestInfo::new([78u8; 32], 512);
+    let insert_timestamp_2 = make_system_time(2);
+    let mut listener_2 =
+        setup_action(&scheduler, action_digest_2, HashMap::new(), insert_timestamp_2).await?;
+    scheduler.do_try_match_for_test().await?;
+
+    let msg_a = rx_a.recv().await.expect("worker_a channel closed");
+    assert!(
+        matches!(msg_a.update, Some(update_for_worker::Update::StartAction(_))),
+        "worker_a was not selectable after its quarantine was cleared by \
+         keepalive"
+    );
+    assert_eq!(
+        listener_2.changed().await.unwrap().0.stage,
+        ActionStage::Executing,
+        "the second action did not dispatch to the un-quarantined worker_a"
+    );
 
     Ok(())
 }
