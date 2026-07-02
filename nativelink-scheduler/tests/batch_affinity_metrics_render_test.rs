@@ -22,10 +22,15 @@
 //! listener uses. Metric paths under the action-scheduler prefix
 //! (`scheduler.{name}.action`, see `src/bin/nativelink.rs:591`):
 //!
-//!   scheduler.test.action.batch_affinity.colocation_surplus
-//!   scheduler.test.action.batch_affinity.max_group
+//!   scheduler.test.action.batch_affinity.colocation_surplus_exact_root_reference
+//!   scheduler.test.action.batch_affinity.max_group_exact_root_reference
 //!   scheduler.test.action.batch_affinity.sampled_ops
 //!   scheduler.test.action.batch_affinity.arrival_within_250ms_total
+//!   scheduler.test.action.batch_affinity.batch_sched_gain_pct
+//!   scheduler.test.action.batch_affinity.batch_sched_subtree_overlap_pct
+//!   scheduler.test.action.batch_affinity.batch_sched_sample_actions
+//!   scheduler.test.action.batch_affinity.batch_sched_sample_workers
+//!   scheduler.test.action.batch_affinity.batch_sched_uncached_skipped
 //!
 //! The dim-B counter is driven by the scheduler's INJECTABLE clock
 //! (`MockInstantWrapped` → thread-local `MockClock`), so this file advances the
@@ -163,13 +168,15 @@ async fn batch_affinity_colocation_surplus_render() -> Result<(), Error> {
     let body = render_prometheus(&registry);
 
     assert!(
-        body.contains("\nscheduler_test_action_batch_affinity_colocation_surplus 1\n"),
+        body.contains(
+            "\nscheduler_test_action_batch_affinity_colocation_surplus_exact_root_reference 1\n"
+        ),
         "#batch-affinity MISSING or WRONG VALUE: colocation_surplus must be 1 \
          (4 pending ops [A,A,B,C], 3 distinct input roots → surplus 1). \
          body=\n{body}"
     );
     assert!(
-        body.contains("\nscheduler_test_action_batch_affinity_max_group 2\n"),
+        body.contains("\nscheduler_test_action_batch_affinity_max_group_exact_root_reference 2\n"),
         "#batch-affinity MISSING or WRONG VALUE: max_group must be 2 \
          (largest same-input-root pending group is the two A's). \
          body=\n{body}"
@@ -205,12 +212,14 @@ async fn batch_affinity_all_distinct_surplus_zero_render() -> Result<(), Error> 
     let body = render_prometheus(&registry);
 
     assert!(
-        body.contains("\nscheduler_test_action_batch_affinity_colocation_surplus 0\n"),
+        body.contains(
+            "\nscheduler_test_action_batch_affinity_colocation_surplus_exact_root_reference 0\n"
+        ),
         "#batch-affinity MISSING or WRONG VALUE: colocation_surplus must be 0 \
          for all-distinct pending roots. body=\n{body}"
     );
     assert!(
-        body.contains("\nscheduler_test_action_batch_affinity_max_group 1\n"),
+        body.contains("\nscheduler_test_action_batch_affinity_max_group_exact_root_reference 1\n"),
         "#batch-affinity MISSING or WRONG VALUE: max_group must be 1 \
          for all-distinct pending roots. body=\n{body}"
     );
@@ -320,7 +329,9 @@ async fn batch_affinity_dim_a_gated_off_on_redis_backend() -> Result<(), Error> 
     );
     // Corroborate: surplus also stays 0 (would be 1 if the pass had run).
     assert!(
-        body.contains("\nscheduler_test_action_batch_affinity_colocation_surplus 0\n"),
+        body.contains(
+            "\nscheduler_test_action_batch_affinity_colocation_surplus_exact_root_reference 0\n"
+        ),
         "#batch-affinity GATE FAILED: colocation_surplus must stay 0 on the gated Redis backend. \
          body=\n{body}"
     );
@@ -368,6 +379,74 @@ async fn batch_affinity_arrival_window_counter_render() -> Result<(), Error> {
          (A@0 and A@100ms are within the 250ms window → +1; A@400ms is 300ms after its peer → \
          outside the window → no increment). Driven by the mock clock, so this is deterministic. \
          body=\n{body}"
+    );
+
+    Ok(())
+}
+
+/// (#batch-sched) The FIVE new batch-scheduling counterfactual gauges must all
+/// render under the batch_affinity prefix on the REAL `/metrics` path. With no
+/// CAS store and no workers, the counterfactual has no cached trees to score,
+/// so `gain_pct`/`overlap_pct`/`sample_actions`/`sample_workers` are 0 and
+/// `uncached_skipped` equals the sampled pending count (every root is a
+/// tree_cache peek MISS — the probe never resolves). This pins the metric NAMES
+/// (dashboards key on them) and the coverage-guardrail semantics.
+#[nativelink_test]
+async fn batch_sched_gauges_render() -> Result<(), Error> {
+    let (scheduler, worker_scheduler, _notify) = new_scheduler();
+
+    // Three pending ops (distinct actions). No workers, no CAS store → the
+    // counterfactual finds no cached trees and no capacity-bearing workers.
+    for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'A', 2, 1), (b'B', 3, 2)] {
+        scheduler
+            .add_action(
+                OperationId::default(),
+                make_action_info(root(input_root), action, off),
+            )
+            .await
+            .expect("#batch-sched setup: add_action must succeed");
+    }
+    scheduler
+        .do_try_match_for_test()
+        .await
+        .expect("#batch-sched setup: do_try_match must succeed");
+
+    let registry = register(scheduler.clone(), worker_scheduler.clone());
+    let body = render_prometheus(&registry);
+
+    for name in [
+        "batch_sched_gain_pct",
+        "batch_sched_subtree_overlap_pct",
+        "batch_sched_sample_actions",
+        "batch_sched_sample_workers",
+        "batch_sched_uncached_skipped",
+    ] {
+        assert!(
+            body.contains(&format!("\nscheduler_test_action_batch_affinity_{name} ")),
+            "#batch-sched MISSING metric: scheduler_test_action_batch_affinity_{name} must render \
+             on the real /metrics path (dashboards key on the name). body=\n{body}"
+        );
+    }
+
+    // With no cached trees and no capacity-bearing workers: gain 0, overlap 0,
+    // sample_actions 0, sample_workers 0, and uncached_skipped == 3 (all three
+    // sampled roots are tree_cache peek misses — the probe never resolves).
+    assert!(
+        body.contains("\nscheduler_test_action_batch_affinity_batch_sched_gain_pct 0\n"),
+        "#batch-sched: gain_pct must be 0 with no cached trees / no workers. body=\n{body}"
+    );
+    assert!(
+        body.contains("\nscheduler_test_action_batch_affinity_batch_sched_sample_actions 0\n"),
+        "#batch-sched: sample_actions must be 0 with no cached trees. body=\n{body}"
+    );
+    assert!(
+        body.contains("\nscheduler_test_action_batch_affinity_batch_sched_sample_workers 0\n"),
+        "#batch-sched: sample_workers must be 0 with no workers registered. body=\n{body}"
+    );
+    assert!(
+        body.contains("\nscheduler_test_action_batch_affinity_batch_sched_uncached_skipped 3\n"),
+        "#batch-sched: uncached_skipped must be 3 (all three sampled roots are tree_cache peek \
+         misses; the probe never resolves). body=\n{body}"
     );
 
     Ok(())

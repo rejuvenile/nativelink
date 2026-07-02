@@ -544,6 +544,9 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 100_000;
 pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
+use crate::simple_scheduler::{
+    BatchSchedAction, BatchSchedGain, BatchSchedWorker, compute_batch_sched_gain,
+};
 use crate::worker::{
     ActionInfoWithProps, PendingActionInfoData, Worker, WorkerTimestamp, WorkerUpdate,
     reduce_platform_properties,
@@ -3818,6 +3821,132 @@ impl ApiWorkerScheduler {
         });
     }
 
+    /// (#batch-sched) OBSERVABILITY-ONLY: compute the batch-scheduling
+    /// counterfactual gauges over `sampled_roots` (the priority-ordered sampled
+    /// pending set the affinity probe collected). Returns
+    /// `(BatchSchedGain, uncached_skipped)`.
+    ///
+    /// FEASIBILITY (design §3 — the load-bearing constraint): computing the
+    /// per-(action, worker) subtree score needs each pending action's RESOLVED
+    /// tree, and resolving trees is the expensive part. This probe NEVER
+    /// resolves — it operates ONLY over sampled roots whose `ResolvedTree` is
+    /// ALREADY in `tree_cache` (a `peek`: no LRU bump, no fetch, no `.await` on
+    /// resolution). Roots without a cached tree are SKIPPED and COUNTED
+    /// (`uncached_skipped`) so coverage is visible; with the enqueue-prefetch
+    /// warming trees, cached coverage is decent, but the probe degrades
+    /// gracefully (reports coverage, never fetches).
+    ///
+    /// Locking discipline: the `tree_cache` peek pass and the worker
+    /// cache/capacity snapshot each take their lock BRIEFLY and drop it; the
+    /// pure `compute_batch_sched_gain` solve then runs entirely LOCK-FREE over
+    /// owned snapshots — no lock is held across the solve, and there is no
+    /// `.await` inside either locked section beyond the lock acquire itself.
+    ///
+    /// Capacity model (design §4): a worker's `capacity` is its admissible slot
+    /// count at match time (`max_inflight_tasks − running_action_infos.len()`,
+    /// and 0 when the worker cannot accept work / is quarantined / pressured —
+    /// the same viability the dispatch gate applies), so the batch solver cannot
+    /// cheat by piling all actions on the single best-cached worker. A worker
+    /// with `max_inflight_tasks == 0` (unbounded) is given a capacity equal to
+    /// the sampled-action count (enough to hold the whole window — effectively
+    /// unbounded for this cycle). `load_penalty` is snapshotted with the SAME
+    /// `capacity_score` + zero-load handling dispatch uses, so greedy's
+    /// `argmax (s − load_penalty)` models production.
+    ///
+    /// Zero routing change: reads only; returns gauges.
+    pub(crate) async fn batch_sched_gain_for_probe(
+        &self,
+        sampled_roots: &[DigestInfo],
+    ) -> (BatchSchedGain, u64) {
+        // ── Pass 1: peek the tree cache for each sampled root (NO resolution) ──
+        // Copy out the subtree structure for cached roots; count the misses.
+        let mut actions: Vec<BatchSchedAction> = Vec::with_capacity(sampled_roots.len());
+        let mut uncached_skipped: u64 = 0;
+        {
+            let cache = self.tree_cache.lock().await;
+            for root in sampled_roots {
+                match cache.peek(root) {
+                    Some(tree) => actions.push(BatchSchedAction {
+                        dir_digests: tree.dir_digests.clone(),
+                        dir_direct_bytes: tree.dir_direct_bytes.clone(),
+                        dir_direct_files: tree.dir_direct_files.clone(),
+                    }),
+                    None => uncached_skipped += 1,
+                }
+            }
+        }
+        // tree_cache lock released here — NOT held across the worker snapshot
+        // or the solve.
+
+        // ── Pass 2: snapshot worker cache + capacity + load penalty ──
+        // One brief read lock; owned copies only, no `.await` while held.
+        let mut workers: Vec<BatchSchedWorker> = Vec::new();
+        {
+            let inner = self.inner.read().await;
+            let assume_core_count = inner.assume_core_count;
+            let load_byte_cost = inner.load_byte_cost;
+            for (_wid, w) in inner.workers.0.iter() {
+                // Admissible slots at match time. A worker that cannot accept
+                // work (paused/draining/full) or is quarantined/pressured has
+                // zero admissible capacity — mirror the dispatch viability gate
+                // so the counterfactual assigns over the SAME feasible set.
+                if !w.can_accept_work()
+                    || w.quarantined_at.is_some()
+                    || w.indefinite_pin_saturated
+                    || w.swap_pressured
+                    || w.disk_pressured
+                {
+                    continue;
+                }
+                let running = w.running_action_infos.len() as u64;
+                let capacity = if w.max_inflight_tasks == 0 {
+                    // Unbounded worker: give it enough slots to hold the whole
+                    // sampled window this cycle (effectively unbounded here).
+                    sampled_roots.len() as u64
+                } else {
+                    w.max_inflight_tasks.saturating_sub(running)
+                };
+                if capacity == 0 {
+                    continue;
+                }
+                // Snapshot the load penalty with the SAME zero-load handling as
+                // dispatch (`cap_score` closure): a worker that never reported
+                // load is treated as fully busy (100/100/100) so it does not win
+                // a min-load tie on a phantom all-free reading.
+                let cap = if w.has_reported_load {
+                    capacity_score(
+                        w.p_core_load_pct,
+                        w.e_core_load_pct,
+                        w.cpu_load_pct,
+                        w.p_core_count,
+                        w.e_core_count,
+                        assume_core_count,
+                        load_byte_cost,
+                    )
+                } else {
+                    capacity_score(
+                        100,
+                        100,
+                        100,
+                        w.p_core_count,
+                        w.e_core_count,
+                        assume_core_count,
+                        load_byte_cost,
+                    )
+                };
+                workers.push(BatchSchedWorker {
+                    cached_subtree_digests: w.cached_subtree_digests.clone(),
+                    capacity,
+                    load_penalty: cap.load_penalty,
+                });
+            }
+        }
+        // inner read lock released here — the solve runs lock-free.
+
+        let gain = compute_batch_sched_gain(&actions, &workers);
+        (gain, uncached_skipped)
+    }
+
     /// Resolves the full input tree for the given `input_root_digest`,
     /// returning a cached result if available. On cache miss, returns
     /// `None` immediately (falling back to load-based scoring) and
@@ -5220,7 +5349,11 @@ impl ResolvedTree {
 /// of subtree bytes" from "worker has 80 %", unlike a root-only
 /// collapse which would kill tier 2 (every dir-cache match also wins
 /// tier 1 at `:822` above).
-fn compute_dedup_cached_score(
+// (#batch-sched) `pub(crate)` so the batch-scheduling counterfactual probe in
+// `simple_scheduler.rs` scores each sampled (action, worker) pair with the SAME
+// atom Tier-1.5 dispatch uses — the counterfactual is only meaningful if `s(i,j)`
+// is byte-identical to the score the real scheduler ranks on.
+pub(crate) fn compute_dedup_cached_score(
     dir_digests: &HashSet<DigestInfo>,
     cached_subtree_digests: &HashSet<DigestInfo>,
     dir_direct_bytes: &HashMap<DigestInfo, u64>,

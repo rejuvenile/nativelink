@@ -46,7 +46,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tracing::{debug, error, info, info_span, warn};
 
-use crate::api_worker_scheduler::ApiWorkerScheduler;
+use crate::api_worker_scheduler::{ApiWorkerScheduler, compute_dedup_cached_score};
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::simple_scheduler_state_manager::SimpleSchedulerStateManager;
@@ -270,6 +270,308 @@ impl RecentRootsWindow {
 // UNDERCOUNTS the true surplus — a conservative bias for an observability metric.
 pub const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
 
+/// (#batch-sched) Bytes-equivalent weight of a single cached input file when
+/// blending the `(cached_bytes, cached_files)` returned by
+/// `compute_dedup_cached_score` into a scalar match score `s`:
+/// `s = cached_bytes + cached_files * PER_FILE_WEIGHT`. MIRRORS the production
+/// Tier-1.5 dispatch constant (`api_worker_scheduler.rs`, the local
+/// `PER_FILE_WEIGHT` inside `inner_find_and_reserve_worker`) so the
+/// counterfactual probe's `s(i,j)` is the SAME score the real scheduler ranks
+/// on — a divergent weight would make the (B−G) delta compare against a
+/// fiction. The equality is pinned by
+/// `batch_sched_gain_test::per_file_weight_matches_dispatch`. `pub` so that
+/// test can read it.
+pub const PER_FILE_WEIGHT: u64 = 100 * 1024; // 100KB per file — see api_worker_scheduler.rs
+
+/// (#batch-sched) One sampled pending action whose `ResolvedTree` was ALREADY
+/// cached (a `tree_cache` peek hit — the probe NEVER resolves a tree). Carries
+/// the owned subtree structure needed to score it against a worker's cache:
+/// the directory-digest membership set and the disjoint per-directory direct
+/// byte/file weights (copied out of the cached `ResolvedTree`). The `Vec` these
+/// live in is in PRIORITY order (the pending set is already priority-sorted),
+/// which the greedy counterfactual walks.
+#[derive(Debug, Clone)]
+pub struct BatchSchedAction {
+    /// All directory digests in this action's input tree (root + subtrees).
+    pub dir_digests: HashSet<DigestInfo>,
+    /// Direct (non-recursive) file bytes attributed to each directory digest.
+    /// Disjoint across directories (no double-counting via nesting) — the same
+    /// partition `compute_dedup_cached_score` sums over.
+    pub dir_direct_bytes: HashMap<DigestInfo, u64>,
+    /// Direct (non-recursive) file COUNT per directory digest; blended into `s`
+    /// via `PER_FILE_WEIGHT`.
+    pub dir_direct_files: HashMap<DigestInfo, u64>,
+}
+
+/// (#batch-sched) One worker-with-capacity in the counterfactual. Snapshotted
+/// under the scheduler lock, then the solve runs lock-free over these owned
+/// copies. `capacity` is the worker's admissible slot count at match time
+/// (`max_inflight_tasks − running_action_infos.len()`, gated by
+/// `can_accept_work` + viability) — the SAME headroom the real gate applies, so
+/// batch cannot cheat by piling every action on the single best-cached worker.
+#[derive(Debug, Clone)]
+pub struct BatchSchedWorker {
+    /// The worker's cached directory subtree digests (its warm set at snapshot
+    /// time). Scored against each action's `dir_digests`.
+    pub cached_subtree_digests: HashSet<DigestInfo>,
+    /// Admissible slots remaining. Both greedy and batch respect it.
+    // CAPPED AT worker.max_inflight_tasks: derived from the worker's configured
+    // in-flight ceiling minus its running count; a per-cycle scratch value, not
+    // a network buffer.
+    pub capacity: u64,
+    /// The worker's continuous load penalty (`CapacityScore.load_penalty`), used
+    /// ONLY by the greedy counterfactual's `argmax_j (s − load_penalty_j)` so
+    /// greedy models the production load blend. Batch maximizes raw `Σ s`.
+    pub load_penalty: i64,
+}
+
+/// (#batch-sched) The counterfactual result the probe stores into gauges.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BatchSchedGain {
+    /// `(B − G) / G * 100`, floored, `0` when `G == 0` (guard: no greedy match
+    /// to improve on, or empty inputs).
+    pub gain_pct: u64,
+    /// Shared-subtree mass: `Σ dir_direct_bytes` over directory digests
+    /// appearing in ≥2 sampled actions' `dir_digests`, / total sampled subtree
+    /// bytes, `× 100` floored. `0` when there are no sampled subtree bytes.
+    pub subtree_overlap_pct: u64,
+    /// Number of cached (scored) actions the solve ran over. Coverage guardrail
+    /// — `gain_pct` is only meaningful at `≥ 2`.
+    pub sample_actions: u64,
+    /// Number of capacity-bearing workers the solve ran over. Coverage
+    /// guardrail — `gain_pct` is only meaningful at `≥ 2`.
+    pub sample_workers: u64,
+}
+
+/// (#batch-sched) Scalar subtree-match score `s(i,j)` for `action` against
+/// `worker_cache`: the SAME `compute_dedup_cached_score` atom Tier-1.5 dispatch
+/// uses, blended to a scalar via `PER_FILE_WEIGHT`. Kept private to the solver;
+/// the counterfactual is only meaningful because this is byte-identical to the
+/// dispatch score.
+fn batch_sched_score(action: &BatchSchedAction, worker_cache: &HashSet<DigestInfo>) -> u64 {
+    let (cached_bytes, cached_files) = compute_dedup_cached_score(
+        &action.dir_digests,
+        worker_cache,
+        &action.dir_direct_bytes,
+        &action.dir_direct_files,
+    );
+    cached_bytes + cached_files * PER_FILE_WEIGHT
+}
+
+/// (#batch-sched) OBSERVABILITY-ONLY counterfactual: over the sampled pending
+/// window `actions` (PRIORITY order) and `workers` (with capacity), compute the
+/// aggregate subtree-match score under the current GREEDY priority-order
+/// assignment `G` vs a global capacity-constrained BATCH assignment `B`
+/// (reorder + intra-batch warming), and report `(B − G)/G` as `gain_pct` plus
+/// coverage/overlap guardrails. PURE: no I/O, no lock, no scheduler state — the
+/// caller extracts `actions`/`workers` from already-cached data. It does NOT
+/// change dispatch (the real scheduler stays greedy).
+///
+/// GREEDY `G` (models production): walk `actions` in priority order; each takes
+/// `argmax_j (s(i,j) − load_penalty_j)` over workers with remaining capacity,
+/// decrements that worker, and adds the chosen `s(i,j)` (NOT the penalized
+/// value — the metric measures cache-match mass, the penalty only steers the
+/// choice). Greedy does NOT model warming — it scores against each worker's
+/// snapshot cache only, matching one-at-a-time dispatch.
+///
+/// BATCH `B` (global, order-free, warming): greedy-global max-weight — each
+/// round picks the current best `(i, j)` pair (re-derived against the evolving
+/// warm set) and assigns it if the action is unassigned AND the worker has
+/// capacity. Model INTRA-BATCH WARMING: when `A_i` is assigned to `W_j`, add
+/// `A_i.dir_digests` to `W_j`'s will-be-warm set, so a later co-located action
+/// assigned to `W_j` scores the shared subtree as cached (the co-location
+/// benefit — a shared cold subtree is materialized once, then reused). Because
+/// warming CHANGES scores after each assignment, pairs are re-derived each round.
+/// This is the cheap greedy-global approximation the design specifies (NOT
+/// Hungarian): `O(rounds × actions × workers)` set-membership, bounded by the
+/// sampled window and ~10-worker fleet.
+///
+/// `gain_pct` is guarded on `G == 0` (empty inputs, or every greedy placement
+/// cold) → `0`, avoiding divide-by-zero; a genuine positive potential requires
+/// a nonzero greedy baseline (read alongside `sample_actions`/`sample_workers`).
+pub fn compute_batch_sched_gain(
+    actions: &[BatchSchedAction],
+    workers: &[BatchSchedWorker],
+) -> BatchSchedGain {
+    let sample_actions = actions.len() as u64;
+    let sample_workers = workers.len() as u64;
+
+    let subtree_overlap_pct = compute_subtree_overlap_pct(actions);
+
+    // Nothing to assign in either direction → no gain, but still report
+    // coverage + overlap so the reader sees WHY gain is 0.
+    if actions.is_empty() || workers.is_empty() {
+        return BatchSchedGain {
+            gain_pct: 0,
+            subtree_overlap_pct,
+            sample_actions,
+            sample_workers,
+        };
+    }
+
+    let greedy = greedy_assignment_score(actions, workers);
+    let batch = batch_assignment_score(actions, workers);
+
+    // Guard G == 0: no greedy cache-match to improve on. `saturating_sub`
+    // guards the (should-not-happen) B < G from an approximation artifact.
+    let gain_pct = if greedy == 0 {
+        0
+    } else {
+        batch.saturating_sub(greedy) * 100 / greedy
+    };
+
+    BatchSchedGain {
+        gain_pct,
+        subtree_overlap_pct,
+        sample_actions,
+        sample_workers,
+    }
+}
+
+/// (#batch-sched) GREEDY `G`: priority-order, one action at a time, each grabs
+/// its `argmax_j (s − load_penalty_j)` over workers with remaining capacity;
+/// sum the chosen `s` (unpenalized). No warming (models one-at-a-time dispatch).
+fn greedy_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWorker]) -> u64 {
+    let mut remaining: Vec<u64> = workers.iter().map(|w| w.capacity).collect();
+    let mut total: u64 = 0;
+    for action in actions {
+        // argmax over workers with remaining capacity of (s − load_penalty).
+        let mut best: Option<(usize, i64, u64)> = None; // (worker_idx, penalized, raw_s)
+        for (j, worker) in workers.iter().enumerate() {
+            if remaining[j] == 0 {
+                continue;
+            }
+            let raw_s = batch_sched_score(action, &worker.cached_subtree_digests);
+            let penalized = i64::try_from(raw_s).unwrap_or(i64::MAX) - worker.load_penalty;
+            let dominated = best.is_some_and(|(_, best_pen, _)| penalized <= best_pen);
+            if !dominated {
+                best = Some((j, penalized, raw_s));
+            }
+        }
+        if let Some((j, _, raw_s)) = best {
+            remaining[j] -= 1;
+            total += raw_s;
+        }
+        // No capacity anywhere → this action goes unplaced (contributes 0),
+        // same as production leaving it queued for the next cycle.
+    }
+    total
+}
+
+/// (#batch-sched) BATCH `B`: global greedy-max-weight with intra-batch warming.
+/// Each round picks the current best `(action, worker)` pair (re-derived against
+/// the evolving per-worker warm set), assigns it, adds the action's `dir_digests`
+/// to that worker's warm set, and sums the score. Rounds continue while ANY
+/// unassigned action can still be placed on a capacity-bearing worker —
+/// INCLUDING zero-score (cold) placements, because a cold placement WARMS its
+/// worker so a later co-located sibling assigned there scores the shared subtree
+/// (the co-location benefit is exactly this second-order effect). Leftover
+/// actions (no capacity left) contribute 0. Reorder is inherent — pairs are
+/// ranked globally, not per-action in priority order.
+///
+/// Pair ranking key (max wins): PRIMARY the current score `s`; SECONDARY, on a
+/// tie (notably the all-cold tie), the overlap of the action's `dir_digests`
+/// with the candidate worker's CURRENT warm set — so once one sibling warms a
+/// worker, the tie-break pulls its co-located siblings onto the SAME worker,
+/// grouping a shared cold subtree onto one materialization rather than
+/// scattering it (without this, two same-subtree cold actions could split
+/// across two single-slot workers and never warm each other). Ties beyond that
+/// resolve to the smallest (action_idx, worker_idx) for determinism.
+fn batch_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWorker]) -> u64 {
+    let mut remaining: Vec<u64> = workers.iter().map(|w| w.capacity).collect();
+    // Per-worker will-be-warm set, seeded with the snapshot cache and grown as
+    // actions are assigned (the intra-batch warming model).
+    let mut warm: Vec<HashSet<DigestInfo>> = workers
+        .iter()
+        .map(|w| w.cached_subtree_digests.clone())
+        .collect();
+    let mut assigned: Vec<bool> = vec![false; actions.len()];
+    let mut total: u64 = 0;
+
+    // Each round assigns exactly one pair (if any is feasible); at most
+    // `actions.len()` rounds. Re-deriving scores each round captures warming.
+    for _round in 0..actions.len() {
+        // (score, warm_overlap) tuple maximized; ties → first-seen (smallest
+        // action_idx then worker_idx).
+        let mut best: Option<(usize, usize, u64, usize)> = None; // (i, j, s, warm_overlap)
+        for (i, action) in actions.iter().enumerate() {
+            if assigned[i] {
+                continue;
+            }
+            for (j, _worker) in workers.iter().enumerate() {
+                if remaining[j] == 0 {
+                    continue;
+                }
+                let s = batch_sched_score(action, &warm[j]);
+                // Secondary key: how many of this action's dir digests the
+                // worker's warm set ALREADY holds (co-location grouping on the
+                // all-cold tie). Cheap set-membership over the action's dirs.
+                let warm_overlap = action
+                    .dir_digests
+                    .iter()
+                    .filter(|d| warm[j].contains(d))
+                    .count();
+                let dominated = best.is_some_and(|(_, _, best_s, best_ov)| {
+                    (s, warm_overlap) <= (best_s, best_ov)
+                });
+                if !dominated {
+                    best = Some((i, j, s, warm_overlap));
+                }
+            }
+        }
+        match best {
+            Some((i, j, s, _)) => {
+                assigned[i] = true;
+                remaining[j] -= 1;
+                // Warm the chosen worker with this action's subtrees so a later
+                // co-located action assigned here scores the shared subtree.
+                for d in &actions[i].dir_digests {
+                    warm[j].insert(*d);
+                }
+                total += s;
+            }
+            // No unassigned action has any capacity-bearing worker left → stop.
+            None => break,
+        }
+    }
+    total
+}
+
+/// (#batch-sched) `subtree_overlap_pct`: `Σ dir_direct_bytes` over directory
+/// digests appearing in ≥2 sampled actions' `dir_digests`, / total sampled
+/// subtree bytes, `× 100` floored. Measures "is there batchable structure" —
+/// expected non-zero for builds sharing external-crate rlibs / source dirs.
+/// A shared digest's direct bytes are counted ONCE in the numerator (its value
+/// is taken from the first action that carries it — disjoint per-directory, so
+/// all carriers agree). The denominator sums every action's every directory's
+/// direct bytes (with multiplicity across actions — total sampled subtree mass).
+fn compute_subtree_overlap_pct(actions: &[BatchSchedAction]) -> u64 {
+    // Count in how many DISTINCT actions each directory digest appears, and
+    // remember one direct-byte value for it.
+    // digest → (action_count, direct_bytes)
+    let mut appearances: HashMap<DigestInfo, (u64, u64)> = HashMap::new();
+    let mut total_bytes: u64 = 0;
+    for action in actions {
+        for d in &action.dir_digests {
+            let bytes = action.dir_direct_bytes.get(d).copied().unwrap_or(0);
+            total_bytes += bytes;
+            let entry = appearances.entry(*d).or_insert((0, bytes));
+            entry.0 += 1;
+            // Keep the first-seen byte value (disjoint partition → identical
+            // across actions carrying the same directory digest).
+        }
+    }
+    if total_bytes == 0 {
+        return 0;
+    }
+    let shared_bytes: u64 = appearances
+        .values()
+        .filter(|(count, _)| *count >= 2)
+        .map(|(_, bytes)| *bytes)
+        .sum();
+    shared_bytes * 100 / total_bytes
+}
+
 /// (#batch-affinity, dimension B) Type-erased injectable clock producing the
 /// `SystemTime` that timestamps arrivals. `SystemTime::now` in prod;
 /// `MockInstantWrapped`'s `now()` (mock-clock-driven) in tests. Erased so
@@ -283,46 +585,103 @@ type AffinityClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 /// `scheduler.<name>.action.batch_affinity.<field>` (the action-scheduler
 /// registration prefix — see `src/bin/nativelink.rs:591`).
 ///
-/// Interpretation: `colocation_surplus` is a RAW UPPER BOUND, not a realized
-/// benefit — the worker cache signal is populated only POST-materialize, so the
-/// surplus is genuinely uncaptured only for the COLD (build-startup burst)
-/// subset; WARM steady-state roots are already Tier-1 co-located by existing
-/// routing and the gauge cannot separate them. So interpret it ALONGSIDE the
-/// existing `find_worker_hits`/`find_worker_misses` baseline: a high surplus
-/// fully absorbed by locality routing (high hit rate) is NOT a green light. A
-/// steadily climbing `arrival_within_250ms_total` (related tasks arriving in
-/// tight bursts a small delay would catch) is the cleaner cold-burst signal.
-/// Values near zero on both refute building batch/delay scheduling.
+/// Interpretation: the HEADLINE is `batch_sched_gain_pct` — the aggregate
+/// dir-cache-match improvement a subtree-aware batch assignment would buy over
+/// the current greedy priority-order assignment THIS cycle (`(B−G)/G`; design
+/// `.claude/audits/batch-scheduling-subtree-assignment-metric-design-2026-07-02.md`).
+/// Read it ONLY alongside the coverage guardrails: it is meaningful only when
+/// `batch_sched_sample_actions ≥ 2`, `batch_sched_sample_workers ≥ 2`, and
+/// `batch_sched_uncached_skipped` is a small fraction (design §6). It is a
+/// per-cycle POTENTIAL, not a realized speedup.
+///
+/// `batch_sched_subtree_overlap_pct` answers "is there batchable structure"
+/// (shared-subtree mass) — expected non-zero for builds sharing external-crate
+/// rlibs / source dirs. `arrival_within_250ms_total` is the orthogonal temporal
+/// batching signal (still valid).
+///
+/// The `*_exact_root_reference` gauges are the SUPERSEDED exact-input-root
+/// signal (`sampled_ops − distinct(input_root_digest)`). They key on the FULL
+/// input root, which build actions essentially never share (each compile's input
+/// tree is unique), so they read near-always 0 for builds and MEASURE THE WRONG
+/// THING — kept only as a labeled reference so dashboards migrating off them see
+/// continuity, NOT as a batch-scheduling green light. Prefer `batch_sched_*`.
 ///
 /// These are per-key SCALAR aggregates on purpose: `MetricsComponent` cannot
 /// emit dynamic per-digest/per-worker labels, so we aggregate to gauges +
 /// a counter. The `#[metric]` names are STABLE — dashboards key on them.
 #[derive(Debug, Default, MetricsComponent)]
 pub struct BatchAffinityMetrics {
-    /// Dimension A gauge: `pending_ops - distinct_input_roots` over the sampled
-    /// pending prefix at the last match cycle. A RAW UPPER BOUND on pending
-    /// assignments that could reuse a peer pending task's dir-cache locality if
-    /// grouped — real signal is the cold-burst subset; read with the
-    /// `find_worker_hits`/`misses` baseline (see the struct doc).
+    /// (#batch-sched) HEADLINE gauge: `(B − G) / G * 100` — the aggregate
+    /// subtree-cache-match score improvement a global capacity-constrained batch
+    /// assignment (reorder + intra-batch warming) would buy over the current
+    /// greedy priority-order assignment, computed over the sampled cached
+    /// pending window at the last match cycle. `0` when `G == 0` or coverage is
+    /// empty. MEANINGFUL ONLY with `batch_sched_sample_actions/workers ≥ 2` and
+    /// low `batch_sched_uncached_skipped` (design §6).
     #[metric(
-        help = "pending co-location surplus (sampled pending ops minus distinct input roots) at last match cycle; RAW UPPER BOUND (real signal is cold-burst subset); read with find_worker_hits/misses"
+        help = "batch-scheduling potential: (B-G)/G percent aggregate dir-cache-match gain of a subtree-aware batch assignment over the current greedy, last match cycle; read with sample_actions/workers>=2 and low uncached_skipped"
     )]
-    pub colocation_surplus: AtomicU64,
+    pub batch_sched_gain_pct: AtomicU64,
 
-    /// Dimension A gauge: size of the largest same-input-root group in the
-    /// sampled pending prefix at the last match cycle (the biggest single batch
-    /// a grouper could form).
+    /// (#batch-sched) Gauge: shared-subtree mass — `Σ dir_direct_bytes` over
+    /// directory digests appearing in ≥2 sampled actions' `dir_digests`, / total
+    /// sampled subtree bytes, percent. "Is there batchable structure" (expected
+    /// non-zero for builds); independent of worker state.
     #[metric(
-        help = "largest same-input-root pending group at last match cycle; the biggest single batch a grouper could form"
+        help = "shared-subtree mass percent: sum of direct bytes of directory digests shared by >=2 sampled pending actions over total sampled subtree bytes, last match cycle"
     )]
-    pub max_group: AtomicU64,
+    pub batch_sched_subtree_overlap_pct: AtomicU64,
 
-    /// Dimension A gauge: number of pending ops the surplus was computed over at
-    /// the last match cycle (== min(pending, MAX_PENDING_AFFINITY_SAMPLE)). If
-    /// this equals the sample cap, the surplus is a lower bound on the true
-    /// pending-set surplus.
+    /// (#batch-sched) Coverage guardrail gauge: number of sampled pending actions
+    /// whose `ResolvedTree` was ALREADY cached (peek hit) and thus scored in the
+    /// counterfactual. `gain_pct` is a low-coverage artifact below 2.
     #[metric(
-        help = "pending ops sampled for the co-location surplus at last match cycle; equals the sample cap when the pending set is larger (surplus then a lower bound)"
+        help = "number of sampled pending actions with an already-cached resolved tree scored in the batch counterfactual, last match cycle (gain_pct meaningful only at >=2)"
+    )]
+    pub batch_sched_sample_actions: AtomicU64,
+
+    /// (#batch-sched) Coverage guardrail gauge: number of workers-with-capacity
+    /// the counterfactual assigned over. `gain_pct` is a low-coverage artifact
+    /// below 2.
+    #[metric(
+        help = "number of capacity-bearing workers in the batch counterfactual, last match cycle (gain_pct meaningful only at >=2)"
+    )]
+    pub batch_sched_sample_workers: AtomicU64,
+
+    /// (#batch-sched) Coverage guardrail gauge: number of sampled pending actions
+    /// SKIPPED because their `ResolvedTree` was NOT yet cached (a `tree_cache`
+    /// peek miss — the probe NEVER resolves a tree). A large fraction means the
+    /// `gain_pct` sample is unrepresentative (design §3/§6).
+    #[metric(
+        help = "sampled pending actions skipped because their resolved tree was not yet cached (probe never resolves); a large fraction means gain_pct is low-coverage, last match cycle"
+    )]
+    pub batch_sched_uncached_skipped: AtomicU64,
+
+    /// (SUPERSEDED — exact-input-root reference) Gauge:
+    /// `pending_ops − distinct_input_roots` over the sampled pending prefix. Keys
+    /// on the FULL `input_root_digest`, which build actions essentially never
+    /// share → near-always 0 for builds (MEASURES THE WRONG THING; superseded by
+    /// `batch_sched_gain_pct`). Kept, relabeled, only for dashboard continuity.
+    #[metric(
+        help = "SUPERSEDED exact-input-root reference: sampled pending ops minus distinct input roots; near-always 0 for builds (they never share a full input root) — prefer batch_sched_gain_pct"
+    )]
+    pub colocation_surplus_exact_root_reference: AtomicU64,
+
+    /// (SUPERSEDED — exact-input-root reference) Gauge: size of the largest
+    /// same-input-root pending group. Same exact-root limitation as
+    /// `colocation_surplus_exact_root_reference`; kept only for continuity.
+    #[metric(
+        help = "SUPERSEDED exact-input-root reference: largest same-input-root pending group; near-always 1 for builds — prefer batch_sched_subtree_overlap_pct"
+    )]
+    pub max_group_exact_root_reference: AtomicU64,
+
+    /// Gauge: number of pending ops the exact-root reference was computed over at
+    /// the last match cycle (== min(pending, MAX_PENDING_AFFINITY_SAMPLE)). Also
+    /// the window size the batch counterfactual sampled BEFORE the cached-tree
+    /// filter (`batch_sched_sample_actions` + `batch_sched_uncached_skipped`
+    /// partition it).
+    #[metric(
+        help = "pending ops sampled at last match cycle; equals the sample cap when the pending set is larger; partitioned by the batch probe into sample_actions + uncached_skipped"
     )]
     pub sampled_ops: AtomicU64,
 
@@ -678,20 +1037,26 @@ impl SimpleScheduler {
         result
     }
 
-    /// (#batch-affinity, dimension A) OBSERVABILITY-ONLY: compute the
-    /// instantaneous co-location surplus over the (already-collected,
-    /// priority-sorted) pending set and store it into the gauges. Samples at
-    /// most `MAX_PENDING_AFFINITY_SAMPLE` highest-priority ops; each sampled op
-    /// costs one `as_action_info()` call. On the memory backend (the deployed
-    /// topology, the only one this method runs on — the caller gates it OFF for
-    /// the Redis/store backend) that is a cheap in-memory
-    /// `watch::borrow().clone()`, the same KIND of call the matcher makes; it is
-    /// nonetheless a SEPARATE pass (the matcher does not reuse this result), so
-    /// it is a bounded ADDITIONAL read, not free. Ops whose `as_action_info()`
-    /// fails (e.g. an `ErrorActionStateResult` from a stream decode error) are
-    /// skipped — a best-effort probe must never fail the match cycle. This
-    /// method has NO effect on assignment: it borrows `queued_actions`, mutates
-    /// only the gauge atomics, and returns `()`.
+    /// (#batch-affinity / #batch-sched) OBSERVABILITY-ONLY: over the
+    /// (already-collected, priority-sorted) pending set, store (a) the SUPERSEDED
+    /// exact-input-root reference gauges and (b) the HEADLINE batch-scheduling
+    /// counterfactual (`batch_sched_*`). Samples at most
+    /// `MAX_PENDING_AFFINITY_SAMPLE` highest-priority ops; each sampled op costs
+    /// one `as_action_info()` call — on the memory backend (the deployed
+    /// topology, the only one this method runs on; the caller gates it OFF for
+    /// the Redis/store backend) a cheap in-memory `watch::borrow().clone()`, the
+    /// same KIND of call the matcher makes, but a SEPARATE bounded pass. Ops whose
+    /// `as_action_info()` fails are skipped — a best-effort probe must never fail
+    /// the match cycle.
+    ///
+    /// The batch counterfactual (`worker_scheduler.batch_sched_gain_for_probe`)
+    /// operates ONLY over sampled roots whose `ResolvedTree` is ALREADY cached
+    /// (a `tree_cache` peek — NO resolution, NO fetch, NO LRU bump); uncached
+    /// roots are skipped and counted (`batch_sched_uncached_skipped`). It reads
+    /// worker caches + capacities under the scheduler lock, then solves lock-free.
+    ///
+    /// This method has NO effect on assignment: it borrows `queued_actions`,
+    /// mutates only the gauge atomics, and returns `()`.
     async fn record_pending_affinity_surplus(
         &self,
         queued_actions: &[Box<dyn ActionStateResult>],
@@ -703,16 +1068,42 @@ impl SimpleScheduler {
                 pending_roots.push(action_info.input_root_digest);
             }
         }
+
+        // (SUPERSEDED reference) exact-input-root surplus/max-group.
         let (surplus, max_group) = colocation_surplus(&pending_roots);
         self.batch_affinity_metrics
-            .colocation_surplus
+            .colocation_surplus_exact_root_reference
             .store(surplus, Ordering::Relaxed);
         self.batch_affinity_metrics
-            .max_group
+            .max_group_exact_root_reference
             .store(max_group, Ordering::Relaxed);
         self.batch_affinity_metrics
             .sampled_ops
             .store(pending_roots.len() as u64, Ordering::Relaxed);
+
+        // (#batch-sched) HEADLINE counterfactual over the sampled roots whose
+        // resolved trees are ALREADY cached (peek-only; the probe never
+        // resolves). Reads worker cache/capacity under the scheduler lock, then
+        // solves lock-free. `uncached_skipped` = sampled − scored.
+        let (gain, uncached_skipped) = self
+            .worker_scheduler
+            .batch_sched_gain_for_probe(&pending_roots)
+            .await;
+        self.batch_affinity_metrics
+            .batch_sched_gain_pct
+            .store(gain.gain_pct, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .batch_sched_subtree_overlap_pct
+            .store(gain.subtree_overlap_pct, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .batch_sched_sample_actions
+            .store(gain.sample_actions, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .batch_sched_sample_workers
+            .store(gain.sample_workers, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .batch_sched_uncached_skipped
+            .store(uncached_skipped, Ordering::Relaxed);
     }
 
     /// Matches a single action to a worker, using a shared cache for computed
