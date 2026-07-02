@@ -1278,6 +1278,13 @@ impl ApiWorkerSchedulerImpl {
         // has a free slot, every pref collapses to `u64::MAX` (all-equal primary)
         // → sort by load = the Phase-2-lift parity (§12.3) without a separate
         // pre-scan.
+        // INTENTIONAL — the raw flag, NOT the cache tiers'
+        // `p_headroom_gate_enabled && any_viable_has_p_headroom` (:1617): the
+        // fallback achieves Phase-2-lift no-wedge (I2) AUTOMATICALLY via the
+        // all-`u64::MAX` pref tie (all candidates saturated ⇒ equal primary key
+        // ⇒ sort by load), so it needs no pre-scan. Do NOT "unify" this with the
+        // cache-tier binding by ANDing in `any_viable_has_p_headroom` — that
+        // would break I2 (the fallback has no such pre-scan and does not need one).
         let p_gate_active = self.p_headroom_gate_enabled;
         let p_idle_threshold_pct = self.p_idle_threshold_pct;
         let p_headroom_override_factor = self.p_headroom_override_factor;
@@ -6284,6 +6291,40 @@ mod tests {
         );
     }
 
+    /// (§13, I-1) A5 (`p_core_count == 0`, ungated legacy/Linux/Intel) must rank
+    /// TOP-tier (pref 0) with the gate ACTIVE, regardless of how high its running
+    /// count or `p_load` is — §5 I4 / §12.3 require an ungated worker to rank
+    /// byte-identically to v1 (by load alone, top tier). The predicate-level A5
+    /// test (`test_worker_has_p_headroom_v2_truth_table`) covers ELIGIBILITY; this
+    /// covers the RANKING arm, which is otherwise unguarded.
+    ///
+    /// MUTATION: delete the `w.p_core_count == 0 ||` disjunct from the free-slot
+    /// arm of `p_headroom_pref` → an A5 worker (p_count 0) falls through to the
+    /// override arm, where `running < p_count(0) * factor` is `running < 0` (never
+    /// true) → returns `u64::MAX` = ranked WORST. This assert then red-fails with
+    /// the bespoke message below.
+    #[test]
+    fn test_p_headroom_pref_a5_is_top_tier_under_active_gate() {
+        // A5: p_core_count 0, HIGH p_load 99, and MORE-than-zero running (5) — the
+        // adversarial case (high load + high in-flight) that would fall to the
+        // override/MAX arms if the A5 short-circuit were missing.
+        let a5 = worker_with_running("A5", 0, 99, 5);
+        assert_eq!(
+            p_headroom_pref(&a5, true, 50, 2),
+            0,
+            "A5 (p_core_count == 0) must rank TOP-tier (pref 0) under the ACTIVE \
+             gate even at high running(5) + high p_load(99) — an ungated worker \
+             ranks by load alone (v1 parity), NOT at the override/no-headroom tier"
+        );
+        // And at running 0 (the trivially-idle A5) — still pref 0.
+        let a5_idle = worker_with_running("A5_IDLE", 0, 99, 0);
+        assert_eq!(
+            p_headroom_pref(&a5_idle, true, 50, 2),
+            0,
+            "A5 stays pref 0 at running 0 (the free-slot/A5 arm), independent of p_load"
+        );
+    }
+
     /// Helper: encode a Directory proto and compute its DigestInfo (SHA256).
     fn encode_directory(dir: &Directory) -> (Vec<u8>, DigestInfo) {
         let dir_bytes = dir.encode_to_vec();
@@ -9324,13 +9365,16 @@ mod b1_lock_decouple_tests {
         /// so the cascade falls through to `inner_find_worker_for_action`, whose
         /// sort key is `(p_headroom_pref, effective_load_score)`. FREE_SLOT
         /// (pref 0) must beat OVERRIDE (pref ≥ 1) despite OVERRIDE's lower stale
-        /// `effective_load_score`. MUTATION: revert the fallback key to
-        /// `(!has_p_headroom, load)` → both are `!has_p_headroom` false for
-        /// FREE_SLOT / true-ish… actually with v2.2's bool the override worker
-        /// (no fresh slot) sorts tier `true`, so the bool ALSO picks FREE_SLOT;
-        /// the DISTINGUISHING mutation is reverting `p_headroom_pref` to the raw
-        /// stale `effective_load_score` (drop the primary key), which picks
-        /// OVERRIDE — this test red-fails then.
+        /// `effective_load_score`. Note the old v2.2 bool key
+        /// `(!worker_has_p_headroom, load)` would NOT catch this magnet: at
+        /// threshold 50 the OVERRIDE worker is admitted by the idle-P override
+        /// (p_load 5 < 50), so `worker_has_p_headroom` is TRUE for BOTH workers
+        /// → both sort tier `false` → the bool key falls straight to `load` and
+        /// picks OVERRIDE (lower stale load) — the magnet. Only the fresh-count
+        /// `p_headroom_pref` PRIMARY key ({0 for FREE_SLOT} < {1 for OVERRIDE})
+        /// separates them. MUTATION: drop `p_headroom_pref` from the key (revert
+        /// to sorting on `effective_load_score` alone) → OVERRIDE's lower stale
+        /// load wins → this test red-fails.
         #[nativelink_test]
         async fn t_i6_magnet_fallback_free_slot_beats_override() {
             let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
@@ -9454,6 +9498,74 @@ mod b1_lock_decouple_tests {
             );
         }
 
+        /// (§13, SingleHolderCeiling — the Rust counterpart to the proven TLA+
+        /// `SingleHolderCeiling` invariant.) The honest single-holder coverage:
+        /// ONE worker holds the action's `input_root` in its dir-cache (a Tier-1
+        /// root match — the sticky magnet), and it is OVER its P-slot count but
+        /// still override-admitted (p_load 5 < threshold 50). There are cache-COLD
+        /// PEERS with genuine free P slots. The invariant: the sole holder is
+        /// CAPPED at `p_core_count * factor` in-flight — once it reaches the
+        /// ceiling, the override CLOSES, so the holder is gate-excluded from the
+        /// cache tiers and the next same-root dispatch's overflow lands on a
+        /// (cold) PEER, NOT the holder. Without the ceiling the root-match
+        /// stickiness would let a single holder accrete the whole same-root storm
+        /// unboundedly (the concentration the M1 gate exists to bound).
+        ///
+        /// MUTATION: drop the ceiling term (`running < p_count * factor`) from the
+        /// override clause of `worker_has_p_headroom` → at running 8 the holder is
+        /// STILL admitted (p_load 5 < 50), its Tier-1 root match beats the cold
+        /// peers' fall-through, and the holder wins its OWN root past the ceiling
+        /// → the peer-wins assert red-fails with the bespoke message below.
+        #[nativelink_test]
+        async fn t_single_holder_capped_at_ceiling_overflow_lands_on_cold_peer() {
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
+
+            // SOLE HOLDER: p_count 4, idle-P (p_load 5), holds `input_root` as a
+            // Tier-1 root match. Placed AT the ceiling (running 8 == 4 * 2), so
+            // its idle-P override is CLOSED (I5_Bounded) despite the stale-low
+            // p_load — the fresh-count backstop, not the load, decides.
+            add_tier1_worker(&scheduler, "HOLDER", 4, 0, 5, 5, 0).await;
+            set_worker_running(&scheduler, "HOLDER", 8).await; // 8 == ceiling → NO override
+
+            // Cache-COLD PEERS (no `update_cached_directories` → not root holders)
+            // each with a genuine free P slot (running 0 < p_count 4). They are
+            // the legitimate overflow targets once the holder hits its ceiling.
+            for peer in ["COLD_A", "COLD_B"] {
+                let _rx = add_worker_in_pool(&scheduler, peer).await;
+                scheduler
+                    .set_worker_core_counts(&WorkerId(peer.to_string()), 4, 0)
+                    .await
+                    .expect("counts");
+                scheduler
+                    .update_worker_load(&WorkerId(peer.to_string()), 5, 5, 0)
+                    .await
+                    .expect("load");
+                // running defaults to 0 → genuine free P slot.
+            }
+
+            // The holder is at its ceiling → override closed → excluded from the
+            // cache tiers → the same-root dispatch overflows to a COLD peer, NOT
+            // the holder. (Either cold peer is acceptable; the load-bearing
+            // assertion is that it is NOT the holder.)
+            let chosen = select(&scheduler).await;
+            assert!(
+                chosen.is_some(),
+                "SingleHolderCeiling: a same-root dispatch must place SOMEWHERE — \
+                 the fleet has cold peers with free P slots; wedging is a bug"
+            );
+            assert_ne!(
+                chosen,
+                Some(WorkerId("HOLDER".to_string())),
+                "SingleHolderCeiling: the sole root HOLDER is at its P-slot ceiling \
+                 (running 8 == p_count 4 * factor 2), so its idle-P override is \
+                 CLOSED and it is gate-excluded from the cache tiers — the overflow \
+                 same-root dispatch MUST land on a cold PEER (free P slot), NOT pile \
+                 onto the holder past its ceiling. The root-match stickiness cannot \
+                 override the fresh-count backstop (the Rust counterpart to the \
+                 proven TLA+ SingleHolderCeiling)"
+            );
+        }
+
         /// (§13 test 3, Tier-1.5) I6 magnet fix on the subtree-coverage tier.
         /// TWO subtree holders with the SAME cached_score, both gate-eligible:
         ///   - FREE_SLOT: `running(3) < p_count(4)` (free slot), HIGH stale
@@ -9481,6 +9593,25 @@ mod b1_lock_decouple_tests {
             // OVERRIDE: low stale load → higher blended_s in v1.
             add_tier15_worker(&scheduler, "OVERRIDE", 4, 0, 5, 0, vec![child_a]).await;
             set_worker_running(&scheduler, "OVERRIDE", 4).await; // 4 == 4 → override-admit
+
+            // Precondition (mirrors the Tier-1 / fallback tests): both workers
+            // cache child_a → SAME cached_score, so `blended_s = cached_score -
+            // load_penalty` is discriminated ONLY by the penalty. The override
+            // worker's stale-low p_load (5) gives it the LOWER penalty → the
+            // HIGHER blended_s. Without pref, v1's max-blended_s Tier-1.5 would
+            // fall for OVERRIDE — this pins that the magnet is actually present
+            // (a future load/`build_tree` edit can't silently collapse it so the
+            // test passes because FREE_SLOT won on the secondary key).
+            let free_pen =
+                super::super::capacity_score(90, 0, 90, 4, 0, 8, 512 * 1024).load_penalty;
+            let over_pen =
+                super::super::capacity_score(5, 0, 5, 4, 0, 8, 512 * 1024).load_penalty;
+            assert!(
+                over_pen < free_pen,
+                "precondition: the override worker's stale-low p_load gives it the \
+                 LOWER load_penalty → a HIGHER blended_s (same cached_score) — the \
+                 max-blended_s magnet v1 would fall for"
+            );
 
             let chosen = select_tier15(&scheduler, &tree).await;
             assert_eq!(
@@ -10301,8 +10432,8 @@ mod b1_lock_decouple_tests {
     ///
     /// Mutation: change the `has_reported_load` branch in `effective_load_score`
     /// to always return `u64::MAX` (revert to pre-fix behaviour) → the
-    /// `min_by_key` in `inner_find_worker_for_action` (§11 v2.2: keyed on the
-    /// tuple `(no_p_headroom_tier, effective_load_score)`) sees BOTH load
+    /// `min_by_key` in `inner_find_worker_for_action` (v2: keyed on the
+    /// tuple `(p_headroom_pref, effective_load_score)`) sees BOTH load
     /// scores as `u64::MAX` and, with the gate OFF here (both tier `false`),
     /// returns the first candidate (the LRU/MRU position wins the tie), so the
     /// bespoke message "reported-idle worker must score 0 (best)" from
@@ -10345,8 +10476,8 @@ mod b1_lock_decouple_tests {
     /// dispatched action MUST return SOME worker — not None. This test calls
     /// `find_worker_for_action` → `inner_find_worker_for_action`, whose
     /// selectability mechanism for an all-never-reported fleet is the
-    /// `viable.iter().min_by_key(...)` selection (§11 v2.2: keyed on the tuple
-    /// `(no_p_headroom_tier, effective_load_score)`): every candidate scores
+    /// `viable.iter().min_by_key(...)` selection (v2: keyed on the tuple
+    /// `(p_headroom_pref, effective_load_score)`): every candidate scores
     /// `effective_load_score(..., has_reported_load=false) == u64::MAX` and,
     /// with the gate OFF here, shares tier `false`, so `min_by_key` returns the
     /// FIRST (LRU/MRU-leading) candidate — never `None` for a non-empty viable
