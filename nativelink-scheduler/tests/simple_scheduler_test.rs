@@ -3596,6 +3596,35 @@ async fn enqueue_triggers_input_tree_prefetch_test() -> Result<(), Error> {
         "a fresh scheduler has permits — must not count as skipped_nopermit. body=\n{body}"
     );
 
+    // (#p1p2, assumption-auditor) Pin the NINE cold-resolution latency histogram
+    // bucket names on the REAL /metrics render path (dashboards key on them; the
+    // sibling prefetch counters above have render pins, these did not). All nine
+    // are `SchedulerMetrics` fields under the same worker_scheduler_metrics group,
+    // so they render (at their default 0 here) whenever the group renders. This
+    // pins the NAME + boundary set; a bucket rename or a boundary-constant edit
+    // that changes the emitted name red-fails here.
+    for bucket in [
+        "tree_resolution_ms_le_50",
+        "tree_resolution_ms_le_100",
+        "tree_resolution_ms_le_250",
+        "tree_resolution_ms_le_500",
+        "tree_resolution_ms_le_1000",
+        "tree_resolution_ms_le_2000",
+        "tree_resolution_ms_le_5000",
+        "tree_resolution_ms_le_30000",
+        "tree_resolution_ms_gt_30000",
+    ] {
+        assert!(
+            body.contains(&format!(
+                "\nscheduler_testsched_worker_scheduler_metrics_{bucket} "
+            )),
+            "#p1p2 MISSING histogram bucket: \
+             scheduler_testsched_worker_scheduler_metrics_{bucket} must render on the real \
+             /metrics path (dashboards key on the 9-bucket cold-resolution latency histogram). \
+             body=\n{body}"
+        );
+    }
+
     Ok(())
 }
 

@@ -329,7 +329,10 @@ pub struct BatchSchedWorker {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BatchSchedGain {
     /// `(B − G) / G * 100`, floored, `0` when `G == 0` (guard: no greedy match
-    /// to improve on, or empty inputs).
+    /// to improve on, or empty inputs). `B := max(B_heuristic, G)` — a real
+    /// batch scheduler never does worse than greedy, so `gain_pct` is a genuine
+    /// LOWER BOUND on the batch gain (the from-scratch heuristic may miss gains
+    /// the optimal batch would capture; see `greedy_fallback`).
     pub gain_pct: u64,
     /// Shared-subtree mass: `Σ dir_direct_bytes` over directory digests
     /// appearing in ≥2 sampled actions' `dir_digests`, / total sampled subtree
@@ -341,6 +344,15 @@ pub struct BatchSchedGain {
     /// Number of capacity-bearing workers the solve ran over. Coverage
     /// guardrail — `gain_pct` is only meaningful at `≥ 2`.
     pub sample_workers: u64,
+    /// (#batch-sched) TRUE for this cycle iff the from-scratch batch heuristic
+    /// `B_heuristic` scored STRICTLY BELOW the greedy baseline `G` — i.e. the
+    /// heuristic (which is NOT the optimum) picked a worse assignment than
+    /// greedy this cycle, so `B` was floored up to `G` (`max`) and `gain_pct`
+    /// is 0. The probe increments `batch_sched_greedy_fallback_total` on each
+    /// such cycle so operators can see how often the heuristic undersells its
+    /// own gain. NOT an error — a real batch scheduler would simply keep the
+    /// greedy result; this flag just makes the floor visible.
+    pub greedy_fallback: bool,
 }
 
 /// (#batch-sched) Scalar subtree-match score `s(i,j)` for `action` against
@@ -367,12 +379,24 @@ fn batch_sched_score(action: &BatchSchedAction, worker_cache: &HashSet<DigestInf
 /// caller extracts `actions`/`workers` from already-cached data. It does NOT
 /// change dispatch (the real scheduler stays greedy).
 ///
-/// GREEDY `G` (models production): walk `actions` in priority order; each takes
+/// GREEDY `G` (models the CACHE-AFFINITY greedy — Tier-1.5 load-blend, NOT the
+/// whole selector): walk `actions` in priority order; each takes
 /// `argmax_j (s(i,j) − load_penalty_j)` over workers with remaining capacity,
 /// decrements that worker, and adds the chosen `s(i,j)` (NOT the penalized
 /// value — the metric measures cache-match mass, the penalty only steers the
 /// choice). Greedy does NOT model warming — it scores against each worker's
 /// snapshot cache only, matching one-at-a-time dispatch.
+///
+/// SCOPE (assumption-auditor 2026-07-02): `G` reproduces production's Tier-1.5
+/// `argmax(s − load_penalty)` cache-affinity ranking ONLY. It deliberately
+/// HOLDS ASIDE the tiers/keys the real selector wraps around that ranking — the
+/// `p_headroom_pref` PRIMARY key (M1 v2), the `blended_s > 0` crossover, and the
+/// exact-root (Tier-1) / LRU (Tier-2) tiers — because the metric ISOLATES the
+/// SUBTREE-CACHE-AFFINITY assignment gap (does subtree-aware batching beat the
+/// cache-affinity greedy). Adding `p_headroom_pref` to `G` would fold headroom
+/// steering back in and blur the cache-affinity signal this gauge exists to
+/// measure. `gain_pct` is therefore the batch gap OVER THE CACHE-AFFINITY GREEDY,
+/// not over the full production selector.
 ///
 /// BATCH `B` (global, order-free, warming): greedy-global max-weight — each
 /// round picks the current best `(i, j)` pair (re-derived against the evolving
@@ -385,6 +409,13 @@ fn batch_sched_score(action: &BatchSchedAction, worker_cache: &HashSet<DigestInf
 /// This is the cheap greedy-global approximation the design specifies (NOT
 /// Hungarian): `O(rounds × actions × workers)` set-membership, bounded by the
 /// sampled window and ~10-worker fleet.
+///
+/// `B` is defined `max(B_heuristic, G)`: the from-scratch greedy-global is a
+/// HEURISTIC, not the optimum, so it can score below `G` on contended cycles;
+/// a real batch scheduler never does worse than greedy (it keeps the better of
+/// its global solution and the greedy baseline). This makes `gain_pct` a genuine
+/// LOWER BOUND (`≥ 0`, no silent clip) and sets `greedy_fallback` when the
+/// heuristic underperformed so the counter surfaces how often that happens.
 ///
 /// `gain_pct` is guarded on `G == 0` (empty inputs, or every greedy placement
 /// cold) → `0`, avoiding divide-by-zero; a genuine positive potential requires
@@ -406,18 +437,28 @@ pub fn compute_batch_sched_gain(
             subtree_overlap_pct,
             sample_actions,
             sample_workers,
+            greedy_fallback: false,
         };
     }
 
     let greedy = greedy_assignment_score(actions, workers);
-    let batch = batch_assignment_score(actions, workers);
+    let batch_heuristic = batch_assignment_score(actions, workers);
 
-    // Guard G == 0: no greedy cache-match to improve on. `saturating_sub`
-    // guards the (should-not-happen) B < G from an approximation artifact.
+    // `batch_assignment_score` is a from-scratch greedy-global HEURISTIC, NOT
+    // the optimal batch assignment — it can score BELOW `greedy` on ~2.75% of
+    // contended cycles (auditor 2026-07-02). A real batch scheduler would never
+    // do worse than greedy: it picks the better of its global solution and the
+    // greedy baseline. So define `B := max(B_heuristic, G)`. This makes
+    // `gain_pct = (B−G)/G ≥ 0` a genuine LOWER BOUND (no silent clip), and
+    // `greedy_fallback` records when the heuristic underperformed so the counter
+    // surfaces how often it undersells its own gain.
+    let greedy_fallback = batch_heuristic < greedy;
+    let batch = batch_heuristic.max(greedy);
+    // Guard G == 0: no greedy cache-match to improve on (divide-by-zero).
     let gain_pct = if greedy == 0 {
         0
     } else {
-        batch.saturating_sub(greedy) * 100 / greedy
+        (batch - greedy) * 100 / greedy
     };
 
     BatchSchedGain {
@@ -425,6 +466,7 @@ pub fn compute_batch_sched_gain(
         subtree_overlap_pct,
         sample_actions,
         sample_workers,
+        greedy_fallback,
     }
 }
 
@@ -587,8 +629,15 @@ type AffinityClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 ///
 /// Interpretation: the HEADLINE is `batch_sched_gain_pct` — the aggregate
 /// dir-cache-match improvement a subtree-aware batch assignment would buy over
-/// the current greedy priority-order assignment THIS cycle (`(B−G)/G`; design
+/// the current CACHE-AFFINITY greedy assignment THIS cycle (`(B−G)/G`; design
 /// `.claude/audits/batch-scheduling-subtree-assignment-metric-design-2026-07-02.md`).
+/// SCOPE: `G` models production's Tier-1.5 `argmax(s − load_penalty)`
+/// cache-affinity ranking ONLY — it holds the `p_headroom_pref` gate, the
+/// `blended_s > 0` crossover, and the exact-root/LRU tiers aside so the gauge
+/// ISOLATES the subtree-cache-affinity assignment gap, not the whole-selector
+/// gap. It is a genuine LOWER BOUND: `B := max(B_heuristic, G)`, so
+/// `gain_pct ≥ 0` and a rising `batch_sched_greedy_fallback_total` means the
+/// heuristic undersold the gain on those cycles (read "≥ this", not "no gain").
 /// Read it ONLY alongside the coverage guardrails: it is meaningful only when
 /// `batch_sched_sample_actions ≥ 2`, `batch_sched_sample_workers ≥ 2`, and
 /// `batch_sched_uncached_skipped` is a small fraction (design §6). It is a
@@ -656,6 +705,19 @@ pub struct BatchAffinityMetrics {
         help = "sampled pending actions skipped because their resolved tree was not yet cached (probe never resolves); a large fraction means gain_pct is low-coverage, last match cycle"
     )]
     pub batch_sched_uncached_skipped: AtomicU64,
+
+    /// (#batch-sched) CUMULATIVE counter: match cycles in which the from-scratch
+    /// batch HEURISTIC scored BELOW the greedy baseline `G`, so `B` was floored
+    /// up to `G` (`B := max(B_heuristic, G)`) and `gain_pct` reported 0 for that
+    /// cycle. A growing value means the heuristic UNDERSELLS the batch gain on
+    /// contended cycles (it is a lower bound, not the optimum) — so a small,
+    /// non-zero `batch_sched_gain_pct` alongside a rising fallback count should
+    /// be read as "≥ this, possibly more", not "batch does not help". NOT an
+    /// error condition.
+    #[metric(
+        help = "cumulative match cycles where the from-scratch batch heuristic underperformed greedy (B floored to G); a rising value means batch_sched_gain_pct is a loose lower bound on those cycles"
+    )]
+    pub batch_sched_greedy_fallback_total: AtomicU64,
 
     /// (SUPERSEDED — exact-input-root reference) Gauge:
     /// `pending_ops − distinct_input_roots` over the sampled pending prefix. Keys
@@ -1104,6 +1166,14 @@ impl SimpleScheduler {
         self.batch_affinity_metrics
             .batch_sched_uncached_skipped
             .store(uncached_skipped, Ordering::Relaxed);
+        // (#batch-sched) Count cycles where the from-scratch heuristic
+        // underperformed greedy (B floored to G). CUMULATIVE — fetch_add, not
+        // store — so operators see how OFTEN gain_pct is a loose lower bound.
+        if gain.greedy_fallback {
+            self.batch_affinity_metrics
+                .batch_sched_greedy_fallback_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Matches a single action to a worker, using a shared cache for computed

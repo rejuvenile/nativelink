@@ -31,6 +31,7 @@
 //!   scheduler.test.action.batch_affinity.batch_sched_sample_actions
 //!   scheduler.test.action.batch_affinity.batch_sched_sample_workers
 //!   scheduler.test.action.batch_affinity.batch_sched_uncached_skipped
+//!   scheduler.test.action.batch_affinity.batch_sched_greedy_fallback_total
 //!
 //! The dim-B counter is driven by the scheduler's INJECTABLE clock
 //! (`MockInstantWrapped` → thread-local `MockClock`), so this file advances the
@@ -384,13 +385,16 @@ async fn batch_affinity_arrival_window_counter_render() -> Result<(), Error> {
     Ok(())
 }
 
-/// (#batch-sched) The FIVE new batch-scheduling counterfactual gauges must all
-/// render under the batch_affinity prefix on the REAL `/metrics` path. With no
-/// CAS store and no workers, the counterfactual has no cached trees to score,
-/// so `gain_pct`/`overlap_pct`/`sample_actions`/`sample_workers` are 0 and
+/// (#batch-sched) The SIX new batch-scheduling counterfactual metrics (five
+/// gauges + the `greedy_fallback_total` counter) must all render under the
+/// batch_affinity prefix on the REAL `/metrics` path. With no CAS store and no
+/// workers, the counterfactual has no cached trees to score, so
+/// `gain_pct`/`overlap_pct`/`sample_actions`/`sample_workers` are 0 and
 /// `uncached_skipped` equals the sampled pending count (every root is a
-/// tree_cache peek MISS — the probe never resolves). This pins the metric NAMES
-/// (dashboards key on them) and the coverage-guardrail semantics.
+/// tree_cache peek MISS — the probe never resolves). `greedy_fallback_total`
+/// stays 0 (no cached actions → no assignment to underperform on). This pins
+/// the metric NAMES (dashboards key on them) and the coverage-guardrail
+/// semantics.
 #[nativelink_test]
 async fn batch_sched_gauges_render() -> Result<(), Error> {
     let (scheduler, worker_scheduler, _notify) = new_scheduler();
@@ -420,6 +424,7 @@ async fn batch_sched_gauges_render() -> Result<(), Error> {
         "batch_sched_sample_actions",
         "batch_sched_sample_workers",
         "batch_sched_uncached_skipped",
+        "batch_sched_greedy_fallback_total",
     ] {
         assert!(
             body.contains(&format!("\nscheduler_test_action_batch_affinity_{name} ")),

@@ -90,19 +90,22 @@ fn worker(cached: &[u8], capacity: u64, load_penalty: i64) -> BatchSchedWorker {
     }
 }
 
-// ─────────────────────────── (1a) batch beats greedy via REORDER ────────────
+// ──────── (1a) G==0 guard returns gain 0 with full coverage counted ─────────
 
-/// Two single-slot workers, two actions. The HIGH-priority action A0 matches
-/// BOTH workers equally-well cold (no cache), but the LOW-priority action A1 is
-/// a large cache match ONLY on W0. Greedy (priority order) lets A0 grab its
-/// argmax worker; if that is W0, A1 is left with W1 (cold) and the aggregate
-/// match is 0. Batch, reordering, gives W0 to A1 (its big match) and W1 to A0.
+/// NAME/SCOPE (testing-czar): this asserts the `G == 0` DIVIDE-BY-ZERO GUARD and
+/// the coverage counting — NOT that batch numerically beats greedy (the positive
+/// beat is proven by `batch_beats_greedy_positive_gain`). Here `B` internally
+/// exceeds `G`, but because `G == 0` the guard returns `gain_pct == 0` (no
+/// divide-by-zero), and both cached actions / both capacity-bearing workers must
+/// still be counted in the coverage gauges.
 ///
-/// To make greedy DETERMINISTICALLY grab W0 for the cold A0, W1 carries a small
-/// load_penalty so `s - penalty` is strictly larger on W0 (s==0 both, penalty
-/// 0 vs 5). A1's `s` on W0 is a large positive number that batch captures.
+/// Layout: two single-slot workers, two actions. The HIGH-priority A0 matches
+/// BOTH workers equally cold (no cache); the LOW-priority A1 is a large cache
+/// match ONLY on W0. To make greedy DETERMINISTICALLY grab W0 for the cold A0,
+/// W1 carries a small load_penalty so `s - penalty` is strictly larger on W0
+/// (s==0 both, penalty 0 vs 5). Greedy strands A1 cold on W1 → G == 0.
 #[test]
-fn batch_beats_greedy_via_reorder() {
+fn g_zero_guard_returns_zero_gain_with_full_coverage() {
     // A0: dirs {b} — NO worker caches `b` → cold on both workers (s==0).
     let a0 = action(&[(b'b', 1000, 0)]);
     // A1: dirs {a} with big direct bytes — W0 caches `a` (large s on W0 only).
@@ -383,5 +386,110 @@ fn subtree_overlap_pct_known_layout() {
         "#batch-sched: only dir `p` is shared (A0,A1); its 300 direct bytes counted ONCE \
          over total 1300 sampled subtree bytes = 23% (floor); got {}",
         g.subtree_overlap_pct
+    );
+}
+
+// ───────────────── (5) gain_pct is a genuine LOWER BOUND: B >= G ─────────────
+
+/// A tiny xorshift PRNG so the property test is deterministic (no `rand` dep)
+/// and reproducible: a fixed seed exercises the SAME matrices every run, so a
+/// regression is not a flaky heisenbug.
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + self.next() % (hi - lo + 1)
+    }
+}
+
+/// (#batch-sched, assumption-auditor FIX-FIRST) The headline `gain_pct = (B−G)/G`
+/// must be a genuine LOWER BOUND on the batch gain: `B ≥ G` and therefore
+/// `gain_pct ≥ 0` for EVERY input. The from-scratch batch heuristic is NOT the
+/// optimum — auditor measured it scoring WORSE than the greedy baseline in
+/// ~2.75% of random cases — and the old code's `saturating_sub` silently floored
+/// those cycles to gain 0, biasing the headline LOW and clipping exactly the
+/// contended cycles. The fix defines `B := max(B_heuristic, G)` ("a real batch
+/// scheduler never does worse than greedy") and records `greedy_fallback` when
+/// the heuristic underperformed G, so the clip is EXPLICIT and countable.
+///
+/// This property test sweeps thousands of small random matrices and asserts the
+/// invariant holds and — the load-bearing part — that at least one case actually
+/// EXERCISES the fallback (heuristic < greedy), so the max() is not vacuous. It
+/// is deterministic (fixed xorshift seed).
+#[test]
+fn gain_pct_is_lower_bound_b_ge_g_over_random_matrices() {
+    let mut rng = XorShift(0x1234_5678_9abc_def0);
+    // A small pool of directory digests so overlap/contention actually arises.
+    let dir_pool: Vec<u8> = (0u8..8).collect();
+
+    let mut fallback_seen = 0u64;
+    let cases = 5000u64;
+    for _ in 0..cases {
+        let n_actions = rng.range(1, 5) as usize;
+        let n_workers = rng.range(1, 4) as usize;
+
+        // Random actions: each references 1-3 dirs with random direct bytes.
+        let actions: Vec<BatchSchedAction> = (0..n_actions)
+            .map(|_| {
+                let n_dirs = rng.range(1, 3) as usize;
+                let dirs: Vec<(u8, u64, u64)> = (0..n_dirs)
+                    .map(|_| {
+                        let d = dir_pool[rng.range(0, dir_pool.len() as u64 - 1) as usize];
+                        (d, rng.range(0, 1_000_000), rng.range(0, 20))
+                    })
+                    .collect();
+                action(&dirs)
+            })
+            .collect();
+
+        // Random workers: each caches a random subset of the pool, has 1-3 slots
+        // and a random load_penalty (the greedy steer).
+        let workers: Vec<BatchSchedWorker> = (0..n_workers)
+            .map(|_| {
+                let cached: Vec<u8> = dir_pool
+                    .iter()
+                    .copied()
+                    .filter(|_| rng.range(0, 1) == 1)
+                    .collect();
+                let capacity = rng.range(1, 3);
+                let load_penalty = rng.range(0, 50_000) as i64;
+                worker(&cached, capacity, load_penalty)
+            })
+            .collect();
+
+        let g = compute_batch_sched_gain(&actions, &workers);
+
+        // gain_pct is u64 → structurally never negative; the REAL invariant is
+        // that it is a HONEST lower bound: whenever the fallback fired, gain must
+        // be 0 (B was floored up to G), never a clipped-away positive.
+        if g.greedy_fallback {
+            fallback_seen += 1;
+            assert_eq!(
+                g.gain_pct, 0,
+                "#batch-sched: when the heuristic underperformed greedy the fallback \
+                 B:=max(B,G) makes B==G → gain_pct must be exactly 0 (an honest floor), \
+                 not a clipped negative; got {}",
+                g.gain_pct
+            );
+        }
+    }
+
+    // Load-bearing: the max() must actually catch real underperformance in this
+    // sweep, else the property is vacuous and a future regression that removes
+    // the guard would pass silently. Auditor measured ~2.75% → thousands of
+    // cases must surface dozens+.
+    assert!(
+        fallback_seen > 0,
+        "#batch-sched: over {cases} random matrices the from-scratch heuristic never \
+         underperformed greedy — the B:=max(B,G) fallback is UNTESTED (vacuous). Either \
+         the generator lost its contention or the fallback flag is not wired; expected \
+         >0 fallback cases (auditor measured ~2.75%). fallback_seen={fallback_seen}"
     );
 }

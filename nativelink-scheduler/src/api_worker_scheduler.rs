@@ -8435,6 +8435,232 @@ mod tests {
         (scheduler, dir_digest)
     }
 
+    /// (#batch-sched) Build a scheduler over a REAL CAS store holding two roots
+    /// (`r1`, `r2`) that SHARE a subdirectory `c`, so the batch counterfactual
+    /// has resolvable, subtree-overlapping trees to score. Layout (byte-share ≠
+    /// file-share, so the `dir_direct_bytes ↔ dir_direct_files` extractor swap is
+    /// detectable via `subtree_overlap_pct`):
+    ///   c  : 2 files (100 + 100 = 200 bytes, 2 files)
+    ///   r1 : 1 file (500 bytes, 1 file) + subdir c
+    ///   r2 : 1 file (900 bytes, 1 file) + subdir c
+    /// Returns `(scheduler, r1, r2, c)` (digests). Neither tree is resolved yet —
+    /// the caller resolves via `resolve_input_tree` to warm `tree_cache`.
+    async fn batch_sched_probe_scheduler() -> (Arc<ApiWorkerScheduler>, DigestInfo, DigestInfo, DigestInfo) {
+        use nativelink_config::schedulers::WorkerAllocationStrategy;
+        use crate::platform_property_manager::PlatformPropertyManager;
+        use crate::worker_registry::WorkerRegistry;
+
+        #[derive(Debug)]
+        struct NoopWSM;
+        impl MetricsComponent for NoopWSM {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+        #[tonic::async_trait]
+        impl WorkerStateManager for NoopWSM {
+            async fn update_operation(
+                &self,
+                _operation_id: &OperationId,
+                _worker_id: &WorkerId,
+                _update: UpdateOperationType,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+
+        // Shared subdir c: 2 files, 200 bytes total, 2 files.
+        let c_dir = Directory {
+            files: vec![
+                make_file_node("c0.txt", 0xa0, 100),
+                make_file_node("c1.txt", 0xa1, 100),
+            ],
+            directories: vec![],
+            ..Default::default()
+        };
+        let (c_bytes, c_digest) = encode_directory(&c_dir);
+
+        // r1: 1 file (500 bytes) + subdir c.
+        let r1_dir = Directory {
+            files: vec![make_file_node("r1.txt", 0xb1, 500)],
+            directories: vec![DirectoryNode {
+                name: "c".to_string(),
+                digest: Some(c_digest.into()),
+            }],
+            ..Default::default()
+        };
+        let (r1_bytes, r1_digest) = encode_directory(&r1_dir);
+
+        // r2: 1 file (900 bytes) + subdir c.
+        let r2_dir = Directory {
+            files: vec![make_file_node("r2.txt", 0xb2, 900)],
+            directories: vec![DirectoryNode {
+                name: "c".to_string(),
+                digest: Some(c_digest.into()),
+            }],
+            ..Default::default()
+        };
+        let (r2_bytes, r2_digest) = encode_directory(&r2_dir);
+
+        for (digest, bytes) in [
+            (c_digest, c_bytes),
+            (r1_digest, r1_bytes),
+            (r2_digest, r2_bytes),
+        ] {
+            let key: StoreKey<'_> = digest.into();
+            store
+                .update_oneshot(key, Bytes::from(bytes))
+                .await
+                .expect("store dir");
+        }
+
+        let scheduler = ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWSM),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some(store),
+            None,
+            512 * 1024,
+            8,
+            false,
+            0,
+            2,
+        );
+        (scheduler, r1_digest, r2_digest, c_digest)
+    }
+
+    /// (#batch-sched, testing-czar GAP) END-TO-END probe seam: the counterfactual
+    /// extraction in `batch_sched_gain_for_probe` reads each cached tree's
+    /// `dir_direct_bytes` / `dir_direct_files` (both `HashMap<DigestInfo,u64>` — a
+    /// swap COMPILES clean) and a worker snapshot. The only pre-existing probe
+    /// test ran `cas_store: None` → `tree_cache` empty → ONLY the miss arm ran,
+    /// leaving the extraction DEAD in the suite. This test warms `tree_cache` with
+    /// two REAL resolved trees sharing a subtree, gives one worker a warm cache
+    /// on the shared subtree, and asserts a NON-ZERO gain (and the exact overlap)
+    /// flows through the real `batch_sched_gain_for_probe`.
+    ///
+    /// Gain scenario (intra-batch warming): `sampled_roots = [r1, r2, r2]`
+    /// (three pending actions, all containing shared dir `c`). W0 caches `c`
+    /// (1 slot); W1 caches nothing (2 slots). GREEDY places one `c`-match on W0
+    /// (`s_c`), the other two cold on W1 (greedy models no warming) → G = s_c =
+    /// c.direct = 200 + 2·PER_FILE_WEIGHT = 205000. BATCH: r1→W0 (s_c); r2→W1 cold
+    /// (0) warms W1 with {r2, c}; the SECOND r2→W1 now scores BOTH its own r2
+    /// direct AND the warmed c → s_r2c = (900 + PER_FILE_WEIGHT) + (200 +
+    /// 2·PER_FILE_WEIGHT) = 308100. B = 205000 + 0 + 308100 = 513100 →
+    /// gain = (513100−205000)/205000 = 150 (floor). A non-zero gain flowing
+    /// through the REAL probe — the whole point of the seam test.
+    ///
+    /// Overlap scenario (swap-detecting): shared dirs (≥2 actions) are `c` (all 3)
+    /// and `r2` (2 actions). Byte-share (c 200 + r2 900 = 1100) over total
+    /// (r1 500 + c 200 ×3 + r2 900 ×2 = 2900) = 37%. If the extractor swaps
+    /// bytes↔files, overlap becomes file-share (c 2 + r2 1 = 3 over
+    /// 1 + 2×3 + 1×2 = 9) = 33% — so the swap RED-FAILS the overlap assertion.
+    #[tokio::test]
+    async fn batch_sched_gain_flows_through_real_probe() {
+        let (scheduler, r1, r2, _c) = batch_sched_probe_scheduler().await;
+
+        // Warm tree_cache with BOTH resolved trees (the probe peeks; it never
+        // resolves — so without this the extraction never runs).
+        assert!(
+            scheduler.resolve_input_tree(r1).await.is_some(),
+            "#batch-sched: r1 must resolve from the real CAS store"
+        );
+        assert!(
+            scheduler.resolve_input_tree(r2).await.is_some(),
+            "#batch-sched: r2 must resolve from the real CAS store"
+        );
+
+        // The shared subdir digest as the scheduler resolved it (so the worker's
+        // warm cache uses the SAME DigestInfo the tree carries).
+        let r1_tree = scheduler
+            .resolve_input_tree(r1)
+            .await
+            .expect("r1 cached");
+        // c is the one dir in r1's tree that is NOT the root r1 itself.
+        let c_digest = *r1_tree
+            .dir_digests
+            .iter()
+            .find(|d| **d != r1)
+            .expect("#batch-sched: r1's resolved tree must contain the shared subdir c");
+
+        // W0: 1 slot, warm on the shared subtree c. W1: 2 slots, cold.
+        let (tx0, _rx0) = mpsc::unbounded_channel();
+        scheduler
+            .add_worker(Worker::new(WorkerId("W0".to_string()), PlatformProperties::default(), tx0, 1, 1))
+            .await
+            .expect("add W0");
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        scheduler
+            .add_worker(Worker::new(WorkerId("W1".to_string()), PlatformProperties::default(), tx1, 1, 2))
+            .await
+            .expect("add W1");
+        // Report low load on both so their load_penalty is small + equal (the
+        // C-cache match dominates the greedy argmax regardless, but this keeps
+        // the scenario deterministic).
+        scheduler
+            .update_worker_load(&WorkerId("W0".to_string()), 10, 10, 10)
+            .await
+            .expect("load W0");
+        scheduler
+            .update_worker_load(&WorkerId("W1".to_string()), 10, 10, 10)
+            .await
+            .expect("load W1");
+        // W0 warm on c (a FULL-snapshot cached-subtree update).
+        scheduler
+            .update_cached_subtrees(&WorkerId("W0".to_string()), true, vec![c_digest], Vec::new(), Vec::new())
+            .await
+            .expect("warm W0 with c");
+
+        // Drive the REAL probe over [r1, r2, r2] (three pending actions, all
+        // carrying the shared subdir c).
+        let (gain, uncached_skipped) = scheduler
+            .batch_sched_gain_for_probe(&[r1, r2, r2])
+            .await;
+
+        assert_eq!(
+            uncached_skipped, 0,
+            "#batch-sched: all three sampled roots are cached (r1, r2 both resolved) → \
+             uncached_skipped must be 0; got {uncached_skipped}"
+        );
+        assert_eq!(
+            gain.sample_actions, 3,
+            "#batch-sched: three cached actions must be scored; got {}",
+            gain.sample_actions
+        );
+        assert_eq!(
+            gain.sample_workers, 2,
+            "#batch-sched: both capacity-bearing workers must be counted; got {}",
+            gain.sample_workers
+        );
+        assert_eq!(
+            gain.gain_pct, 150,
+            "#batch-sched: intra-batch warming lets the 2nd co-located r2 action on the cold \
+             2-slot worker score BOTH its own r2 direct AND the warmed shared subtree c → \
+             B = 205000 (r1→W0) + 0 (r2→W1 cold) + 308100 (r2→W1 warm) = 513100 vs G = 205000 → \
+             gain 150 flowing through the REAL probe (tree_cache peek + worker snapshot + solve). \
+             got {}",
+            gain.gain_pct
+        );
+        assert_eq!(
+            gain.subtree_overlap_pct, 37,
+            "#batch-sched: shared dirs c (200B, in all 3) + r2 (900B, in 2) = 1100B shared over \
+             2900B total = 37%. A `dir_direct_bytes ↔ dir_direct_files` swap in the extractor \
+             makes this file-share (3/9 = 33%), so this pins the extractor reads the RIGHT map. \
+             got {}",
+            gain.subtree_overlap_pct
+        );
+    }
+
     /// (#p1p2) Bounded, deterministic wait for a background prefetch to warm
     /// the cache: yields (no sleep-as-synchronization) until a cold
     /// resolution has been recorded, then fails loudly if the budget is
