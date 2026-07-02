@@ -503,11 +503,32 @@ impl SimpleScheduler {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+        // (#p1p2) Capture the input root before `action_info` is moved into
+        // `add_action` so we can prefetch its tree ahead of match. `DigestInfo`
+        // is `Copy`, so this is free.
+        let input_root_digest = action_info.input_root_digest;
         let action_state_result = self
             .client_state_manager
             .add_action(client_operation_id.clone(), action_info)
             .await
             .err_tip(|| "In SimpleScheduler::add_action")?;
+
+        // (#p1p2) Fire-and-forget: kick off an ahead-of-time tree resolution
+        // so this action's input tree is (usually) warm in the scheduler's
+        // `tree_cache` by the time it reaches `find_and_reserve_worker`,
+        // moving the ~59ms mean cold resolution + its 2s timeout tail OFF the
+        // dispatch critical path. This is data-justified by the 2026-07-02
+        // dual-benchmark (37% of cold resolves abandoned locality scoring at
+        // the inline cap). `prefetch_input_tree` self-bounds via a semaphore
+        // (CAPPED AT `TREE_PREFETCH_CONCURRENCY`) and spawns the CAS I/O onto
+        // a background task — the inline portion is only a cheap cache peek +
+        // a non-blocking permit try, so it does NOT delay the enqueue and
+        // holds no lock across the spawn. Done AFTER the action is enqueued so
+        // a failed add does not trigger a wasted prefetch.
+        self.worker_scheduler
+            .prefetch_input_tree(input_root_digest)
+            .await;
+
         Ok(Box::new(SimpleSchedulerActionStateResult::new(
             client_operation_id.clone(),
             action_state_result,

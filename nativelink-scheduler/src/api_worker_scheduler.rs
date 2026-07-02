@@ -240,10 +240,10 @@ pub struct SchedulerMetrics {
     pub tree_cache_evictions: AtomicU64,
     /// (#p1p2) Point-in-time estimated resident heap bytes held by the
     /// tree cache, sampled after each put under the cache lock. Compare
-    /// against `TREE_CACHE_MAX_BYTES` (512 MiB) to see how close the cache
+    /// against `TREE_CACHE_MAX_BYTES` (2 GiB) to see how close the cache
     /// runs to its byte budget.
     #[metric(
-        help = "(#p1p2) point-in-time estimated resident heap bytes in the tree cache (vs TREE_CACHE_MAX_BYTES = 512 MiB)"
+        help = "(#p1p2) point-in-time estimated resident heap bytes in the tree cache (vs TREE_CACHE_MAX_BYTES = 2 GiB)"
     )]
     pub tree_cache_resident_bytes: AtomicU64,
     /// (#p1p2) Point-in-time number of entries resident in the tree cache,
@@ -269,12 +269,15 @@ pub struct SchedulerMetrics {
         help = "(#p1p2) cumulative count of successful cold inline tree resolutions (denominator for tree_resolution_cold_time_ns)"
     )]
     pub tree_resolution_cold_count: AtomicU64,
-    /// (#p1p2) Cumulative inline tree resolutions that hit the 500 ms
+    /// (#p1p2) Cumulative inline tree resolutions that hit the 2s inline
     /// timeout and fell back to load-based scoring (resolution continues
     /// in a background task). A non-zero, growing value means cold
     /// resolution is frequently exceeding the dispatch-latency budget.
+    /// (Raised from 500ms to 2s 2026-07-02 after 37% of cold resolves
+    /// exceeded 500ms in the dual-benchmark; enqueue-time prefetch should
+    /// drive this toward zero by warming trees before match.)
     #[metric(
-        help = "(#p1p2) cumulative inline tree resolutions that hit the 500ms timeout and fell back to load-based scoring"
+        help = "(#p1p2) cumulative inline tree resolutions that hit the 2s timeout and fell back to load-based scoring"
     )]
     pub tree_resolution_timeouts: AtomicU64,
     /// (#p1p2) Cumulative inline tree resolutions that returned a
@@ -285,6 +288,34 @@ pub struct SchedulerMetrics {
         help = "(#p1p2) cumulative inline tree resolutions that failed with a resolution error (not a timeout)"
     )]
     pub tree_resolution_errors: AtomicU64,
+
+    // ── (#p1p2) Enqueue-time tree-prefetch telemetry ──
+    // Measure prefetch coverage (how often an enqueue warms a tree ahead of
+    // match) and whether the concurrency bound saturates. No behavior
+    // change beyond the prefetch itself — increments only, Relaxed.
+    /// (#p1p2) Cumulative enqueue-triggered prefetches that acquired a
+    /// permit and spawned a background `resolve_input_tree`. High relative
+    /// to `tree_cache_misses` means most cold trees were warmed before
+    /// their action reached `find_and_reserve_worker` (the goal).
+    #[metric(
+        help = "(#p1p2) cumulative enqueue-time tree prefetches that acquired a permit and spawned a background resolution"
+    )]
+    pub tree_prefetch_issued: AtomicU64,
+    /// (#p1p2) Cumulative enqueue-triggered prefetches skipped because the
+    /// tree was already cached (a cheap lock+peek hit) — no work needed.
+    #[metric(
+        help = "(#p1p2) cumulative enqueue-time tree prefetches skipped because the tree was already cached"
+    )]
+    pub tree_prefetch_skipped_cached: AtomicU64,
+    /// (#p1p2) Cumulative enqueue-triggered prefetches skipped because the
+    /// `tree_prefetch_semaphore` was exhausted (no permit). A non-zero,
+    /// growing value means the `TREE_PREFETCH_CONCURRENCY` bound is
+    /// saturating — the lazy match-time resolution backstops these, so it
+    /// is a coverage-loss signal (consider raising the bound), NOT a defect.
+    #[metric(
+        help = "(#p1p2) cumulative enqueue-time tree prefetches skipped because the concurrency semaphore was exhausted"
+    )]
+    pub tree_prefetch_skipped_nopermit: AtomicU64,
 }
 
 /// Point-in-time intersection of an action's `file_digests` and the
@@ -2424,6 +2455,15 @@ pub struct ApiWorkerScheduler {
     /// duplicate spawns when many actions share the same input root.
     tree_resolution_in_progress: Arc<tokio::sync::Mutex<HashSet<DigestInfo>>>,
 
+    /// (#p1p2) Bounds concurrent enqueue-triggered tree prefetches.
+    /// `prefetch_input_tree` acquires a permit with `try_acquire_owned`
+    /// before spawning a background resolution; when the semaphore is
+    /// exhausted it returns without spawning (the lazy match-time
+    /// resolution backstops). Held as `Arc<Semaphore>` so the owned permit
+    /// can move into the spawned task and be released on task completion.
+    // CAPPED AT TREE_PREFETCH_CONCURRENCY: bounds concurrent enqueue-triggered CAS tree fetches
+    tree_prefetch_semaphore: Arc<Semaphore>,
+
     /// Negative cache: root digests whose tree resolution failed recently.
     /// Entries carry (timestamp, attempt_count) for exponential backoff:
     /// attempt 1 → 60s, attempt 2 → 300s, attempt 3 → 1500s, attempt 4+ → 1800s (capped).
@@ -2540,7 +2580,17 @@ const TREE_CACHE_CAPACITY: usize = 1024;
 /// input roots with hundreds of thousands of files). When the byte
 /// limit is exceeded, the least-recently-used entries are evicted
 /// until usage drops below.
-const TREE_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+///
+/// Raised 512 MiB → 2 GiB 2026-07-02. The dual-benchmark measured avg tree
+/// ≈ 665 KB (251 MiB resident / 373 roots), so the OLD 512 MiB byte cap
+/// bound first at ~770 roots — a build with >~770 distinct input roots
+/// would evict warm trees → re-resolution → more of the 37% cold-resolve
+/// timeout storm. At 665 KB/tree, 2 GiB gives ~3000-root headroom (the
+/// count cap `TREE_CACHE_CAPACITY` = 1024 becomes the binding limit first,
+/// which is the intended eviction discipline rather than a byte-pressure
+/// surprise). Cheap eviction insurance for large builds; not the binding
+/// issue at the measured 373 roots.
+const TREE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// LRU cache for resolved input trees, bounded by both entry count
 /// and total estimated heap bytes.
@@ -2565,6 +2615,16 @@ impl ByteBoundedTreeCache {
         key: &DigestInfo,
     ) -> Option<&Arc<ResolvedTree>> {
         self.lru.get(key)
+    }
+
+    /// (#p1p2) Membership check that does NOT bump LRU recency. Used by
+    /// `prefetch_input_tree` to answer "is this root already cached" without
+    /// promoting it — the real match-path `get` is what should mark it warm.
+    fn peek(
+        &self,
+        key: &DigestInfo,
+    ) -> Option<&Arc<ResolvedTree>> {
+        self.lru.peek(key)
     }
 
     /// Inserts `key`/`value`, evicting to stay within both bounds, and
@@ -2686,6 +2746,17 @@ const NEGATIVE_CACHE_SWEEP_THRESHOLD: usize = 1000;
 /// `tree_resolution_in_progress` cannot leak entries even under
 /// pathological CAS failures.
 const TREE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// (#p1p2) Maximum concurrent enqueue-triggered tree prefetches. Bounds the
+/// number of background `resolve_input_tree` tasks the enqueue path may spawn
+/// at once so a burst of distinct-root arrivals (build startup) cannot fan out
+/// unbounded CAS BFS work. When all permits are held, `prefetch_input_tree`
+/// returns WITHOUT spawning — the lazy match-time resolution in
+/// `find_and_reserve_worker` backstops (it still resolves inline, just not
+/// pre-warmed). Started at 16: comfortably above the ~10-worker match
+/// concurrency so steady-state prefetch keeps up, but a hard cap against a
+/// cold-startup storm of hundreds of distinct roots.
+const TREE_PREFETCH_CONCURRENCY: usize = 16;
 
 /// RAII guard that removes a digest from `tree_resolution_in_progress` when
 /// dropped. Ensures that even if the future driving `resolve_input_tree` is
@@ -2847,6 +2918,8 @@ impl ApiWorkerScheduler {
                 TREE_CACHE_MAX_BYTES,
             ))),
             tree_resolution_in_progress: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            // (#p1p2) Bounded prefetch fan-out. See TREE_PREFETCH_CONCURRENCY.
+            tree_prefetch_semaphore: Arc::new(Semaphore::new(TREE_PREFETCH_CONCURRENCY)),
             tree_resolution_failures: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             failed_directory_digests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             scores_cache,
@@ -3550,6 +3623,93 @@ impl ApiWorkerScheduler {
         worker.keep_alive()
     }
 
+    /// (#p1p2) Kicks off an ahead-of-time resolution of `input_root_digest`
+    /// so its tree is already warm in `tree_cache` by the time the action
+    /// reaches `find_and_reserve_worker`. Fire-and-forget: moves the ~59ms
+    /// mean cold resolution (and its 2s timeout tail) OFF the dispatch
+    /// critical path onto a bounded background task. The 2026-07-02
+    /// dual-benchmark measured 37% of cold resolutions abandoning locality
+    /// scoring at the (then-500ms) inline cap; warming ahead of match is the
+    /// data-justified fix.
+    ///
+    /// Bounding + dedup, all before any spawn (no lock held across it):
+    /// 1. Skips if no CAS store is configured (nothing to resolve).
+    /// 2. Cheap `tree_cache` lock+peek — if already cached, records
+    ///    `tree_prefetch_skipped_cached` and returns (no permit, no spawn).
+    /// 3. `try_acquire_owned` on `tree_prefetch_semaphore`
+    ///    (CAPPED AT `TREE_PREFETCH_CONCURRENCY`). If no permit is
+    ///    available, records `tree_prefetch_skipped_nopermit` and RETURNS
+    ///    WITHOUT spawning — the lazy match-time `resolve_input_tree` in
+    ///    `find_and_reserve_worker` still resolves it inline (just not
+    ///    pre-warmed). This is the unbounded-fan-out guard.
+    /// 4. Otherwise records `tree_prefetch_issued` and spawns a task that
+    ///    HOLDS the permit for the duration of a single `resolve_input_tree`
+    ///    call, then drops it. `resolve_input_tree` itself dedups
+    ///    (the in-progress guard returns `None` if another resolution is
+    ///    already running for this root), caches, and negative-caches — so
+    ///    prefetch adds no duplicate logic, only an early trigger.
+    ///
+    /// MUST NOT block the enqueue: only a brief `tree_cache` peek and a
+    /// non-blocking `try_acquire_owned` run inline; the CAS I/O is entirely
+    /// inside the spawned task.
+    ///
+    /// Takes `self: &Arc<Self>` so the spawned `'static` task can hold an
+    /// owned `Arc` clone and call `resolve_input_tree` on it (which needs
+    /// `&self`). The caller (`SimpleScheduler::inner_add_action`) already
+    /// holds the scheduler as `Arc<ApiWorkerScheduler>`.
+    pub(crate) async fn prefetch_input_tree(self: &Arc<Self>, input_root_digest: DigestInfo) {
+        // (1) No CAS store → tier-2 locality scoring is disabled; nothing to
+        // prefetch.
+        if self.cas_store.is_none() {
+            return;
+        }
+
+        // (2) Cheap lock+peek. `peek` does NOT bump LRU recency (the match
+        // path's real hit is what should mark the entry warm), it only
+        // answers "is this already cached". If so, no work is needed.
+        {
+            let cache = self.tree_cache.lock().await;
+            if cache.peek(&input_root_digest).is_some() {
+                self.metrics
+                    .tree_prefetch_skipped_cached
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Cache lock released here — NOT held across the try_acquire/spawn.
+
+        // (3) Bounded fan-out. `try_acquire_owned` is non-blocking: if all
+        // TREE_PREFETCH_CONCURRENCY permits are held, return without spawning
+        // (the lazy match-time resolution backstops). This is the hard cap
+        // against a cold-startup storm of distinct roots.
+        let permit = match Arc::clone(&self.tree_prefetch_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics
+                    .tree_prefetch_skipped_nopermit
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // (4) Permit acquired — spawn the background resolution. The permit
+        // moves into the task and is dropped when the task ends (success,
+        // error, or resolve-internal dedup-skip), freeing the slot.
+        self.metrics
+            .tree_prefetch_issued
+            .fetch_add(1, Ordering::Relaxed);
+        let scheduler = Arc::clone(self);
+        tokio::spawn(async move {
+            // Hold the permit for the whole resolution, then drop it.
+            let _permit = permit;
+            // Reuse the existing resolution path: it dedups via the
+            // in-progress guard, caches on success, and negative-caches on
+            // failure. We drop the returned Arc — the side effect (a warm
+            // cache entry) is the point.
+            drop(scheduler.resolve_input_tree(input_root_digest).await);
+        });
+    }
+
     /// Resolves the full input tree for the given `input_root_digest`,
     /// returning a cached result if available. On cache miss, returns
     /// `None` immediately (falling back to load-based scoring) and
@@ -3624,10 +3784,19 @@ impl ApiWorkerScheduler {
         // Cache miss — resolve inline so the current action benefits from
         // locality scoring. Tree resolution is typically fast (MemoryStore
         // or local CAS) and the result is cached for future actions.
-        // A 500ms timeout prevents slow CAS lookups from blocking dispatch.
+        // A 2s timeout prevents slow CAS lookups from blocking dispatch.
         // GetTree with subtree caching resolves 1000-dir trees in 10-50ms
-        // when warm, but cold starts (first action for a new tree) need
-        // up to ~200ms for store fetches. 500ms covers p99 of warm+cold.
+        // when warm, but cold starts (first action for a new tree) are far
+        // slower than earlier estimated: the 2026-07-02 dual-benchmark
+        // measured mean cold resolve = 59ms AND 37% (138/373) of cold
+        // resolutions EXCEEDED the prior 500ms cap and dispatched WITHOUT
+        // locality scoring (a cold-startup burst of distinct roots the CAS
+        // BFS could not resolve in 500ms). Raised to 2s so the vast majority
+        // of cold resolutions complete inline and keep locality scoring,
+        // instead of abandoning it to the background path 37% of the time.
+        // The #p1p2 enqueue-time prefetch (prefetch_input_tree) additionally
+        // warms most trees BEFORE match, so the inline path is usually a hit
+        // and the 2s cap is the safety net for a not-yet-prefetched cold root.
         //
         // (#p1p2 telemetry) A cold resolution is being attempted (the
         // positive and negative caches both missed and the in-progress
@@ -3644,7 +3813,7 @@ impl ApiWorkerScheduler {
         // from the warm (hit) path. Recorded on the success arm below.
         let resolve_started = Instant::now();
         let resolve_result =
-            tokio::time::timeout(Duration::from_millis(500), resolve_fut).await;
+            tokio::time::timeout(Duration::from_secs(2), resolve_fut).await;
         let resolve_elapsed = resolve_started.elapsed();
 
         match resolve_result {
@@ -3727,7 +3896,7 @@ impl ApiWorkerScheduler {
                 None
             }
             Err(_elapsed) => {
-                // (#p1p2 telemetry) Inline resolution hit the 500ms timeout
+                // (#p1p2 telemetry) Inline resolution hit the 2s timeout
                 // and is falling back to load-based scoring.
                 self.metrics
                     .tree_resolution_timeouts
@@ -3748,7 +3917,7 @@ impl ApiWorkerScheduler {
                 // background put() can attribute its evictions + refresh the
                 // resident-bytes / entry gauges (the same cache the inline
                 // put writes; instrumenting only the inline site would
-                // silently undercount whenever the 500ms timeout fires).
+                // silently undercount whenever the 2s timeout fires).
                 let metrics = self.metrics.clone();
                 let digest = input_root_digest;
                 tokio::spawn(async move {
@@ -7734,6 +7903,285 @@ mod tests {
         );
     }
 
+    /// (#p1p2) Shared harness for the enqueue-time prefetch tests: builds a
+    /// scheduler with a CAS store holding one single-directory tree, and
+    /// returns `(scheduler, dir_digest)`. Mirrors
+    /// `test_resolve_input_tree_updates_hit_miss_counters`.
+    async fn prefetch_test_scheduler() -> (Arc<ApiWorkerScheduler>, DigestInfo) {
+        use nativelink_config::schedulers::WorkerAllocationStrategy;
+        use crate::platform_property_manager::PlatformPropertyManager;
+        use crate::worker_registry::WorkerRegistry;
+
+        #[derive(Debug)]
+        struct NoopWorkerStateManager;
+        impl MetricsComponent for NoopWorkerStateManager {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+        #[tonic::async_trait]
+        impl WorkerStateManager for NoopWorkerStateManager {
+            async fn update_operation(
+                &self,
+                _operation_id: &OperationId,
+                _worker_id: &WorkerId,
+                _update: UpdateOperationType,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let dir = Directory {
+            files: vec![make_file_node("prefetch.txt", 0xcc, 1000)],
+            directories: vec![],
+            ..Default::default()
+        };
+        let (dir_bytes, dir_digest) = encode_directory(&dir);
+        let key: StoreKey<'_> = dir_digest.into();
+        store
+            .update_oneshot(key, Bytes::from(dir_bytes))
+            .await
+            .expect("store update");
+
+        let scheduler = ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWorkerStateManager),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some(store),
+            None,
+            512 * 1024,
+            8,
+            false,
+            0,
+            2,
+        );
+        (scheduler, dir_digest)
+    }
+
+    /// (#p1p2) Bounded, deterministic wait for a background prefetch to warm
+    /// the cache: yields (no sleep-as-synchronization) until a cold
+    /// resolution has been recorded, then fails loudly if the budget is
+    /// exhausted. The prefetch task calls `resolve_input_tree`, which bumps
+    /// `tree_resolution_cold_count` on a successful cold resolution, so that
+    /// counter reaching >= 1 proves the spawned task ran to completion.
+    async fn await_cold_resolution(scheduler: &Arc<ApiWorkerScheduler>) {
+        for _ in 0..10_000 {
+            if scheduler
+                .metrics
+                .tree_resolution_cold_count
+                .load(Ordering::Relaxed)
+                >= 1
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "background prefetch never completed a cold resolution \
+             (tree_resolution_cold_count stayed 0)"
+        );
+    }
+
+    /// (#p1p2) `prefetch_input_tree` warms `tree_cache` ahead of match: after
+    /// a prefetch, a subsequent `resolve_input_tree` for the same root is a
+    /// HIT (not a fresh cold miss). Proves the enqueue-time prefetch moves
+    /// the cold resolution off the dispatch path.
+    #[tokio::test]
+    async fn test_prefetch_input_tree_warms_cache() {
+        let (scheduler, dir_digest) = prefetch_test_scheduler().await;
+
+        // Preconditions: nothing prefetched or resolved yet.
+        assert_eq!(
+            scheduler.metrics.tree_prefetch_issued.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            scheduler.metrics.tree_cache_hits.load(Ordering::Relaxed),
+            0
+        );
+
+        // Prefetch: acquires a permit and spawns the background resolution.
+        scheduler.prefetch_input_tree(dir_digest).await;
+        assert_eq!(
+            scheduler.metrics.tree_prefetch_issued.load(Ordering::Relaxed),
+            1,
+            "prefetch of a cold, uncached root must acquire a permit and issue exactly one prefetch"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_prefetch_skipped_cached
+                .load(Ordering::Relaxed),
+            0,
+            "a cold root is not cached — must not count as skipped_cached"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_prefetch_skipped_nopermit
+                .load(Ordering::Relaxed),
+            0,
+            "a fresh scheduler has permits — must not count as skipped_nopermit"
+        );
+
+        // Wait for the background resolution to complete and warm the cache.
+        await_cold_resolution(&scheduler).await;
+
+        // A subsequent resolve for the SAME root must be a warm HIT, not a
+        // second cold miss — proving the prefetch populated the cache.
+        let misses_before = scheduler.metrics.tree_cache_misses.load(Ordering::Relaxed);
+        let result = scheduler.resolve_input_tree(dir_digest).await;
+        assert!(
+            result.is_some(),
+            "resolve after prefetch must return the warmed tree"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_cache_hits.load(Ordering::Relaxed),
+            1,
+            "resolve after prefetch must be a cache HIT (prefetch warmed the tree)"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_cache_misses.load(Ordering::Relaxed),
+            misses_before,
+            "resolve after prefetch must NOT record a second cold miss — the tree was pre-warmed"
+        );
+    }
+
+    /// (#p1p2) When the prefetch semaphore is exhausted, `prefetch_input_tree`
+    /// returns WITHOUT spawning (records `tree_prefetch_skipped_nopermit`),
+    /// and the lazy match-time `resolve_input_tree` still resolves the tree.
+    /// This is the unbounded-fan-out guard: a cold-startup storm cannot spawn
+    /// more than `TREE_PREFETCH_CONCURRENCY` background resolutions at once.
+    #[tokio::test]
+    async fn test_prefetch_input_tree_bounded_no_permit() {
+        let (scheduler, dir_digest) = prefetch_test_scheduler().await;
+
+        // Exhaust every prefetch permit and HOLD them for the duration of the
+        // test so the try_acquire in prefetch_input_tree cannot succeed.
+        let _held = Arc::clone(&scheduler.tree_prefetch_semaphore)
+            .try_acquire_many_owned(TREE_PREFETCH_CONCURRENCY as u32)
+            .expect("should acquire all permits on a fresh semaphore");
+
+        // Prefetch with no permits available: must NOT spawn.
+        scheduler.prefetch_input_tree(dir_digest).await;
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_prefetch_skipped_nopermit
+                .load(Ordering::Relaxed),
+            1,
+            "prefetch with an exhausted semaphore must record exactly one skipped_nopermit"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_prefetch_issued.load(Ordering::Relaxed),
+            0,
+            "prefetch with an exhausted semaphore must NOT issue a prefetch (no spawn)"
+        );
+        // The no-permit path spawned nothing, so no cold resolution ran.
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_resolution_cold_count
+                .load(Ordering::Relaxed),
+            0,
+            "the no-permit path must not have spawned a background resolution"
+        );
+
+        // The lazy match-time resolution still works (the backstop): resolve
+        // inline succeeds and records its own cold miss even though the
+        // prefetch was skipped.
+        let result = scheduler.resolve_input_tree(dir_digest).await;
+        assert!(
+            result.is_some(),
+            "lazy resolve_input_tree must still resolve the tree when prefetch was skipped"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_cache_misses.load(Ordering::Relaxed),
+            1,
+            "the lazy backstop resolution records the (only) cold miss"
+        );
+    }
+
+    /// (#p1p2) Prefetching an already-cached root records
+    /// `tree_prefetch_skipped_cached` and spawns nothing (no permit consumed,
+    /// no background resolution).
+    #[tokio::test]
+    async fn test_prefetch_input_tree_skips_if_cached() {
+        let (scheduler, dir_digest) = prefetch_test_scheduler().await;
+
+        // Warm the cache with a real resolve first (records one cold miss).
+        let warm = scheduler.resolve_input_tree(dir_digest).await;
+        assert!(warm.is_some(), "initial resolve should cache the tree");
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_resolution_cold_count
+                .load(Ordering::Relaxed),
+            1,
+            "the warming resolve records exactly one cold resolution"
+        );
+
+        // Now prefetch the SAME (cached) root: it must short-circuit on the
+        // cheap peek, before touching the semaphore or spawning.
+        scheduler.prefetch_input_tree(dir_digest).await;
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_prefetch_skipped_cached
+                .load(Ordering::Relaxed),
+            1,
+            "prefetch of an already-cached root must record exactly one skipped_cached"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_prefetch_issued.load(Ordering::Relaxed),
+            0,
+            "prefetch of a cached root must NOT issue a prefetch (no permit, no spawn)"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_prefetch_skipped_nopermit
+                .load(Ordering::Relaxed),
+            0,
+            "a cached-root skip is not a no-permit skip"
+        );
+        // No second cold resolution was spawned.
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_resolution_cold_count
+                .load(Ordering::Relaxed),
+            1,
+            "prefetch of a cached root must not spawn a second cold resolution"
+        );
+    }
+
+    /// (#p1p2 Change 3 + prefetch bound) The tree-cache byte budget was raised
+    /// to 2 GiB and the prefetch fan-out cap is 16. Pins the constant values
+    /// at their declaration so a doc-comment or commit-message drift cannot
+    /// hide a stale literal (numeric-constant discipline).
+    #[test]
+    fn test_prefetch_and_cache_constants() {
+        assert_eq!(
+            TREE_CACHE_MAX_BYTES,
+            2 * 1024 * 1024 * 1024,
+            "TREE_CACHE_MAX_BYTES must be 2 GiB (raised from 512 MiB 2026-07-02)"
+        );
+        assert_eq!(
+            TREE_PREFETCH_CONCURRENCY, 16,
+            "TREE_PREFETCH_CONCURRENCY must bound enqueue-time prefetch fan-out at 16"
+        );
+    }
+
     /// Verifies that `TreeResolutionGuard` removes the digest from the
     /// in-progress set on Drop. This is the core invariant: if the guard's
     /// Drop fires, the leak is impossible. Combined with the fact that the
@@ -8795,6 +9243,19 @@ mod tests {
             .metrics
             .tree_resolution_errors
             .fetch_add(133, Ordering::Relaxed);
+        // (#p1p2) enqueue-time prefetch counters.
+        scheduler
+            .metrics
+            .tree_prefetch_issued
+            .fetch_add(144, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_prefetch_skipped_cached
+            .fetch_add(155, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_prefetch_skipped_nopermit
+            .fetch_add(166, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -8887,6 +9348,9 @@ mod tests {
             ("tree_resolution_cold_count", 111),
             ("tree_resolution_timeouts", 122),
             ("tree_resolution_errors", 133),
+            ("tree_prefetch_issued", 144),
+            ("tree_prefetch_skipped_cached", 155),
+            ("tree_prefetch_skipped_nopermit", 166),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),
