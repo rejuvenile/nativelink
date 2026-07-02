@@ -79,7 +79,9 @@ use nativelink_util::store_trait::{
     ItemCallback, DurableDelegation, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, UploadSizeInfo,
 };
+use nativelink_util::o11_probes::reconcile_pin_counters;
 use nativelink_worker::local_worker::handle_upload_missing_blobs_for_test;
+use serial_test::serial;
 
 mod utils {
     pub(crate) mod local_worker_test_utils;
@@ -238,7 +240,14 @@ fn seed_mirror(fss: &Arc<FastSlowStore>, digest: DigestInfo, payload: Bytes) {
 /// W4: a failed backfill upload MUST re-queue the digest into
 /// `failed_slow_writes` (small-blob `update_oneshot` path) so the reconnect
 /// drainer re-attempts it — NOT drop it (the FL-688 stuck-loop regression).
+///
+/// `#[serial]` because these RejectingSlowStore backfills now also increment
+/// the process-global reconcile-pin counters (`reconcile_pin_requeued_total`);
+/// the counter-asserting tests below read those statics via before→after
+/// deltas, so every test touching them must be serialized to keep those windows
+/// exclusive.
 #[nativelink_test]
+#[serial]
 async fn backfill_small_blob_upload_failure_requeues_for_retry() {
     let payload = Bytes::from_static(b"small_backfill_blob");
     let digest = mk_digest(11, payload.len());
@@ -273,7 +282,10 @@ async fn backfill_small_blob_upload_failure_requeues_for_retry() {
 /// the streaming `update` branch of the backfill handler. Covers both
 /// per-blob upload branches (oneshot AND streaming) — they share the Err
 /// arm but reach it via different code.
+///
+/// `#[serial]` for the process-global counter reason (see the small-blob test).
 #[nativelink_test]
+#[serial]
 async fn backfill_large_blob_upload_failure_requeues_for_retry() {
     // 1 MiB + 1 byte → exceeds STREAMING_THRESHOLD (1 MiB) in the handler.
     let size = 1024 * 1024 + 1;
@@ -313,7 +325,10 @@ async fn backfill_large_blob_upload_failure_requeues_for_retry() {
 /// convergence point for transport give-up on the backfill path: the inline
 /// W1=3 / W2-narrowing bounds stay UNCHANGED, durability comes from the
 /// re-queue.
+///
+/// `#[serial]` for the process-global counter reason (see the small-blob test).
 #[nativelink_test]
+#[serial]
 async fn backfill_transport_giveup_requeues_not_abandons() {
     let payload = Bytes::from_static(b"transport_giveup_blob");
     let digest = mk_digest(13, payload.len());
@@ -350,4 +365,189 @@ async fn backfill_transport_giveup_requeues_not_abandons() {
              never abandons) — #FL-688",
         );
     }
+}
+
+/// Compose a production-shaped `FastSlowStore` whose slow tier ACCEPTS every
+/// upload (a plain `MemoryStore`). Used as the negative control: a successful
+/// backfill must NOT fire the FL-688 data-loss counter.
+fn make_fss_with_accepting_slow() -> Arc<FastSlowStore> {
+    let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        fast,
+        slow,
+    )
+}
+
+/// (#FL-688 MAJOR-1) The GENUINE FL-688 data-loss signal: an advertised digest
+/// that VANISHED at the reconcile re-check (`requested > found` — returns `None`
+/// from `has_with_results`) MUST increment `reconcile_pin_vanished_total`, NOT
+/// any of the upload-outcome counters. This is the false-negative the earlier
+/// `failed>0` alarm missed entirely: the server only requests blobs the worker
+/// advertised, so a re-check-`None` digest = advertised-then-lost = sole-copy
+/// permanent loss, and it is SILENTLY DROPPED from `present` before the upload
+/// loop (never uploaded, never re-queued, never counted in `failed`).
+/// Composition: a digest NOT seeded into `mirror_blobs` over the accepting FSS,
+/// so `has_with_results` returns `None` and it lands on the vanished path.
+///
+/// `#[serial]` because `reconcile_pin_counters()` is a process-global static;
+/// serialization keeps the before→after delta window exclusive.
+///
+/// Mutation: comment out the `.vanished.fetch_add(vanished as u64, ...)` in
+/// `handle_upload_missing_blobs` → the delta stays 0; this test red-fails with
+/// the bespoke message below.
+#[nativelink_test]
+#[serial]
+async fn backfill_vanished_advertised_blob_fires_fl688_data_loss_counter() {
+    // A digest the server requests (the worker advertised it) but which is NOT
+    // seeded anywhere locally — has_with_results returns None → VANISHED.
+    let digest = mk_digest(23, 512);
+
+    let fss = make_fss_with_accepting_slow();
+    // Deliberately DO NOT seed_mirror — the blob has vanished.
+
+    let ram = Arc::new(MockRunningActionsManager::new());
+    ram.set_cas_store(fss.clone());
+
+    let before = reconcile_pin_counters().vanished.load(Ordering::Relaxed);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle_upload_missing_blobs_for_test::<MockWorkerApiClient, _>(&ram, vec![digest], 4),
+    )
+    .await
+    .expect("handle_upload_missing_blobs must not deadlock — FL-688 vanished test");
+
+    let after = reconcile_pin_counters().vanished.load(Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        1,
+        "FL-688 data-loss signal: an advertised blob VANISHED at the reconcile re-check \
+         (requested>found) MUST increment reconcile_pin_vanished_total by exactly 1 — this \
+         is the genuine sole-copy loss signal the failed>0 alarm missed (before={before}, \
+         after={after})",
+    );
+}
+
+/// (#FL-688 MINOR-1) A RECOVERABLE upload failure (upload fails but the digest
+/// IS re-queued into `failed_slow_writes`) MUST increment
+/// `reconcile_pin_requeued_total` — the RECOVERABLE (info-level) counter — and
+/// MUST NOT touch either irrecoverable-loss counter (`vanished`/`dropped`). The
+/// old single `backfill_failed` folded recoverable + irrecoverable together.
+/// Composition: real `FastSlowStore` over a `RejectingSlowStore` (every
+/// `update` → Err), blob seeded into `mirror_blobs`, requeue succeeds (cap not
+/// hit).
+///
+/// `#[serial]` for the process-global-static reason.
+///
+/// Mutation: comment out the `.requeued.fetch_add(requeued as u64, ...)` in
+/// `handle_upload_missing_blobs` → the delta stays 0; red-fail below.
+#[nativelink_test]
+#[serial]
+async fn backfill_recoverable_failure_increments_requeued_not_loss() {
+    let payload = Bytes::from_static(b"failing_backfill_blob_recoverable");
+    let digest = mk_digest(21, payload.len());
+
+    let fss = make_fss_with_rejecting_slow();
+    seed_mirror(&fss, digest, payload);
+
+    let ram = Arc::new(MockRunningActionsManager::new());
+    ram.set_cas_store(fss.clone());
+
+    let requeued_before = reconcile_pin_counters().requeued.load(Ordering::Relaxed);
+    let vanished_before = reconcile_pin_counters().vanished.load(Ordering::Relaxed);
+    let dropped_before = reconcile_pin_counters().dropped.load(Ordering::Relaxed);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle_upload_missing_blobs_for_test::<MockWorkerApiClient, _>(&ram, vec![digest], 4),
+    )
+    .await
+    .expect("handle_upload_missing_blobs must not deadlock — FL-688 requeued test");
+
+    // The blob was re-queued (recoverable) — visible in failed_slow_writes.
+    assert!(
+        fss.failed_slow_writes_contains(&digest),
+        "a RECOVERABLE backfill failure MUST re-queue into failed_slow_writes",
+    );
+    assert_eq!(
+        reconcile_pin_counters().requeued.load(Ordering::Relaxed) - requeued_before,
+        1,
+        "a RECOVERABLE (re-queued) backfill failure MUST increment \
+         reconcile_pin_requeued_total by exactly 1",
+    );
+    // ...and MUST NOT read as irrecoverable loss.
+    assert_eq!(
+        reconcile_pin_counters().vanished.load(Ordering::Relaxed) - vanished_before,
+        0,
+        "MINOR-1: a RECOVERABLE requeued failure MUST NOT increment the vanished \
+         (sole-copy loss) counter — recoverable and irrecoverable must not be folded",
+    );
+    assert_eq!(
+        reconcile_pin_counters().dropped.load(Ordering::Relaxed) - dropped_before,
+        0,
+        "MINOR-1: a RECOVERABLE requeued failure MUST NOT increment the dropped \
+         (irrecoverable over-cap) counter",
+    );
+}
+
+/// (#FL-688) A SUCCESSFUL backfill (`uploaded`, no failure, no vanish) MUST NOT
+/// fire ANY of the reconcile-pin loss/retry counters. Negative control proving
+/// the counters are keyed on ACTUAL outcome, not on the handler running.
+/// Composition: accepting slow tier (`MemoryStore`); the mirror-seeded blob
+/// uploads cleanly.
+///
+/// `#[serial]` for the process-global-static reason.
+#[nativelink_test]
+#[serial]
+async fn backfill_success_does_not_fire_any_loss_counter() {
+    let payload = Bytes::from_static(b"successful_backfill_blob_no_signal");
+    let digest = mk_digest(22, payload.len());
+
+    let fss = make_fss_with_accepting_slow();
+    seed_mirror(&fss, digest, payload);
+
+    let ram = Arc::new(MockRunningActionsManager::new());
+    ram.set_cas_store(fss.clone());
+
+    let vanished_before = reconcile_pin_counters().vanished.load(Ordering::Relaxed);
+    let requeued_before = reconcile_pin_counters().requeued.load(Ordering::Relaxed);
+    let dropped_before = reconcile_pin_counters().dropped.load(Ordering::Relaxed);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle_upload_missing_blobs_for_test::<MockWorkerApiClient, _>(&ram, vec![digest], 4),
+    )
+    .await
+    .expect("handle_upload_missing_blobs must not deadlock — FL-688 negative control");
+
+    // A successful upload leaves nothing in failed_slow_writes...
+    assert!(
+        !fss.failed_slow_writes_contains(&digest),
+        "a SUCCESSFUL backfill upload must NOT re-queue into failed_slow_writes",
+    );
+    // ...and MUST NOT bump ANY loss/retry counter.
+    assert_eq!(
+        reconcile_pin_counters().vanished.load(Ordering::Relaxed) - vanished_before,
+        0,
+        "a SUCCESSFUL backfill MUST NOT increment reconcile_pin_vanished_total",
+    );
+    assert_eq!(
+        reconcile_pin_counters().requeued.load(Ordering::Relaxed) - requeued_before,
+        0,
+        "a SUCCESSFUL backfill MUST NOT increment reconcile_pin_requeued_total",
+    );
+    assert_eq!(
+        reconcile_pin_counters().dropped.load(Ordering::Relaxed) - dropped_before,
+        0,
+        "a SUCCESSFUL backfill MUST NOT increment reconcile_pin_dropped_total",
+    );
 }

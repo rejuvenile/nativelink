@@ -1530,6 +1530,190 @@ impl MetricsComponent for MemoryGateCountersHandle {
 }
 
 // =====================================================================
+// #FL-688 reconcile-pin observability — process-wide reconcile-pin /
+// backfill counters
+// =====================================================================
+
+/// (#FL-688 log-miscalibration fix) Process-wide reconcile-pin / backfill
+/// counters for the worker's `UploadMissingBlobs` handler.
+///
+/// These were originally fields on `LocalWorker.metrics` (a per-instance
+/// `MetricsComponent` tree that is never registered with `MetricsRegistry` —
+/// the worker-metrics-exposure trap; the same class #37 memory_gate, #86
+/// symlink_fix, and #DC3 dir_cache fixed). On that dark tree the counters
+/// rendered in an in-process `publish()` unit test but never reached
+/// `/metrics`. Moving them to a process singleton (registered under the
+/// "reconcile_pin" prefix in `nativelink.rs`) makes them visible without
+/// per-instance registration.
+///
+/// The server ONLY requests a blob the worker itself advertised via
+/// `BlobsAvailable` (`worker_api_server.rs::request_missing_blob_uploads` gates
+/// the request on the worker's advertised set minus the server CAS's own
+/// `has_with_results`). So every digest in an `UploadMissingBlobs` request is
+/// one the worker CLAIMED to hold. The four counters below classify what
+/// happens to each such digest by SEVERITY — separating benign races and
+/// recoverable retries from genuine, irrecoverable sole-copy loss:
+///
+/// - `refused` (BENIGN, info): the digest was absent from the moka in-memory
+///   eviction INDEX at reconcile-pin time (`pin_digest_indefinite_or_time_bounded`
+///   returned `Refused`). NOT data loss: the handler does not skip the upload —
+///   it re-checks presence via `FastSlowStore::has_with_results`, which reads
+///   DISK + `mirror_blobs` (not the moka index), so a blob absent from the
+///   pin-index is still on disk and uploads fine (verified live: `970 refused →
+///   found: 1000 → uploaded: 1000, failed: 0`). Observe the rate; do NOT alert.
+///
+/// - `vanished` (IRRECOVERABLE loss, WARN): the digest the worker advertised is
+///   ABSENT at the `has_with_results` re-check (disk + in-flight + mirror all
+///   `None`). The worker advertised it, then lost it (unpinned eviction + mirror
+///   drop) and can no longer produce it. Because the server requested it, the
+///   server does not hold it either → **sole-copy permanent loss**. This is the
+///   genuine FL-688 regression signal — the path a real regression surfaces on.
+///   Nothing downstream can recover it (the blob is gone); alert on any non-zero.
+///
+/// - `requeued` (RECOVERABLE, info): the upload was attempted but FAILED, and
+///   the digest WAS re-queued into `failed_slow_writes` (`requeue_failed_push`
+///   returned true) for retry-until-durable by the reconnect drainer. The blob
+///   still exists locally and will be re-attempted — not yet lost. Rate>0 under
+///   load is expected; a SUSTAINED high rate indicates a stuck slow tier.
+///
+/// - `dropped` (IRRECOVERABLE, WARN): the upload FAILED and the digest could
+///   NOT be re-queued because `failed_slow_writes` is at cap
+///   (`requeue_failed_push` returned false). The digest is dropped from the
+///   retry set; only the server's next `BlobsAvailable` re-request can recover
+///   it (and only while the blob still exists locally). Alert on any non-zero.
+#[derive(Debug)]
+pub struct ReconcilePinCounters {
+    /// Digests absent from the moka eviction index at reconcile-pin time
+    /// (`Refused`). BENIGN eviction race — the disk-backed upload still
+    /// proceeds. Monotonic; alert on nothing, observe the rate for eviction
+    /// churn.
+    pub refused: AtomicU64,
+    /// Advertised digests ABSENT at the `has_with_results` re-check — the worker
+    /// claimed the blob then lost it and can no longer produce it. Sole-copy
+    /// PERMANENT loss (the server requested it, so the server lacks it too). The
+    /// genuine FL-688 data-loss signal. Monotonic; alert on any non-zero.
+    pub vanished: AtomicU64,
+    /// Upload attempted and FAILED but the digest WAS re-queued into
+    /// `failed_slow_writes` for retry-until-durable (RECOVERABLE — the blob
+    /// still exists locally). Monotonic; sustained high rate = stuck slow tier.
+    pub requeued: AtomicU64,
+    /// Upload FAILED and the digest could NOT be re-queued (`failed_slow_writes`
+    /// at cap) — dropped from the retry set (IRRECOVERABLE via the local retry
+    /// path). Monotonic; alert on any non-zero.
+    pub dropped: AtomicU64,
+}
+
+impl ReconcilePinCounters {
+    const fn new() -> Self {
+        Self {
+            refused: AtomicU64::new(0),
+            vanished: AtomicU64::new(0),
+            requeued: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MetricsComponent for ReconcilePinCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        // Registered under prefix "reconcile_pin" (nativelink.rs). The publish!
+        // name is the FULL field name so operators alert on the literal string.
+        // No inner group!() — the prefix already scopes these uniquely (avoids
+        // the #86 doubled-name trap).
+        let v = self.refused.load(Ordering::Relaxed);
+        publish!(
+            "refused_total",
+            &v,
+            MetricKind::Counter,
+            "BENIGN: blobs absent from the moka eviction index at reconcile-pin \
+             time (evicted before pin or never inserted). The disk-backed upload \
+             still proceeds (presence is re-checked on disk + mirror_blobs, NOT \
+             the moka index). Monotonic — observe the rate for eviction churn; do \
+             NOT alert on non-zero (this is NOT the data-loss signal — see \
+             reconcile_pin_vanished_total)."
+        );
+        let v = self.vanished.load(Ordering::Relaxed);
+        publish!(
+            "vanished_total",
+            &v,
+            MetricKind::Counter,
+            "FL-688 data-loss signal (IRRECOVERABLE): advertised blobs ABSENT at \
+             the reconcile re-check — the worker advertised the blob, then lost it \
+             (unpinned eviction + mirror drop) and can no longer produce it. The \
+             server requested it, so the server lacks it too = sole-copy permanent \
+             loss. Monotonic — alert on ANY non-zero; this is where a real FL-688 \
+             regression surfaces. Nothing downstream can recover it."
+        );
+        let v = self.requeued.load(Ordering::Relaxed);
+        publish!(
+            "requeued_total",
+            &v,
+            MetricKind::Counter,
+            "RECOVERABLE: backfill uploads that FAILED but were re-queued into \
+             failed_slow_writes for retry-until-durable (the blob still exists \
+             locally). Monotonic — rate>0 under load is expected; a SUSTAINED high \
+             rate indicates a stuck slow tier, not yet loss."
+        );
+        let v = self.dropped.load(Ordering::Relaxed);
+        publish!(
+            "dropped_total",
+            &v,
+            MetricKind::Counter,
+            "FL-688 data-loss signal (IRRECOVERABLE via local retry): backfill \
+             uploads that FAILED and could NOT be re-queued because \
+             failed_slow_writes is at cap. Dropped from the retry set; only the \
+             server's next BlobsAvailable re-request can recover it (and only \
+             while the blob still exists locally). Monotonic — alert on any \
+             non-zero."
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// #FL-688: process-wide reconcile-pin counters. Backed by a `static`
+/// so `const fn new()` suffices.
+static RECONCILE_PIN_COUNTERS: ReconcilePinCounters = ReconcilePinCounters::new();
+/// #FL-688: cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents
+/// a double-registration hazard if `reconcile_pin_counters_arc()` is called
+/// twice — both calls return a clone of the same `Arc`.
+static RECONCILE_PIN_COUNTERS_ARC: OnceLock<Arc<ReconcilePinCountersHandle>> = OnceLock::new();
+
+/// #FL-688: process-wide reconcile-pin counters singleton. All calls within
+/// the process observe the same atomic state.
+#[must_use]
+pub fn reconcile_pin_counters() -> &'static ReconcilePinCounters {
+    &RECONCILE_PIN_COUNTERS
+}
+
+/// #FL-688: `Arc` wrapper for `MetricsRegistry::register`. The singleton lives
+/// in a `static`; the `Arc` carries a zero-sized handle that delegates
+/// `publish` to the static so scrapes always read live state. `OnceLock`-
+/// cached so repeated calls return a clone of the same `Arc`.
+#[must_use]
+pub fn reconcile_pin_counters_arc() -> Arc<ReconcilePinCountersHandle> {
+    Arc::clone(RECONCILE_PIN_COUNTERS_ARC.get_or_init(|| Arc::new(ReconcilePinCountersHandle)))
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an
+/// `Arc<T: MetricsComponent>` for the `static`-backed reconcile-pin counters.
+#[derive(Debug)]
+pub struct ReconcilePinCountersHandle;
+
+impl MetricsComponent for ReconcilePinCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        RECONCILE_PIN_COUNTERS.publish(kind, field_metadata)
+    }
+}
+
+// =====================================================================
 // P4 — System metrics sampler (macOS workers only)
 // =====================================================================
 
@@ -2299,6 +2483,121 @@ mod tests {
             "#37 doubled metric name: rendered output contains `memory_gate_memory_gate` \
              — the register key and an inner group!() are concatenating. body=\n{body}"
         );
+    }
+
+    /// (#FL-688 log-miscalibration fix) All four reconcile-pin counters must
+    /// render on the REAL `/metrics` path (`MetricsRegistry::register` +
+    /// `render_prometheus`), not just `MetricsComponent::publish` in isolation
+    /// — the fleet alarm keys on the rendered Prometheus line. This test PINS
+    /// the exact rendered names: the value lines are the BARE
+    /// `reconcile_pin_refused_total`, `reconcile_pin_vanished_total`,
+    /// `reconcile_pin_requeued_total`, `reconcile_pin_dropped_total` (NO
+    /// `_counter` suffix). Without a rendering singleton these would stay on the
+    /// per-instance `LocalWorker.metrics` tree — DARK on `/metrics` (the
+    /// worker-metrics-exposure trap).
+    ///
+    /// Mutation: comment out any one `publish!` block in
+    /// `ReconcilePinCounters::publish` → the corresponding line vanishes; this
+    /// test red-fails with the bespoke "dark on /metrics" message below.
+    #[test]
+    fn reconcile_pin_render_prometheus_exposes_counters() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // LOCAL Arc (not the process static) for the 'static register()
+        // lifetime + to avoid cross-test interference with
+        // RECONCILE_PIN_COUNTERS. The blanket `Arc<T: MetricsComponent>` impl
+        // delegates to `ReconcilePinCounters::publish` — the same path the
+        // registered handle uses. Distinct values so a mis-wired field (right
+        // name, wrong source) is caught, not just an absent line.
+        let counters = Arc::new(ReconcilePinCounters::new());
+        counters.refused.fetch_add(970, Ordering::Relaxed);
+        counters.vanished.fetch_add(3, Ordering::Relaxed);
+        counters.requeued.fetch_add(11, Ordering::Relaxed);
+        counters.dropped.fetch_add(2, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        // Prefix "reconcile_pin" — the exact key production nativelink.rs registers.
+        registry.register("reconcile_pin", counters);
+        let body = render_prometheus(&registry);
+
+        for (name, value) in [
+            ("reconcile_pin_refused_total", 970u64),
+            ("reconcile_pin_vanished_total", 3),
+            ("reconcile_pin_requeued_total", 11),
+            ("reconcile_pin_dropped_total", 2),
+        ] {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "#FL-688 dark on /metrics: expected exact line `{name} {value}` from the \
+                 render_prometheus walk, but it is ABSENT — the fleet alarm keys on this \
+                 EXACT rendered name. body=\n{body}"
+            );
+        }
+        // Guard the doubled-prefix trap (as the dir_cache / memory_gate tests do).
+        assert!(
+            !body.contains("reconcile_pin_reconcile_pin"),
+            "#FL-688 doubled metric name: rendered output contains \
+             `reconcile_pin_reconcile_pin` — the register key and an inner group!() are \
+             concatenating. body=\n{body}"
+        );
+    }
+
+    /// (#FL-688 log-miscalibration fix) The four reconcile-pin counters are
+    /// SEPARATE atomics classified by durability SEVERITY — incrementing one
+    /// must NEVER touch another. This pins the asymmetry that makes the fix
+    /// correct: the BENIGN `refused` path (eviction race, disk-backed upload
+    /// still proceeds) and the RECOVERABLE `requeued` path (failed-but-retried)
+    /// must NOT raise either irrecoverable data-loss counter (`vanished` =
+    /// advertised-then-lost sole-copy loss; `dropped` = over-cap requeue drop).
+    /// The old single `backfill_failed` counter folded recoverable and
+    /// irrecoverable together — a milder reprise of the miscalibration this fix
+    /// removes.
+    ///
+    /// (The production increments fire in `local_worker.rs`'s
+    /// `handle_upload_missing_blobs`; `vanished`/`dropped`/`requeued` are
+    /// exercised end-to-end by the `backfill_*` tests in
+    /// `nativelink-worker/tests/backfill_upload_requeue_test.rs`. This test pins
+    /// the field-independence contract those rely on.)
+    ///
+    /// Mutation: point any `fetch_add` at the wrong field → a cross-field
+    /// assertion red-fails with its bespoke message.
+    #[test]
+    fn reconcile_pin_counters_are_independent_by_severity() {
+        let c = ReconcilePinCounters::new();
+        for f in [&c.refused, &c.vanished, &c.requeued, &c.dropped] {
+            assert_eq!(f.load(Ordering::Relaxed), 0);
+        }
+
+        // BENIGN refused bumps ONLY refused — never an irrecoverable-loss counter.
+        c.refused.fetch_add(970, Ordering::Relaxed);
+        assert_eq!(
+            c.vanished.load(Ordering::Relaxed),
+            0,
+            "#FL-688 miscalibration: a benign reconcile-pin Refused (970) must NOT raise the \
+             vanished (sole-copy loss) counter — Refused is an eviction race, the \
+             disk-backed upload still proceeds",
+        );
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+
+        // RECOVERABLE requeued must NOT read as irrecoverable loss.
+        c.requeued.fetch_add(11, Ordering::Relaxed);
+        assert_eq!(
+            c.vanished.load(Ordering::Relaxed),
+            0,
+            "#FL-688: a RECOVERABLE requeued failure (retry-until-durable) must NOT raise the \
+             vanished (irrecoverable sole-copy loss) counter — the folded backfill_failed \
+             counter was the miscalibration this split removes",
+        );
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 0);
+
+        // The two irrecoverable-loss counters are distinct and do not cross.
+        c.vanished.fetch_add(3, Ordering::Relaxed);
+        c.dropped.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(c.refused.load(Ordering::Relaxed), 970);
+        assert_eq!(c.requeued.load(Ordering::Relaxed), 11);
+        assert_eq!(c.vanished.load(Ordering::Relaxed), 3);
+        assert_eq!(c.dropped.load(Ordering::Relaxed), 2);
     }
 
     /// #DC3 (scope ext): phase-observe increment test on a LOCAL

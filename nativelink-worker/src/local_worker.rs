@@ -3276,6 +3276,24 @@ pub fn upload_fanout_semaphore(max_concurrent_uploads: usize) -> Arc<Semaphore> 
     Arc::new(Semaphore::new(max_concurrent_uploads))
 }
 
+/// (#FL-688) Per-blob outcome of the backfill upload loop in
+/// [`LocalWorkerImpl::handle_upload_missing_blobs`], classified by durability
+/// severity so the aggregate tally can feed the correctly-labeled counters.
+/// (The re-check `None`/VANISHED case never reaches this enum — those digests
+/// are filtered out of `present` before the upload loop and counted separately.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillOutcome {
+    /// The blob was uploaded to the server successfully.
+    Uploaded,
+    /// The upload failed but the digest was re-queued into `failed_slow_writes`
+    /// for retry-until-durable (RECOVERABLE — the blob still exists locally).
+    Requeued,
+    /// The upload failed AND the digest could not be re-queued
+    /// (`failed_slow_writes` at cap) — dropped from the local retry path
+    /// (IRRECOVERABLE via local retry; the server may still re-request).
+    Dropped,
+}
+
 impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorkerImpl<'a, T, U> {
     fn new(
         config: &'a LocalWorkerConfig,
@@ -3356,11 +3374,40 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             .filter_map(|(d, r)| if r.is_some() { Some(*d) } else { None })
             .collect();
 
-        if present.is_empty() {
-            info!(
+        // (#FL-688) An advertised digest that returns `None` at the re-check is
+        // VANISHED — the worker advertised the blob (the server only requests
+        // what the worker advertised, worker_api_server.rs
+        // request_missing_blob_uploads), then lost it (unpinned eviction +
+        // mirror drop) and can no longer produce it. Since the server requested
+        // it, no copy remains anywhere = sole-copy permanent loss. This is the
+        // genuine FL-688 data-loss signal — warned + counted here ONCE for both
+        // the all-vanished (present.is_empty) and partial-vanish cases. Nothing
+        // downstream can recover a vanished blob (it is gone), so this fires
+        // regardless of whether the surviving `present` subset uploads.
+        let vanished = digests.len() - present.len();
+        if vanished > 0 {
+            warn!(
+                vanished,
                 requested = digests.len(),
-                "UploadMissingBlobs: none of the requested blobs found locally"
+                found = present.len(),
+                "FL-688 data-loss signal: {vanished} advertised blob(s) VANISHED at reconcile \
+                 re-check (no longer present on disk/in-flight/mirror — sole-copy permanent \
+                 loss; the server requested them, so no copy remains)"
             );
+            ::nativelink_util::o11_probes::reconcile_pin_counters()
+                .vanished
+                .fetch_add(vanished as u64, Ordering::Relaxed);
+        }
+
+        if present.is_empty() {
+            // Everything requested vanished (or the request was empty); the
+            // vanished signal above already fired. Nothing left to upload.
+            if vanished == 0 {
+                info!(
+                    requested = digests.len(),
+                    "UploadMissingBlobs: none of the requested blobs found locally"
+                );
+            }
             return;
         }
 
@@ -3508,7 +3555,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         }
                     };
                     match result {
-                        Ok(()) => true,
+                        Ok(()) => BackfillOutcome::Uploaded,
                         Err(err) => {
                             // #FL-688 W4 retry-until-durable: a failed
                             // worker→server backfill push MUST NOT be
@@ -3522,27 +3569,35 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             // tick and the count never decreased (the stuck
                             // loop). The re-queue is bounded by
                             // `FAILED_SLOW_WRITES_MAX`; `requeue_failed_push`
-                            // returns false only on the over-cap rejection,
-                            // surfaced here at warn! so the (never-in-practice)
-                            // over-cap event is observable.
-                            let requeued = cas_store.requeue_failed_push(digest);
-                            if requeued {
-                                warn!(
+                            // returns false only on the over-cap rejection.
+                            if cas_store.requeue_failed_push(digest) {
+                                // RECOVERABLE: the blob still exists locally
+                                // and is re-queued for retry-until-durable.
+                                // NOT yet loss — info!, not the data-loss WARN.
+                                info!(
                                     ?digest,
                                     ?err,
                                     "UploadMissingBlobs: failed to transfer blob; \
                                      re-queued into failed_slow_writes for retry-until-durable"
                                 );
+                                BackfillOutcome::Requeued
                             } else {
+                                // IRRECOVERABLE via the local retry path: the
+                                // digest is DROPPED from the retry-until-durable
+                                // set (failed_slow_writes at cap) — only the
+                                // server's next BlobsAvailable re-request can
+                                // recover it (and only while the blob still
+                                // exists locally). Labeled with the FL-688
+                                // data-loss signal so the fleet alarm keys on it.
                                 warn!(
                                     ?digest,
                                     ?err,
-                                    "UploadMissingBlobs: failed to transfer blob AND \
+                                    "FL-688 data-loss signal: failed to transfer blob AND \
                                      failed_slow_writes is at cap — digest NOT re-queued; \
                                      server BlobsAvailable re-request is the remaining retry path"
                                 );
+                                BackfillOutcome::Dropped
                             }
-                            false
                         }
                     }
                 })
@@ -3550,21 +3605,48 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             .collect();
 
         let mut uploaded = 0usize;
-        let mut failed = 0usize;
-        while let Some(ok) = uploads.next().await {
-            if ok {
-                uploaded += 1;
-            } else {
-                failed += 1;
+        let mut requeued = 0usize;
+        let mut dropped = 0usize;
+        while let Some(outcome) = uploads.next().await {
+            match outcome {
+                BackfillOutcome::Uploaded => uploaded += 1,
+                BackfillOutcome::Requeued => requeued += 1,
+                BackfillOutcome::Dropped => dropped += 1,
             }
         }
 
         info!(
             uploaded,
-            failed,
+            requeued,
+            dropped,
+            vanished,
             total = present.len(),
             "UploadMissingBlobs: backfill complete"
         );
+        // (#FL-688 log-miscalibration fix) The upload-outcome severity split.
+        // The server ONLY requests blobs the worker advertised
+        // (worker_api_server.rs request_missing_blob_uploads), so every
+        // classification is about a blob the worker CLAIMED to hold. VANISHED
+        // (the genuine irrecoverable sole-copy loss) is warned + counted BEFORE
+        // this loop — those digests were dropped from `present` at the re-check
+        // and never reached the upload. Here we split the upload OUTCOMES:
+        //
+        // DROPPED is irrecoverable via the local retry path (failed_slow_writes
+        // at cap) — a WARN-level data-loss signal. The per-digest arm above
+        // already warned per blob; the counter carries the batch count.
+        if dropped > 0 {
+            ::nativelink_util::o11_probes::reconcile_pin_counters()
+                .dropped
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        }
+        // REQUEUED is RECOVERABLE (retry-until-durable) — info-level, not a
+        // data-loss alarm. The counter lets operators watch the slow-tier
+        // backpressure rate without it reading as loss.
+        if requeued > 0 {
+            ::nativelink_util::o11_probes::reconcile_pin_counters()
+                .requeued
+                .fetch_add(requeued as u64, Ordering::Relaxed);
+        }
     }
 
     /// Starts a background spawn/thread that will send a message to the server every `timeout / 2`.
@@ -4837,16 +4919,36 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         .add(time_bounded_count);
                                 }
                                 if refused_count > 0 {
-                                    warn!(
+                                    // NOT the FL-688 data-loss signal: a `Refused`
+                                    // pin means the digest is absent from the moka
+                                    // in-memory eviction INDEX, but the upload does
+                                    // NOT skip on this — `handle_upload_missing_blobs`
+                                    // re-checks presence via
+                                    // `FastSlowStore::has_with_results` (reads DISK +
+                                    // mirror_blobs, NOT the moka index), so a
+                                    // disk-backed blob still uploads (verified live:
+                                    // 970 refused → found: 1000 → uploaded: 1000,
+                                    // failed: 0). `pin_digest_indefinite_or_time_bounded`'s
+                                    // own doc-comment names `Refused` an expected
+                                    // self-healing eviction race. The genuine
+                                    // data-loss signal is `failed > 0` at
+                                    // `backfill complete` (below), keyed on the actual
+                                    // upload outcome. Kept at info! (NOT debug!, which
+                                    // the release_max_level_info prod binary compiles
+                                    // out) so the rate stays visible; the
+                                    // process-singleton counter
+                                    // `reconcile_pin_refused_total` carries the count
+                                    // without per-batch log volume.
+                                    info!(
                                         refused_count,
-                                        "reconcile-pin: {refused_count} blob(s) absent from \
-                                         eviction map (evicted before reconcile-pin or never \
-                                         inserted); uploads will fail — this is the FL-688 \
-                                         data-loss signal"
+                                        "reconcile-pin: {refused_count} blob(s) not in the \
+                                         in-memory eviction index (benign eviction race; \
+                                         disk-backed upload proceeds — see \
+                                         reconcile_pin_vanished_total for actual loss)"
                                     );
-                                    self.metrics
-                                        .reconcile_pin_refused_total
-                                        .add(refused_count);
+                                    ::nativelink_util::o11_probes::reconcile_pin_counters()
+                                        .refused
+                                        .fetch_add(refused_count, Ordering::Relaxed);
                                 }
                             }
                             let ram = self.running_actions_manager.clone();
@@ -7050,16 +7152,22 @@ pub struct Metrics {
         help = "Blobs reconcile-pinned with time-bounded fallback (indefinite cap full); 120s protection window, non-zero = cap saturation backpressure."
     )]
     reconcile_pin_time_bounded_fallback_total: Counter,
-
-    /// (FL-688 v3 Stage C — MINOR-1) Count of blobs in `UploadMissingBlobs`
-    /// where reconcile-pin was fully refused because the blob was absent from
-    /// the eviction map (evicted before reconcile-pin or never inserted).
-    /// Non-zero = FL-688 data-loss signal: these blobs will fail upload and
-    /// must be re-requested by the server.
-    #[metric(
-        help = "Blobs absent from eviction map at reconcile-pin time (evicted before pin or never inserted); non-zero = FL-688 data-loss signal — upload will fail."
-    )]
-    reconcile_pin_refused_total: Counter,
+    // NOTE: `reconcile_pin_refused_total` was previously a per-instance Counter
+    // field here. It has been MOVED to the process-singleton
+    // `nativelink_util::o11_probes::reconcile_pin_counters()` and registered in
+    // nativelink.rs so it is visible on /metrics. The per-instance `Metrics`
+    // tree is never registered with MetricsRegistry (the
+    // worker-metrics-exposure trap; same class as the #37 memory_gate move) —
+    // the old field was dark. Its help-text ALSO miscalled `Refused` the
+    // "FL-688 data-loss signal — upload will fail", which is false: a Refused
+    // pin is a benign eviction race and the disk-backed upload proceeds. The
+    // genuine data-loss signal is now `reconcile_pin_vanished_total` (an
+    // advertised digest ABSENT at the has_with_results re-check = sole-copy
+    // loss), with `reconcile_pin_dropped_total` (over-cap requeue drop) and
+    // `reconcile_pin_requeued_total` (recoverable retry) split out by severity.
+    // See #FL-688 log fix. (`reconcile_pin_time_bounded_fallback_total` above is
+    // ALSO on this dark tree; it is a separate recoverable-backpressure signal,
+    // left in place — making it render is a follow-up, filed in deferred_tasks.md.)
 
     /// (#37 re-enable follow-up) NAKs issued to the scheduler because the
     /// available-memory free-floor PRIMARY was breached (available
@@ -7103,7 +7211,6 @@ impl Metrics {
             running_actions_manager_metrics,
             ac_write_detached_inflight_count,
             reconcile_pin_time_bounded_fallback_total: Counter::default(),
-            reconcile_pin_refused_total: Counter::default(),
             reconcile_gate_fail_open_total: Counter::default(),
         }
     }

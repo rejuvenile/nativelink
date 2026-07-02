@@ -755,6 +755,28 @@ async fn inner_main(
         nativelink_util::o11_probes::memory_gate_counters_arc(),
     );
 
+    // #FL-688 (log-miscalibration fix): register the reconcile-pin counters
+    // singleton so the worker's UploadMissingBlobs backfill signals appear on
+    // /metrics, split by durability severity: `reconcile_pin_refused_total`
+    // (benign eviction race), `reconcile_pin_vanished_total` (the genuine
+    // FL-688 data-loss signal — advertised digest ABSENT at re-check = sole-copy
+    // loss), `reconcile_pin_dropped_total` (irrecoverable over-cap requeue
+    // drop), `reconcile_pin_requeued_total` (recoverable retry). These were
+    // previously on the per-instance `LocalWorker.metrics` struct which is never
+    // registered with MetricsRegistry (the worker-metrics-exposure trap; same
+    // class as #37 memory_gate, #86 symlink_fix, #DC3 dir_cache) — the refused
+    // counter was dark on /metrics. Prefix is "reconcile_pin"; the rendered
+    // Prometheus names the fleet alarm keys on are the BARE names above (no
+    // `_counter` suffix — empirically pinned by
+    // `reconcile_pin_render_prometheus_exposes_counters` in o11_probes.rs).
+    // Registered unconditionally to match the sibling pattern; the producer
+    // (LocalWorker UploadMissingBlobs) is WORKER-ONLY so the counters read 0 on
+    // server-only processes.
+    metrics_registry.register(
+        "reconcile_pin",
+        nativelink_util::o11_probes::reconcile_pin_counters_arc(),
+    );
+
     metrics_registry.register(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),
