@@ -197,6 +197,85 @@ pub struct SchedulerMetrics {
                 (sum of per-worker running_action_infos)"
     )]
     pub total_running_actions: AtomicU64,
+
+    // ── (#p1p2) Phase-1 tree-resolution telemetry ──
+    // TELEMETRY-ONLY. These answer two open questions with production
+    // data: (1) is Phase-1 tree resolution a scheduling-latency
+    // contributor (the cold-resolution time sum + count, warm path =
+    // hits), and (2) does the `ByteBoundedTreeCache` run out of space and
+    // evict (the eviction counter + the resident-bytes / entry-count
+    // gauges vs `TREE_CACHE_MAX_BYTES` / `TREE_CACHE_CAPACITY`). No
+    // behavior change — increments/stores only, `Ordering::Relaxed`.
+    /// (#p1p2) Cumulative `resolve_input_tree` calls served from the
+    /// positive tree cache (warm path). Ratio hits/(hits+misses) is the
+    /// tree-cache hit rate — a low rate means Phase-1 resolution is on the
+    /// scheduling critical path more often than expected.
+    #[metric(
+        help = "(#p1p2) cumulative resolve_input_tree calls served from the positive tree cache (warm path)"
+    )]
+    pub tree_cache_hits: AtomicU64,
+    /// (#p1p2) Cumulative `resolve_input_tree` calls that missed the
+    /// positive cache and attempted a cold resolution from CAS.
+    #[metric(
+        help = "(#p1p2) cumulative resolve_input_tree cache misses (cold resolution attempted from CAS)"
+    )]
+    pub tree_cache_misses: AtomicU64,
+    /// (#p1p2) Cumulative entries evicted from the tree cache — the
+    /// count-capacity (`TREE_CACHE_CAPACITY`) displacement plus the
+    /// byte-budget (`TREE_CACHE_MAX_BYTES`) loop. A non-zero, growing
+    /// value means the cache is under space pressure and dropping warm
+    /// trees. Same-key replacements are NOT counted.
+    #[metric(
+        help = "(#p1p2) cumulative entries evicted from the tree cache (count-cap displacement + byte-budget loop); non-zero means space pressure"
+    )]
+    pub tree_cache_evictions: AtomicU64,
+    /// (#p1p2) Point-in-time estimated resident heap bytes held by the
+    /// tree cache, sampled after each put under the cache lock. Compare
+    /// against `TREE_CACHE_MAX_BYTES` (512 MiB) to see how close the cache
+    /// runs to its byte budget.
+    #[metric(
+        help = "(#p1p2) point-in-time estimated resident heap bytes in the tree cache (vs TREE_CACHE_MAX_BYTES = 512 MiB)"
+    )]
+    pub tree_cache_resident_bytes: AtomicU64,
+    /// (#p1p2) Point-in-time number of entries resident in the tree cache,
+    /// sampled after each put under the cache lock. Compare against
+    /// `TREE_CACHE_CAPACITY` (1024) to see how close the cache runs to its
+    /// count budget.
+    #[metric(
+        help = "(#p1p2) point-in-time number of entries resident in the tree cache (vs TREE_CACHE_CAPACITY = 1024)"
+    )]
+    pub tree_cache_entries: AtomicU64,
+    /// (#p1p2) Cumulative wall-clock nanoseconds spent in successful COLD
+    /// (cache-miss) inline tree resolutions from CAS. Divided by
+    /// `tree_resolution_cold_count` gives mean cold-resolution latency —
+    /// the direct answer to "is Phase-1 resolution a scheduling-latency
+    /// contributor". The warm path adds no time here (it is a hit).
+    #[metric(
+        help = "(#p1p2) cumulative nanoseconds in successful cold (cache-miss) inline tree resolutions; /count = mean cold latency"
+    )]
+    pub tree_resolution_cold_time_ns: AtomicU64,
+    /// (#p1p2) Cumulative count of successful cold inline tree
+    /// resolutions — the denominator for `tree_resolution_cold_time_ns`.
+    #[metric(
+        help = "(#p1p2) cumulative count of successful cold inline tree resolutions (denominator for tree_resolution_cold_time_ns)"
+    )]
+    pub tree_resolution_cold_count: AtomicU64,
+    /// (#p1p2) Cumulative inline tree resolutions that hit the 500 ms
+    /// timeout and fell back to load-based scoring (resolution continues
+    /// in a background task). A non-zero, growing value means cold
+    /// resolution is frequently exceeding the dispatch-latency budget.
+    #[metric(
+        help = "(#p1p2) cumulative inline tree resolutions that hit the 500ms timeout and fell back to load-based scoring"
+    )]
+    pub tree_resolution_timeouts: AtomicU64,
+    /// (#p1p2) Cumulative inline tree resolutions that returned a
+    /// resolution error (not a timeout) — e.g. a CAS fetch failure or a
+    /// missing directory blob. Recorded in the negative cache with
+    /// backoff.
+    #[metric(
+        help = "(#p1p2) cumulative inline tree resolutions that failed with a resolution error (not a timeout)"
+    )]
+    pub tree_resolution_errors: AtomicU64,
 }
 
 /// Point-in-time intersection of an action's `file_digests` and the
@@ -2479,20 +2558,33 @@ impl ByteBoundedTreeCache {
         self.lru.get(key)
     }
 
+    /// Inserts `key`/`value`, evicting to stay within both bounds, and
+    /// returns the number of entries EVICTED. (#p1p2 telemetry) A same-key
+    /// replacement is a replace, not an eviction, and returns 0 for that
+    /// displacement; only count-capacity overflow and the byte-budget loop
+    /// contribute to the returned count. Eviction LOGIC is unchanged —
+    /// only the return value is added.
     fn put(
         &mut self,
         key: DigestInfo,
         value: Arc<ResolvedTree>,
-    ) {
+    ) -> usize {
         let new_bytes = value.estimated_heap_bytes();
+        let mut evicted_count: usize = 0;
 
         // push() returns the displaced entry: either a same-key
         // replacement or the LRU entry evicted on capacity overflow.
         // put() silently drops on overflow, so we must use push().
-        if let Some((_displaced_key, displaced_val)) = self.lru.push(key, value) {
+        if let Some((displaced_key, displaced_val)) = self.lru.push(key, value) {
             self.total_bytes = self
                 .total_bytes
                 .saturating_sub(displaced_val.estimated_heap_bytes());
+            // A displaced key EQUAL to the inserted key is a same-key
+            // replacement, not an eviction — net entry count is unchanged.
+            // A DIFFERENT key is a count-capacity eviction of the LRU entry.
+            if displaced_key != key {
+                evicted_count += 1;
+            }
         }
         self.total_bytes += new_bytes;
 
@@ -2502,10 +2594,13 @@ impl ByteBoundedTreeCache {
                 let evicted_bytes = evicted_val.estimated_heap_bytes();
                 self.total_bytes =
                     self.total_bytes.saturating_sub(evicted_bytes);
+                evicted_count += 1;
             } else {
                 break;
             }
         }
+
+        evicted_count
     }
 
     fn len(&self) -> usize {
@@ -3468,6 +3563,10 @@ impl ApiWorkerScheduler {
         {
             let mut cache = self.tree_cache.lock().await;
             if let Some(cached) = cache.get(&input_root_digest) {
+                // (#p1p2 telemetry) warm-path hit.
+                self.metrics
+                    .tree_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(
                     %input_root_digest,
                     file_count = cached.file_digests.len(),
@@ -3520,18 +3619,38 @@ impl ApiWorkerScheduler {
         // GetTree with subtree caching resolves 1000-dir trees in 10-50ms
         // when warm, but cold starts (first action for a new tree) need
         // up to ~200ms for store fetches. 500ms covers p99 of warm+cold.
+        //
+        // (#p1p2 telemetry) A cold resolution is being attempted (the
+        // positive and negative caches both missed and the in-progress
+        // guard was acquired).
+        self.metrics
+            .tree_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
         let resolve_fut = resolve_tree_from_cas(
             cas_store,
             input_root_digest,
             &self.failed_directory_digests,
         );
+        // (#p1p2 telemetry) Time the cold resolution to isolate its cost
+        // from the warm (hit) path. Recorded on the success arm below.
+        let resolve_started = Instant::now();
         let resolve_result =
             tokio::time::timeout(Duration::from_millis(500), resolve_fut).await;
+        let resolve_elapsed = resolve_started.elapsed();
 
         match resolve_result {
             Ok(Ok(resolved)) => {
                 // resolution_guard fires here, releasing the in-progress flag.
                 drop(resolution_guard);
+                // (#p1p2 telemetry) Successful cold resolution — record its
+                // elapsed cost (sum + count) so the mean cold-resolution
+                // latency is derivable.
+                self.metrics
+                    .tree_resolution_cold_time_ns
+                    .fetch_add(resolve_elapsed.as_nanos() as u64, Ordering::Relaxed);
+                self.metrics
+                    .tree_resolution_cold_count
+                    .fetch_add(1, Ordering::Relaxed);
                 let entry_bytes = resolved.estimated_heap_bytes();
                 debug!(
                     %input_root_digest,
@@ -3542,9 +3661,21 @@ impl ApiWorkerScheduler {
                 );
                 let arc = Arc::new(resolved);
                 let mut cache = self.tree_cache.lock().await;
-                let before_count = cache.len();
-                cache.put(input_root_digest, Arc::clone(&arc));
-                let evicted = before_count.saturating_sub(cache.len().saturating_sub(1));
+                // (#p1p2 telemetry) put() now reports the exact number of
+                // entries it evicted (count-cap displacement + byte-budget
+                // loop; same-key replace = 0). Read the post-put resident
+                // bytes / entry count while the cache lock is STILL held (no
+                // extra critical section) and store them into the gauges.
+                let evicted = cache.put(input_root_digest, Arc::clone(&arc));
+                self.metrics
+                    .tree_cache_evictions
+                    .fetch_add(evicted as u64, Ordering::Relaxed);
+                self.metrics
+                    .tree_cache_resident_bytes
+                    .store(cache.total_bytes(), Ordering::Relaxed);
+                self.metrics
+                    .tree_cache_entries
+                    .store(cache.len() as u64, Ordering::Relaxed);
                 if evicted > 0 {
                     debug!(
                         evicted,
@@ -3563,6 +3694,11 @@ impl ApiWorkerScheduler {
             Ok(Err(err)) => {
                 // resolution_guard fires here, releasing the in-progress flag.
                 drop(resolution_guard);
+                // (#p1p2 telemetry) Cold resolution returned an error (not a
+                // timeout) — e.g. CAS fetch failure or missing directory blob.
+                self.metrics
+                    .tree_resolution_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 // Resolution failed — record in negative cache with backoff.
                 let mut failures = self.tree_resolution_failures.lock().await;
                 let attempts = failures
@@ -3582,6 +3718,11 @@ impl ApiWorkerScheduler {
                 None
             }
             Err(_elapsed) => {
+                // (#p1p2 telemetry) Inline resolution hit the 500ms timeout
+                // and is falling back to load-based scoring.
+                self.metrics
+                    .tree_resolution_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
                 // Resolution timed out — fall back to load-based scoring.
                 // Spawn background task to finish resolution for next time.
                 // Move the resolution_guard into the spawned task so the
@@ -3594,6 +3735,12 @@ impl ApiWorkerScheduler {
                 let failures_ref = self.tree_resolution_failures.clone();
                 let failed_dirs_ref = self.failed_directory_digests.clone();
                 let store = cas_store.clone();
+                // (#p1p2 telemetry) Clone the metrics handle so the
+                // background put() can attribute its evictions + refresh the
+                // resident-bytes / entry gauges (the same cache the inline
+                // put writes; instrumenting only the inline site would
+                // silently undercount whenever the 500ms timeout fires).
+                let metrics = self.metrics.clone();
                 let digest = input_root_digest;
                 tokio::spawn(async move {
                     // Bind the guard to this task's lifetime. It fires on
@@ -3612,7 +3759,20 @@ impl ApiWorkerScheduler {
                                 "background tree resolution complete after timeout, caching"
                             );
                             let mut cache = tree_cache.lock().await;
-                            cache.put(digest, Arc::new(resolved));
+                            // (#p1p2 telemetry) Attribute the background
+                            // put's evictions and refresh the gauges under
+                            // the already-held cache lock (no extra critical
+                            // section).
+                            let evicted = cache.put(digest, Arc::new(resolved));
+                            metrics
+                                .tree_cache_evictions
+                                .fetch_add(evicted as u64, Ordering::Relaxed);
+                            metrics
+                                .tree_cache_resident_bytes
+                                .store(cache.total_bytes(), Ordering::Relaxed);
+                            metrics
+                                .tree_cache_entries
+                                .store(cache.len() as u64, Ordering::Relaxed);
                             failures_ref.lock().await.remove(&digest);
                         }
                         Ok(Err(err)) => {
@@ -7363,6 +7523,208 @@ mod tests {
         );
     }
 
+    /// Build a `ResolvedTree` whose `estimated_heap_bytes()` is dominated
+    /// by the `file_digests` Vec capacity (48 bytes/entry), so the
+    /// heap-byte accounting used by `ByteBoundedTreeCache` is controllable
+    /// per fixture without constructing large directory protos.
+    fn tree_with_heap_bytes(n_file_entries: usize) -> Arc<ResolvedTree> {
+        let mut file_digests = Vec::with_capacity(n_file_entries);
+        for i in 0..n_file_entries {
+            file_digests.push((DigestInfo::new([0u8; 32], i as u64), 1u64));
+        }
+        Arc::new(ResolvedTree {
+            file_digests,
+            dir_digests: HashSet::new(),
+            subtree_bytes: HashMap::new(),
+            subtree_files: HashMap::new(),
+            dir_direct_bytes: HashMap::new(),
+            dir_direct_files: HashMap::new(),
+            directories: HashMap::new(),
+        })
+    }
+
+    /// (#p1p2 telemetry) `ByteBoundedTreeCache::put` must RETURN the number
+    /// of entries it removed so the caller can attribute
+    /// `tree_cache_evictions` correctly. Three contracts:
+    ///   (1) a fresh insert below both bounds evicts nothing → returns 0;
+    ///   (2) a same-key replacement is NOT an eviction → returns 0;
+    ///   (3) inserting past `max_count` evicts exactly the count-capacity
+    ///       displacement (1 per over-cap insert);
+    ///   (4) inserting a tree that overflows `max_bytes` evicts the LRU
+    ///       entries the byte-budget loop pops, and the returned count
+    ///       equals the number removed by that loop.
+    #[test]
+    fn test_tree_cache_put_returns_eviction_count() {
+        // (1) fresh insert below both bounds: no eviction.
+        let mut cache = ByteBoundedTreeCache::new(
+            NonZeroUsize::new(4).unwrap(),
+            1024 * 1024, // generous byte budget
+        );
+        let evicted = cache.put(DigestInfo::new([1u8; 32], 0), tree_with_heap_bytes(1));
+        assert_eq!(evicted, 0, "fresh insert below both bounds must evict 0");
+        assert_eq!(cache.len(), 1);
+
+        // (2) same-key replacement: displaces the old value but is NOT an
+        // eviction (net entry count unchanged).
+        let evicted = cache.put(DigestInfo::new([1u8; 32], 0), tree_with_heap_bytes(1));
+        assert_eq!(
+            evicted, 0,
+            "same-key replacement must return 0 evictions (it is a replace, not an eviction)"
+        );
+        assert_eq!(cache.len(), 1, "same-key replace must not grow the cache");
+
+        // (3) count-capacity displacement: fill to max_count, then one more
+        // distinct-key insert displaces exactly one LRU entry.
+        let mut cache = ByteBoundedTreeCache::new(
+            NonZeroUsize::new(2).unwrap(),
+            1024 * 1024,
+        );
+        assert_eq!(cache.put(DigestInfo::new([2u8; 32], 0), tree_with_heap_bytes(1)), 0);
+        assert_eq!(cache.put(DigestInfo::new([3u8; 32], 0), tree_with_heap_bytes(1)), 0);
+        let evicted = cache.put(DigestInfo::new([4u8; 32], 0), tree_with_heap_bytes(1));
+        assert_eq!(
+            evicted, 1,
+            "insert past max_count must report exactly one count-capacity eviction"
+        );
+        assert_eq!(cache.len(), 2, "cache must stay at max_count");
+
+        // (4) byte-budget eviction: a large max_count so the count cap never
+        // fires, but a tight byte budget so the while-loop pops LRU entries.
+        // Each tree_with_heap_bytes(10) is ~480 bytes (10 * 48). Budget of
+        // 1200 bytes holds two such trees (~960) but not three (~1440), so
+        // inserting the third pops exactly one LRU entry.
+        let mut cache = ByteBoundedTreeCache::new(
+            NonZeroUsize::new(100).unwrap(),
+            1200,
+        );
+        assert_eq!(cache.put(DigestInfo::new([5u8; 32], 0), tree_with_heap_bytes(10)), 0);
+        assert_eq!(cache.put(DigestInfo::new([6u8; 32], 0), tree_with_heap_bytes(10)), 0);
+        let evicted = cache.put(DigestInfo::new([7u8; 32], 0), tree_with_heap_bytes(10));
+        assert_eq!(
+            evicted, 1,
+            "insert overflowing max_bytes must report the count popped by the byte-budget loop"
+        );
+        assert!(
+            cache.total_bytes() <= 1200,
+            "byte-budget loop must restore the invariant total_bytes <= max_bytes"
+        );
+    }
+
+    /// (#p1p2 telemetry) A resolve against a pre-populated cache increments
+    /// `tree_cache_hits`; a resolve for a never-seen (cold) digest that
+    /// succeeds inline increments `tree_cache_misses`. Modeled on
+    /// `test_resolve_input_tree_cache_hit_returns_same_arc`.
+    #[tokio::test]
+    async fn test_resolve_input_tree_updates_hit_miss_counters() {
+        use nativelink_config::schedulers::WorkerAllocationStrategy;
+        use crate::platform_property_manager::PlatformPropertyManager;
+        use crate::worker_registry::WorkerRegistry;
+
+        #[derive(Debug)]
+        struct NoopWorkerStateManager;
+        impl MetricsComponent for NoopWorkerStateManager {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+        #[tonic::async_trait]
+        impl WorkerStateManager for NoopWorkerStateManager {
+            async fn update_operation(
+                &self,
+                _operation_id: &OperationId,
+                _worker_id: &WorkerId,
+                _update: UpdateOperationType,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        // Store a single-directory tree so inline resolution succeeds.
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let dir = Directory {
+            files: vec![make_file_node("hit_miss.txt", 0xbb, 1000)],
+            directories: vec![],
+            ..Default::default()
+        };
+        let (dir_bytes, dir_digest) = encode_directory(&dir);
+        let key: StoreKey<'_> = dir_digest.into();
+        store
+            .update_oneshot(key, Bytes::from(dir_bytes))
+            .await
+            .expect("store update");
+
+        let scheduler = ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWorkerStateManager),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some(store),
+            None,
+            512 * 1024,
+            8,
+            false,
+            0,
+            2,
+        );
+
+        // Precondition: both counters start at zero.
+        assert_eq!(scheduler.metrics.tree_cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.metrics.tree_cache_misses.load(Ordering::Relaxed), 0);
+
+        // First resolve: cold digest → cache MISS, inline resolution caches it.
+        let r1 = scheduler.resolve_input_tree(dir_digest).await;
+        assert!(r1.is_some(), "first resolve should succeed inline");
+        assert_eq!(
+            scheduler.metrics.tree_cache_misses.load(Ordering::Relaxed),
+            1,
+            "cold resolve must increment tree_cache_misses exactly once"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_cache_hits.load(Ordering::Relaxed),
+            0,
+            "cold resolve must NOT increment tree_cache_hits"
+        );
+
+        // Second resolve of the same digest: cache HIT.
+        let r2 = scheduler.resolve_input_tree(dir_digest).await;
+        assert!(r2.is_some(), "second resolve should hit the cache");
+        assert_eq!(
+            scheduler.metrics.tree_cache_hits.load(Ordering::Relaxed),
+            1,
+            "warm resolve must increment tree_cache_hits exactly once"
+        );
+        assert_eq!(
+            scheduler.metrics.tree_cache_misses.load(Ordering::Relaxed),
+            1,
+            "warm resolve must NOT increment tree_cache_misses"
+        );
+
+        // The cold miss must have recorded exactly one cold-resolution sample.
+        assert_eq!(
+            scheduler
+                .metrics
+                .tree_resolution_cold_count
+                .load(Ordering::Relaxed),
+            1,
+            "the single cold miss must record exactly one cold-resolution sample"
+        );
+        assert!(
+            scheduler
+                .metrics
+                .tree_resolution_cold_time_ns
+                .load(Ordering::Relaxed)
+                > 0,
+            "cold resolution must accumulate a non-zero elapsed-ns sample"
+        );
+    }
+
     /// Verifies that `TreeResolutionGuard` removes the digest from the
     /// in-progress set on Drop. This is the core invariant: if the guard's
     /// Drop fires, the leak is impossible. Combined with the fact that the
@@ -8384,6 +8746,46 @@ mod tests {
             .bis_replay_buffer_overflow_drops
             .fetch_add(33, Ordering::Relaxed);
         scheduler.metrics.cache_warm_spawned.inc();
+        // (#p1p2 telemetry) distinctive values on the tree-cache /
+        // tree-resolution counters + gauges so a misrouted group/field
+        // renders a different number (wrong-field guard). Gauges use
+        // `store` (point-in-time), counters use `fetch_add` (cumulative).
+        scheduler
+            .metrics
+            .tree_cache_hits
+            .fetch_add(44, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_cache_misses
+            .fetch_add(55, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_cache_evictions
+            .fetch_add(66, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_cache_resident_bytes
+            .store(77, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_cache_entries
+            .store(88, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_resolution_cold_time_ns
+            .fetch_add(99, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_resolution_cold_count
+            .fetch_add(111, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_resolution_timeouts
+            .fetch_add(122, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .tree_resolution_errors
+            .fetch_add(133, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -8459,6 +8861,38 @@ mod tests {
             "#231: cache_warm_spawned.counter rendered the wrong value \
              (expected 1 after one inc()). body=\n{body}"
         );
+
+        // (#p1p2 telemetry) The tree-cache / tree-resolution counters and
+        // gauges must render on /metrics with their set values. These
+        // answer (1) is Phase-1 tree resolution a scheduling-latency
+        // contributor and (2) does ByteBoundedTreeCache evict — dark
+        // fields answer neither. Pinning the literal emitted names guards
+        // against the doubled-name/dark-field trap.
+        for (name, value) in [
+            ("tree_cache_hits", 44u64),
+            ("tree_cache_misses", 55),
+            ("tree_cache_evictions", 66),
+            ("tree_cache_resident_bytes", 77),
+            ("tree_cache_entries", 88),
+            ("tree_resolution_cold_time_ns", 99),
+            ("tree_resolution_cold_count", 111),
+            ("tree_resolution_timeouts", 122),
+            ("tree_resolution_errors", 133),
+        ] {
+            assert!(
+                body.contains(&format!("scheduler_metrics_{name}")),
+                "#p1p2: SchedulerMetrics.{name} dark on /metrics — the tree-cache \
+                 telemetry cannot answer its question if the field does not render. \
+                 body=\n{body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "\nscheduler_testsched_worker_scheduler_metrics_{name} {value}\n"
+                )),
+                "#p1p2: SchedulerMetrics.{name} rendered the wrong value \
+                 (expected {value}) — group/field routing is wrong. body=\n{body}"
+            );
+        }
 
         // (#231 T1 de-flake) Sibling assertion on the `inner`
         // (`ApiWorkerSchedulerImpl`) sub-tree. The whole-group-vanishes
