@@ -207,11 +207,20 @@ pub struct SchedulerMetrics {
     // gauges vs `TREE_CACHE_MAX_BYTES` / `TREE_CACHE_CAPACITY`). No
     // behavior change — increments/stores only, `Ordering::Relaxed`.
     /// (#p1p2) Cumulative `resolve_input_tree` calls served from the
-    /// positive tree cache (warm path). Ratio hits/(hits+misses) is the
-    /// tree-cache hit rate — a low rate means Phase-1 resolution is on the
-    /// scheduling critical path more often than expected.
+    /// positive tree cache (warm path). WARNING — `hits/(hits+misses)` is
+    /// NOT the true distinct-root hit rate and must NOT be headlined:
+    /// `resolve_input_tree` runs in Phase-1, BEFORE the worker-availability
+    /// gate, and an action that cannot be placed re-cycles through
+    /// `do_try_match` every round, re-hitting the now-warm cache — so ONE
+    /// distinct root waiting N rounds for a worker records `1 miss + N hits`.
+    /// The ratio therefore reads HIGHEST exactly under worker starvation (the
+    /// latency regime it appears to measure), and `hits + misses` is NOT the
+    /// total resolve-attempt count. For the LATENCY question use
+    /// `tree_resolution_cold_time_ns / cold_count` (+ `tree_resolution_timeouts`);
+    /// for cache-fullness use `entries` / `resident_bytes` / `evictions`, with
+    /// `misses` as the distinct-cold-root arrival proxy. (auditor 91cb337c)
     #[metric(
-        help = "(#p1p2) cumulative resolve_input_tree calls served from the positive tree cache (warm path)"
+        help = "(#p1p2) cumulative warm tree-cache serves; NOT a hit rate — re-cycle-inflated (1 root waiting N rounds = 1 miss + N hits); use cold_time_ns/cold_count for latency"
     )]
     pub tree_cache_hits: AtomicU64,
     /// (#p1p2) Cumulative `resolve_input_tree` calls that missed the
