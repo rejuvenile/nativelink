@@ -533,22 +533,98 @@ fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32, has_repor
     }
 }
 
-/// (#sched M1 rebalance) Dispatch-count P-headroom predicate. A worker has
-/// P-headroom while its in-flight action count — the scheduler's own fresh
-/// per-worker `running_action_infos`, updated synchronously under the write
-/// lock on assign + completion (no stale worker-reported load, closes red-team
-/// R3 / invariant I5) — is below its advertised P-core count.
+/// (#sched M1 rebalance v2) Dispatch-count P-headroom predicate with a BOUNDED
+/// `p_load` override (design §2). A worker has P-headroom when ANY of three
+/// clauses (precedence order) holds:
 ///
-/// (A5) A worker advertising `p_core_count == 0` (legacy / Linux / Intel-Mac /
-/// pre-populated) is treated as UNGATED (always has headroom) so it degrades to
-/// current behavior rather than being frozen out — otherwise `0 < 0 == false`
-/// would permanently exclude it. The `u64` cast matches
-/// `running_action_infos.len(): usize` against `p_core_count: u32` without
-/// truncation. Shared by the cache-tier gate (`inner_find_and_reserve_worker`)
-/// and the fallback's soft P-headroom-first tier (`inner_find_worker_for_action`,
-/// §11 v2.2).
-fn worker_has_p_headroom(w: &Worker) -> bool {
-    w.p_core_count == 0 || (w.running_action_infos.len() as u64) < u64::from(w.p_core_count)
+/// 1. **A5** (`p_core_count == 0`, legacy / Linux / Intel-Mac / pre-populated)
+///    — UNGATED (always has headroom) so it degrades to current behavior rather
+///    than being frozen out (otherwise `0 < 0 == false` would permanently
+///    exclude it). Byte-identical to v1.
+/// 2. **v1 fresh signal** — a genuinely-free P slot by the synchronously-updated
+///    in-flight count (`running_action_infos`, updated under the write lock on
+///    assign + completion — never stale, closes red-team R3 / invariant I5).
+///    Unchanged from v1.
+/// 3. **NEW bounded override** — admits a worker at/over its P-slot count IFF
+///    its reported `p_core_load_pct` says the P cores are actually idle
+///    (`< idle_threshold_pct`; I/O-bound actions leave P idle) AND it is still
+///    under a FRESH-count ceiling `p_core_count * override_factor`. The ceiling
+///    is the load-bearing bound (design §3, invariant I5_Bounded): however
+///    stale-low `p_load` is, the override admits to at most
+///    `p_core_count * override_factor` in-flight actions — past that the fresh
+///    count shuts the gate, so a fully-adversarial stale reading yields bounded
+///    over-concentration, NOT the runaway R3 pileup.
+///
+/// `idle_threshold_pct == 0` (the default) makes clause 3 `p_load < 0` = never,
+/// so v2 collapses to EXACT v1. Consts are THREADED as params (this is a free
+/// `fn(&Worker)`, no `self`); both call sites — the cache-tier gate
+/// (`inner_find_and_reserve_worker`) and the fallback's soft tier
+/// (`inner_find_worker_for_action`) — pass the scheduler's configured values.
+/// All comparisons are `u64` to match `running_action_infos.len(): usize`
+/// against `p_core_count: u32` without truncation, and `u64::from(p_core_count)
+/// * u64::from(override_factor)` cannot overflow (u32*u32 fits in u64).
+fn worker_has_p_headroom(w: &Worker, idle_threshold_pct: u32, override_factor: u32) -> bool {
+    let running = w.running_action_infos.len() as u64;
+    w.p_core_count == 0
+        || running < u64::from(w.p_core_count)
+        || (w.p_core_load_pct < idle_threshold_pct
+            && running < u64::from(w.p_core_count) * u64::from(override_factor))
+}
+
+/// (#sched M1 rebalance v2, §12.1) Ranking preference for the cache-tier and
+/// fallback winner selectors — the "magnet fix". SMALLER = preferred. The load
+/// term stays the SECONDARY key; this is PRIMARY, so a worker with a genuine
+/// free P slot (or an ungated A5 worker) ALWAYS out-ranks an override-admit
+/// **regardless of how stale-low the override worker's `p_load` is** (invariant
+/// I6). Without this, the re-introduced stale `p_load` would make an
+/// override-admitted worker the *preferred* winner (the bounded magnet the §10
+/// convergent RECONSIDER named).
+///
+/// Tiers, computed from the FRESH in-flight count (never stale):
+/// - `!p_gate_active` → `0` — gate off / flag off / Phase-2 lift; every worker
+///   collapses to the same tier so the tuple reduces to the EXISTING load key
+///   (v1/current parity, design §12.3).
+/// - genuine free P slot (`running < p_core_count`) OR A5 (`p_core_count == 0`,
+///   ungated) → `0` — BEST. (A5 is not in the §12.1 pseudocode but §5 I4 /
+///   §12.3 require an ungated worker to rank byte-identically to v1, i.e. by
+///   load alone; giving it pref 0 keeps it in the top tier where v1 left it.)
+/// - override-admit (clause 3 fired: `p_load < threshold && running <
+///   p_core_count * factor`) → `1 + (running - p_core_count)` — the
+///   `+ (running - p_core_count)` is the FRESH over-subscription (never stale),
+///   so a more-oversubscribed override worker ranks strictly WORSE. This decays
+///   the override worker's preference as it fills toward the ceiling (closing
+///   red-team's "duration-of-preference" gap: a stale-low `p_load` can no
+///   longer hold it at the top of the ranking as it accumulates work), and is
+///   the LOAD-BEARING term for `PrefMonotone` (§13 R1: KEEP it).
+/// - no headroom → `u64::MAX` — only reachable on the soft fallback path (the
+///   cache tiers already excluded such workers via `worker_is_viable_gated`).
+///
+/// Overflow-safe: `1 + (running - p_core_count)` is computed in `u64` and the
+/// subtraction is guarded by the branch order (`running >= p_core_count` on the
+/// override arm), so it never underflows.
+fn p_headroom_pref(
+    w: &Worker,
+    p_gate_active: bool,
+    idle_threshold_pct: u32,
+    override_factor: u32,
+) -> u64 {
+    if !p_gate_active {
+        return 0;
+    }
+    let running = w.running_action_infos.len() as u64;
+    // Genuine free P slot, or A5 (ungated legacy/Linux/Intel worker): BEST tier.
+    if w.p_core_count == 0 || running < u64::from(w.p_core_count) {
+        return 0;
+    }
+    // Override-admit (clause 3): eligible up to the fresh-count ceiling,
+    // fresh-count-penalized so preference decays toward the ceiling.
+    if w.p_core_load_pct < idle_threshold_pct
+        && running < u64::from(w.p_core_count) * u64::from(override_factor)
+    {
+        return 1 + (running - u64::from(w.p_core_count));
+    }
+    // No headroom (only reachable on the soft, never-filtering fallback path).
+    u64::MAX
 }
 
 #[derive(Debug)]
@@ -611,6 +687,17 @@ struct ApiWorkerSchedulerImpl {
     /// behaves byte-identically to the pre-gate path until an operator flips
     /// the config flag. Read once per dispatch under the same write lock.
     p_headroom_gate_enabled: bool,
+    /// (#sched M1 rebalance v2) `p_core_load_pct` below which P cores count as
+    /// idle enough to RELAX the dispatch-count gate (bounded p_load override,
+    /// design §2). Config (`SimpleSpec::p_idle_threshold_pct`). Default 0 =
+    /// override OFF → EXACT v1 (`p_load < 0` never fires). Only consulted when
+    /// `p_headroom_gate_enabled`.
+    p_idle_threshold_pct: u32,
+    /// (#sched M1 rebalance v2) In-flight ceiling MULTIPLIER for the bounded
+    /// p_load override: it admits to at most `p_core_count * factor` in-flight
+    /// actions (design §3, I5_Bounded). Config
+    /// (`SimpleSpec::p_headroom_override_factor`). Default 2.
+    p_headroom_override_factor: u32,
     /// A channel to notify the matching engine that the worker pool has changed.
     worker_change_notify: Arc<Notify>,
     /// Worker registry for tracking worker liveness.
@@ -1164,35 +1251,44 @@ impl ApiWorkerSchedulerImpl {
         // multiple consecutive actions all matching the same "least recently used" worker.
         let workers_iter = self.workers.iter();
 
-        // (#sched M1 rebalance §11 v2.2) SOFT P-headroom-first ranking. The
-        // per-worker sort key is a TUPLE `(p_gate_tier, effective_load_score)`:
-        //   - `p_gate_tier`: when the P-headroom gate is enabled, workers WITHOUT
-        //     dispatch-count P-headroom sort into tier `true`(=1), AFTER
-        //     P-headroom workers (tier `false`=0). This steers an M1 cache-tier
-        //     overflow to a P-headroom PEER even when the excluded holder reports
-        //     a LOWER (stale) `p_load` — the RECONSIDER-PREMISE the fresh
-        //     dispatch-count gate would otherwise lose to the fallback's stale
-        //     `p_load` ranking. When the flag is OFF the tier is unconditionally
-        //     `false`, so the key reduces to `(false, load)` for every worker →
-        //     single-tier by load, behaviorally identical to the pre-v2.2 path
-        //     (one always-`else` branch + a byte-wider key, not literally
-        //     byte-identical machine code; perf-optimizer nit).
+        // (#sched M1 rebalance §12.2 v2) SOFT P-headroom-first ranking. The
+        // per-worker sort key is a TUPLE `(p_headroom_pref, effective_load_score)`:
+        //   - `p_headroom_pref`: the PRIMARY key (design §12.1). When the gate is
+        //     enabled it separates a genuine-free-P-slot worker (pref 0) from an
+        //     override-admit (pref `1 + fresh-oversub`) from a no-headroom worker
+        //     (pref `u64::MAX`), all from the FRESH in-flight count — so a
+        //     free-slot peer ALWAYS out-ranks an override-admit even when the
+        //     override worker reports a LOWER (stale) `p_load` (invariant I6, the
+        //     magnet fix). This SUPERSEDES the v2.2 `!worker_has_p_headroom` bool:
+        //     a strict refinement (bool `{0,1}` → `{0, 1+oversub, MAX}`), so a
+        //     genuine free slot still sorts first, override-admits now sort
+        //     BETWEEN free-slot and no-headroom AND are fresh-count-ordered among
+        //     themselves. With `p_idle_threshold_pct == 0` (default) clause 3
+        //     never fires, so pref is `{0, u64::MAX}` = the v2.2 two-way order
+        //     (THRESHOLD=0 parity). When the flag is OFF, `p_gate_active` is false
+        //     → pref ≡ 0 for every worker → the key reduces to `(0, load)` →
+        //     single-tier by load, behaviorally identical to the pre-v2.2 path.
         //   - `effective_load_score`: the EXISTING within-tier ranking, unchanged
         //     (idle P-cores beat idle E-cores; aggregate-only competes in the
-        //     P-core tier). Applied WITHIN each tier.
-        // SOFT, not a filter: tier-`true` workers stay in the candidate `Vec` and
-        // win when tier `false` is empty (fully-P-saturated fleet / Phase 2), so
-        // dispatch always proceeds — NO wedge (I2; the M1 gate's Phase-2 lift and
-        // this fallback are the two mechanisms that jointly guarantee no-wedge).
-        let p_gate_enabled = self.p_headroom_gate_enabled;
-        let sort_key = |w: &Worker| -> (bool, u64) {
-            let tier = if p_gate_enabled {
-                !worker_has_p_headroom(w)
-            } else {
-                false
-            };
+        //     P-core tier). Applied WITHIN each pref tier.
+        // SOFT, not a filter: no-headroom workers (pref `u64::MAX`) stay in the
+        // candidate `Vec` and win when no free-slot/override worker exists
+        // (fully-P-saturated fleet), so dispatch always proceeds — NO wedge (I2).
+        // The fallback's `p_gate_active` is simply the flag: when no candidate
+        // has a free slot, every pref collapses to `u64::MAX` (all-equal primary)
+        // → sort by load = the Phase-2-lift parity (§12.3) without a separate
+        // pre-scan.
+        let p_gate_active = self.p_headroom_gate_enabled;
+        let p_idle_threshold_pct = self.p_idle_threshold_pct;
+        let p_headroom_override_factor = self.p_headroom_override_factor;
+        let sort_key = |w: &Worker| -> (u64, u64) {
             (
-                tier,
+                p_headroom_pref(
+                    w,
+                    p_gate_active,
+                    p_idle_threshold_pct,
+                    p_headroom_override_factor,
+                ),
                 effective_load_score(
                     w.p_core_load_pct,
                     w.e_core_load_pct,
@@ -1201,7 +1297,7 @@ impl ApiWorkerSchedulerImpl {
                 ),
             )
         };
-        let viable: Vec<(WorkerId, (bool, u64))> = match self.allocation_strategy {
+        let viable: Vec<(WorkerId, (u64, u64))> = match self.allocation_strategy {
             WorkerAllocationStrategy::LeastRecentlyUsed => workers_iter
                 .rev()
                 .filter(|(worker_id, _)| candidates.contains(worker_id))
@@ -1215,12 +1311,12 @@ impl ApiWorkerSchedulerImpl {
                 .collect(),
         };
 
-        // Pick the best worker by the tuple key: P-headroom tier first, then
+        // Pick the best worker by the tuple key: `p_headroom_pref` first, then
         // lowest load within tier. `min_by_key` returns the FIRST minimum, so on
         // an all-unknown-load fleet (every load score == u64::MAX) it degrades to
         // LRU/MRU iteration order within the winning tier — identical to the
         // prior `first()` fallback when the flag is OFF (all keys share the same
-        // `(false, u64::MAX)`, so the first candidate wins).
+        // `(0, u64::MAX)`, so the first candidate wins).
         let mut worker_id = viable
             .iter()
             .min_by_key(|(_, key)| *key)
@@ -1280,7 +1376,7 @@ impl ApiWorkerSchedulerImpl {
 
         // Log load-aware selection decision.
         if let Some(ref wid) = worker_id {
-            // (§11 v2.2) each entry is (short_id, (no_p_headroom_tier, load_score)).
+            // (§12.2 v2) each entry is (short_id, (p_headroom_pref, load_score)).
             let viable_loads: Vec<_> = viable
                 .iter()
                 .map(|(id, key)| {
@@ -1292,11 +1388,11 @@ impl ApiWorkerSchedulerImpl {
                 .iter()
                 .find(|(id, _)| id == wid)
                 .map(|(_, k)| *k)
-                .unwrap_or((false, 0));
+                .unwrap_or((0, 0));
             debug!(
                 candidates = viable.len(),
                 worker_id = %wid,
-                winner_no_p_headroom_tier = winner_key.0,
+                winner_p_headroom_pref = winner_key.0,
                 winner_load_score = winner_key.1,
                 ?viable_loads,
                 "load-aware worker selection"
@@ -1392,10 +1488,18 @@ impl ApiWorkerSchedulerImpl {
             platform_properties.is_satisfied_by(&w.platform_properties, false)
         };
 
-        // (#sched M1 rebalance) Dispatch-count P-headroom predicate (module fn
-        // `worker_has_p_headroom`, shared with the fallback's soft tier §11).
-        let has_p_headroom = worker_has_p_headroom;
+        // (#sched M1 rebalance v2) Dispatch-count P-headroom predicate with the
+        // bounded p_load override (module fn `worker_has_p_headroom`, shared with
+        // the fallback's soft tier §12.2). Wrapped in a closure that threads the
+        // two configured consts (the free fn takes them as params — it has no
+        // `self`; code-reviewer fix 1). With `p_idle_threshold_pct == 0`
+        // (default) the override clause is inert → EXACT v1 predicate.
         let p_headroom_gate_enabled = self.p_headroom_gate_enabled;
+        let p_idle_threshold_pct = self.p_idle_threshold_pct;
+        let p_headroom_override_factor = self.p_headroom_override_factor;
+        let has_p_headroom = |w: &Worker| -> bool {
+            worker_has_p_headroom(w, p_idle_threshold_pct, p_headroom_override_factor)
+        };
 
         // (#sched-blend) Per-candidate free-capacity score. Replaces the
         // binary `CACHE_AFFINITY_LOAD_CUTOFF` + `best_overloaded` soft-
@@ -1512,6 +1616,26 @@ impl ApiWorkerSchedulerImpl {
         // every tier's gated predicate below is identical to `worker_is_viable`.
         let p_gate_active = p_headroom_gate_enabled && any_viable_has_p_headroom;
 
+        // (#sched M1 rebalance v2, §12.1) The ranking-preference key the cache
+        // tiers apply as their PRIMARY sort key (the load term becomes
+        // SECONDARY). Threads the same `p_gate_active` + consts through the
+        // module fn `p_headroom_pref`. A genuine-free-P-slot holder (pref 0)
+        // therefore beats an override-admit (pref ≥ 1) REGARDLESS of the
+        // override worker's stale-low `p_load` (invariant I6 — the magnet fix).
+        // When `p_gate_active` is false (flag off / Phase-2 lift) it returns 0
+        // for every worker → the tuple collapses to the existing load key
+        // (byte-parity, §12.3). All cache-tier candidates already passed
+        // `worker_is_viable_gated`, so here pref is only `{0} ∪ {1+oversub}`
+        // (the `u64::MAX` no-headroom arm is unreachable on the gated tiers).
+        let pref = |w: &Worker| -> u64 {
+            p_headroom_pref(
+                w,
+                p_gate_active,
+                p_idle_threshold_pct,
+                p_headroom_override_factor,
+            )
+        };
+
         // (#sched M1 rebalance, M1) The gated viability predicate the cache
         // tiers use. Adding `has_p_headroom` here (the single check all three
         // cache tiers call) makes Tier-1 / Tier-1.5 / Tier-2 inherit the gate
@@ -1581,41 +1705,51 @@ impl ApiWorkerSchedulerImpl {
             );
         }
 
-        // ── Tier 1: Exact root match (continuous min-load among holders) ──
+        // ── Tier 1: Exact root match (p_headroom_pref, then min-load) ──
         // If a viable worker has the action's input_root_digest in its
         // directory cache (either as a root or as a subtree of a previously
         // cached tree), it can hardlink the entire input tree in
         // milliseconds. Among the viable root/subtree holders, pick the one
-        // with the SMALLEST `load_penalty` (= the most free capacity). No
-        // cutoff, no `best_overloaded` soft-fallback, no `EXACT_ROOT_GAIN`
-        // (dropped — a constant gain cancels across Tier-1 members, so the
-        // tier reduces to min-load; §4.1). When every viable candidate is
-        // saturated, the tier declines (backstop (a)).
+        // with the SMALLEST `(p_headroom_pref, load_penalty)` tuple. No cutoff,
+        // no `best_overloaded` soft-fallback, no `EXACT_ROOT_GAIN` (dropped — a
+        // constant gain cancels across Tier-1 members; §4.1). When every viable
+        // candidate is saturated, the tier declines (backstop (a)).
+        //
+        // (#sched M1 rebalance v2, §12.2) `p_headroom_pref` is the PRIMARY key,
+        // `load_penalty` SECONDARY. A genuine-free-P-slot holder (pref 0) thus
+        // beats an override-admit (pref ≥ 1) EVEN IF the override holder reports
+        // a lower (stale) `p_load` → lower `load_penalty` — closing the bounded
+        // magnet (invariant I6). When the gate is off/lifted, `pref ≡ 0` for all
+        // holders, so the tuple reduces to min-`load_penalty` = the exact v1
+        // (pre-v2) Tier-1 order.
         let dir_cache_winner: Option<WorkerId> = if saturation_fall_through {
             None
         } else {
-            let mut best: Option<(WorkerId, i64)> = None; // (id, load_penalty)
+            // (id, (p_headroom_pref, load_penalty)) — tuple key, smaller wins.
+            let mut best: Option<(WorkerId, (u64, i64))> = None;
             for wid in &candidates {
                 if let Some(w) = self.workers.0.peek(wid) {
                     let has_root_match = w.cached_directory_digests.contains(&input_root_digest);
                     let has_subtree_match = w.cached_subtree_digests.contains(&input_root_digest);
                     if (has_root_match || has_subtree_match) && worker_is_viable_gated(wid) {
-                        let penalty = cap_score(w).load_penalty;
+                        let key = (pref(w), cap_score(w).load_penalty);
                         let dominated = best
                             .as_ref()
-                            .is_some_and(|(_, best_penalty)| penalty >= *best_penalty);
+                            .is_some_and(|(_, best_key)| key >= *best_key);
                         if !dominated {
-                            best = Some((wid.clone(), penalty));
+                            best = Some((wid.clone(), key));
                         }
                     }
                 }
             }
-            if let Some((ref wid, penalty)) = best {
+            if let Some((ref wid, (p, penalty))) = best {
                 debug!(
                     ?wid,
+                    p_headroom_pref = p,
                     load_penalty = penalty,
                     %input_root_digest,
-                    "directory cache hit — worker has input_root cached (min load_penalty)"
+                    "directory cache hit — worker has input_root cached \
+                     (min (p_headroom_pref, load_penalty))"
                 );
             }
             best.map(|(wid, _)| wid)
@@ -1645,8 +1779,15 @@ impl ApiWorkerSchedulerImpl {
             if tree.dir_digests.len() <= 1 || total_score == 0 {
                 None // only root (or empty), no subtrees to match
             } else {
-                // (id, blended_S, cached_bytes, cached_files)
-                let mut best: Option<(WorkerId, i64, u64, u64)> = None;
+                // (#sched M1 rebalance v2, §12.2) PRIMARY key `p_headroom_pref`
+                // (min), SECONDARY key `blended_s` (max, via `Reverse`). So a
+                // genuine-free-P-slot subtree holder (pref 0) beats an
+                // override-admit (pref ≥ 1) regardless of the override worker's
+                // stale-low `p_load` → higher `blended_s` (invariant I6). When
+                // the gate is off/lifted, `pref ≡ 0` for all → the tuple reduces
+                // to max-`blended_s` = the exact v1 (pre-v2) Tier-1.5 order.
+                // (id, p_headroom_pref, blended_S, cached_bytes, cached_files)
+                let mut best: Option<(WorkerId, u64, i64, u64, u64)> = None;
                 for wid in &candidates {
                     if let Some(w) = self.workers.0.peek(wid) {
                         if !worker_is_viable_gated(wid) {
@@ -1683,42 +1824,53 @@ impl ApiWorkerSchedulerImpl {
                         let penalty = cap_score(w).load_penalty;
                         let blended_s =
                             i64::try_from(cached_score).unwrap_or(i64::MAX) - penalty;
-                        let dominated = best
-                            .as_ref()
-                            .is_some_and(|(_, best_s, _, _)| blended_s <= *best_s);
+                        let p = pref(w);
+                        // Tuple key `(pref, Reverse(blended_s))`: min-pref then
+                        // MAX-blended_s. `Reverse` inverts only the secondary so
+                        // the max-S semantics are preserved WITHIN a pref tier.
+                        let dominated = best.as_ref().is_some_and(|(_, best_p, best_s, _, _)| {
+                            (p, core::cmp::Reverse(blended_s))
+                                >= (*best_p, core::cmp::Reverse(*best_s))
+                        });
                         if !dominated {
-                            best = Some((wid.clone(), blended_s, cached_bytes, cached_files));
+                            best = Some((wid.clone(), p, blended_s, cached_bytes, cached_files));
                         }
                     }
                 }
-                // (#sched-blend §5.3) Keep the max-S worker only if its
-                // blended score is POSITIVE. A cache-cold-but-idle worker has
-                // S = 0 (cached_score 0, penalty 0) and is the implicit
-                // baseline — it is NOT in this loop (its cached_score == 0
-                // was `continue`d), so a NEGATIVE-S Tier-1.5 winner (a small
-                // cache hit on a busy worker) must NOT be committed; the tier
-                // DECLINES and the cascade falls through to the LRU/MRU path,
-                // which selects an idle worker (lowest effective_load_score).
-                // This is the crossover: take the cache pick iff the cache
-                // saving exceeds the load cost. (Without this gate Tier 1.5
-                // would return its only — negative-S — candidate and pile
-                // onto the busy warm worker.)
-                let best = best.filter(|(_, blended_s, _, _)| *blended_s > 0);
-                if let Some((ref wid, blended_s, cached_bytes, cached_files)) = best {
+                // (#sched-blend §5.3) Keep the winner only if its blended score
+                // is POSITIVE. A cache-cold-but-idle worker has S = 0
+                // (cached_score 0, penalty 0) and is the implicit baseline — it
+                // is NOT in this loop (its cached_score == 0 was `continue`d),
+                // so a NEGATIVE-S Tier-1.5 winner (a small cache hit on a busy
+                // worker) must NOT be committed; the tier DECLINES and the
+                // cascade falls through to the LRU/MRU path, which selects an
+                // idle worker (lowest effective_load_score). This is the
+                // crossover: take the cache pick iff the cache saving exceeds
+                // the load cost. (Without this gate Tier 1.5 would return its
+                // only — negative-S — candidate and pile onto the busy warm
+                // worker.) The v2 `pref` PRIMARY key does NOT touch this filter:
+                // it selects WHICH holder among the eligible; the crossover then
+                // decides whether that holder's cache lead justifies the load —
+                // independent of pref (§12.2, PRESERVE the `blended_s > 0`
+                // crossover on the winner).
+                let best = best.filter(|(_, _, blended_s, _, _)| *blended_s > 0);
+                if let Some((ref wid, p, blended_s, cached_bytes, cached_files)) = best {
                     let cached_score = cached_bytes + cached_files * PER_FILE_WEIGHT;
                     let pct = if total_score > 0 { cached_score * 100 / total_score } else { 0 };
                     debug!(
                         ?wid,
+                        p_headroom_pref = p,
                         cached_bytes,
                         cached_files,
                         blended_s,
                         coverage_pct = pct,
                         %input_root_digest,
-                        "subtree coverage winner — {}% cached (max cache_gain - load_penalty)",
+                        "subtree coverage winner — {}% cached \
+                         (min p_headroom_pref, then max cache_gain - load_penalty)",
                         pct,
                     );
                 }
-                best.map(|(wid, _, _, _)| wid)
+                best.map(|(wid, _, _, _, _)| wid)
             }
         } else {
             None
@@ -2481,11 +2633,17 @@ impl ApiWorkerScheduler {
             None,
             None,
             // (#sched-blend) defaults matching `SimpleSpec` serde defaults
-            // for the no-config constructor path.
-            512 * 1024,
-            8,
+            // for the no-config constructor path — sourced from the SAME
+            // `default_*` fns the config uses, so this 3rd copy cannot drift
+            // (code-reviewer note; previously hardcoded `512 * 1024, 8`).
+            nativelink_config::schedulers::default_load_byte_cost(),
+            nativelink_config::schedulers::default_assume_core_count(),
             // (#sched M1 rebalance) P-headroom gate defaults OFF.
             false,
+            // (#sched M1 rebalance v2) override tunables: threshold 0 =
+            // override OFF (exact v1), factor 2 (from the config default fn).
+            0,
+            nativelink_config::schedulers::default_p_headroom_override_factor(),
         )
     }
 
@@ -2503,6 +2661,8 @@ impl ApiWorkerScheduler {
         load_byte_cost: u64,
         assume_core_count: u32,
         p_headroom_gate_enabled: bool,
+        p_idle_threshold_pct: u32,
+        p_headroom_override_factor: u32,
     ) -> Arc<Self> {
         let memory_store_threshold = cas_store
             .as_ref()
@@ -2554,6 +2714,8 @@ impl ApiWorkerScheduler {
                 load_byte_cost,
                 assume_core_count,
                 p_headroom_gate_enabled,
+                p_idle_threshold_pct,
+                p_headroom_override_factor,
                 worker_change_notify,
                 worker_registry: worker_registry.clone(),
                 shutting_down: false,
@@ -5879,6 +6041,249 @@ mod tests {
         assert!(saturated_p < unknown, "known load should beat unknown");
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // (#sched M1 rebalance v2) P-headroom gate predicate + ranker unit tests.
+    // These call the PRIVATE free fns `worker_has_p_headroom` /
+    // `p_headroom_pref` DIRECTLY (design §13 test plan items 1/2/4/5),
+    // exercising the truth-table, ceiling bound, overflow safety, PrefMonotone,
+    // and THRESHOLD=0 collapse. The magnet (I6) tests drive the production
+    // Tier-1 + fallback selection paths and live in the external
+    // `tests/scheduler_m1v2_ranker_test.rs` (black-box) — this module owns the
+    // predicate-level coverage the external crate cannot reach (private fns).
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Build a bare `Worker` with a chosen `p_core_count`, `p_core_load_pct`,
+    /// and exactly `running` in-flight actions (each a distinct dummy op). The
+    /// predicate + ranker read ONLY `running_action_infos.len()`,
+    /// `p_core_count`, and `p_core_load_pct` — so this fixture is sufficient to
+    /// drive every clause. Self-contained (this `mod tests` does not import the
+    /// `b1_lock_decouple_tests` action builders).
+    fn worker_with_running(
+        name: &str,
+        p_core_count: u32,
+        p_core_load_pct: u32,
+        running: usize,
+    ) -> Worker {
+        use core::time::Duration;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use nativelink_util::action_messages::{
+            ActionInfo, ActionUniqueKey, ActionUniqueQualifier,
+        };
+        use nativelink_util::platform_properties::PlatformProperties;
+
+        use crate::worker::ActionInfoWithProps;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut w = Worker::new(
+            WorkerId(name.to_string()),
+            PlatformProperties::default(),
+            tx,
+            42,
+            0,
+        );
+        w.set_core_counts(p_core_count, 0);
+        w.p_core_load_pct = p_core_load_pct;
+        w.has_reported_load = true;
+        for _ in 0..running {
+            // `OperationId::default()` is a fresh v4 UUID each call, so the
+            // HashMap keys are distinct and its length equals `running`.
+            let op = OperationId::default();
+            let action = ActionInfoWithProps {
+                inner: Arc::new(ActionInfo {
+                    command_digest: DigestInfo::new([0u8; 32], 0),
+                    input_root_digest: DigestInfo::new([0u8; 32], 0),
+                    timeout: Duration::MAX,
+                    platform_properties: HashMap::new(),
+                    priority: 0,
+                    load_timestamp: UNIX_EPOCH,
+                    insert_timestamp: SystemTime::now(),
+                    unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                        instance_name: "main".to_string(),
+                        digest_function: DigestHasherFunc::Sha256,
+                        digest: DigestInfo::new([7u8; 32], 1),
+                    }),
+                }),
+                platform_properties: PlatformProperties::default(),
+            };
+            w.running_action_infos
+                .insert(op, PendingActionInfoData { action_info: action });
+        }
+        assert_eq!(
+            w.running_action_infos.len(),
+            running,
+            "fixture must produce exactly `running` in-flight actions"
+        );
+        w
+    }
+
+    /// (§13 test 1) Gate predicate truth-table — all 3 clauses × A5, incl. the
+    /// override clause firing/not by threshold + ceiling. Calls the predicate
+    /// directly.
+    #[test]
+    fn test_worker_has_p_headroom_v2_truth_table() {
+        // ── Clause A5: p_core_count == 0 → ALWAYS ungated (any threshold/factor).
+        let a5 = worker_with_running("A5", 0, 100, 99);
+        assert!(
+            worker_has_p_headroom(&a5, 0, 2),
+            "A5 (p_core_count==0) must be ungated regardless of running/p_load"
+        );
+        assert!(
+            worker_has_p_headroom(&a5, 50, 2),
+            "A5 must stay ungated even with a threshold set"
+        );
+
+        // ── Clause 2: running < p_core_count → genuine free P slot.
+        let free = worker_with_running("FREE", 4, 100, 3); // p_load HIGH, still free
+        assert!(
+            worker_has_p_headroom(&free, 0, 2),
+            "clause 2: running(3) < p_core_count(4) → headroom by fresh count, \
+             independent of p_load or threshold"
+        );
+
+        // ── At the P-count boundary (running == p_core_count): clause 2 false.
+        //    THRESHOLD=0 → override clause `p_load < 0` never fires → NO headroom.
+        let at_count_thr0 = worker_with_running("AT0", 4, 0, 4);
+        assert!(
+            !worker_has_p_headroom(&at_count_thr0, 0, 2),
+            "threshold 0: at running==p_core_count the override can NEVER fire \
+             (`p_load < 0` is never true) → exact v1: no headroom"
+        );
+
+        // ── Clause 3 FIRES: running >= p_core_count, p_load < threshold, and
+        //    running < p_core_count*factor. Worker at 4 running, p_load 10 < 50,
+        //    ceiling 4*2=8 → 4 < 8 → admitted by override.
+        let override_ok = worker_with_running("OV", 4, 10, 4);
+        assert!(
+            worker_has_p_headroom(&override_ok, 50, 2),
+            "clause 3: running(4) >= p_count(4), p_load(10) < threshold(50), \
+             running(4) < ceiling(8) → bounded override admits"
+        );
+
+        // ── Clause 3 DENIED by threshold: p_load(60) >= threshold(50).
+        let override_busy_p = worker_with_running("BUSYP", 4, 60, 4);
+        assert!(
+            !worker_has_p_headroom(&override_busy_p, 50, 2),
+            "clause 3 denied: p_load(60) >= threshold(50) → P cores not idle, \
+             override must NOT relax (would re-concentrate real CPU work)"
+        );
+
+        // ── Clause 3 DENIED by ceiling: running(8) == ceiling(4*2) → NOT < 8.
+        let override_at_ceiling = worker_with_running("CEIL", 4, 10, 8);
+        assert!(
+            !worker_has_p_headroom(&override_at_ceiling, 50, 2),
+            "clause 3 denied at ceiling: running(8) NOT < p_count(4)*factor(2)=8 \
+             → the fresh-count ceiling shuts the gate regardless of stale-low p_load"
+        );
+    }
+
+    /// (§13 test 2) Ceiling bound (I5_Bounded): an idle-P worker (low p_load) is
+    /// ADMITTED at running==p_count (via the override) but REJECTED at
+    /// running==p_count*factor. Plus an overflow test: p_core_count near
+    /// u32::MAX must not panic (the ceiling is computed in u64).
+    #[test]
+    fn test_worker_has_p_headroom_v2_ceiling_bound() {
+        // Idle-P worker, threshold 50, factor 2, p_count 4 → ceiling 8.
+        // Admitted for running in [4, 7] (override), rejected at 8 (ceiling).
+        for running in 4..=7 {
+            let w = worker_with_running("IDLEP", 4, 10, running);
+            assert!(
+                worker_has_p_headroom(&w, 50, 2),
+                "idle-P override must admit at running={running} (< ceiling 8)"
+            );
+        }
+        let at_ceiling = worker_with_running("IDLEP", 4, 10, 8);
+        assert!(
+            !worker_has_p_headroom(&at_ceiling, 50, 2),
+            "idle-P override must REJECT at running==p_count*factor(8) — the fresh \
+             count is the hard backstop (I5_Bounded)"
+        );
+
+        // Overflow safety: p_core_count near u32::MAX. `p_count * factor` as
+        // u32*u32 would overflow (debug panic / release wrap); the u64
+        // discipline must keep it sane. Just calling it must not panic.
+        let huge = worker_with_running("HUGE", u32::MAX, 10, 3);
+        assert!(
+            worker_has_p_headroom(&huge, 50, 2),
+            "u32::MAX p_core_count with running(3) < p_count → clause 2 headroom; \
+             the ceiling `u64::from(p_count) * u64::from(factor)` must not overflow"
+        );
+    }
+
+    /// (§13 test 4) PrefMonotone: two override-admit workers — the MORE
+    /// oversubscribed one ranks WORSE (fresh-count decay via `+ (running -
+    /// p_count)`). Calls `p_headroom_pref` directly with the gate active.
+    #[test]
+    fn test_p_headroom_pref_monotone_intra_override() {
+        // Both override-admit (p_count 4, p_load 10 < threshold 50, under
+        // ceiling 8): one at running 5, one at running 6.
+        let less_sub = worker_with_running("LESS", 4, 10, 5);
+        let more_sub = worker_with_running("MORE", 4, 10, 6);
+        let pref_less = p_headroom_pref(&less_sub, true, 50, 2);
+        let pref_more = p_headroom_pref(&more_sub, true, 50, 2);
+        assert_eq!(
+            pref_less, 2,
+            "override pref = 1 + (running(5) - p_count(4)) = 2"
+        );
+        assert_eq!(
+            pref_more, 3,
+            "override pref = 1 + (running(6) - p_count(4)) = 3"
+        );
+        assert!(
+            pref_less < pref_more,
+            "PrefMonotone: the LESS-oversubscribed override worker must rank \
+             strictly better (smaller pref) — the `+ (running - p_count)` fresh \
+             decay closes red-team's duration-of-preference gap"
+        );
+        // And a genuine free slot (pref 0) beats BOTH override-admits.
+        let free = worker_with_running("FREE", 4, 10, 2);
+        assert_eq!(
+            p_headroom_pref(&free, true, 50, 2),
+            0,
+            "genuine free P slot (running 2 < p_count 4) → pref 0 (BEST), beats \
+             any override-admit (pref >= 1) regardless of p_load"
+        );
+    }
+
+    /// (§13 test 5, unit half) THRESHOLD=0 parity at the pref level: with
+    /// `p_idle_threshold_pct == 0` the override never fires, so pref collapses
+    /// to the v1 two-way order `{0 for free/A5, u64::MAX for no-headroom}` —
+    /// exactly the `{false, true}` order the v2.2 bool key gave, so a
+    /// gate-on-v1 selection is unchanged. Also verifies gate-off → pref ≡ 0.
+    #[test]
+    fn test_p_headroom_pref_threshold_zero_and_gate_off_parity() {
+        let free = worker_with_running("FREE", 4, 90, 3); // free slot, high p_load
+        let at_count = worker_with_running("FULL", 4, 0, 4); // no free slot, idle p_load
+
+        // THRESHOLD=0, gate active: free → 0, no-free-slot → u64::MAX (override
+        // dead). This is the v1 two-way order (free before no-headroom).
+        assert_eq!(
+            p_headroom_pref(&free, true, 0, 2),
+            0,
+            "threshold 0: a genuine free slot is pref 0"
+        );
+        assert_eq!(
+            p_headroom_pref(&at_count, true, 0, 2),
+            u64::MAX,
+            "threshold 0: the override is dead (`p_load < 0` never), so a \
+             no-free-slot worker is pref u64::MAX — the v1 two-way order, NOT an \
+             override tier"
+        );
+
+        // Gate OFF (p_gate_active == false): pref ≡ 0 for ALL workers → the
+        // tuple collapses to the existing load key → byte-parity with current.
+        assert_eq!(
+            p_headroom_pref(&free, false, 50, 2),
+            0,
+            "gate off: pref ≡ 0 (parity — tuple reduces to the load key)"
+        );
+        assert_eq!(
+            p_headroom_pref(&at_count, false, 50, 2),
+            0,
+            "gate off: pref ≡ 0 even for a no-free-slot worker (parity)"
+        );
+    }
+
     /// Helper: encode a Directory proto and compute its DigestInfo (SHA256).
     fn encode_directory(dir: &Directory) -> (Vec<u8>, DigestInfo) {
         let dir_bytes = dir.encode_to_vec();
@@ -6888,6 +7293,8 @@ mod tests {
             512 * 1024,
             8,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         );
 
         // First call: cache miss, inline resolution succeeds and caches.
@@ -7018,6 +7425,8 @@ mod tests {
             512 * 1024,
             8,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         );
 
         // First, verify guard wiring against the real shared map. Pre-insert
@@ -7149,6 +7558,8 @@ mod tests {
             512 * 1024,
             8,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         )
     }
 
@@ -8190,6 +8601,8 @@ mod b1_lock_decouple_tests {
             load_byte_cost,
             8,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         )
     }
 
@@ -8214,6 +8627,8 @@ mod b1_lock_decouple_tests {
             512 * 1024,
             assume_core_count,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         )
     }
 
@@ -8793,6 +9208,292 @@ mod b1_lock_decouple_tests {
             .map(|(wid, _tx, _msg)| wid)
         }
 
+        // ════════════════════════════════════════════════════════════════
+        // (#sched M1 rebalance v2, §13) Ranker-aware magnet tests — I6.
+        // These drive the PRODUCTION Tier-1 selection (`inner_find_and_reserve_
+        // worker`) and the SOFT fallback (`find_and_reserve_worker`) with the
+        // P-headroom gate ENABLED and a real idle-threshold, proving a
+        // genuine-free-slot worker out-ranks a stale-low-p_load override-admit
+        // (invariant I6, the magnet fix). Design-drift note: the dispatch named
+        // an external `tests/scheduler_m1v2_ranker_test.rs`, but the external
+        // crate cannot set per-worker core counts (`set_worker_core_counts` is
+        // `#[cfg(test)]`-only) NOR inject a precise `running_action_infos`
+        // count, both REQUIRED to place a worker deterministically at
+        // `running >= p_count` with a chosen p_load. So the magnet tests live
+        // here (inline), the production-composition location every sibling
+        // cache-tier test already uses; the external file carries the
+        // black-box gate-plumbing coverage the public API supports.
+        // ════════════════════════════════════════════════════════════════
+
+        /// Build a scheduler with the P-headroom gate ON and a chosen idle
+        /// threshold + override factor. Everything else matches `build_scheduler`.
+        fn build_scheduler_gate_on(
+            wsm: Arc<BarrierWorkerStateManager>,
+            p_idle_threshold_pct: u32,
+            p_headroom_override_factor: u32,
+        ) -> Arc<ApiWorkerScheduler> {
+            ApiWorkerScheduler::new_with_locality_map(
+                wsm,
+                Arc::new(PlatformPropertyManager::new(HashMap::new())),
+                WorkerAllocationStrategy::default(),
+                Arc::new(Notify::new()),
+                100,
+                Arc::new(WorkerRegistry::new()),
+                None,
+                None,
+                None,
+                512 * 1024,
+                8,
+                true, // (#sched M1 rebalance v2) p_headroom_gate ON
+                p_idle_threshold_pct,
+                p_headroom_override_factor,
+            )
+        }
+
+        /// Force a worker's fresh in-flight count to exactly `running` by
+        /// inserting/removing dummy `PendingActionInfoData` entries under the
+        /// write lock (the ranker reads `running_action_infos.len()`; there is
+        /// no public setter). Distinct v4-UUID ops so the map length is exact.
+        async fn set_worker_running(scheduler: &Arc<ApiWorkerScheduler>, name: &str, running: usize) {
+            use crate::worker::PendingActionInfoData;
+            let mut inner = scheduler.inner.write().await;
+            let w = inner
+                .workers
+                .0
+                .peek_mut(&WorkerId(name.to_string()))
+                .expect("worker exists");
+            w.running_action_infos.clear();
+            for _ in 0..running {
+                w.running_action_infos.insert(
+                    OperationId::default(),
+                    PendingActionInfoData { action_info: pool_action() },
+                );
+            }
+            assert_eq!(
+                w.running_action_infos.len(),
+                running,
+                "fixture must set exactly `running` in-flight actions"
+            );
+        }
+
+        /// (§13 test 3, Tier-1) I6 magnet fix on the exact-root tier. TWO
+        /// root-holding workers, BOTH eligible under the gate:
+        ///   - FREE_SLOT: `running(3) < p_count(4)` → genuine free P slot, but a
+        ///     HIGH (stale) p_load 90 → HIGH `load_penalty`.
+        ///   - OVERRIDE : `running(4) == p_count(4)` (no free slot) admitted by
+        ///     the idle-P override (p_load 5 < threshold 50), and its LOW p_load
+        ///     → LOW `load_penalty`.
+        /// v1's min-`load_penalty` Tier-1 would pick OVERRIDE (lower stale load)
+        /// — the bounded magnet. v2's `(p_headroom_pref, load_penalty)` primary
+        /// key makes FREE_SLOT (pref 0) beat OVERRIDE (pref ≥ 1) regardless of
+        /// the stale load. MUTATION: drop `pref` from the Tier-1 key (revert to
+        /// `min load_penalty`) → OVERRIDE wins → this test red-fails.
+        #[nativelink_test]
+        async fn t_i6_magnet_tier1_free_slot_beats_override() {
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
+            // FREE_SLOT: p_count 4, HIGH p_load 90 (stale), root holder.
+            add_tier1_worker(&scheduler, "FREE_SLOT", 4, 0, 90, 90, 0).await;
+            set_worker_running(&scheduler, "FREE_SLOT", 3).await; // 3 < 4 → free slot
+            // OVERRIDE: p_count 4, LOW p_load 5 (stale-low), root holder.
+            add_tier1_worker(&scheduler, "OVERRIDE", 4, 0, 5, 5, 0).await;
+            set_worker_running(&scheduler, "OVERRIDE", 4).await; // 4 == 4 → override-admit
+
+            // Sanity: v1's stale-load ranking WOULD prefer OVERRIDE.
+            let free_pen = super::super::capacity_score(90, 0, 90, 4, 0, 8, 512 * 1024).load_penalty;
+            let over_pen = super::super::capacity_score(5, 0, 5, 4, 0, 8, 512 * 1024).load_penalty;
+            assert!(
+                over_pen < free_pen,
+                "precondition: the override worker's stale-low p_load gives it the \
+                 LOWER load_penalty — this is exactly the magnet v1 would fall for"
+            );
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("FREE_SLOT".to_string())),
+                "I6 Tier-1 magnet: a genuine-free-P-slot root holder (running 3 < \
+                 p_count 4, pref 0) MUST beat an override-admit root holder (running \
+                 4 == p_count 4, pref 1) EVEN THOUGH the override worker's stale-low \
+                 p_load gives it a lower load_penalty — the fresh-count `p_headroom_pref` \
+                 PRIMARY key dominates the stale load SECONDARY key"
+            );
+        }
+
+        /// (§13 test 3, fallback) I6 magnet fix on the SOFT LRU/MRU fallback.
+        /// Same shape as the Tier-1 test but NEITHER worker is a cache holder,
+        /// so the cascade falls through to `inner_find_worker_for_action`, whose
+        /// sort key is `(p_headroom_pref, effective_load_score)`. FREE_SLOT
+        /// (pref 0) must beat OVERRIDE (pref ≥ 1) despite OVERRIDE's lower stale
+        /// `effective_load_score`. MUTATION: revert the fallback key to
+        /// `(!has_p_headroom, load)` → both are `!has_p_headroom` false for
+        /// FREE_SLOT / true-ish… actually with v2.2's bool the override worker
+        /// (no fresh slot) sorts tier `true`, so the bool ALSO picks FREE_SLOT;
+        /// the DISTINGUISHING mutation is reverting `p_headroom_pref` to the raw
+        /// stale `effective_load_score` (drop the primary key), which picks
+        /// OVERRIDE — this test red-fails then.
+        #[nativelink_test]
+        async fn t_i6_magnet_fallback_free_slot_beats_override() {
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
+            // NON-holders (no update_cached_directories) → cascade falls through.
+            let _rx1 = add_worker_in_pool(&scheduler, "FREE_SLOT").await;
+            scheduler
+                .set_worker_core_counts(&WorkerId("FREE_SLOT".to_string()), 4, 0)
+                .await
+                .expect("counts");
+            scheduler
+                .update_worker_load(&WorkerId("FREE_SLOT".to_string()), 90, 90, 0)
+                .await
+                .expect("load");
+            set_worker_running(&scheduler, "FREE_SLOT", 3).await; // free slot, high stale load
+
+            let _rx2 = add_worker_in_pool(&scheduler, "OVERRIDE").await;
+            scheduler
+                .set_worker_core_counts(&WorkerId("OVERRIDE".to_string()), 4, 0)
+                .await
+                .expect("counts");
+            scheduler
+                .update_worker_load(&WorkerId("OVERRIDE".to_string()), 5, 5, 0)
+                .await
+                .expect("load");
+            set_worker_running(&scheduler, "OVERRIDE", 4).await; // override-admit, low stale load
+
+            // Sanity: the override worker has the LOWER effective_load_score.
+            let free_els = super::super::effective_load_score(90, 0, 90, true);
+            let over_els = super::super::effective_load_score(5, 0, 5, true);
+            assert!(
+                over_els < free_els,
+                "precondition: the override worker's stale-low p_load gives it the \
+                 lower effective_load_score (the fallback magnet)"
+            );
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("FREE_SLOT".to_string())),
+                "I6 fallback magnet: on the soft LRU/MRU path a genuine-free-P-slot \
+                 worker (pref 0) MUST beat an override-admit (pref 1) EVEN THOUGH the \
+                 override worker's stale-low p_load gives it the lower \
+                 effective_load_score — `p_headroom_pref` is the PRIMARY sort key"
+            );
+        }
+
+        /// (§13 test 5, e2e) THRESHOLD=0 parity: with `p_idle_threshold_pct == 0`
+        /// the override is dead, so a gate-ON scheduler selects IDENTICALLY to
+        /// gate-on-v1 — an at-capacity worker gets no override, and among two
+        /// root holders the min-load one wins as before. Here FREE_SLOT (running
+        /// 3 < p_count 4) is the only worker with headroom; the AT_CAP worker
+        /// (running 4, low p_load) gets NO override (threshold 0) so it is
+        /// excluded from the cache tiers → FREE_SLOT wins by headroom alone, the
+        /// v1 order. (Contrast `t_i6_magnet_tier1_*`, where threshold 50 admits
+        /// the override worker; here threshold 0 keeps it out entirely.)
+        #[nativelink_test]
+        async fn t_threshold_zero_parity_no_override() {
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 0, 2);
+            add_tier1_worker(&scheduler, "FREE_SLOT", 4, 0, 90, 90, 0).await;
+            set_worker_running(&scheduler, "FREE_SLOT", 3).await; // free slot (high stale load)
+            add_tier1_worker(&scheduler, "AT_CAP", 4, 0, 5, 5, 0).await;
+            set_worker_running(&scheduler, "AT_CAP", 4).await; // at cap, low stale load
+
+            let chosen = select(&scheduler).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("FREE_SLOT".to_string())),
+                "THRESHOLD=0 parity: the override is dead (`p_load < 0` never fires), \
+                 so AT_CAP (running 4 == p_count 4, no fresh headroom) is gate-excluded \
+                 from the cache tiers exactly as in gate-on-v1 — FREE_SLOT wins by \
+                 dispatch-count headroom alone, NOT by any p_load override"
+            );
+        }
+
+        /// (§13 test 2, e2e) Ceiling bound (I5_Bounded) end-to-end: with the
+        /// gate ON, threshold 50, factor 2, a sole idle-P root holder is
+        /// selectable while `running < p_count*factor` but its override CLOSES
+        /// at the ceiling. At running 4 (< 8) it is admitted and selected; at
+        /// running 8 (== ceiling) it is gate-excluded from the cache tiers. The
+        /// second worker COLD_FREE (a non-holder with a genuine free slot) then
+        /// takes the fall-through, proving the ceiling shut the override.
+        #[nativelink_test]
+        async fn t_ceiling_bound_override_closes_e2e() {
+            // running 4 < ceiling 8 → override active → HOLDER selected.
+            let s1 = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
+            add_tier1_worker(&s1, "HOLDER", 4, 0, 5, 5, 0).await; // idle-P root holder
+            set_worker_running(&s1, "HOLDER", 4).await; // 4 < 8 → override admits
+            let _rx = add_worker_in_pool(&s1, "COLD_FREE").await; // non-holder, free slot
+            s1.set_worker_core_counts(&WorkerId("COLD_FREE".to_string()), 4, 0)
+                .await
+                .expect("counts");
+            s1.update_worker_load(&WorkerId("COLD_FREE".to_string()), 5, 5, 0)
+                .await
+                .expect("load");
+            assert_eq!(
+                select(&s1).await,
+                Some(WorkerId("HOLDER".to_string())),
+                "below the ceiling (running 4 < p_count 4 * factor 2 = 8) the idle-P \
+                 override admits the root HOLDER to the cache tier → it wins its own root"
+            );
+
+            // running 8 == ceiling → override CLOSES → HOLDER gate-excluded from
+            // the cache tiers → COLD_FREE (genuine free slot) wins the fall-through.
+            let s2 = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
+            add_tier1_worker(&s2, "HOLDER", 4, 0, 5, 5, 0).await;
+            set_worker_running(&s2, "HOLDER", 8).await; // 8 == ceiling → NO override
+            let _rx2 = add_worker_in_pool(&s2, "COLD_FREE").await;
+            s2.set_worker_core_counts(&WorkerId("COLD_FREE".to_string()), 4, 0)
+                .await
+                .expect("counts");
+            s2.update_worker_load(&WorkerId("COLD_FREE".to_string()), 5, 5, 0)
+                .await
+                .expect("load");
+            assert_eq!(
+                select(&s2).await,
+                Some(WorkerId("COLD_FREE".to_string())),
+                "at the ceiling (running 8 == p_count 4 * factor 2) the fresh-count \
+                 backstop shuts the override (I5_Bounded); the root HOLDER is excluded \
+                 from the cache tiers and COLD_FREE (genuine free slot) takes the \
+                 fall-through — stale-low p_load cannot re-admit past the ceiling"
+            );
+        }
+
+        /// (§13 test 3, Tier-1.5) I6 magnet fix on the subtree-coverage tier.
+        /// TWO subtree holders with the SAME cached_score, both gate-eligible:
+        ///   - FREE_SLOT: `running(3) < p_count(4)` (free slot), HIGH stale
+        ///     p_load 90 → lower `blended_s` (cached_score − higher penalty).
+        ///   - OVERRIDE : `running(4) == p_count(4)` override-admit (p_load 5 <
+        ///     threshold 50), LOW stale p_load → higher `blended_s`.
+        /// v1's max-`blended_s` Tier-1.5 would pick OVERRIDE (higher blended_s
+        /// from lower stale penalty) — the magnet. v2's `(pref, Reverse(
+        /// blended_s))` key makes FREE_SLOT (pref 0) win. The `blended_s > 0`
+        /// crossover filter is preserved (both workers have a large enough cache
+        /// lead to stay positive). MUTATION: drop `pref` from the Tier-1.5 key →
+        /// OVERRIDE wins → red-fail.
+        #[nativelink_test]
+        async fn t_i6_magnet_tier15_free_slot_beats_override() {
+            let child_a = DigestInfo::new([0xa1u8; 32], 1);
+            let child_b = DigestInfo::new([0xb2u8; 32], 1);
+            // Large cache (≈3 MiB ≫ any penalty) so BOTH workers stay blended_s
+            // > 0 (crossover preserved) and the winner is decided by pref, not
+            // the crossover filter.
+            let tree = build_tree(child_a, child_b, 3 * 1024 * 1024);
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 2);
+            // Both cache child_a (SAME cached_score). FREE_SLOT: high stale load.
+            add_tier15_worker(&scheduler, "FREE_SLOT", 4, 0, 90, 0, vec![child_a]).await;
+            set_worker_running(&scheduler, "FREE_SLOT", 3).await; // 3 < 4 → free slot
+            // OVERRIDE: low stale load → higher blended_s in v1.
+            add_tier15_worker(&scheduler, "OVERRIDE", 4, 0, 5, 0, vec![child_a]).await;
+            set_worker_running(&scheduler, "OVERRIDE", 4).await; // 4 == 4 → override-admit
+
+            let chosen = select_tier15(&scheduler, &tree).await;
+            assert_eq!(
+                chosen,
+                Some(WorkerId("FREE_SLOT".to_string())),
+                "I6 Tier-1.5 magnet: a genuine-free-P-slot subtree holder (running 3 < \
+                 p_count 4, pref 0) MUST beat an override-admit subtree holder (running \
+                 4 == p_count 4, pref 1) with the SAME cached_score EVEN THOUGH the \
+                 override worker's stale-low p_load gives it a higher blended_s — the \
+                 `p_headroom_pref` PRIMARY key dominates the blended_s SECONDARY key"
+            );
+        }
+
         // ── T-const: numeric-constant pin (design §9 constant-pin) ──
         // Pins the NEW/load-bearing constants at their integer encoding in
         // the compare loop, NOT a float. `REF_FREE == 200` is the centi-core
@@ -9112,6 +9813,8 @@ mod b1_lock_decouple_tests {
                 512 * 1024,
                 8,
                 false, // (#sched M1 rebalance) p_headroom_gate OFF
+                0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+                2, // (#sched M1 rebalance v2) p_headroom_override_factor
             );
             // X_ROOT: Tier-1 root match (cached_directory_digests ∋ input_root),
             // moderately loaded.
@@ -10125,6 +10828,8 @@ mod deferred_proto_clone_tests {
             512 * 1024,
             8,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         )
     }
 
@@ -10142,6 +10847,8 @@ mod deferred_proto_clone_tests {
             512 * 1024,
             8,
             false, // (#sched M1 rebalance) p_headroom_gate OFF
+            0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+            2, // (#sched M1 rebalance v2) p_headroom_override_factor
         )
     }
 

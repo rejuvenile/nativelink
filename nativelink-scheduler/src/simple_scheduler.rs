@@ -1104,6 +1104,11 @@ impl SimpleScheduler {
             // default OFF (byte-identical to the pre-gate matcher until an
             // operator enables it).
             spec.p_headroom_gate_enabled,
+            // (#sched M1 rebalance v2) bounded p_load override tunables;
+            // threshold default 0 = override OFF (exact v1), factor default 2.
+            // Inert unless `p_headroom_gate_enabled` AND threshold > 0.
+            spec.p_idle_threshold_pct,
+            spec.p_headroom_override_factor,
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();

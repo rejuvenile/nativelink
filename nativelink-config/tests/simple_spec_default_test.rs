@@ -116,6 +116,17 @@ fn simple_spec_default_matches_deserialize_empty() {
         derived.p_headroom_gate_enabled, deserialized.p_headroom_gate_enabled,
         "p_headroom_gate_enabled default drift (both should be false)"
     );
+    assert_eq!(
+        derived.p_idle_threshold_pct, deserialized.p_idle_threshold_pct,
+        "p_idle_threshold_pct default drift (both should be 0 = override OFF, \
+         exact v1 behavior)"
+    );
+    assert_eq!(
+        derived.p_headroom_override_factor, deserialized.p_headroom_override_factor,
+        "p_headroom_override_factor default drift — serde default is 2 \
+         (default_p_headroom_override_factor); a bare #[serde(default)] would \
+         yield 0 and silently disable the override"
+    );
 }
 
 /// Direct assertions on the concrete default values, so the intent is legible
@@ -144,5 +155,17 @@ fn simple_spec_default_concrete_values() {
     assert!(
         !spec.p_headroom_gate_enabled,
         "p_headroom_gate_enabled default must be false (gate OFF until enabled)"
+    );
+    assert_eq!(
+        spec.p_idle_threshold_pct, 0,
+        "p_idle_threshold_pct default must be 0 (override OFF → exact v1: \
+         `p_load < 0` is never true, clause 3 never fires)"
+    );
+    assert_eq!(
+        spec.p_headroom_override_factor, 2,
+        "p_headroom_override_factor default must be 2 \
+         (default_p_headroom_override_factor); NOT the u32 type default 0, \
+         which would make the ceiling `p_core_count * 0 == 0` and disable the \
+         override"
     );
 }

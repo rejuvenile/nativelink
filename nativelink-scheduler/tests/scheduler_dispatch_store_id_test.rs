@@ -124,6 +124,8 @@ fn make_scheduler() -> Arc<ApiWorkerScheduler> {
         512 * 1024,
         8,
         false, // (#sched M1 rebalance) p_headroom_gate OFF
+        0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
+        2, // (#sched M1 rebalance v2) p_headroom_override_factor
     )
 }
 

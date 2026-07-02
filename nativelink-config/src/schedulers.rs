@@ -239,6 +239,43 @@ pub struct SimpleSpec {
     /// or memory-gate effect.
     #[serde(default)]
     pub p_headroom_gate_enabled: bool,
+
+    /// (#sched M1 rebalance v2) `p_core_load_pct` below which a worker's P
+    /// cores count as reported-idle enough to RELAX the dispatch-count gate:
+    /// a worker at/over its `p_core_count` in-flight actions but reporting
+    /// `p_core_load_pct < p_idle_threshold_pct` is I/O-bound (its P cores are
+    /// idle), so the gate admits it — up to a FRESH-count ceiling
+    /// (`p_core_count * p_headroom_override_factor`) that bounds the blast
+    /// radius of a stale-low `p_load` (design §2/§3). Only consulted when
+    /// `p_headroom_gate_enabled` is on.
+    ///
+    /// Default: 0 (= override OFF → EXACT v1 behavior; `p_load < 0` is never
+    /// true, so clause 3 can never fire). A bare `#[serde(default)]` (u32 0)
+    /// is correct HERE precisely because 0 is the intended "override off"
+    /// value — landing the code changes nothing until an operator sets a
+    /// threshold. Contrast `p_headroom_override_factor`, whose 0 would silently
+    /// disable the override even with a set threshold, so it needs a named
+    /// default fn.
+    #[serde(default)]
+    pub p_idle_threshold_pct: u32,
+
+    /// (#sched M1 rebalance v2) In-flight ceiling MULTIPLIER for the bounded
+    /// p_load override: the override (above) can admit a worker to at most
+    /// `p_core_count * p_headroom_override_factor` in-flight actions. Past
+    /// that, the fresh dispatch-count — never stale — shuts the gate, so the
+    /// worst case from a fully-adversarial stale-low `p_load` is bounded
+    /// over-concentration of `factor×` the P-core count on one worker, NOT a
+    /// runaway pileup (design §3, invariant I5_Bounded). Only consulted when
+    /// `p_headroom_gate_enabled` is on AND `p_idle_threshold_pct > 0`.
+    ///
+    /// Default: 2 (via `default_p_headroom_override_factor`). CRITICAL: a bare
+    /// `#[serde(default)]` here would yield u32 `0` → ceiling
+    /// `p_core_count * 0 == 0` → the override could NEVER admit any worker
+    /// (`running < 0` is never true), silently disabling the whole v2 feature
+    /// even with a set threshold. The named default fn keeps the deserialized
+    /// empty-config value at 2.
+    #[serde(default = "default_p_headroom_override_factor")]
+    pub p_headroom_override_factor: u32,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -286,19 +323,36 @@ impl Default for SimpleSpec {
             assume_core_count: default_assume_core_count(),
             // #[serde(default)] → bool default (false).
             p_headroom_gate_enabled: false,
+            // #[serde(default)] → type default (0) = override OFF (exact v1).
+            p_idle_threshold_pct: 0,
+            // #[serde(default = "default_p_headroom_override_factor")] → 2.
+            // NOT the u32 type default (0), which would disable the override.
+            p_headroom_override_factor: default_p_headroom_override_factor(),
         }
     }
 }
 
 /// (#sched-blend) Default cache-vs-load crossover anchor (512 KiB).
 /// PROVISIONAL — see `SimpleSpec::load_byte_cost`; soak-select before deploy.
-const fn default_load_byte_cost() -> u64 {
+/// `pub` so the scheduler's no-config `ApiWorkerScheduler::new` path sources
+/// the SAME value (single source of truth — no hardcoded 3rd copy to drift).
+pub const fn default_load_byte_cost() -> u64 {
     512 * 1024
 }
 
 /// (#sched-blend) Default substituted P-core count for count-less workers.
-const fn default_assume_core_count() -> u32 {
+/// `pub` for the same single-source-of-truth reason as `default_load_byte_cost`.
+pub const fn default_assume_core_count() -> u32 {
     8
+}
+
+/// (#sched M1 rebalance v2) Default in-flight ceiling multiplier for the
+/// bounded p_load override. MUST be a named default fn (not a bare
+/// `#[serde(default)]`, which would yield 0 → `p_core_count * 0 == 0` ceiling
+/// → the override never fires). See `SimpleSpec::p_headroom_override_factor`.
+/// `pub` for the same single-source-of-truth reason as `default_load_byte_cost`.
+pub const fn default_p_headroom_override_factor() -> u32 {
+    2
 }
 
 #[derive(Deserialize, Serialize, Debug)]
