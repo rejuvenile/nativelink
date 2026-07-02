@@ -3476,6 +3476,129 @@ async fn locality_scoring_selects_best_worker_test() -> Result<(), Error> {
     Ok(())
 }
 
+/// (#p1p2 enqueue-hook wiring) Proves the PRODUCTION seam
+/// `SimpleScheduler::inner_add_action → worker_scheduler.prefetch_input_tree`
+/// is live: adding an action whose `input_root_digest` names a real tree in a
+/// configured `cas_store` must trigger an enqueue-time prefetch. The prefetch
+/// counter `tree_prefetch_issued` is bumped SYNCHRONOUSLY inside
+/// `prefetch_input_tree` (before the spawn), so after `add_action` returns it
+/// is deterministically 1 — no wait needed.
+///
+/// The existing `simple_scheduler_test.rs` harness always passed
+/// `cas_store: None` (so the prefetch early-returns on the no-CAS guard and
+/// the seam was UNTESTED). This variant wires `Some(cas_store)` — the same
+/// shape `locality_scoring_selects_best_worker_test` proves is drivable — and
+/// observes the counter through the PRODUCTION `/metrics` render path (the
+/// returned `Arc<dyn WorkerScheduler>` is `RootMetricsComponent`, registered
+/// exactly as `src/bin/nativelink.rs` registers it).
+///
+/// Mutation step (CLAUDE.md TDD #5): comment out the
+/// `self.worker_scheduler.prefetch_input_tree(...).await;` call in
+/// `SimpleScheduler::inner_add_action` — `tree_prefetch_issued` stays 0 and
+/// this test red-fails with its bespoke "enqueue seam did not fire" message.
+#[nativelink_test]
+async fn enqueue_triggers_input_tree_prefetch_test() -> Result<(), Error> {
+    use nativelink_util::metrics_publisher::{
+        MetricsComponentTrait, MetricsRegistry, render_prometheus,
+    };
+
+    // Build a real single-directory input tree and store it in the CAS.
+    let input_root_dir = Directory {
+        files: vec![FileNode {
+            name: "prefetch_seam.txt".to_string(),
+            digest: Some(DigestInfo::new([7u8; 32], 1234).into()),
+            is_executable: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let dir_bytes = input_root_dir.encode_to_vec();
+    let input_root_digest = DigestInfo::new(
+        {
+            use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+            let mut hasher = DigestHasherFunc::Sha256.hasher();
+            hasher.update(&dir_bytes);
+            let digest_info = hasher.finalize_digest();
+            **digest_info.packed_hash()
+        },
+        dir_bytes.len() as u64,
+    );
+
+    let cas_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let key: nativelink_util::store_trait::StoreKey<'_> = input_root_digest.into();
+    cas_store
+        .update_oneshot(key, Bytes::from(dir_bytes))
+        .await?;
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        Some(cas_store), // (#p1p2) CAS store present — the prefetch is not no-op'd
+        Some(new_shared_blob_locality_map()),
+        None, // worker_tls_config
+    );
+
+    // Add an action whose input root names the stored tree. No worker is
+    // registered — this isolates the ENQUEUE-time prefetch from any
+    // match-time lazy resolution (no worker ⇒ no match ⇒ no lazy resolve).
+    let action_digest = DigestInfo::new([99u8; 32], 512);
+    let _action_listener = setup_action_with_input_root(
+        &scheduler,
+        action_digest,
+        input_root_digest,
+        HashMap::new(),
+        make_system_time(1),
+    )
+    .await?;
+
+    // Render the worker scheduler's metrics exactly as production does and
+    // assert the enqueue seam fired. `tree_prefetch_issued` is incremented
+    // synchronously in `prefetch_input_tree`, so it is already 1 here.
+    let registry = MetricsRegistry::new();
+    registry.register_dyn(
+        "scheduler.testsched.worker",
+        worker_scheduler as Arc<dyn MetricsComponentTrait + Send + Sync>,
+    );
+    // Warm the lazy span-thread-local path once and discard (same de-flake the
+    // unit render test uses; avoids the 1/47 cold whole-group-vanishes flake).
+    let _warm = render_prometheus(&registry);
+    let body = render_prometheus(&registry);
+
+    assert!(
+        body.contains(
+            "\nscheduler_testsched_worker_scheduler_metrics_tree_prefetch_issued 1\n"
+        ),
+        "enqueue seam did not fire: SimpleScheduler::inner_add_action must call \
+         worker_scheduler.prefetch_input_tree for an action with a cas_store set, \
+         bumping tree_prefetch_issued to 1. body=\n{body}"
+    );
+    // Neither skip counter should have fired: the root is cold (not cached) and
+    // a fresh scheduler has all prefetch permits.
+    assert!(
+        body.contains(
+            "\nscheduler_testsched_worker_scheduler_metrics_tree_prefetch_skipped_cached 0\n"
+        ),
+        "a cold (uncached) root must not count as skipped_cached. body=\n{body}"
+    );
+    assert!(
+        body.contains(
+            "\nscheduler_testsched_worker_scheduler_metrics_tree_prefetch_skipped_nopermit 0\n"
+        ),
+        "a fresh scheduler has permits — must not count as skipped_nopermit. body=\n{body}"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn no_peer_hints_without_resolved_tree_test() -> Result<(), Error> {
     // Test: When a locality map has entries for the input_root_digest itself

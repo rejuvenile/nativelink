@@ -289,6 +289,60 @@ pub struct SchedulerMetrics {
     )]
     pub tree_resolution_errors: AtomicU64,
 
+    // ── (#p1p2) Cold-resolution latency HISTOGRAM ──
+    // TELEMETRY-ONLY. `tree_resolution_cold_time_ns / cold_count` gives only
+    // the mean of the INLINE SURVIVORS: a cold resolution that hit the 2s
+    // inline timeout has its TRUE latency CENSORED (the inline arm records
+    // nothing, and the background continuation's completion time was
+    // previously unrecorded). That censoring is exactly the slow tail we need
+    // to see — it is what adjudicates whether the 2s inline timeout is a good
+    // bet (tail ~600ms → fine) or a bad one (tail ~30s → catches nothing).
+    //
+    // These per-bucket counters classify EVERY cold resolution — both the
+    // inline-success arm AND the post-timeout background continuation — by its
+    // TRUE elapsed from the ORIGINAL resolution start, so the distribution
+    // (including the previously-invisible tail beyond 2s) becomes visible on
+    // `/metrics`. Per-bucket (NOT cumulative-le) for clarity: each records the
+    // count whose true elapsed fell in that half-open range. Boundaries mirror
+    // the inline (2s) and background (60s) timeout constants so `le_2000` and
+    // `le_30000`/`gt_30000` frame the two decision points. Increments only,
+    // `Ordering::Relaxed`; no behavior change.
+    /// (#p1p2) Cold resolutions whose true elapsed ≤ 50 ms.
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed <= 50ms")]
+    pub tree_resolution_ms_le_50: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (50 ms, 100 ms].
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (50ms, 100ms]")]
+    pub tree_resolution_ms_le_100: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (100 ms, 250 ms].
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (100ms, 250ms]")]
+    pub tree_resolution_ms_le_250: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (250 ms, 500 ms]. The
+    /// old inline cap lived here — 37% of cold resolves exceeded it.
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (250ms, 500ms]")]
+    pub tree_resolution_ms_le_500: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (500 ms, 1000 ms].
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (500ms, 1000ms]")]
+    pub tree_resolution_ms_le_1000: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (1000 ms, 2000 ms]. The
+    /// current inline cap (`TREE_RESOLUTION_INLINE_TIMEOUT`) is the upper edge
+    /// — resolutions at or below here still complete on the inline arm.
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (1000ms, 2000ms]")]
+    pub tree_resolution_ms_le_2000: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (2000 ms, 5000 ms].
+    /// Everything above 2000 ms hit the inline timeout and completed on the
+    /// background continuation — this is the tail the mean could not see.
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (2000ms, 5000ms]")]
+    pub tree_resolution_ms_le_5000: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed was (5000 ms, 30000 ms].
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed in (5000ms, 30000ms]")]
+    pub tree_resolution_ms_le_30000: AtomicU64,
+    /// (#p1p2) Cold resolutions whose true elapsed EXCEEDED 30000 ms — the
+    /// deep tail (up to the 60s background hard-cap `TREE_RESOLUTION_TIMEOUT`).
+    /// A non-zero value here means the 2s inline timeout catches almost none
+    /// of these and the background path is doing heavy lifting.
+    #[metric(help = "(#p1p2) cold tree resolutions with true elapsed > 30000ms (deep tail)")]
+    pub tree_resolution_ms_gt_30000: AtomicU64,
+
     // ── (#p1p2) Enqueue-time tree-prefetch telemetry ──
     // Measure prefetch coverage (how often an enqueue warms a tree ahead of
     // match) and whether the concurrency bound saturates. No behavior
@@ -316,6 +370,40 @@ pub struct SchedulerMetrics {
         help = "(#p1p2) cumulative enqueue-time tree prefetches skipped because the concurrency semaphore was exhausted"
     )]
     pub tree_prefetch_skipped_nopermit: AtomicU64,
+}
+
+impl SchedulerMetrics {
+    /// (#p1p2) Classifies a COLD tree-resolution's TRUE elapsed into exactly
+    /// one `tree_resolution_ms_le_*` bucket and increments it. Called from
+    /// BOTH the inline-success arm (elapsed measured from the inline
+    /// resolution start) AND the post-timeout background continuation
+    /// (elapsed measured from the ORIGINAL, pre-inline-timeout start) so the
+    /// slow tail that the inline mean censors becomes visible. Per-bucket
+    /// (half-open ranges), so every cold resolution lands in one and only one
+    /// counter. `Ordering::Relaxed` — telemetry only, no behavior change.
+    fn record_cold_resolution_bucket(&self, elapsed: Duration) {
+        let ms = elapsed.as_millis();
+        let bucket = if ms <= 50 {
+            &self.tree_resolution_ms_le_50
+        } else if ms <= 100 {
+            &self.tree_resolution_ms_le_100
+        } else if ms <= 250 {
+            &self.tree_resolution_ms_le_250
+        } else if ms <= 500 {
+            &self.tree_resolution_ms_le_500
+        } else if ms <= 1000 {
+            &self.tree_resolution_ms_le_1000
+        } else if ms <= 2000 {
+            &self.tree_resolution_ms_le_2000
+        } else if ms <= 5000 {
+            &self.tree_resolution_ms_le_5000
+        } else if ms <= 30000 {
+            &self.tree_resolution_ms_le_30000
+        } else {
+            &self.tree_resolution_ms_gt_30000
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Point-in-time intersection of an action's `file_digests` and the
@@ -2582,10 +2670,10 @@ const TREE_CACHE_CAPACITY: usize = 1024;
 /// until usage drops below.
 ///
 /// Raised 512 MiB → 2 GiB 2026-07-02. The dual-benchmark measured avg tree
-/// ≈ 665 KB (251 MiB resident / 373 roots), so the OLD 512 MiB byte cap
-/// bound first at ~770 roots — a build with >~770 distinct input roots
+/// ≈ 689 KiB (251 MiB resident / 373 roots), so the OLD 512 MiB byte cap
+/// bound first at ~761 roots — a build with >~760 distinct input roots
 /// would evict warm trees → re-resolution → more of the 37% cold-resolve
-/// timeout storm. At 665 KB/tree, 2 GiB gives ~3000-root headroom (the
+/// timeout storm. At 689 KiB/tree, 2 GiB gives ~3040-root headroom (the
 /// count cap `TREE_CACHE_CAPACITY` = 1024 becomes the binding limit first,
 /// which is the intended eviction discipline rather than a byte-pressure
 /// surprise). Cheap eviction insurance for large builds; not the binding
@@ -2746,6 +2834,26 @@ const NEGATIVE_CACHE_SWEEP_THRESHOLD: usize = 1000;
 /// `tree_resolution_in_progress` cannot leak entries even under
 /// pathological CAS failures.
 const TREE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// (#p1p2) Inline (dispatch-path) cold-resolution deadline. When a cold
+/// `resolve_input_tree` does not complete within this budget the action is
+/// dispatched WITHOUT locality scoring and the resolution finishes on a
+/// spawned background task (bounded by `TREE_RESOLUTION_TIMEOUT` = 60s).
+///
+/// Raised 500ms → 2s 2026-07-02. This is a PROVISIONAL bet on an UNMEASURED
+/// tail, NOT a "500ms covers p99"-style claim: the only current evidence is
+/// that 37% (138/373) of cold resolves exceeded the prior 500ms cap in the
+/// 2026-07-02 dual-benchmark, and the latencies of the timed-out resolutions
+/// were themselves UNINSTRUMENTED (censored — the mean saw only survivors).
+/// The `tree_resolution_ms_le_*` histogram (added the same change) now records
+/// the TRUE completion time on BOTH the inline arm AND the background
+/// continuation, so this value can be confirmed or refuted against the real
+/// distribution rather than carried forward on faith.
+///
+/// Named (not a bare literal) so the `tree_resolution_ms_le_2000` histogram
+/// bucket boundary is self-documenting and a value drift is caught by
+/// `test_tree_resolution_inline_timeout_const`.
+const TREE_RESOLUTION_INLINE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// (#p1p2) Maximum concurrent enqueue-triggered tree prefetches. Bounds the
 /// number of background `resolve_input_tree` tasks the enqueue path may spawn
@@ -3784,19 +3892,29 @@ impl ApiWorkerScheduler {
         // Cache miss — resolve inline so the current action benefits from
         // locality scoring. Tree resolution is typically fast (MemoryStore
         // or local CAS) and the result is cached for future actions.
-        // A 2s timeout prevents slow CAS lookups from blocking dispatch.
-        // GetTree with subtree caching resolves 1000-dir trees in 10-50ms
-        // when warm, but cold starts (first action for a new tree) are far
-        // slower than earlier estimated: the 2026-07-02 dual-benchmark
-        // measured mean cold resolve = 59ms AND 37% (138/373) of cold
-        // resolutions EXCEEDED the prior 500ms cap and dispatched WITHOUT
-        // locality scoring (a cold-startup burst of distinct roots the CAS
-        // BFS could not resolve in 500ms). Raised to 2s so the vast majority
-        // of cold resolutions complete inline and keep locality scoring,
-        // instead of abandoning it to the background path 37% of the time.
-        // The #p1p2 enqueue-time prefetch (prefetch_input_tree) additionally
-        // warms most trees BEFORE match, so the inline path is usually a hit
-        // and the 2s cap is the safety net for a not-yet-prefetched cold root.
+        // The inline deadline (`TREE_RESOLUTION_INLINE_TIMEOUT` = 2s) prevents
+        // slow CAS lookups from blocking dispatch. GetTree with subtree
+        // caching resolves 1000-dir trees in 10-50ms when warm, but cold
+        // starts (first action for a new tree) are far slower than earlier
+        // estimated: the 2026-07-02 dual-benchmark measured mean cold resolve
+        // = 59ms AND 37% (138/373) of cold resolutions EXCEEDED the prior
+        // 500ms cap and dispatched WITHOUT locality scoring (a cold-startup
+        // burst of distinct roots the CAS BFS could not resolve in 500ms).
+        //
+        // The 2s value is a PROVISIONAL bet on an UNMEASURED tail, NOT a
+        // "2s covers p99" claim (which would repeat the exact unsupported
+        // pattern the old 500ms cap made): the ONLY current evidence is that
+        // 37% exceeded 500ms, and the latencies of those timed-out resolves
+        // were themselves UNINSTRUMENTED — the inline mean saw only the
+        // survivors, so we cannot yet say whether the real tail is ~600ms (2s
+        // is generous) or ~30s (2s catches almost nothing). The
+        // `tree_resolution_ms_le_*` histogram (this change) now records the
+        // TRUE completion time on BOTH the inline arm AND the background
+        // continuation, so the next soak CONFIRMS OR REFUTES 2s against the
+        // real distribution rather than carrying it forward on faith. The
+        // #p1p2 enqueue-time prefetch (prefetch_input_tree) additionally warms
+        // most trees BEFORE match, so the inline path is usually a hit and the
+        // 2s cap is the safety net for a not-yet-prefetched cold root.
         //
         // (#p1p2 telemetry) A cold resolution is being attempted (the
         // positive and negative caches both missed and the in-progress
@@ -3810,10 +3928,13 @@ impl ApiWorkerScheduler {
             &self.failed_directory_digests,
         );
         // (#p1p2 telemetry) Time the cold resolution to isolate its cost
-        // from the warm (hit) path. Recorded on the success arm below.
+        // from the warm (hit) path. Recorded on the success arm below. This
+        // ORIGINAL start Instant is ALSO threaded into the post-timeout
+        // background continuation (Err arm) so the histogram measures the
+        // TRUE elapsed to the eventual completion, not just the inline window.
         let resolve_started = Instant::now();
         let resolve_result =
-            tokio::time::timeout(Duration::from_secs(2), resolve_fut).await;
+            tokio::time::timeout(TREE_RESOLUTION_INLINE_TIMEOUT, resolve_fut).await;
         let resolve_elapsed = resolve_started.elapsed();
 
         match resolve_result {
@@ -3829,6 +3950,13 @@ impl ApiWorkerScheduler {
                 self.metrics
                     .tree_resolution_cold_count
                     .fetch_add(1, Ordering::Relaxed);
+                // (#p1p2 telemetry) Record the TRUE elapsed into the latency
+                // histogram (inline-success arm). The Err arm records the same
+                // for the background continuation, so the histogram covers the
+                // full distribution including the beyond-2s tail the mean
+                // cannot see.
+                self.metrics
+                    .record_cold_resolution_bucket(resolve_elapsed);
                 let entry_bytes = resolved.estimated_heap_bytes();
                 debug!(
                     %input_root_digest,
@@ -3920,6 +4048,13 @@ impl ApiWorkerScheduler {
                 // silently undercount whenever the 2s timeout fires).
                 let metrics = self.metrics.clone();
                 let digest = input_root_digest;
+                // (#p1p2 telemetry) Capture the ORIGINAL resolution start
+                // (pre-inline-timeout) so the background continuation records
+                // TRUE end-to-end elapsed into the latency histogram. `Instant`
+                // is `Copy`; this moves a copy into the task. Without it the
+                // slow tail (every resolution beyond the 2s inline cap) would
+                // stay invisible — which is the whole point of the histogram.
+                let bg_started = resolve_started;
                 tokio::spawn(async move {
                     // Bind the guard to this task's lifetime. It fires on
                     // any exit path (success, error, timeout, cancellation).
@@ -3928,6 +4063,11 @@ impl ApiWorkerScheduler {
                         resolve_tree_from_cas(&store, digest, &failed_dirs_ref);
                     match tokio::time::timeout(TREE_RESOLUTION_TIMEOUT, bg_fut).await {
                         Ok(Ok(resolved)) => {
+                            // (#p1p2 telemetry) TRUE elapsed from the original
+                            // resolution start to background completion — the
+                            // censored tail the inline mean never saw. Recorded
+                            // into the SAME histogram as the inline-success arm.
+                            metrics.record_cold_resolution_bucket(bg_started.elapsed());
                             let entry_bytes = resolved.estimated_heap_bytes();
                             info!(
                                 %digest,
@@ -7903,6 +8043,201 @@ mod tests {
         );
     }
 
+    /// (#p1p2 histogram) Direct classification test for
+    /// `record_cold_resolution_bucket`: an elapsed of KNOWN latency must land
+    /// in EXACTLY the right bucket and no other. Boundary values (the `le`
+    /// edges) exercise the half-open `<=` classification — a `<` vs `<=` slip
+    /// or a mis-ordered `else if` chain is caught here. Values are chosen ON
+    /// the boundaries (50, 100, 250, 500, 1000, 2000, 5000, 30000 ms) plus a
+    /// deep-tail value beyond 30s.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): change any boundary in
+    /// `record_cold_resolution_bucket` (e.g. `ms <= 50` → `ms <= 49`) and the
+    /// on-boundary sample misroutes to the next bucket → this test red-fails
+    /// with the bespoke "landed in the wrong bucket" message.
+    #[test]
+    fn test_record_cold_resolution_bucket_classification() {
+        // (elapsed, field-selector name, index into the ordered bucket list)
+        // The ordered list of (name, accessor) so we can assert the target
+        // bucket is 1 and every OTHER bucket is 0 after a single record.
+        let cases: [(Duration, &str); 11] = [
+            (Duration::from_millis(0), "tree_resolution_ms_le_50"),
+            (Duration::from_millis(50), "tree_resolution_ms_le_50"),
+            (Duration::from_millis(51), "tree_resolution_ms_le_100"),
+            (Duration::from_millis(100), "tree_resolution_ms_le_100"),
+            (Duration::from_millis(250), "tree_resolution_ms_le_250"),
+            (Duration::from_millis(500), "tree_resolution_ms_le_500"),
+            (Duration::from_millis(1000), "tree_resolution_ms_le_1000"),
+            (Duration::from_millis(2000), "tree_resolution_ms_le_2000"),
+            (Duration::from_millis(5000), "tree_resolution_ms_le_5000"),
+            (Duration::from_millis(30000), "tree_resolution_ms_le_30000"),
+            (Duration::from_millis(30001), "tree_resolution_ms_gt_30000"),
+        ];
+        for (elapsed, expected_field) in cases {
+            let m = SchedulerMetrics::default();
+            m.record_cold_resolution_bucket(elapsed);
+            // Snapshot every bucket by name; exactly one must be 1.
+            let observed: [(&str, u64); 9] = [
+                ("tree_resolution_ms_le_50", m.tree_resolution_ms_le_50.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_100", m.tree_resolution_ms_le_100.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_250", m.tree_resolution_ms_le_250.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_500", m.tree_resolution_ms_le_500.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_1000", m.tree_resolution_ms_le_1000.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_2000", m.tree_resolution_ms_le_2000.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_5000", m.tree_resolution_ms_le_5000.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_le_30000", m.tree_resolution_ms_le_30000.load(Ordering::Relaxed)),
+                ("tree_resolution_ms_gt_30000", m.tree_resolution_ms_gt_30000.load(Ordering::Relaxed)),
+            ];
+            for (field, count) in observed {
+                let want = u64::from(field == expected_field);
+                assert_eq!(
+                    count, want,
+                    "elapsed {elapsed:?} landed in the wrong bucket: {field} = {count} \
+                     (expected {want}); target bucket was {expected_field}"
+                );
+            }
+        }
+    }
+
+    /// (#p1p2 histogram) A real cold resolution of KNOWN (tiny) latency lands
+    /// in the fast bucket. A MemoryStore-backed single-directory resolve
+    /// completes in well under 50ms, so the single cold miss must increment
+    /// `tree_resolution_ms_le_50` exactly once and every slower bucket must
+    /// stay 0 — proving the inline-success arm feeds the histogram.
+    ///
+    /// Mutation step: comment out the `record_cold_resolution_bucket` call on
+    /// the inline-success arm of `resolve_input_tree` and this red-fails with
+    /// "the cold inline resolution must record exactly one histogram sample".
+    #[tokio::test]
+    async fn test_cold_resolution_records_histogram_bucket() {
+        let (scheduler, dir_digest) = prefetch_test_scheduler().await;
+
+        // One cold inline resolution.
+        let r = scheduler.resolve_input_tree(dir_digest).await;
+        assert!(r.is_some(), "cold resolve should succeed inline");
+
+        // The single fast cold resolve must land in le_50 and nowhere else.
+        assert_eq!(
+            scheduler.metrics.tree_resolution_ms_le_50.load(Ordering::Relaxed),
+            1,
+            "the cold inline resolution must record exactly one histogram sample in le_50 \
+             (a sub-ms MemoryStore resolve)"
+        );
+        // Sum across all buckets must be exactly 1 — no double-count, no leak
+        // into a slower bucket.
+        let total: u64 = [
+            &scheduler.metrics.tree_resolution_ms_le_50,
+            &scheduler.metrics.tree_resolution_ms_le_100,
+            &scheduler.metrics.tree_resolution_ms_le_250,
+            &scheduler.metrics.tree_resolution_ms_le_500,
+            &scheduler.metrics.tree_resolution_ms_le_1000,
+            &scheduler.metrics.tree_resolution_ms_le_2000,
+            &scheduler.metrics.tree_resolution_ms_le_5000,
+            &scheduler.metrics.tree_resolution_ms_le_30000,
+            &scheduler.metrics.tree_resolution_ms_gt_30000,
+        ]
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .sum();
+        assert_eq!(
+            total, 1,
+            "exactly one cold resolution occurred — the histogram total must be 1 \
+             (no double-count, no misroute)"
+        );
+    }
+
+    /// (#p1p2 histogram — tail path) Proves the background continuation's
+    /// EXACT record expression (`bg_started.elapsed()` classified into the
+    /// histogram) lands the censored tail in a slow bucket, deterministically
+    /// and without a 2s wall-clock wait.
+    ///
+    /// The production background arm captures the ORIGINAL pre-inline-timeout
+    /// start (`resolve_started`, a `std::time::Instant`) and, on completion,
+    /// runs `metrics.record_cold_resolution_bucket(bg_started.elapsed())`.
+    /// Here we reconstruct that exact input by building an `Instant` 3 seconds
+    /// in the PAST (as if the resolution began 3s before background
+    /// completion) and running the same classifier the arm runs. A 3s elapsed
+    /// exceeds the 2s inline budget, so it MUST land in `le_5000` and every
+    /// bucket <= `le_2000` must stay 0 — this is exactly the tail the inline
+    /// mean censors.
+    ///
+    /// DESIGN-DRIFT (reported, not silently adapted): a full end-to-end test
+    /// driving the real 2s inline timeout is NOT cheaply drivable — the inline
+    /// deadline `TREE_RESOLUTION_INLINE_TIMEOUT` is not runtime-injectable, and
+    /// the histogram uses a real-wall-clock `std::time::Instant` (not
+    /// `tokio::time`), so `tokio::time::pause`/`advance` cannot fast-forward
+    /// `elapsed()`. Any true-timeout test therefore costs ~2s real time AND
+    /// needs a full custom `StoreDriver` fault store. This deterministic test
+    /// exercises the background arm's exact record expression instead; the
+    /// inline-arm wiring is proven by `test_cold_resolution_records_histogram_bucket`
+    /// and the classifier by `test_record_cold_resolution_bucket_classification`.
+    ///
+    /// Mutation step (accurate to what this test invokes): this test calls the
+    /// shared classifier `record_cold_resolution_bucket` DIRECTLY with a
+    /// reconstructed background-arm input, so its mutations are on the
+    /// classifier — corrupting the `<= 2000` / `<= 5000` boundary reroutes the
+    /// 3s sample and red-fails the `le_5000 == 1` / `fast_sum == 0` assertions
+    /// (verified). It does NOT invoke the production background arm (the real
+    /// 2s inline timeout is not cheaply drivable — see the DESIGN-DRIFT note
+    /// above), so a mutation that swaps `bg_started.elapsed()` for
+    /// `Duration::ZERO` in the arm is NOT caught here — that arm's use of the
+    /// original start is covered by inspection plus the fact that the inline
+    /// arm's identical `record_cold_resolution_bucket(resolve_elapsed)` call is
+    /// mutation-verified by `test_cold_resolution_records_histogram_bucket`.
+    #[test]
+    fn test_background_tail_elapsed_lands_in_slow_bucket() {
+        let m = SchedulerMetrics::default();
+
+        // Reconstruct the background arm's input: an original-start Instant 3s
+        // in the past → `elapsed()` ≈ 3s, exceeding the 2s inline budget.
+        let bg_started = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("Instant 3s in the past must be representable");
+        m.record_cold_resolution_bucket(bg_started.elapsed());
+
+        // A ~3s elapsed lands in le_5000 (2000ms < 3000ms <= 5000ms).
+        assert_eq!(
+            m.tree_resolution_ms_le_5000.load(Ordering::Relaxed),
+            1,
+            "a ~3s background-continuation elapsed must land in le_5000 (the tail bucket)"
+        );
+        // Every bucket at or below the 2s inline cap must be 0 — the tail is
+        // exactly what the inline mean cannot see.
+        let fast_sum: u64 = [
+            &m.tree_resolution_ms_le_50,
+            &m.tree_resolution_ms_le_100,
+            &m.tree_resolution_ms_le_250,
+            &m.tree_resolution_ms_le_500,
+            &m.tree_resolution_ms_le_1000,
+            &m.tree_resolution_ms_le_2000,
+        ]
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .sum();
+        assert_eq!(
+            fast_sum, 0,
+            "the background-tail sample measures TRUE elapsed from the ORIGINAL start \
+             (> 2s inline budget) — it must NOT land in any bucket <= le_2000"
+        );
+    }
+
+    /// (#p1p2 histogram numeric-constant discipline) The inline cold-resolution
+    /// deadline is exactly 2s, and it is the `le_2000` histogram bucket's upper
+    /// edge. Pins the constant at its declaration so a doc-comment or bucket-
+    /// name drift cannot hide a stale literal.
+    ///
+    /// Mutation step: change `TREE_RESOLUTION_INLINE_TIMEOUT` to any other
+    /// value and this red-fails with the bespoke 2s message.
+    #[test]
+    fn test_tree_resolution_inline_timeout_const() {
+        assert_eq!(
+            TREE_RESOLUTION_INLINE_TIMEOUT,
+            Duration::from_secs(2),
+            "TREE_RESOLUTION_INLINE_TIMEOUT must be 2s (raised from 500ms 2026-07-02); \
+             it is also the tree_resolution_ms_le_2000 histogram bucket boundary"
+        );
+    }
+
     /// (#p1p2) Shared harness for the enqueue-time prefetch tests: builds a
     /// scheduler with a CAS store holding one single-directory tree, and
     /// returns `(scheduler, dir_digest)`. Mirrors
@@ -9256,6 +9591,19 @@ mod tests {
             .metrics
             .tree_prefetch_skipped_nopermit
             .fetch_add(166, Ordering::Relaxed);
+        // (#p1p2 histogram) distinctive per-bucket values on the nine
+        // cold-resolution latency buckets so a misrouted bucket renders a
+        // different number (wrong-field guard); the render assertions below
+        // pin each literal emitted name+value.
+        scheduler.metrics.tree_resolution_ms_le_50.fetch_add(201, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_100.fetch_add(202, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_250.fetch_add(203, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_500.fetch_add(204, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_1000.fetch_add(205, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_2000.fetch_add(206, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_5000.fetch_add(207, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_le_30000.fetch_add(208, Ordering::Relaxed);
+        scheduler.metrics.tree_resolution_ms_gt_30000.fetch_add(209, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -9351,6 +9699,19 @@ mod tests {
             ("tree_prefetch_issued", 144),
             ("tree_prefetch_skipped_cached", 155),
             ("tree_prefetch_skipped_nopermit", 166),
+            // (#p1p2 histogram) the nine cold-resolution latency buckets —
+            // dark buckets = no distribution data (the exact gap this change
+            // closes). Distinctive per-bucket values guard the doubled-name
+            // trap (a misrouted bucket renders a different number).
+            ("tree_resolution_ms_le_50", 201),
+            ("tree_resolution_ms_le_100", 202),
+            ("tree_resolution_ms_le_250", 203),
+            ("tree_resolution_ms_le_500", 204),
+            ("tree_resolution_ms_le_1000", 205),
+            ("tree_resolution_ms_le_2000", 206),
+            ("tree_resolution_ms_le_5000", 207),
+            ("tree_resolution_ms_le_30000", 208),
+            ("tree_resolution_ms_gt_30000", 209),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),
