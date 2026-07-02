@@ -545,7 +545,7 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::simple_scheduler::{
-    BatchSchedAction, BatchSchedGain, BatchSchedWorker, compute_batch_sched_gain,
+    BatchSchedAction, BatchSchedGain, BatchSchedGateCfg, BatchSchedWorker, compute_batch_sched_gain,
 };
 use crate::worker::{
     ActionInfoWithProps, PendingActionInfoData, Worker, WorkerTimestamp, WorkerUpdate,
@@ -3842,16 +3842,23 @@ impl ApiWorkerScheduler {
     /// owned snapshots — no lock is held across the solve, and there is no
     /// `.await` inside either locked section beyond the lock acquire itself.
     ///
-    /// Capacity model (design §4): a worker's `capacity` is its admissible slot
-    /// count at match time (`max_inflight_tasks − running_action_infos.len()`,
-    /// and 0 when the worker cannot accept work / is quarantined / pressured —
-    /// the same viability the dispatch gate applies), so the batch solver cannot
-    /// cheat by piling all actions on the single best-cached worker. A worker
-    /// with `max_inflight_tasks == 0` (unbounded) is given a capacity equal to
-    /// the sampled-action count (enough to hold the whole window — effectively
-    /// unbounded for this cycle). `load_penalty` is snapshotted with the SAME
-    /// `capacity_score` + zero-load handling dispatch uses, so greedy's
-    /// `argmax (s − load_penalty)` models production.
+    /// Contention model (M1-replay): the batch solver FAITHFULLY REPLAYS the live
+    /// M1 P-headroom gate rather than an `max_inflight_tasks` slot budget. Each
+    /// worker is seeded with its REAL fresh in-flight count
+    /// (`running_action_infos.len()`), its `p_core_count`, and its
+    /// `p_core_load_pct`; the gate config (`p_headroom_gate_enabled` /
+    /// `p_idle_threshold_pct` / `p_headroom_override_factor`) is threaded in. The
+    /// CONTENTION is the fresh-count `running < p_core_count` cache-tier
+    /// eligibility (with the Phase-2 lift when no worker has headroom) — the SAME
+    /// gate `inner_find_and_reserve_worker` applies. This gate is CONFIRMED ON in
+    /// prod (25,303 `p_headroom_gate_exclusion` events since boot) at
+    /// `p_idle_threshold_pct == 0` (v1 behavior). Every sampled action is placed
+    /// (the gate, not a slot count, is the contention). `load_penalty` is
+    /// snapshotted ONCE with the SAME `capacity_score` + zero-load handling
+    /// dispatch uses (CONSTANT across the solve — the gate is the contention, not
+    /// a load ramp), so greedy's `argmax (s − load_penalty)` models production.
+    /// Workers that cannot accept work / are quarantined / pressured are excluded
+    /// from the snapshot (the same viability the dispatch pre-scan folds over).
     ///
     /// Zero routing change: reads only; returns gauges.
     pub(crate) async fn batch_sched_gain_for_probe(
@@ -3878,18 +3885,27 @@ impl ApiWorkerScheduler {
         // tree_cache lock released here — NOT held across the worker snapshot
         // or the solve.
 
-        // ── Pass 2: snapshot worker cache + capacity + load penalty ──
+        // ── Pass 2: snapshot worker cache + gate seeds + load penalty ──
         // One brief read lock; owned copies only, no `.await` while held.
         let mut workers: Vec<BatchSchedWorker> = Vec::new();
+        let gate_cfg;
         {
             let inner = self.inner.read().await;
             let assume_core_count = inner.assume_core_count;
             let load_byte_cost = inner.load_byte_cost;
+            // (M1-replay) Snapshot the live gate config so the counterfactual's
+            // cache-tier eligibility is byte-identical to the dispatch gate
+            // (`inner_find_and_reserve_worker`). Prod: enabled=true, threshold=0.
+            gate_cfg = BatchSchedGateCfg {
+                enabled: inner.p_headroom_gate_enabled,
+                idle_threshold_pct: inner.p_idle_threshold_pct,
+                override_factor: inner.p_headroom_override_factor,
+            };
             for (_wid, w) in inner.workers.0.iter() {
-                // Admissible slots at match time. A worker that cannot accept
-                // work (paused/draining/full) or is quarantined/pressured has
-                // zero admissible capacity — mirror the dispatch viability gate
-                // so the counterfactual assigns over the SAME feasible set.
+                // A worker that cannot accept work (paused/draining/full) or is
+                // quarantined/pressured is NOT viable — mirror the dispatch
+                // viability pre-scan so the counterfactual assigns over the SAME
+                // feasible set (`worker_is_viable`).
                 if !w.can_accept_work()
                     || w.quarantined_at.is_some()
                     || w.indefinite_pin_saturated
@@ -3898,21 +3914,11 @@ impl ApiWorkerScheduler {
                 {
                     continue;
                 }
-                let running = w.running_action_infos.len() as u64;
-                let capacity = if w.max_inflight_tasks == 0 {
-                    // Unbounded worker: give it enough slots to hold the whole
-                    // sampled window this cycle (effectively unbounded here).
-                    sampled_roots.len() as u64
-                } else {
-                    w.max_inflight_tasks.saturating_sub(running)
-                };
-                if capacity == 0 {
-                    continue;
-                }
                 // Snapshot the load penalty with the SAME zero-load handling as
                 // dispatch (`cap_score` closure): a worker that never reported
                 // load is treated as fully busy (100/100/100) so it does not win
-                // a min-load tie on a phantom all-free reading.
+                // a min-load tie on a phantom all-free reading. CONSTANT across
+                // the solve (the gate is the contention, not a load ramp).
                 let cap = if w.has_reported_load {
                     capacity_score(
                         w.p_core_load_pct,
@@ -3936,14 +3942,18 @@ impl ApiWorkerScheduler {
                 };
                 workers.push(BatchSchedWorker {
                     cached_subtree_digests: w.cached_subtree_digests.clone(),
-                    capacity,
+                    // (M1-replay) SEED the fresh in-flight count — the contention
+                    // driver the gate keys on. Do NOT zero it.
+                    running: w.running_action_infos.len() as u64,
+                    p_core_count: w.p_core_count,
+                    p_core_load_pct: w.p_core_load_pct,
                     load_penalty: cap.load_penalty,
                 });
             }
         }
         // inner read lock released here — the solve runs lock-free.
 
-        let gain = compute_batch_sched_gain(&actions, &workers);
+        let gain = compute_batch_sched_gain(&actions, &workers, gate_cfg);
         (gain, uncached_skipped)
     }
 
@@ -5933,6 +5943,65 @@ impl ApiWorkerScheduler {
             )
         })?;
         worker.set_core_counts(p_core_count, e_core_count);
+        Ok(())
+    }
+
+    /// Test-only: force a registered worker's FRESH in-flight count to exactly
+    /// `running` by populating `running_action_infos` with dummy entries. The M1
+    /// P-headroom gate (and the batch-sched counterfactual that replays it) keys
+    /// on `running_action_infos.len()`, so seeding a worker across the
+    /// `p_core_count` gate boundary is how tests drive the gated/lifted regimes.
+    /// `peek_mut` to avoid LRU promotion (a fixture fact, not a work assignment).
+    async fn set_worker_running_count(
+        &self,
+        worker_id: &WorkerId,
+        running: usize,
+    ) -> Result<(), Error> {
+        use nativelink_util::action_messages::{
+            ActionInfo, ActionUniqueKey, ActionUniqueQualifier,
+        };
+        use nativelink_util::digest_hasher::DigestHasherFunc;
+
+        use crate::worker::{ActionInfoWithProps, PendingActionInfoData};
+
+        let mut inner = self.inner.write().await;
+        let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+            make_input_err!(
+                "Worker not found in worker map in set_worker_running_count() {}",
+                worker_id
+            )
+        })?;
+        worker.running_action_infos.clear();
+        for _ in 0..running {
+            // `OperationId::default()` is a fresh v4 UUID each call, so the
+            // HashMap keys are distinct and its length equals `running` — the
+            // fresh count the M1 gate reads.
+            let action = ActionInfoWithProps {
+                inner: Arc::new(ActionInfo {
+                    command_digest: DigestInfo::new([0u8; 32], 0),
+                    input_root_digest: DigestInfo::new([0u8; 32], 0),
+                    timeout: Duration::MAX,
+                    platform_properties: HashMap::new(),
+                    priority: 0,
+                    load_timestamp: UNIX_EPOCH,
+                    insert_timestamp: SystemTime::now(),
+                    unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                        instance_name: "main".to_string(),
+                        digest_function: DigestHasherFunc::Sha256,
+                        digest: DigestInfo::new([7u8; 32], 1),
+                    }),
+                }),
+                platform_properties: PlatformProperties::default(),
+            };
+            worker
+                .running_action_infos
+                .insert(OperationId::default(), PendingActionInfoData { action_info: action });
+        }
+        assert_eq!(
+            worker.running_action_infos.len(),
+            running,
+            "fixture must set exactly `running` in-flight actions"
+        );
         Ok(())
     }
 }
@@ -8532,33 +8601,40 @@ mod tests {
             None,
             512 * 1024,
             8,
-            false,
-            0,
-            2,
+            true, // (M1-replay) P-headroom gate ON — the seam test replays the live gate
+            0,    // p_idle_threshold_pct = 0 (v1 behavior, matching prod)
+            2,    // p_headroom_override_factor (prod default; inert at threshold 0)
         );
         (scheduler, r1_digest, r2_digest, c_digest)
     }
 
-    /// (#batch-sched, testing-czar GAP) END-TO-END probe seam: the counterfactual
-    /// extraction in `batch_sched_gain_for_probe` reads each cached tree's
-    /// `dir_direct_bytes` / `dir_direct_files` (both `HashMap<DigestInfo,u64>` — a
-    /// swap COMPILES clean) and a worker snapshot. The only pre-existing probe
-    /// test ran `cas_store: None` → `tree_cache` empty → ONLY the miss arm ran,
-    /// leaving the extraction DEAD in the suite. This test warms `tree_cache` with
-    /// two REAL resolved trees sharing a subtree, gives one worker a warm cache
-    /// on the shared subtree, and asserts a NON-ZERO gain (and the exact overlap)
-    /// flows through the real `batch_sched_gain_for_probe`.
+    /// (#batch-sched / M1-replay, testing-czar GAP) END-TO-END probe seam: the
+    /// counterfactual extraction in `batch_sched_gain_for_probe` reads each cached
+    /// tree's `dir_direct_bytes` / `dir_direct_files` (both
+    /// `HashMap<DigestInfo,u64>` — a swap COMPILES clean), snapshots each worker's
+    /// FRESH `running` count + `p_core_count` + `p_core_load_pct` + `load_penalty`,
+    /// and REPLAYS the live M1 P-headroom gate. This test warms `tree_cache` with
+    /// two REAL resolved trees sharing a subtree, seeds workers ACROSS the gate
+    /// boundary, and asserts a NON-ZERO gain flows through the real probe — driven
+    /// by the FRESH-count gate contention (NOT the retired `max_inflight_tasks`
+    /// slot budget).
     ///
-    /// Gain scenario (intra-batch warming): `sampled_roots = [r1, r2, r2]`
-    /// (three pending actions, all containing shared dir `c`). W0 caches `c`
-    /// (1 slot); W1 caches nothing (2 slots). GREEDY places one `c`-match on W0
-    /// (`s_c`), the other two cold on W1 (greedy models no warming) → G = s_c =
-    /// c.direct = 200 + 2·PER_FILE_WEIGHT = 205000. BATCH: r1→W0 (s_c); r2→W1 cold
-    /// (0) warms W1 with {r2, c}; the SECOND r2→W1 now scores BOTH its own r2
-    /// direct AND the warmed c → s_r2c = (900 + PER_FILE_WEIGHT) + (200 +
-    /// 2·PER_FILE_WEIGHT) = 308100. B = 205000 + 0 + 308100 = 513100 →
-    /// gain = (513100−205000)/205000 = 150 (floor). A non-zero gain flowing
-    /// through the REAL probe — the whole point of the seam test.
+    /// Gate-driven gain scenario (`sampled_roots = [r1, r2, r2]`, all containing
+    /// shared dir `c`; M4 shape p_core=4; gate ON, threshold 0):
+    ///   - W0: caches `c`, seeded `running=3` (< 4 → p_headroom, ONE slot before
+    ///     it crosses the gate boundary), low p_load.
+    ///   - W1: cold, seeded `running=2` (< 4 → p_headroom, two slots), low p_load.
+    /// GREEDY (priority order): A1(r1) argmax over eligible {W0 (c-match
+    ///   s=205000), W1 (0)} → W0; W0 `running` 3→4 → LOSES p_headroom. A2(r2): W0
+    ///   gate-excluded, gate still active (W1 has headroom) → only W1 eligible →
+    ///   cold (0), W1 3. A3(r2): W1 still has headroom → cold (0). Greedy models NO
+    ///   warming → G = 205000 + 0 + 0 = 205000.
+    /// BATCH (global + warming, gated): r1→W0 (205000; W0 →running 4, loses
+    ///   headroom); r2→W1 cold (0) WARMS W1 with {r2,c}; the SECOND r2→W1 now
+    ///   scores BOTH its own r2 direct AND the warmed c → s = (900+PER_FILE_WEIGHT)
+    ///   + (200 + 2·PER_FILE_WEIGHT) = 103300 + 205000 = 308300. B = 205000 + 0 +
+    ///   308300 = 513300 → gain = (513300−205000)/205000 = 150 (floor). A non-zero
+    ///   gain flowing through the REAL probe, produced by the fresh-count gate.
     ///
     /// Overlap scenario (swap-detecting): shared dirs (≥2 actions) are `c` (all 3)
     /// and `r2` (2 actions). Byte-share (c 200 + r2 900 = 1100) over total
@@ -8593,20 +8669,33 @@ mod tests {
             .find(|d| **d != r1)
             .expect("#batch-sched: r1's resolved tree must contain the shared subdir c");
 
-        // W0: 1 slot, warm on the shared subtree c. W1: 2 slots, cold.
+        // W0: warm on the shared subtree c. W1: cold. Both M4 shape (p_core=4)
+        // and seeded ACROSS the gate boundary so the FRESH-count gate (not a slot
+        // budget) is the contention. `max_inflight_tasks` here (100) is IRRELEVANT
+        // to the counterfactual under the M1-replay model.
         let (tx0, _rx0) = mpsc::unbounded_channel();
         scheduler
-            .add_worker(Worker::new(WorkerId("W0".to_string()), PlatformProperties::default(), tx0, 1, 1))
+            .add_worker(Worker::new(WorkerId("W0".to_string()), PlatformProperties::default(), tx0, 1, 100))
             .await
             .expect("add W0");
         let (tx1, _rx1) = mpsc::unbounded_channel();
         scheduler
-            .add_worker(Worker::new(WorkerId("W1".to_string()), PlatformProperties::default(), tx1, 1, 2))
+            .add_worker(Worker::new(WorkerId("W1".to_string()), PlatformProperties::default(), tx1, 1, 100))
             .await
             .expect("add W1");
-        // Report low load on both so their load_penalty is small + equal (the
-        // C-cache match dominates the greedy argmax regardless, but this keeps
-        // the scenario deterministic).
+        // M4 P-core shape (4 P-cores) so the fresh-count gate boundary is at
+        // running==4.
+        scheduler
+            .set_worker_core_counts(&WorkerId("W0".to_string()), 4, 6)
+            .await
+            .expect("core counts W0");
+        scheduler
+            .set_worker_core_counts(&WorkerId("W1".to_string()), 4, 6)
+            .await
+            .expect("core counts W1");
+        // Report low P-load on both so their load_penalty is 0 + equal (the
+        // c-cache match dominates the greedy argmax; the gate — not load — is the
+        // contention).
         scheduler
             .update_worker_load(&WorkerId("W0".to_string()), 10, 10, 10)
             .await
@@ -8615,6 +8704,16 @@ mod tests {
             .update_worker_load(&WorkerId("W1".to_string()), 10, 10, 10)
             .await
             .expect("load W1");
+        // Seed fresh in-flight counts ACROSS the gate boundary: W0 at 3 (one slot
+        // of p_headroom → loses it after ONE assignment), W1 at 2 (two slots).
+        scheduler
+            .set_worker_running_count(&WorkerId("W0".to_string()), 3)
+            .await
+            .expect("seed running W0");
+        scheduler
+            .set_worker_running_count(&WorkerId("W1".to_string()), 2)
+            .await
+            .expect("seed running W1");
         // W0 warm on c (a FULL-snapshot cached-subtree update).
         scheduler
             .update_cached_subtrees(&WorkerId("W0".to_string()), true, vec![c_digest], Vec::new(), Vec::new())
@@ -8639,16 +8738,23 @@ mod tests {
         );
         assert_eq!(
             gain.sample_workers, 2,
-            "#batch-sched: both capacity-bearing workers must be counted; got {}",
+            "#batch-sched: both viable workers must be counted; got {}",
             gain.sample_workers
         );
         assert_eq!(
+            gain.greedy_score, 205000,
+            "#batch-sched M1-replay: GREEDY places A1(r1)→W0 (c-match 205000), pushing W0 \
+             to running=4 → loses p_headroom; A2/A3 (r2) find W0 gate-excluded and land \
+             cold on W1 (0 each; greedy models no warming) → G=205000. got {}",
+            gain.greedy_score
+        );
+        assert_eq!(
             gain.gain_pct, 150,
-            "#batch-sched: intra-batch warming lets the 2nd co-located r2 action on the cold \
-             2-slot worker score BOTH its own r2 direct AND the warmed shared subtree c → \
-             B = 205000 (r1→W0) + 0 (r2→W1 cold) + 308100 (r2→W1 warm) = 513100 vs G = 205000 → \
-             gain 150 flowing through the REAL probe (tree_cache peek + worker snapshot + solve). \
-             got {}",
+            "#batch-sched M1-replay: the FRESH-count gate (W0 loses headroom after r1) \
+             spills the two r2 actions to the cold W1; intra-batch warming lets the 2nd \
+             r2 on W1 score BOTH its own r2 direct AND the warmed shared subtree c → \
+             B = 205000 (r1→W0) + 0 (r2→W1 cold) + 308300 (r2→W1 warm) = 513300 vs \
+             G = 205000 → gain 150 flowing through the REAL probe. got {}",
             gain.gain_pct
         );
         assert_eq!(

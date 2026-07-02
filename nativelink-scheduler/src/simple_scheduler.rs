@@ -303,26 +303,84 @@ pub struct BatchSchedAction {
     pub dir_direct_files: HashMap<DigestInfo, u64>,
 }
 
-/// (#batch-sched) One worker-with-capacity in the counterfactual. Snapshotted
-/// under the scheduler lock, then the solve runs lock-free over these owned
-/// copies. `capacity` is the worker's admissible slot count at match time
-/// (`max_inflight_tasks − running_action_infos.len()`, gated by
-/// `can_accept_work` + viability) — the SAME headroom the real gate applies, so
-/// batch cannot cheat by piling every action on the single best-cached worker.
+/// (#batch-sched / M1-replay) One worker in the counterfactual, snapshotted
+/// under the scheduler lock; the solve then runs lock-free over these owned
+/// copies. FAITHFULLY REPLAYS the live M1 P-headroom gate: the CONTENTION driver
+/// is the FRESH in-flight count (`running`) against `p_core_count` cache-tier
+/// eligibility (mirroring `worker_has_p_headroom` in `api_worker_scheduler.rs`),
+/// NOT an `max_inflight_tasks` slot budget. The gate is CONFIRMED ON in prod
+/// (25,303 `p_headroom_gate_exclusion` events observed live 2026-07-02) at
+/// `p_idle_threshold_pct == 0` (v1 behavior — workers at `running==p_core` with
+/// `p_load` as low as 0 are still excluded, so the override clause never fires).
+/// Every sampled action is PLACED (contention comes from the gate, not a slot
+/// count); when the gate lifts (no viable worker has headroom) cache-tier opens
+/// to all.
 #[derive(Debug, Clone)]
 pub struct BatchSchedWorker {
     /// The worker's cached directory subtree digests (its warm set at snapshot
     /// time). Scored against each action's `dir_digests`.
     pub cached_subtree_digests: HashSet<DigestInfo>,
-    /// Admissible slots remaining. Both greedy and batch respect it.
-    // CAPPED AT worker.max_inflight_tasks: derived from the worker's configured
-    // in-flight ceiling minus its running count; a per-cycle scratch value, not
-    // a network buffer.
-    pub capacity: u64,
-    /// The worker's continuous load penalty (`CapacityScore.load_penalty`), used
-    /// ONLY by the greedy counterfactual's `argmax_j (s − load_penalty_j)` so
-    /// greedy models the production load blend. Batch maximizes raw `Σ s`.
+    /// (M1-replay) SEED: the worker's FRESH in-flight action count at snapshot
+    /// (`running_action_infos.len()`). This is the contention driver — mirror of
+    /// the production gate's fresh count. RISES by 1 for each action the solver
+    /// assigns to this worker (so it can lose p_headroom mid-solve, exactly as
+    /// the real gate does under the write lock). Seeded from real state, NOT
+    /// zeroed.
+    // CAPPED AT (unbounded in principle, but) the sampled window size: `running`
+    // only ever rises by one per placed action within a single solve; a per-cycle
+    // scratch counter, not a network buffer.
+    pub running: u64,
+    /// (M1-replay) The worker's real reported P-core logical count. `has_p_headroom`
+    /// is `p_core_count == 0 || running < p_core_count || (override)`; a
+    /// `p_core_count == 0` worker (legacy/Linux/Intel-Mac) is ALWAYS ungated (A5).
+    pub p_core_count: u32,
+    /// (M1-replay) The worker's real reported P-core load percent. Feeds the
+    /// bounded override clause of `has_p_headroom` (`p_core_load_pct <
+    /// idle_threshold_pct && running < p_core_count*override_factor`). Inert at the
+    /// prod `idle_threshold_pct == 0`, carried so the mirror is EXACT if the
+    /// threshold is ever raised.
+    pub p_core_load_pct: u32,
+    /// The worker's continuous load penalty (`CapacityScore.load_penalty`),
+    /// computed ONCE from the real snapshot (NOT recomputed per assignment — the
+    /// gate is the contention, not a load ramp). Used ONLY by the greedy
+    /// counterfactual's `argmax_j (s − load_penalty_j)` so greedy models the
+    /// production Tier-1.5 load blend. Batch maximizes raw `Σ s`.
     pub load_penalty: i64,
+}
+
+/// (M1-replay) The live M1 P-headroom gate configuration, snapshotted from the
+/// scheduler (`p_headroom_gate_enabled` / `p_idle_threshold_pct` /
+/// `p_headroom_override_factor`) and threaded into the pure solve so the
+/// counterfactual's eligibility decisions are byte-identical to the dispatch
+/// gate. Prod values: `enabled = true`, `idle_threshold_pct = 0` (v1),
+/// `override_factor = 2` (inert at threshold 0).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchSchedGateCfg {
+    /// Mirror of `self.p_headroom_gate_enabled`. When `false` the gate is never
+    /// active and every worker is cache-tier-eligible (pre-gate parity).
+    pub enabled: bool,
+    /// Mirror of `self.p_idle_threshold_pct`. `0` (prod) makes the override
+    /// clause `p_load < 0` = never → EXACT v1 predicate.
+    pub idle_threshold_pct: u32,
+    /// Mirror of `self.p_headroom_override_factor`. Bounds the override to
+    /// `p_core_count * override_factor` in-flight actions when the threshold is
+    /// nonzero.
+    pub override_factor: u32,
+}
+
+impl BatchSchedGateCfg {
+    /// (M1-replay) Mirror of `worker_has_p_headroom` (`api_worker_scheduler.rs`).
+    /// A worker has P-headroom when: A5 `p_core_count == 0` (ungated legacy), OR a
+    /// genuine free P slot by the FRESH count (`running < p_core_count`), OR the
+    /// bounded idle-P override (`p_load < idle_threshold_pct && running <
+    /// p_core_count * override_factor`). All `u64` to match `running` against
+    /// `p_core_count` without truncation.
+    fn has_p_headroom(&self, w: &BatchSchedWorker) -> bool {
+        w.p_core_count == 0
+            || w.running < u64::from(w.p_core_count)
+            || (w.p_core_load_pct < self.idle_threshold_pct
+                && w.running < u64::from(w.p_core_count) * u64::from(self.override_factor))
+    }
 }
 
 /// (#batch-sched) The counterfactual result the probe stores into gauges.
@@ -353,6 +411,24 @@ pub struct BatchSchedGain {
     /// own gain. NOT an error — a real batch scheduler would simply keep the
     /// greedy result; this flag just makes the floor visible.
     pub greedy_fallback: bool,
+    /// (M1-replay) The greedy baseline `G` — the aggregate chosen `cache_score`
+    /// under priority-order assignment. Exposed raw (not just as the `gain_pct`
+    /// denominator) so a scrape can see the absolute cache-match mass greedy
+    /// captures, and so the "greedy is near-optimal under lift" regime is
+    /// legible (a large `greedy_score` at `gain_pct == 0`).
+    pub greedy_score: u64,
+    /// (M1-replay diagnostic gauge) Fraction of the GREEDY assignment steps on
+    /// which the gate was ACTIVE (some viable worker still had p_headroom, so
+    /// cache-tier eligibility was restricted), `× 100`. `100` = every step
+    /// contended (the gate band); `0` = every step ran with the gate lifted
+    /// (all-full, cache-tier open to all). Reveals WHICH regime the fleet is in
+    /// when interpreting `gain_pct`. `0` when there were no greedy steps.
+    pub gate_active_frac: u64,
+    /// (M1-replay diagnostic gauge) Mean SEEDED `running` count across the
+    /// sampled workers, `× 100` (so the sub-integer mean is legible). Reveals how
+    /// deep in the gate band the fleet sits (near `p_core_count` = contended;
+    /// well below = idle). `0` when there are no sampled workers.
+    pub mean_seed_running: u64,
 }
 
 /// (#batch-sched) Scalar subtree-match score `s(i,j)` for `action` against
@@ -370,45 +446,62 @@ fn batch_sched_score(action: &BatchSchedAction, worker_cache: &HashSet<DigestInf
     cached_bytes + cached_files * PER_FILE_WEIGHT
 }
 
-/// (#batch-sched) OBSERVABILITY-ONLY counterfactual: over the sampled pending
-/// window `actions` (PRIORITY order) and `workers` (with capacity), compute the
-/// aggregate subtree-match score under the current GREEDY priority-order
-/// assignment `G` vs a global capacity-constrained BATCH assignment `B`
-/// (reorder + intra-batch warming), and report `(B − G)/G` as `gain_pct` plus
-/// coverage/overlap guardrails. PURE: no I/O, no lock, no scheduler state — the
-/// caller extracts `actions`/`workers` from already-cached data. It does NOT
-/// change dispatch (the real scheduler stays greedy).
+/// (#batch-sched / M1-replay) OBSERVABILITY-ONLY counterfactual: over the sampled
+/// pending window `actions` (PRIORITY order) and `workers` (seeded from real
+/// state), compute the aggregate subtree-match score under the current GREEDY
+/// priority-order assignment `G` vs a global BATCH assignment `B` (reorder +
+/// intra-batch warming), each subject to the LIVE M1 P-headroom gate, and report
+/// `(B − G)/G` as `gain_pct` plus coverage/overlap/regime guardrails. PURE: no
+/// I/O, no lock, no scheduler state — the caller extracts `actions`/`workers`
+/// from already-cached data. It does NOT change dispatch (the real scheduler
+/// stays greedy).
+///
+/// M1 GATE REPLAY (the contention model — `gate_cfg`): a worker is CACHE-TIER-
+/// ELIGIBLE only when the gate permits it, mirroring the production dispatch gate
+/// in `inner_find_and_reserve_worker`. Per assignment step:
+/// - `gate_active = gate_cfg.enabled && (∃ worker j with has_p_headroom(j))`,
+///   recomputed as `running_j` rises (the Phase-1/Phase-2 fold: when NO worker
+///   has p_headroom the gate LIFTS and cache-tier opens to ALL).
+/// - eligible(j) = `!gate_active || has_p_headroom(j)`.
+///
+/// `has_p_headroom` = `BatchSchedGateCfg::has_p_headroom` = the byte-exact mirror
+/// of `worker_has_p_headroom` (fresh-count `running < p_core_count`, A5
+/// `p_core==0` ungated, bounded idle-P override — inert at the prod
+/// `idle_threshold_pct == 0`). The gate is CONFIRMED ON in prod (25,303 exclusion
+/// events observed live 2026-07-02) at threshold 0 (v1). The CONTENTION is the
+/// gate; there is NO `max_inflight_tasks` slot budget — EVERY action is placed
+/// (once the gate lifts there is always ≥1 eligible worker).
 ///
 /// GREEDY `G` (models the CACHE-AFFINITY greedy — Tier-1.5 load-blend, NOT the
 /// whole selector): walk `actions` in priority order; each takes
-/// `argmax_j (s(i,j) − load_penalty_j)` over workers with remaining capacity,
-/// decrements that worker, and adds the chosen `s(i,j)` (NOT the penalized
-/// value — the metric measures cache-match mass, the penalty only steers the
-/// choice). Greedy does NOT model warming — it scores against each worker's
-/// snapshot cache only, matching one-at-a-time dispatch.
+/// `argmax_j (s(i,j) − load_penalty_j)` over CACHE-ELIGIBLE workers, then
+/// `running_j += 1` (so the worker can lose p_headroom for the NEXT action,
+/// exactly as the real gate does under the write lock), and adds the chosen
+/// `s(i,j)` (NOT the penalized value — the metric measures cache-match mass, the
+/// penalty only steers the choice). `load_penalty_j` is CONSTANT (computed once
+/// from the real snapshot; the gate is the contention, not a load ramp). Greedy
+/// does NOT model warming — it scores each worker's snapshot cache, matching
+/// one-at-a-time dispatch.
 ///
-/// SCOPE (assumption-auditor 2026-07-02): `G` reproduces production's Tier-1.5
-/// `argmax(s − load_penalty)` cache-affinity ranking ONLY. It deliberately
-/// HOLDS ASIDE the tiers/keys the real selector wraps around that ranking — the
-/// `p_headroom_pref` PRIMARY key (M1 v2), the `blended_s > 0` crossover, and the
-/// exact-root (Tier-1) / LRU (Tier-2) tiers — because the metric ISOLATES the
-/// SUBTREE-CACHE-AFFINITY assignment gap (does subtree-aware batching beat the
-/// cache-affinity greedy). Adding `p_headroom_pref` to `G` would fold headroom
-/// steering back in and blur the cache-affinity signal this gauge exists to
-/// measure. `gain_pct` is therefore the batch gap OVER THE CACHE-AFFINITY GREEDY,
-/// not over the full production selector.
+/// SCOPE: `G` reproduces production's Tier-1.5 `argmax(s − load_penalty)` cache-
+/// affinity ranking UNDER THE M1 GATE. It deliberately holds aside the
+/// `p_headroom_pref` SECONDARY-ranking key (M1 v2 — the intra-tier magnet fix),
+/// the `blended_s > 0` crossover, and the exact-root (Tier-1) / LRU (Tier-2)
+/// tiers, because the metric ISOLATES the subtree-cache-affinity ASSIGNMENT gap
+/// (does subtree-aware batching beat the cache-affinity greedy) while faithfully
+/// modeling the gate's ELIGIBILITY restriction (the real contention). `gain_pct`
+/// is therefore the batch gap over the CACHE-AFFINITY GREEDY within the gated
+/// eligibility, not over the full production selector.
 ///
-/// BATCH `B` (global, order-free, warming): greedy-global max-weight — each
-/// round picks the current best `(i, j)` pair (re-derived against the evolving
-/// warm set) and assigns it if the action is unassigned AND the worker has
-/// capacity. Model INTRA-BATCH WARMING: when `A_i` is assigned to `W_j`, add
-/// `A_i.dir_digests` to `W_j`'s will-be-warm set, so a later co-located action
-/// assigned to `W_j` scores the shared subtree as cached (the co-location
-/// benefit — a shared cold subtree is materialized once, then reused). Because
-/// warming CHANGES scores after each assignment, pairs are re-derived each round.
-/// This is the cheap greedy-global approximation the design specifies (NOT
-/// Hungarian): `O(rounds × actions × workers)` set-membership, bounded by the
-/// sampled window and ~10-worker fleet.
+/// BATCH `B` (global, order-free, warming, gated): greedy-global max-weight —
+/// each round picks the current best `(i, j)` pair over CACHE-ELIGIBLE workers
+/// (gate re-evaluated as `running` rises), assigns it, `running_j += 1`, and
+/// models INTRA-BATCH WARMING (add `A_i.dir_digests` to `W_j`'s will-be-warm set
+/// so a later co-located action assigned to `W_j` scores the shared subtree as
+/// cached). Ranks by RAW `s` (max) — the cache-match mass; the load penalty only
+/// steers greedy. Because warming + the gate CHANGE eligibility/scores after each
+/// assignment, pairs are re-derived each round. `O(rounds × actions × workers)`
+/// set-membership, bounded by the sampled window and ~10-worker fleet.
 ///
 /// `B` is defined `max(B_heuristic, G)`: the from-scratch greedy-global is a
 /// HEURISTIC, not the optimum, so it can score below `G` on contended cycles;
@@ -420,17 +513,33 @@ fn batch_sched_score(action: &BatchSchedAction, worker_cache: &HashSet<DigestInf
 /// `gain_pct` is guarded on `G == 0` (empty inputs, or every greedy placement
 /// cold) → `0`, avoiding divide-by-zero; a genuine positive potential requires
 /// a nonzero greedy baseline (read alongside `sample_actions`/`sample_workers`).
+///
+/// Diagnostics: `greedy_score = G`; `gate_active_frac` = fraction of greedy steps
+/// with the gate active (×100 — 100 = fully contended band, 0 = all-lifted);
+/// `mean_seed_running` = mean seeded `running` across sampled workers (×100).
+/// These make the REGIME visible in a scrape when interpreting `gain_pct`.
 pub fn compute_batch_sched_gain(
     actions: &[BatchSchedAction],
     workers: &[BatchSchedWorker],
+    gate_cfg: BatchSchedGateCfg,
 ) -> BatchSchedGain {
     let sample_actions = actions.len() as u64;
     let sample_workers = workers.len() as u64;
 
     let subtree_overlap_pct = compute_subtree_overlap_pct(actions);
 
+    // (M1-replay diagnostic) Mean seeded running across sampled workers, ×100.
+    // Computed over the SEED counts (before any solve mutates them) so it reports
+    // the fleet's real depth in the gate band. `0` when no workers.
+    let mean_seed_running = if workers.is_empty() {
+        0
+    } else {
+        let sum_running: u64 = workers.iter().map(|w| w.running).sum();
+        sum_running * 100 / workers.len() as u64
+    };
+
     // Nothing to assign in either direction → no gain, but still report
-    // coverage + overlap so the reader sees WHY gain is 0.
+    // coverage + overlap + the seed diagnostic so the reader sees WHY gain is 0.
     if actions.is_empty() || workers.is_empty() {
         return BatchSchedGain {
             gain_pct: 0,
@@ -438,20 +547,32 @@ pub fn compute_batch_sched_gain(
             sample_actions,
             sample_workers,
             greedy_fallback: false,
+            greedy_score: 0,
+            gate_active_frac: 0,
+            mean_seed_running,
         };
     }
 
-    let greedy = greedy_assignment_score(actions, workers);
-    let batch_heuristic = batch_assignment_score(actions, workers);
+    let (greedy, gate_active_steps, greedy_steps) =
+        greedy_assignment_score(actions, workers, gate_cfg);
+    let batch_heuristic = batch_assignment_score(actions, workers, gate_cfg);
+
+    // (M1-replay diagnostic) Fraction of greedy steps with the gate active, ×100.
+    // Reveals the contended band (100) vs the all-lifted regime (0). `greedy_steps`
+    // is `actions.len()` (every action is placed), but guard against 0 defensively.
+    let gate_active_frac = if greedy_steps == 0 {
+        0
+    } else {
+        gate_active_steps * 100 / greedy_steps
+    };
 
     // `batch_assignment_score` is a from-scratch greedy-global HEURISTIC, NOT
-    // the optimal batch assignment — it can score BELOW `greedy` on ~2.75% of
-    // contended cycles (auditor 2026-07-02). A real batch scheduler would never
-    // do worse than greedy: it picks the better of its global solution and the
-    // greedy baseline. So define `B := max(B_heuristic, G)`. This makes
-    // `gain_pct = (B−G)/G ≥ 0` a genuine LOWER BOUND (no silent clip), and
-    // `greedy_fallback` records when the heuristic underperformed so the counter
-    // surfaces how often it undersells its own gain.
+    // the optimal batch assignment — it can score BELOW `greedy` on contended
+    // cycles. A real batch scheduler would never do worse than greedy: it picks
+    // the better of its global solution and the greedy baseline. So define
+    // `B := max(B_heuristic, G)`. This makes `gain_pct = (B−G)/G ≥ 0` a genuine
+    // LOWER BOUND (no silent clip), and `greedy_fallback` records when the
+    // heuristic underperformed so the counter surfaces how often it undersells.
     let greedy_fallback = batch_heuristic < greedy;
     let batch = batch_heuristic.max(greedy);
     // Guard G == 0: no greedy cache-match to improve on (divide-by-zero).
@@ -467,21 +588,62 @@ pub fn compute_batch_sched_gain(
         sample_actions,
         sample_workers,
         greedy_fallback,
+        greedy_score: greedy,
+        gate_active_frac,
+        mean_seed_running,
     }
 }
 
-/// (#batch-sched) GREEDY `G`: priority-order, one action at a time, each grabs
-/// its `argmax_j (s − load_penalty_j)` over workers with remaining capacity;
-/// sum the chosen `s` (unpenalized). No warming (models one-at-a-time dispatch).
-fn greedy_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWorker]) -> u64 {
-    let mut remaining: Vec<u64> = workers.iter().map(|w| w.capacity).collect();
+/// (M1-replay) Compute `gate_active` for the CURRENT step: the gate is active
+/// only when enabled AND some worker still has p_headroom (Phase-1). When NO
+/// worker has headroom the gate LIFTS (Phase-2) and cache-tier opens to all.
+/// Mirrors `p_gate_active = p_headroom_gate_enabled && any_viable_has_p_headroom`
+/// in `inner_find_and_reserve_worker`. (All sampled workers are viable — the
+/// probe snapshot already applied the viability filter, matching the production
+/// pre-scan that folds `any_viable_has_p_headroom` over VIABLE workers only.)
+fn gate_active_now(workers: &[BatchSchedWorker], gate_cfg: BatchSchedGateCfg) -> bool {
+    gate_cfg.enabled && workers.iter().any(|w| gate_cfg.has_p_headroom(w))
+}
+
+/// (M1-replay) GREEDY `G`: priority-order, one action at a time, each grabs its
+/// `argmax_j (s − load_penalty_j)` over CACHE-ELIGIBLE workers (the live M1 gate),
+/// then increments that worker's fresh `running` count (so it can lose
+/// p_headroom for the next action). Sum the chosen `s` (unpenalized —
+/// `load_penalty` steers the choice but the metric measures cache-match mass).
+/// No warming (models one-at-a-time dispatch). Returns
+/// `(total_score, gate_active_steps, total_steps)` for the diagnostic gauges.
+///
+/// EVERY action is placed: when no worker has p_headroom the gate LIFTS, so the
+/// eligible set is never empty (all viable workers become eligible). If an action
+/// finds no cache match on any eligible worker it still lands on the argmax
+/// (best `−load_penalty`) eligible worker, scoring that worker's real match
+/// (usually ~0) — matching production, which always dispatches a matched action.
+fn greedy_assignment_score(
+    actions: &[BatchSchedAction],
+    workers: &[BatchSchedWorker],
+    gate_cfg: BatchSchedGateCfg,
+) -> (u64, u64, u64) {
+    // Local mutable running counts, seeded from the real snapshot; rise as we
+    // assign (the fresh-count contention the gate keys on).
+    let mut state: Vec<BatchSchedWorker> = workers.to_vec();
     let mut total: u64 = 0;
+    let mut gate_active_steps: u64 = 0;
+    let mut steps: u64 = 0;
     for action in actions {
-        // argmax over workers with remaining capacity of (s − load_penalty).
+        steps += 1;
+        // Recompute the gate for THIS step over the current running counts: the
+        // Phase-1/Phase-2 fold. As workers fill, they lose headroom; when all
+        // lose it the gate lifts and cache-tier opens to all.
+        let gate_active = gate_active_now(&state, gate_cfg);
+        if gate_active {
+            gate_active_steps += 1;
+        }
+        // argmax over CACHE-ELIGIBLE workers of (s − load_penalty). Eligible =
+        // gate lifted OR this worker still has p_headroom.
         let mut best: Option<(usize, i64, u64)> = None; // (worker_idx, penalized, raw_s)
-        for (j, worker) in workers.iter().enumerate() {
-            if remaining[j] == 0 {
-                continue;
+        for (j, worker) in state.iter().enumerate() {
+            if gate_active && !gate_cfg.has_p_headroom(worker) {
+                continue; // gate-excluded from the cache tiers
             }
             let raw_s = batch_sched_score(action, &worker.cached_subtree_digests);
             let penalized = i64::try_from(raw_s).unwrap_or(i64::MAX) - worker.load_penalty;
@@ -491,36 +653,51 @@ fn greedy_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWo
             }
         }
         if let Some((j, _, raw_s)) = best {
-            remaining[j] -= 1;
+            state[j].running += 1;
             total += raw_s;
         }
-        // No capacity anywhere → this action goes unplaced (contributes 0),
-        // same as production leaving it queued for the next cycle.
+        // `best` is None only if the eligible set is empty, which cannot happen
+        // when there is ≥1 worker: if the gate is active some worker has
+        // headroom (else it would have lifted); if lifted every worker is
+        // eligible. So every action is placed.
     }
-    total
+    (total, gate_active_steps, steps)
 }
 
-/// (#batch-sched) BATCH `B`: global greedy-max-weight with intra-batch warming.
-/// Each round picks the current best `(action, worker)` pair (re-derived against
-/// the evolving per-worker warm set), assigns it, adds the action's `dir_digests`
-/// to that worker's warm set, and sums the score. Rounds continue while ANY
-/// unassigned action can still be placed on a capacity-bearing worker —
-/// INCLUDING zero-score (cold) placements, because a cold placement WARMS its
-/// worker so a later co-located sibling assigned there scores the shared subtree
-/// (the co-location benefit is exactly this second-order effect). Leftover
-/// actions (no capacity left) contribute 0. Reorder is inherent — pairs are
-/// ranked globally, not per-action in priority order.
+/// (M1-replay) BATCH `B`: global greedy-max-weight with intra-batch warming,
+/// under the live M1 P-headroom gate. Each round picks the current best
+/// `(action, worker)` pair over CACHE-ELIGIBLE workers (re-derived against the
+/// evolving warm set AND the evolving gate), assigns it, increments that
+/// worker's fresh `running` count, adds the action's `dir_digests` to that
+/// worker's warm set, and sums the RAW score `s`. Rounds continue while ANY
+/// unassigned action can still be placed on an eligible worker — INCLUDING
+/// zero-score (cold) placements, because a cold placement WARMS its worker so a
+/// later co-located sibling assigned there scores the shared subtree (the
+/// co-location benefit is exactly this second-order effect). Reorder is inherent
+/// — pairs are ranked globally, not per-action in priority order.
+///
+/// Gate re-evaluation: like greedy, the gate is recomputed each round over the
+/// current `running` counts (Phase-1/Phase-2 fold). A worker that fills to
+/// `running >= p_core_count` loses p_headroom and drops out of the cache-eligible
+/// set; when NO worker has headroom the gate lifts and cache-tier opens to all.
+/// So every action is eventually placeable (the eligible set is never empty when
+/// ≥1 worker exists).
 ///
 /// Pair ranking key (max wins): PRIMARY the current score `s`; SECONDARY, on a
 /// tie (notably the all-cold tie), the overlap of the action's `dir_digests`
 /// with the candidate worker's CURRENT warm set — so once one sibling warms a
 /// worker, the tie-break pulls its co-located siblings onto the SAME worker,
 /// grouping a shared cold subtree onto one materialization rather than
-/// scattering it (without this, two same-subtree cold actions could split
-/// across two single-slot workers and never warm each other). Ties beyond that
-/// resolve to the smallest (action_idx, worker_idx) for determinism.
-fn batch_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWorker]) -> u64 {
-    let mut remaining: Vec<u64> = workers.iter().map(|w| w.capacity).collect();
+/// scattering it. Ties beyond that resolve to the smallest (action_idx,
+/// worker_idx) for determinism.
+fn batch_assignment_score(
+    actions: &[BatchSchedAction],
+    workers: &[BatchSchedWorker],
+    gate_cfg: BatchSchedGateCfg,
+) -> u64 {
+    // Local mutable worker state (running rises as we assign — the gate keys on
+    // the fresh count).
+    let mut state: Vec<BatchSchedWorker> = workers.to_vec();
     // Per-worker will-be-warm set, seeded with the snapshot cache and grown as
     // actions are assigned (the intra-batch warming model).
     let mut warm: Vec<HashSet<DigestInfo>> = workers
@@ -531,8 +708,11 @@ fn batch_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWor
     let mut total: u64 = 0;
 
     // Each round assigns exactly one pair (if any is feasible); at most
-    // `actions.len()` rounds. Re-deriving scores each round captures warming.
+    // `actions.len()` rounds. Re-deriving scores each round captures warming AND
+    // the gate re-evaluation.
     for _round in 0..actions.len() {
+        // Recompute the gate for THIS round over the current running counts.
+        let gate_active = gate_active_now(&state, gate_cfg);
         // (score, warm_overlap) tuple maximized; ties → first-seen (smallest
         // action_idx then worker_idx).
         let mut best: Option<(usize, usize, u64, usize)> = None; // (i, j, s, warm_overlap)
@@ -540,9 +720,9 @@ fn batch_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWor
             if assigned[i] {
                 continue;
             }
-            for (j, _worker) in workers.iter().enumerate() {
-                if remaining[j] == 0 {
-                    continue;
+            for (j, worker) in state.iter().enumerate() {
+                if gate_active && !gate_cfg.has_p_headroom(worker) {
+                    continue; // gate-excluded from the cache tiers this round
                 }
                 let s = batch_sched_score(action, &warm[j]);
                 // Secondary key: how many of this action's dir digests the
@@ -564,7 +744,7 @@ fn batch_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWor
         match best {
             Some((i, j, s, _)) => {
                 assigned[i] = true;
-                remaining[j] -= 1;
+                state[j].running += 1;
                 // Warm the chosen worker with this action's subtrees so a later
                 // co-located action assigned here scores the shared subtree.
                 for d in &actions[i].dir_digests {
@@ -572,7 +752,9 @@ fn batch_assignment_score(actions: &[BatchSchedAction], workers: &[BatchSchedWor
                 }
                 total += s;
             }
-            // No unassigned action has any capacity-bearing worker left → stop.
+            // No unassigned action has any eligible worker this round. With ≥1
+            // worker the gate lift guarantees eligibility, so this only triggers
+            // once all actions are assigned (or there are zero workers) → stop.
             None => break,
         }
     }
@@ -718,6 +900,35 @@ pub struct BatchAffinityMetrics {
         help = "cumulative match cycles where the from-scratch batch heuristic underperformed greedy (B floored to G); a rising value means batch_sched_gain_pct is a loose lower bound on those cycles"
     )]
     pub batch_sched_greedy_fallback_total: AtomicU64,
+
+    /// (M1-replay) Gauge: the greedy baseline `G` — the aggregate chosen
+    /// `cache_score` under priority-order assignment at the last match cycle. The
+    /// `gain_pct` denominator, exposed raw so a large `greedy_score` at
+    /// `gain_pct == 0` reads as "greedy already near-optimal (heavy-load lift
+    /// regime)", not "no opportunity".
+    #[metric(
+        help = "batch-scheduling greedy baseline G: aggregate chosen dir-cache-match score under the current greedy priority-order assignment, last match cycle (the gain_pct denominator)"
+    )]
+    pub batch_sched_greedy_score: AtomicU64,
+
+    /// (M1-replay diagnostic) Gauge: fraction of the GREEDY assignment steps on
+    /// which the live M1 P-headroom gate was ACTIVE (some viable worker still had
+    /// p_headroom → cache-tier eligibility restricted), ×100. `100` = fully
+    /// contended band; `0` = every step ran with the gate lifted (all-full).
+    /// Reveals WHICH regime the fleet is in when interpreting `batch_sched_gain_pct`.
+    #[metric(
+        help = "fraction (x100) of greedy assignment steps where the M1 P-headroom gate was active (contended band) vs lifted (all-full), last match cycle; interpret batch_sched_gain_pct against this"
+    )]
+    pub batch_sched_gate_active_frac: AtomicU64,
+
+    /// (M1-replay diagnostic) Gauge: mean SEEDED `running` (fresh in-flight)
+    /// count across the sampled workers, ×100 (so the sub-integer mean is
+    /// legible). Reveals how deep in the gate band the fleet sits (near
+    /// `p_core_count` = contended; well below = idle).
+    #[metric(
+        help = "mean seeded fresh in-flight (running_action_infos.len()) count across sampled workers, x100, last match cycle; how deep in the M1 gate band the fleet sits"
+    )]
+    pub batch_sched_mean_seed_running: AtomicU64,
 
     /// (SUPERSEDED — exact-input-root reference) Gauge:
     /// `pending_ops − distinct_input_roots` over the sampled pending prefix. Keys
@@ -1166,6 +1377,18 @@ impl SimpleScheduler {
         self.batch_affinity_metrics
             .batch_sched_uncached_skipped
             .store(uncached_skipped, Ordering::Relaxed);
+        // (M1-replay) The greedy baseline + the two regime-diagnostic gauges, so
+        // a scrape can tell the contended band from the all-lifted regime when
+        // reading gain_pct.
+        self.batch_affinity_metrics
+            .batch_sched_greedy_score
+            .store(gain.greedy_score, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .batch_sched_gate_active_frac
+            .store(gain.gate_active_frac, Ordering::Relaxed);
+        self.batch_affinity_metrics
+            .batch_sched_mean_seed_running
+            .store(gain.mean_seed_running, Ordering::Relaxed);
         // (#batch-sched) Count cycles where the from-scratch heuristic
         // underperformed greedy (B floored to G). CUMULATIVE — fetch_add, not
         // store — so operators see how OFTEN gain_pct is a loose lower bound.
@@ -2113,3 +2336,250 @@ impl WorkerScheduler for SimpleScheduler {
 }
 
 impl RootMetricsComponent for SimpleScheduler {}
+
+#[cfg(test)]
+mod batch_sched_gain_test {
+    //! (#p1p2 M1-replay) Prod-shape tests for the batch-scheduling counterfactual
+    //! that FAITHFULLY REPLAYS the live M1 P-headroom gate. The gate is CONFIRMED
+    //! ON in prod (25,303 `p_headroom_gate_exclusion` events observed live
+    //! 2026-07-02; workers at `running_actions=4, p_core_count=4, p_load=0/2/5`
+    //! are STILL excluded — proving `p_idle_threshold_pct == 0`, i.e. v1 behavior:
+    //! `has_p_headroom ⟺ p_core == 0 || running < p_core`). The contention driver
+    //! is the FRESH-count `p_core_count` cache-tier eligibility WITH the Phase-2
+    //! lift (when no viable worker has headroom, the gate lifts and cache-tier
+    //! opens to all). These fixtures use the real M4 shape (p_core=4, e_core=6)
+    //! and seed `running` SPANNING the gate boundary.
+
+    use std::collections::{HashMap, HashSet};
+
+    use nativelink_util::common::DigestInfo;
+
+    use super::{
+        BatchSchedAction, BatchSchedGateCfg, BatchSchedWorker, PER_FILE_WEIGHT,
+        compute_batch_sched_gain,
+    };
+
+    /// A distinct digest keyed by a single seed byte (the rest zero). Only
+    /// membership + the attached direct-byte weight matter for `s(i,j)`.
+    fn dg(seed: u8) -> DigestInfo {
+        DigestInfo::new([seed; 32], 0)
+    }
+
+    /// One action carrying `(digest, direct_bytes)` pairs. `dir_direct_files`
+    /// left empty so `s = Σ matching direct_bytes` (isolates the gate/assignment
+    /// logic from the `PER_FILE_WEIGHT` blend — the blend equality is pinned
+    /// separately by `per_file_weight_matches_dispatch`).
+    fn mk_action(dirs: &[(DigestInfo, u64)]) -> BatchSchedAction {
+        let mut dir_digests = HashSet::new();
+        let mut dir_direct_bytes = HashMap::new();
+        let dir_direct_files = HashMap::new();
+        for (d, bytes) in dirs {
+            dir_digests.insert(*d);
+            dir_direct_bytes.insert(*d, *bytes);
+        }
+        BatchSchedAction {
+            dir_digests,
+            dir_direct_bytes,
+            dir_direct_files,
+        }
+    }
+
+    /// One M4-shape worker: real `p_core_count`/`p_core_load_pct`, seeded fresh
+    /// `running` count (the contention driver), a warm cache, and a CONSTANT
+    /// `load_penalty` (computed once from the real snapshot in production; here
+    /// passed directly — most fixtures use 0 so cache-fit alone discriminates).
+    fn mk_worker(
+        cache: &[DigestInfo],
+        running: u64,
+        p_core_count: u32,
+        p_core_load_pct: u32,
+        load_penalty: i64,
+    ) -> BatchSchedWorker {
+        BatchSchedWorker {
+            cached_subtree_digests: cache.iter().copied().collect(),
+            running,
+            p_core_count,
+            p_core_load_pct,
+            load_penalty,
+        }
+    }
+
+    /// The live-replay gate config: enabled, threshold 0 (v1 behavior — the
+    /// override clause never fires, matching the 25,303-exclusion prod data),
+    /// factor 2 (prod default; inert at threshold 0).
+    const GATE_ON_V1: BatchSchedGateCfg = BatchSchedGateCfg {
+        enabled: true,
+        idle_threshold_pct: 0,
+        override_factor: 2,
+    };
+
+    /// (Test 1) CONTENDED-BAND GAIN. Warm cache-holders are gate-EXCLUDED
+    /// (`running ≥ p_core=4`); only a few coldish workers retain p_headroom
+    /// (`running < 4`). Two queued tasks whose only p_headroom-eligible options
+    /// differ in partial-cache-fit such that a GLOBAL assignment of the limited
+    /// p_headroom slots beats greedy priority-order.
+    ///
+    /// Fixture (all p_core=4, e_core omitted, load_penalty 0):
+    ///   - `WA` cache {p,q}, running=4 → EXCLUDED (holds the big A2 match but gated out).
+    ///   - `WC` cache {p,q}, running=3 → p_headroom (1 slot). Holds A1's p (100) AND A2's q (1000).
+    ///   - `WD` cache {r},   running=3 → p_headroom (1 slot). Holds A1's r (90) only.
+    ///   - A1 (priority 0) dir {p:100, r:90}. A2 (priority 1) dir {q:1000}.
+    ///
+    /// GREEDY (priority order): A1's argmax over the eligible {WC(s=100), WD(s=90)}
+    /// → WC (100); WC running 3→4 → LOSES headroom. A2 now: WC excluded (fresh count),
+    /// WA excluded (seeded ≥4), only WD eligible (s=0 for q). G = 100 + 0 = 100.
+    /// BATCH (global): A1→WD (90), A2→WC (1000). B = 1090.
+    /// gain = (1090−100)/100 = 990.
+    #[test]
+    fn contended_band_gain_reorder_beats_priority() {
+        let p = dg(1);
+        let q = dg(2);
+        let r = dg(3);
+        let actions = vec![
+            mk_action(&[(p, 100), (r, 90)]), // A1, priority 0
+            mk_action(&[(q, 1000)]),         // A2, priority 1
+        ];
+        let workers = vec![
+            mk_worker(&[p, q], 4, 4, 50, 0), // WA excluded (running==p_core)
+            mk_worker(&[p, q], 3, 4, 50, 0), // WC p_headroom, 1 slot
+            mk_worker(&[r], 3, 4, 50, 0),    // WD p_headroom, 1 slot
+        ];
+        let gain = compute_batch_sched_gain(&actions, &workers, GATE_ON_V1);
+        assert_eq!(
+            gain.greedy_score, 100,
+            "GREEDY (priority order): A1→WC(100) consumes WC's last fresh-count \
+             p_headroom slot (running 3→4); A2 then finds WC gate-excluded and WA \
+             seeded-excluded, so it lands cold on WD (0) → G=100. got {}",
+            gain.greedy_score
+        );
+        assert_eq!(
+            gain.gain_pct, 990,
+            "BATCH reorders: A1→WD(90), A2→WC(1000) → B=1090; gain=(1090−100)/100=990. \
+             A subtree-aware global assignment of the LIMITED p_headroom slots beats \
+             greedy priority-order. got {}",
+            gain.gain_pct
+        );
+    }
+
+    /// (Test 2) PHASE-2 LIFT → GAIN 0 (all workers full). ALL workers at
+    /// `running ≥ p_core=4` → no viable worker has p_headroom → the gate LIFTS →
+    /// cache-tier opens to ALL workers → greedy assigns each task to its unique
+    /// cache holder by cache lead → batch cannot improve → `gain_pct == 0`. This
+    /// documents the "under heavy load the gate is inert, greedy near-optimal"
+    /// regime. The NON-ZERO `greedy_score` is what the lift BUYS: without the lift
+    /// no worker would be cache-eligible and greedy would strand (G=0).
+    #[test]
+    fn phase2_lift_all_full_gain_zero_but_greedy_nonzero() {
+        let da = dg(10);
+        let db = dg(11);
+        let actions = vec![
+            mk_action(&[(da, 500)]), // A1 → only WA caches da
+            mk_action(&[(db, 700)]), // A2 → only WB caches db
+        ];
+        let workers = vec![
+            mk_worker(&[da], 4, 4, 90, 0), // WA full (running==p_core)
+            mk_worker(&[db], 5, 4, 90, 0), // WB full (running>p_core)
+        ];
+        let gain = compute_batch_sched_gain(&actions, &workers, GATE_ON_V1);
+        assert_eq!(
+            gain.greedy_score, 1200,
+            "the PHASE-2 LIFT opens cache-tier to all when no worker has headroom: \
+             greedy places A1→WA(500) + A2→WB(700) → G=1200. WITHOUT the lift, no \
+             worker is cache-eligible and greedy strands at 0. got {}",
+            gain.greedy_score
+        );
+        assert_eq!(
+            gain.gain_pct, 0,
+            "with the gate lifted, greedy already reaches each action's unique cache \
+             holder; a global batch cannot beat it → gain 0 (the heavy-load inert \
+             regime). got {}",
+            gain.gain_pct
+        );
+        assert_eq!(
+            gain.gate_active_frac, 0,
+            "gate LIFTED for every greedy step (no viable worker has headroom) → \
+             gate_active_frac 0. got {}",
+            gain.gate_active_frac
+        );
+    }
+
+    /// (Test 3) FRESH-COUNT CONTENTION: assigning `p_core − running` tasks to a
+    /// worker makes it lose p_headroom (cache-tier-ineligible for the NEXT action)
+    /// — verified through the eligibility recompute. `WC` (running=3, p_core=4,
+    /// caches d) has exactly ONE headroom slot; `WFill` (running=0, p_core=4, cold)
+    /// keeps the gate ACTIVE so the lift does not re-admit WC. Two actions both
+    /// matching d: greedy gives the 1st to WC (running 3→4, now excluded); the 2nd
+    /// finds WC gate-excluded and lands cold on WFill. Only ONE d-match is captured.
+    #[test]
+    fn fresh_count_recompute_shuts_worker_out_after_p_core_assignments() {
+        let d = dg(20);
+        let actions = vec![mk_action(&[(d, 1000)]), mk_action(&[(d, 1000)])];
+        let workers = vec![
+            mk_worker(&[d], 3, 4, 50, 0), // WC: 1 headroom slot, caches d
+            mk_worker(&[], 0, 4, 50, 0),  // WFill: deep headroom, keeps gate active, cold
+        ];
+        let gain = compute_batch_sched_gain(&actions, &workers, GATE_ON_V1);
+        assert_eq!(
+            gain.greedy_score, 1000,
+            "the FRESH-count recompute: A1→WC captures d (1000) and pushes WC to \
+             running=4 (== p_core) → WC loses p_headroom; A2 finds WC gate-excluded \
+             (WFill still holds the gate active) and lands cold on WFill (0). Exactly \
+             ONE d-match captured → G=1000. If the recompute were broken (running not \
+             re-evaluated) both would pile on WC → 2000. got {}",
+            gain.greedy_score
+        );
+    }
+
+    /// (Test 4) `greedy_score` + the two diagnostic gauges render. Contended-band
+    /// fixture (Test 1): `gate_active_frac` and `mean_seed_running` must carry the
+    /// regime-revealing values a scrape needs to interpret gain.
+    #[test]
+    fn greedy_score_and_diagnostic_gauges_render() {
+        let p = dg(1);
+        let q = dg(2);
+        let r = dg(3);
+        let actions = vec![mk_action(&[(p, 100), (r, 90)]), mk_action(&[(q, 1000)])];
+        let workers = vec![
+            mk_worker(&[p, q], 4, 4, 50, 0),
+            mk_worker(&[p, q], 3, 4, 50, 0),
+            mk_worker(&[r], 3, 4, 50, 0),
+        ];
+        let gain = compute_batch_sched_gain(&actions, &workers, GATE_ON_V1);
+        assert_eq!(
+            gain.greedy_score, 100,
+            "greedy_score (=G) must render for the contended-band regime. got {}",
+            gain.greedy_score
+        );
+        // Both greedy steps ran with the gate ACTIVE (some viable worker retained
+        // p_headroom on each step) → gate_active_frac = 100 (×100 of fraction 1.0).
+        assert_eq!(
+            gain.gate_active_frac, 100,
+            "both greedy assignment steps had a viable p_headroom worker → gate_active \
+             on 2/2 steps → gate_active_frac = 100 (×100). Reveals the CONTENDED band \
+             (vs 0 = all-lifted). got {}",
+            gain.gate_active_frac
+        );
+        // mean seeded running across the 3 sampled workers = (4+3+3)/3 = 3.33…,
+        // ×100 floored = 333.
+        assert_eq!(
+            gain.mean_seed_running, 333,
+            "mean seeded running across sampled workers = (4+3+3)/3 = 3.33 → ×100 = 333. \
+             Reveals how deep in the gate band the fleet sits. got {}",
+            gain.mean_seed_running
+        );
+    }
+
+    /// The blend constant `s = bytes + files*PER_FILE_WEIGHT` must match the
+    /// production Tier-1.5 dispatch constant (a divergent weight would make the
+    /// (B−G) delta compare against a fiction). Pins the equality the model relies
+    /// on.
+    #[test]
+    fn per_file_weight_matches_dispatch() {
+        assert_eq!(
+            PER_FILE_WEIGHT,
+            100 * 1024,
+            "PER_FILE_WEIGHT must equal the api_worker_scheduler.rs Tier-1.5 constant \
+             (100 KiB/file) so s(i,j) is byte-identical to the dispatch score"
+        );
+    }
+}

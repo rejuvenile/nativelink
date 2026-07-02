@@ -385,22 +385,26 @@ async fn batch_affinity_arrival_window_counter_render() -> Result<(), Error> {
     Ok(())
 }
 
-/// (#batch-sched) The SIX new batch-scheduling counterfactual metrics (five
-/// gauges + the `greedy_fallback_total` counter) must all render under the
-/// batch_affinity prefix on the REAL `/metrics` path. With no CAS store and no
-/// workers, the counterfactual has no cached trees to score, so
-/// `gain_pct`/`overlap_pct`/`sample_actions`/`sample_workers` are 0 and
-/// `uncached_skipped` equals the sampled pending count (every root is a
-/// tree_cache peek MISS — the probe never resolves). `greedy_fallback_total`
-/// stays 0 (no cached actions → no assignment to underperform on). This pins
-/// the metric NAMES (dashboards key on them) and the coverage-guardrail
-/// semantics.
+/// (#batch-sched / M1-replay) The NINE batch-scheduling counterfactual metrics
+/// (eight gauges + the `greedy_fallback_total` counter) must all render under the
+/// batch_affinity prefix on the REAL `/metrics` path — including the M1-replay
+/// additions `batch_sched_greedy_score`, `batch_sched_gate_active_frac`, and
+/// `batch_sched_mean_seed_running` (Test 4: the diagnostic gauges must be
+/// SCRAPE-VISIBLE so the regime is legible). With no CAS store and no workers,
+/// the counterfactual has no cached trees to score, so
+/// `gain_pct`/`overlap_pct`/`sample_actions`/`sample_workers`/`greedy_score`/
+/// `gate_active_frac`/`mean_seed_running` are 0 (no workers → mean 0; empty solve
+/// → gate_active_frac 0) and `uncached_skipped` equals the sampled pending count
+/// (every root is a tree_cache peek MISS — the probe never resolves).
+/// `greedy_fallback_total` stays 0 (no cached actions → no assignment to
+/// underperform on). This pins the metric NAMES (dashboards key on them) and the
+/// coverage-guardrail semantics.
 #[nativelink_test]
 async fn batch_sched_gauges_render() -> Result<(), Error> {
     let (scheduler, worker_scheduler, _notify) = new_scheduler();
 
     // Three pending ops (distinct actions). No workers, no CAS store → the
-    // counterfactual finds no cached trees and no capacity-bearing workers.
+    // counterfactual finds no cached trees and no viable workers.
     for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'A', 2, 1), (b'B', 3, 2)] {
         scheduler
             .add_action(
@@ -425,6 +429,9 @@ async fn batch_sched_gauges_render() -> Result<(), Error> {
         "batch_sched_sample_workers",
         "batch_sched_uncached_skipped",
         "batch_sched_greedy_fallback_total",
+        "batch_sched_greedy_score",
+        "batch_sched_gate_active_frac",
+        "batch_sched_mean_seed_running",
     ] {
         assert!(
             body.contains(&format!("\nscheduler_test_action_batch_affinity_{name} ")),
