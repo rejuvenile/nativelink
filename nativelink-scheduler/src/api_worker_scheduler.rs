@@ -3856,7 +3856,11 @@ impl ApiWorkerScheduler {
     /// (the gate, not a slot count, is the contention). `load_penalty` is
     /// snapshotted ONCE with the SAME `capacity_score` + zero-load handling
     /// dispatch uses (CONSTANT across the solve — the gate is the contention, not
-    /// a load ramp), so greedy's `argmax (s − load_penalty)` models production.
+    /// a load ramp), so greedy's `argmax (s − load_penalty)` models production —
+    /// INCLUDING the Tier-1.5 `blended_s > 0` crossover (a load-dominated marginal
+    /// pick contributes 0, shed to the idle LRU path, mirroring the `best.filter`
+    /// at the Tier-1.5 commit site), applied symmetrically to greedy AND batch so
+    /// `gain_pct` is an EXACT realizable gain rather than an up-biased upper bound.
     /// Workers that cannot accept work / are quarantined / pressured are excluded
     /// from the snapshot (the same viability the dispatch pre-scan folds over).
     ///

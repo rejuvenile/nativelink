@@ -476,32 +476,47 @@ fn batch_sched_score(action: &BatchSchedAction, worker_cache: &HashSet<DigestInf
 /// whole selector): walk `actions` in priority order; each takes
 /// `argmax_j (s(i,j) − load_penalty_j)` over CACHE-ELIGIBLE workers, then
 /// `running_j += 1` (so the worker can lose p_headroom for the NEXT action,
-/// exactly as the real gate does under the write lock), and adds the chosen
+/// exactly as the real gate does under the write lock). It adds the chosen
 /// `s(i,j)` (NOT the penalized value — the metric measures cache-match mass, the
-/// penalty only steers the choice). `load_penalty_j` is CONSTANT (computed once
-/// from the real snapshot; the gate is the contention, not a load ramp). Greedy
-/// does NOT model warming — it scores each worker's snapshot cache, matching
-/// one-at-a-time dispatch.
+/// penalty only steers the choice) ONLY when the chosen pick clears the Tier-1.5
+/// `blended_s > 0` CROSSOVER (`s(i,j) − load_penalty_j > 0`); when the cache
+/// saving does NOT beat the load cost production DECLINES the cache tier and the
+/// action falls to an idle LRU worker with NO cache benefit → it contributes 0
+/// (the action is still PLACED — `running_j` rises — so the gate keeps evolving).
+/// `load_penalty_j` is CONSTANT (computed once from the real snapshot; the gate is
+/// the contention, not a load ramp). Greedy does NOT model warming — it scores
+/// each worker's snapshot cache, matching one-at-a-time dispatch.
 ///
 /// SCOPE: `G` reproduces production's Tier-1.5 `argmax(s − load_penalty)` cache-
-/// affinity ranking UNDER THE M1 GATE. It deliberately holds aside the
-/// `p_headroom_pref` SECONDARY-ranking key (M1 v2 — the intra-tier magnet fix),
-/// the `blended_s > 0` crossover, and the exact-root (Tier-1) / LRU (Tier-2)
-/// tiers, because the metric ISOLATES the subtree-cache-affinity ASSIGNMENT gap
-/// (does subtree-aware batching beat the cache-affinity greedy) while faithfully
-/// modeling the gate's ELIGIBILITY restriction (the real contention). `gain_pct`
-/// is therefore the batch gap over the CACHE-AFFINITY GREEDY within the gated
-/// eligibility, not over the full production selector.
+/// affinity ranking UNDER THE M1 GATE, INCLUDING the `blended_s > 0` crossover
+/// (a load-dominated marginal pick is shed to the idle LRU path and contributes
+/// 0, exactly as `api_worker_scheduler.rs` `best.filter(|blended_s| *blended_s >
+/// 0)` does) — so `gain_pct` is an EXACT measure of the realizable reorder/warming
+/// benefit over the full production selector's supra-threshold picks, not an
+/// up-biased upper bound. It deliberately holds aside only the `p_headroom_pref`
+/// SECONDARY-ranking key (M1 v2 — the intra-tier magnet fix) and the exact-root
+/// (Tier-1) / LRU (Tier-2) tiers, because the metric ISOLATES the subtree-cache-
+/// affinity ASSIGNMENT gap (does subtree-aware batching beat the cache-affinity
+/// greedy) while faithfully modeling the gate's ELIGIBILITY restriction and the
+/// crossover (the real contention + the real load-shed). `gain_pct` is therefore
+/// the batch gap over the CACHE-AFFINITY GREEDY within the gated eligibility and
+/// the load-crossover, not over the exact-root/LRU tiers or the pref key.
 ///
 /// BATCH `B` (global, order-free, warming, gated): greedy-global max-weight —
 /// each round picks the current best `(i, j)` pair over CACHE-ELIGIBLE workers
 /// (gate re-evaluated as `running` rises), assigns it, `running_j += 1`, and
 /// models INTRA-BATCH WARMING (add `A_i.dir_digests` to `W_j`'s will-be-warm set
 /// so a later co-located action assigned to `W_j` scores the shared subtree as
-/// cached). Ranks by RAW `s` (max) — the cache-match mass; the load penalty only
-/// steers greedy. Because warming + the gate CHANGE eligibility/scores after each
-/// assignment, pairs are re-derived each round. `O(rounds × actions × workers)`
-/// set-membership, bounded by the sampled window and ~10-worker fleet.
+/// cached — the action LANDS on `W_j` and materializes its tree there whether or
+/// not the crossover credits the cache match). Ranks by RAW `s` (max) — the
+/// cache-match mass; the load penalty only steers greedy. It credits the chosen
+/// `s` ONLY when it clears the SAME Tier-1.5 `blended_s > 0` crossover greedy
+/// applies (`s − load_penalty_j > 0`); a load-dominated pick contributes 0
+/// (shed to the idle LRU path), applied SYMMETRICALLY so batch cannot claim a
+/// cache credit greedy zeroes for the same pick. Because warming + the gate
+/// CHANGE eligibility/scores after each assignment, pairs are re-derived each
+/// round. `O(rounds × actions × workers)` set-membership, bounded by the sampled
+/// window and ~10-worker fleet.
 ///
 /// `B` is defined `max(B_heuristic, G)`: the from-scratch greedy-global is a
 /// HEURISTIC, not the optimum, so it can score below `G` on contended cycles;
@@ -652,9 +667,21 @@ fn greedy_assignment_score(
                 best = Some((j, penalized, raw_s));
             }
         }
-        if let Some((j, _, raw_s)) = best {
+        if let Some((j, penalized, raw_s)) = best {
+            // The action is PLACED (the fresh count rises so the gate can shut
+            // this worker out for the next action) regardless of the crossover.
             state[j].running += 1;
-            total += raw_s;
+            // (Tier-1.5 `blended_s > 0` crossover, `api_worker_scheduler.rs`
+            // `best.filter(|blended_s| *blended_s > 0)`) — credit the cache match
+            // ONLY when it beats the load cost (`penalized = raw_s − load_penalty
+            // > 0`). When `penalized ≤ 0` production DECLINES the cache tier and
+            // the action falls to an idle LRU worker with NO cache benefit → this
+            // action contributes 0 to the cache-match mass (NOT `raw_s`). This
+            // makes G a faithful mirror that does not over-credit load-shed
+            // marginal picks (an up-bias on `gain_pct`).
+            if penalized > 0 {
+                total += raw_s;
+            }
         }
         // `best` is None only if the eligible set is empty, which cannot happen
         // when there is ≥1 worker: if the gate is active some worker has
@@ -744,13 +771,27 @@ fn batch_assignment_score(
         match best {
             Some((i, j, s, _)) => {
                 assigned[i] = true;
+                // The action LANDS on this worker (fresh count rises → the gate
+                // can shut it out next round) and materializes its input tree
+                // there (warming), regardless of the crossover — a real batch
+                // scheduler still places the action on SOME worker and warms it.
                 state[j].running += 1;
                 // Warm the chosen worker with this action's subtrees so a later
                 // co-located action assigned here scores the shared subtree.
                 for d in &actions[i].dir_digests {
                     warm[j].insert(*d);
                 }
-                total += s;
+                // (Tier-1.5 `blended_s > 0` crossover — the SAME predicate greedy
+                // applies, `api_worker_scheduler.rs` `best.filter(|blended_s|
+                // *blended_s > 0)`) — credit the cache match ONLY when it beats
+                // the load cost (`s − load_penalty > 0`). When `s − load_penalty
+                // ≤ 0` production DECLINES the cache tier and the action falls to
+                // an idle LRU worker with NO cache benefit → contribute 0 (NOT
+                // `s`). Applied symmetrically to G and B so batch cannot claim a
+                // cache credit greedy zeroes for the same load-dominated pick.
+                if i64::try_from(s).unwrap_or(i64::MAX) - state[j].load_penalty > 0 {
+                    total += s;
+                }
             }
             // No unassigned action has any eligible worker this round. With ≥1
             // worker the gate lift guarantees eligibility, so this only triggers
@@ -814,16 +855,46 @@ type AffinityClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 /// the current CACHE-AFFINITY greedy assignment THIS cycle (`(B−G)/G`; design
 /// `.claude/audits/batch-scheduling-subtree-assignment-metric-design-2026-07-02.md`).
 /// SCOPE: `G` models production's Tier-1.5 `argmax(s − load_penalty)`
-/// cache-affinity ranking ONLY — it holds the `p_headroom_pref` gate, the
-/// `blended_s > 0` crossover, and the exact-root/LRU tiers aside so the gauge
-/// ISOLATES the subtree-cache-affinity assignment gap, not the whole-selector
-/// gap. It is a genuine LOWER BOUND: `B := max(B_heuristic, G)`, so
-/// `gain_pct ≥ 0` and a rising `batch_sched_greedy_fallback_total` means the
-/// heuristic undersold the gain on those cycles (read "≥ this", not "no gain").
-/// Read it ONLY alongside the coverage guardrails: it is meaningful only when
+/// cache-affinity ranking UNDER THE LIVE M1 P-HEADROOM GATE, INCLUDING the
+/// `blended_s > 0` crossover (a load-dominated marginal pick is shed to the idle
+/// LRU path and contributes 0, mirroring `api_worker_scheduler.rs`
+/// `best.filter(|blended_s| *blended_s > 0)`) — so `gain_pct` is an EXACT measure
+/// of the realizable reorder/warming benefit over the selector's supra-threshold
+/// picks, NOT an up-biased upper bound. It holds aside only the `p_headroom_pref`
+/// SECONDARY key (M1 v2) and the exact-root (Tier-1) / LRU (Tier-2) tiers, so the
+/// gauge ISOLATES the subtree-cache-affinity assignment gap. It is a genuine LOWER
+/// BOUND: `B := max(B_heuristic, G)`, so `gain_pct ≥ 0` and a rising
+/// `batch_sched_greedy_fallback_total` means the heuristic undersold the gain on
+/// those cycles (read "≥ this", not "no gain"). It is a per-cycle POTENTIAL, not a
+/// realized speedup.
+///
+/// READ `gain_pct` ONLY WITH ITS COMPANIONS — it is meaningful only when
 /// `batch_sched_sample_actions ≥ 2`, `batch_sched_sample_workers ≥ 2`, and
-/// `batch_sched_uncached_skipped` is a small fraction (design §6). It is a
-/// per-cycle POTENTIAL, not a realized speedup.
+/// `batch_sched_uncached_skipped` is a small fraction (design §6), AND alongside
+/// `batch_sched_gate_active_frac` (≈100 = the CONTENDED band = the batch-target
+/// regime where reorder can help; ≈0 with a large `batch_sched_greedy_score` =
+/// the heavy-load lift regime where greedy is already near-optimal) and
+/// `batch_sched_subtree_overlap_pct` (is there batchable structure at all).
+///
+/// CAVEAT — `gain_pct == 0` does NOT mean "batch scheduling is not worth
+/// building." This gauge measures batch-over-greedy ASSIGNMENT QUALITY WITHIN the
+/// current M1 gate's eligibility. The GATE ITSELF is the dominant cache loss: it
+/// over-excludes idle-P cache-holders on the large majority of contended cycles
+/// (the upstream loss that the M1 v2 `p_headroom_pref` rebalance addresses),
+/// which is INVISIBLE to this gauge (the gauge takes the gate as given and only
+/// asks whether reorder+warming beats greedy under it). So a low `gain_pct` is a
+/// verdict on batch-vs-greedy under the gate, NOT on the value of fixing the gate.
+///
+/// CAVEAT — GATE-ON PREMISE. This model assumes the live M1 P-headroom gate is ON
+/// (verified 2026-07-02: 25,303 `p_headroom_gate_exclusion` events since boot;
+/// `p_headroom_gate_enabled: true` in the deployed config, `p_idle_threshold_pct
+/// == 0` → v1). The gauge threads the live `BatchSchedGateCfg` snapshot, so if the
+/// config DRIFTS to gate-OFF on a restart the model reverts to the ungated
+/// selector: with no eligibility restriction greedy already reaches each action's
+/// best cache holder and `gain_pct` collapses to a structural ≈0 — NOT a signal
+/// that batching is worthless, but that the premise this gauge is designed for
+/// (the gated regime) no longer holds. Cross-check `batch_sched_gate_active_frac`
+/// (0 across all cycles with the fleet contended = the gate is off).
 ///
 /// `batch_sched_subtree_overlap_pct` answers "is there batchable structure"
 /// (shared-subtree mass) — expected non-zero for builds sharing external-crate
@@ -843,12 +914,18 @@ type AffinityClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 #[derive(Debug, Default, MetricsComponent)]
 pub struct BatchAffinityMetrics {
     /// (#batch-sched) HEADLINE gauge: `(B − G) / G * 100` — the aggregate
-    /// subtree-cache-match score improvement a global capacity-constrained batch
-    /// assignment (reorder + intra-batch warming) would buy over the current
-    /// greedy priority-order assignment, computed over the sampled cached
-    /// pending window at the last match cycle. `0` when `G == 0` or coverage is
-    /// empty. MEANINGFUL ONLY with `batch_sched_sample_actions/workers ≥ 2` and
-    /// low `batch_sched_uncached_skipped` (design §6).
+    /// subtree-cache-match score improvement a global batch assignment (reorder +
+    /// intra-batch warming) would buy over the current greedy priority-order
+    /// assignment, both UNDER THE LIVE M1 P-HEADROOM GATE + the `blended_s > 0`
+    /// load crossover (so this is an EXACT realizable gain, not an upper bound),
+    /// computed over the sampled cached pending window at the last match cycle.
+    /// `0` when `G == 0` or coverage is empty. MEANINGFUL ONLY with
+    /// `batch_sched_sample_actions/workers ≥ 2`, low `batch_sched_uncached_skipped`,
+    /// and read against `batch_sched_gate_active_frac` (design §5/§6). `gain_pct ==
+    /// 0` is NOT "batch not worth building" — the GATE itself is the dominant cache
+    /// loss and is invisible here; this only measures batch-vs-greedy UNDER it.
+    /// Assumes the gate is ON (prod: enabled, threshold 0); a config drift to
+    /// gate-OFF collapses this to a structural ≈0 (see the struct-level doc).
     #[metric(
         help = "batch-scheduling potential: (B-G)/G percent aggregate dir-cache-match gain of a subtree-aware batch assignment over the current greedy, last match cycle; read with sample_actions/workers>=2 and low uncached_skipped"
     )]
@@ -2566,6 +2643,117 @@ mod batch_sched_gain_test {
             "mean seeded running across sampled workers = (4+3+3)/3 = 3.33 → ×100 = 333. \
              Reveals how deep in the gate band the fleet sits. got {}",
             gain.mean_seed_running
+        );
+    }
+
+    /// (Test 5) TIER-1.5 `blended_s > 0` CROSSOVER: when the argmax cache worker's
+    /// `cached_score − load_penalty ≤ 0` (the cache saving does NOT beat the load
+    /// cost), production's Tier-1.5 DECLINES that pick (`api_worker_scheduler.rs`
+    /// `best.filter(|blended_s| *blended_s > 0)`) — the action falls to an idle
+    /// LRU worker with cache contribution 0. The model mirrors this: such an action
+    /// contributes 0 (NOT its `cached_score`) to BOTH G and B, so `gain_pct` is an
+    /// EXACT measure of the realizable reorder benefit over supra-threshold picks
+    /// (not an up-biased upper bound that over-credits load-shed marginal picks).
+    ///
+    /// Fixture (gate ON, p_core=4; `WHold` deep-headroom keeps the gate active):
+    ///   - `A1` (priority 0) dir {y:100} — a SMALL cache value.
+    ///   - `A2` (priority 1) dir {z:900} — a LARGE cache value.
+    ///   - `WShared` caches {y,z}, running=3 → ONE headroom slot; holds BOTH y & z,
+    ///     load_penalty 0.
+    ///   - `WLoaded` caches {y}, running=3 → ONE headroom slot; holds y ONLY,
+    ///     load_penalty 200 (so a y-match here is `100 − 200 = −100` — load-dominated).
+    ///   - `WHold`  caches {}, running=0 → deep headroom, load_penalty 1000, cold.
+    ///
+    /// GREEDY (priority order): A1(y)→WShared (100; WShared's only slot consumed,
+    ///   running 3→4 → excluded). A2(z) then finds WShared gate-excluded; the only
+    ///   remaining eligible cache option is WLoaded, which does NOT cache z → cold
+    ///   (raw_s 0) → contributes 0. G = 100 (the z-value is STRANDED by priority
+    ///   order + the gate) — identical with or without the crossover (z found no
+    ///   cache match to shed).
+    /// BATCH (reorder): A2(z)→WShared (900 — the big match placed well; WShared
+    ///   →running 4 excluded). A1(y) then lands on WLoaded (its only remaining
+    ///   cache option), where `100 − 200 = −100 ≤ 0` → the CROSSOVER zeroes it (it
+    ///   fell to the LRU/idle path). B = 900 + 0 = 900 → gain = (900−100)/100 = 800.
+    /// WITHOUT the crossover BATCH would ALSO count A1's load-shed 100 on WLoaded →
+    ///   B = 1000 → gain 900 (the ~1.77× family of up-bias). The crossover makes
+    ///   the gain EXACT (800 = ONLY the realizable z-reorder benefit).
+    #[test]
+    fn crossover_load_dominated_pick_contributes_zero_exact_gain() {
+        let y = dg(30);
+        let z = dg(31);
+        let actions = vec![
+            mk_action(&[(y, 100)]), // A1, priority 0 — small
+            mk_action(&[(z, 900)]), // A2, priority 1 — large
+        ];
+        let workers = vec![
+            mk_worker(&[y, z], 3, 4, 50, 0),   // WShared: 1 slot, holds y AND z
+            mk_worker(&[y], 3, 4, 50, 200),    // WLoaded: 1 slot, holds y, load-dominated
+            mk_worker(&[], 0, 4, 50, 1000),    // WHold: deep headroom, keeps gate active, cold
+        ];
+        let gain = compute_batch_sched_gain(&actions, &workers, GATE_ON_V1);
+        assert_eq!(
+            gain.greedy_score, 100,
+            "GREEDY: priority order gives WShared's ONLY slot to the small A1(y)=100, \
+             then A2(z) is gate-excluded from WShared and finds no z-cache elsewhere \
+             (WLoaded caches only y) → z stranded cold → G=100. got {}",
+            gain.greedy_score
+        );
+        assert_eq!(
+            gain.gain_pct, 800,
+            "the Tier-1.5 `blended_s > 0` CROSSOVER: BATCH reorders A2(z)→WShared (900), \
+             spilling A1(y) to the LOADED WLoaded where 100−200=−100 ≤ 0 → the crossover \
+             zeroes it (fell to the LRU/idle path) → B=900+0=900 → gain=(900−100)/100=800 \
+             (ONLY the realizable z-reorder benefit). WITHOUT the crossover B would count \
+             the load-shed 100 → B=1000 → gain 900 (the up-bias). got {}",
+            gain.gain_pct
+        );
+    }
+
+    /// (Test 6) CROSSOVER SYMMETRY: G and B apply the `blended_s > 0` crossover
+    /// under the IDENTICAL predicate, so BATCH cannot claim a cache credit that
+    /// GREEDY zeroes for the SAME (action, worker) pairing. Fixture forces G and B
+    /// to the SAME assignment (A1→WA, A2→WB), so the ONLY thing that could produce
+    /// a non-zero gain is an asymmetric crossover (batch skipping the filter that
+    /// greedy applies). Asserting `gain_pct == 0` proves the crossover is symmetric.
+    ///
+    /// Fixture (gate ON, p_core=4; `WHold` keeps the gate active):
+    ///   - `A1` dir {s:1000} — only `WA` caches s. `A2` dir {d:300} — only `WB` caches d.
+    ///   - `WA` caches {s,d}, running=3 → ONE slot; supra s (1000), load_penalty 0.
+    ///   - `WB` caches {d},   running=3 → ONE slot; marginal d, load_penalty 500
+    ///     (a d-match here is `300 − 500 = −200` — load-dominated).
+    ///   - `WHold` caches {}, running=0 → deep headroom, load_penalty 1000, cold.
+    ///
+    /// GREEDY: A1(s)→WA (1000; WA running 3→4 excluded). A2(d): WA excluded, WHold
+    ///   caches no d → only WB is a d-holder; `300 − 500 = −200 ≤ 0` → crossover
+    ///   zeroes it → contributes 0. G = 1000.
+    /// BATCH: same pairing — A1(s)→WA (1000; excluded), A2(d)→WB where the crossover
+    ///   ALSO zeroes the `−200` pick → B = 1000. gain = 0. If BATCH did NOT apply
+    ///   the crossover it would credit A2's 300 on WB → B = 1300 → gain 30. gain==0
+    ///   proves batch honors the SAME crossover as greedy (no batch-only advantage).
+    #[test]
+    fn crossover_applies_symmetrically_to_greedy_and_batch() {
+        let s = dg(40);
+        let d = dg(41);
+        let actions = vec![mk_action(&[(s, 1000)]), mk_action(&[(d, 300)])];
+        let workers = vec![
+            mk_worker(&[s, d], 3, 4, 50, 0),   // WA: 1 slot, supra s, holds d too
+            mk_worker(&[d], 3, 4, 50, 500),    // WB: 1 slot, marginal d, load-dominated
+            mk_worker(&[], 0, 4, 50, 1000),    // WHold: deep headroom, keeps gate active
+        ];
+        let gain = compute_batch_sched_gain(&actions, &workers, GATE_ON_V1);
+        assert_eq!(
+            gain.greedy_score, 1000,
+            "GREEDY: A1(s)→WA (1000, WA excluded after); A2(d) lands on the loaded WB \
+             where 300−500=−200 ≤ 0 → crossover zeroes it → G=1000. got {}",
+            gain.greedy_score
+        );
+        assert_eq!(
+            gain.gain_pct, 0,
+            "SYMMETRY: G and B assign IDENTICALLY (A1→WA, A2→WB); the crossover zeroes \
+             the SAME load-dominated A2/WB pick in BOTH → B=G=1000 → gain 0. If batch \
+             skipped the crossover it would credit A2's 300 → B=1300 → gain 30; gain==0 \
+             proves the crossover is applied symmetrically. got {}",
+            gain.gain_pct
         );
     }
 
