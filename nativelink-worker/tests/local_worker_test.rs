@@ -304,6 +304,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -398,6 +399,7 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -560,6 +562,7 @@ async fn worker_sends_blobs_available_before_execute_result_test() -> Result<(),
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -746,6 +749,7 @@ async fn post_action_delta_reports_true_when_still_saturated() -> Result<(), Err
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1030,6 +1034,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1121,6 +1126,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1219,6 +1225,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1339,6 +1346,7 @@ async fn cas_not_found_translation_preserves_details_test() -> Result<(), Error>
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1483,6 +1491,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1621,6 +1630,7 @@ async fn not_found_with_precondition_detail_translates_without_substring() -> Re
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1811,6 +1821,7 @@ async fn non_not_found_with_precondition_detail_does_not_translate() -> Result<(
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -1982,6 +1993,7 @@ async fn not_found_with_non_pf_detail_and_no_substring_does_not_translate() -> R
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -2140,6 +2152,7 @@ async fn worker_translates_not_found_to_failed_precondition_test() -> Result<(),
                         resolved_directory_digests: Vec::new(),
 
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -2458,6 +2471,7 @@ async fn phase6_probe_p_worker_boundary_fires_on_tonic_ok() -> Result<(), Error>
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     })),
                 })
                 .unwrap(),
@@ -2748,6 +2762,7 @@ async fn v3c_gap2_reconcile_fail_open_releases_gate_after_timeout() -> Result<()
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 })),
             })
             .map_err(|e| make_input_err!("encode StartAction 1: {e:?}"))?,
@@ -2817,6 +2832,7 @@ async fn v3c_gap2_reconcile_fail_open_releases_gate_after_timeout() -> Result<()
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 })),
             })
             .map_err(|e| make_input_err!("encode StartAction 2: {e:?}"))?,

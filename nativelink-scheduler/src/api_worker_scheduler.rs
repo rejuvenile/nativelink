@@ -33,8 +33,8 @@ use nativelink_metric::{
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory, Tree};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    AcPinResyncRequest, BlobsInStableStorage, KillOperationRequest, PeerHint, StartExecute,
-    UpdateForWorker, update_for_worker,
+    AcPinResyncRequest, BlobsInStableStorage, KillOperationRequest, MissingBlobPeers, PeerHint,
+    StartExecute, UpdateForWorker, update_for_worker,
 };
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -2461,6 +2461,10 @@ impl ApiWorkerSchedulerImpl {
             resolved_directories: Vec::new(),
             resolved_directory_digests: Vec::new(),
             missing_digests: Vec::new(),
+            // (#p2p-prefetch) Empty here; the dispatch path (Phase 4) injects
+            // the inline peer hints post-lock alongside `missing_digests`, only
+            // when the P2P-prefetch flag is enabled.
+            missing_digest_peers: Vec::new(),
         };
         let msg = UpdateForWorker {
             update: Some(update_for_worker::Update::StartAction(start_execute)),
@@ -2710,6 +2714,16 @@ pub struct ApiWorkerScheduler {
     /// When set, prefetch connections use TLS with this config.
     worker_tls_config: Option<ClientTlsConfig>,
 
+    /// (#p2p-prefetch) When true, the Phase-4 dispatch path SHEDS the
+    /// peer-held partition of the prefetch candidate set from `spawn_prefetch`
+    /// (the worker pulls those inputs P2P via the inline
+    /// `StartExecute.missing_digest_peers` hints instead) and keeps prefetching
+    /// only the server-only partition. When false (default), the full
+    /// prefetch set is pushed exactly as before and the inline field is left
+    /// empty — byte-identical to pre-feature behavior. Sourced from
+    /// `SimpleSpec::enable_p2p_input_prefetch`.
+    enable_p2p_input_prefetch: bool,
+
     /// (#97) Monotonic broadcast id allocator for BIS chunked broadcasts.
     /// Lock-free `fetch_add` removes the per-broadcast write-lock
     /// previously taken to bump a u64. Initialised to 1 so a fresh
@@ -2953,6 +2967,29 @@ const PREFETCH_MAX_INFLIGHT_BYTES: u64 = 200 * 1024 * 1024;
 /// because small blobs are cheap to push via BatchUpdateBlobs.
 const PREFETCH_MAX_BLOBS: usize = 1024;
 
+// CAPPED AT 4096: (#p2p-prefetch) hard cap on the number of
+// `StartExecute.missing_digest_peers` entries carried INLINE in the
+// assignment. Each entry ≈ D(~40 B digest) + P·(endpoint ≤256 B); at
+// MAX_PEERS_PER_MISSING_BLOB=4 and the ~26 B typical endpoint, 4096 entries ≈
+// 0.7 MiB — negligible against the ≤32 MiB tree already inline inside the
+// 64 MiB worker decode ceiling, and bounded regardless of action size. This is
+// the fence's teeth: uncapped, `missing_digests`/`all_missing` is bounded only
+// by |file_digests| (tens of thousands on a large action; verified no
+// `.truncate` on `all_missing`), which would re-arm the #98 `StartExecute`
+// balloon. OVER-CAP: missing blobs past this cap carry NO inline hint and the
+// worker demand-fetches them from the server (never worse than today). Starting
+// value; soak-tunable (design §3, §10).
+const MAX_INLINE_PEER_HINTS: usize = 4096;
+
+// CAPPED AT 4: (#p2p-prefetch) hard cap on peer CAS endpoints carried per
+// `MissingBlobPeers` entry. The `WorkerProxyStore` race consumes only
+// `peers[0]` today (peer fan-out is a deferred, measure-first follow-up), so
+// more than a few holders to race is pointless; the cap also bounds the wire
+// size (see MAX_INLINE_PEER_HINTS arithmetic). OVER-CAP: extra holders for a
+// blob are dropped from the inline hint (the worker still has the server
+// fallback + the async PeerHintsChunk superset). Starting value; soak-tunable.
+const MAX_PEERS_PER_MISSING_BLOB: usize = 4;
+
 /// Maximum total bytes per BatchUpdateBlobs RPC batch (4MiB).
 /// Matches PREFETCH_MAX_SINGLE_BLOB_SIZE so all prefetched blobs
 /// can go through the efficient batch path.
@@ -3102,6 +3139,9 @@ impl ApiWorkerScheduler {
             // override OFF (exact v1), factor 2 (from the config default fn).
             0,
             nativelink_config::schedulers::default_p_headroom_override_factor(),
+            // (#p2p-prefetch) P2P input prefetch shed OFF on the no-config
+            // constructor path — byte-identical to today.
+            false,
         )
     }
 
@@ -3121,6 +3161,7 @@ impl ApiWorkerScheduler {
         p_headroom_gate_enabled: bool,
         p_idle_threshold_pct: u32,
         p_headroom_override_factor: u32,
+        enable_p2p_input_prefetch: bool,
     ) -> Arc<Self> {
         let memory_store_threshold = cas_store
             .as_ref()
@@ -3213,6 +3254,7 @@ impl ApiWorkerScheduler {
             prefetch_semaphores: ParkingMutex::new(HashMap::new()),
             memory_store_threshold,
             worker_tls_config,
+            enable_p2p_input_prefetch,
             next_bis_broadcast_id: AtomicU64::new(1),
             // (#97 red-team #5) Random nonce per server-process. Loop
             // to regenerate if `gen` returns 0 — the proto default for
@@ -3618,13 +3660,15 @@ impl ApiWorkerScheduler {
             );
             if !prefetch_missing.is_empty() {
                 // (#prefetch-peer-offload) TELEMETRY-ONLY: measure, among
-                // the blobs we are ABOUT TO push server→target, the byte
-                // mass a PEER worker already holds — the server-offload
-                // headroom a peer-preferring prefetch could reclaim. Reuses
-                // the same locality snapshot/live-read path as the
-                // compute_missing_blobs call above (single query path). No
-                // routing change: the spawn_prefetch call below is
-                // unchanged and still pushes the full prefetch_missing set.
+                // the blobs we are ABOUT TO consider pushing server→target,
+                // the byte mass a PEER worker already holds — the
+                // server-offload headroom a peer-preferring prefetch could
+                // reclaim. Reuses the same locality snapshot/live-read path as
+                // the compute_missing_blobs call above (single query path).
+                // Counted on the FULL candidate set regardless of the shed so
+                // the ceiling metric's meaning is unchanged whether or not the
+                // shed fires (design §4 "the metric stays and becomes the A/B
+                // instrument").
                 let (peer_bytes, peer_blobs) = Self::count_peer_offloadable(
                     &prefetch_missing,
                     endpoint,
@@ -3637,11 +3681,32 @@ impl ApiWorkerScheduler {
                 self.metrics
                     .prefetch_peer_offloadable_blobs
                     .fetch_add(peer_blobs, Ordering::Relaxed);
-                self.spawn_prefetch(
-                    Arc::clone(endpoint),
-                    prefetch_missing.clone(),
-                    operation_id.to_string(),
+
+                // (#p2p-prefetch) SHED the peer-held partition from the
+                // server-push prefetch when the flag is ON: those blobs go to
+                // the worker as inline `missing_digest_peers` hints for a P2P
+                // pull instead (populated below), and the worker's
+                // WorkerProxyStore race co-launches a server fetch as the
+                // fallback (no stall). The server-only partition (no peer holds
+                // it — only the server has it) STILL gets pushed, since the
+                // worker cannot pull it from a peer.
+                //
+                // Flag OFF (default): push the full `prefetch_missing` set
+                // exactly as before — byte-identical to pre-feature behavior.
+                let to_prefetch = Self::select_prefetch_after_shed(
+                    &prefetch_missing,
+                    endpoint,
+                    locality_snapshot,
+                    loc_map,
+                    self.enable_p2p_input_prefetch,
                 );
+                if !to_prefetch.is_empty() {
+                    self.spawn_prefetch(
+                        Arc::clone(endpoint),
+                        to_prefetch,
+                        operation_id.to_string(),
+                    );
+                }
             }
 
             // Compute the FULL set of missing digests (all sizes) for the
@@ -3690,6 +3755,28 @@ impl ApiWorkerScheduler {
                         .iter()
                         .map(|(digest, _)| (*digest).into())
                         .collect();
+
+                    // (#p2p-prefetch) Populate the inline per-missing-blob peer
+                    // endpoints so the worker registers them into its
+                    // `peer_locality_map` BEFORE input materialization and the
+                    // existing WorkerProxyStore race pulls them P2P. Built from
+                    // the SAME `all_missing` set + the SAME locality snapshot
+                    // holder list already in hand (no second, drift-prone
+                    // lookup), excluding the target endpoint (the same
+                    // predicate `count_peer_offloadable` applies), and hard-
+                    // capped per §3. Gated behind the flag so flag-OFF is
+                    // byte-identical to today (empty field, worker registers
+                    // nothing extra). Populated together with the shed above:
+                    // the shed'd (peer-held) blobs are exactly the ones that
+                    // get a non-empty inline entry here.
+                    if self.enable_p2p_input_prefetch {
+                        start_execute.missing_digest_peers = Self::build_missing_blob_peers(
+                            &all_missing,
+                            endpoint,
+                            locality_snapshot,
+                            loc_map,
+                        );
+                    }
                 }
             }
 
@@ -4896,6 +4983,147 @@ impl ApiWorkerScheduler {
         }
 
         (peer_bytes, peer_blobs)
+    }
+
+    /// (#p2p-prefetch) Single-blob peer-heldness predicate: true iff at least
+    /// one holder endpoint of `digest` is NOT the target `worker_endpoint`.
+    /// This is the exact predicate `count_peer_offloadable` applies, factored
+    /// out so the prefetch-shed partition and the inline-hint populate share
+    /// ONE query path with the counter (no second, drift-prone lookup). Same
+    /// `locality_snapshot`-fast / `locality_map.read()`-slow duality; the slow
+    /// read guard is dropped before returning; synchronous (no `.await`).
+    fn digest_peer_held(
+        digest: &DigestInfo,
+        worker_endpoint: &str,
+        locality_snapshot: Option<&LocalitySnapshot>,
+        locality_map: &SharedBlobLocalityMap,
+    ) -> bool {
+        if let Some(snapshot) = locality_snapshot {
+            snapshot
+                .get(digest)
+                .is_some_and(|endpoints| endpoints.iter().any(|e| &**e != worker_endpoint))
+        } else {
+            let map = locality_map.read();
+            let held = map
+                .blobs_map()
+                .get(digest)
+                .is_some_and(|endpoints| endpoints.iter().any(|e| &**e != worker_endpoint));
+            drop(map);
+            held
+        }
+    }
+
+    /// (#p2p-prefetch) The prefetch-shed routing decision: given the prefetch
+    /// candidate set (from `compute_missing_blobs`), return the subset the
+    /// server should STILL push server→worker.
+    ///
+    /// - `flag == false` (default): the FULL candidate set — byte-identical to
+    ///   pre-feature behavior. This is the "never worse than today" guarantee.
+    /// - `flag == true`: only the SERVER-ONLY partition (no peer other than the
+    ///   target holds it). The peer-held partition is SHED — those blobs ride
+    ///   the inline `missing_digest_peers` hints for a worker-driven P2P pull
+    ///   instead, with the WorkerProxyStore race's co-launched server fetch as
+    ///   the fallback (no stall).
+    ///
+    /// Uses the SAME `digest_peer_held` predicate as the inline populate and
+    /// `count_peer_offloadable` (one query path, no drift). Synchronous.
+    fn select_prefetch_after_shed(
+        prefetch_candidates: &[(DigestInfo, u64)],
+        worker_endpoint: &str,
+        locality_snapshot: Option<&LocalitySnapshot>,
+        locality_map: &SharedBlobLocalityMap,
+        flag: bool,
+    ) -> Vec<(DigestInfo, u64)> {
+        if !flag {
+            return prefetch_candidates.to_vec();
+        }
+        prefetch_candidates
+            .iter()
+            .filter(|(digest, _)| {
+                // Keep only server-only blobs (no peer holds them). Peer-held
+                // blobs are shed — the worker pulls them P2P.
+                !Self::digest_peer_held(digest, worker_endpoint, locality_snapshot, locality_map)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// (#p2p-prefetch) Build the inline `StartExecute.missing_digest_peers`
+    /// from the FULL missing set + the SAME locality snapshot already in hand.
+    /// For each missing digest, collect the holder endpoints that are NOT the
+    /// target (the `count_peer_offloadable` predicate), capped at
+    /// `MAX_PEERS_PER_MISSING_BLOB` per entry; emit an entry ONLY when the blob
+    /// has ≥1 peer holder (server-only blobs carry no inline hint — the worker
+    /// gets them via the retained server-push). The whole set is hard-capped at
+    /// `MAX_INLINE_PEER_HINTS` entries so the field cannot re-arm the #98
+    /// `StartExecute` balloon; over-cap missing blobs simply carry no hint and
+    /// degrade to server-fetch (never worse than today).
+    ///
+    /// Same `locality_snapshot`-fast / `locality_map.read()`-slow duality as
+    /// `count_peer_offloadable`; on the slow path the read guard is held for
+    /// the whole walk (a single O(|all_missing|) pass, bounded by
+    /// `MAX_INLINE_PEER_HINTS` entries emitted) and dropped before returning.
+    /// Synchronous — no `.await`, no lock held across one.
+    fn build_missing_blob_peers(
+        all_missing: &[(DigestInfo, u64)],
+        worker_endpoint: &str,
+        locality_snapshot: Option<&LocalitySnapshot>,
+        locality_map: &SharedBlobLocalityMap,
+    ) -> Vec<MissingBlobPeers> {
+        // Collect the (at most MAX_PEERS_PER_MISSING_BLOB) non-target holder
+        // endpoints for one digest into `out` as owned strings. Shared by both
+        // arms so the cap + exclusion logic exists once.
+        fn collect_peers<'a>(
+            endpoints: impl Iterator<Item = &'a Arc<str>>,
+            worker_endpoint: &str,
+        ) -> Vec<String> {
+            endpoints
+                .filter(|e| &***e != worker_endpoint)
+                .take(MAX_PEERS_PER_MISSING_BLOB)
+                .map(|e| e.as_ref().to_string())
+                .collect()
+        }
+
+        let mut out: Vec<MissingBlobPeers> = Vec::new();
+        if let Some(snapshot) = locality_snapshot {
+            for (digest, _size) in all_missing {
+                if out.len() >= MAX_INLINE_PEER_HINTS {
+                    break;
+                }
+                let Some(endpoints) = snapshot.get(digest) else {
+                    continue;
+                };
+                let peer_endpoints = collect_peers(endpoints.iter(), worker_endpoint);
+                if peer_endpoints.is_empty() {
+                    continue;
+                }
+                out.push(MissingBlobPeers {
+                    digest: Some((*digest).into()),
+                    peer_endpoints,
+                });
+            }
+        } else {
+            let map = locality_map.read();
+            let blobs = map.blobs_map();
+            for (digest, _size) in all_missing {
+                if out.len() >= MAX_INLINE_PEER_HINTS {
+                    break;
+                }
+                let Some(endpoints) = blobs.get(digest) else {
+                    continue;
+                };
+                let peer_endpoints = collect_peers(endpoints.iter(), worker_endpoint);
+                if peer_endpoints.is_empty() {
+                    continue;
+                }
+                out.push(MissingBlobPeers {
+                    digest: Some((*digest).into()),
+                    peer_endpoints,
+                });
+            }
+            drop(map);
+        }
+        out
     }
 
     /// Spawns a background task that prefetches missing small blobs from
@@ -8758,6 +8986,372 @@ mod tests {
         );
     }
 
+    // ── (#p2p-prefetch) build_missing_blob_peers populate + caps ──
+    // These assert the inline `StartExecute.missing_digest_peers` populate:
+    // only peer-held missing blobs get an entry, the TARGET endpoint is
+    // always excluded, and both caps (MAX_PEERS_PER_MISSING_BLOB per entry,
+    // MAX_INLINE_PEER_HINTS total) are enforced with graceful over-cap
+    // omission. Snapshot fast path AND live-read slow path.
+
+    /// Only peer-held missing blobs get an inline entry; the entry carries the
+    /// non-target holder endpoint(s); server-only (unowned) missing blobs get
+    /// NO entry (the worker gets them via the retained server-push). Snapshot
+    /// path, built by the production `score_and_generate_hints` builder.
+    ///
+    /// Mutation: change `build_missing_blob_peers` to include server-only
+    /// blobs (drop the `peer_endpoints.is_empty()` continue) → the assert on
+    /// `out.len() == 1` red-fails with the bespoke message below. Covers BOTH
+    /// server-only sub-cases: a blob NO ONE holds (excluded by `snapshot.get`
+    /// == None) AND a blob only the TARGET holds (excluded by the
+    /// `peer_endpoints.is_empty()` guard) — so both guards are load-bearing.
+    #[test]
+    fn test_build_missing_blob_peers_only_peer_held() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        // d_peer: held only by a peer → gets an inline entry.
+        // d_unowned: held by no one → NO entry (server must push it).
+        // d_target_only: held only by the TARGET → NO entry (target already has
+        //   it; there is no peer to pull from — the `is_empty` guard).
+        let d_peer = DigestInfo::new([0xaa; 32], 1500);
+        let d_unowned = DigestInfo::new([0xcc; 32], 900);
+        let d_target_only = DigestInfo::new([0xee; 32], 700);
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_peer]);
+            map.register_blobs(target, &[d_target_only]);
+        }
+
+        // Build the snapshot exactly as production does (file_digests ∩ map).
+        let file_digests = vec![(d_peer, 1500), (d_unowned, 900), (d_target_only, 700)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+
+        // all_missing = all three (walk whatever the caller passes).
+        let all_missing = vec![(d_peer, 1500), (d_unowned, 900), (d_target_only, 700)];
+        let hints = ApiWorkerScheduler::build_missing_blob_peers(
+            &all_missing,
+            target,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        assert_eq!(
+            hints.len(),
+            1,
+            "only the peer-held missing blob gets an inline entry; the \
+             unowned AND target-only blobs must be omitted (worker gets them \
+             via server-push) — got {} entries",
+            hints.len()
+        );
+        let entry = &hints[0];
+        assert_eq!(
+            entry.digest.as_ref().map(DigestInfo::try_from),
+            Some(Ok(d_peer)),
+            "the inline entry must be for the peer-held digest"
+        );
+        assert_eq!(
+            entry.peer_endpoints,
+            vec![peer.to_string()],
+            "the inline entry must carry the peer endpoint"
+        );
+    }
+
+    /// The TARGET endpoint is NEVER included in an inline entry, even when the
+    /// target is (spuriously) a holder alongside a peer. The predicate is
+    /// "holders != target"; a blob held by both target and peer still emits
+    /// the PEER holder only. Guards a naive impl that copies the whole holder
+    /// list.
+    ///
+    /// Mutation: drop the `.filter(|e| &***e != worker_endpoint)` in
+    /// `collect_peers` → the target string leaks into `peer_endpoints` and
+    /// the `!contains(target)` assert red-fails.
+    #[test]
+    fn test_build_missing_blob_peers_excludes_target_endpoint() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        // d_shared: held by BOTH target and peer. Still a "missing" blob from
+        // the caller's view is impossible (target holds it), but
+        // build_missing_blob_peers walks whatever all_missing it is given and
+        // must exclude the target holder regardless.
+        let d_shared = DigestInfo::new([0xdd; 32], 2000);
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_shared]);
+            map.register_blobs(target, &[d_shared]);
+        }
+        let file_digests = vec![(d_shared, 2000)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+
+        let all_missing = vec![(d_shared, 2000)];
+        let hints = ApiWorkerScheduler::build_missing_blob_peers(
+            &all_missing,
+            target,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        assert_eq!(hints.len(), 1, "the peer holder makes this a peer-held blob");
+        assert!(
+            !hints[0].peer_endpoints.contains(&target.to_string()),
+            "the TARGET endpoint must never appear in an inline peer hint — \
+             got {:?}",
+            hints[0].peer_endpoints
+        );
+        assert_eq!(
+            hints[0].peer_endpoints,
+            vec![peer.to_string()],
+            "only the peer holder must be carried"
+        );
+    }
+
+    /// `MAX_PEERS_PER_MISSING_BLOB` caps holders per entry: a blob held by
+    /// more than the cap emits exactly the cap's worth of endpoints. Over-cap
+    /// holders are dropped (the worker's race consumes only peers[0] today +
+    /// still has the server fallback + the async stream superset).
+    ///
+    /// Mutation: remove the `.take(MAX_PEERS_PER_MISSING_BLOB)` in
+    /// `collect_peers` → the entry carries all holders and the
+    /// `<= MAX_PEERS_PER_MISSING_BLOB` assert red-fails.
+    #[test]
+    fn test_build_missing_blob_peers_caps_peers_per_blob() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+
+        let d = DigestInfo::new([0xee; 32], 3000);
+        // Register more holders than the per-blob cap.
+        let n_holders = MAX_PEERS_PER_MISSING_BLOB + 3;
+        {
+            let mut map = locality_map.write();
+            for i in 0..n_holders {
+                map.register_blobs(&format!("grpc://peer-{i}:50081"), &[d]);
+            }
+        }
+        let file_digests = vec![(d, 3000)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+
+        let all_missing = vec![(d, 3000)];
+        let hints = ApiWorkerScheduler::build_missing_blob_peers(
+            &all_missing,
+            target,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        assert_eq!(hints.len(), 1, "one peer-held blob → one entry");
+        assert_eq!(
+            hints[0].peer_endpoints.len(),
+            MAX_PEERS_PER_MISSING_BLOB,
+            "holders per entry must be capped at MAX_PEERS_PER_MISSING_BLOB \
+             ({MAX_PEERS_PER_MISSING_BLOB}); registered {n_holders} holders, \
+             got {} endpoints",
+            hints[0].peer_endpoints.len()
+        );
+    }
+
+    /// `MAX_INLINE_PEER_HINTS` caps the total number of inline entries: an
+    /// all_missing set with more peer-held blobs than the cap emits exactly
+    /// the cap's worth of entries. Over-cap missing blobs carry no hint and
+    /// degrade to server-fetch (never worse than today).
+    ///
+    /// Mutation: remove the `if out.len() >= MAX_INLINE_PEER_HINTS { break; }`
+    /// guard → `out` exceeds the cap and the `== MAX_INLINE_PEER_HINTS` assert
+    /// red-fails.
+    #[test]
+    fn test_build_missing_blob_peers_caps_total_entries() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        // More distinct peer-held blobs than MAX_INLINE_PEER_HINTS.
+        let n = MAX_INLINE_PEER_HINTS + 100;
+        let mut all_missing: Vec<(DigestInfo, u64)> = Vec::with_capacity(n);
+        {
+            let mut map = locality_map.write();
+            for i in 0..n {
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                let d = DigestInfo::new(hash, 100);
+                map.register_blobs(peer, &[d]);
+                all_missing.push((d, 100));
+            }
+        }
+        let file_digests: Vec<(DigestInfo, u64)> = all_missing.clone();
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+
+        let hints = ApiWorkerScheduler::build_missing_blob_peers(
+            &all_missing,
+            target,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        assert_eq!(
+            hints.len(),
+            MAX_INLINE_PEER_HINTS,
+            "total inline entries must be hard-capped at MAX_INLINE_PEER_HINTS \
+             ({MAX_INLINE_PEER_HINTS}); {n} peer-held blobs offered, got {} \
+             entries",
+            hints.len()
+        );
+    }
+
+    /// Live-read (over-cap snapshot=None) path produces the SAME populate as
+    /// the snapshot path: only peer-held blobs, target excluded. Parity guard.
+    ///
+    /// Mutation: make the live-read arm return `Vec::new()` → the
+    /// `len() == 1` assert red-fails, proving the slow path is exercised.
+    #[test]
+    fn test_build_missing_blob_peers_live_read_parity() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        let d_peer = DigestInfo::new([0xaa; 32], 1500);
+        let d_server_only = DigestInfo::new([0xcc; 32], 900);
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_peer]);
+        }
+
+        let all_missing = vec![(d_peer, 1500), (d_server_only, 900)];
+        let hints = ApiWorkerScheduler::build_missing_blob_peers(
+            &all_missing,
+            target,
+            None, // ← over-cap fallback: walk live map
+            &locality_map,
+        );
+
+        assert_eq!(
+            hints.len(),
+            1,
+            "live-read path must match snapshot path: only the peer-held blob \
+             gets an entry — got {}",
+            hints.len()
+        );
+        assert_eq!(
+            hints[0].peer_endpoints,
+            vec![peer.to_string()],
+            "live-read entry must carry the peer endpoint"
+        );
+    }
+
+    // ── (#p2p-prefetch) select_prefetch_after_shed routing ──
+    // The shed decision. flag OFF ⇒ the FULL candidate set is prefetched
+    // (byte-identical to today); flag ON ⇒ only the server-only partition is
+    // prefetched (peer-held blobs are shed to the P2P inline path).
+
+    /// DEFAULT-OFF ZERO-BEHAVIOR-CHANGE contract: with the flag OFF, the
+    /// prefetch set is the FULL candidate set unchanged — even for blobs a
+    /// peer holds. This is THE guarantee that landing the feature (flag off)
+    /// is byte-identical to today's server-push prefetch.
+    ///
+    /// Mutation: change the `if !flag { return prefetch_candidates.to_vec(); }`
+    /// early return to also filter (i.e. shed even when flag off) → the
+    /// `len() == 2` / peer-held-still-present asserts red-fail with the
+    /// bespoke message, proving flag-off no longer preserves the full set.
+    #[test]
+    fn test_select_prefetch_after_shed_flag_off_keeps_full_set() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        let d_peer = DigestInfo::new([0xaa; 32], 1500); // a peer holds this
+        let d_server_only = DigestInfo::new([0xcc; 32], 900); // no one holds this
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_peer]);
+        }
+        let file_digests = vec![(d_peer, 1500), (d_server_only, 900)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+        let candidates = vec![(d_peer, 1500), (d_server_only, 900)];
+
+        let to_prefetch = ApiWorkerScheduler::select_prefetch_after_shed(
+            &candidates,
+            target,
+            Some(snapshot),
+            &locality_map,
+            false, // flag OFF
+        );
+
+        assert_eq!(
+            to_prefetch.len(),
+            2,
+            "flag OFF must prefetch the FULL candidate set (byte-identical to \
+             today) — got {} of 2",
+            to_prefetch.len()
+        );
+        let set: std::collections::HashSet<DigestInfo> =
+            to_prefetch.iter().map(|(d, _)| *d).collect();
+        assert!(
+            set.contains(&d_peer),
+            "flag OFF must STILL prefetch the peer-held blob (no shed)"
+        );
+        assert!(
+            set.contains(&d_server_only),
+            "flag OFF must prefetch the server-only blob"
+        );
+    }
+
+    /// SHED contract (flag ON): only the server-only partition is prefetched;
+    /// the peer-held blob is SHED (goes to the P2P inline path). This is the
+    /// offload — leaving the peer-held blob in the prefetch set would be
+    /// double delivery.
+    ///
+    /// Mutation: make `select_prefetch_after_shed` return the full set even
+    /// when flag on (drop the filter branch) → the `len() == 1` /
+    /// `!contains(d_peer)` asserts red-fail, proving the shed fired.
+    #[test]
+    fn test_select_prefetch_after_shed_flag_on_sheds_peer_held() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        let d_peer = DigestInfo::new([0xaa; 32], 1500); // a peer holds → SHED
+        let d_server_only = DigestInfo::new([0xcc; 32], 900); // no one holds → KEEP
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_peer]);
+        }
+        let file_digests = vec![(d_peer, 1500), (d_server_only, 900)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+        let candidates = vec![(d_peer, 1500), (d_server_only, 900)];
+
+        let to_prefetch = ApiWorkerScheduler::select_prefetch_after_shed(
+            &candidates,
+            target,
+            Some(snapshot),
+            &locality_map,
+            true, // flag ON
+        );
+
+        assert_eq!(
+            to_prefetch.len(),
+            1,
+            "flag ON must shed the peer-held blob and prefetch ONLY the \
+             server-only partition — got {} of 1 expected",
+            to_prefetch.len()
+        );
+        let set: std::collections::HashSet<DigestInfo> =
+            to_prefetch.iter().map(|(d, _)| *d).collect();
+        assert!(
+            !set.contains(&d_peer),
+            "flag ON must SHED the peer-held blob (it rides the P2P inline path)"
+        );
+        assert!(
+            set.contains(&d_server_only),
+            "flag ON must STILL prefetch the server-only blob (no peer holds it)"
+        );
+    }
+
     /// Mechanical contract: `score_and_generate_hints` returns a
     /// snapshot whose entries are *exactly* the file_digests ∩
     /// locality_map intersection, with peer endpoints matching
@@ -8871,6 +9465,8 @@ mod tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         );
 
         // First call: cache miss, inline resolution succeeds and caches.
@@ -9047,6 +9643,8 @@ mod tests {
             false,
             0,
             2,
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         );
 
         // Precondition: both counters start at zero.
@@ -9355,6 +9953,8 @@ mod tests {
             false,
             0,
             2,
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         );
         (scheduler, dir_digest)
     }
@@ -9459,6 +10059,8 @@ mod tests {
             true, // (M1-replay) P-headroom gate ON — the seam test replays the live gate
             0,    // p_idle_threshold_pct = 0 (v1 behavior, matching prod)
             2,    // p_headroom_override_factor (prod default; inert at threshold 0)
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         );
         (scheduler, r1_digest, r2_digest, c_digest)
     }
@@ -9895,6 +10497,8 @@ mod tests {
             true,
             0,
             2,
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         )
     }
 
@@ -10521,6 +11125,8 @@ mod tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         );
 
         // First, verify guard wiring against the real shared map. Pre-insert
@@ -10654,6 +11260,8 @@ mod tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         )
     }
 
@@ -11854,6 +12462,8 @@ mod b1_lock_decouple_tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         )
     }
 
@@ -11880,6 +12490,8 @@ mod b1_lock_decouple_tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         )
     }
 
@@ -12498,6 +13110,8 @@ mod b1_lock_decouple_tests {
                 true, // (#sched M1 rebalance v2) p_headroom_gate ON
                 p_idle_threshold_pct,
                 p_headroom_override_factor,
+                // (#p2p-prefetch) P2P input prefetch OFF (test default)
+                false,
             )
         }
 
@@ -13156,6 +13770,8 @@ mod b1_lock_decouple_tests {
                 false, // (#sched M1 rebalance) p_headroom_gate OFF
                 0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
                 2, // (#sched M1 rebalance v2) p_headroom_override_factor
+                // (#p2p-prefetch) P2P input prefetch OFF (test default)
+                false,
             );
             // X_ROOT: Tier-1 root match (cached_directory_digests ∋ input_root),
             // moderately loaded.
@@ -14171,6 +14787,8 @@ mod deferred_proto_clone_tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         )
     }
 
@@ -14190,6 +14808,8 @@ mod deferred_proto_clone_tests {
             false, // (#sched M1 rebalance) p_headroom_gate OFF
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
+            // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
         )
     }
 

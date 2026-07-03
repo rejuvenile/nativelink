@@ -428,6 +428,10 @@ impl Worker {
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    // (#p2p-prefetch) This builder does not run the Phase-4
+                    // locality walk (that lives in `api_worker_scheduler.rs`),
+                    // so no inline peer hints are carried here.
+                    missing_digest_peers: Vec::new(),
                 };
                 reduce_platform_properties(
                     worker_platform_properties,

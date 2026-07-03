@@ -94,6 +94,7 @@ async fn send_start_action(
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 })),
             })
             .unwrap(),

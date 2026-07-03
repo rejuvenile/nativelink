@@ -114,6 +114,13 @@ tracing-test = { version = "0.2.5", default-features = false, features = [
 ignored = ["tracing-test"]
 
 [[test]]
+# (#p2p-prefetch) Worker-side inline peer-hint registration. The production-
+# composition seam test uses `WorkerProxyStore::inject_worker_connection`,
+# gated behind `cfg(any(test, feature = "test-utils"))` in nativelink-store.
+name = "missing_blob_peers_register_test"
+required-features = ["test-utils"]
+
+[[test]]
 name = "blobs_in_stable_storage_handler_test"
 required-features = ["test-utils"]
 

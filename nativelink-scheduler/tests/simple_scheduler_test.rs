@@ -208,6 +208,7 @@ async fn basic_add_action_with_one_worker_test() -> Result<(), Error> {
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
             })),
         };
         let msg_for_worker = rx_from_worker.recv().await.unwrap();
@@ -397,6 +398,7 @@ async fn find_executing_action() -> Result<(), Error> {
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
             })),
         };
         let msg_for_worker = rx_from_worker.recv().await.unwrap();
@@ -482,6 +484,7 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
     };
 
     let mut expected_start_execute_for_worker2 = StartExecute {
@@ -498,6 +501,7 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
     };
     let operation_id1 = {
         // Worker1 should now see first execution request.
@@ -1253,6 +1257,7 @@ async fn worker_should_not_queue_if_properties_dont_match_test() -> Result<(), E
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
             })),
         };
         let msg_for_worker = rx_from_worker2.recv().await.unwrap();
@@ -1358,6 +1363,7 @@ async fn cacheable_items_join_same_action_queued_test() -> Result<(), Error> {
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
             })),
         };
         let msg_for_worker = rx_from_worker.recv().await.unwrap();
@@ -1724,6 +1730,7 @@ async fn worker_timesout_reschedules_running_job_test() -> Result<(), Error> {
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
     };
 
     {
@@ -2214,6 +2221,7 @@ async fn does_not_crash_if_operation_joined_then_relaunched() -> Result<(), Erro
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
             })),
         };
         let msg_for_worker = rx_from_worker.recv().await.unwrap();

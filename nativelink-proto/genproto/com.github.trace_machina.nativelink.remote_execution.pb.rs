@@ -471,6 +471,36 @@ pub struct PeerHint {
     #[prost(string, repeated, tag = "2")]
     pub peer_endpoints: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// / A missing input digest together with the peer worker CAS endpoints
+/// / believed to hold it, as of the locality-map snapshot at dispatch
+/// / (task #p2p-prefetch). Carried INLINE in `StartExecute` — see
+/// / `StartExecute.missing_digest_peers`. Distinct from the streaming
+/// / `PeerHint`/`PeerHintsChunk`: this is the FRESH, atomic, per-action
+/// / snapshot the worker registers into its `peer_locality_map` BEFORE
+/// / input materialization, so the existing `WorkerProxyStore` peer-race
+/// / fires for this action's inputs on the first read instead of losing
+/// / to async-stream timing.
+/// /
+/// / BOUNDED: at most one entry per missing_digest; the enclosing set is
+/// / hard-capped at MAX_INLINE_PEER_HINTS so `StartExecute` cannot balloon
+/// / (the constraint #98 relieved by moving unbounded `peer_hints` to a
+/// / stream — see the `reserved 8` note on `StartExecute`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MissingBlobPeers {
+    /// / The missing input digest.
+    #[prost(message, optional, tag = "1")]
+    pub digest: ::core::option::Option<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / Worker CAS gRPC endpoints (from `ConnectWorkerRequest.cas_endpoint`)
+    /// / that held this digest at snapshot time. Capped at
+    /// / MAX_PEERS_PER_MISSING_BLOB per entry. May be stale (a peer may have
+    /// / evicted the blob) — the worker's `WorkerProxyStore` race falls back
+    /// / to the server automatically on a peer miss, so a stale entry costs
+    /// / at most a lost race, never a stall.
+    #[prost(string, repeated, tag = "2")]
+    pub peer_endpoints: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 /// / One chunk of a streaming peer-hints emission. Carries up to
 /// / `PEER_HINTS_PER_CHUNK` `PeerHint` entries plus the operation_id the
 /// / hints were generated for (informational only — the worker does NOT key
@@ -1198,6 +1228,19 @@ pub struct StartExecute {
     pub missing_digests: ::prost::alloc::vec::Vec<
         super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
     >,
+    /// / (#p2p-prefetch) Per-missing-digest peer CAS endpoints for
+    /// / worker-driven P2P input prefetch. BOUNDED by |missing_digests| and
+    /// / hard-capped at MAX_INLINE_PEER_HINTS (with MAX_PEERS_PER_MISSING_BLOB
+    /// / endpoints per entry). Populated only when the scheduler's
+    /// / `enable_p2p_input_prefetch` flag is on; empty otherwise (the worker
+    /// / falls back to today's behavior — server-push prefetch + the async
+    /// / PeerHintsChunk stream). Distinct from the streaming PeerHintsChunk:
+    /// / this is the FRESH, atomic, per-action snapshot the worker registers
+    /// / into its `peer_locality_map` BEFORE input materialization. Over-cap
+    /// / missing blobs simply carry NO inline hint and degrade to server-fetch
+    /// / (never worse than today).
+    #[prost(message, repeated, tag = "12")]
+    pub missing_digest_peers: ::prost::alloc::vec::Vec<MissingBlobPeers>,
 }
 /// / This is a special message used to save actions into the CAS that can be used
 /// / by programs like bb_browswer to inspect the history of a build.

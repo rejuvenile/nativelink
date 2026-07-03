@@ -126,6 +126,8 @@ fn make_scheduler() -> Arc<ApiWorkerScheduler> {
         false, // (#sched M1 rebalance) p_headroom_gate OFF
         0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
         2, // (#sched M1 rebalance v2) p_headroom_override_factor
+        // (#p2p-prefetch) P2P input prefetch OFF (test default)
+        false,
     )
 }
 

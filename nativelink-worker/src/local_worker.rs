@@ -35,7 +35,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     BisAck, BlobDigestInfo, BlobsAvailableAck, BlobsAvailableChunk, BlobsAvailableNotification,
     BlobsInStableStorageChunk, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest,
-    MirrorPinEntry, PeerHintsChunk, UpdateForWorker, chunked_message, execute_result,
+    MirrorPinEntry, MissingBlobPeers, PeerHintsChunk, UpdateForWorker, chunked_message,
+    execute_result,
 };
 use nativelink_store::fast_slow_store::{FastSlowStore, SlowTierMetricSink};
 use nativelink_store::filesystem_store::{FilesystemStore, IndefinitePinOutcome};
@@ -3098,6 +3099,72 @@ pub fn handle_blobs_available_ack(state: &BlobsAvailableState, ack: &BlobsAvaila
 /// Logged at `info!` so the chunk arrival cadence is visible in
 /// production journals; the per-chunk count + sequence + is_last let
 /// reviewers reconstruct the scheduler's emit pattern from logs alone.
+/// (#p2p-prefetch) Register the inline `StartExecute.missing_digest_peers`
+/// into the worker's global `peer_locality_map` SYNCHRONOUSLY, at StartExecute
+/// parse time — BEFORE input materialization (`download_to_directory`) issues
+/// the first missing-blob `get_part`. This is the ONE new worker-side step of
+/// the worker-driven P2P input prefetch: it makes the EXISTING
+/// `WorkerProxyStore` peer-race (`worker_proxy_store.rs` `get_part`) fire for
+/// THIS action's missing inputs on the first read — instead of losing to the
+/// async `PeerHintsChunk` stream's timing (whose chunk "may arrive after
+/// input_fetch started", `handle_peer_hints_chunk` doc) and demand-fetching
+/// from the server.
+///
+/// Because this runs on the same action-setup path strictly UPSTREAM of the
+/// fetch (parse StartExecute → prepare inputs → download), the registration is
+/// a hard happens-before the read's `lookup_workers` — no buffer, no
+/// chunk-count, no race. Uses the SAME idempotent `register_blobs` as
+/// `handle_peer_hints_chunk`; a digest registered by both merges endpoints. The
+/// inline set is a strict subset of what the async stream registers
+/// (`all_missing ⊆ file_digests`), so this adds NO new keys to the map — it
+/// only registers them earlier and guaranteed (design §5/D1: zero net growth).
+///
+/// No-op when the worker has no `peer_locality_map` (no `cas_server_port` →
+/// peer sharing disabled), or when the flag is off server-side (the field
+/// arrives empty). Entries with an unparseable digest are skipped.
+///
+/// Synchronous: one `peer_locality_map.write()` for the whole batch (mirrors
+/// `handle_peer_hints_chunk` to avoid N× contention), no `.await`.
+pub fn register_missing_blob_peers(
+    peer_locality_map: Option<&SharedBlobLocalityMap>,
+    missing_digest_peers: &[MissingBlobPeers],
+) {
+    if missing_digest_peers.is_empty() {
+        return;
+    }
+    let Some(locality_map) = peer_locality_map else {
+        // Worker built without peer-blob sharing (no `cas_server_port`).
+        // Hints would be unused even if registered; drop them silently.
+        trace!(
+            entries = missing_digest_peers.len(),
+            "StartExecute.missing_digest_peers received but worker has no \
+             peer_locality_map (peer sharing disabled)"
+        );
+        return;
+    };
+    let mut total_registered = 0usize;
+    {
+        let mut map = locality_map.write();
+        for entry in missing_digest_peers {
+            let Some(ref digest_proto) = entry.digest else {
+                continue;
+            };
+            let Ok(digest) = DigestInfo::try_from(digest_proto) else {
+                continue;
+            };
+            for endpoint in &entry.peer_endpoints {
+                map.register_blobs(endpoint, &[digest]);
+                total_registered += 1;
+            }
+        }
+    }
+    info!(
+        entries = missing_digest_peers.len(),
+        registrations = total_registered,
+        "registered inline StartExecute peer hints into locality map before input_fetch"
+    );
+}
+
 pub fn handle_peer_hints_chunk(
     peer_locality_map: Option<&SharedBlobLocalityMap>,
     chunk: &PeerHintsChunk,
@@ -5246,6 +5313,27 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
 
                             self.metrics.start_actions_received.inc();
+
+                            // (#p2p-prefetch) Register the inline per-missing-blob
+                            // peer endpoints into the worker's peer_locality_map
+                            // SYNCHRONOUSLY, here at StartExecute-parse — strictly
+                            // BEFORE `create_and_add_action` → prepare_action →
+                            // `download_to_directory` issues the first
+                            // missing-blob fetch. This makes the existing
+                            // WorkerProxyStore peer-race consult the FRESH peers
+                            // for this action's inputs on the first read (instead
+                            // of losing to the async PeerHintsChunk stream). Empty
+                            // when the scheduler's flag is off / no peer holds a
+                            // blob / worker has no peer_locality_map → no-op. The
+                            // peer_locality_map lives on `LocalWorkerImpl` (this
+                            // scope); `create_and_add_action` /
+                            // `RunningActionsManager` cannot reach it, which is
+                            // why the registration lives here rather than at the
+                            // RAM `server_missing_digests` parse site.
+                            register_missing_blob_peers(
+                                self.peer_locality_map.as_ref(),
+                                &start_execute.missing_digest_peers,
+                            );
 
                             let execute_request = start_execute.execute_request.as_ref();
                             let operation_id = start_execute.operation_id.clone();

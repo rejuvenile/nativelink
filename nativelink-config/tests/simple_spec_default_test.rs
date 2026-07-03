@@ -127,6 +127,11 @@ fn simple_spec_default_matches_deserialize_empty() {
          (default_p_headroom_override_factor); a bare #[serde(default)] would \
          yield 0 and silently disable the override"
     );
+    assert_eq!(
+        derived.enable_p2p_input_prefetch, deserialized.enable_p2p_input_prefetch,
+        "enable_p2p_input_prefetch default drift (both should be false = P2P \
+         input prefetch OFF, byte-identical to today)"
+    );
 }
 
 /// Direct assertions on the concrete default values, so the intent is legible
@@ -167,5 +172,10 @@ fn simple_spec_default_concrete_values() {
          (default_p_headroom_override_factor); NOT the u32 type default 0, \
          which would make the ceiling `p_core_count * 0 == 0` and disable the \
          override"
+    );
+    assert!(
+        !spec.enable_p2p_input_prefetch,
+        "enable_p2p_input_prefetch default must be false (P2P input prefetch \
+         OFF until an operator enables it — never worse than today)"
     );
 }
