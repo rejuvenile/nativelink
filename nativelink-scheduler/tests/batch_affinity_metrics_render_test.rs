@@ -531,3 +531,64 @@ async fn output_affinity_gauges_render() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// (#output-locality-probe / file-level) The FILE-level output-affinity gauges
+/// must RENDER on `/metrics` (a dark gauge answers nothing). Built with NO
+/// cas_store and NO workers, so every gauge sits at floor 0 — proving the SIBLING
+/// `output_file_affinity` group is wired and non-dark, at the CORRECT (un-doubled)
+/// names `scheduler_test_action_output_file_affinity_<leaf>`.
+///
+/// Mutation rule: comment out the file-level block in
+/// `record_pending_affinity_surplus`; this test red-fails on the missing lines.
+#[nativelink_test]
+async fn output_file_affinity_gauges_render() -> Result<(), Error> {
+    let (scheduler, worker_scheduler, _notify) = new_scheduler();
+
+    for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'B', 2, 1)] {
+        scheduler
+            .add_action(
+                OperationId::default(),
+                make_action_info(root(input_root), action, off),
+            )
+            .await
+            .expect("#output-file setup: add_action must succeed");
+    }
+    scheduler
+        .do_try_match_for_test()
+        .await
+        .expect("#output-file setup: do_try_match must succeed with no workers");
+
+    let registry = register(scheduler.clone(), worker_scheduler.clone());
+    let body = render_prometheus(&registry);
+
+    // Emitted as `scheduler_test_action_output_file_affinity_<leaf>` — the group
+    // `output_file_affinity` + the leaf field (no doubled prefix).
+    for leaf in [
+        "match_frac",
+        "matched_bytes",
+        "distinct_producers",
+        "sample_actions",
+        "map_size",
+        "largest_contributor_bytes",
+    ] {
+        assert!(
+            body.contains(&format!(
+                "\nscheduler_test_action_output_file_affinity_{leaf} 0\n"
+            )),
+            "#output-file: gauge `output_file_affinity_{leaf}` is DARK or non-zero \
+             on /metrics (expected floor 0 with no cas_store/workers/producers). \
+             body=\n{body}"
+        );
+    }
+
+    // The file recorder's cumulative counter must also render at floor.
+    assert!(
+        body.contains(
+            "\nscheduler_test_worker_scheduler_metrics_output_files_recorded 0\n"
+        ),
+        "#output-file: SchedulerMetrics counter `output_files_recorded` is DARK on \
+         /metrics (expected floor 0). body=\n{body}"
+    );
+
+    Ok(())
+}

@@ -405,6 +405,16 @@ pub struct SchedulerMetrics {
         help = "(#output-locality-probe) cumulative output Directory digests inserted into the bounded output->producer map by the recorder (root+children)"
     )]
     pub output_dirs_recorded: AtomicU64,
+
+    /// (#output-locality-probe / file-level) Cumulative output FILE digests
+    /// INSERTED into the bounded output-file→producer map by the recorder
+    /// (top-level `output_files` + in-folder Tree FileNodes; zero-size excluded).
+    /// Read against `output_file_affinity_map_size` to see insert vs. resident
+    /// (LRU eviction) pressure.
+    #[metric(
+        help = "(#output-locality-probe) cumulative output FILE digests inserted into the bounded output-file->producer map by the recorder (top-level output_files + in-folder Tree FileNodes, zero-size excluded)"
+    )]
+    pub output_files_recorded: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -2597,8 +2607,25 @@ pub struct ApiWorkerScheduler {
     /// input tree (see `.claude/audits/output-locality-probe-design-2026-07-02.md`).
     // CAPPED AT OUTPUT_PRODUCER_MAP_CAP (8192): bounded LRU of recent output
     // Directory digests; over-cap evicts the oldest (= the recency window). Only a
-    // WorkerId + Instant per entry — no owned blob bytes.
+    // WorkerId per entry — no owned blob bytes.
     output_producer_map: Arc<tokio::sync::Mutex<LruCache<DigestInfo, OutputProducer>>>,
+
+    /// (#output-locality-probe / file-level) OBSERVABILITY-ONLY output-FILE→producer
+    /// map: recently-produced output FILE blob digests → the worker that produced
+    /// each. Keyed on the file blob digest DIRECTLY from
+    /// `ActionResult.output_files[].digest` (top-level files, recorded
+    /// SYNCHRONOUSLY in `update_action` — no decode) and from the output `Tree`'s
+    /// `FileNode` digests (in-folder files, recorded on the SAME detached decode
+    /// path the directory probe uses). Read at the sample point to measure the
+    /// FILE-level output-locality OPPORTUNITY — the ceiling for feeding outputs
+    /// into the existing `score_and_generate_hints` locality map. NOT consulted by
+    /// any routing decision. Zero-size files are NOT recorded (they carry no
+    /// transferable content and only inflate match_frac — the file-level guard
+    /// against the empty-`Directory{}`-class artifact the directory probe found).
+    // CAPPED AT OUTPUT_FILE_PRODUCER_MAP_CAP (65536): bounded LRU of recent output
+    // file digests; over-cap evicts the oldest (= the recency window). Only a
+    // WorkerId per entry — no owned blob bytes.
+    output_file_producer_map: Arc<tokio::sync::Mutex<LruCache<DigestInfo, OutputProducer>>>,
 
     /// (#p1p2) Bounds concurrent enqueue-triggered tree prefetches.
     /// `prefetch_input_tree` acquires a permit with `try_acquire_owned`
@@ -2761,11 +2788,24 @@ const OUTPUT_PRODUCER_MAP_CAP: usize = 8192;
 /// alone exceeds 4 MiB is an outlier worth surfacing, not silently absorbing.
 const OUTPUT_TREE_MAX_DECODE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// (#output-locality-probe / file-level) Maximum number of output-FILE-digest
+/// entries in the bounded output-file→producer map (`output_file_producer_map`).
+/// Each entry is a recently-produced output file blob digest → its producer. A
+/// build produces far MORE distinct output files than distinct output directories
+/// (every compile emits object/rlib/dep files), so this is sized larger than
+/// `OUTPUT_PRODUCER_MAP_CAP`. 65536 file digests × (32-byte digest + short
+/// `WorkerId` String) ≈ a few MiB. Over-cap: LRU eviction (oldest output file
+/// drops first) = the recency window; `output_file_affinity_map_size` exposes
+/// whether the cap is binding (then `match_frac`/`matched_bytes` are lower bounds
+/// over a longer window).
+const OUTPUT_FILE_PRODUCER_MAP_CAP: usize = 65536;
+
 /// (#output-locality-probe) One producer of a recently-completed output
 /// directory, stored in the bounded `output_producer_map` keyed by the output
-/// `Directory` digest. The bounded LRU (`OUTPUT_PRODUCER_MAP_CAP`) IS the recency
-/// mechanism — an explicit timestamp would be a second, unread aging mechanism
-/// (OMITTED per the necessity ledger).
+/// `Directory` digest. Also reused for the file-level `output_file_producer_map`
+/// (keyed by output FILE blob digest). The bounded LRU IS the recency mechanism —
+/// an explicit timestamp would be a second, unread aging mechanism (OMITTED per
+/// the necessity ledger).
 #[derive(Debug, Clone)]
 pub(crate) struct OutputProducer {
     /// The worker that produced this output directory. Matched against the
@@ -3124,6 +3164,11 @@ impl ApiWorkerScheduler {
             // map. See OUTPUT_PRODUCER_MAP_CAP.
             output_producer_map: Arc::new(tokio::sync::Mutex::new(LruCache::new(
                 NonZeroUsize::new(OUTPUT_PRODUCER_MAP_CAP).unwrap(),
+            ))),
+            // (#output-locality-probe / file-level) Bounded output-file→producer
+            // file-digest map. See OUTPUT_FILE_PRODUCER_MAP_CAP.
+            output_file_producer_map: Arc::new(tokio::sync::Mutex::new(LruCache::new(
+                NonZeroUsize::new(OUTPUT_FILE_PRODUCER_MAP_CAP).unwrap(),
             ))),
             // (#p1p2) Bounded prefetch fan-out. See TREE_PREFETCH_CONCURRENCY.
             tree_prefetch_semaphore: Arc::new(Semaphore::new(TREE_PREFETCH_CONCURRENCY)),
@@ -4079,16 +4124,38 @@ impl ApiWorkerScheduler {
         &self,
         worker_id: WorkerId,
         output_tree_digests: Vec<DigestInfo>,
+        output_file_digests: Vec<(DigestInfo, u64)>,
         digest_function: DigestHasherFunc,
     ) {
-        let Some(cas_store) = self.cas_store.clone() else {
-            // No CAS store configured (locality scoring disabled) → nothing to
-            // resolve; the probe simply reports 0 opportunity.
-            return;
-        };
+        let cas_store = self.cas_store.clone();
         let output_producer_map = self.output_producer_map.clone();
+        let output_file_producer_map = self.output_file_producer_map.clone();
         let metrics = self.metrics.clone();
         background_spawn!("output_producer_recorder", async move {
+            // (#output-locality-probe / file-level) FIRST record the TOP-LEVEL
+            // output files — no decode, no CAS I/O (digests carried directly). This
+            // runs even when no CAS store is configured (only the Tree decode below
+            // needs it). Zero-size files were already filtered at extraction.
+            if !output_file_digests.is_empty() {
+                let mut fmap = output_file_producer_map.lock().await;
+                for (f, _size) in &output_file_digests {
+                    fmap.put(
+                        *f,
+                        OutputProducer {
+                            worker_id: worker_id.clone(),
+                        },
+                    );
+                }
+                drop(fmap);
+                metrics
+                    .output_files_recorded
+                    .fetch_add(output_file_digests.len() as u64, Ordering::Relaxed);
+            }
+
+            // The Tree decode (for in-folder dir + file digests) needs the CAS.
+            let Some(cas_store) = cas_store else {
+                return;
+            };
             for tree_digest in output_tree_digests {
                 // Cost-control (no-silent-truncation rule): skip an output whose
                 // Tree MESSAGE alone exceeds the cap — a pure check on the digest,
@@ -4142,31 +4209,50 @@ impl ApiWorkerScheduler {
                 };
 
                 let dir_digests = tree_directory_digests(&tree, digest_function);
-                if dir_digests.is_empty() {
-                    continue;
+                if !dir_digests.is_empty() {
+                    {
+                        let mut map = output_producer_map.lock().await;
+                        for d in &dir_digests {
+                            // LRU insert; over-cap evicts the oldest = the recency
+                            // window. A re-produced dir refreshes its producer (put
+                            // bumps it to most-recent).
+                            map.put(
+                                *d,
+                                OutputProducer {
+                                    worker_id: worker_id.clone(),
+                                },
+                            );
+                        }
+                    }
+                    // NOTE: `output_affinity_map_size` (point-in-time resident
+                    // count) is published at the SAMPLE point — the recorder only
+                    // needs the cumulative insert counter here.
+                    metrics
+                        .output_dirs_recorded
+                        .fetch_add(dir_digests.len() as u64, Ordering::Relaxed);
                 }
 
-                {
-                    let mut map = output_producer_map.lock().await;
-                    for d in &dir_digests {
-                        // LRU insert; over-cap evicts the oldest = the recency
-                        // window. A re-produced dir refreshes its producer (put
-                        // bumps it to most-recent).
-                        map.put(
-                            *d,
-                            OutputProducer {
-                                worker_id: worker_id.clone(),
-                            },
-                        );
+                // (#output-locality-probe / file-level) Record the IN-FOLDER output
+                // files from this Tree's FileNodes (the files nested inside an
+                // output directory, which `output_files` does not carry). Zero-size
+                // filtered inside `tree_file_digests`.
+                let in_folder_files = tree_file_digests(&tree);
+                if !in_folder_files.is_empty() {
+                    {
+                        let mut fmap = output_file_producer_map.lock().await;
+                        for (f, _size) in &in_folder_files {
+                            fmap.put(
+                                *f,
+                                OutputProducer {
+                                    worker_id: worker_id.clone(),
+                                },
+                            );
+                        }
                     }
+                    metrics
+                        .output_files_recorded
+                        .fetch_add(in_folder_files.len() as u64, Ordering::Relaxed);
                 }
-                // NOTE: `output_affinity_map_size` (point-in-time resident count)
-                // is published at the SAMPLE point (`output_affinity_for_probe`),
-                // which reads `map.len()` — the recorder only needs the cumulative
-                // insert counter here.
-                metrics
-                    .output_dirs_recorded
-                    .fetch_add(dir_digests.len() as u64, Ordering::Relaxed);
             }
         });
     }
@@ -4231,6 +4317,64 @@ impl ApiWorkerScheduler {
         // inner read lock released here — the solve runs lock-free.
 
         let gain = compute_output_affinity(&sampled, &producer_map, &connected);
+        (gain, map_size)
+    }
+
+    /// (#output-locality-probe / file-level) OBSERVABILITY-ONLY sample-point
+    /// snapshot for the FILE-level output-affinity probe (sibling of
+    /// `output_affinity_for_probe`). Over the sampled ready-action roots whose
+    /// input `ResolvedTree` is ALREADY cached (peek-only — NO resolution, NO
+    /// fetch, NO LRU bump), computes how often an input FILE digest matches a file
+    /// a STILL-CONNECTED worker recently produced, and sums the matched file
+    /// SIZES (the headline byte-mass).
+    ///
+    /// Two brief locks, each dropped before the pure solve: the `tree_cache` peek
+    /// (Pass 1, copying each cached tree's `file_digests` `(digest, size)` pairs)
+    /// and one snapshot of {`output_file_producer_map`, connected worker set}
+    /// (Pass 2). The compute itself is the PURE `compute_output_file_affinity` over
+    /// owned copies — no lock held across it.
+    ///
+    /// Returns `(OutputFileAffinityGain, map_size)`. Zero routing change: reads only.
+    pub(crate) async fn output_file_affinity_for_probe(
+        &self,
+        sampled_roots: &[DigestInfo],
+    ) -> (crate::simple_scheduler::OutputFileAffinityGain, u64) {
+        use crate::simple_scheduler::{OutputFileAffinityAction, compute_output_file_affinity};
+
+        // ── Pass 1: peek the tree cache for each sampled root's input file set ──
+        let mut sampled: Vec<OutputFileAffinityAction> =
+            Vec::with_capacity(sampled_roots.len());
+        {
+            let cache = self.tree_cache.lock().await;
+            for root in sampled_roots {
+                if let Some(tree) = cache.peek(root) {
+                    sampled.push(OutputFileAffinityAction {
+                        file_digests: tree.file_digests.clone(),
+                    });
+                }
+            }
+        }
+        // tree_cache lock released here.
+
+        // ── Pass 2: snapshot the output-FILE→producer map + connected worker set ──
+        let (producer_map, map_size) = {
+            let map = self.output_file_producer_map.lock().await;
+            let owned: HashMap<DigestInfo, WorkerId> = map
+                .iter()
+                .map(|(d, p)| (*d, p.worker_id.clone()))
+                .collect();
+            let size = map.len() as u64;
+            (owned, size)
+        };
+        // output_file_producer_map lock released here.
+
+        let connected: HashSet<WorkerId> = {
+            let inner = self.inner.read().await;
+            inner.workers.0.iter().map(|(wid, _)| wid.clone()).collect()
+        };
+        // inner read lock released here — the solve runs lock-free.
+
+        let gain = compute_output_file_affinity(&sampled, &producer_map, &connected);
         (gain, map_size)
     }
 
@@ -5768,6 +5912,29 @@ fn output_tree_digests_of_completion(update: &UpdateOperationType) -> Vec<Digest
     }
 }
 
+/// (#output-locality-probe / file-level) PURE: the TOP-LEVEL output FILE
+/// `(digest, size)` pairs to record from a completion update — the SUCCESS gate.
+/// Returns `output_files[].(digest, size)` IFF the update is a
+/// `Completed(ActionResult)`; EMPTY for `CompletedFromCache`/error/disconnect/
+/// keepalive (no executing producer worker). Zero-size files are FILTERED OUT
+/// here (they carry no transferable content and only inflate match_frac — the
+/// file-level guard against the empty-`Directory{}`-class artifact). Files nested
+/// INSIDE output directories are recovered separately from the output Tree's
+/// FileNodes on the detached recorder's decode.
+fn output_file_digests_of_completion(update: &UpdateOperationType) -> Vec<(DigestInfo, u64)> {
+    match update {
+        UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(action_result)) => {
+            action_result
+                .output_files
+                .iter()
+                .map(|f| (f.digest, f.digest.size_bytes()))
+                .filter(|(_, size)| *size > 0)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// (#output-locality-probe) PURE: extract the constituent `Directory` digests
 /// (root + every child) of a decoded output `Tree`, computing each digest by
 /// hashing the `Directory`'s serialized proto with `digest_function` — the SAME
@@ -5791,6 +5958,33 @@ fn tree_directory_digests(tree: &Tree, digest_function: DigestHasherFunc) -> Vec
         let digest = hasher.finalize_digest();
         if seen.insert(digest) {
             out.push(digest);
+        }
+    }
+    out
+}
+
+/// (#output-locality-probe / file-level) PURE: extract the IN-FOLDER output FILE
+/// `(digest, size)` pairs of a decoded output `Tree` — the `FileNode.digest`s
+/// (with `size_bytes`) across the root + every child `Directory`. These are the
+/// files nested INSIDE an output directory (an `output_folders` entry), which the
+/// top-level `output_files` list does NOT carry. Deduplicated; zero-size files
+/// filtered out (same content-free guard as the top-level path). Recovers these
+/// files so the file-level match_frac/matched_bytes are NOT silently undercounted
+/// for actions that output directories rather than loose files.
+fn tree_file_digests(tree: &Tree) -> Vec<(DigestInfo, u64)> {
+    let mut out: Vec<(DigestInfo, u64)> = Vec::new();
+    let mut seen: HashSet<DigestInfo> = HashSet::new();
+    let dirs = tree.root.iter().chain(tree.children.iter());
+    for dir in dirs {
+        for file_node in &dir.files {
+            if let Some(ref digest) = file_node.digest {
+                if let Ok(digest_info) = DigestInfo::try_from(digest) {
+                    let size = digest_info.size_bytes();
+                    if size > 0 && seen.insert(digest_info) {
+                        out.push((digest_info, size));
+                    }
+                }
+            }
         }
     }
     out
@@ -6352,6 +6546,25 @@ impl ApiWorkerScheduler {
     async fn output_producer_map_len(&self) -> usize {
         self.output_producer_map.lock().await.len()
     }
+
+    /// (#output-locality-probe / file-level) Test-only: directly seed the
+    /// output-FILE→producer map with `file_digest → worker_id`, bypassing the
+    /// recorder so the file SAMPLE seam can be driven deterministically.
+    async fn seed_output_file_producer(&self, file_digest: DigestInfo, worker_id: &WorkerId) {
+        let mut map = self.output_file_producer_map.lock().await;
+        map.put(
+            file_digest,
+            OutputProducer {
+                worker_id: worker_id.clone(),
+            },
+        );
+    }
+
+    /// (#output-locality-probe / file-level) Test-only: current entry count of the
+    /// bounded output-file→producer map (so the recorder test can await it).
+    async fn output_file_producer_map_len(&self) -> usize {
+        self.output_file_producer_map.lock().await.len()
+    }
 }
 
 #[async_trait]
@@ -6483,6 +6696,11 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // commit — it is NEVER on this completion RPC's critical path (no CAS I/O
         // added to the sched-b1-decoupled `update_action`).
         let output_tree_digests = output_tree_digests_of_completion(&update);
+        // (#output-locality-probe / file-level) Top-level output FILE digests +
+        // sizes — DIRECTLY from `output_files[].digest` (no decode). Recorded into
+        // the file→producer map by the same detached recorder. In-folder files are
+        // recovered from the output Tree's FileNodes on that recorder's decode.
+        let output_file_digests = output_file_digests_of_completion(&update);
 
         // ── lock-free await — (b) operation-state update; retries/sleeps
         //    here with NO worker-pool lock held ──
@@ -6501,18 +6719,19 @@ impl WorkerScheduler for ApiWorkerScheduler {
             })?;
 
         // (#output-locality-probe) The op-state commit SUCCEEDED for a `Completed`
-        // update carrying output directories → record the producer off the
-        // critical path. Detached: this returns immediately; the fetch+decode+map
-        // insert happens on a spawned task. Only spawned when there are output
-        // directories to record (`output_tree_digests` non-empty ⟺ this was a
-        // successful `Completed` with `output_folders`).
-        if !output_tree_digests.is_empty() {
+        // update carrying outputs → record the producer(s) off the critical path.
+        // Detached: this returns immediately; the top-level-file map inserts +
+        // Tree fetch/decode + dir/in-folder-file map inserts all happen on a
+        // spawned task. Spawned when there are outputs to record at all (dirs OR
+        // files ⟺ this was a successful `Completed` with output_folders/output_files).
+        if !output_tree_digests.is_empty() || !output_file_digests.is_empty() {
             // Capture the request's digest function WHILE the completion context
             // is live (the detached task runs outside it). The output `Directory`
             // protos must be hashed with the SAME function the worker used so the
             // computed digests match the input-side `dir_digests`. Falls back to
             // the fleet default (blake3 here) if the context carries none — the
-            // same resolution `parse_get_tree_response` uses.
+            // same resolution `parse_get_tree_response` uses. (Top-level output
+            // FILE digests need NO hashing — they are carried directly.)
             let digest_function = Context::current()
                 .get::<DigestHasherFunc>()
                 .copied()
@@ -6520,6 +6739,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
             self.spawn_output_producer_recorder(
                 worker_id.clone(),
                 output_tree_digests,
+                output_file_digests,
                 digest_function,
             );
         }
@@ -9305,10 +9525,13 @@ mod tests {
         let scheduler = build_output_recorder_scheduler(store).await;
 
         // Record the output for W0 (using SHA256 — the same function
-        // `encode_directory` used, so the recorder's hashes match).
+        // `encode_directory` used, so the recorder's hashes match). No TOP-LEVEL
+        // output files here (empty vec); the in-folder FileNodes (root.txt,
+        // leaf.txt) are recovered from the Tree decode.
         scheduler.spawn_output_producer_recorder(
             WorkerId("W0".to_string()),
             vec![tree_digest],
+            Vec::new(),
             DigestHasherFunc::Sha256,
         );
 
@@ -9421,6 +9644,242 @@ mod tests {
             0,
             2,
         )
+    }
+
+    /// (#output-locality-probe / file-level) END-TO-END SAMPLE seam:
+    /// `output_file_affinity_for_probe` must peek the REAL `tree_cache` for each
+    /// action's input `file_digests` (with sizes), snapshot the REAL
+    /// output-file→producer map, snapshot the REAL connected-worker set, and
+    /// compute matched_bytes = sum of matched file SIZES for STILL-CONNECTED
+    /// producers. Uses r1's real resolved tree (its file `r1.txt` size 500).
+    #[tokio::test]
+    async fn output_file_affinity_flows_through_real_probe() {
+        let (scheduler, r1, _r2, _c) = batch_sched_probe_scheduler().await;
+
+        // Warm tree_cache with r1's resolved input tree (peek-only at sample).
+        let r1_tree = scheduler
+            .resolve_input_tree(r1)
+            .await
+            .expect("#output-file: r1 must resolve");
+        // r1's input files: exactly one, `r1.txt`, size 500 (see fixture).
+        let (r1_file, r1_size) = *r1_tree
+            .file_digests
+            .first()
+            .expect("#output-file: r1's tree must carry its input file");
+        assert_eq!(r1_size, 500, "#output-file: fixture r1.txt is 500 bytes");
+
+        // FIRST: seed `r1.txt` as produced by a DISCONNECTED worker (GHOST not
+        // added) → connectedness gate must exclude it → 0.
+        scheduler
+            .seed_output_file_producer(r1_file, &WorkerId("GHOST".to_string()))
+            .await;
+        let (ghost_gain, _) = scheduler.output_file_affinity_for_probe(&[r1]).await;
+        assert_eq!(
+            ghost_gain.sample_actions, 1,
+            "#output-file: r1 cached → one sampled action. got {}",
+            ghost_gain.sample_actions
+        );
+        assert_eq!(
+            ghost_gain.match_frac, 0,
+            "#output-file: r1.txt's producer GHOST is DISCONNECTED → excluded → \
+             match_frac 0. got {}",
+            ghost_gain.match_frac
+        );
+        assert_eq!(
+            ghost_gain.matched_bytes, 0,
+            "#output-file: disconnected → 0 matched bytes. got {}",
+            ghost_gain.matched_bytes
+        );
+
+        // NOW connect W0 and re-seed r1.txt → W0. The input file matches a
+        // CONNECTED producer → match_frac 100, matched_bytes = 500 (the file size).
+        let (tx0, _rx0) = mpsc::unbounded_channel();
+        scheduler
+            .add_worker(Worker::new(
+                WorkerId("W0".to_string()),
+                PlatformProperties::default(),
+                tx0,
+                1,
+                100,
+            ))
+            .await
+            .expect("add W0");
+        scheduler
+            .seed_output_file_producer(r1_file, &WorkerId("W0".to_string()))
+            .await;
+
+        let (gain, map_size) = scheduler.output_file_affinity_for_probe(&[r1]).await;
+        assert_eq!(
+            gain.match_frac, 100,
+            "#output-file: r1.txt now produced by CONNECTED W0 → match_frac 100. got {}",
+            gain.match_frac
+        );
+        assert_eq!(
+            gain.matched_bytes, 500,
+            "#output-file: matched_bytes = r1.txt's SIZE (500), the byte-mass a \
+             peer-fetch would move. got {}",
+            gain.matched_bytes
+        );
+        assert_eq!(
+            gain.distinct_producers, 1,
+            "#output-file: one connected producer (W0). got {}",
+            gain.distinct_producers
+        );
+        assert_eq!(
+            gain.largest_contributor_bytes, 500,
+            "#output-file: r1.txt (500×1) is the sole contributor. got {}",
+            gain.largest_contributor_bytes
+        );
+        assert_eq!(
+            map_size, 1,
+            "#output-file: r1.txt re-seeded (LRU replace) → 1 resident. got {map_size}"
+        );
+    }
+
+    /// (#output-locality-probe / file-level) END-TO-END RECORDER seam:
+    /// `spawn_output_producer_recorder` must record TOP-LEVEL `output_files`
+    /// digests DIRECTLY into the file map (no decode) AND recover IN-FOLDER file
+    /// digests from the output Tree's FileNodes on its detached decode. Zero-size
+    /// files must be EXCLUDED at extraction.
+    #[tokio::test]
+    async fn output_file_recorder_records_top_level_and_in_folder_files() {
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+
+        // An output Tree with a child dir containing an in-folder file (size 128).
+        let child_dir = Directory {
+            files: vec![make_file_node("in_folder.o", 0xc0, 128)],
+            directories: vec![],
+            ..Default::default()
+        };
+        let (_child_bytes, _child_digest) = encode_directory(&child_dir);
+        let root_dir = Directory {
+            files: vec![],
+            directories: vec![],
+            ..Default::default()
+        };
+        let tree = Tree {
+            root: Some(root_dir),
+            children: vec![child_dir],
+        };
+        let tree_bytes = tree.encode_to_vec();
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        hasher.update(&tree_bytes);
+        let tree_digest = hasher.finalize_digest();
+        let key: StoreKey<'_> = tree_digest.into();
+        store
+            .update_oneshot(key, Bytes::from(tree_bytes))
+            .await
+            .expect("store output Tree");
+
+        let scheduler = build_output_recorder_scheduler(store).await;
+
+        // Top-level output files: a real one (2048) and a ZERO-size one (must be
+        // filtered — but note `spawn_output_producer_recorder` receives the ALREADY
+        // FILTERED list; the extraction filter is tested by the gate test. Here we
+        // pass one real top-level file digest directly).
+        let in_folder_digest = DigestInfo::new([0xc0; 32], 128);
+        let top_level_digest = DigestInfo::new([0xf0; 32], 2048);
+
+        scheduler.spawn_output_producer_recorder(
+            WorkerId("W0".to_string()),
+            vec![tree_digest],
+            vec![(top_level_digest, 2048)],
+            DigestHasherFunc::Sha256,
+        );
+
+        // Await both the top-level (immediate) and in-folder (post-decode) inserts
+        // → 2 file digests. Bounded yield, no sleep-as-sync.
+        let mut ok = false;
+        for _ in 0..10_000 {
+            if scheduler.output_file_producer_map_len().await >= 2 {
+                ok = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ok,
+            "#output-file: recorder never recorded both top-level + in-folder \
+             files (expected 2 file digests in the map)"
+        );
+
+        // Both digests must be present and attributed to W0.
+        let connected: HashSet<WorkerId> =
+            core::iter::once(WorkerId("W0".to_string())).collect();
+        for (label, fd) in [("top-level", top_level_digest), ("in-folder", in_folder_digest)] {
+            let action = crate::simple_scheduler::OutputFileAffinityAction {
+                file_digests: vec![(fd, fd.size_bytes())],
+            };
+            let owned: HashMap<DigestInfo, WorkerId> = {
+                let map = scheduler.output_file_producer_map.lock().await;
+                map.iter().map(|(d, p)| (*d, p.worker_id.clone())).collect()
+            };
+            let g = crate::simple_scheduler::compute_output_file_affinity(
+                core::slice::from_ref(&action),
+                &owned,
+                &connected,
+            );
+            assert_eq!(
+                g.match_frac, 100,
+                "#output-file: the {label} output file digest MUST be recorded for \
+                 W0. got {}",
+                g.match_frac
+            );
+        }
+    }
+
+    /// (#output-locality-probe / file-level) The SUCCESS gate + zero-size filter:
+    /// `output_file_digests_of_completion` returns `(digest, size)` for TOP-LEVEL
+    /// output files ONLY on `Completed(ActionResult)`, EXCLUDING zero-size files,
+    /// and NOTHING for error/keepalive/disconnect/executing.
+    #[test]
+    fn output_file_digests_gate_and_zero_size_filter() {
+        use nativelink_util::action_messages::{ActionResult, FileInfo, NameOrPath};
+
+        let real = DigestInfo::new([0x11; 32], 4096);
+        let zero = DigestInfo::new([0x22; 32], 0); // zero-size → filtered
+        let mut ar = ActionResult::default();
+        ar.output_files = vec![
+            FileInfo {
+                name_or_path: NameOrPath::Path("out/real.o".to_string()),
+                digest: real,
+                is_executable: false,
+            },
+            FileInfo {
+                name_or_path: NameOrPath::Path("out/empty".to_string()),
+                digest: zero,
+                is_executable: false,
+            },
+        ];
+
+        let completed =
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ar));
+        let got = output_file_digests_of_completion(&completed);
+        assert_eq!(
+            got,
+            vec![(real, 4096)],
+            "#output-file: only the non-zero-size top-level file (real.o, 4096) is \
+             recorded; the zero-size `empty` is FILTERED (content-free guard). got {got:?}"
+        );
+
+        for (label, update) in [
+            (
+                "error",
+                UpdateOperationType::UpdateWithError(make_err!(Code::Internal, "x")),
+            ),
+            ("keepalive", UpdateOperationType::KeepAlive),
+            ("disconnect", UpdateOperationType::UpdateWithDisconnect),
+            (
+                "executing",
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Executing),
+            ),
+        ] {
+            assert!(
+                output_file_digests_of_completion(&update).is_empty(),
+                "#output-file: a `{label}` update is NOT a success → records no \
+                 output files (the success gate)"
+            );
+        }
     }
 
     /// (#output-locality-probe) The SUCCESS gate: `output_tree_digests_of_completion`

@@ -941,6 +941,126 @@ pub fn compute_output_affinity(
     }
 }
 
+/// (#output-locality-probe / file-level) The OPPORTUNITY result the FILE-level
+/// output-affinity probe stores into gauges. Sibling to `OutputAffinityGain` but
+/// measuring INPUT-FILE ∩ recently-produced-OUTPUT-FILE overlap — the signal that
+/// feeds the EXISTING `score_and_generate_hints(&tree.file_digests, loc_map)`
+/// peer-fetch/prefetch mechanism (`api_worker_scheduler.rs`), which today never
+/// sees outputs in its locality map.
+///
+/// `matched_bytes` (sum of matched file SIZES) is the HEADLINE — the directory
+/// probe showed match_frac inflates on content-free digests while byte-mass is
+/// the honest signal. `largest_contributor_bytes` exposes whether a SINGLE
+/// ubiquitous file digest dominates the mass (the file-level analog of the
+/// empty-`Directory{}` artifact: a common small file compiled into many outputs).
+/// `map_size` is filled by the caller from the bounded map.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutputFileAffinityGain {
+    /// Fraction (×100, floored) of sampled ready actions with ≥1 input FILE
+    /// digest that hits the output-file→producer map for a STILL-CONNECTED
+    /// producer. `0` when there are no sampled actions.
+    pub match_frac: u64,
+    /// HEADLINE: sum of the SIZES (bytes) of matched input files across all
+    /// sampled actions — the byte-mass a peer-fetch/hardlink from the producer
+    /// would move. A file digest is counted once PER ACTION (an action's
+    /// `file_digests` is already deduplicated).
+    pub matched_bytes: u64,
+    /// Distinct producing workers matched this cycle (counted once each).
+    pub distinct_producers: u64,
+    /// Coverage denominator: number of sampled ready actions scored.
+    pub sample_actions: u64,
+    /// The single output-file digest contributing the MOST matched bytes this
+    /// cycle (its size × how many sampled actions matched it). Surfaces a
+    /// ubiquitous-but-nonzero dominator so `matched_bytes` is not silently one
+    /// hot file — the file-level guard against the empty-`Directory{}`-class
+    /// artifact. `0` when nothing matched.
+    pub largest_contributor_bytes: u64,
+}
+
+/// (#output-locality-probe / file-level) PURE (no I/O, no lock, no scheduler
+/// state): over the sampled ready-action window `sampled` (each carrying the
+/// action's input `(file_digest, size)` pairs from `ResolvedTree.file_digests`),
+/// count how often an input FILE digest matches a file recently PRODUCED as
+/// output by a STILL-CONNECTED worker, and sum the matched file SIZES.
+///
+/// A file digest `f` of action `i` MATCHES iff `producer_map[f]` exists AND that
+/// producer is in `connected`. `matched_bytes` sums the file size for each match
+/// (per action). `largest_contributor_bytes` tracks the single output-file digest
+/// whose (size × matching-action-count) is largest, so a reader can tell whether
+/// the mass is one ubiquitous file or genuinely spread — the file-level analog of
+/// the directory probe's empty-`Directory{}` diagnosis.
+///
+/// It does NOT change dispatch — the scheduler has no output-file-affinity tier;
+/// this measures the ceiling for feeding outputs into the existing
+/// `score_and_generate_hints` locality map.
+pub fn compute_output_file_affinity(
+    sampled: &[OutputFileAffinityAction],
+    producer_map: &HashMap<DigestInfo, WorkerId>,
+    connected: &HashSet<WorkerId>,
+) -> OutputFileAffinityGain {
+    let sample_actions = sampled.len() as u64;
+    let mut actions_with_match: u64 = 0;
+    let mut matched_bytes: u64 = 0;
+    let mut distinct_producers: HashSet<WorkerId> = HashSet::new();
+    // Per matched file digest: (its size, how many actions matched it) → the
+    // (size × count) contribution to matched_bytes, so we can report the single
+    // largest contributor.
+    let mut contributor_counts: HashMap<DigestInfo, (u64, u64)> = HashMap::new();
+
+    for action in sampled {
+        let mut this_action_matched = false;
+        for (f, size) in &action.file_digests {
+            // A file the action needs as INPUT that a worker recently PRODUCED as
+            // OUTPUT — and that worker is still connected (so a peer-fetch/prefetch
+            // hint to it would be actionable).
+            if let Some(producer) = producer_map.get(f) {
+                if connected.contains(producer) {
+                    this_action_matched = true;
+                    distinct_producers.insert(producer.clone());
+                    matched_bytes += *size;
+                    let entry = contributor_counts.entry(*f).or_insert((*size, 0));
+                    entry.1 += 1;
+                }
+            }
+        }
+        if this_action_matched {
+            actions_with_match += 1;
+        }
+    }
+
+    let match_frac = if sample_actions == 0 {
+        0
+    } else {
+        actions_with_match * 100 / sample_actions
+    };
+
+    // Largest single-digest contribution = max over matched digests of size×count.
+    let largest_contributor_bytes = contributor_counts
+        .values()
+        .map(|(size, count)| size * count)
+        .max()
+        .unwrap_or(0);
+
+    OutputFileAffinityGain {
+        match_frac,
+        matched_bytes,
+        distinct_producers: distinct_producers.len() as u64,
+        sample_actions,
+        largest_contributor_bytes,
+    }
+}
+
+/// (#output-locality-probe / file-level) One sampled ready action's INPUT file
+/// digests + sizes, copied from the cached `ResolvedTree.file_digests` at the
+/// probe sample point. `file_digests` is already deduplicated per action (the
+/// BFS `seen_files` set), so each digest appears once.
+#[derive(Debug, Clone)]
+pub struct OutputFileAffinityAction {
+    /// `(file_blob_digest, size_bytes)` for every distinct file in the action's
+    /// input tree.
+    pub file_digests: Vec<(DigestInfo, u64)>,
+}
+
 /// (#batch-affinity, dimension B) Type-erased injectable clock producing the
 /// `SystemTime` that timestamps arrivals. `SystemTime::now` in prod;
 /// `MockInstantWrapped`'s `now()` (mock-clock-driven) in tests. Erased so
@@ -1220,6 +1340,74 @@ pub struct OutputAffinityMetrics {
     pub map_size: AtomicU64,
 }
 
+/// (#output-locality-probe / file-level) OBSERVABILITY-ONLY gauges quantifying the
+/// FILE-level OUTPUT-locality opportunity: how often a ready action's INPUT files
+/// overlap files a STILL-CONNECTED worker recently produced as output. This is the
+/// ceiling for feeding outputs into the EXISTING
+/// `score_and_generate_hints(&tree.file_digests, loc_map)` peer-fetch/prefetch
+/// mechanism (which today never sees outputs in its locality map). Emitted under
+/// `scheduler.<name>.action.output_file_affinity.<field>` — a SIBLING namespace to
+/// `output_affinity` (directory-level) and `batch_affinity` (input-overlap).
+///
+/// `matched_bytes` (sum of matched file SIZES) is the HEADLINE — the directory
+/// probe showed match_frac inflates on content-free digests while byte-mass is the
+/// honest signal. `largest_contributor_bytes` exposes whether a single ubiquitous
+/// file dominates the mass. Read `match_frac` against `sample_actions ≥ 1`.
+#[derive(Debug, Default, MetricsComponent)]
+pub struct OutputFileAffinityMetrics {
+    /// (#output-locality-probe / file-level) Gauge: fraction (×100) of sampled
+    /// ready actions with ≥1 input FILE digest a STILL-CONNECTED worker recently
+    /// produced as output, last match cycle. `0` when `sample_actions` is 0. Read
+    /// `matched_bytes` as the honest headline; a high match_frac with low
+    /// matched_bytes is content-light (see the directory probe's empty-dir finding).
+    #[metric(
+        help = "file-level output-locality opportunity: percent of sampled ready actions with >=1 input file produced as output by a still-connected worker, last match cycle; read matched_bytes as the honest headline"
+    )]
+    pub match_frac: AtomicU64,
+
+    /// (#output-locality-probe / file-level) HEADLINE gauge: sum of the SIZES
+    /// (bytes) of matched input files across sampled actions, last match cycle —
+    /// the byte-mass a peer-fetch/hardlink from the producer would move. This is
+    /// the load-bearing signal (real bytes), unlike the frac.
+    #[metric(
+        help = "HEADLINE: sum of matched input-file sizes (bytes) across sampled ready actions, last match cycle — the byte-mass a peer-fetch from the producer would move"
+    )]
+    pub matched_bytes: AtomicU64,
+
+    /// (#output-locality-probe / file-level) Gauge: distinct producing workers
+    /// matched this cycle.
+    #[metric(
+        help = "distinct still-connected producing workers matched by the sampled ready actions' input files, last match cycle"
+    )]
+    pub distinct_producers: AtomicU64,
+
+    /// (#output-locality-probe / file-level) Coverage guardrail gauge: number of
+    /// sampled ready actions scored (input tree already cached). `match_frac` /
+    /// `matched_bytes` are low-coverage artifacts below 1.
+    #[metric(
+        help = "number of sampled ready actions with an already-cached input tree scored in the file-level output-affinity computation, last match cycle"
+    )]
+    pub sample_actions: AtomicU64,
+
+    /// (#output-locality-probe / file-level) Gauge: current entries in the bounded
+    /// output-file→producer map. At the cap (`OUTPUT_FILE_PRODUCER_MAP_CAP`) the
+    /// recency window is binding, so match_frac/matched_bytes are lower bounds.
+    #[metric(
+        help = "current entries in the bounded output-file->producer file-digest map; at the cap means the recency window is binding (matched_bytes is then a lower bound)"
+    )]
+    pub map_size: AtomicU64,
+
+    /// (#output-locality-probe / file-level) DIAGNOSTIC gauge: the single output
+    /// file digest contributing the MOST matched bytes this cycle (its size × how
+    /// many actions matched it). If this ≈ `matched_bytes`, ONE ubiquitous file
+    /// dominates (the file-level analog of the empty-`Directory{}` artifact); if
+    /// ≪ `matched_bytes`, the opportunity is genuinely spread across files.
+    #[metric(
+        help = "the single output-file digest contributing the most matched bytes (size x matching-action-count) this cycle; if ~= matched_bytes then one ubiquitous file dominates (content-light), if << then the opportunity is spread"
+    )]
+    pub largest_contributor_bytes: AtomicU64,
+}
+
 struct SimpleSchedulerActionStateResult {
     client_operation_id: OperationId,
     action_state_result: Box<dyn ActionStateResult>,
@@ -1322,6 +1510,14 @@ pub struct SimpleScheduler {
     /// see `OutputAffinityMetrics`. SIBLING namespace to `batch_affinity`.
     #[metric(group = "output_affinity")]
     output_affinity_metrics: OutputAffinityMetrics,
+
+    /// (#output-locality-probe / file-level) OBSERVABILITY-ONLY gauges quantifying
+    /// the FILE-level output-locality opportunity (a ready action's input files
+    /// overlap files a still-connected worker recently produced). Read-only w.r.t.
+    /// assignment — see `OutputFileAffinityMetrics`. SIBLING namespace to
+    /// `output_affinity` (directory-level) and `batch_affinity`.
+    #[metric(group = "output_file_affinity")]
+    output_file_affinity_metrics: OutputFileAffinityMetrics,
 
     /// (#batch-affinity, dimension B) Bounded recent-arrival window feeding
     /// `batch_affinity_metrics.arrival_within_250ms_total`. Guarded by a
@@ -1681,6 +1877,35 @@ impl SimpleScheduler {
         self.output_affinity_metrics
             .map_size
             .store(out_map_size, Ordering::Relaxed);
+
+        // (#output-locality-probe / file-level) FILE-level output-affinity over the
+        // SAME sampled roots: input file_digests ∩ recently-produced output files
+        // for a still-connected producer. matched_bytes (sum of matched file
+        // SIZES) is the HEADLINE; largest_contributor_bytes flags a ubiquitous
+        // single file. Peek-only + one map/worker snapshot + pure solve. SIBLING to
+        // the directory-level and batch-sched blocks above.
+        let (file_gain, file_map_size) = self
+            .worker_scheduler
+            .output_file_affinity_for_probe(&pending_roots)
+            .await;
+        self.output_file_affinity_metrics
+            .match_frac
+            .store(file_gain.match_frac, Ordering::Relaxed);
+        self.output_file_affinity_metrics
+            .matched_bytes
+            .store(file_gain.matched_bytes, Ordering::Relaxed);
+        self.output_file_affinity_metrics
+            .distinct_producers
+            .store(file_gain.distinct_producers, Ordering::Relaxed);
+        self.output_file_affinity_metrics
+            .sample_actions
+            .store(file_gain.sample_actions, Ordering::Relaxed);
+        self.output_file_affinity_metrics
+            .map_size
+            .store(file_map_size, Ordering::Relaxed);
+        self.output_file_affinity_metrics
+            .largest_contributor_bytes
+            .store(file_gain.largest_contributor_bytes, Ordering::Relaxed);
     }
 
     /// Matches a single action to a worker, using a shared cache for computed
@@ -2393,6 +2618,7 @@ impl SimpleScheduler {
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
                 batch_affinity_metrics: BatchAffinityMetrics::default(),
                 output_affinity_metrics: OutputAffinityMetrics::default(),
+                output_file_affinity_metrics: OutputFileAffinityMetrics::default(),
                 recent_roots_window: Mutex::new(RecentRootsWindow::new()),
                 affinity_clock,
                 pending_affinity_probe_enabled,
