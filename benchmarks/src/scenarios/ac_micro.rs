@@ -225,6 +225,11 @@ async fn build_ac_filesystem_store(
         // has no indefinite-pin cap to exercise. Field added by #FL-681
         // follow-up `b73a1f94`; this explicit literal predated it.
         pending_bis_pin_max_bytes: 0,
+        // AC store, not a worker CAS store — leave the reconcile gate OFF
+        // (matches the FilesystemSpec default). Field added by FL-688 v3
+        // Stage C; this fully-enumerated literal predated it, so the
+        // bench crate failed to compile until it was added here.
+        startup_reconcile_gate: false,
     };
     let fs_arc: Arc<FilesystemStore> = FilesystemStore::new(&spec).await?;
     Ok((Store::new(fs_arc), temp_dir))
