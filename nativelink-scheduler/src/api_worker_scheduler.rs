@@ -123,8 +123,18 @@ pub struct SchedulerMetrics {
     /// NO behavior change: this does NOT alter which blobs are
     /// prefetched, where they are read from, or any routing — it counts
     /// the peer-available byte mass among the SAME candidates.
+    ///
+    /// CAVEAT — a CEILING, not realizable offload (reviewers `8ff8177d`):
+    /// it OVER-states what a peer could actually serve because (a) the
+    /// `locality_map` is trusted-until-explicit-eviction, so a stale holder
+    /// inflates the count; (b) a peer holding the blob may itself be
+    /// saturated by the same burst; (c) this numerator sums CANDIDATES at
+    /// decision time while `prefetch_bytes_sent` counts only bytes
+    /// SUCCESSFULLY sent, so the ratio biases slightly high under partial
+    /// prefetch failure. Conservative for a build decision (cannot hide
+    /// real headroom); discount for staleness + peer load before acting.
     #[metric(
-        help = "(#prefetch-peer-offload) cumulative bytes among prefetch candidates that a peer worker already holds (locality_map holder != target); ratio over prefetch_bytes_sent = server-offload headroom. telemetry-only, no routing change"
+        help = "(#prefetch-peer-offload) cumulative bytes among prefetch candidates that a peer worker already holds (locality_map holder != target); ratio over prefetch_bytes_sent = server-offload headroom CEILING (over-states: stale locality + peer saturation + candidate-vs-sent basis). telemetry-only, no routing change"
     )]
     pub prefetch_peer_offloadable_bytes: AtomicU64,
     /// (#prefetch-peer-offload) TELEMETRY-ONLY. Companion to
