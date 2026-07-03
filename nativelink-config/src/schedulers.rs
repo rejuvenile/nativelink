@@ -276,6 +276,26 @@ pub struct SimpleSpec {
     /// empty-config value at 2.
     #[serde(default = "default_p_headroom_override_factor")]
     pub p_headroom_override_factor: u32,
+
+    /// (#p2p-prefetch) When enabled, the scheduler carries per-missing-blob
+    /// peer CAS endpoints INLINE in `StartExecute.missing_digest_peers` and
+    /// STOPS server-prefetching the peer-held missing blobs — the assigned
+    /// worker pulls those inputs P2P from a peer instead (worker-driven P2P
+    /// input prefetch). The server keeps prefetching the server-only missing
+    /// blobs (no peer holds them). The worker's `WorkerProxyStore` race
+    /// co-launches a server fetch as the fallback, so a peer miss/slow/down
+    /// degrades to today's server latency, never a stall.
+    ///
+    /// Default: false (OFF) — byte-identical to today. With the flag OFF the
+    /// scheduler prefetches the full missing set exactly as before and the
+    /// inline field is left empty (the worker registers nothing extra). This
+    /// is the "never worse than today" guarantee and the rollback lever.
+    /// The realizable offload fraction is UNMEASURED; the feature must not
+    /// ship on the ~85-90% ceiling metric — leave OFF until the landed
+    /// `worker_proxy_peer_fetch_*` counters measure realizable win-vs-fallback
+    /// on a canary (design §7).
+    #[serde(default)]
+    pub enable_p2p_input_prefetch: bool,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -328,6 +348,9 @@ impl Default for SimpleSpec {
             // #[serde(default = "default_p_headroom_override_factor")] → 2.
             // NOT the u32 type default (0), which would disable the override.
             p_headroom_override_factor: default_p_headroom_override_factor(),
+            // #[serde(default)] → bool default (false) = P2P input prefetch OFF
+            // (byte-identical to today until an operator enables it).
+            enable_p2p_input_prefetch: false,
         }
     }
 }

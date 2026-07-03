@@ -240,6 +240,7 @@ async fn prepare_action_shared_dir_in_input_and_output_succeeds()
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                 missing_digests: Vec::new(),
+                missing_digest_peers: Vec::new(),
             },
         )
         .await?;
@@ -368,6 +369,7 @@ async fn prepare_action_output_dirs_created_correctly()
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                 missing_digests: Vec::new(),
+                missing_digest_peers: Vec::new(),
             },
         )
         .await?;

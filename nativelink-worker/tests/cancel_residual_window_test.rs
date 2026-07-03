@@ -170,6 +170,7 @@ async fn setup_manager_and_action(
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
         missing_digests: Vec::new(),
+        missing_digest_peers: Vec::new(),
     };
     Ok((running_actions_manager, operation_id, start_execute))
 }
@@ -396,6 +397,7 @@ async fn cancel_then_cleanup_race_does_not_poison_ac() -> Result<(), Error> {
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
         missing_digests: Vec::new(),
+        missing_digest_peers: Vec::new(),
     };
 
     let running_action = manager

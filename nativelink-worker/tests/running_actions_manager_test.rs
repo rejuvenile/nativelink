@@ -270,6 +270,7 @@ mod tests {
             resolved_directories: Vec::new(),
             resolved_directory_digests: Vec::new(),
             missing_digests: Vec::new(),
+            missing_digest_peers: Vec::new(),
         })
     }
 
@@ -1340,6 +1341,7 @@ mod tests {
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -1474,6 +1476,7 @@ mod tests {
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -1624,6 +1627,7 @@ mod tests {
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -1813,6 +1817,7 @@ mod tests {
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -1986,6 +1991,7 @@ mod tests {
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -2198,6 +2204,7 @@ mod tests {
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -2356,6 +2363,7 @@ mod tests {
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -2545,6 +2553,7 @@ exit 0
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -2740,6 +2749,7 @@ exit 0
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -2906,6 +2916,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -3503,6 +3514,7 @@ exit 1
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .and_then(|action| {
@@ -3599,6 +3611,7 @@ exit 1
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .and_then(|action| {
@@ -3695,6 +3708,7 @@ exit 1
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .and_then(|action| {
@@ -3836,6 +3850,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .and_then(|action| async move {
@@ -3996,6 +4011,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -4272,6 +4288,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -4415,6 +4432,7 @@ exit 1
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await?;
@@ -4606,6 +4624,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -4734,6 +4753,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await;
@@ -4854,6 +4874,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -4878,6 +4899,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await;
@@ -5745,6 +5767,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -6431,6 +6454,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -6833,6 +6857,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -7025,6 +7050,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -7237,6 +7263,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -7464,6 +7491,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -7821,6 +7849,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -7983,6 +8012,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -8150,6 +8180,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -8539,6 +8570,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -8723,6 +8755,7 @@ exit 1
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),
+                    missing_digest_peers: Vec::new(),
                 },
             )
             .await?;
@@ -8969,6 +9002,7 @@ exit 1
                         resolved_directories: Vec::new(),
                         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
                     },
                 )
                 .await

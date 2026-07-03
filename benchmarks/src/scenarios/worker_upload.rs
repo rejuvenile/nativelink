@@ -766,6 +766,9 @@ async fn stage_one_action(
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                 missing_digests: Vec::new(),
+                // (#p2p-prefetch) Bench harness does not exercise inline P2P
+                // peer hints — field added by the proto change.
+                missing_digest_peers: Vec::new(),
             },
         )
         .await?;

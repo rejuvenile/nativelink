@@ -2323,6 +2323,10 @@ impl SimpleScheduler {
             // Inert unless `p_headroom_gate_enabled` AND threshold > 0.
             spec.p_idle_threshold_pct,
             spec.p_headroom_override_factor,
+            // (#p2p-prefetch) worker-driven P2P input prefetch shed; default
+            // OFF (byte-identical to today — full server-push prefetch + empty
+            // inline field until an operator enables it).
+            spec.enable_p2p_input_prefetch,
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();
