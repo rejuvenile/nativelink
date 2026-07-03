@@ -110,6 +110,40 @@ pub struct SchedulerMetrics {
     /// Total bytes successfully prefetched to workers.
     #[metric(help = "total bytes successfully prefetched to workers")]
     pub prefetch_bytes_sent: AtomicU64,
+    /// (#prefetch-peer-offload) TELEMETRY-ONLY. Of the blobs the server
+    /// decides to prefetch (push server→target worker), the cumulative
+    /// byte mass of those a PEER worker already holds in the
+    /// `locality_map` (some holder endpoint ≠ the prefetch target). This
+    /// is the server-offload headroom a peer-preferring prefetch (or a
+    /// send-input-list-first-then-prefetch-only-non-peer design) could
+    /// reclaim under burst. The ratio
+    /// `prefetch_peer_offloadable_bytes / prefetch_bytes_sent` is the
+    /// scrapeable offload fraction. LIVE — incremented on the prefetch
+    /// decision path (`find_and_reserve_worker` Phase 4), `Relaxed`.
+    /// NO behavior change: this does NOT alter which blobs are
+    /// prefetched, where they are read from, or any routing — it counts
+    /// the peer-available byte mass among the SAME candidates.
+    ///
+    /// CAVEAT — a CEILING, not realizable offload (reviewers `8ff8177d`):
+    /// it OVER-states what a peer could actually serve because (a) the
+    /// `locality_map` is trusted-until-explicit-eviction, so a stale holder
+    /// inflates the count; (b) a peer holding the blob may itself be
+    /// saturated by the same burst; (c) this numerator sums CANDIDATES at
+    /// decision time while `prefetch_bytes_sent` counts only bytes
+    /// SUCCESSFULLY sent, so the ratio biases slightly high under partial
+    /// prefetch failure. Conservative for a build decision (cannot hide
+    /// real headroom); discount for staleness + peer load before acting.
+    #[metric(
+        help = "(#prefetch-peer-offload) cumulative bytes among prefetch candidates that a peer worker already holds (locality_map holder != target); ratio over prefetch_bytes_sent = server-offload headroom CEILING (over-states: stale locality + peer saturation + candidate-vs-sent basis). telemetry-only, no routing change"
+    )]
+    pub prefetch_peer_offloadable_bytes: AtomicU64,
+    /// (#prefetch-peer-offload) TELEMETRY-ONLY. Companion to
+    /// `prefetch_peer_offloadable_bytes`: the count of prefetch-candidate
+    /// blobs a peer worker already holds. LIVE, `Relaxed`.
+    #[metric(
+        help = "(#prefetch-peer-offload) cumulative count of prefetch-candidate blobs a peer worker already holds (locality_map holder != target). telemetry-only, no routing change"
+    )]
+    pub prefetch_peer_offloadable_blobs: AtomicU64,
     /// Total number of blobs that failed to prefetch.
     #[metric(help = "total number of blobs that failed to prefetch")]
     pub prefetch_blobs_failed: AtomicU64,
@@ -3583,6 +3617,26 @@ impl ApiWorkerScheduler {
                 loc_map,
             );
             if !prefetch_missing.is_empty() {
+                // (#prefetch-peer-offload) TELEMETRY-ONLY: measure, among
+                // the blobs we are ABOUT TO push server→target, the byte
+                // mass a PEER worker already holds — the server-offload
+                // headroom a peer-preferring prefetch could reclaim. Reuses
+                // the same locality snapshot/live-read path as the
+                // compute_missing_blobs call above (single query path). No
+                // routing change: the spawn_prefetch call below is
+                // unchanged and still pushes the full prefetch_missing set.
+                let (peer_bytes, peer_blobs) = Self::count_peer_offloadable(
+                    &prefetch_missing,
+                    endpoint,
+                    locality_snapshot,
+                    loc_map,
+                );
+                self.metrics
+                    .prefetch_peer_offloadable_bytes
+                    .fetch_add(peer_bytes, Ordering::Relaxed);
+                self.metrics
+                    .prefetch_peer_offloadable_blobs
+                    .fetch_add(peer_blobs, Ordering::Relaxed);
                 self.spawn_prefetch(
                     Arc::clone(endpoint),
                     prefetch_missing.clone(),
@@ -4780,6 +4834,68 @@ impl ApiWorkerScheduler {
         });
 
         missing
+    }
+
+    /// (#prefetch-peer-offload) TELEMETRY-ONLY. Given the exact set of
+    /// blobs the server is about to prefetch (push server→`worker_endpoint`),
+    /// returns `(peer_offloadable_bytes, peer_offloadable_blobs)`: the byte
+    /// mass and count of those blobs a PEER worker already holds in the
+    /// locality map — i.e. some holder endpoint ≠ the prefetch target.
+    /// This is the server-offload headroom a peer-preferring prefetch could
+    /// reclaim. It measures the SAME candidate set `compute_missing_blobs`
+    /// produced; it does NOT change what is prefetched or where it is read.
+    ///
+    /// Reuses the identical `locality_snapshot`-fast / `locality_map.read()`-
+    /// slow duality as `compute_missing_blobs` so there is exactly ONE
+    /// locality query path (no second, drift-prone lookup). On the slow
+    /// path the read guard is dropped before returning; no lock is held
+    /// across any `.await` (this fn is synchronous). Work is bounded by
+    /// `prefetch_blobs.len()`, itself capped at `PREFETCH_MAX_BLOBS` by
+    /// `compute_missing_blobs`.
+    ///
+    /// Note: a blob held ONLY by the target (or by no one) is NOT counted.
+    /// The target-held case cannot actually occur here — `compute_missing_blobs`
+    /// already excludes target-held blobs from `prefetch_blobs` — but the
+    /// predicate is written to exclude it regardless, so the count is the
+    /// true peer-available mass even if the caller passes an unfiltered set.
+    fn count_peer_offloadable(
+        prefetch_blobs: &[(DigestInfo, u64)],
+        worker_endpoint: &str,
+        locality_snapshot: Option<&LocalitySnapshot>,
+        locality_map: &SharedBlobLocalityMap,
+    ) -> (u64, u64) {
+        // A blob is peer-offloadable iff at least one holder endpoint is
+        // NOT the prefetch target. Same snapshot/live-read split as
+        // `compute_missing_blobs`; predicate inlined in each arm because
+        // the two holder iterators (`slice::Iter` vs `EndpointList::iter`)
+        // have distinct types.
+        let mut peer_bytes: u64 = 0;
+        let mut peer_blobs: u64 = 0;
+
+        if let Some(snapshot) = locality_snapshot {
+            for (digest, size) in prefetch_blobs {
+                if let Some(endpoints) = snapshot.get(digest) {
+                    if endpoints.iter().any(|e| &**e != worker_endpoint) {
+                        peer_bytes += *size;
+                        peer_blobs += 1;
+                    }
+                }
+            }
+        } else {
+            let map = locality_map.read();
+            let blobs = map.blobs_map();
+            for (digest, size) in prefetch_blobs {
+                if let Some(endpoints) = blobs.get(digest) {
+                    if endpoints.iter().any(|e| &**e != worker_endpoint) {
+                        peer_bytes += *size;
+                        peer_blobs += 1;
+                    }
+                }
+            }
+            drop(map);
+        }
+
+        (peer_bytes, peer_blobs)
     }
 
     /// Spawns a background task that prefetches missing small blobs from
@@ -8506,6 +8622,142 @@ mod tests {
         );
     }
 
+    // ── (#prefetch-peer-offload) count_peer_offloadable telemetry ──
+    // These assert the peer-offload-headroom counter over the SNAPSHOT
+    // fast path AND the live-read slow path, covering the three cases the
+    // metric must distinguish: (a) a prefetch candidate a PEER holds counts
+    // its bytes; (b) a candidate NO peer holds (unowned, or target-only)
+    // does NOT count; (c) a candidate the TARGET holds is excluded (it also
+    // never reaches the prefetch set — compute_missing_blobs drops it — but
+    // the predicate excludes it independently).
+
+    /// (a) peer-held prefetch candidate counts its bytes; (b) an unowned
+    /// candidate and (c) a target-only candidate do NOT count. Snapshot
+    /// (fast) path. The snapshot is built by the PRODUCTION builder
+    /// (`score_and_generate_hints`) so the test view matches prod shape.
+    #[test]
+    fn test_count_peer_offloadable_snapshot_peer_held_only_counts() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        // d_peer: held ONLY by a peer  → offloadable (counts 1500).
+        // d_target: held ONLY by the target → NOT offloadable.
+        // d_unowned: held by no one → NOT offloadable (not in map).
+        let d_peer = DigestInfo::new([0xaa; 32], 1500);
+        let d_target = DigestInfo::new([0xbb; 32], 700);
+        let d_unowned = DigestInfo::new([0xcc; 32], 900);
+
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_peer]);
+            map.register_blobs(target, &[d_target]);
+        }
+
+        // Build the snapshot exactly as production does (file_digests ∩ map).
+        let file_digests = vec![(d_peer, 1500), (d_target, 700), (d_unowned, 900)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+
+        // The prefetch candidate set is what would be pushed to `target`:
+        // d_peer (peer-only, missing from target) and d_unowned (missing).
+        // d_target is target-held so compute_missing_blobs would drop it;
+        // we include it here anyway to prove the predicate excludes it.
+        let prefetch_candidates = vec![(d_peer, 1500), (d_target, 700), (d_unowned, 900)];
+
+        let (peer_bytes, peer_blobs) = ApiWorkerScheduler::count_peer_offloadable(
+            &prefetch_candidates,
+            target,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        assert_eq!(
+            peer_bytes, 1500,
+            "only d_peer (held by a peer) is offloadable; d_target (target-only) \
+             and d_unowned (no holder) must NOT contribute — got {peer_bytes} bytes"
+        );
+        assert_eq!(
+            peer_blobs, 1,
+            "exactly one prefetch candidate is peer-held — got {peer_blobs} blobs"
+        );
+    }
+
+    /// A candidate held by BOTH the target AND a peer still counts: the
+    /// predicate is "ANY holder != target", not "no holder is target".
+    /// Guards against a naive `!contains(target)` implementation that would
+    /// under-count shared blobs (the common CI case: a blob many workers
+    /// hold). Snapshot path.
+    #[test]
+    fn test_count_peer_offloadable_shared_target_and_peer_counts() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        // d_shared: held by target AND peer → still offloadable (peer copy).
+        let d_shared = DigestInfo::new([0x55; 32], 4096);
+
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(target, &[d_shared]);
+            map.register_blobs(peer, &[d_shared]);
+        }
+
+        let file_digests = vec![(d_shared, 4096)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring.locality_snapshot.as_ref().expect("snapshot Some");
+
+        let (peer_bytes, peer_blobs) = ApiWorkerScheduler::count_peer_offloadable(
+            &[(d_shared, 4096)],
+            target,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        assert_eq!(
+            peer_bytes, 4096,
+            "a blob held by target AND a peer is peer-offloadable (a peer copy \
+             exists) — got {peer_bytes} bytes"
+        );
+        assert_eq!(peer_blobs, 1, "the shared blob counts once — got {peer_blobs}");
+    }
+
+    /// Live-read (snapshot=None) path parity: same classification as the
+    /// snapshot path. Exercises the over-cap fallback branch of
+    /// `count_peer_offloadable` that walks `locality_map.read()` directly.
+    #[test]
+    fn test_count_peer_offloadable_live_read_parity() {
+        let locality_map = new_shared_blob_locality_map();
+        let target = "grpc://worker-target:50081";
+        let peer = "grpc://worker-peer:50081";
+
+        let d_peer = DigestInfo::new([0xaa; 32], 1500);
+        let d_target = DigestInfo::new([0xbb; 32], 700);
+
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(peer, &[d_peer]);
+            map.register_blobs(target, &[d_target]);
+        }
+
+        let (peer_bytes, peer_blobs) = ApiWorkerScheduler::count_peer_offloadable(
+            &[(d_peer, 1500), (d_target, 700)],
+            target,
+            None, // ← over-cap fallback: walk live map
+            &locality_map,
+        );
+
+        assert_eq!(
+            peer_bytes, 1500,
+            "live-read path must match snapshot path: only d_peer is offloadable \
+             — got {peer_bytes} bytes"
+        );
+        assert_eq!(
+            peer_blobs, 1,
+            "live-read path: exactly one peer-held candidate — got {peer_blobs}"
+        );
+    }
+
     /// Mechanical contract: `score_and_generate_hints` returns a
     /// snapshot whose entries are *exactly* the file_digests ∩
     /// locality_map intersection, with peer endpoints matching
@@ -11180,6 +11432,19 @@ mod tests {
             .metrics
             .prefetch_blobs_sent
             .fetch_add(22, Ordering::Relaxed);
+        // (#prefetch-peer-offload) distinctive values on the two
+        // peer-offload-headroom telemetry counters so a misrouted
+        // group/field renders a different number (wrong-field guard) and
+        // a dark field (declared-but-never-rendered, the
+        // `prefetch_blobs_already_present` trap) is caught.
+        scheduler
+            .metrics
+            .prefetch_peer_offloadable_bytes
+            .fetch_add(24, Ordering::Relaxed);
+        scheduler
+            .metrics
+            .prefetch_peer_offloadable_blobs
+            .fetch_add(23, Ordering::Relaxed);
         scheduler
             .metrics
             .bis_replay_buffer_overflow_drops
@@ -11302,6 +11567,36 @@ mod tests {
             body.contains("\nscheduler_testsched_worker_scheduler_metrics_prefetch_blobs_sent 22\n"),
             "#231: prefetch_blobs_sent rendered the wrong value (expected 22). \
              body=\n{body}"
+        );
+        // (#prefetch-peer-offload) The peer-offload-headroom counters must
+        // render on /metrics with their set values — the ratio
+        // `prefetch_peer_offloadable_bytes / prefetch_bytes_sent` is only
+        // scrapeable if both fields render. A dark field here is the
+        // `prefetch_blobs_already_present` dead-counter trap.
+        assert!(
+            body.contains("scheduler_metrics_prefetch_peer_offloadable_bytes"),
+            "#prefetch-peer-offload: SchedulerMetrics.prefetch_peer_offloadable_bytes \
+             dark on /metrics — the server-offload-headroom numerator does not \
+             render, so the offload ratio is not scrapeable. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_scheduler_metrics_prefetch_peer_offloadable_bytes 24\n"
+            ),
+            "#prefetch-peer-offload: prefetch_peer_offloadable_bytes rendered the \
+             wrong value (expected 24) — group/field routing is wrong. body=\n{body}"
+        );
+        assert!(
+            body.contains("scheduler_metrics_prefetch_peer_offloadable_blobs"),
+            "#prefetch-peer-offload: SchedulerMetrics.prefetch_peer_offloadable_blobs \
+             dark on /metrics. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_scheduler_metrics_prefetch_peer_offloadable_blobs 23\n"
+            ),
+            "#prefetch-peer-offload: prefetch_peer_offloadable_blobs rendered the \
+             wrong value (expected 23) — group/field routing is wrong. body=\n{body}"
         );
         assert!(
             body.contains("scheduler_metrics_bis_replay_buffer_overflow_drops"),
