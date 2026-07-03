@@ -463,3 +463,71 @@ async fn batch_sched_gauges_render() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// (#output-locality-probe) The output-affinity opportunity gauges must RENDER on
+/// `/metrics` (a gauge that is not registered is DARK — the probe cannot answer
+/// its question if the field does not render). Built with NO cas_store and NO
+/// workers, so every gauge sits at its floor (0), which is exactly what proves
+/// the SIBLING `output_affinity` group is wired and non-dark.
+///
+/// Mutation rule: comment out the output-affinity block in
+/// `record_pending_affinity_surplus`; this test must red-fail on the missing
+/// `scheduler_test_action_output_affinity_*` lines.
+#[nativelink_test]
+async fn output_affinity_gauges_render() -> Result<(), Error> {
+    let (scheduler, worker_scheduler, _notify) = new_scheduler();
+
+    // Two pending ops so the sample pass runs (values are all 0 — no cas_store to
+    // resolve input trees, no workers connected, empty producer map).
+    for (input_root, action, off) in [(b'A', 1u8, 0u64), (b'B', 2, 1)] {
+        scheduler
+            .add_action(
+                OperationId::default(),
+                make_action_info(root(input_root), action, off),
+            )
+            .await
+            .expect("#output-locality-probe setup: add_action must succeed");
+    }
+    scheduler
+        .do_try_match_for_test()
+        .await
+        .expect("#output-locality-probe setup: do_try_match must succeed with no workers");
+
+    let registry = register(scheduler.clone(), worker_scheduler.clone());
+    let body = render_prometheus(&registry);
+
+    // All five SIBLING-namespace gauges must render at their floor. The literal
+    // names are the dashboard contract (worker-metrics-exposure discipline).
+    // Emitted as `scheduler_test_action_output_affinity_<leaf>` — the group
+    // `output_affinity` + the leaf field name (no doubled prefix).
+    for leaf in [
+        "match_frac",
+        "matched_bytes",
+        "distinct_producers",
+        "sample_actions",
+        "map_size",
+    ] {
+        assert!(
+            body.contains(&format!("\nscheduler_test_action_output_affinity_{leaf} 0\n")),
+            "#output-locality-probe: gauge `output_affinity_{leaf}` is DARK or non-zero \
+             on /metrics (expected floor 0 with no cas_store/workers/producers). The \
+             sibling output_affinity group is not wired. body=\n{body}"
+        );
+    }
+
+    // The recorder's SchedulerMetrics counters (on the worker_scheduler tree)
+    // must also render at floor — proving they are not dark.
+    for name in [
+        "output_tree_decode_skipped_oversized",
+        "output_tree_decode_errors",
+        "output_dirs_recorded",
+    ] {
+        assert!(
+            body.contains(&format!("\nscheduler_test_worker_scheduler_metrics_{name} 0\n")),
+            "#output-locality-probe: SchedulerMetrics counter `{name}` is DARK on \
+             /metrics (expected floor 0). body=\n{body}"
+        );
+    }
+
+    Ok(())
+}

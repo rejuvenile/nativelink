@@ -837,6 +837,110 @@ fn compute_subtree_overlap_pct(actions: &[BatchSchedAction]) -> u64 {
     shared_bytes * 100 / total_bytes
 }
 
+/// (#output-locality-probe) The OPPORTUNITY result the output-affinity probe
+/// stores into gauges. Measures how often a ready action's INPUT directory
+/// subtree matches an OUTPUT directory a STILL-CONNECTED worker recently
+/// produced — the ceiling of what "route a consumer to the worker that produced
+/// its inputs" could exploit, a signal the scheduler does NOT currently have (its
+/// only affinity signal is input-tree overlap via `cached_subtree_digests`).
+///
+/// This is OPPORTUNITY (a match EXISTS: a connected worker produced this
+/// directory), which is SEPARATE from realizability (the worker must ALSO still
+/// hold the output bytes locally to hardlink them — that is a worker-side
+/// retention change, out of scope for this probe). `map_size` is filled by the
+/// caller from the bounded map, not by the pure function.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutputAffinityGain {
+    /// Fraction (×100, floored) of sampled ready actions with ≥1 input directory
+    /// digest that hits the output→producer map for a producer STILL CONNECTED.
+    /// `0` when there are no sampled actions.
+    pub match_frac: u64,
+    /// Byte-mass of matched output subtrees, using the SAME model as
+    /// `compute_dedup_cached_score` + the Tier-1.5 dispatch blend:
+    /// `Σ dir_direct_bytes[d] + dir_direct_files[d]·PER_FILE_WEIGHT` over every
+    /// matched directory digest `d`, summed across sampled actions. Comparable to
+    /// the `batch_sched_*` byte numbers (same weighting).
+    pub matched_bytes: u64,
+    /// Distinct producing workers matched this cycle (a producer counts once even
+    /// if it produced several matched directories across the sample).
+    pub distinct_producers: u64,
+    /// Coverage denominator: number of sampled ready actions the computation ran
+    /// over (mirrors `batch_sched_sample_actions`). `match_frac` is meaningful
+    /// only at `≥ 1`.
+    pub sample_actions: u64,
+}
+
+/// (#output-locality-probe) PURE (no I/O, no lock, no scheduler state): over the
+/// sampled ready-action window `sampled` (each carrying the action's input
+/// directory digests + the disjoint per-directory direct byte/file weights,
+/// already produced by the `tree_cache` peek the batch probe does), count how
+/// often an input directory digest matches an OUTPUT directory recently produced
+/// by a STILL-CONNECTED worker.
+///
+/// A directory digest `d` of action `i` MATCHES iff `producer_map[d]` exists AND
+/// that producer is in `connected`. The `producer_map` is keyed on the
+/// constituent `Directory` digests of recently-produced output `Tree`s (root +
+/// children) — NOT on the `Tree` digest itself, because a downstream consumer
+/// references an output directory by its root/child `Directory` digest (which is
+/// what appears in the consumer's input-tree `dir_digests`), and the `Tree`
+/// digest is a digest of a DIFFERENT message shape that never appears in an input
+/// tree (see the design doc + REAPI `OutputDirectory.tree_digest`).
+///
+/// Byte-mass uses the SAME weighting as the Tier-1.5 dispatch score
+/// (`compute_dedup_cached_score` + `PER_FILE_WEIGHT`), summed over matched
+/// directories across all sampled actions, so `matched_bytes` is directly
+/// comparable to the `batch_sched_*` numbers.
+///
+/// It does NOT change dispatch — the real scheduler has no output-affinity tier.
+pub fn compute_output_affinity(
+    sampled: &[BatchSchedAction],
+    producer_map: &HashMap<DigestInfo, WorkerId>,
+    connected: &HashSet<WorkerId>,
+) -> OutputAffinityGain {
+    let sample_actions = sampled.len() as u64;
+    let mut actions_with_match: u64 = 0;
+    let mut matched_bytes: u64 = 0;
+    let mut distinct_producers: HashSet<WorkerId> = HashSet::new();
+
+    for action in sampled {
+        let mut this_action_matched = false;
+        for d in &action.dir_digests {
+            // A directory the action needs as INPUT that a worker recently
+            // PRODUCED as OUTPUT — and that worker is still connected (so it
+            // could, retention permitting, serve the consumer).
+            if let Some(producer) = producer_map.get(d) {
+                if connected.contains(producer) {
+                    this_action_matched = true;
+                    distinct_producers.insert(producer.clone());
+                    // Same byte model as compute_dedup_cached_score + Tier-1.5:
+                    // direct bytes + direct files × PER_FILE_WEIGHT for this
+                    // matched directory digest (disjoint partition → no
+                    // double-count across directories of the same action).
+                    let direct_bytes = action.dir_direct_bytes.get(d).copied().unwrap_or(0);
+                    let direct_files = action.dir_direct_files.get(d).copied().unwrap_or(0);
+                    matched_bytes += direct_bytes + direct_files * PER_FILE_WEIGHT;
+                }
+            }
+        }
+        if this_action_matched {
+            actions_with_match += 1;
+        }
+    }
+
+    let match_frac = if sample_actions == 0 {
+        0
+    } else {
+        actions_with_match * 100 / sample_actions
+    };
+
+    OutputAffinityGain {
+        match_frac,
+        matched_bytes,
+        distinct_producers: distinct_producers.len() as u64,
+        sample_actions,
+    }
+}
+
 /// (#batch-affinity, dimension B) Type-erased injectable clock producing the
 /// `SystemTime` that timestamps arrivals. `SystemTime::now` in prod;
 /// `MockInstantWrapped`'s `now()` (mock-clock-driven) in tests. Erased so
@@ -1045,6 +1149,77 @@ pub struct BatchAffinityMetrics {
     pub arrival_within_250ms_total: AtomicU64,
 }
 
+/// (#output-locality-probe) OBSERVABILITY-ONLY gauges quantifying the OUTPUT-
+/// LOCALITY OPPORTUNITY: how often a ready action's INPUT directory subtree
+/// matches an OUTPUT directory a STILL-CONNECTED worker recently produced. This
+/// is the ceiling of what "route a consumer to the worker that produced its
+/// inputs" could exploit — a signal the scheduler does NOT currently have (its
+/// only affinity signal is INPUT-tree overlap via `cached_subtree_digests`,
+/// whose batch-scheduling gain measured ~0%). Emitted on `/metrics` under
+/// `scheduler.<name>.action.output_affinity.<field>` — a SIBLING namespace to
+/// `...action.batch_affinity.batch_sched_*`.
+///
+/// None of these fields influence assignment; they only MEASURE the opportunity.
+/// Interpretation: this is OPPORTUNITY (a match EXISTS — a connected worker
+/// produced this directory), which is SEPARATE from realizability (the worker
+/// must ALSO still hold the output bytes locally to hardlink them — a worker-side
+/// retention change, OUT OF SCOPE for this probe). Read `output_affinity_match_frac`
+/// against `output_affinity_sample_actions ≥ 1` (coverage) and
+/// `output_affinity_map_size` (is the bounded map saturated / binding).
+#[derive(Debug, Default, MetricsComponent)]
+pub struct OutputAffinityMetrics {
+    /// (#output-locality-probe) HEADLINE gauge: fraction (×100) of sampled ready
+    /// actions with ≥1 input directory digest that matches an output directory a
+    /// STILL-CONNECTED worker recently produced, last match cycle. `0` when
+    /// coverage (`output_affinity_sample_actions`) is 0. This is the OUTPUT-
+    /// locality opportunity ceiling; compare it against the INPUT-overlap signal
+    /// (`batch_sched_*`) to see which affinity dimension is larger.
+    // Field names are the LEAF under the `output_affinity` group → the emitted
+    // metric is `..._action_output_affinity_match_frac` (no doubled prefix; the
+    // group already carries `output_affinity`, mirroring how `batch_affinity`'s
+    // fields are `batch_sched_*`, not `batch_affinity_*`).
+    #[metric(
+        help = "output-locality opportunity: percent of sampled ready actions with >=1 input dir produced as output by a still-connected worker, last match cycle; read with sample_actions>=1"
+    )]
+    pub match_frac: AtomicU64,
+
+    /// (#output-locality-probe) Gauge: byte-mass of matched output subtrees, SAME
+    /// weighting as the Tier-1.5 dispatch score (`compute_dedup_cached_score` +
+    /// `PER_FILE_WEIGHT`: `Σ dir_direct_bytes + dir_direct_files·100KiB` over
+    /// matched dirs), summed across sampled actions, last match cycle. Comparable
+    /// to the `batch_sched_*` byte numbers.
+    #[metric(
+        help = "byte-mass of matched output subtrees (direct bytes + files*100KiB, same model as batch_sched), summed across sampled actions, last match cycle"
+    )]
+    pub matched_bytes: AtomicU64,
+
+    /// (#output-locality-probe) Gauge: distinct producing workers matched this
+    /// cycle (a producer counts once even if it produced several matched dirs).
+    #[metric(
+        help = "distinct still-connected producing workers matched by the sampled ready actions, last match cycle"
+    )]
+    pub distinct_producers: AtomicU64,
+
+    /// (#output-locality-probe) Coverage guardrail gauge: number of sampled ready
+    /// actions the match computation ran over (those whose input tree was already
+    /// cached — mirrors `batch_sched_sample_actions`). `output_affinity_match_frac`
+    /// is a low-coverage artifact below 1.
+    #[metric(
+        help = "number of sampled ready actions with an already-cached input tree scored in the output-affinity computation, last match cycle (match_frac meaningful only at >=1)"
+    )]
+    pub sample_actions: AtomicU64,
+
+    /// (#output-locality-probe) Gauge: current entries in the bounded
+    /// output→producer map (Directory digests of recently-produced outputs). If
+    /// this sits at the cap (`OUTPUT_PRODUCER_MAP_CAP`), the recency window is
+    /// binding — the oldest output dirs are being LRU-evicted, so `match_frac` is
+    /// a lower bound on the true opportunity over a longer window.
+    #[metric(
+        help = "current entries in the bounded output->producer directory-digest map; at the cap means the recency window is binding (match_frac is then a lower bound)"
+    )]
+    pub map_size: AtomicU64,
+}
+
 struct SimpleSchedulerActionStateResult {
     client_operation_id: OperationId,
     action_state_result: Box<dyn ActionStateResult>,
@@ -1140,6 +1315,13 @@ pub struct SimpleScheduler {
     /// Read-only w.r.t. assignment — see `BatchAffinityMetrics`.
     #[metric(group = "batch_affinity")]
     batch_affinity_metrics: BatchAffinityMetrics,
+
+    /// (#output-locality-probe) OBSERVABILITY-ONLY gauges quantifying the OUTPUT-
+    /// locality opportunity (a ready action's input subtree matches an output a
+    /// still-connected worker recently produced). Read-only w.r.t. assignment —
+    /// see `OutputAffinityMetrics`. SIBLING namespace to `batch_affinity`.
+    #[metric(group = "output_affinity")]
+    output_affinity_metrics: OutputAffinityMetrics,
 
     /// (#batch-affinity, dimension B) Bounded recent-arrival window feeding
     /// `batch_affinity_metrics.arrival_within_250ms_total`. Guarded by a
@@ -1474,6 +1656,31 @@ impl SimpleScheduler {
                 .batch_sched_greedy_fallback_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+
+        // (#output-locality-probe) HEADLINE output-affinity opportunity over the
+        // SAME sampled roots (reusing `pending_roots`), against the bounded
+        // output→producer map + the still-connected worker set. Peek-only tree
+        // reads + one map/worker snapshot, then a pure solve — no resolution, no
+        // routing effect. SIBLING to the batch-sched block above.
+        let (out_gain, out_map_size) = self
+            .worker_scheduler
+            .output_affinity_for_probe(&pending_roots)
+            .await;
+        self.output_affinity_metrics
+            .match_frac
+            .store(out_gain.match_frac, Ordering::Relaxed);
+        self.output_affinity_metrics
+            .matched_bytes
+            .store(out_gain.matched_bytes, Ordering::Relaxed);
+        self.output_affinity_metrics
+            .distinct_producers
+            .store(out_gain.distinct_producers, Ordering::Relaxed);
+        self.output_affinity_metrics
+            .sample_actions
+            .store(out_gain.sample_actions, Ordering::Relaxed);
+        self.output_affinity_metrics
+            .map_size
+            .store(out_map_size, Ordering::Relaxed);
     }
 
     /// Matches a single action to a worker, using a shared cache for computed
@@ -2185,6 +2392,7 @@ impl SimpleScheduler {
                 worker_match_logging_interval,
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
                 batch_affinity_metrics: BatchAffinityMetrics::default(),
+                output_affinity_metrics: OutputAffinityMetrics::default(),
                 recent_roots_window: Mutex::new(RecentRootsWindow::new()),
                 affinity_clock,
                 pending_affinity_probe_enabled,

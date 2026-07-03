@@ -23,6 +23,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use async_lock::RwLock;
 use bytes::Bytes;
 use lru::LruCache;
+use opentelemetry::context::Context;
 use nativelink_config::schedulers::WorkerAllocationStrategy;
 use nativelink_config::stores::{ClientTlsConfig, GrpcEndpoint, GrpcSpec, Retry, StoreType};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
@@ -30,7 +31,7 @@ use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
     RootMetricsComponent, group,
 };
-use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory};
+use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory, Tree};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     AcPinResyncRequest, BlobsInStableStorage, KillOperationRequest, PeerHint, StartExecute,
     UpdateForWorker, update_for_worker,
@@ -40,10 +41,13 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::verify_store::VerifyStore;
-use nativelink_util::action_messages::{OperationId, WorkerId};
+use nativelink_util::action_messages::{ActionStage, OperationId, WorkerId};
 use nativelink_util::background_spawn;
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
+use nativelink_util::digest_hasher::{
+    DigestHasher, DigestHasherFunc, default_digest_hasher_func,
+};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
 use nativelink_util::platform_properties::PlatformProperties;
@@ -370,6 +374,37 @@ pub struct SchedulerMetrics {
         help = "(#p1p2) cumulative enqueue-time tree prefetches skipped because the concurrency semaphore was exhausted"
     )]
     pub tree_prefetch_skipped_nopermit: AtomicU64,
+
+    /// (#output-locality-probe) Cumulative output `Tree` blobs the detached
+    /// output→producer recorder SKIPPED because the Tree message exceeded
+    /// `OUTPUT_TREE_MAX_DECODE_BYTES` (cost-control, no-silent-truncation rule).
+    /// A non-zero value means `output_affinity_match_frac` is a KNOWN lower bound
+    /// (those oversized outputs' Directory digests were never recorded), NOT a
+    /// silent truncation — paired with a rate-limited `warn!`.
+    #[metric(
+        help = "(#output-locality-probe) cumulative output Tree blobs skipped by the output-affinity recorder for exceeding OUTPUT_TREE_MAX_DECODE_BYTES; nonzero means output_affinity_match_frac is a known lower bound"
+    )]
+    pub output_tree_decode_skipped_oversized: AtomicU64,
+
+    /// (#output-locality-probe) Cumulative output `Tree` fetch/decode FAILURES on
+    /// the detached recorder (CAS read error, decode error, or the output blob
+    /// not yet readable from the scheduler's CAS). Best-effort — the recorder
+    /// never fails a completion; a non-zero value means those completions did not
+    /// contribute Directory digests, so `match_frac` is a lower bound.
+    #[metric(
+        help = "(#output-locality-probe) cumulative output Tree fetch/decode failures on the detached output-affinity recorder (best-effort; those completions contribute nothing)"
+    )]
+    pub output_tree_decode_errors: AtomicU64,
+
+    /// (#output-locality-probe) Cumulative output `Directory` digests INSERTED
+    /// into the bounded output→producer map by the recorder (root + children
+    /// across all recorded output Trees). Rising with the fleet's completion rate;
+    /// read against `output_affinity_map_size` to see insert vs. resident (LRU
+    /// eviction) pressure.
+    #[metric(
+        help = "(#output-locality-probe) cumulative output Directory digests inserted into the bounded output->producer map by the recorder (root+children)"
+    )]
+    pub output_dirs_recorded: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -2546,6 +2581,25 @@ pub struct ApiWorkerScheduler {
     /// duplicate spawns when many actions share the same input root.
     tree_resolution_in_progress: Arc<tokio::sync::Mutex<HashSet<DigestInfo>>>,
 
+    /// (#output-locality-probe) OBSERVABILITY-ONLY output→producer map: the
+    /// constituent `Directory` digests (root + children) of recently-produced
+    /// output directories → the worker that produced each. Populated on a
+    /// DETACHED task from the SUCCESSFUL completion path (`update_action` on
+    /// `ActionStage::Completed`), read at the metrics sample point to measure the
+    /// output-locality OPPORTUNITY (a ready action's input dir was produced as
+    /// output by a still-connected worker). NOT consulted by any routing
+    /// decision.
+    ///
+    /// Keyed on `Directory` digests (NOT the `Tree` digest carried in
+    /// `ActionResult.output_folders[].tree_digest`) so the keys live in the SAME
+    /// digest space as the input-side `dir_digests` matched against — the `Tree`
+    /// digest is a digest of a different message shape that never appears in an
+    /// input tree (see `.claude/audits/output-locality-probe-design-2026-07-02.md`).
+    // CAPPED AT OUTPUT_PRODUCER_MAP_CAP (8192): bounded LRU of recent output
+    // Directory digests; over-cap evicts the oldest (= the recency window). Only a
+    // WorkerId + Instant per entry — no owned blob bytes.
+    output_producer_map: Arc<tokio::sync::Mutex<LruCache<DigestInfo, OutputProducer>>>,
+
     /// (#p1p2) Bounds concurrent enqueue-triggered tree prefetches.
     /// `prefetch_input_tree` acquires a permit with `try_acquire_owned`
     /// before spawning a background resolution; when the semaphore is
@@ -2682,6 +2736,43 @@ const TREE_CACHE_CAPACITY: usize = 1024;
 /// surprise). Cheap eviction insurance for large builds; not the binding
 /// issue at the measured 373 roots.
 const TREE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// (#output-locality-probe) Maximum number of `Directory`-digest entries in the
+/// bounded output→producer map (`output_producer_map`). Each entry is a
+/// recently-produced output directory digest → its producer. Over-cap behavior:
+/// LRU eviction (oldest-touched output dir drops first), which IS the
+/// "recently produced" recency window the probe wants. 8192 distinct output
+/// `Directory` digests (root+children across the recent completion window) at
+/// (32-byte digest + a short `WorkerId` String + `Instant`) ≈ well under 1 MiB.
+/// `output_affinity_map_size` exposes whether this cap is binding (if it sits at
+/// the cap, `match_frac` is a lower bound over a longer window). Sized generously
+/// above `MAX_PENDING_AFFINITY_SAMPLE` (512) and the tree-cache count cap (1024)
+/// so a match window's producing set fits without premature recency truncation.
+const OUTPUT_PRODUCER_MAP_CAP: usize = 8192;
+
+/// (#output-locality-probe) Cost-control cap (no-silent-truncation rule): output
+/// `Tree` blobs LARGER than this are NOT fetched/decoded on the detached recorder
+/// task; the skip is `warn!`-logged AND counted in
+/// `output_tree_decode_skipped_oversized` so the opportunity number is a KNOWN
+/// (not silent) lower bound rather than paying an unbounded decode on a pathologic
+/// output tree. 4 MiB covers ordinary build output directory Trees (a Tree bundles
+/// only the Directory protos — names + child/file digests — not file CONTENTS, so
+/// even a large output tree's Tree message is small); an output whose Tree message
+/// alone exceeds 4 MiB is an outlier worth surfacing, not silently absorbing.
+const OUTPUT_TREE_MAX_DECODE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// (#output-locality-probe) One producer of a recently-completed output
+/// directory, stored in the bounded `output_producer_map` keyed by the output
+/// `Directory` digest. The bounded LRU (`OUTPUT_PRODUCER_MAP_CAP`) IS the recency
+/// mechanism — an explicit timestamp would be a second, unread aging mechanism
+/// (OMITTED per the necessity ledger).
+#[derive(Debug, Clone)]
+pub(crate) struct OutputProducer {
+    /// The worker that produced this output directory. Matched against the
+    /// still-connected worker set at sample time — a match is an OPPORTUNITY only
+    /// if this worker is still in the pool.
+    pub worker_id: WorkerId,
+}
 
 /// LRU cache for resolved input trees, bounded by both entry count
 /// and total estimated heap bytes.
@@ -3029,6 +3120,11 @@ impl ApiWorkerScheduler {
                 TREE_CACHE_MAX_BYTES,
             ))),
             tree_resolution_in_progress: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            // (#output-locality-probe) Bounded output→producer Directory-digest
+            // map. See OUTPUT_PRODUCER_MAP_CAP.
+            output_producer_map: Arc::new(tokio::sync::Mutex::new(LruCache::new(
+                NonZeroUsize::new(OUTPUT_PRODUCER_MAP_CAP).unwrap(),
+            ))),
             // (#p1p2) Bounded prefetch fan-out. See TREE_PREFETCH_CONCURRENCY.
             tree_prefetch_semaphore: Arc::new(Semaphore::new(TREE_PREFETCH_CONCURRENCY)),
             tree_resolution_failures: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3959,6 +4055,183 @@ impl ApiWorkerScheduler {
 
         let gain = compute_batch_sched_gain(&actions, &workers, gate_cfg);
         (gain, uncached_skipped)
+    }
+
+    /// (#output-locality-probe) OBSERVABILITY-ONLY: spawn a DETACHED task that
+    /// fetches + decodes the just-produced output `Tree` blobs, extracts their
+    /// constituent `Directory` digests (root + children), and records each →
+    /// `worker_id` in the bounded output→producer map. Read later at the metrics
+    /// sample point to measure the output-locality OPPORTUNITY.
+    ///
+    /// DETACHED so the completion RPC (`update_action`) is NEVER delayed by CAS
+    /// I/O — the sched-b1 lock-decouple keeps the completion path clean, and a
+    /// probe measures opportunity RETROSPECTIVELY over a recency window, so the
+    /// few-ms fetch/decode latency is irrelevant (a consumer arriving inside that
+    /// window is a negligible undercount — the Bazel action round-trip makes it
+    /// near-impossible). NO routing decision consults this map.
+    ///
+    /// Keys on the output Tree's `Directory` digests (NOT the `Tree` digest in
+    /// `output_folders[].tree_digest`) so they share the input side's digest
+    /// space; the Directory protos are hashed with `digest_function` — the SAME
+    /// function the worker used (captured from the completion context) — exactly
+    /// as `parse_get_tree_response` / the input BFS do.
+    fn spawn_output_producer_recorder(
+        &self,
+        worker_id: WorkerId,
+        output_tree_digests: Vec<DigestInfo>,
+        digest_function: DigestHasherFunc,
+    ) {
+        let Some(cas_store) = self.cas_store.clone() else {
+            // No CAS store configured (locality scoring disabled) → nothing to
+            // resolve; the probe simply reports 0 opportunity.
+            return;
+        };
+        let output_producer_map = self.output_producer_map.clone();
+        let metrics = self.metrics.clone();
+        background_spawn!("output_producer_recorder", async move {
+            for tree_digest in output_tree_digests {
+                // Cost-control (no-silent-truncation rule): skip an output whose
+                // Tree MESSAGE alone exceeds the cap — a pure check on the digest,
+                // no fetch. Counted + rate-limited-warned so `match_frac` is a
+                // KNOWN lower bound, not a silent truncation.
+                if tree_digest.size_bytes() > OUTPUT_TREE_MAX_DECODE_BYTES {
+                    let skipped = metrics
+                        .output_tree_decode_skipped_oversized
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Rate-limit: warn on the first, then every 256th, so a
+                    // pathologic burst does not flood the log.
+                    if skipped % 256 == 0 {
+                        warn!(
+                            %tree_digest,
+                            size_bytes = tree_digest.size_bytes(),
+                            cap = OUTPUT_TREE_MAX_DECODE_BYTES,
+                            total_skipped = skipped + 1,
+                            "output-affinity probe skipped an oversized output Tree \
+                             (match_frac is a lower bound); telemetry-only, no routing effect"
+                        );
+                    }
+                    continue;
+                }
+
+                // Zero-size digest = empty/absent output tree; nothing to record.
+                if tree_digest.size_bytes() == 0 {
+                    continue;
+                }
+
+                let key: StoreKey<'_> = tree_digest.into();
+                let tree_bytes = match cas_store.get_part_unchunked(key, 0, None).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        // Best-effort: the output blob may not be readable from the
+                        // scheduler's CAS yet (or a transient read error). Count +
+                        // move on — never fail a completion for a probe.
+                        metrics
+                            .output_tree_decode_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let tree = match Tree::decode(tree_bytes) {
+                    Ok(tree) => tree,
+                    Err(_) => {
+                        metrics
+                            .output_tree_decode_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let dir_digests = tree_directory_digests(&tree, digest_function);
+                if dir_digests.is_empty() {
+                    continue;
+                }
+
+                {
+                    let mut map = output_producer_map.lock().await;
+                    for d in &dir_digests {
+                        // LRU insert; over-cap evicts the oldest = the recency
+                        // window. A re-produced dir refreshes its producer (put
+                        // bumps it to most-recent).
+                        map.put(
+                            *d,
+                            OutputProducer {
+                                worker_id: worker_id.clone(),
+                            },
+                        );
+                    }
+                }
+                // NOTE: `output_affinity_map_size` (point-in-time resident count)
+                // is published at the SAMPLE point (`output_affinity_for_probe`),
+                // which reads `map.len()` — the recorder only needs the cumulative
+                // insert counter here.
+                metrics
+                    .output_dirs_recorded
+                    .fetch_add(dir_digests.len() as u64, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// (#output-locality-probe) OBSERVABILITY-ONLY sample-point snapshot for the
+    /// output-affinity opportunity probe (sibling of `batch_sched_gain_for_probe`).
+    /// Over the sampled ready-action roots whose input `ResolvedTree` is ALREADY
+    /// cached (peek-only — NO resolution, NO fetch, NO LRU bump; same discipline
+    /// as the batch probe), computes how often an input directory digest matches
+    /// an output directory a STILL-CONNECTED worker recently produced.
+    ///
+    /// Two brief locks, each dropped before the pure solve: the `tree_cache` peek
+    /// (Pass 1) and one snapshot of {`output_producer_map`, connected worker set}
+    /// (Pass 2). The match-rate itself is the PURE `compute_output_affinity` over
+    /// owned copies — no lock held across it, no `.await` inside either locked
+    /// section beyond the lock acquire.
+    ///
+    /// Returns `(OutputAffinityGain, map_size)`. Zero routing change: reads only.
+    pub(crate) async fn output_affinity_for_probe(
+        &self,
+        sampled_roots: &[DigestInfo],
+    ) -> (crate::simple_scheduler::OutputAffinityGain, u64) {
+        use crate::simple_scheduler::{BatchSchedAction, compute_output_affinity};
+
+        // ── Pass 1: peek the tree cache for each sampled root (NO resolution) ──
+        // Copy out the same owned subtree structure the batch probe uses; skip
+        // (silently, into the coverage denominator) roots whose tree isn't cached.
+        let mut sampled: Vec<BatchSchedAction> = Vec::with_capacity(sampled_roots.len());
+        {
+            let cache = self.tree_cache.lock().await;
+            for root in sampled_roots {
+                if let Some(tree) = cache.peek(root) {
+                    sampled.push(BatchSchedAction {
+                        dir_digests: tree.dir_digests.clone(),
+                        dir_direct_bytes: tree.dir_direct_bytes.clone(),
+                        dir_direct_files: tree.dir_direct_files.clone(),
+                    });
+                }
+            }
+        }
+        // tree_cache lock released here.
+
+        // ── Pass 2: snapshot the output→producer map + the connected worker set ──
+        // The producer map is snapshotted to an owned `HashMap` (Directory digest
+        // → producer worker) and the connected set to an owned `HashSet` so the
+        // pure solve runs lock-free. `map_size` is read here for the gauge.
+        let (producer_map, map_size) = {
+            let map = self.output_producer_map.lock().await;
+            let owned: HashMap<DigestInfo, WorkerId> = map
+                .iter()
+                .map(|(d, p)| (*d, p.worker_id.clone()))
+                .collect();
+            let size = map.len() as u64;
+            (owned, size)
+        };
+        // output_producer_map lock released here.
+
+        let connected: HashSet<WorkerId> = {
+            let inner = self.inner.read().await;
+            inner.workers.0.iter().map(|(wid, _)| wid.clone()).collect()
+        };
+        // inner read lock released here — the solve runs lock-free.
+
+        let gain = compute_output_affinity(&sampled, &producer_map, &connected);
+        (gain, map_size)
     }
 
     /// Resolves the full input tree for the given `input_root_digest`,
@@ -5474,6 +5747,55 @@ async fn create_worker_cas_connection(
     Ok(Store::new(store))
 }
 
+/// (#output-locality-probe) PURE: the output directories' `Tree` digests to
+/// record from a completion update — the SUCCESS gate. Returns the
+/// `output_folders[].tree_digest`s IFF the update is a
+/// `Completed(ActionResult)` (a real worker execution result); EMPTY for a
+/// `CompletedFromCache` (no executing producer worker to attribute locality to),
+/// an error, a disconnect, or a keepalive. Recording only on genuine success is
+/// what makes the output→producer map an honest "this worker produced this
+/// output" signal.
+fn output_tree_digests_of_completion(update: &UpdateOperationType) -> Vec<DigestInfo> {
+    match update {
+        UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(action_result)) => {
+            action_result
+                .output_folders
+                .iter()
+                .map(|d| d.tree_digest)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// (#output-locality-probe) PURE: extract the constituent `Directory` digests
+/// (root + every child) of a decoded output `Tree`, computing each digest by
+/// hashing the `Directory`'s serialized proto with `digest_function` — the SAME
+/// construction `parse_get_tree_response` (`running_actions_manager.rs`) and the
+/// input-side BFS use, so the returned digests live in the SAME digest space as
+/// a consumer's input `dir_digests`. Deduplicates (a Tree with repeated
+/// identical directories yields each digest once).
+///
+/// This is the load-bearing bridge from the output side (which carries only the
+/// `Tree` digest) to the input side (which carries `Directory` digests): a
+/// downstream consumer references an output directory by its root/child
+/// `Directory` digest, NOT the `Tree` digest.
+fn tree_directory_digests(tree: &Tree, digest_function: DigestHasherFunc) -> Vec<DigestInfo> {
+    let mut out: Vec<DigestInfo> = Vec::new();
+    let mut seen: HashSet<DigestInfo> = HashSet::new();
+    let dirs = tree.root.iter().chain(tree.children.iter());
+    for dir in dirs {
+        let encoded = dir.encode_to_vec();
+        let mut hasher = digest_function.hasher();
+        hasher.update(&encoded);
+        let digest = hasher.finalize_digest();
+        if seen.insert(digest) {
+            out.push(digest);
+        }
+    }
+    out
+}
+
 /// Resolves a directory tree from the CAS store by recursively reading
 /// Directory protos and collecting file digests (for locality scoring),
 /// directory digests (for subtree coverage scoring), and per-subtree
@@ -6008,6 +6330,28 @@ impl ApiWorkerScheduler {
         );
         Ok(())
     }
+
+    /// (#output-locality-probe) Test-only: directly seed the output→producer map
+    /// with `dir_digest → worker_id`, bypassing the detached recorder so the
+    /// SAMPLE-time seam (`output_affinity_for_probe`: peek tree_cache + snapshot
+    /// map + snapshot the REAL connected-worker set) can be driven
+    /// deterministically. The recorder's own decode/hash/insert path is exercised
+    /// separately by `output_producer_recorder_decodes_and_records`.
+    async fn seed_output_producer(&self, dir_digest: DigestInfo, worker_id: &WorkerId) {
+        let mut map = self.output_producer_map.lock().await;
+        map.put(
+            dir_digest,
+            OutputProducer {
+                worker_id: worker_id.clone(),
+            },
+        );
+    }
+
+    /// (#output-locality-probe) Test-only: current entry count of the bounded
+    /// output→producer map (so the recorder test can await population).
+    async fn output_producer_map_len(&self) -> usize {
+        self.output_producer_map.lock().await.len()
+    }
 }
 
 #[async_trait]
@@ -6129,6 +6473,17 @@ impl WorkerScheduler for ApiWorkerScheduler {
             Err(err) => return Err(err),
         };
 
+        // (#output-locality-probe) Borrow the SUCCESS `ActionResult` (if this is a
+        // `Completed` update — NOT an error/disconnect/keepalive) to capture the
+        // output directories' `Tree` digests BEFORE `update` is consumed by
+        // `update_operation` below. CS1's Proceed decision already confirmed the
+        // worker was legitimately running this op, so this is an honest "this
+        // worker produced this output" signal. The actual CAS fetch + Tree decode
+        // + Directory-digest recording runs on a DETACHED task AFTER the op-state
+        // commit — it is NEVER on this completion RPC's critical path (no CAS I/O
+        // added to the sched-b1-decoupled `update_action`).
+        let output_tree_digests = output_tree_digests_of_completion(&update);
+
         // ── lock-free await — (b) operation-state update; retries/sleeps
         //    here with NO worker-pool lock held ──
         worker_state_manager
@@ -6144,6 +6499,30 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 );
                 err
             })?;
+
+        // (#output-locality-probe) The op-state commit SUCCEEDED for a `Completed`
+        // update carrying output directories → record the producer off the
+        // critical path. Detached: this returns immediately; the fetch+decode+map
+        // insert happens on a spawned task. Only spawned when there are output
+        // directories to record (`output_tree_digests` non-empty ⟺ this was a
+        // successful `Completed` with `output_folders`).
+        if !output_tree_digests.is_empty() {
+            // Capture the request's digest function WHILE the completion context
+            // is live (the detached task runs outside it). The output `Directory`
+            // protos must be hashed with the SAME function the worker used so the
+            // computed digests match the input-side `dir_digests`. Falls back to
+            // the fleet default (blake3 here) if the context carries none — the
+            // same resolution `parse_get_tree_response` uses.
+            let digest_function = Context::current()
+                .get::<DigestHasherFunc>()
+                .copied()
+                .unwrap_or_else(default_digest_hasher_func);
+            self.spawn_output_producer_recorder(
+                worker_id.clone(),
+                output_tree_digests,
+                digest_function,
+            );
+        }
 
         if !is_finished {
             return Ok(());
@@ -8769,6 +9148,346 @@ mod tests {
              got {}",
             gain.subtree_overlap_pct
         );
+    }
+
+    /// (#output-locality-probe) END-TO-END SAMPLE-TIME seam: `output_affinity_for_probe`
+    /// must (1) peek the REAL `tree_cache` for each sampled root's input
+    /// `dir_digests`, (2) snapshot the REAL bounded output→producer map, (3)
+    /// snapshot the REAL connected-worker set from `inner.workers`, then compute
+    /// the opportunity — matching an input dir against an output a STILL-CONNECTED
+    /// worker produced.
+    ///
+    /// Scenario: r1's input tree contains shared subdir `c`. Seed the map so `c`
+    /// was produced by W0 (which we then ADD as a connected worker) and a
+    /// throwaway dir `z` was produced by "GHOST" (never added → disconnected).
+    /// Over `[r1]`: `c` matches connected W0 → 1/1 action → match_frac 100, 1
+    /// producer, matched_bytes = c's direct (200 bytes, 2 files) =
+    /// 200 + 2·PER_FILE_WEIGHT. The GHOST/z entry must NOT count (disconnected).
+    #[tokio::test]
+    async fn output_affinity_flows_through_real_probe() {
+        let (scheduler, r1, _r2, c_digest) = batch_sched_probe_scheduler().await;
+
+        // Warm tree_cache with r1's resolved input tree (the probe peeks only).
+        assert!(
+            scheduler.resolve_input_tree(r1).await.is_some(),
+            "#output-locality-probe: r1 must resolve from the real CAS store"
+        );
+
+        // FIRST: seed `c` (a REAL input dir of r1) as produced by a DISCONNECTED
+        // worker (GHOST is never added to the pool). The connectedness gate —
+        // snapshotting the REAL `inner.workers` — must EXCLUDE it, so a match on
+        // the actual input dir contributes 0. (This is the case that pins the
+        // gate: `c` IS referenced by r1, so only the connected/disconnected status
+        // decides the count.)
+        scheduler
+            .seed_output_producer(c_digest, &WorkerId("GHOST".to_string()))
+            .await;
+        let (ghost_gain, _) = scheduler.output_affinity_for_probe(&[r1]).await;
+        assert_eq!(
+            ghost_gain.sample_actions, 1,
+            "#output-locality-probe: r1's tree is cached → one sampled action; got {}",
+            ghost_gain.sample_actions
+        );
+        assert_eq!(
+            ghost_gain.match_frac, 0,
+            "#output-locality-probe: `c` was produced by DISCONNECTED GHOST (not in \
+             inner.workers) → the connectedness gate excludes it → match_frac 0. \
+             got {}",
+            ghost_gain.match_frac
+        );
+        assert_eq!(
+            ghost_gain.matched_bytes, 0,
+            "#output-locality-probe: disconnected producer → 0 matched bytes. got {}",
+            ghost_gain.matched_bytes
+        );
+
+        // NOW connect W0 and RE-seed `c` as produced by W0 (LRU put replaces the
+        // GHOST entry). The SAME input dir now matches a CONNECTED producer → 100.
+        let (tx0, _rx0) = mpsc::unbounded_channel();
+        scheduler
+            .add_worker(Worker::new(
+                WorkerId("W0".to_string()),
+                PlatformProperties::default(),
+                tx0,
+                1,
+                100,
+            ))
+            .await
+            .expect("add W0");
+        scheduler
+            .seed_output_producer(c_digest, &WorkerId("W0".to_string()))
+            .await;
+
+        let (gain, map_size) = scheduler.output_affinity_for_probe(&[r1]).await;
+
+        assert_eq!(
+            gain.match_frac, 100,
+            "#output-locality-probe: r1's input dir `c` is now produced by CONNECTED \
+             W0 → 1/1 action matches → match_frac 100. got {}",
+            gain.match_frac
+        );
+        assert_eq!(
+            gain.distinct_producers, 1,
+            "#output-locality-probe: exactly one connected producer (W0) matched. got {}",
+            gain.distinct_producers
+        );
+        assert_eq!(
+            gain.matched_bytes,
+            200 + 2 * crate::simple_scheduler::PER_FILE_WEIGHT,
+            "#output-locality-probe: c's matched byte-mass = its 2 direct files' \
+             200 bytes + 2·PER_FILE_WEIGHT (Tier-1.5 model). got {}",
+            gain.matched_bytes
+        );
+        assert_eq!(
+            map_size, 1,
+            "#output-locality-probe: `c` was re-seeded (LRU put replaced GHOST with \
+             W0) → one resident entry. got {map_size}"
+        );
+    }
+
+    /// (#output-locality-probe) END-TO-END RECORDER seam: `spawn_output_producer_recorder`
+    /// must fetch the output `Tree` blob from the REAL CAS, decode it, hash its
+    /// constituent `Directory` protos (root + children) with the SAME digest
+    /// function the input side uses, and record each Directory digest → producer.
+    /// Proves the output→input digest-space BRIDGE: the recorded digests are
+    /// EXACTLY the `Directory` digests a consumer's input tree would carry (NOT
+    /// the `Tree` digest).
+    ///
+    /// Builds a `Tree{root, children:[child]}`, writes it to CAS under its Tree
+    /// digest, records it for W0, awaits the detached task, then asserts BOTH the
+    /// root and child `Directory` digests (computed independently via
+    /// `encode_directory`, the same SHA256 the input BFS uses in tests) are in the
+    /// map — and that the `Tree` digest itself is NOT (the trap this whole probe
+    /// avoids).
+    #[tokio::test]
+    async fn output_producer_recorder_decodes_and_records() {
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+
+        // child: a leaf Directory (its digest is what a consumer reusing this
+        // subdir would carry as one of its input dir_digests).
+        let child_dir = Directory {
+            files: vec![make_file_node("leaf.txt", 0xc0, 128)],
+            directories: vec![],
+            ..Default::default()
+        };
+        let (_child_bytes, child_digest) = encode_directory(&child_dir);
+
+        // root: references child. Its digest is what a consumer reusing the WHOLE
+        // output directory would carry.
+        let root_dir = Directory {
+            files: vec![make_file_node("root.txt", 0xd0, 256)],
+            directories: vec![DirectoryNode {
+                name: "child".to_string(),
+                digest: Some(child_digest.into()),
+            }],
+            ..Default::default()
+        };
+        let (_root_bytes, root_digest) = encode_directory(&root_dir);
+
+        // The output Tree bundles root + children; its digest is a DIFFERENT value
+        // (a Tree-message digest, NOT a Directory digest) — this is exactly the
+        // key we must NOT use.
+        let tree = Tree {
+            root: Some(root_dir.clone()),
+            children: vec![child_dir.clone()],
+        };
+        let tree_bytes = tree.encode_to_vec();
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        hasher.update(&tree_bytes);
+        let tree_digest = hasher.finalize_digest();
+
+        let key: StoreKey<'_> = tree_digest.into();
+        store
+            .update_oneshot(key, Bytes::from(tree_bytes))
+            .await
+            .expect("store output Tree");
+
+        let scheduler = build_output_recorder_scheduler(store).await;
+
+        // Record the output for W0 (using SHA256 — the same function
+        // `encode_directory` used, so the recorder's hashes match).
+        scheduler.spawn_output_producer_recorder(
+            WorkerId("W0".to_string()),
+            vec![tree_digest],
+            DigestHasherFunc::Sha256,
+        );
+
+        // Await the detached recorder (bounded yield — no sleep-as-sync). The
+        // recorder inserts 2 Directory digests (root + child).
+        let mut recorded = false;
+        for _ in 0..10_000 {
+            if scheduler.output_producer_map_len().await >= 2 {
+                recorded = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            recorded,
+            "#output-locality-probe: detached recorder never populated the map \
+             (expected root+child = 2 Directory digests)"
+        );
+
+        // Both the ROOT and CHILD Directory digests must be present → a consumer
+        // reusing the whole output OR just the subdir would match.
+        let (gain_root, _) = scheduler.output_affinity_for_probe(&[]).await; // no-op sample; drains nothing
+        let _ = gain_root;
+        let connected: HashSet<WorkerId> =
+            core::iter::once(WorkerId("W0".to_string())).collect();
+        // Directly assert map membership via the sample computation over synthetic
+        // single-dir actions carrying each digest.
+        for (label, dir) in [("root", root_digest), ("child", child_digest)] {
+            let mut dd = HashSet::new();
+            dd.insert(dir);
+            let action = crate::simple_scheduler::BatchSchedAction {
+                dir_digests: dd,
+                dir_direct_bytes: HashMap::new(),
+                dir_direct_files: HashMap::new(),
+            };
+            let owned: HashMap<DigestInfo, WorkerId> = {
+                let map = scheduler.output_producer_map.lock().await;
+                map.iter().map(|(d, p)| (*d, p.worker_id.clone())).collect()
+            };
+            let g = crate::simple_scheduler::compute_output_affinity(
+                core::slice::from_ref(&action),
+                &owned,
+                &connected,
+            );
+            assert_eq!(
+                g.match_frac, 100,
+                "#output-locality-probe: the {label} Directory digest MUST be \
+                 recorded (a consumer referencing it would match W0). got {}",
+                g.match_frac
+            );
+        }
+
+        // The Tree digest itself must NOT be recorded — keying on it is the trap.
+        {
+            let map = scheduler.output_producer_map.lock().await;
+            assert!(
+                map.peek(&tree_digest).is_none(),
+                "#output-locality-probe: the Tree digest must NOT be a map key — \
+                 it is a Tree-message digest, disjoint from the Directory-digest \
+                 space consumers' inputs carry (keying on it would match zero)"
+            );
+        }
+    }
+
+    /// (#output-locality-probe) Minimal scheduler with a real CAS store for the
+    /// recorder seam test (no workers/trees needed — the recorder only touches
+    /// `cas_store` + `output_producer_map`).
+    async fn build_output_recorder_scheduler(store: Store) -> Arc<ApiWorkerScheduler> {
+        use nativelink_config::schedulers::WorkerAllocationStrategy;
+
+        use crate::platform_property_manager::PlatformPropertyManager;
+        use crate::worker_registry::WorkerRegistry;
+
+        #[derive(Debug)]
+        struct NoopWSM;
+        impl MetricsComponent for NoopWSM {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+        #[tonic::async_trait]
+        impl WorkerStateManager for NoopWSM {
+            async fn update_operation(
+                &self,
+                _operation_id: &OperationId,
+                _worker_id: &WorkerId,
+                _update: UpdateOperationType,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWSM),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some(store),
+            None,
+            512 * 1024,
+            8,
+            true,
+            0,
+            2,
+        )
+    }
+
+    /// (#output-locality-probe) The SUCCESS gate: `output_tree_digests_of_completion`
+    /// records the output `tree_digest`s ONLY for a genuine
+    /// `Completed(ActionResult)` — the sole update shape with an executing
+    /// producer worker to attribute output-locality to. Error, disconnect,
+    /// keepalive, and `CompletedFromCache` (no producer worker) must record
+    /// NOTHING, so the map never falsely attributes an output to a worker that
+    /// did not produce it.
+    #[test]
+    fn output_tree_digests_recorded_only_on_completed_success() {
+        use nativelink_util::action_messages::{ActionResult, DirectoryInfo};
+
+        let td0 = DigestInfo::new([0x11; 32], 10);
+        let td1 = DigestInfo::new([0x22; 32], 20);
+        let mut ar = ActionResult::default();
+        ar.output_folders = vec![
+            DirectoryInfo {
+                path: "out/a".to_string(),
+                tree_digest: td0,
+            },
+            DirectoryInfo {
+                path: "out/b".to_string(),
+                tree_digest: td1,
+            },
+        ];
+
+        // Completed WITH output folders → both tree_digests recorded.
+        let completed =
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ar.clone()));
+        assert_eq!(
+            output_tree_digests_of_completion(&completed),
+            vec![td0, td1],
+            "#output-locality-probe: a genuine Completed(ActionResult) must yield its \
+             output_folders' tree_digests (the success signal)"
+        );
+
+        // Completed with NO output folders → nothing.
+        let completed_empty = UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+            ActionResult::default(),
+        ));
+        assert!(
+            output_tree_digests_of_completion(&completed_empty).is_empty(),
+            "#output-locality-probe: a Completed with no output directories records nothing"
+        );
+
+        // NON-success updates → nothing (the gate). Each must be EMPTY so no
+        // output is ever falsely attributed to a worker on a failure/keepalive.
+        for (label, update) in [
+            (
+                "error",
+                UpdateOperationType::UpdateWithError(make_err!(Code::Internal, "boom")),
+            ),
+            ("keepalive", UpdateOperationType::KeepAlive),
+            ("disconnect", UpdateOperationType::UpdateWithDisconnect),
+            ("execution_complete", UpdateOperationType::ExecutionComplete),
+            (
+                "executing_stage",
+                UpdateOperationType::UpdateWithActionStage(ActionStage::Executing),
+            ),
+        ] {
+            assert!(
+                output_tree_digests_of_completion(&update).is_empty(),
+                "#output-locality-probe: a `{label}` update is NOT a success → it must \
+                 record no output producers (the success gate)"
+            );
+        }
     }
 
     /// (#p1p2) Bounded, deterministic wait for a background prefetch to warm
