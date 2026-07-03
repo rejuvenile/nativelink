@@ -246,6 +246,62 @@ pub struct WorkerProxyStore {
     /// SERVER (inner CAS) produced the winning first chunk. peer_win /
     /// (peer_win + server_win) is the peer win-rate.
     race_server_win_total: CounterWithTime,
+    // (#p2p-prefetch-metrics) REALIZED peer-fetch offload effectiveness on
+    // the worker-side `get_part` input-read path (slow tier of the input
+    // FastSlowStore; `race_peers=true`, INITIATOR mode). `race_peer_win_total`
+    // / `race_server_win_total` above give the win-RATE (count only); these
+    // eight add the BYTE dimension AND two outcomes the win/loss counters do
+    // not name — `no_peer` (the freshness gap the in-assignment prefetch
+    // feature closes) and `peer_unreachable`. Together they partition every
+    // raced `get_part` call into who served it, so the headline realized
+    // offload fraction is `win_bytes / (win + server_won + no_peer +
+    // unreachable)_bytes`. Keeping `no_peer` separate shows the ceiling the
+    // feature could convert (no_peer -> win).
+    //
+    // SCOPE: `get_part` serves worker reads dominated by action-input
+    // materialization (FastSlowStore::populate -> slow tier -> here), so
+    // this is representative of input peer-fetch effectiveness. It is NOT
+    // strictly input-only: any other reader routed through this store's slow
+    // tier is folded in too. Byte attribution = the effective requested read
+    // length (`length`, else `digest.size_bytes() - offset`), attributed at
+    // race resolution / dispatch decision — NOT a per-chunk running tally, so
+    // a rare mid-stream failure after resolution is still attributed to the
+    // resolved source. Both-empty NotFound (peer AND server produced empty
+    // EOF) is counted under `server_won_count` with 0 bytes for count
+    // completeness (a peer-tried loss where no source served); it therefore
+    // does NOT track `race_server_win_total` exactly (which fires only when a
+    // source served the winning chunk) — the delta is the both-empty rate.
+    //
+    // Bare `AtomicU64` (not `CounterWithTime`) so the rendered Prometheus
+    // names are the clean `_bytes` / `_count` literals with no
+    // `_counter`/`_last_time` suffix artifact — same rationale as the
+    // `wps_worker_read_*` fields. `fetch_add(_, Relaxed)`: observability-only,
+    // no cross-field ordering dependency, off the per-chunk loop.
+    //
+    /// Peer won the race — bytes the peer served (offload achieved, central
+    /// CAS work avoided). NUMERATOR of the realized offload fraction.
+    peer_fetch_win_bytes: AtomicU64,
+    /// Count of `get_part` calls where the peer won the race.
+    peer_fetch_win_count: AtomicU64,
+    /// Server won the race — bytes the server served after a peer WAS tried
+    /// but lost (slow / evicted / stale-positive), PLUS both-empty NotFound
+    /// (0 bytes). No offload achieved despite a peer being available.
+    peer_fetch_server_won_bytes: AtomicU64,
+    /// Count of `get_part` calls where a peer was tried but the server (or
+    /// nobody, on both-empty) served. See `peer_fetch_server_won_bytes`.
+    peer_fetch_server_won_count: AtomicU64,
+    /// No peer known — `peers.is_empty()` short-circuited to the sequential
+    /// (server-direct) path. Bytes the server served. THE freshness gap the
+    /// inline-in-assignment prefetch feature closes (converts no_peer -> win).
+    peer_fetch_no_peer_bytes: AtomicU64,
+    /// Count of `get_part` calls with no peer in the locality map.
+    peer_fetch_no_peer_count: AtomicU64,
+    /// Peer known but unreachable — `get_or_create_connection` returned None,
+    /// so `get_part` fell through to the sequential path. Bytes the server
+    /// served. Distinct from `no_peer`: a peer WAS known, we couldn't reach it.
+    peer_fetch_peer_unreachable_bytes: AtomicU64,
+    /// Count of `get_part` calls where a known peer was unreachable.
+    peer_fetch_peer_unreachable_count: AtomicU64,
     /// #130 — singleflight/dedup map for concurrent same-digest peer
     /// fetches. Collapses the "N callers, same digest, ms apart" cohort
     /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
@@ -814,6 +870,77 @@ impl MetricsComponent for WorkerProxyStore {
             "(#linkperf) Worker-side get_part race wins served by the SERVER \
              (inner CAS, first winning chunk). Sibling of race_peer_win_total."
         );
+        // (#p2p-prefetch-metrics) REALIZED offload effectiveness — bytes+count
+        // partition of every raced worker-side get_part read by who served it.
+        // Headline realized offload fraction =
+        //   peer_fetch_win_bytes / (win + server_won + no_peer + unreachable).
+        // Bare AtomicU64 ⇒ clean `_bytes` / `_count` Prometheus literals.
+        publish!(
+            "worker_proxy_peer_fetch_win_bytes",
+            &self.peer_fetch_win_bytes,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Bytes served by a PEER winning the worker-side \
+             get_part race — REALIZED offload (central CAS work avoided). Numerator \
+             of the realized offload fraction. Byte attribution = effective read \
+             length at race resolution. Adds the byte dimension to the count-only \
+             race_peer_win_total."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_win_count",
+            &self.peer_fetch_win_count,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Count of worker-side get_part reads a PEER won."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_server_won_bytes",
+            &self.peer_fetch_server_won_bytes,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Bytes the SERVER served after a peer WAS tried \
+             but lost (slow / evicted / stale-positive) — no offload achieved. Also \
+             counts both-empty NotFound at 0 bytes (peer and server both returned \
+             empty EOF). Part of the offload-fraction denominator. Does NOT track \
+             race_server_win_total exactly: the delta is the both-empty rate."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_server_won_count",
+            &self.peer_fetch_server_won_count,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Count of worker-side get_part reads where a peer \
+             was tried but the server (or nobody, on both-empty) served."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_no_peer_bytes",
+            &self.peer_fetch_no_peer_bytes,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Bytes the server served on the sequential path \
+             because NO peer was known (peers.is_empty()) — THE freshness gap the \
+             inline-in-assignment prefetch feature closes. This bucket is the \
+             ceiling the feature could convert (no_peer -> win). Part of the \
+             offload-fraction denominator."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_no_peer_count",
+            &self.peer_fetch_no_peer_count,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Count of worker-side get_part reads with no peer \
+             in the locality map."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_peer_unreachable_bytes",
+            &self.peer_fetch_peer_unreachable_bytes,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Bytes the server served on the sequential path \
+             because a KNOWN peer was unreachable (get_or_create_connection => None). \
+             Distinct from no_peer: a peer was known, we couldn't connect. Part of \
+             the offload-fraction denominator."
+        );
+        publish!(
+            "worker_proxy_peer_fetch_peer_unreachable_count",
+            &self.peer_fetch_peer_unreachable_count,
+            MetricKind::Counter,
+            "(#p2p-prefetch-metrics) Count of worker-side get_part reads where a known \
+             peer was unreachable."
+        );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
         // outside the lock so we never hold it across the macro's tracing
@@ -1078,6 +1205,14 @@ impl WorkerProxyStore {
             wps_worker_read_no_source_total: AtomicU64::new(0),
             race_peer_win_total: CounterWithTime::default(),
             race_server_win_total: CounterWithTime::default(),
+            peer_fetch_win_bytes: AtomicU64::new(0),
+            peer_fetch_win_count: AtomicU64::new(0),
+            peer_fetch_server_won_bytes: AtomicU64::new(0),
+            peer_fetch_server_won_count: AtomicU64::new(0),
+            peer_fetch_no_peer_bytes: AtomicU64::new(0),
+            peer_fetch_no_peer_count: AtomicU64::new(0),
+            peer_fetch_peer_unreachable_bytes: AtomicU64::new(0),
+            peer_fetch_peer_unreachable_count: AtomicU64::new(0),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -1115,6 +1250,14 @@ impl WorkerProxyStore {
             wps_worker_read_no_source_total: AtomicU64::new(0),
             race_peer_win_total: CounterWithTime::default(),
             race_server_win_total: CounterWithTime::default(),
+            peer_fetch_win_bytes: AtomicU64::new(0),
+            peer_fetch_win_count: AtomicU64::new(0),
+            peer_fetch_server_won_bytes: AtomicU64::new(0),
+            peer_fetch_server_won_count: AtomicU64::new(0),
+            peer_fetch_no_peer_bytes: AtomicU64::new(0),
+            peer_fetch_no_peer_count: AtomicU64::new(0),
+            peer_fetch_peer_unreachable_bytes: AtomicU64::new(0),
+            peer_fetch_peer_unreachable_count: AtomicU64::new(0),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -3413,6 +3556,9 @@ impl WorkerProxyStore {
         digest: &DigestInfo,
         peer_endpoint: &Arc<str>,
         is_zero_blob: bool,
+        // (#p2p-prefetch-metrics) effective bytes to attribute to the resolved
+        // source, computed once in `get_part`.
+        served_bytes: u64,
     ) -> Result<(), Error> {
         let peer_chunk = match peer_rx.recv().await {
             Ok(c) => c,
@@ -3422,6 +3568,9 @@ impl WorkerProxyStore {
                 // shaped propagation; the outer `get_part` joins on this
                 // writer's tx/rx pair (when wrapped). Terminate so the
                 // paired reader unblocks. Idempotent.
+                // (#p2p-prefetch-metrics) both racers failed to deliver — no
+                // offload; count as server_won (peer tried, lost) with 0 bytes.
+                self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
                 let err = e.append("WorkerProxyStore: peer recv after server failure/empty");
                 writer.send_error(err.clone());
                 return Err(err);
@@ -3431,6 +3580,10 @@ impl WorkerProxyStore {
             if is_zero_blob {
                 // (#linkperf) peer ultimately served (zero-length).
                 self.race_peer_win_total.inc();
+                // (#p2p-prefetch-metrics) peer served; served_bytes==0 here.
+                self.peer_fetch_win_bytes
+                    .fetch_add(served_bytes, Ordering::Relaxed);
+                self.peer_fetch_win_count.fetch_add(1, Ordering::Relaxed);
                 writer.send_eof()
                     .err_tip(|| "WorkerProxyStore: peer EOF for zero-length blob")?;
                 return peer_handle.await
@@ -3440,6 +3593,9 @@ impl WorkerProxyStore {
             // #336 P1 sibling fix (parallel-race path): we constructed
             // this NotFound; neither racer wrote bytes nor terminated the
             // outer writer. Wrapping caller's rx must observe it.
+            // (#p2p-prefetch-metrics) both-empty: no offload, no source served.
+            // Count under server_won (peer tried, lost) with 0 bytes.
+            self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
             let err = Error::not_found_with_detail(
                 format!(
                     "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
@@ -3454,6 +3610,11 @@ impl WorkerProxyStore {
         }
         // (#linkperf) peer ultimately served (server empty/failed).
         self.race_peer_win_total.inc();
+        // (#p2p-prefetch-metrics) peer served after server empty/failed —
+        // REALIZED offload.
+        self.peer_fetch_win_bytes
+            .fetch_add(served_bytes, Ordering::Relaxed);
+        self.peer_fetch_win_count.fetch_add(1, Ordering::Relaxed);
         debug!(
             ?digest,
             endpoint = %peer_endpoint,
@@ -3475,6 +3636,9 @@ impl WorkerProxyStore {
         server_handle: JoinHandle<Result<(), Error>>,
         digest: &DigestInfo,
         is_zero_blob: bool,
+        // (#p2p-prefetch-metrics) effective bytes to attribute to the resolved
+        // source, computed once in `get_part`.
+        served_bytes: u64,
     ) -> Result<(), Error> {
         let server_chunk = match server_rx.recv().await {
             Ok(c) => c,
@@ -3482,6 +3646,9 @@ impl WorkerProxyStore {
                 // #336 P1 sibling fix (parallel-race path): server racer
                 // failed on the second recv. Terminate the outer writer
                 // so wrapping callers' rx unblocks. Idempotent.
+                // (#p2p-prefetch-metrics) peer already lost (empty/failed) and
+                // server also failed — no offload; count server_won, 0 bytes.
+                self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
                 let err = e.append("WorkerProxyStore: server recv after peer failure/empty");
                 writer.send_error(err.clone());
                 return Err(err);
@@ -3491,6 +3658,10 @@ impl WorkerProxyStore {
             if is_zero_blob {
                 // (#linkperf) server ultimately served (zero-length).
                 self.race_server_win_total.inc();
+                // (#p2p-prefetch-metrics) server served; served_bytes==0 here.
+                self.peer_fetch_server_won_bytes
+                    .fetch_add(served_bytes, Ordering::Relaxed);
+                self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
                 writer.send_eof()
                     .err_tip(|| "WorkerProxyStore: server EOF for zero-length blob")?;
                 return server_handle.await
@@ -3499,6 +3670,9 @@ impl WorkerProxyStore {
             // #336 P1 sibling fix (parallel-race path): we constructed
             // this NotFound; neither racer wrote bytes nor terminated the
             // outer writer. Wrapping caller's rx must observe it.
+            // (#p2p-prefetch-metrics) both-empty: no offload, no source served.
+            // Count under server_won (peer tried, lost) with 0 bytes.
+            self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
             let err = Error::not_found_with_detail(
                 format!(
                     "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
@@ -3512,6 +3686,11 @@ impl WorkerProxyStore {
         }
         // (#linkperf) server ultimately served (peer empty/failed).
         self.race_server_win_total.inc();
+        // (#p2p-prefetch-metrics) server served after peer empty/failed — the
+        // peer was tried but lost; no offload.
+        self.peer_fetch_server_won_bytes
+            .fetch_add(served_bytes, Ordering::Relaxed);
+        self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
         debug!(
             ?digest,
             "WorkerProxyStore: server won race (peer empty/failed)"
@@ -4712,6 +4891,12 @@ impl StoreDriver for WorkerProxyStore {
         // WorkerProxyStore uses the sequential path which generates
         // redirects for workers and proxies for non-worker callers.
         let digest = key.borrow().into_digest();
+        // (#p2p-prefetch-metrics) Effective bytes this read is on the hook to
+        // serve — attributed to whichever source resolves the race/dispatch.
+        // `length` when the caller requested a range, else the whole blob from
+        // `offset`. Computed once here so every outcome arm attributes the same
+        // figure. Observability-only; does not affect control flow.
+        let served_bytes = length.unwrap_or_else(|| digest.size_bytes().saturating_sub(offset));
         let peers = if self.race_peers.load(Ordering::Relaxed) {
             // #67: read-side circuit breaker. Filter out peers currently
             // quarantined by `mirror_state` so a persistently-failing
@@ -4727,6 +4912,10 @@ impl StoreDriver for WorkerProxyStore {
 
         if peers.is_empty() {
             // No peers known (or server side) — use the sequential path.
+            // (#p2p-prefetch-metrics) The freshness gap: no peer to offload to.
+            self.peer_fetch_no_peer_bytes
+                .fetch_add(served_bytes, Ordering::Relaxed);
+            self.peer_fetch_no_peer_count.fetch_add(1, Ordering::Relaxed);
             return self
                 .get_part_sequential(key, writer, offset, length)
                 .await;
@@ -4736,6 +4925,12 @@ impl StoreDriver for WorkerProxyStore {
         let peer_store = match self.get_or_create_connection(&peers[0]).await {
             Some(store) => store,
             None => {
+                // (#p2p-prefetch-metrics) A peer was known but unreachable —
+                // distinct from no_peer. Fall through to the server directly.
+                self.peer_fetch_peer_unreachable_bytes
+                    .fetch_add(served_bytes, Ordering::Relaxed);
+                self.peer_fetch_peer_unreachable_count
+                    .fetch_add(1, Ordering::Relaxed);
                 return self
                     .get_part_sequential(key, writer, offset, length)
                     .await;
@@ -4802,6 +4997,10 @@ impl StoreDriver for WorkerProxyStore {
                         // grace window before falling back to abort().
                         Self::cancel_loser_racer(peer_rx, peer_handle);
                         self.race_server_win_total.inc(); // (#linkperf)
+                        // (#p2p-prefetch-metrics) peer tried but server won — no offload.
+                        self.peer_fetch_server_won_bytes
+                            .fetch_add(served_bytes, Ordering::Relaxed);
+                        self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             ?digest,
                             "WorkerProxyStore: server won race against peer"
@@ -4814,6 +5013,10 @@ impl StoreDriver for WorkerProxyStore {
                         // Legitimate zero-length blob — server won the race.
                         Self::cancel_loser_racer(peer_rx, peer_handle);
                         self.race_server_win_total.inc(); // (#linkperf)
+                        // (#p2p-prefetch-metrics) server won; served_bytes==0 here.
+                        self.peer_fetch_server_won_bytes
+                            .fetch_add(served_bytes, Ordering::Relaxed);
+                        self.peer_fetch_server_won_count.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             ?digest,
                             "WorkerProxyStore: server won race (zero-length blob)"
@@ -4833,6 +5036,7 @@ impl StoreDriver for WorkerProxyStore {
                         );
                         self.await_peer_after_empty_server(
                             writer, &mut peer_rx, peer_handle, &digest, &peer_endpoint, is_zero_blob,
+                            served_bytes,
                         ).await
                     }
                     Err(_server_err) => {
@@ -4843,6 +5047,7 @@ impl StoreDriver for WorkerProxyStore {
                         );
                         self.await_peer_after_empty_server(
                             writer, &mut peer_rx, peer_handle, &digest, &peer_endpoint, is_zero_blob,
+                            served_bytes,
                         ).await
                     }
                 }
@@ -4853,6 +5058,10 @@ impl StoreDriver for WorkerProxyStore {
                         // Peer produced data first — it wins.
                         Self::cancel_loser_racer(server_rx, server_handle);
                         self.race_peer_win_total.inc(); // (#linkperf)
+                        // (#p2p-prefetch-metrics) peer won — REALIZED offload.
+                        self.peer_fetch_win_bytes
+                            .fetch_add(served_bytes, Ordering::Relaxed);
+                        self.peer_fetch_win_count.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,
@@ -4866,6 +5075,10 @@ impl StoreDriver for WorkerProxyStore {
                         // Legitimate zero-length blob — peer won the race.
                         Self::cancel_loser_racer(server_rx, server_handle);
                         self.race_peer_win_total.inc(); // (#linkperf)
+                        // (#p2p-prefetch-metrics) peer won; served_bytes==0 here.
+                        self.peer_fetch_win_bytes
+                            .fetch_add(served_bytes, Ordering::Relaxed);
+                        self.peer_fetch_win_count.fetch_add(1, Ordering::Relaxed);
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,
@@ -4892,6 +5105,7 @@ impl StoreDriver for WorkerProxyStore {
                             .evict_blobs(&peer_endpoint, &[digest]);
                         self.await_server_after_empty_peer(
                             writer, &mut server_rx, server_handle, &digest, is_zero_blob,
+                            served_bytes,
                         ).await
                     }
                     Err(_peer_err) => {
@@ -4903,6 +5117,7 @@ impl StoreDriver for WorkerProxyStore {
                         );
                         self.await_server_after_empty_peer(
                             writer, &mut server_rx, server_handle, &digest, is_zero_blob,
+                            served_bytes,
                         ).await
                     }
                 }
@@ -6172,6 +6387,323 @@ mod tests {
             "server win must NOT increment race_peer_win_total"
         );
 
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // (#p2p-prefetch-metrics) REALIZED peer-fetch offload effectiveness.
+    // The four outcomes of the worker-side get_part race (race_peers=ON,
+    // INITIATOR mode) partition every raced input read into who served it:
+    //   1. peer won        -> worker_proxy_peer_fetch_win_*
+    //   2. server won      -> worker_proxy_peer_fetch_server_won_*
+    //   3. no peer known   -> worker_proxy_peer_fetch_no_peer_*
+    //   4. peer unreachable-> worker_proxy_peer_fetch_peer_unreachable_*
+    // Each test drives ONE outcome through the production composition
+    // (Store::new(proxy) -> get_part_unchunked) and asserts the bytes AND
+    // count landed on the RIGHT counter and NO other counter moved. Byte
+    // attribution = effective read length (digest.size_bytes() - offset,
+    // or `length` when set). Mutation: comment out the counter's fetch_add
+    // and the bespoke message red-fails.
+    //
+    // Production composition: WorkerProxyStore with race_peers=ON
+    // (enable_race_peers), non-IS_WORKER_REQUEST caller (INITIATOR mode) —
+    // exactly local_worker.rs's slow-tier input-read wiring.
+    // ---------------------------------------------------------------
+
+    /// Snapshot of all eight offload counters for cross-counter assertions.
+    #[derive(Clone, Copy)]
+    struct OffloadSnapshot {
+        win_bytes: u64,
+        win_count: u64,
+        server_won_bytes: u64,
+        server_won_count: u64,
+        no_peer_bytes: u64,
+        no_peer_count: u64,
+        unreachable_bytes: u64,
+        unreachable_count: u64,
+    }
+
+    fn snapshot_offload(proxy: &WorkerProxyStore) -> OffloadSnapshot {
+        OffloadSnapshot {
+            win_bytes: proxy.peer_fetch_win_bytes.load(Ordering::Relaxed),
+            win_count: proxy.peer_fetch_win_count.load(Ordering::Relaxed),
+            server_won_bytes: proxy.peer_fetch_server_won_bytes.load(Ordering::Relaxed),
+            server_won_count: proxy.peer_fetch_server_won_count.load(Ordering::Relaxed),
+            no_peer_bytes: proxy.peer_fetch_no_peer_bytes.load(Ordering::Relaxed),
+            no_peer_count: proxy.peer_fetch_no_peer_count.load(Ordering::Relaxed),
+            unreachable_bytes: proxy.peer_fetch_peer_unreachable_bytes.load(Ordering::Relaxed),
+            unreachable_count: proxy.peer_fetch_peer_unreachable_count.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Outcome 1 — PEER wins the race: bytes + count land on
+    /// `peer_fetch_win_*`; none of the other three outcome counters move.
+    ///
+    /// Mutation: comment out the `peer_fetch_win_bytes.fetch_add` /
+    /// `peer_fetch_win_count.fetch_add` at either peer-win site (the direct
+    /// `peer_rx` data branch OR the `await_peer_after_empty_server`
+    /// fallback); this test red-fails with
+    ///   "peer win must attribute served bytes to peer_fetch_win_bytes".
+    #[nativelink_test]
+    async fn test_peer_fetch_win_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let value = b"peer offload payload";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Inner empty; only the peer holds the blob => peer serves.
+        let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        peer_store
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        proxy.inject_worker_connection("grpc://peer:50071", peer_store);
+        locality_map
+            .write()
+            .register_blobs("grpc://peer:50071", &[digest]);
+
+        let before = snapshot_offload(&proxy);
+        let result = store.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(result.as_ref(), value, "peer must serve the bytes");
+        let after = snapshot_offload(&proxy);
+
+        assert_eq!(
+            after.win_bytes,
+            before.win_bytes + value.len() as u64,
+            "peer win must attribute served bytes to peer_fetch_win_bytes \
+             (was {}, now {})",
+            before.win_bytes,
+            after.win_bytes
+        );
+        assert_eq!(
+            after.win_count,
+            before.win_count + 1,
+            "peer win must increment peer_fetch_win_count"
+        );
+        assert_eq!(
+            after.server_won_bytes, before.server_won_bytes,
+            "peer win must NOT attribute bytes to server_won"
+        );
+        assert_eq!(
+            after.server_won_count, before.server_won_count,
+            "peer win must NOT increment server_won_count"
+        );
+        assert_eq!(
+            after.no_peer_count, before.no_peer_count,
+            "peer win must NOT increment no_peer_count"
+        );
+        assert_eq!(
+            after.unreachable_count, before.unreachable_count,
+            "peer win must NOT increment peer_unreachable_count"
+        );
+        Ok(())
+    }
+
+    /// Outcome 2 — SERVER wins (peer registered but its CAS is empty =>
+    /// stale-positive, peer loses): bytes + count land on
+    /// `peer_fetch_server_won_*`; no other outcome counter moves.
+    ///
+    /// Mutation: comment out the `peer_fetch_server_won_bytes.fetch_add` /
+    /// `peer_fetch_server_won_count.fetch_add` at either server-win site
+    /// (the direct `server_rx` data branch OR the
+    /// `await_server_after_empty_peer` fallback); this test red-fails with
+    ///   "server win (peer tried, lost) must attribute bytes to
+    ///    peer_fetch_server_won_bytes".
+    #[nativelink_test]
+    async fn test_peer_fetch_server_won_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let value = b"server served payload";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Inner has the blob; peer registered but its CAS is EMPTY
+        // (stale-positive) => peer returns empty EOF for the non-zero digest
+        // => await_server_after_empty_peer serves from the server.
+        inner
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        let empty_peer = Store::new(MemoryStore::new(&MemorySpec::default()));
+        proxy.inject_worker_connection("grpc://peer:50071", empty_peer);
+        locality_map
+            .write()
+            .register_blobs("grpc://peer:50071", &[digest]);
+
+        let before = snapshot_offload(&proxy);
+        let result = store.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(result.as_ref(), value, "server must serve the bytes");
+        let after = snapshot_offload(&proxy);
+
+        assert_eq!(
+            after.server_won_bytes,
+            before.server_won_bytes + value.len() as u64,
+            "server win (peer tried, lost) must attribute bytes to \
+             peer_fetch_server_won_bytes (was {}, now {})",
+            before.server_won_bytes,
+            after.server_won_bytes
+        );
+        assert_eq!(
+            after.server_won_count,
+            before.server_won_count + 1,
+            "server win must increment peer_fetch_server_won_count"
+        );
+        assert_eq!(
+            after.win_bytes, before.win_bytes,
+            "server win must NOT attribute bytes to peer_fetch_win_bytes"
+        );
+        assert_eq!(
+            after.win_count, before.win_count,
+            "server win must NOT increment peer_fetch_win_count"
+        );
+        assert_eq!(
+            after.no_peer_count, before.no_peer_count,
+            "server win must NOT increment no_peer_count"
+        );
+        assert_eq!(
+            after.unreachable_count, before.unreachable_count,
+            "server win must NOT increment peer_unreachable_count"
+        );
+        Ok(())
+    }
+
+    /// Outcome 3 — NO PEER known: `peers.is_empty()` short-circuits to the
+    /// sequential path (the freshness gap the inline-in-assignment prefetch
+    /// feature closes). Inner serves. bytes + count land on
+    /// `peer_fetch_no_peer_*`; no win/server_won/unreachable counter moves.
+    ///
+    /// Mutation: comment out the `peer_fetch_no_peer_bytes.fetch_add` /
+    /// `peer_fetch_no_peer_count.fetch_add` at the `peers.is_empty()`
+    /// dispatch site; this test red-fails with
+    ///   "no-peer read must attribute bytes to peer_fetch_no_peer_bytes".
+    #[nativelink_test]
+    async fn test_peer_fetch_no_peer_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let value = b"no peer freshness gap payload";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Inner has the blob; NO locality registration => peers.is_empty()
+        // => sequential path serves from the server directly.
+        inner
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+
+        let before = snapshot_offload(&proxy);
+        let result = store.get_part_unchunked(digest, 0, None).await?;
+        assert_eq!(result.as_ref(), value, "inner must serve the bytes");
+        let after = snapshot_offload(&proxy);
+
+        assert_eq!(
+            after.no_peer_bytes,
+            before.no_peer_bytes + value.len() as u64,
+            "no-peer read must attribute bytes to peer_fetch_no_peer_bytes \
+             (was {}, now {})",
+            before.no_peer_bytes,
+            after.no_peer_bytes
+        );
+        assert_eq!(
+            after.no_peer_count,
+            before.no_peer_count + 1,
+            "no-peer read must increment peer_fetch_no_peer_count"
+        );
+        assert_eq!(
+            after.win_count, before.win_count,
+            "no-peer read must NOT increment peer_fetch_win_count"
+        );
+        assert_eq!(
+            after.server_won_count, before.server_won_count,
+            "no-peer read must NOT increment peer_fetch_server_won_count"
+        );
+        assert_eq!(
+            after.unreachable_count, before.unreachable_count,
+            "no-peer read must NOT increment peer_unreachable_count"
+        );
+        Ok(())
+    }
+
+    /// Outcome 4 — PEER UNREACHABLE: a peer IS in the locality map but the
+    /// connection can't be established (`get_or_create_connection` => None),
+    /// so `get_part` falls through to the sequential path. Distinct from
+    /// no-peer: a peer WAS known, we just couldn't reach it. bytes + count
+    /// land on `peer_fetch_peer_unreachable_*`; no other counter moves.
+    ///
+    /// A malformed endpoint (`grpc://in valid:50071` — space in authority)
+    /// makes `GrpcStore::new` -> `Uri::try_from` fail synchronously, so the
+    /// connection returns None with no network I/O (deterministic + fast).
+    ///
+    /// Mutation: comment out the
+    /// `peer_fetch_peer_unreachable_bytes.fetch_add` /
+    /// `peer_fetch_peer_unreachable_count.fetch_add` at the connection-fail
+    /// branch; this test red-fails with
+    ///   "unreachable-peer read must attribute bytes to
+    ///    peer_fetch_peer_unreachable_bytes".
+    #[nativelink_test]
+    async fn test_peer_fetch_peer_unreachable_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let value = b"unreachable peer payload";
+        let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+        // Inner has the blob; a peer is registered but under a MALFORMED
+        // endpoint (never injected) so get_or_create_connection returns None
+        // synchronously => connection-fail branch => sequential path serves.
+        inner
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        locality_map
+            .write()
+            .register_blobs("grpc://in valid:50071", &[digest]);
+
+        let before = snapshot_offload(&proxy);
+        // Deadlock/hang detector: a malformed URI must fail fast (no network).
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            store.get_part_unchunked(digest, 0, None),
+        )
+        .await
+        .expect("must not hang — malformed endpoint fails URI parse synchronously")?;
+        assert_eq!(result.as_ref(), value, "inner must serve the bytes");
+        let after = snapshot_offload(&proxy);
+
+        assert_eq!(
+            after.unreachable_bytes,
+            before.unreachable_bytes + value.len() as u64,
+            "unreachable-peer read must attribute bytes to \
+             peer_fetch_peer_unreachable_bytes (was {}, now {})",
+            before.unreachable_bytes,
+            after.unreachable_bytes
+        );
+        assert_eq!(
+            after.unreachable_count,
+            before.unreachable_count + 1,
+            "unreachable-peer read must increment peer_fetch_peer_unreachable_count"
+        );
+        assert_eq!(
+            after.win_count, before.win_count,
+            "unreachable-peer read must NOT increment peer_fetch_win_count"
+        );
+        assert_eq!(
+            after.server_won_count, before.server_won_count,
+            "unreachable-peer read must NOT increment peer_fetch_server_won_count"
+        );
+        assert_eq!(
+            after.no_peer_count, before.no_peer_count,
+            "unreachable-peer read must NOT increment peer_fetch_no_peer_count"
+        );
         Ok(())
     }
 
