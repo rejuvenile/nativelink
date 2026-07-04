@@ -2613,6 +2613,18 @@ pub struct ApiWorkerScheduler {
 
     /// Blob locality map for peer-to-peer blob sharing.
     /// Used to generate peer hints in StartExecute messages.
+    ///
+    /// (#mapgap) `#[metric]` renders the routing-map SIZE at scrape time:
+    /// `scheduler.<name>.worker.locality_map.{digest_count,endpoint_count}`
+    /// plus a per-endpoint `endpoints.<ep>.blob_count`. Bare `#[metric]`
+    /// (no `group=`) so the leaf `BlobLocalityMap::publish` owns the
+    /// `locality_map` namespace (see its manual impl in
+    /// `nativelink-util/src/blob_locality_map.rs`). The `Option`/`Arc`/
+    /// `parking_lot::RwLock` library impls chain to it, the `RwLock` one
+    /// via `try_read()` (never parks the scrape's tokio worker). Computed
+    /// from the live map at scrape — zero cost on the hot register/evict
+    /// path. Observability-only; no behavior change.
+    #[metric]
     locality_map: Option<SharedBlobLocalityMap>,
 
     /// CAS store for resolving input trees (reading Directory protos).
@@ -12308,6 +12320,114 @@ mod tests {
             "#231 T1: inner-tree worker `id` rendered the wrong value \
              (expected the registered worker id \"wmetric\") — group/field \
              routing into ApiWorkerSchedulerImpl.workers is wrong. body=\n{body}"
+        );
+    }
+
+    /// (#mapgap) Render-test through the FULL `ApiWorkerScheduler`
+    /// production composition: the routing-map SIZE gauges must render on
+    /// `/metrics` when the scheduler owns a populated `locality_map`.
+    ///
+    /// Unlike `make_test_scheduler` (which passes `locality_map = None`),
+    /// this builds the scheduler with a `SharedBlobLocalityMap` holding a
+    /// known topology, registers it exactly as `src/bin/nativelink.rs`
+    /// registers worker schedulers (upcast `RootMetricsComponent` → erased
+    /// `MetricsComponent` under the `scheduler.<name>.worker` prefix), and
+    /// asserts the leaf gauges appear with correct counts. This proves the
+    /// `#[metric]` annotation on the `locality_map` FIELD wires the leaf
+    /// `BlobLocalityMap::publish` into the root walk — the field annotation
+    /// and the leaf impl are only correct TOGETHER.
+    ///
+    /// Mutation (per CLAUDE.md TDD): drop the `#[metric]` on the
+    /// `locality_map` field of `ApiWorkerScheduler` — the root walk no
+    /// longer descends into the map and the first assertion red-fails with
+    /// its bespoke "#mapgap: ... dark on /metrics" message.
+    #[tokio::test]
+    async fn locality_map_size_gauges_rendered_on_metrics_endpoint() {
+        use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
+        use nativelink_util::common::DigestInfo;
+        use nativelink_util::metrics_publisher::{
+            MetricsComponentTrait, MetricsRegistry, render_prometheus,
+        };
+
+        // Known topology: 3 distinct digests, 2 endpoints; worker_x holds
+        // 2 (d1,d2), worker_y holds 2 (d2,d3). Distinctive counts double as
+        // a wrong-field guard.
+        let locality_map = new_shared_blob_locality_map();
+        {
+            let mut m = locality_map.write();
+            let d1 = DigestInfo::new([10u8; 32], 100);
+            let d2 = DigestInfo::new([20u8; 32], 200);
+            let d3 = DigestInfo::new([30u8; 32], 300);
+            m.register_blobs("worker_x", &[d1, d2]);
+            m.register_blobs("worker_y", &[d2, d3]);
+            assert_eq!(m.digest_count(), 3);
+            assert_eq!(m.endpoint_count(), 2);
+        }
+
+        let scheduler = ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWsm),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            Some(locality_map),
+            None,
+            None,
+            512 * 1024,
+            8,
+            false,
+            0,
+            2,
+            false,
+        );
+
+        let registry = MetricsRegistry::new();
+        registry.register_dyn(
+            "scheduler.testsched.worker",
+            scheduler.clone() as Arc<dyn MetricsComponentTrait + Send + Sync>,
+        );
+
+        // Warm the lazy span-thread-local path once (T1 de-flake), discard,
+        // then take the asserted render.
+        let _warm = render_prometheus(&registry);
+        let body = render_prometheus(&registry);
+
+        assert!(
+            body.contains("locality_map_digest_count"),
+            "#mapgap: ApiWorkerScheduler.locality_map digest_count dark on \
+             /metrics — the `#[metric]` field annotation did not wire the \
+             leaf into the root walk, so the routing-map completeness gap is \
+             unmeasurable in prod. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_digest_count 3\n"
+            ),
+            "#mapgap: locality_map digest_count rendered the wrong value \
+             (expected 3) through the full scheduler composition — group/field \
+             routing is wrong. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_endpoint_count 2\n"
+            ),
+            "#mapgap: locality_map endpoint_count rendered the wrong value \
+             (expected 2). body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_endpoints_worker_x_blob_count 2\n"
+            ),
+            "#mapgap: per-endpoint blob_count for worker_x dark or wrong \
+             (expected 2) — the per-worker domino is not scrapeable. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_endpoints_worker_y_blob_count 2\n"
+            ),
+            "#mapgap: per-endpoint blob_count for worker_y dark or wrong \
+             (expected 2). body=\n{body}"
         );
     }
 }
