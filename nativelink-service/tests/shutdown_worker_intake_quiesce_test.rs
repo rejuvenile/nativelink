@@ -155,6 +155,7 @@ fn blobs_available(cas_endpoint: &str, digests: Vec<DigestInfo>) -> Update {
         digests: digests.into_iter().map(Into::into).collect(),
         is_full_snapshot: false,
         evicted_digests: vec![],
+        evicted_blob_infos: Vec::new(),
         digest_infos: vec![],
         cpu_load_pct: 0,
         cached_directory_digests: vec![],

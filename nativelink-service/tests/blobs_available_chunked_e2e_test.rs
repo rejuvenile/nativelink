@@ -261,6 +261,7 @@ fn build_notification(
         digests: vec![],
         is_full_snapshot: true,
         evicted_digests: vec![],
+        evicted_blob_infos: Vec::new(),
         digest_infos,
         cpu_load_pct: 42,
         cached_directory_digests: vec![],
