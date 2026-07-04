@@ -45,14 +45,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use nativelink_config::stores::EvictionPolicy;
+use nativelink_config::stores::{EvictionPolicy, FilesystemSpec};
 use nativelink_macro::nativelink_test;
 use nativelink_store::callback_utils::ItemCallbackHolder;
+use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_util::blob_locality_map::{BlobLocalityMap, Stamp};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
-use nativelink_util::store_trait::StoreKey;
+use nativelink_util::store_trait::{StoreDriver, StoreKey, StoreLike};
 use nativelink_worker::local_worker::{BlobChangeTracker, BlobState};
 use tokio::sync::Notify;
 
@@ -340,4 +341,187 @@ async fn scenario3_ungated_force_evict_and_heal() {
     })
     .await
     .expect("scenario3 deadlocked — composite drift detector");
+}
+
+// ===============================================================
+// Scenario 4: PRODUCTION-COMPOSITION eviction stamp fidelity (BLOCK-1 guard).
+//
+// The other scenarios use `StampedBytes`, a fake value that carries a stamp.
+// The PRODUCTION value is `Arc<FileEntryImpl>`; if `FileEntryImpl` does not
+// override `LenEntry::{stamp,set_stamp}`, the map's `set_stamp` is a no-op and
+// the eviction listener reads `value.stamp() == 0` — so every genuine-eviction
+// delta carries counter 0, loses `evict_gated` against any stored PRESENT@≥1,
+// and the whole value-carried-ts fix INVERTS into a persistent stale-positive
+// on every eviction (the false-negative only "looks fixed" because 0 always
+// loses).
+//
+// This test composes the REAL `FilesystemStore<FileEntryImpl>` + a real
+// `ItemCallback` (registered via `register_item_callback`, exactly as
+// `local_worker.rs` wires the `BlobChangeTracker` in production) and asserts a
+// genuine LRU eviction fires the removal callback carrying a NON-ZERO counter
+// (the value's frozen INSERT counter), NOT 0.
+//
+// We assert on the RAW eviction callback ts (captured directly), not on the
+// tracker's post-LWW state: a spurious internal read on the insert→evict seam
+// could otherwise supersede the eviction in the LWW (the exact false-positive
+// the `still_ours`→`get_no_touch` fix removes). Capturing the raw ts is the
+// faithful BLOCK-1 observable — "did the value carry its stamp to the evict".
+//
+// MUTATION (documented): comment out `FileEntryImpl::set_stamp`'s body (make it
+// a no-op again, = pre-BLOCK-1). The eviction callback then fires with counter 0
+// (`value.stamp()` reads the never-written 0) and this test RED-fails with its
+// bespoke "eviction reported ts 0 — value-carried stamp not stored on
+// FileEntryImpl" message.
+#[derive(Debug)]
+struct EvictCaptureCallback {
+    target: DigestInfo,
+    captured: std::sync::Mutex<Option<Stamp>>,
+}
+
+impl nativelink_util::store_trait::ItemCallback for EvictCaptureCallback {
+    fn callback<'a>(
+        &'a self,
+        store_key: StoreKey<'a>,
+        ts_boot_epoch: u64,
+        ts_counter: u64,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send + 'a>> {
+        if let StoreKey::Digest(d) = store_key {
+            if d == self.target {
+                *self.captured.lock().unwrap() = Some(Stamp::new(ts_boot_epoch, ts_counter));
+            }
+        }
+        Box::pin(core::future::ready(()))
+    }
+}
+
+#[nativelink_test]
+async fn scenario4_filesystem_store_eviction_carries_nonzero_stamp() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let content_dir = tempfile::Builder::new()
+            .prefix("nl_lmd_content_")
+            .tempdir()
+            .expect("content tempdir");
+        let temp_dir = tempfile::Builder::new()
+            .prefix("nl_lmd_temp_")
+            .tempdir()
+            .expect("temp tempdir");
+
+        // Byte-driven cap so eviction fires on the SYNCHRONOUS `insert_inner`
+        // drain path (the `max_count && max_bytes>0` re-check + inline
+        // `drain_pending_evictions`), NOT only on the 10s background drain tick.
+        // Blobs are ~2 KiB → weight 2 each; cap = 5000/1024 = 4 → two blobs
+        // (weight 4) fit, the third (weight 6) evicts the LRU.
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_dir.path().to_string_lossy().into_owned(),
+            temp_path: temp_dir.path().to_string_lossy().into_owned(),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: 5000,
+                max_count: 2,
+                max_seconds: 0,
+                evict_bytes: 0,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create filesystem store");
+
+        // (#locality-map-drift) The worker stamps the map's boot_epoch at boot;
+        // do the same here so the delta carries a realistic (boot_epoch,
+        // counter). The COUNTER (not the epoch) is what BLOCK-1 defangs.
+        // (`FilesystemStore::new` already started the background eviction
+        // drainer, so the async eviction callback fires without us kicking it.)
+        store.set_map_boot_epoch(7);
+
+        let d1 = DigestInfo::new([11u8; 32], 2000);
+        let d2 = DigestInfo::new([12u8; 32], 2000);
+        let d3 = DigestInfo::new([13u8; 32], 2000);
+
+        // Register BOTH the real BlobChangeTracker (production wiring) AND a
+        // capture callback that records d1's RAW eviction ts (pre-LWW).
+        let notify = Arc::new(Notify::new());
+        let tracker = BlobChangeTracker::new(notify);
+        store
+            .clone()
+            .register_item_callback(tracker.clone())
+            .expect("register_item_callback (tracker) on FilesystemStore");
+        let capture = Arc::new(EvictCaptureCallback {
+            target: d1,
+            captured: std::sync::Mutex::new(None),
+        });
+        store
+            .clone()
+            .register_item_callback(capture.clone())
+            .expect("register_item_callback (capture) on FilesystemStore");
+
+        let blob = |b: u8| bytes::Bytes::from(vec![b; 2000]);
+
+        // Insert d1, d2 (at capacity). Then promote d2 with a get so d1 is the
+        // LRU victim, then insert d3 to force d1's eviction.
+        store.update_oneshot(d1, blob(0xAA)).await.expect("insert d1");
+        store.update_oneshot(d2, blob(0xBB)).await.expect("insert d2");
+        let _ = store.get_part_unchunked(d2, 0, None).await;
+        store
+            .update_oneshot(d3, blob(0xCC))
+            .await
+            .expect("insert d3");
+
+        // Wait for d1's genuine eviction callback (sync inside the emplace spawn
+        // OR async via the background drainer).
+        let mut evict_stamp: Option<Stamp> = None;
+        for _ in 0..200 {
+            if let Some(s) = *capture.captured.lock().unwrap() {
+                evict_stamp = Some(s);
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let stamp = evict_stamp.expect(
+            "scenario4: d1's genuine LRU eviction callback never fired on the real \
+             FilesystemStore<FileEntryImpl> composition (max_bytes/max_count \
+             eviction did not evict d1) — test cannot observe the eviction stamp",
+        );
+        assert!(
+            stamp.counter > 0,
+            "scenario4: eviction reported ts 0 — value-carried stamp not stored \
+             on FileEntryImpl. The map's set_stamp is a no-op and the eviction \
+             listener read value.stamp()==0, so the fix is INERT in production \
+             (every eviction becomes a permanent stale-positive: a counter-0 \
+             evict can never win the server LWW gate). FileEntryImpl must \
+             override LenEntry::{{stamp,set_stamp}}. Got counter={}, boot_epoch={}.",
+            stamp.counter,
+            stamp.boot_epoch,
+        );
+        assert_eq!(
+            stamp.boot_epoch, 7,
+            "scenario4: eviction stamp must carry the map's boot_epoch (7)"
+        );
+
+        // The tracker (production consumer) must ALSO end with d1 ABSENT — the
+        // `still_ours`→`get_no_touch` fix ensures the genuine eviction is not
+        // suppressed by a spurious internal read on the insert→evict seam.
+        let mut d1_absent_in_tracker = false;
+        for _ in 0..50 {
+            for (d, state, _stamp) in tracker.swap() {
+                if d == d1 && state == BlobState::Absent {
+                    d1_absent_in_tracker = true;
+                }
+            }
+            if d1_absent_in_tracker {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            d1_absent_in_tracker,
+            "scenario4: the tracker did NOT report d1 ABSENT after a genuine \
+             eviction — a spurious internal read (e.g. the emplace `still_ours` \
+             get) minted a fresh counter that suppressed the eviction in the \
+             LWW. The `still_ours` check must use `get_no_touch` (no on_get)."
+        );
+    })
+    .await
+    .expect("scenario4 deadlocked — composite drift detector");
 }

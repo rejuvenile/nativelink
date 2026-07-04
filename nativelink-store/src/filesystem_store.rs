@@ -301,6 +301,18 @@ pub struct FileEntryImpl {
     block_size: u64,
     // We lock around this as it gets rewritten when we move between temp and content types
     encoded_file_path: RwLock<EncodedFilePath>,
+    /// (#locality-map-drift) The per-mutation logical-LWW counter the
+    /// `MokaEvictingMap` freezes into THIS value at insert (via
+    /// `LenEntry::set_stamp`, before `cache.insert`). The eviction listener
+    /// reads it back off the evicted value (`LenEntry::stamp`) so the holdings
+    /// eviction delta carries the counter this value was inserted with — never
+    /// a fresh mint — which is what makes `ts_evict(V) < ts_reinsert` hold under
+    /// out-of-order async callback delivery. Interior-mutable (`AtomicU64`)
+    /// because moka values are shared behind `Arc<FileEntryImpl>` and stamped
+    /// through a `&self` call. `0` until the map stamps it. Only meaningful on
+    /// the worker's fast `FilesystemStore` (whose `BlobChangeTracker` consumes
+    /// it); server-side FS stores stamp it too but no tracker reads it.
+    stamp: AtomicU64,
 }
 
 impl FileEntryImpl {
@@ -315,6 +327,7 @@ impl FileEntry for FileEntryImpl {
             data_size,
             block_size,
             encoded_file_path,
+            stamp: AtomicU64::new(0),
         }
     }
 
@@ -480,6 +493,26 @@ impl LenEntry for FileEntryImpl {
 
     fn is_empty(&self) -> bool {
         self.data_size == 0
+    }
+
+    // (#locality-map-drift) Real value-carried logical-LWW stamp. Without these
+    // overrides `Arc<FileEntryImpl>` would inherit the `LenEntry` defaults
+    // (`stamp()→0`, `set_stamp()→no-op`), making the whole value-carried-ts fix
+    // INERT in production: every genuine-eviction delta would carry counter 0
+    // and lose `evict_gated` against any stored PRESENT@(be,≥1) → a
+    // genuinely-evicted blob would be reported PRESENT forever (a stale-positive
+    // on every eviction). `Relaxed`: the map establishes the value↔counter
+    // binding by calling `set_stamp` before `cache.insert`; the LWW needs only
+    // per-value uniqueness + monotonicity of the counter, both from the map's
+    // `fetch_add`.
+    #[inline]
+    fn stamp(&self) -> u64 {
+        self.stamp.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn set_stamp(&self, stamp: u64) {
+        self.stamp.store(stamp, Ordering::Relaxed);
     }
 
     // unref() only triggers when an item is removed from the eviction_map. It is possible
@@ -1517,7 +1550,15 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             // need to immediately use the entry must verify presence — see
             // FastSlowStore::populate_fast_store_unchecked which does
             // post-write has() + retry once.
-            let still_ours = match evicting_map.get(&key).await {
+            // (#locality-map-drift) `get_no_touch`, NOT `get`: this is an
+            // internal ptr-eq verification on the insert→evict seam, not a
+            // logical materialization read. Firing `on_get` here would mint a
+            // fresh logical-LWW counter HIGHER than the value's frozen
+            // insert-counter, so the blob's subsequent GENUINE eviction (which
+            // carries the lower insert-counter) would LOSE the server LWW gate
+            // and the blob would be reported PRESENT while evicted — a
+            // systematic false-positive on every evicted-after-write blob.
+            let still_ours = match evicting_map.get_no_touch(&key).await {
                 Some(map_entry) => Arc::ptr_eq(&map_entry, &entry),
                 None => false,
             };

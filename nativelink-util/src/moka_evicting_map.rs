@@ -722,6 +722,34 @@ where
         result
     }
 
+    /// (#locality-map-drift) Like [`Self::get`] but does NOT fire the `on_get`
+    /// callback. For INTERNAL, non-logical lookups (e.g. `FilesystemStore`'s
+    /// post-emplace `still_ours` ptr-eq verification) that must NOT emit a
+    /// "recently read" heat signal.
+    ///
+    /// Why this matters for the holdings LWW: `on_get` mints a FRESH logical-LWW
+    /// counter (so a genuine materialization read can supersede a stale
+    /// out-of-order evict — the false-missing fix). But that fresh counter is
+    /// HIGHER than the value's own frozen insert-counter, so if a spurious read
+    /// fires between a value's insert and its GENUINE eviction, the eviction
+    /// (carrying the value's lower insert-counter) LOSES the LWW and the blob is
+    /// reported PRESENT while gone — a systematic false-POSITIVE on EVERY
+    /// evicted-after-write blob. The `still_ours` check runs on exactly that
+    /// insert→evict seam, so it must use this non-signalling lookup. Genuine
+    /// materialization reads (`get`) still fire `on_get` (the design accepts the
+    /// resulting transient, force_evict-healed false-positive for real reads).
+    ///
+    /// Still promotes the moka LRU (like `get`) — a just-written blob staying
+    /// warm is desirable and independent of the holdings signal.
+    pub async fn get_no_touch(&self, key: &Q) -> Option<T> {
+        if self.has_pinned() {
+            if let Some(entry) = self.pinned.get(key) {
+                return Some(entry.data.clone());
+            }
+        }
+        self.cache.get(key)
+    }
+
     /// Retrieve multiple values by key. Sequential iteration is intentional:
     /// Moka's `cache.get()` is synchronous (lock-free concurrent hash map),
     /// so 500 lookups complete in ~50us. Parallelism via `spawn_blocking` or
