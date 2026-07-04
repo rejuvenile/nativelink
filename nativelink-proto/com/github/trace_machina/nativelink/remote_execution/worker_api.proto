@@ -191,12 +191,18 @@ message BlobsAvailableNotification {
     bool is_full_snapshot = 3;
     /// Digests that have been evicted from the worker since the last update.
     /// Only meaningful when is_full_snapshot == false.
-    /// (#locality-map-drift) UPGRADED from `repeated Digest` to carry the
-    /// eviction's logical LWW ts (the evicted value's FROZEN `(boot_epoch,
-    /// counter)`), so the server can suppress a stale out-of-order eviction of
-    /// a blob that has since been re-admitted. `digest` is required; the ts
-    /// words are 0 for a legacy worker (treated as oldest → applied as before).
-    repeated BlobDigestInfo evicted_digests = 4;
+    /// (#locality-map-drift) LEGACY eviction list — stays `repeated Digest`, NO
+    /// tag reuse: a `BlobDigestInfo`-shaped element decoded against
+    /// `repeated Digest` mis-reads its nested-message bytes as a `string` and
+    /// prost ABORTS THE WHOLE MESSAGE, dropping the co-resident `digest_infos`
+    /// too — self-inflicted holdings loss for the duration of any non-atomic
+    /// fleet deploy skew window. The ts-carrying eviction list is the NEW field
+    /// `evicted_blob_infos` (tag 24). SKEW-SAFE BOTH WAYS: a new worker
+    /// DUAL-EMITS this legacy list (no ts) AND `evicted_blob_infos` (with ts); a
+    /// new server prefers `evicted_blob_infos` when present, else falls back to
+    /// this (applied ungated, as before); an old server reads this + ignores the
+    /// unknown tag 24; an old worker emits only this → new server falls back.
+    repeated build.bazel.remote.execution.v2.Digest evicted_digests = 4;
     /// Per-digest info with LRU timestamps. When present, the server should
     /// prefer this over the plain `digests` field.
     repeated BlobDigestInfo digest_infos = 5;
@@ -403,6 +409,17 @@ message BlobsAvailableNotification {
     /// gate), never this wire boolean. `false` for workers that never report
     /// disk pressure (pre-F4 / sampler stale → fail-open via the fallback).
     bool disk_pressured = 23;
+
+    /// (#locality-map-drift) Ts-carrying eviction list — the NEW skew-safe
+    /// companion to the legacy `evicted_digests` (tag 4). Each element is a
+    /// `BlobDigestInfo` (digest + `(ts_boot_epoch, ts_counter)` logical-LWW
+    /// stamp = the EVICTED value's FROZEN counter). A new server ts-gates
+    /// evictions from THIS field (suppressing a stale out-of-order eviction of a
+    /// re-admitted blob); it falls back to `evicted_digests` (ungated) only when
+    /// this is empty (old worker). A new worker DUAL-EMITS both. An old server
+    /// ignores this unknown tag and reads `evicted_digests`. Only meaningful
+    /// when is_full_snapshot == false (per legacy field-4 semantics).
+    repeated BlobDigestInfo evicted_blob_infos = 24;
 }
 
 /// One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
@@ -697,9 +714,10 @@ message BlobsAvailableChunk {
     /// Per-chunk slice of `BlobsAvailableNotification.evicted_digests`.
     /// May be empty on any chunk. Only meaningful when
     /// `is_full_snapshot=false` (per legacy field 4 semantics).
-    /// (#locality-map-drift) UPGRADED to `BlobDigestInfo` (matching field 4)
-    /// so each evicted digest carries its frozen `(boot_epoch, counter)` ts.
-    repeated BlobDigestInfo evicted_digests = 13;
+    /// (#locality-map-drift) LEGACY — stays `repeated Digest` (NO tag reuse; see
+    /// the notification's field-4 comment for the whole-message-decode-abort
+    /// hazard). The ts-carrying per-chunk slice is `evicted_blob_infos` (tag 28).
+    repeated build.bazel.remote.execution.v2.Digest evicted_digests = 13;
 
     /// CPU load — only meaningful on chunk 0; subsequent chunks
     /// leave at proto3 default 0.
@@ -751,6 +769,14 @@ message BlobsAvailableChunk {
     /// carries the chunk-0 value forward into the reassembled
     /// `BlobsAvailableNotification.disk_pressured` (field 23).
     bool disk_pressured = 27;
+
+    /// (#locality-map-drift) Per-chunk slice of
+    /// `BlobsAvailableNotification.evicted_blob_infos` (tag 24) — the ts-carrying
+    /// eviction list. `BlobDigestInfo` elements (digest + frozen logical-LWW
+    /// stamp). May be empty on any chunk. The chunker DUAL-EMITS this alongside
+    /// the legacy `evicted_digests` (tag 13). Only meaningful when
+    /// `is_full_snapshot=false`.
+    repeated BlobDigestInfo evicted_blob_infos = 28;
 }
 
 /// A streaming-message envelope shared across the cas→worker, scheduler→

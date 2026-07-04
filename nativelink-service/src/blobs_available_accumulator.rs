@@ -306,6 +306,12 @@ impl BroadcastAccumulator {
             .pinned_ac_mirror_entries
             .extend(chunk.pinned_ac_mirror_entries);
         self.body.evicted_digests.extend(chunk.evicted_digests);
+        // (#locality-map-drift) Merge the ts-carrying eviction list too — the
+        // chunked path is the PRODUCTION path (all ByteStream CAS writes), so
+        // dropping it here would make the ts-gate inert in prod.
+        self.body
+            .evicted_blob_infos
+            .extend(chunk.evicted_blob_infos);
         self.body
             .added_subtree_digests
             .extend(chunk.added_subtree_digests);
@@ -354,13 +360,15 @@ impl BroadcastAccumulator {
     }
 }
 
-/// Sum of entries across all 8 payload slices on a chunk.
+/// Sum of entries across all payload slices on a chunk.
 fn entries_in_chunk(chunk: &BlobsAvailableChunk) -> usize {
     chunk.digests.len()
         + chunk.cached_directory_digests.len()
         + chunk.pinned_mirror_entries.len()
         + chunk.pinned_ac_mirror_entries.len()
         + chunk.evicted_digests.len()
+        // (#locality-map-drift) count the dual-emitted ts eviction list too.
+        + chunk.evicted_blob_infos.len()
         + chunk.added_subtree_digests.len()
         + chunk.removed_subtree_digests.len()
         + chunk.pinned_mirror_digests.len()
@@ -964,6 +972,7 @@ mod tests {
             pinned_mirror_entries: Vec::new(),
             pinned_ac_mirror_entries: Vec::new(),
             evicted_digests: Vec::new(),
+            evicted_blob_infos: Vec::new(),
             added_subtree_digests: Vec::new(),
             removed_subtree_digests: Vec::new(),
             pinned_mirror_digests: Vec::new(),
@@ -1292,13 +1301,15 @@ mod tests {
         c0.cached_directory_digests = vec![d(10)];
         c0.pinned_mirror_entries = vec![mpe(20, "cas")];
         c0.pinned_ac_mirror_entries = vec![mpe(30, "ac")];
-        c0.evicted_digests = vec![bdi(40)];
+        c0.evicted_digests = vec![d(40)];
+        c0.evicted_blob_infos = vec![bdi(40)];
 
         let mut c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
         c1.cached_directory_digests = vec![d(11)];
         c1.pinned_mirror_entries = vec![mpe(21, "cas")];
         c1.pinned_ac_mirror_entries = vec![mpe(31, "ac")];
-        c1.evicted_digests = vec![bdi(41)];
+        c1.evicted_digests = vec![d(41)];
+        c1.evicted_blob_infos = vec![bdi(41)];
 
         assert!(acc.merge_chunk(c0).is_none());
         let out = acc.merge_chunk(c1).expect("terminal");
@@ -1307,6 +1318,9 @@ mod tests {
         assert_eq!(out.pinned_mirror_entries.len(), 2);
         assert_eq!(out.pinned_ac_mirror_entries.len(), 2);
         assert_eq!(out.evicted_digests.len(), 2);
+        // (#locality-map-drift) the ts-carrying eviction list must ALSO merge
+        // across chunks (the chunked path is production).
+        assert_eq!(out.evicted_blob_infos.len(), 2);
     }
 
     #[test]
@@ -1915,8 +1929,9 @@ mod tests {
             worker_cas_endpoint: String::new(),
             digests: Vec::<Digest>::new(),
             is_full_snapshot: false,
-            // (#locality-map-drift) evicted_digests upgraded Digest -> BlobDigestInfo.
-            evicted_digests: Vec::<BlobDigestInfo>::new(),
+            // (#locality-map-drift) evicted_digests stays Digest (legacy, no tag
+            // reuse); evicted_blob_infos (below) is the ts-carrying companion.
+            evicted_digests: Vec::<Digest>::new(),
             digest_infos: Vec::new(),
             cpu_load_pct: 0,
             cached_directory_digests: Vec::<Digest>::new(),
@@ -1936,6 +1951,7 @@ mod tests {
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            evicted_blob_infos: Vec::<BlobDigestInfo>::new(),
         };
         // The test is a compile-time check; no runtime assertions needed.
     }

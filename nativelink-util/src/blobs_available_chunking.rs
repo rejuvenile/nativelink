@@ -128,6 +128,7 @@ pub fn chunk_blobs_available(
         memory_pressured,
         available_disk_bytes,
         disk_pressured,
+        evicted_blob_infos,
     } = notification;
 
     // Fold legacy field 2 (`digests`) into `digest_infos` for backwards
@@ -148,6 +149,7 @@ pub fn chunk_blobs_available(
         pinned_mirror_entries: pinned_mirror_entries.into_iter(),
         pinned_ac_mirror_entries: pinned_ac_mirror_entries.into_iter(),
         evicted_digests: evicted_digests.into_iter(),
+        evicted_blob_infos: evicted_blob_infos.into_iter(),
         added_subtree_digests: added_subtree_digests.into_iter(),
         removed_subtree_digests: removed_subtree_digests.into_iter(),
         pinned_mirror_digests: pinned_mirror_digests.into_iter(),
@@ -206,6 +208,7 @@ pub fn chunk_blobs_available(
             pinned_mirror_entries: Vec::new(),
             pinned_ac_mirror_entries: Vec::new(),
             evicted_digests: Vec::new(),
+            evicted_blob_infos: Vec::new(),
             added_subtree_digests: Vec::new(),
             removed_subtree_digests: Vec::new(),
             pinned_mirror_digests: Vec::new(),
@@ -231,6 +234,11 @@ pub fn chunk_blobs_available(
         budget = drain_into(
             &mut src.evicted_digests,
             &mut chunk.evicted_digests,
+            budget,
+        );
+        budget = drain_into(
+            &mut src.evicted_blob_infos,
+            &mut chunk.evicted_blob_infos,
             budget,
         );
         budget = drain_into(
@@ -318,10 +326,11 @@ struct ChunkSources {
     cached_directory_digests: alloc::vec::IntoIter<Digest>,
     pinned_mirror_entries: alloc::vec::IntoIter<MirrorPinEntry>,
     pinned_ac_mirror_entries: alloc::vec::IntoIter<MirrorPinEntry>,
-    // (#locality-map-drift) `evicted_digests` upgraded from `Digest` to
-    // `BlobDigestInfo` so each evicted digest carries its frozen
-    // `(boot_epoch, counter)` logical-LWW ts.
-    evicted_digests: alloc::vec::IntoIter<BlobDigestInfo>,
+    // (#locality-map-drift) `evicted_digests` stays `Digest` (legacy, no ts;
+    // NO tag reuse). `evicted_blob_infos` is the NEW ts-carrying eviction list
+    // (`BlobDigestInfo`); the worker dual-emits both, chunked in lock-step.
+    evicted_digests: alloc::vec::IntoIter<Digest>,
+    evicted_blob_infos: alloc::vec::IntoIter<BlobDigestInfo>,
     added_subtree_digests: alloc::vec::IntoIter<Digest>,
     removed_subtree_digests: alloc::vec::IntoIter<Digest>,
     pinned_mirror_digests: alloc::vec::IntoIter<Digest>,
@@ -334,6 +343,7 @@ impl ChunkSources {
             && self.pinned_mirror_entries.len() == 0
             && self.pinned_ac_mirror_entries.len() == 0
             && self.evicted_digests.len() == 0
+            && self.evicted_blob_infos.len() == 0
             && self.added_subtree_digests.len() == 0
             && self.removed_subtree_digests.len() == 0
             && self.pinned_mirror_digests.len() == 0
@@ -381,6 +391,138 @@ mod tests {
             digest: Some(d(i)),
             store_id: store.to_string(),
         }
+    }
+
+    // ===========================================================
+    // (#locality-map-drift) BLOCK-3 wire-skew round-trip: the eviction fields
+    // MUST NOT reuse a tag, so a non-atomic fleet deploy (new worker ↔ old
+    // server, or old worker ↔ new server) never drops a whole holdings tick.
+    //
+    // `evicted_digests` (tag 4) stays `repeated Digest`; the ts-carrying list is
+    // the NEW `evicted_blob_infos` (tag 24). We prove skew-safety BOTH ways with
+    // real prost encode/decode.
+    // ===========================================================
+
+    /// Minimal mirror of the OLD (pre-fix) `BlobsAvailableNotification` schema:
+    /// `evicted_digests` at tag 4 is `repeated Digest`, and there is NO tag 24.
+    /// Decoding NEW-worker bytes against this proves an OLD server (a) reads the
+    /// legacy eviction from field 4 and (b) SKIPS the unknown tag 24 WITHOUT
+    /// aborting the whole message (so co-resident `digest_infos` survive).
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct OldNotification {
+        #[prost(message, repeated, tag = "4")]
+        evicted_digests: alloc::vec::Vec<Digest>,
+        #[prost(message, repeated, tag = "5")]
+        digest_infos: alloc::vec::Vec<BlobDigestInfo>,
+        // NOTE: deliberately NO field 24 — the old server doesn't know it.
+    }
+
+    #[test]
+    fn wire_skew_new_worker_bytes_decode_on_old_server_no_whole_message_loss() {
+        use prost::Message;
+        // A NEW worker DUAL-EMITS: legacy `evicted_digests` (tag 4, Digest, no
+        // ts) AND `evicted_blob_infos` (tag 24, BlobDigestInfo, with ts), plus a
+        // co-resident PRESENT `digest_infos`.
+        let new_worker = BlobsAvailableNotification {
+            evicted_digests: vec![d(40), d(41)],
+            evicted_blob_infos: vec![
+                BlobDigestInfo {
+                    digest: Some(d(40)),
+                    ts_boot_epoch: 7,
+                    ts_counter: 99,
+                },
+                BlobDigestInfo {
+                    digest: Some(d(41)),
+                    ts_boot_epoch: 7,
+                    ts_counter: 100,
+                },
+            ],
+            digest_infos: vec![bdi(1), bdi(2), bdi(3)],
+            ..Default::default()
+        };
+        let bytes = new_worker.encode_to_vec();
+
+        // Decode against the OLD schema (no tag 24).
+        let old_view = OldNotification::decode(&bytes[..]).expect(
+            "BLOCK-3 wire-skew: an OLD server must decode a NEW worker's message \
+             WITHOUT error — reusing tag 4 for BlobDigestInfo would abort the \
+             whole message (prost mis-reads the nested-Digest bytes as a string) \
+             and DROP the co-resident digest_infos, self-inflicting a holdings \
+             loss for the deploy skew window",
+        );
+        assert_eq!(
+            old_view.digest_infos.len(),
+            3,
+            "BLOCK-3 wire-skew: the co-resident PRESENT digest_infos MUST survive \
+             the old server's decode (whole-message decode did not abort)"
+        );
+        assert_eq!(
+            old_view.evicted_digests.len(),
+            2,
+            "BLOCK-3 wire-skew: the old server MUST read the legacy evicted_digests \
+             (tag 4, still Digest) — its eviction handling keeps working"
+        );
+        assert_eq!(
+            old_view.evicted_digests[0],
+            d(40),
+            "BLOCK-3 wire-skew: legacy evicted_digests decode to the right Digests"
+        );
+    }
+
+    #[test]
+    fn wire_skew_old_worker_bytes_decode_on_new_server_ts_list_empty() {
+        use prost::Message;
+        // An OLD worker emits ONLY the legacy `evicted_digests` (tag 4), no tag
+        // 24. Decode against the NEW (full) schema.
+        let old_worker = OldNotification {
+            evicted_digests: vec![d(50), d(51)],
+            digest_infos: vec![bdi(9)],
+        };
+        let bytes = old_worker.encode_to_vec();
+
+        let new_view = BlobsAvailableNotification::decode(&bytes[..]).expect(
+            "BLOCK-3 wire-skew: a NEW server must decode an OLD worker's message \
+             cleanly",
+        );
+        assert_eq!(
+            new_view.digest_infos.len(),
+            1,
+            "BLOCK-3 wire-skew: old-worker digest_infos survive on the new server"
+        );
+        assert_eq!(
+            new_view.evicted_digests.len(),
+            2,
+            "BLOCK-3 wire-skew: the new server reads the old worker's legacy \
+             evicted_digests (tag 4)"
+        );
+        assert!(
+            new_view.evicted_blob_infos.is_empty(),
+            "BLOCK-3 wire-skew: an old worker sends NO tag 24, so the new server's \
+             ts list is empty → it falls back to the legacy (ungated) eviction \
+             path, exactly as before the fix"
+        );
+    }
+
+    #[test]
+    fn wire_skew_new_to_new_roundtrip_preserves_ts() {
+        use prost::Message;
+        // Full new-schema round-trip: both eviction fields + the ts survive.
+        let n = BlobsAvailableNotification {
+            evicted_digests: vec![d(60)],
+            evicted_blob_infos: vec![BlobDigestInfo {
+                digest: Some(d(60)),
+                ts_boot_epoch: 3,
+                ts_counter: 77,
+            }],
+            digest_infos: vec![bdi(1)],
+            ..Default::default()
+        };
+        let decoded = BlobsAvailableNotification::decode(&n.encode_to_vec()[..])
+            .expect("new→new round-trip must decode");
+        assert_eq!(decoded.evicted_blob_infos.len(), 1);
+        assert_eq!(decoded.evicted_blob_infos[0].ts_counter, 77);
+        assert_eq!(decoded.evicted_blob_infos[0].ts_boot_epoch, 3);
+        assert_eq!(decoded.evicted_digests.len(), 1);
     }
 
     #[test]
@@ -610,13 +752,16 @@ mod tests {
             cached_directory_digests: (10..12).map(d).collect(),
             pinned_mirror_entries: vec![mpe(20, "cas_STORE")],
             pinned_ac_mirror_entries: vec![mpe(30, "AC_MAIN_STORE")],
-            evicted_digests: (40..42).map(bdi).collect(),
+            // (#locality-map-drift) evicted_digests is Digest (legacy);
+            // evicted_blob_infos is the ts-carrying companion.
+            evicted_digests: (40..42).map(d).collect(),
+            evicted_blob_infos: (42..44).map(bdi).collect(),
             ..Default::default()
         };
         let chunks = chunk_blobs_available(n, 1, 99, String::new(), 1)
-            .expect("8-chunk partition must succeed");
-        // 2 + 2 + 1 + 1 + 2 = 8 entries -> 8 chunks; last is is_last.
-        assert_eq!(chunks.len(), 8);
+            .expect("multi-chunk partition must succeed");
+        // 2 + 2 + 1 + 1 + 2 + 2 = 10 entries -> 10 chunks; last is is_last.
+        assert_eq!(chunks.len(), 10);
         assert!(chunks.last().unwrap().is_last);
         let total: usize = chunks
             .iter()
@@ -626,9 +771,10 @@ mod tests {
                     + c.pinned_mirror_entries.len()
                     + c.pinned_ac_mirror_entries.len()
                     + c.evicted_digests.len()
+                    + c.evicted_blob_infos.len()
             })
             .sum();
-        assert_eq!(total, 8);
+        assert_eq!(total, 10);
     }
 
     #[test]

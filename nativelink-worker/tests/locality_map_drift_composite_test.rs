@@ -217,62 +217,71 @@ async fn scenario1_async_reorder_lww_suppression() {
 }
 
 // ===============================================================
-// Scenario 2: restart dominance (bare-counter counterexample).
+// Scenario 2: restart convergence via the REAL reconnect wipe (MAJOR fix).
 //
-// A stale, HIGH-counter PRESENT stamp from the OLD process survives a restart
-// with NO server wipe (adversarial isolation, matching HoldingsRestartEpoch.tla
-// — imagine the reconnect wipe raced). The worker restarts (boot_epoch bumps
-// STRICTLY, counter resets to c=1) and its FRESH-epoch delta must be able to
-// TAKE CONTROL of the digest: re-register@(epoch_new, 1) must refresh the
-// stored stamp, and a subsequent same-value evict@(epoch_new, 1) must then
-// REMOVE d (the value is genuinely gone).
+// `boot_epoch_id()` (worker_utils.rs) is a RANDOM u64, NOT monotone — so the
+// stamp's cross-epoch comparison provides NO reliable "fresh epoch dominates"
+// ordering in production. Restart safety actually rests on the server's
+// WIPE-ON-EPOCH-CHANGE (`worker_api_server.rs` `remove_endpoint` when the
+// reconnect's `boot_epoch_id` differs from the stored one) + connection-scoped
+// inflight teardown (`drop_all_inflight` on the RST) — NOT epoch dominance.
 //
-// The lexicographic (boot_epoch, counter) order makes a fresh epoch dominate
-// ANY prior counter, so both the refresh AND the evict land. A BARE COUNTER
-// wedges: (epoch_new, 1) loses to the stale high counter, so the register is
-// NOT applied and the later evict is SUPPRESSED — d is stuck PRESENT with the
-// dead old-epoch stamp forever, uncontrollable by the live worker.
+// This scenario drives that REAL path at the `BlobLocalityMap` layer:
+//   1. old process registers d@(epoch_old, c) — its holdings.
+//   2. the worker restarts → the reconnect handler calls `remove_endpoint`
+//      (the wipe) because the boot_epoch changed → d is CLEARED.
+//   3. the fresh process re-registers d@(epoch_new, 1) into the wiped
+//      (empty) state → d re-converges to PRESENT.
+// Because the wipe cleared the endpoint's stamps, the fresh delta registers
+// into an EMPTY entry — the stamp's cross-epoch comparison is NEVER reached, so
+// a random (non-monotone) boot_epoch is fine. The stale (epoch_old, c) stamp is
+// gone; no bare-counter/epoch-ordering wedge is possible.
 //
-// MUTATION (documented): strip the epoch from the server comparator (compare
-// counter only). Then the fresh-epoch evict cannot beat the stale high counter
-// → d stays PRESENT → the final `!has_digest` assertion RED-fails.
+// MUTATION (documented): comment out the `remove_endpoint` wipe (step 2). The
+// stale old-epoch state then survives the restart, and the
+// `!has_digest`-after-wipe assertion RED-fails — proving the WIPE (not epoch
+// dominance) is the load-bearing restart-safety mechanism.
 // ===============================================================
 #[nativelink_test]
-async fn scenario2_restart_dominance() {
+async fn scenario2_restart_convergence_via_wipe() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let endpoint = "grpc://worker-a:50081";
         let mut server = BlobLocalityMap::new();
         let d = digest(2);
 
-        // Old process registered d PRESENT at a HIGH counter and it is STILL
-        // present on the server (no wipe on restart — the adversarial case).
-        let epoch_old = 100u64;
-        let high_c = 50u64;
-        server.register_blobs_gated(endpoint, &[(d, Stamp::new(epoch_old, high_c))]);
+        // (1) Old process holdings: register d@(epoch_old, c).
+        let epoch_old = 0x1111_2222_3333_4444u64; // a RANDOM-shaped boot_epoch
+        server.register_blobs_gated(endpoint, &[(d, Stamp::new(epoch_old, 7))]);
         assert!(
             server.has_digest(&d),
-            "scenario2 precondition: the old-epoch high-counter PRESENT must be \
-             registered"
+            "scenario2 precondition: old-process holdings must register d present"
         );
 
-        // Worker restarts: fresh boot_epoch (strictly greater), counter reset.
-        // It re-acquires d (register@(epoch_new,1)) then evicts it
-        // (evict@(epoch_new,1), same frozen value ts). Under the lexicographic
-        // comparator the fresh epoch dominates the stale high counter, so the
-        // register REFRESHES the stamp to (epoch_new,1) and the evict then wins
-        // the ABSENT≻PRESENT tie-break and REMOVES d.
-        let epoch_new = 101u64;
-        server.register_blobs_gated(endpoint, &[(d, Stamp::new(epoch_new, 1))]);
-        server.evict_blobs_gated(endpoint, &[(d, Stamp::new(epoch_new, 1))]);
-
+        // (2) Worker restart → the server's reconnect handler wipes the endpoint
+        // on boot_epoch change (the REAL restart-safety mechanism, NOT epoch
+        // dominance). Modelled by `remove_endpoint`, exactly what
+        // `worker_api_server.rs` calls.
+        server.remove_endpoint(endpoint);
         assert!(
             !server.has_digest(&d),
-            "scenario2: the restarted worker's fresh (epoch_new, c=1) delta did \
-             NOT take control of the digest — its evict could not beat the \
-             stale (epoch_old, high_c) stamp, so d is wedged PRESENT with a \
-             dead old-epoch stamp forever. The lexicographic (boot_epoch, \
-             counter) comparator must let a fresh epoch dominate any prior \
-             counter (a bare counter wedges here)."
+            "scenario2: the reconnect wipe (remove_endpoint on boot_epoch change) \
+             did NOT clear the endpoint's stale holdings — restart safety rests \
+             on this wipe (boot_epoch_id is random, so the stamp comparator \
+             gives NO cross-epoch ordering to fall back on). Without the wipe a \
+             stale entry survives the restart."
+        );
+
+        // (3) Fresh process re-registers into the wiped (empty) state. Its
+        // RANDOM new boot_epoch need not exceed the old one — the stored stamp
+        // was cleared, so the cross-epoch comparison is never reached.
+        let epoch_new = 0x0000_0001u64; // deliberately SMALLER than epoch_old
+        server.register_blobs_gated(endpoint, &[(d, Stamp::new(epoch_new, 1))]);
+        assert!(
+            server.has_digest(&d),
+            "scenario2: after the reconnect wipe, the fresh process's holdings \
+             (register into the now-empty entry) must re-converge d to PRESENT \
+             — even with a numerically SMALLER random boot_epoch, because the \
+             wipe cleared the stored stamp so no cross-epoch comparison occurs."
         );
     })
     .await

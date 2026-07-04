@@ -1608,6 +1608,13 @@ where
             }
             // Move back into moka cache. Under LRU there is no admission
             // filter to fight, so a bare insert is sufficient.
+            // (#locality-map-drift) Intentionally a bare `cache.insert` — NO
+            // `set_stamp`, NO `fire_on_insert_callbacks`. The value keeps its
+            // OWN frozen insert-stamp (assigned when it was first inserted before
+            // being pinned), which is LWW-correct: a later GENUINE eviction of
+            // this value will carry that stamp, and the holdings map already
+            // learned this digest is PRESENT at insert time (unpin does not
+            // change residency, so re-emitting a PRESENT delta is unnecessary).
             self.cache.insert(owned_key, entry.data);
         }
     }

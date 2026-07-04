@@ -3053,12 +3053,17 @@ impl WorkerConnection {
 
         let is_full_snapshot = notification.is_full_snapshot;
 
-        // (#locality-map-drift) Process evicted digests WITH their logical-LWW
-        // `(boot_epoch, counter)` stamp (each is now a `BlobDigestInfo`). The
-        // stamp is the EVICTED value's frozen ts; the gated apply below
-        // suppresses a re-ordered stale eviction of a re-admitted blob.
+        // (#locality-map-drift) Eviction list — SKEW-SAFE dual-field decode.
+        // Prefer the ts-carrying `evicted_blob_infos` (tag 24): apply it
+        // ts-GATED (the LWW suppresses a re-ordered stale eviction of a
+        // re-admitted blob). Fall back to the LEGACY `evicted_digests` (tag 4,
+        // bare Digest, no ts) — from an OLD worker that doesn't emit tag 24 —
+        // applied UNGATED, exactly as before the fix. A new worker DUAL-EMITS
+        // both; preferring the ts list means its evictions are gated. `digest`
+        // mis-decode / whole-message-abort is impossible because field 4 stays
+        // `repeated Digest` on both old and new schemas (no tag reuse).
         let evicted_stamped: Vec<(DigestInfo, Stamp)> = notification
-            .evicted_digests
+            .evicted_blob_infos
             .into_iter()
             .filter_map(|info| {
                 info.digest
@@ -3066,6 +3071,17 @@ impl WorkerConnection {
                     .map(|d| (d, Stamp::new(info.ts_boot_epoch, info.ts_counter)))
             })
             .collect();
+        // Legacy fallback (old worker): bare digests, applied ungated. Only
+        // used when the new ts list is empty.
+        let evicted_legacy: Vec<DigestInfo> = if evicted_stamped.is_empty() {
+            notification
+                .evicted_digests
+                .into_iter()
+                .filter_map(|d| DigestInfo::try_from(d).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Collect PRESENT digests WITH stamps from digest_infos (preferred).
         // (#locality-map-drift) `ts_boot_epoch`/`ts_counter` replaced the
@@ -3153,6 +3169,17 @@ impl WorkerConnection {
             // Delta evictions are ts-gated: a stale, re-ordered eviction of a
             // re-admitted blob is suppressed (the false-missing fix).
             map.evict_blobs_gated(endpoint, &evicted_stamped);
+        } else if !evicted_legacy.is_empty() {
+            debug!(
+                worker_id=?self.worker_id,
+                endpoint,
+                count=evicted_legacy.len(),
+                "Processing evicted digests from BlobsAvailable (legacy, ungated)"
+            );
+            // (#locality-map-drift) OLD-worker fallback: no ts on the wire, so
+            // apply ungated exactly as before the fix. (A new worker always
+            // populates `evicted_blob_infos`, so this branch is old-worker-only.)
+            map.evict_blobs(endpoint, &evicted_legacy);
         }
 
         // Register PRESENT holdings. Full snapshot → ungated `register_blobs_iter`

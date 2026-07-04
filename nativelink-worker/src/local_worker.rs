@@ -4016,7 +4016,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // replay-until-acked reader + the over-cap force-snapshot EVENT (above).
         // See [`apply_periodic_tick_memo_resets`].
         let _ = apply_periodic_tick_memo_resets(&state.last_sent_ac_pin_set, is_first);
-        let (digest_infos, evicted_digests, pinned_mirror_digests) = if is_first {
+        // (#locality-map-drift) `evicted_blob_infos` = the ts-carrying eviction
+        // list (BlobDigestInfo). Below we DUAL-EMIT: the legacy `evicted_digests`
+        // (bare Digest, no ts) is derived from it so an old server still reads
+        // the eviction, and a new server prefers `evicted_blob_infos`.
+        let (digest_infos, evicted_blob_infos, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
             // Drain any changes that accumulated during startup.
@@ -4125,7 +4129,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         };
 
         let new_or_touched_count = digest_infos.len();
-        let evicted_count = evicted_digests.len();
+        let evicted_count = evicted_blob_infos.len();
+        // (#locality-map-drift) DUAL-EMIT: derive the LEGACY `evicted_digests`
+        // (bare Digest, no ts) from the ts-carrying `evicted_blob_infos` so an
+        // OLD server (pre-tag-24) still reads the eviction from field 4. A NEW
+        // server prefers `evicted_blob_infos` (ts-gated). Same digests, same
+        // order — the two lists are the same eviction set.
+        let evicted_digests: Vec<_> = evicted_blob_infos
+            .iter()
+            .filter_map(|bdi| bdi.digest.clone())
+            .collect();
         let cached_dir_count = cached_directory_digests.len();
         let added_subtree_count = added_subtree_digests.len();
         let removed_subtree_count = removed_subtree_digests.len();
@@ -4239,6 +4252,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             digests: Vec::new(),
             is_full_snapshot: is_first,
             evicted_digests,
+            // (#locality-map-drift) DUAL-EMIT the ts-carrying eviction list.
+            evicted_blob_infos,
             digest_infos,
             cpu_load_pct: load,
             cached_directory_digests,
@@ -5626,6 +5641,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             digests: output_digests,
                                                             is_full_snapshot: false,
                                                             evicted_digests: Vec::new(),
+                                                            evicted_blob_infos: Vec::new(),
                                                             digest_infos: Vec::new(),
                                                             cpu_load_pct: load,
                                                             cached_directory_digests: Vec::new(),

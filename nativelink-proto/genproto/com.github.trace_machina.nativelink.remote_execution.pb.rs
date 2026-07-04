@@ -163,13 +163,21 @@ pub struct BlobsAvailableNotification {
     pub is_full_snapshot: bool,
     /// / Digests that have been evicted from the worker since the last update.
     /// / Only meaningful when is_full_snapshot == false.
-    /// / (#locality-map-drift) UPGRADED from `repeated Digest` to carry the
-    /// / eviction's logical LWW ts (the evicted value's FROZEN `(boot_epoch,
-    /// / counter)`), so the server can suppress a stale out-of-order eviction of
-    /// / a blob that has since been re-admitted. `digest` is required; the ts
-    /// / words are 0 for a legacy worker (treated as oldest → applied as before).
+    /// / (#locality-map-drift) LEGACY eviction list — stays `repeated Digest`, NO
+    /// / tag reuse: a `BlobDigestInfo`-shaped element decoded against
+    /// / `repeated Digest` mis-reads its nested-message bytes as a `string` and
+    /// / prost ABORTS THE WHOLE MESSAGE, dropping the co-resident `digest_infos`
+    /// / too — self-inflicted holdings loss for the duration of any non-atomic
+    /// / fleet deploy skew window. The ts-carrying eviction list is the NEW field
+    /// / `evicted_blob_infos` (tag 24). SKEW-SAFE BOTH WAYS: a new worker
+    /// / DUAL-EMITS this legacy list (no ts) AND `evicted_blob_infos` (with ts); a
+    /// / new server prefers `evicted_blob_infos` when present, else falls back to
+    /// / this (applied ungated, as before); an old server reads this + ignores the
+    /// / unknown tag 24; an old worker emits only this → new server falls back.
     #[prost(message, repeated, tag = "4")]
-    pub evicted_digests: ::prost::alloc::vec::Vec<BlobDigestInfo>,
+    pub evicted_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
     /// / Per-digest info with LRU timestamps. When present, the server should
     /// / prefer this over the plain `digests` field.
     #[prost(message, repeated, tag = "5")]
@@ -391,6 +399,17 @@ pub struct BlobsAvailableNotification {
     /// / disk pressure (pre-F4 / sampler stale → fail-open via the fallback).
     #[prost(bool, tag = "23")]
     pub disk_pressured: bool,
+    /// / (#locality-map-drift) Ts-carrying eviction list — the NEW skew-safe
+    /// / companion to the legacy `evicted_digests` (tag 4). Each element is a
+    /// / `BlobDigestInfo` (digest + `(ts_boot_epoch, ts_counter)` logical-LWW
+    /// / stamp = the EVICTED value's FROZEN counter). A new server ts-gates
+    /// / evictions from THIS field (suppressing a stale out-of-order eviction of a
+    /// / re-admitted blob); it falls back to `evicted_digests` (ungated) only when
+    /// / this is empty (old worker). A new worker DUAL-EMITS both. An old server
+    /// / ignores this unknown tag and reads `evicted_digests`. Only meaningful
+    /// / when is_full_snapshot == false (per legacy field-4 semantics).
+    #[prost(message, repeated, tag = "24")]
+    pub evicted_blob_infos: ::prost::alloc::vec::Vec<BlobDigestInfo>,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -737,10 +756,13 @@ pub struct BlobsAvailableChunk {
     /// / Per-chunk slice of `BlobsAvailableNotification.evicted_digests`.
     /// / May be empty on any chunk. Only meaningful when
     /// / `is_full_snapshot=false` (per legacy field 4 semantics).
-    /// / (#locality-map-drift) UPGRADED to `BlobDigestInfo` (matching field 4)
-    /// / so each evicted digest carries its frozen `(boot_epoch, counter)` ts.
+    /// / (#locality-map-drift) LEGACY — stays `repeated Digest` (NO tag reuse; see
+    /// / the notification's field-4 comment for the whole-message-decode-abort
+    /// / hazard). The ts-carrying per-chunk slice is `evicted_blob_infos` (tag 28).
     #[prost(message, repeated, tag = "13")]
-    pub evicted_digests: ::prost::alloc::vec::Vec<BlobDigestInfo>,
+    pub evicted_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
     /// / CPU load — only meaningful on chunk 0; subsequent chunks
     /// / leave at proto3 default 0.
     #[prost(uint32, tag = "14")]
@@ -811,6 +833,14 @@ pub struct BlobsAvailableChunk {
     /// / `BlobsAvailableNotification.disk_pressured` (field 23).
     #[prost(bool, tag = "27")]
     pub disk_pressured: bool,
+    /// / (#locality-map-drift) Per-chunk slice of
+    /// / `BlobsAvailableNotification.evicted_blob_infos` (tag 24) — the ts-carrying
+    /// / eviction list. `BlobDigestInfo` elements (digest + frozen logical-LWW
+    /// / stamp). May be empty on any chunk. The chunker DUAL-EMITS this alongside
+    /// / the legacy `evicted_digests` (tag 13). Only meaningful when
+    /// / `is_full_snapshot=false`.
+    #[prost(message, repeated, tag = "28")]
+    pub evicted_blob_infos: ::prost::alloc::vec::Vec<BlobDigestInfo>,
 }
 /// / A streaming-message envelope shared across the cas→worker, scheduler→
 /// / worker, and worker→scheduler chunk producers. Exactly ONE of the
