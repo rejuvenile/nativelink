@@ -579,9 +579,13 @@ struct PinExpireFailedWritesListener {
 }
 
 impl ItemCallback for PinExpireFailedWritesListener {
+    // (#locality-map-drift) `_ts_*` unused: this listener acts on pin-expiry,
+    // not eviction, and does no holdings tracking.
     fn callback<'a>(
         &'a self,
         _store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         // Eviction is unrelated to pin-expiry; nothing to do.
         Box::pin(core::future::ready(()))
@@ -749,9 +753,13 @@ struct SlowEvictionInvalidatesStableSetListener {
 }
 
 impl ItemCallback for SlowEvictionInvalidatesStableSetListener {
+    // (#locality-map-drift) `_ts_*` unused: this listener invalidates the
+    // stable-digest set on slow-tier eviction; it is not a holdings tracker.
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         if let StoreKey::Digest(digest) = store_key {
             // (1) Remove digest from `stable_digests` so the next BIS

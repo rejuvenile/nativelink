@@ -413,12 +413,17 @@ impl TrackingCallback {
 }
 
 impl ItemCallback<u64> for TrackingCallback {
-    fn callback(&self, _store_key: &u64) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn callback(
+        &self,
+        _store_key: &u64,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.removal_count.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {})
     }
 
-    fn on_insert(&self, _store_key: &u64, _size: u64) {
+    fn on_insert(&self, _store_key: &u64, _size: u64, _ts_boot_epoch: u64, _ts_counter: u64) {
         self.insert_count.fetch_add(1, Ordering::Relaxed);
     }
 }

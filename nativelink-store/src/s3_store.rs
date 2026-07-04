@@ -208,7 +208,9 @@ where
                                         let mut callbacks: FuturesUnordered<_> = item_callbacks
                                             .iter()
                                             .map(|callback| {
-                                                callback.callback(local_digest.borrow())
+                                                // (#locality-map-drift) S3-side lifecycle callbacks
+                                                // carry no logical LWW ts → (0, 0).
+                                                callback.callback(local_digest.borrow(), 0, 0)
                                             })
                                             .collect();
                                         while callbacks.next().await.is_some() {}

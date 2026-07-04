@@ -106,11 +106,13 @@ where
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        ts_boot_epoch: u64,
+        ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let cache = self.cache.upgrade();
         if let Some(local_cache) = cache {
             Box::pin(async move {
-                local_cache.callback(store_key).await;
+                local_cache.callback(store_key, ts_boot_epoch, ts_counter).await;
             })
         } else {
             debug!("Cache dropped, so not doing callback");
@@ -567,9 +569,13 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + Clone + 'static,
 {
+    // (#locality-map-drift) `_ts_*` unused: existence cache, not a holdings
+    // tracker.
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let digest = store_key.borrow().into_digest();
         Box::pin(async move {

@@ -266,7 +266,9 @@ where
                                             .map(|callback| {
                                                 let store_key = local_digest.borrow();
                                                 let cb = callback.clone();
-                                                async move { cb.callback(store_key).await }
+                                                // (#locality-map-drift) S3-side lifecycle callbacks
+                                                // carry no logical LWW ts → (0, 0).
+                                                async move { cb.callback(store_key, 0, 0).await }
                                             })
                                             .collect();
                                         while callbacks.next().await.is_some() {}

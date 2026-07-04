@@ -103,6 +103,47 @@ impl BuildHasher for DigestBuildHasher {
     }
 }
 
+/// (#locality-map-drift) A per-mutation logical LWW timestamp:
+/// `(boot_epoch, counter)`, compared LEXICOGRAPHICALLY (boot_epoch dominates).
+/// `boot_epoch` is the reporting worker's `boot_epoch_id`; `counter` is the
+/// per-map monotonic counter frozen into the blob's resident value at insert.
+/// A restarted worker's fresh boot_epoch outranks any stale counter from a
+/// prior process. `0/0` = unset/legacy (treated as the oldest possible stamp).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stamp {
+    pub boot_epoch: u64,
+    pub counter: u64,
+}
+
+impl Stamp {
+    #[inline]
+    #[must_use]
+    pub const fn new(boot_epoch: u64, counter: u64) -> Self {
+        Self {
+            boot_epoch,
+            counter,
+        }
+    }
+
+    /// Strict lexicographic `>` on `(boot_epoch, counter)`. `pub` so the worker
+    /// `BlobChangeTracker`'s local LWW applies the SAME comparison as the
+    /// server gate.
+    #[inline]
+    #[must_use]
+    pub fn gt(self, other: Self) -> bool {
+        self.boot_epoch > other.boot_epoch
+            || (self.boot_epoch == other.boot_epoch && self.counter > other.counter)
+    }
+
+    /// Lexicographic `==` (the equal-ts case for the ABSENT ≻ PRESENT
+    /// tie-break). `pub` for the worker-side LWW (see `gt`).
+    #[inline]
+    #[must_use]
+    pub fn eq_ts(self, other: Self) -> bool {
+        self.boot_epoch == other.boot_epoch && self.counter == other.counter
+    }
+}
+
 /// Compact per-digest endpoint list. With only ~10 workers, a Vec with linear
 /// scan is faster than HashMap due to:
 /// - No hashing overhead for Arc<str> keys
@@ -110,39 +151,91 @@ impl BuildHasher for DigestBuildHasher {
 /// - No bucket array overhead (HashMap has 50%+ empty slots)
 /// - Fewer allocations (one Vec vs HashMap's bucket array + entries)
 ///
-/// Per-entry timestamps were dropped: with TTL filtering removed, a
-/// "freshest worker" tiebreaker is theatre — any worker carrying the digest
-/// is equally good. Correctness now rests on the v2 lost-eviction invariant
-/// (workers eviction-broadcast before the next FindMissingBlobs can see a
-/// stale Some), which superseded the bytestream-side sync-confirm safety
-/// net deleted in task #155.
+/// (#locality-map-drift) Each PRESENT entry now carries the `(boot_epoch,
+/// counter)` logical-LWW `Stamp` at which that endpoint became present for
+/// this digest (frozen from the reporting worker's resident value). The
+/// worker-delta apply path (`register_blobs_gated`/`evict_blobs_gated`)
+/// LWW-gates against this stamp so an out-of-order STALE eviction of a
+/// re-admitted hot blob is suppressed. Only PRESENT endpoints are stored
+/// (evict removes the entry); the list is reclaimed to empty on
+/// `evict_blobs`-to-empty + `remove_endpoint` — bounded identically to today's
+/// `endpoint_blobs` index. Ungated `evict_blobs`/`register_blobs` (server
+/// self-heal + full-snapshot) mutate residency without consulting the stamp.
 #[derive(Debug, Clone, Default)]
 pub struct EndpointList {
-    entries: Vec<Arc<str>>,
+    // UNBOUNDED-OK: stamp lives inside each PRESENT entry (Arc<str>, Stamp);
+    // reclaimed on evict-to-empty (blobs.remove) + remove_endpoint, so it is
+    // bounded identically to the endpoint_blobs reverse index — no tombstones
+    // accumulate (a genuinely-evicted endpoint is REMOVED, not left ABSENT).
+    entries: Vec<(Arc<str>, Stamp)>,
 }
 
 impl EndpointList {
-    /// Insert an endpoint if not already present. Returns true if newly added.
+    /// Insert an endpoint if not already present, stamping it. Returns true if
+    /// newly added. Ungated (full-snapshot / legacy path): a present endpoint's
+    /// stamp is refreshed to `stamp` unconditionally.
     #[inline]
-    fn insert(&mut self, endpoint: &Arc<str>) -> bool {
-        for existing in &self.entries {
-            if Arc::ptr_eq(existing, endpoint) || **existing == **endpoint {
+    fn insert_stamped(&mut self, endpoint: &Arc<str>, stamp: Stamp) -> bool {
+        for existing in &mut self.entries {
+            if Arc::ptr_eq(&existing.0, endpoint) || *existing.0 == **endpoint {
+                existing.1 = stamp;
                 return false;
             }
         }
-        self.entries.push(endpoint.clone());
+        self.entries.push((endpoint.clone(), stamp));
         true
     }
 
-    /// Remove an endpoint. Returns true if it was present.
+    /// (#locality-map-drift) LWW-gated register: apply the PRESENT@`stamp` iff
+    /// it is strictly newer than the stored stamp for this endpoint (a later
+    /// value re-registers). If the endpoint is not present, add it (a fresh
+    /// PRESENT always applies — the map has no ABSENT tombstone to lose to, so
+    /// a resident blob can never wedge false-missing). Returns true if newly
+    /// added.
+    #[inline]
+    fn register_gated(&mut self, endpoint: &Arc<str>, stamp: Stamp) -> bool {
+        for existing in &mut self.entries {
+            if Arc::ptr_eq(&existing.0, endpoint) || *existing.0 == **endpoint {
+                if stamp.gt(existing.1) {
+                    existing.1 = stamp;
+                }
+                return false;
+            }
+        }
+        self.entries.push((endpoint.clone(), stamp));
+        true
+    }
+
+    /// Remove an endpoint (ungated: server self-heal / full-snapshot). Returns
+    /// true if it was present.
     #[inline]
     fn remove(&mut self, endpoint: &str) -> bool {
-        if let Some(pos) = self.entries.iter().position(|e| &**e == endpoint) {
+        if let Some(pos) = self.entries.iter().position(|(e, _)| &**e == endpoint) {
             self.entries.swap_remove(pos);
             true
         } else {
             false
         }
+    }
+
+    /// (#locality-map-drift) LWW-gated evict: remove the endpoint iff the
+    /// incoming ABSENT@`stamp` wins the LWW — apply iff `stamp > stored` OR
+    /// (`stamp == stored`), i.e. ABSENT ≻ PRESENT at equal ts (an evict-of-V is
+    /// always causally after insert-of-V, so a same-value evict removes a
+    /// genuinely-gone blob). A STRICTLY-OLDER evict (a stale, re-ordered
+    /// eviction of a superseded value) is SUPPRESSED — this is the
+    /// false-missing fix. Returns true if the endpoint was removed.
+    #[inline]
+    fn evict_gated(&mut self, endpoint: &str, stamp: Stamp) -> bool {
+        if let Some(pos) = self.entries.iter().position(|(e, _)| &**e == endpoint) {
+            let stored = self.entries[pos].1;
+            // ABSENT ≻ PRESENT at equal ts (tie-break), else strict-newer.
+            if stamp.gt(stored) || stamp.eq_ts(stored) {
+                self.entries.swap_remove(pos);
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -152,17 +245,17 @@ impl EndpointList {
 
     #[inline]
     pub fn keys(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.entries.iter()
+        self.entries.iter().map(|(e, _)| e)
     }
 
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.entries.iter()
+        self.entries.iter().map(|(e, _)| e)
     }
 
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.entries.iter().any(|e| &**e == key)
+        self.entries.iter().any(|(e, _)| &**e == key)
     }
 
     #[inline]
@@ -173,17 +266,20 @@ impl EndpointList {
     /// Returns true if the given endpoint is in the list.
     #[inline]
     pub fn get(&self, key: &str) -> Option<&Arc<str>> {
-        self.entries.iter().find(|e| &***e == key)
+        self.entries.iter().find(|(e, _)| &**e == key).map(|(e, _)| e)
     }
 }
 
 impl<'a> IntoIterator for &'a EndpointList {
     type Item = &'a Arc<str>;
-    type IntoIter = std::slice::Iter<'a, Arc<str>>;
+    type IntoIter = core::iter::Map<
+        std::slice::Iter<'a, (Arc<str>, Stamp)>,
+        fn(&'a (Arc<str>, Stamp)) -> &'a Arc<str>,
+    >;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter()
+        self.entries.iter().map(|(e, _)| e)
     }
 }
 
@@ -257,10 +353,40 @@ impl BlobLocalityMap {
         for digest in digests {
             digest_set.insert(digest);
             let entry = self.blobs.entry(digest).or_default();
-            entry.insert(&ep);
+            // (#locality-map-drift) Ungated register: this path is the
+            // FULL-SNAPSHOT / reload / test register (post-`remove_endpoint`
+            // wipe on reconnect, so there is no stored stamp to gate against).
+            // Default `Stamp` (0,0); the first real ts-carrying delta refreshes
+            // it. The DELTA apply path uses `register_blobs_gated`.
+            entry.insert_stamped(&ep, Stamp::default());
             if debug_digest_match(&digest) {
                 let endpoints: Vec<String> = entry.iter().map(|s| s.as_ref().to_string()).collect();
                 info!(?digest, %ep, after_endpoints = ?endpoints, "DEBUG: locality_map register_blobs_iter for wedge digest");
+            }
+        }
+    }
+
+    /// (#locality-map-drift) LWW-gated register for the WORKER-DELTA apply path
+    /// (`worker_api_server.rs` `handle_blobs_available`). Each `(digest, stamp)`
+    /// carries the reporting worker's frozen `(boot_epoch, counter)`. A PRESENT
+    /// entry is refreshed only by a strictly-newer stamp; a fresh PRESENT (no
+    /// stored entry) always applies. Bounded identically to `register_blobs`.
+    pub fn register_blobs_gated(&mut self, endpoint: &str, digests: &[(DigestInfo, Stamp)]) {
+        if digests.is_empty() {
+            return;
+        }
+        let ep: Arc<str> = endpoint.into();
+        let digest_set = self
+            .endpoint_blobs
+            .entry(ep.clone())
+            .or_insert_with(|| HashSet::with_hasher(DigestBuildHasher));
+        for &(digest, stamp) in digests {
+            digest_set.insert(digest);
+            let entry = self.blobs.entry(digest).or_default();
+            entry.register_gated(&ep, stamp);
+            if debug_digest_match(&digest) {
+                let endpoints: Vec<String> = entry.iter().map(|s| s.as_ref().to_string()).collect();
+                info!(?digest, %ep, ?stamp, after_endpoints = ?endpoints, "DEBUG: locality_map register_blobs_gated for wedge digest");
             }
         }
     }
@@ -290,6 +416,41 @@ impl BlobLocalityMap {
             if digest_set.is_empty() {
                 self.endpoint_blobs.remove(endpoint);
             }
+        }
+    }
+
+    /// (#locality-map-drift) LWW-gated evict for the WORKER-DELTA apply path.
+    /// Each `(digest, stamp)` carries the EVICTED value's frozen `(boot_epoch,
+    /// counter)`. The endpoint is removed for the digest iff the incoming
+    /// ABSENT wins the LWW (`stamp > stored` OR `stamp == stored`, i.e.
+    /// ABSENT ≻ PRESENT at equal ts). A STRICTLY-OLDER (stale, re-ordered)
+    /// eviction of a value that has since been re-admitted is SUPPRESSED — the
+    /// held blob stays PRESENT (the false-missing fix). If the endpoint wasn't
+    /// present the evict is a no-op. Reverse-index + reclaim semantics mirror
+    /// the ungated `evict_blobs`.
+    pub fn evict_blobs_gated(&mut self, endpoint: &str, digests: &[(DigestInfo, Stamp)]) {
+        let Some(digest_set) = self.endpoint_blobs.get_mut(endpoint) else {
+            return;
+        };
+        for &(digest, stamp) in digests {
+            if let Some(endpoints) = self.blobs.get_mut(&digest) {
+                let removed = endpoints.evict_gated(endpoint, stamp);
+                if debug_digest_match(&digest) {
+                    info!(?digest, %endpoint, ?stamp, removed, remaining = endpoints.len(), "DEBUG: locality_map evict_blobs_gated for wedge digest");
+                }
+                if removed {
+                    // Only drop from the reverse index when the LWW actually
+                    // removed the endpoint — a suppressed stale evict must NOT
+                    // desync the reverse index from the forward map.
+                    digest_set.remove(&digest);
+                    if endpoints.is_empty() {
+                        self.blobs.remove(&digest);
+                    }
+                }
+            }
+        }
+        if digest_set.is_empty() {
+            self.endpoint_blobs.remove(endpoint);
         }
     }
 

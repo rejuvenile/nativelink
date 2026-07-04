@@ -35,21 +35,28 @@ impl<'a, Q> evicting_map::ItemCallback<Q> for ItemCallbackHolder
 where
     Q: Borrow<StoreKey<'a>>,
 {
-    fn callback(&self, store_key: &Q) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn callback(
+        &self,
+        store_key: &Q,
+        ts_boot_epoch: u64,
+        ts_counter: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let callback = self.callback.clone();
         let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
         let store_key = store_key.borrow().into_owned();
-        Box::pin(async move { callback.callback(store_key).await })
+        Box::pin(async move { callback.callback(store_key, ts_boot_epoch, ts_counter).await })
     }
 
-    fn on_insert(&self, store_key: &Q, size: u64) {
+    fn on_insert(&self, store_key: &Q, size: u64, ts_boot_epoch: u64, ts_counter: u64) {
         let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
-        self.callback.on_insert(store_key.borrow().into_owned(), size);
+        self.callback
+            .on_insert(store_key.borrow().into_owned(), size, ts_boot_epoch, ts_counter);
     }
 
-    fn on_get(&self, store_key: &Q) {
+    fn on_get(&self, store_key: &Q, ts_boot_epoch: u64, ts_counter: u64) {
         let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
-        self.callback.on_get(store_key.borrow().into_owned());
+        self.callback
+            .on_get(store_key.borrow().into_owned(), ts_boot_epoch, ts_counter);
     }
 
     fn on_pin_expired(&self, store_key: &Q, size: u64) {

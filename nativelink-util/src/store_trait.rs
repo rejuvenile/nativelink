@@ -1894,14 +1894,31 @@ pub trait StoreDriver:
 }
 
 // Callback invoked when a store inserts or deletes an item.
+//
+// (#locality-map-drift) `callback`/`on_insert`/`on_get` carry a per-mutation
+// logical LWW timestamp `(ts_boot_epoch, ts_counter)` sourced by the
+// underlying `MokaEvictingMap`: `on_insert`/`on_get` get a fresh counter,
+// `callback` (eviction) gets the EVICTED value's frozen counter (never a fresh
+// mint). The single consumer is `BlobChangeTracker` (worker holdings); the six
+// non-holdings impls (existence-cache ×2, ontap-s3 ×2, fast-slow ×2) take the
+// ts as a no-op (`_ts_*`).
 pub trait ItemCallback: Debug + Send + Sync {
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        ts_boot_epoch: u64,
+        ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     /// Called synchronously when a new item is inserted.
-    fn on_insert(&self, _store_key: StoreKey<'_>, _size: u64) {}
+    fn on_insert(
+        &self,
+        _store_key: StoreKey<'_>,
+        _size: u64,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
+    ) {
+    }
 
     /// Fired when a key is read (cache hit) via the public `get` /
     /// `get_many` paths. Intentionally NOT fired from `sizes_for_keys`
@@ -1909,7 +1926,7 @@ pub trait ItemCallback: Debug + Send + Sync {
     /// capture replaced values inside `insert_inner`. Use this to track
     /// recent read activity per digest (worker-side LRU heat signal that
     /// flows back to the server's locality_map via BlobsAvailable).
-    fn on_get(&self, _store_key: StoreKey<'_>) {}
+    fn on_get(&self, _store_key: StoreKey<'_>, _ts_boot_epoch: u64, _ts_counter: u64) {}
 
     /// Fired when a pin auto-expires after `PIN_TIMEOUT_SECS` without
     /// being explicitly unpinned. Distinct from `callback` (eviction):

@@ -46,7 +46,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
 use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
 use nativelink_util::blob_locality_map::{
-    PersistedEndpoint, PersistedLocalityMap, ReloadedLocalitySummary, SharedBlobLocalityMap,
+    PersistedEndpoint, PersistedLocalityMap, ReloadedLocalitySummary, SharedBlobLocalityMap, Stamp,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_scheduler::worker::{MAX_PLAUSIBLE_CORES, Worker};
@@ -3053,29 +3053,44 @@ impl WorkerConnection {
 
         let is_full_snapshot = notification.is_full_snapshot;
 
-        // Process evicted digests (incremental updates report evictions here).
-        let evicted: Vec<DigestInfo> = notification
+        // (#locality-map-drift) Process evicted digests WITH their logical-LWW
+        // `(boot_epoch, counter)` stamp (each is now a `BlobDigestInfo`). The
+        // stamp is the EVICTED value's frozen ts; the gated apply below
+        // suppresses a re-ordered stale eviction of a re-admitted blob.
+        let evicted_stamped: Vec<(DigestInfo, Stamp)> = notification
             .evicted_digests
             .into_iter()
-            .filter_map(|d| d.try_into().ok())
+            .filter_map(|info| {
+                info.digest
+                    .and_then(|d| DigestInfo::try_from(d).ok())
+                    .map(|d| (d, Stamp::new(info.ts_boot_epoch, info.ts_counter)))
+            })
             .collect();
 
-        // Collect digests from digest_infos (preferred) and legacy digests.
-        // The proto used to carry per-blob last_access_timestamp; that field
-        // is now reserved (see worker_api.proto) — locality entries persist
-        // until an explicit eviction signal, so timestamps are no longer
-        // needed for filtering.
-        let mut digests: Vec<DigestInfo> = notification
+        // Collect PRESENT digests WITH stamps from digest_infos (preferred).
+        // (#locality-map-drift) `ts_boot_epoch`/`ts_counter` replaced the
+        // retired `last_access_timestamp` wall-time LRU stamp with a logical
+        // LWW clock (worker_api.proto). Legacy field-2 `digests` (old workers)
+        // carry no stamp → (0,0), treated as oldest.
+        let digests_stamped: Vec<(DigestInfo, Stamp)> = notification
             .digest_infos
             .into_iter()
-            .filter_map(|info| info.digest.and_then(|d| DigestInfo::try_from(d).ok()))
+            .filter_map(|info| {
+                info.digest
+                    .and_then(|d| DigestInfo::try_from(d).ok())
+                    .map(|d| (d, Stamp::new(info.ts_boot_epoch, info.ts_counter)))
+            })
+            .chain(
+                notification
+                    .digests
+                    .into_iter()
+                    .filter_map(|d| DigestInfo::try_from(d).ok())
+                    .map(|d| (d, Stamp::default())),
+            )
             .collect();
-        digests.extend(
-            notification
-                .digests
-                .into_iter()
-                .filter_map(|d| DigestInfo::try_from(d).ok()),
-        );
+        // Flat digest list (no stamps) for the downstream backfill / mirror-pull
+        // scheduling, which only needs the digest identity.
+        let digests: Vec<DigestInfo> = digests_stamped.iter().map(|(d, _)| *d).collect();
 
         // Pinned mirror digests: blobs the worker is holding *only* in
         // memory because the server pushed them as a mirror. The worker is
@@ -3116,32 +3131,42 @@ impl WorkerConnection {
         // evicted it.
         let mut map = locality_map.write();
 
+        // (#locality-map-drift) The ts-gate (LWW by `(boot_epoch, counter)`)
+        // applies ONLY to the WORKER-DELTA apply path here. The full-snapshot
+        // register is UNGATED (it runs after `remove_endpoint`, so there is no
+        // stored stamp to gate against). The server self-heal `evict_blobs`
+        // (`worker_proxy_store.rs` peer-fetch-NotFound repair) is ALSO ungated
+        // — it is server-originated ground truth, not a reorderable worker
+        // delta, and must never be blocked by a poison/stale ts.
         if is_full_snapshot {
             // Remove all existing entries for this endpoint first.
             map.remove_endpoint(endpoint);
         }
 
-        if !evicted.is_empty() {
+        if !evicted_stamped.is_empty() {
             debug!(
                 worker_id=?self.worker_id,
                 endpoint,
-                count=evicted.len(),
-                "Processing evicted digests from BlobsAvailable"
+                count=evicted_stamped.len(),
+                "Processing evicted digests from BlobsAvailable (ts-gated)"
             );
-            map.evict_blobs(endpoint, &evicted);
+            // Delta evictions are ts-gated: a stale, re-ordered eviction of a
+            // re-admitted blob is suppressed (the false-missing fix).
+            map.evict_blobs_gated(endpoint, &evicted_stamped);
         }
 
-        // Collapse generic + pinned-mirror + field-16-pinned-mirror-entries
-        // registrations into a single `register_blobs_iter` call so we
-        // allocate the endpoint `Arc<str>` once per tick instead of three
-        // times (10 workers × 100ms = ~300 alloc/sec saved). The iterator
-        // form chains all slices without building an intermediate `Vec`.
-        // Pinned-mirror digests still take a SEPARATE mirror-pull code
-        // path below — combining the locality registration does not
-        // merge their backfill scheduling. Field-16 entries are also
-        // ack'd via `broadcast_pinned_mirror_ack` AFTER `drop(map)` to
-        // preserve the "register BEFORE ack" invariant (#168 A2 fold).
-        if !digests.is_empty() || !pinned_mirror.is_empty() || !pinned_mirror_field16_digests.is_empty() {
+        // Register PRESENT holdings. Full snapshot → ungated `register_blobs_iter`
+        // (post-wipe residency enumeration). Delta → ts-gated
+        // `register_blobs_gated` (a later value's PRESENT refreshes the stored
+        // stamp; a stale one loses). Mirror digests (pinned_mirror + field-16)
+        // carry no logical clock — they ride stamp (0,0): a mirror-removal@0
+        // evicts a pure-mirror entry via the equal-ts tie-break but is correctly
+        // suppressed for a digest the FS store still holds@(be,c). Field-16
+        // entries are ack'd via `broadcast_pinned_mirror_ack` AFTER `drop(map)`
+        // to preserve the "register BEFORE ack" invariant (#168 A2 fold).
+        let any_to_register =
+            !digests.is_empty() || !pinned_mirror.is_empty() || !pinned_mirror_field16_digests.is_empty();
+        if any_to_register {
             debug!(
                 worker_id=?self.worker_id,
                 endpoint,
@@ -3151,14 +3176,31 @@ impl WorkerConnection {
                 is_full_snapshot,
                 "Registering blobs available from worker"
             );
-            map.register_blobs_iter(
-                endpoint,
-                digests
-                    .iter()
-                    .copied()
-                    .chain(pinned_mirror.iter().copied())
-                    .chain(pinned_mirror_field16_digests.iter().copied()),
-            );
+            if is_full_snapshot {
+                // Ungated full-snapshot residency (stamp (0,0); the first real
+                // delta refreshes each entry).
+                map.register_blobs_iter(
+                    endpoint,
+                    digests
+                        .iter()
+                        .copied()
+                        .chain(pinned_mirror.iter().copied())
+                        .chain(pinned_mirror_field16_digests.iter().copied()),
+                );
+            } else {
+                // ts-gated delta register: FS holdings carry their real stamps;
+                // mirror digests ride (0,0).
+                map.register_blobs_gated(endpoint, &digests_stamped);
+                if !pinned_mirror.is_empty() || !pinned_mirror_field16_digests.is_empty() {
+                    let mirror_stamped: Vec<(DigestInfo, Stamp)> = pinned_mirror
+                        .iter()
+                        .copied()
+                        .chain(pinned_mirror_field16_digests.iter().copied())
+                        .map(|d| (d, Stamp::default()))
+                        .collect();
+                    map.register_blobs_gated(endpoint, &mirror_stamped);
+                }
+            }
         }
 
         // Mirror-pull pipeline: any digest the worker is holding pinned in

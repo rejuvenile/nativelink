@@ -1539,7 +1539,9 @@ where
                         let cb = Arc::clone(cb);
                         let key_for_cb = store_key.borrow().into_owned();
                         inflight.spawn(async move {
-                            cb.callback(key_for_cb).await;
+                            // (#locality-map-drift) Redis keyspace-notification
+                            // callbacks carry no logical LWW ts → (0, 0).
+                            cb.callback(key_for_cb, 0, 0).await;
                         });
                     }
                 }

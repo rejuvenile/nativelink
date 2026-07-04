@@ -115,9 +115,13 @@ pub struct ConnectWorkerRequest {
     pub e_core_count: u32,
 }
 /// / Per-digest info reported by workers in BlobsAvailableNotification.
-/// / The previous `last_access_timestamp` field has been retired now that the
-/// / scheduler trusts the locality map until explicit eviction; the tag is
-/// / reserved so old workers stay wire-compatible.
+/// / The previous `last_access_timestamp` field (retired tag 2) was a WALL-TIME
+/// / LRU stamp used for a "freshest worker" tiebreaker; it was removed once
+/// / lookups stopped age-filtering. `ts_boot_epoch`/`ts_counter` below are NOT
+/// / that: they are a per-mutation LOGICAL LWW clock — the `(boot_epoch,
+/// / counter)` frozen into the blob's resident value AT INSERT — so the server
+/// / can suppress an out-of-order stale eviction of a re-admitted hot blob
+/// / (#locality-map-drift). Compared lexicographically (`boot_epoch` dominates).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlobDigestInfo {
     /// / The digest of the blob.
@@ -125,6 +129,20 @@ pub struct BlobDigestInfo {
     pub digest: ::core::option::Option<
         super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
     >,
+    /// / (#locality-map-drift) High word of the logical LWW timestamp: the
+    /// / worker's `boot_epoch_id` (worker_utils.rs). A restarted worker's fresh
+    /// / boot_epoch dominates any stale counter from a prior process, so its
+    /// / correct low-counter holdings re-register instead of wedging ABSENT.
+    /// / 0 = a legacy worker that does not stamp (server treats as oldest).
+    #[prost(uint64, tag = "3")]
+    pub ts_boot_epoch: u64,
+    /// / (#locality-map-drift) Low word of the logical LWW timestamp: a per-map
+    /// / monotonic counter frozen into the resident value at insert. Distinct
+    /// / values get distinct counters; an eviction carries the EVICTED value's
+    /// / frozen counter (never a fresh mint), so ts_evict(V) < ts_reinsert
+    /// / always. 0 = legacy/unset (oldest).
+    #[prost(uint64, tag = "4")]
+    pub ts_counter: u64,
 }
 /// / Notification that blobs are available on a worker for peer serving.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -145,10 +163,13 @@ pub struct BlobsAvailableNotification {
     pub is_full_snapshot: bool,
     /// / Digests that have been evicted from the worker since the last update.
     /// / Only meaningful when is_full_snapshot == false.
+    /// / (#locality-map-drift) UPGRADED from `repeated Digest` to carry the
+    /// / eviction's logical LWW ts (the evicted value's FROZEN `(boot_epoch,
+    /// / counter)`), so the server can suppress a stale out-of-order eviction of
+    /// / a blob that has since been re-admitted. `digest` is required; the ts
+    /// / words are 0 for a legacy worker (treated as oldest → applied as before).
     #[prost(message, repeated, tag = "4")]
-    pub evicted_digests: ::prost::alloc::vec::Vec<
-        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
-    >,
+    pub evicted_digests: ::prost::alloc::vec::Vec<BlobDigestInfo>,
     /// / Per-digest info with LRU timestamps. When present, the server should
     /// / prefer this over the plain `digests` field.
     #[prost(message, repeated, tag = "5")]
@@ -716,10 +737,10 @@ pub struct BlobsAvailableChunk {
     /// / Per-chunk slice of `BlobsAvailableNotification.evicted_digests`.
     /// / May be empty on any chunk. Only meaningful when
     /// / `is_full_snapshot=false` (per legacy field 4 semantics).
+    /// / (#locality-map-drift) UPGRADED to `BlobDigestInfo` (matching field 4)
+    /// / so each evicted digest carries its frozen `(boot_epoch, counter)` ts.
     #[prost(message, repeated, tag = "13")]
-    pub evicted_digests: ::prost::alloc::vec::Vec<
-        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
-    >,
+    pub evicted_digests: ::prost::alloc::vec::Vec<BlobDigestInfo>,
     /// / CPU load — only meaningful on chunk 0; subsequent chunks
     /// / leave at proto3 default 0.
     #[prost(uint32, tag = "14")]
@@ -1025,14 +1046,40 @@ pub mod update_for_worker {
         /// / `?`-propagating). NO capability flag is required.
         #[prost(message, tag = "13")]
         AcPinResync(super::AcPinResyncRequest),
-        /// / (FL-688 v3 Stage C) Signals the worker that the server has processed
-        /// / its first full BlobsAvailable snapshot and has sent all necessary
-        /// / UploadMissingBlobs requests (or needs nothing). See
-        /// / `UpdateForWorker.reconcile_complete` for full semantics.
+        /// / (FL-688 v3 Stage C) Signals the worker that the server has
+        /// / processed its first full BlobsAvailable snapshot and has sent all
+        /// / necessary UploadMissingBlobs requests (or needs nothing). The
+        /// / worker MUST NOT begin evicting blobs from its FilesystemStore
+        /// / (`reconcile_complete` gate) and MUST NOT admit new actions
+        /// / (`StartAction` executor gate) until this message is received.
+        /// /
+        /// / Sent UNCONDITIONALLY on the first full snapshot, even when the
+        /// / server needs NO blobs from this worker (which would otherwise
+        /// / cause the `:3096` early-return to suppress any reply and wedge a
+        /// / boot-over-cap worker on the eviction gate forever — MINOR-first-
+        /// / connect from v3 design).
+        /// /
+        /// / Backward compatibility: workers built before this variant treat
+        /// / the unknown oneof tag as ignorable (the `None`/catch-all in
+        /// / `local_worker.rs`'s `Update` match `continue`s). A server that
+        /// / does NOT send this message leaves new workers gated at startup.
+        /// / WARNING: an old server (pre-v3) WILL send `StartAction` to gated
+        /// / workers; the worker NAKs with Code::ResourceExhausted (backpressure-
+        /// / exempt) and the gate is released after 2 × DRAIN_INTERVAL_SECS
+        /// / (20s) by the bounded fail-open timer in `local_worker.rs`
+        /// / (MAJOR-2 fix). NO capability flag required.
         #[prost(message, tag = "14")]
         ReconcileComplete(super::ReconcileCompleteRequest),
     }
 }
+/// / (FL-688 v3 Stage C) Signals the worker that reconcile is complete.
+/// / Carries no payload: the affected worker is implicit (the message is
+/// / sent over its own server→worker `UpdateForWorker` stream), and the
+/// / signal itself is the payload — "I have now sent all needed
+/// / UploadMissingBlobs requests (possibly zero)." See
+/// / `UpdateForWorker.reconcile_complete` for full semantics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReconcileCompleteRequest {}
 /// / (FL-688 v3 Stage A fix) Force-re-snapshot signal for the worker's
 /// / AC-pin set. Carries no payload: the affected endpoint is implicit (it
 /// / is the worker this message is routed to over its own server→worker
@@ -1041,11 +1088,6 @@ pub mod update_for_worker {
 /// / list would be dead precision. See `UpdateForWorker.ac_pin_resync`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AcPinResyncRequest {}
-/// / (FL-688 v3 Stage C) Signals the worker that reconcile is complete.
-/// / Carries no payload. See `UpdateForWorker.reconcile_complete` for full
-/// / semantics.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReconcileCompleteRequest {}
 /// / (FL-688 v3 §3.8) Acknowledgement of one `BlobsAvailableChunk` the
 /// / worker sent the scheduler. Symmetric to `BisAck` but in the
 /// / worker→server delta direction: the SERVER sends this after it has

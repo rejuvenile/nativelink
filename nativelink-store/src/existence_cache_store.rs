@@ -198,9 +198,13 @@ impl ExistenceCacheStore<SystemTime> {
 }
 
 impl<I: InstantWrapper> ItemCallback for ExistenceCacheStore<I> {
+    // (#locality-map-drift) `_ts_*` unused: the existence cache is not a
+    // holdings tracker; it only invalidates a cached-existence entry on evict.
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let digest = store_key.borrow().into_digest();
         debug!(%digest, "ExistenceCacheStore: eviction callback received");
@@ -231,6 +235,8 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheCallback<I> {
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        ts_boot_epoch: u64,
+        ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let cache = self.cache.upgrade();
         if let Some(local_cache) = cache {
@@ -240,7 +246,7 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheCallback<I> {
             // eviction callback cannot create a stale positive.
             let store_key = store_key.into_owned();
             return Box::pin(async move {
-                local_cache.callback(store_key).await;
+                local_cache.callback(store_key, ts_boot_epoch, ts_counter).await;
             });
         } else {
             debug!("ExistenceCacheStore: eviction callback skipped (cache dropped)");

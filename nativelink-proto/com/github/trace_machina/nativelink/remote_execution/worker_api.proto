@@ -152,14 +152,30 @@ message ConnectWorkerRequest {
 }
 
 /// Per-digest info reported by workers in BlobsAvailableNotification.
-/// The previous `last_access_timestamp` field has been retired now that the
-/// scheduler trusts the locality map until explicit eviction; the tag is
-/// reserved so old workers stay wire-compatible.
+/// The previous `last_access_timestamp` field (retired tag 2) was a WALL-TIME
+/// LRU stamp used for a "freshest worker" tiebreaker; it was removed once
+/// lookups stopped age-filtering. `ts_boot_epoch`/`ts_counter` below are NOT
+/// that: they are a per-mutation LOGICAL LWW clock — the `(boot_epoch,
+/// counter)` frozen into the blob's resident value AT INSERT — so the server
+/// can suppress an out-of-order stale eviction of a re-admitted hot blob
+/// (#locality-map-drift). Compared lexicographically (`boot_epoch` dominates).
 message BlobDigestInfo {
     /// The digest of the blob.
     build.bazel.remote.execution.v2.Digest digest = 1;
     reserved 2;
     reserved "last_access_timestamp";
+    /// (#locality-map-drift) High word of the logical LWW timestamp: the
+    /// worker's `boot_epoch_id` (worker_utils.rs). A restarted worker's fresh
+    /// boot_epoch dominates any stale counter from a prior process, so its
+    /// correct low-counter holdings re-register instead of wedging ABSENT.
+    /// 0 = a legacy worker that does not stamp (server treats as oldest).
+    uint64 ts_boot_epoch = 3;
+    /// (#locality-map-drift) Low word of the logical LWW timestamp: a per-map
+    /// monotonic counter frozen into the resident value at insert. Distinct
+    /// values get distinct counters; an eviction carries the EVICTED value's
+    /// frozen counter (never a fresh mint), so ts_evict(V) < ts_reinsert
+    /// always. 0 = legacy/unset (oldest).
+    uint64 ts_counter = 4;
 }
 
 /// Notification that blobs are available on a worker for peer serving.
@@ -175,7 +191,12 @@ message BlobsAvailableNotification {
     bool is_full_snapshot = 3;
     /// Digests that have been evicted from the worker since the last update.
     /// Only meaningful when is_full_snapshot == false.
-    repeated build.bazel.remote.execution.v2.Digest evicted_digests = 4;
+    /// (#locality-map-drift) UPGRADED from `repeated Digest` to carry the
+    /// eviction's logical LWW ts (the evicted value's FROZEN `(boot_epoch,
+    /// counter)`), so the server can suppress a stale out-of-order eviction of
+    /// a blob that has since been re-admitted. `digest` is required; the ts
+    /// words are 0 for a legacy worker (treated as oldest → applied as before).
+    repeated BlobDigestInfo evicted_digests = 4;
     /// Per-digest info with LRU timestamps. When present, the server should
     /// prefer this over the plain `digests` field.
     repeated BlobDigestInfo digest_infos = 5;
@@ -676,7 +697,9 @@ message BlobsAvailableChunk {
     /// Per-chunk slice of `BlobsAvailableNotification.evicted_digests`.
     /// May be empty on any chunk. Only meaningful when
     /// `is_full_snapshot=false` (per legacy field 4 semantics).
-    repeated build.bazel.remote.execution.v2.Digest evicted_digests = 13;
+    /// (#locality-map-drift) UPGRADED to `BlobDigestInfo` (matching field 4)
+    /// so each evicted digest carries its frozen `(boot_epoch, counter)` ts.
+    repeated BlobDigestInfo evicted_digests = 13;
 
     /// CPU load — only meaningful on chunk 0; subsequent chunks
     /// leave at proto3 default 0.

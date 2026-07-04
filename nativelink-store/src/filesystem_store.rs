@@ -1245,6 +1245,15 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.reconcile_complete_flag()
     }
 
+    /// (#locality-map-drift) Stamp the eviction map's logical-LWW boot-epoch
+    /// (HIGH word of every holdings stamp). The worker calls this at boot with
+    /// `boot_epoch_id()` — BEFORE any insert — so a restarted worker's fresh
+    /// epoch dominates stale server locality state. `nativelink-store` cannot
+    /// call the worker's `boot_epoch_id()` directly, hence this setter.
+    pub fn set_map_boot_epoch(&self, boot_epoch: u64) {
+        self.evicting_map.set_boot_epoch(boot_epoch);
+    }
+
     /// Test hook: drive the pin-expiry sweep deterministically. The
     /// production background loop in `start_background_eviction` calls
     /// this once per 10s tick. Integration tests for the auto-unpin →

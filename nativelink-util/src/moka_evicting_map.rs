@@ -100,6 +100,13 @@ struct PinnedEntry<T> {
 struct EvictionEvent<K, T> {
     key: Arc<K>,
     value: T,
+    /// (#locality-map-drift) The EVICTED value's FROZEN logical-LWW counter,
+    /// read off `value.stamp()` at the moment of eviction — NOT a fresh mint.
+    /// Carried to the removal `callback` so the holdings eviction delta reports
+    /// the counter the evicted value was inserted with; this is what guarantees
+    /// `ts_evict(V) < ts_reinsert` even when the async callback is delivered
+    /// out of order relative to a re-insert.
+    ts_counter: u64,
 }
 
 /// Result of [`MokaEvictingMap::evict_unpinned_lru_bytes`].
@@ -230,6 +237,33 @@ pub struct MokaEvictingMap<
     /// which protects individual blobs from PER-INSERT moka eviction that
     /// this gate cannot block.
     reconcile_complete: Arc<AtomicBool>,
+    /// (#locality-map-drift) Per-map monotonic logical clock. `fetch_add`-ed
+    /// once per insert and FROZEN into the inserted value (`set_stamp`) so the
+    /// counter travels with the value through moka's cache slot. A distinct
+    /// value therefore gets a distinct, strictly-increasing counter; an
+    /// eviction reads the evicted value's frozen counter (not a fresh tick), so
+    /// `ts_evict(V) < ts_reinsert` holds under reordered async callback
+    /// delivery. Only meaningful for the worker `FilesystemStore` map (whose
+    /// `BlobChangeTracker` consumes it); other maps tick it harmlessly and
+    /// their callbacks ignore it. `Relaxed` is sufficient: uniqueness +
+    /// monotonicity of the returned value is all the LWW needs (the value↔
+    /// counter binding is established by `set_stamp` before `cache.insert`).
+    clock: AtomicU64,
+    /// (#locality-map-drift) This worker process's `boot_epoch_id`
+    /// (`worker_utils.rs`), the HIGH word of the logical LWW ts. A restarted
+    /// worker's fresh boot_epoch dominates any stale counter from a prior
+    /// process (lexicographic `(boot_epoch, counter)`), so its correct
+    /// low-counter holdings re-register instead of wedging ABSENT. `0` for maps
+    /// that don't participate (server-side stores).
+    ///
+    /// `AtomicU64` (not a plain `u64`) so the worker can stamp it via
+    /// [`Self::set_boot_epoch`] AFTER construction — `FilesystemStore::new`
+    /// runs in `nativelink-store`, which cannot call the worker's
+    /// `boot_epoch_id()`; the worker sets it at boot, before any insert, in the
+    /// same spot it arms `set_startup_reconcile_gate`. `Relaxed` throughout:
+    /// set-once before the first insert on the single-threaded boot path, so no
+    /// ordering against the reads is needed.
+    boot_epoch: AtomicU64,
     // Metrics
     evicted_bytes: Counter,
     evicted_items: CounterWithTime,
@@ -443,7 +477,22 @@ where
         // Default the indefinite-pin cap to `pin_cap` (25% of max_bytes):
         // indefinite pins are a subset of all pins and can never exceed
         // the total pin budget. `0` is interpreted below as "use pin_cap".
-        Self::with_anchor_and_indefinite_cap(config, anchor_time, 0)
+        // boot_epoch 0: default (no holdings LWW participation).
+        Self::with_anchor_indefinite_cap_boot_epoch(config, anchor_time, 0, 0)
+    }
+
+    /// (#locality-map-drift) Constructor variant that stamps the map's
+    /// per-mutation logical LWW ts with the worker's `boot_epoch_id`. Used by
+    /// the worker `FilesystemStore` map so its holdings deltas carry
+    /// `(boot_epoch, counter)` and a restarted worker's fresh epoch dominates
+    /// stale server state. Server-side stores keep boot_epoch 0 via the other
+    /// constructors (they never emit holdings deltas).
+    pub fn with_anchor_and_boot_epoch(
+        config: &EvictionPolicy,
+        anchor_time: I,
+        boot_epoch: u64,
+    ) -> Self {
+        Self::with_anchor_indefinite_cap_boot_epoch(config, anchor_time, 0, boot_epoch)
     }
 
     /// FL-681 Fix A constructor variant: same as [`Self::with_anchor`]
@@ -456,6 +505,23 @@ where
         config: &EvictionPolicy,
         anchor_time: I,
         indefinite_pin_cap_bytes: u64,
+    ) -> Self {
+        Self::with_anchor_indefinite_cap_boot_epoch(
+            config,
+            anchor_time,
+            indefinite_pin_cap_bytes,
+            0,
+        )
+    }
+
+    /// (#locality-map-drift) Core constructor: `with_anchor_and_indefinite_cap`
+    /// plus the per-mutation logical-LWW `boot_epoch`. All public constructors
+    /// funnel here; server-side stores pass `boot_epoch = 0`.
+    pub fn with_anchor_indefinite_cap_boot_epoch(
+        config: &EvictionPolicy,
+        anchor_time: I,
+        indefinite_pin_cap_bytes: u64,
+        boot_epoch: u64,
     ) -> Self {
         let max_bytes = config.max_bytes as u64;
         let max_count = config.max_count;
@@ -565,9 +631,16 @@ where
             // same queue synchronously after `run_pending_tasks()` so the
             // evicted item's `unref()` completes before the caller returns
             // — this is the contract the original `EvictingMap` exposed.
+            // (#locality-map-drift) Freeze the EVICTED value's logical-LWW
+            // counter NOW (before `value` is moved) so the removal callback
+            // carries the counter this value was inserted with — never a fresh
+            // mint. This is the load-bearing difference from the flawed
+            // "mint-at-eviction" (TLC Model A) design.
+            let ts_counter = value.stamp();
             listener_pending.lock().push_back(EvictionEvent {
                 key: Arc::clone(&key),
                 value,
+                ts_counter,
             });
             // Unbounded channel never blocks — send only fails if the
             // receiver is dropped (shutdown).
@@ -607,6 +680,12 @@ where
             // time via `startup_reconcile_gate: true` in FilesystemSpec →
             // `set_startup_reconcile_gate()` in `FilesystemStore::new`).
             reconcile_complete: Arc::new(AtomicBool::new(true)),
+            // (#locality-map-drift) Start at 1 so the first real value's
+            // counter is > 0 (0 is the proto default / "unset/legacy", treated
+            // as oldest by the server gate); a genuine stamped value must never
+            // collide with the unset sentinel.
+            clock: AtomicU64::new(1),
+            boot_epoch: AtomicU64::new(boot_epoch),
             evicted_bytes: Counter::default(),
             evicted_items: CounterWithTime::default(),
             replaced_bytes: Counter::default(),
@@ -814,6 +893,12 @@ where
                 }
                 entry.data
             });
+            // (#locality-map-drift) A pinned re-insert is a fresh PRESENT
+            // mutation: mint + freeze a new counter into `data` so the
+            // re-advertise carries a strictly-higher ts than any prior evict
+            // of this key.
+            let ts_counter = self.next_stamp();
+            data.set_stamp(ts_counter);
             self.pinned.insert(
                 key.clone(),
                 PinnedEntry {
@@ -828,7 +913,7 @@ where
                 self.indefinite_pinned_bytes
                     .fetch_add(size, Ordering::Relaxed);
             }
-            self.fire_on_insert_callbacks(&key, size);
+            self.fire_on_insert_callbacks(&key, size, ts_counter);
             if old.is_some() {
                 self.replaced_bytes.add(size);
                 self.replaced_items.inc();
@@ -839,6 +924,12 @@ where
         // Capture old value before insert for replaced-item unref.
         // The eviction listener skips Replaced events since we handle
         // cleanup here.
+        // (#locality-map-drift) Mint + FREEZE the value's logical-LWW counter
+        // BEFORE `cache.insert` moves `data`, so the counter travels with THIS
+        // value through moka's cache slot and is read back off the evicted
+        // value later (value-carried ts, never re-minted at eviction).
+        let ts_counter = self.next_stamp();
+        data.set_stamp(ts_counter);
         let existing = self.cache.get(key.borrow());
         self.cache.insert(key.clone(), data);
         // Process pending tasks so any size-driven eviction triggered by
@@ -856,7 +947,7 @@ where
             self.cache.run_pending_tasks();
         }
 
-        self.fire_on_insert_callbacks(&key, size);
+        self.fire_on_insert_callbacks(&key, size, ts_counter);
         if existing.is_some() {
             self.replaced_bytes.add(size);
             self.replaced_items.inc();
@@ -886,18 +977,50 @@ where
             }
         }
 
+        // (#locality-map-drift) Freeze the value's logical-LWW counter before
+        // `cache.insert` moves `data` (see `insert_inner`).
+        let ts_counter = self.next_stamp();
+        data.set_stamp(ts_counter);
         let existing = self.cache.get(key.borrow());
         self.cache.insert(key.clone(), data);
         // No frequency bump (no extra get()).
         // No run_pending_tasks() — deferred to caller.
-        self.fire_on_insert_callbacks(&key, size);
+        self.fire_on_insert_callbacks(&key, size, ts_counter);
         existing
     }
 
-    fn fire_on_insert_callbacks(&self, key: &K, size: u64) {
+    /// (#locality-map-drift) Hand out the next monotonic logical-LWW counter.
+    /// `Relaxed` is sufficient — the LWW needs only uniqueness + monotonicity of
+    /// the returned value; the value↔counter binding is established by
+    /// `set_stamp` before `cache.insert`.
+    #[inline]
+    fn next_stamp(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// (#locality-map-drift) The map's constant boot-epoch (HIGH word of every
+    /// stamp it emits). See the `boot_epoch` field doc.
+    #[inline]
+    fn boot_epoch(&self) -> u64 {
+        self.boot_epoch.load(Ordering::Relaxed)
+    }
+
+    /// (#locality-map-drift) Set the map's boot-epoch. The worker calls this at
+    /// boot — BEFORE any insert — with `boot_epoch_id()` so its holdings deltas
+    /// carry `(boot_epoch, counter)` and a restarted worker's fresh epoch
+    /// dominates stale server state. Idempotent set-once in practice (single
+    /// call on the boot path). `Relaxed` per the field doc.
+    pub fn set_boot_epoch(&self, boot_epoch: u64) {
+        self.boot_epoch.store(boot_epoch, Ordering::Relaxed);
+    }
+
+    /// (#locality-map-drift) `ts_counter` is the value's freshly-minted insert
+    /// counter (already frozen into the value via `set_stamp` by the caller,
+    /// before `cache.insert`). Fired with the map's constant `boot_epoch`.
+    fn fire_on_insert_callbacks(&self, key: &K, size: u64, ts_counter: u64) {
         let callbacks = self.callbacks.read();
         for cb in callbacks.iter() {
-            cb.on_insert(key.borrow(), size);
+            cb.on_insert(key.borrow(), size, self.boot_epoch(), ts_counter);
         }
     }
 
@@ -916,9 +1039,15 @@ where
         if !self.has_callbacks_flag.load(Ordering::Relaxed) {
             return;
         }
+        // (#locality-map-drift) A read is a fresh PRESENT transition (`touched`)
+        // that must be able to SUPERSEDE a stale evict — so it mints a FRESH
+        // counter (higher than any prior evict of an older value of this key),
+        // not the value's insert counter. This is what lets a worker that reads
+        // a hot blob every action rescue it from a persistent false-missing.
+        let ts_counter = self.next_stamp();
         let callbacks = self.callbacks.read();
         for cb in callbacks.iter() {
-            cb.on_get(key);
+            cb.on_get(key, self.boot_epoch(), ts_counter);
         }
     }
 
@@ -980,6 +1109,12 @@ where
                 }
                 entry.data
             });
+            // (#locality-map-drift) A pinned re-insert is a fresh PRESENT
+            // mutation: mint + freeze a new counter into `data` so the
+            // re-advertise carries a strictly-higher ts than any prior evict
+            // of this key.
+            let ts_counter = self.next_stamp();
+            data.set_stamp(ts_counter);
             self.pinned.insert(
                 key.clone(),
                 PinnedEntry {
@@ -994,7 +1129,7 @@ where
                 self.indefinite_pinned_bytes
                     .fetch_add(size, Ordering::Relaxed);
             }
-            self.fire_on_insert_callbacks(&key, size);
+            self.fire_on_insert_callbacks(&key, size, ts_counter);
             if old.is_some() {
                 self.replaced_bytes.add(size);
                 self.replaced_items.inc();
@@ -1002,10 +1137,14 @@ where
             return old;
         }
 
+        // (#locality-map-drift) Freeze the value's logical-LWW counter before
+        // `cache.insert` moves `data` (see `insert_inner`).
+        let ts_counter = self.next_stamp();
+        data.set_stamp(ts_counter);
         let existing = self.cache.get(key.borrow());
         self.cache.insert(key.clone(), data);
         // No run_pending_tasks — caller batches.
-        self.fire_on_insert_callbacks(&key, size);
+        self.fire_on_insert_callbacks(&key, size, ts_counter);
         if existing.is_some() {
             self.replaced_bytes.add(size);
             self.replaced_items.inc();
@@ -1040,8 +1179,13 @@ where
                 self.update_btree_remove(key);
 
                 // Fire callbacks + unref in background.
+                // (#locality-map-drift) Read the REMOVED value's frozen
+                // logical-LWW counter (this pinned-remove path bypasses the
+                // moka eviction listener / `EvictionEvent`, so it must capture
+                // the ts here) and carry it into the removal callback.
                 let data = entry.data;
-                let callbacks = self.collect_removal_callbacks(key);
+                let ts_counter = data.stamp();
+                let callbacks = self.collect_removal_callbacks(key, ts_counter);
                 drop(background_spawn!(
                     "moka_evicting_map_remove_cleanup",
                     async move {
@@ -1063,6 +1207,78 @@ where
             return true;
         }
         false
+    }
+
+    /// (#locality-map-drift) Test hook: remove `key` from the moka cache but
+    /// DEFER the removal-callback delivery. Returns `(frozen_counter,
+    /// deliver)`, where `frozen_counter` is the EVICTED value's frozen
+    /// logical-LWW counter (`value.stamp()`) captured at removal, and `deliver`
+    /// is a closure that — given the counter to report — fires the removal
+    /// `callback`s and awaits `unref`. This deterministically models moka's
+    /// ASYNC eviction-listener reorder (the value leaves `R` NOW, the tracker
+    /// mutation lands LATE, out of order vs a re-insert). The correct
+    /// (value-carried) delivery passes `frozen_counter`; the Model A
+    /// (mint-at-eviction) mutation passes a FRESH counter minted AFTER a
+    /// re-insert (see `test_next_stamp`). Returns `None` if `key` isn't
+    /// resident. Doc-hidden: exposes the internal decoupling for the composite
+    /// drift test only.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub async fn test_remove_defer_callback(
+        &self,
+        key: &Q,
+    ) -> Option<(
+        u64,
+        Box<
+            dyn FnOnce(u64) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>
+                + Send
+                + '_,
+        >,
+    )>
+    where
+        K: 'static + Clone,
+        Q: Clone,
+    {
+        let value = self.cache.get(key)?;
+        let frozen_counter = value.stamp();
+        let owned_key = key.clone();
+        // Remove from the cache WITHOUT letting the listener-drain deliver the
+        // callback synchronously: invalidate + run_pending_tasks queues the
+        // EvictionEvent, but we discard it and deliver via our own captured
+        // ordering so the interleaving is fully test-controlled.
+        self.cache.invalidate(key);
+        self.cache.run_pending_tasks();
+        while self.pending_evictions.lock().pop_front().is_some() {}
+        let boot_epoch = self.boot_epoch();
+        let callbacks_ref = &self.callbacks;
+        let deliver: Box<
+            dyn FnOnce(u64) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>
+                + Send
+                + '_,
+        > = Box::new(move |report_counter: u64| {
+            let cbs = callbacks_ref.read();
+            let callbacks: Vec<_> = cbs
+                .iter()
+                .map(|cb| cb.callback(owned_key.borrow(), boot_epoch, report_counter))
+                .collect();
+            drop(cbs);
+            Box::pin(async move {
+                let mut futs: FuturesUnordered<_> = callbacks.into_iter().collect();
+                while futs.next().await.is_some() {}
+                value.unref().await;
+            })
+        });
+        Some((frozen_counter, deliver))
+    }
+
+    /// (#locality-map-drift) Test hook: hand out the next logical-LWW counter.
+    /// Lets the composite drift test reproduce the Model A "mint-at-eviction"
+    /// mutation by minting a FRESH counter AFTER a re-insert and delivering the
+    /// deferred evict with it. Doc-hidden.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_next_stamp(&self) -> u64 {
+        self.next_stamp()
     }
 
     pub async fn remove_if<F>(&self, key: &Q, cond: F) -> bool
@@ -1100,12 +1316,19 @@ where
         }
     }
 
+    /// (#locality-map-drift) `ts_counter` is the REMOVED value's frozen
+    /// logical-LWW counter (captured by the caller before the value is moved),
+    /// carried into the removal `callback` so the eviction delta reports the
+    /// counter this value was inserted with.
     fn collect_removal_callbacks(
         &self,
         key: &Q,
+        ts_counter: u64,
     ) -> Vec<core::pin::Pin<Box<dyn core::future::Future<Output = ()> + Send>>> {
         let cbs = self.callbacks.read();
-        cbs.iter().map(|cb| cb.callback(key)).collect()
+        cbs.iter()
+            .map(|cb| cb.callback(key, self.boot_epoch(), ts_counter))
+            .collect()
     }
 
     // ---------------------------------------------------------------
@@ -1828,10 +2051,16 @@ where
 
         event.value.unref().await;
 
+        // (#locality-map-drift) Carry the EVICTED value's frozen logical-LWW
+        // counter (captured off the value by the eviction listener) into the
+        // removal callback — the value-carried ts, never a fresh mint.
+        let ts_counter = event.ts_counter;
         let callbacks = {
             let cbs = self.callbacks.read();
             let q: &Q = (*event.key).borrow();
-            cbs.iter().map(|cb| cb.callback(q)).collect::<Vec<_>>()
+            cbs.iter()
+                .map(|cb| cb.callback(q, self.boot_epoch(), ts_counter))
+                .collect::<Vec<_>>()
         };
         if !callbacks.is_empty() {
             let mut futs: FuturesUnordered<_> = callbacks.into_iter().collect();
@@ -1900,8 +2129,14 @@ where
                 // back into the regular LRU pool. Fire `on_insert` so
                 // the next BlobsAvailable broadcast carries a fresh
                 // entry for it.
+                // (#locality-map-drift) Pin-expiry demotes the blob back into
+                // the LRU pool — a fresh PRESENT transition. Mint + freeze a
+                // new counter so the re-ack carries a strictly-higher ts than
+                // any prior evict of this key.
+                let ts_counter = self.next_stamp();
+                entry.data.set_stamp(ts_counter);
                 self.cache.insert(key.clone(), entry.data);
-                self.fire_on_insert_callbacks(&key, size);
+                self.fire_on_insert_callbacks(&key, size, ts_counter);
                 // Also fire the pin-expiry hook so durability listeners
                 // (FastSlowStore) can record a pending-write retry. The
                 // pin TTL firing means we have NO confirmation that the
@@ -1995,16 +2230,18 @@ mod tests {
         fn callback(
             &self,
             _key: &u64,
+            _ts_boot_epoch: u64,
+            _ts_counter: u64,
         ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             self.removal_count.fetch_add(1, Ordering::Relaxed);
             Box::pin(async {})
         }
 
-        fn on_insert(&self, _key: &u64, _size: u64) {
+        fn on_insert(&self, _key: &u64, _size: u64, _ts_boot_epoch: u64, _ts_counter: u64) {
             self.insert_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn on_get(&self, _key: &u64) {
+        fn on_get(&self, _key: &u64, _ts_boot_epoch: u64, _ts_counter: u64) {
             self.get_count.fetch_add(1, Ordering::Relaxed);
         }
 

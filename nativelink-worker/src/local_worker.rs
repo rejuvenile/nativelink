@@ -41,7 +41,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_store::fast_slow_store::{FastSlowStore, SlowTierMetricSink};
 use nativelink_store::filesystem_store::{FilesystemStore, IndefinitePinOutcome};
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
-use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
+use nativelink_util::blob_locality_map::{SharedBlobLocalityMap, Stamp};
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -67,7 +67,7 @@ use crate::running_actions_manager::{
     RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
 };
 use crate::worker_api_client_wrapper::{WorkerApiClientTrait, WorkerApiClientWrapper};
-use crate::worker_utils::make_connect_worker_request;
+use crate::worker_utils::{boot_epoch_id, make_connect_worker_request};
 
 /// Maximum backstop interval for BlobsAvailable reports (milliseconds).
 /// The send loop normally wakes immediately on blob changes via `Notify`,
@@ -1957,23 +1957,79 @@ impl BlobsAvailableResendBuffer {
     }
 }
 
-/// Accumulated blob changes between BlobsAvailable ticks.
+/// (#locality-map-drift) Build a `BlobDigestInfo` carrying the digest plus its
+/// `(boot_epoch, counter)` logical-LWW stamp. `Stamp::default()` (0,0) is the
+/// unset/legacy sentinel the server treats as oldest.
+#[inline]
+fn bdi_with_stamp(digest: DigestInfo, stamp: Stamp) -> BlobDigestInfo {
+    BlobDigestInfo {
+        digest: Some(digest.into()),
+        ts_boot_epoch: stamp.boot_epoch,
+        ts_counter: stamp.counter,
+    }
+}
+
+/// (#locality-map-drift) The PRESENT/ABSENT holdings state of a digest in a
+/// `BlobChanges` window. A read (`on_get`, `touched`) and an insert
+/// (`on_insert`, `added`) both map to `Present`; an eviction (`callback`) maps
+/// to `Absent`. Reported to the server as `BlobDigestInfo`
+/// (`Present`→`digest_infos`) or `evicted_digests` (`Absent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobState {
+    Present,
+    Absent,
+}
+
+/// (#locality-map-drift) Accumulated per-digest holdings changes between
+/// BlobsAvailable ticks, as a LAST-WRITER-WINS map keyed by digest.
 ///
-/// `added` and `touched` are reported in the same outgoing
-/// `digest_infos` slice (the server's locality_map upserts both as
-/// "present"); separating them lets the tracker maintain the invariant
-/// that no digest is in more than one set at a time.
+/// PRIOR DESIGN (replaced): three disjoint `HashSet`s (`added`/`evicted`/
+/// `touched`) whose membership was mutated by set add/remove. That lost the
+/// causal order between a SYNC `on_insert` and moka's ASYNC eviction callback:
+/// a late evict callback could clobber a re-admitted digest's `added` with
+/// `evicted`, producing a persistent false-missing on the server.
 ///
-/// `touched` (cache hits via on_get) flow into the same slice as
-/// `added` so the server's existing per-broadcast backfill check
-/// (`request_missing_blob_uploads`) can pull hot blobs back into the
-/// server CAS even if it had previously evicted them — without this,
-/// hot-read-cold-write blobs silently age out of the server CAS.
+/// NOW: each digest maps to `(state, Stamp)` where `Stamp = (boot_epoch,
+/// counter)` is the per-mutation logical-LWW timestamp minted by the
+/// `MokaEvictingMap` (frozen into the value at insert; carried on the evicted
+/// value). A callback applies its `(state, stamp)` iff it strictly beats the
+/// stored stamp — OR ties it with `Absent` beating `Present` (an evict-of-V is
+/// causally after insert-of-V). A stale, out-of-order evict of a superseded
+/// value therefore LOSES to the newer insert/read and cannot un-register a
+/// held blob. `Present` entries flow to `digest_infos`; `Absent` to
+/// `evicted_digests`. Both carry the winning stamp on the wire so the server
+/// applies the same LWW.
 #[derive(Debug, Default)]
 pub struct BlobChanges {
-    pub added: HashSet<DigestInfo>,
-    pub evicted: HashSet<DigestInfo>,
-    pub touched: HashSet<DigestInfo>,
+    pub entries: HashMap<DigestInfo, (BlobState, Stamp)>,
+}
+
+impl BlobChanges {
+    /// Apply `(state, stamp)` for `digest` under local LWW. Returns `true` if
+    /// the map was mutated (so the caller wakes the broadcast loop only on a
+    /// real transition). LWW: write iff `stamp` strictly newer than stored, OR
+    /// (equal ts AND incoming `Absent` while stored `Present`) — ABSENT ≻
+    /// PRESENT at equal ts, mirroring the server gate and `HoldingsFixedV2`.
+    fn apply(&mut self, digest: DigestInfo, state: BlobState, stamp: Stamp) -> bool {
+        match self.entries.get(&digest) {
+            Some(&(stored_state, stored_stamp)) => {
+                let newer = stamp.gt(stored_stamp);
+                let tie_absent_wins = stamp.eq_ts(stored_stamp)
+                    && state == BlobState::Absent
+                    && stored_state == BlobState::Present;
+                if newer || tie_absent_wins {
+                    self.entries.insert(digest, (state, stamp));
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                self.entries.insert(digest, (state, stamp));
+                true
+            }
+        }
+    }
 }
 
 /// Tracks inserts, evictions, and reads of the FilesystemStore between ticks.
@@ -1997,55 +2053,59 @@ impl BlobChangeTracker {
         })
     }
 
-    /// Atomically swap out accumulated changes, returning them.
-    /// The internal state is replaced with an empty BlobChanges.
-    pub fn swap(&self) -> BlobChanges {
+    /// Atomically swap out accumulated changes as a flat list of
+    /// `(digest, state, stamp)`, resetting the internal LWW map. Each entry is
+    /// the winning `(state, stamp)` for its digest this window.
+    pub fn swap(&self) -> Vec<(DigestInfo, BlobState, Stamp)> {
         let mut pending = self.pending.lock();
-        std::mem::take(&mut *pending)
+        let taken = std::mem::take(&mut *pending);
+        taken
+            .entries
+            .into_iter()
+            .map(|(d, (state, stamp))| (d, state, stamp))
+            .collect()
     }
 }
 
 impl ItemCallback for BlobChangeTracker {
-    // On evict: add to evicted, remove from added/touched.
+    // On evict: record ABSENT@stamp under LWW. `stamp` is the EVICTED value's
+    // FROZEN (boot_epoch, counter) — never a fresh mint — so a re-ordered stale
+    // evict of a superseded value loses to the newer insert/read.
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        ts_boot_epoch: u64,
+        ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         if let StoreKey::Digest(digest) = store_key {
             let mut pending = self.pending.lock();
-            pending.added.remove(&digest);
-            pending.touched.remove(&digest);
-            pending.evicted.insert(digest);
-            self.notify.notify_one();
+            if pending.apply(digest, BlobState::Absent, Stamp::new(ts_boot_epoch, ts_counter)) {
+                self.notify.notify_one();
+            }
         }
         Box::pin(core::future::ready(()))
     }
 
-    // On insert: add to added, remove from evicted/touched.
-    fn on_insert(&self, store_key: StoreKey<'_>, _size: u64) {
+    // On insert: record PRESENT@stamp (the value's fresh insert counter) under
+    // LWW.
+    fn on_insert(&self, store_key: StoreKey<'_>, _size: u64, ts_boot_epoch: u64, ts_counter: u64) {
         if let StoreKey::Digest(digest) = store_key {
             let mut pending = self.pending.lock();
-            pending.evicted.remove(&digest);
-            pending.touched.remove(&digest);
-            pending.added.insert(digest);
-            self.notify.notify_one();
+            if pending.apply(digest, BlobState::Present, Stamp::new(ts_boot_epoch, ts_counter)) {
+                self.notify.notify_one();
+            }
         }
     }
 
-    // On read (cache hit): record in touched IF the digest isn't already
-    // accounted for in this window's added or evicted sets. This
-    // surfaces blobs the worker is actively reading so the server's
-    // backfill picks them up if its CAS evicted them.
-    fn on_get(&self, store_key: StoreKey<'_>) {
+    // On read (cache hit): record PRESENT@stamp with a FRESH counter (a read is
+    // a fresh present transition). Under LWW this SUPERSEDES a stale evict for
+    // the same digest — re-deriving the old `evicted`-set self-suppression: a
+    // blob the worker reads every action can no longer be stranded ABSENT by an
+    // earlier eviction event in the same window.
+    fn on_get(&self, store_key: StoreKey<'_>, ts_boot_epoch: u64, ts_counter: u64) {
         if let StoreKey::Digest(digest) = store_key {
             let mut pending = self.pending.lock();
-            if pending.added.contains(&digest) || pending.evicted.contains(&digest) {
-                return;
-            }
-            // Only wake the broadcast loop when this is a NEW touched
-            // entry — repeat-read on the same digest between swaps would
-            // otherwise pointlessly wake the loop.
-            if pending.touched.insert(digest) {
+            if pending.apply(digest, BlobState::Present, Stamp::new(ts_boot_epoch, ts_counter)) {
                 self.notify.notify_one();
             }
         }
@@ -2605,7 +2665,11 @@ impl BlobsAvailableState {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn test_record_added_digest(&self, digest: DigestInfo) {
-        self.tracker.on_insert(StoreKey::Digest(digest), 0);
+        // (#locality-map-drift) Carry this process's boot_epoch + a fresh
+        // counter so the delta records the digest PRESENT (the LWW is per
+        // digest, so a shared counter is fine across distinct digests).
+        self.tracker
+            .on_insert(StoreKey::Digest(digest), 0, boot_epoch_id(), 1);
     }
 
     /// Test-only: seed `last_sent_ac_pin_set` to a known set. Models the
@@ -3958,11 +4022,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // Drain any changes that accumulated during startup.
             drop(state.tracker.swap());
 
+            // (#locality-map-drift) The full snapshot enumerates residency,
+            // not per-mutation deltas, and is applied server-side POST-wipe
+            // (`remove_endpoint` on reconnect) — so it carries ts 0 (unset).
+            // The first real ts-carrying delta refreshes each entry's stamp.
             let infos: Vec<BlobDigestInfo> = all
                 .iter()
-                .map(|(digest, _ts)| BlobDigestInfo {
-                    digest: Some((*digest).into()),
-                })
+                .map(|(digest, _ts)| bdi_with_stamp(*digest, Stamp::default()))
                 .collect();
 
             // Mirror digests: drain deltas FIRST, then take the snapshot
@@ -3973,10 +4039,22 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // server's locality map cleanup. The snapshot covers all live
             // pins at the post-drain moment; drained `removed` deltas are
             // merged into `evicted_digests` so the locality map is cleaned.
+            // (#locality-map-drift) Mirror digests carry no per-mutation logical
+            // clock (they are in-memory server-pushed pins, drained
+            // synchronously — not subject to the moka async-reorder bug), so
+            // they ride ts 0: a mirror-removal@0 evicts a pure-mirror entry
+            // (registered@0) via the equal-ts ABSENT≻PRESENT tie-break, but is
+            // correctly SUPPRESSED for a digest the FS store still holds
+            // (registered@(be,c) by a real delta) — the worker still has it on
+            // disk.
             let (mirror_evicted_protos, mirror_pinned_protos) =
                 if let Some(ref fss) = state.cas_server_fss {
                     let (mc, snap) = fss.snapshot_and_reset_mirror_changes();
-                    let evicted: Vec<_> = mc.removed.into_iter().map(|d| d.into()).collect();
+                    let evicted: Vec<BlobDigestInfo> = mc
+                        .removed
+                        .into_iter()
+                        .map(|d| bdi_with_stamp(d, Stamp::default()))
+                        .collect();
                     let pinned: Vec<_> = snap.into_iter().map(|d| d.into()).collect();
                     (evicted, pinned)
                 } else {
@@ -3985,29 +4063,29 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
             (infos, mirror_evicted_protos, mirror_pinned_protos)
         } else {
-            // Delta: swap out accumulated changes. Touched digests (from
-            // on_get cache hits) are merged with `added` so the server's
-            // backfill check sees them; the proto carries no timestamps,
-            // entries persist in the locality map until explicit eviction.
+            // Delta: swap out accumulated per-digest LWW changes. Each entry is
+            // the winning (state, stamp) for its digest this window. PRESENT →
+            // digest_infos, ABSENT → evicted_digests; both carry the winning
+            // `(boot_epoch, counter)` stamp so the server applies the same LWW
+            // and suppresses a re-ordered stale eviction of a re-admitted blob.
             let changes = state.tracker.swap();
-            let mut all_present: HashSet<DigestInfo> = changes.added.into_iter().collect();
-            all_present.extend(changes.touched.into_iter());
-
-            let infos: Vec<BlobDigestInfo> = all_present
-                .iter()
-                .map(|digest| BlobDigestInfo {
-                    digest: Some((*digest).into()),
-                })
-                .collect();
-            let mut evicted_protos: Vec<_> = changes.evicted.iter().map(|d| (*d).into()).collect();
+            let mut infos: Vec<BlobDigestInfo> = Vec::new();
+            let mut evicted_protos: Vec<BlobDigestInfo> = Vec::new();
+            for (digest, state, stamp) in changes {
+                match state {
+                    BlobState::Present => infos.push(bdi_with_stamp(digest, stamp)),
+                    BlobState::Absent => evicted_protos.push(bdi_with_stamp(digest, stamp)),
+                }
+            }
 
             // Mirror delta: drain → send `added` as `pinned_mirror_digests`
-            // and merge `removed` into `evicted_digests` so the server cleans
-            // up locality entries for blobs we no longer hold.
+            // and merge `removed` into `evicted_digests` (ts 0; see the
+            // full-snapshot mirror note above) so the server cleans up
+            // pure-mirror locality entries we no longer hold.
             let mirror_added_protos: Vec<_> = if let Some(ref fss) = state.cas_server_fss {
                 let mc = fss.drain_mirror_changes();
                 for d in mc.removed {
-                    evicted_protos.push(d.into());
+                    evicted_protos.push(bdi_with_stamp(d, Stamp::default()));
                 }
                 mc.added.into_iter().map(|d| d.into()).collect()
             } else {
@@ -6593,6 +6671,16 @@ pub async fn new_local_worker(
             // awaits it to wake immediately.
             let notify = Arc::new(Notify::new());
 
+            // (#locality-map-drift) Stamp the FS store's eviction map with this
+            // process's boot_epoch BEFORE the tracker starts producing consumed
+            // deltas. Startup-loaded blobs (inserted inside `FilesystemStore::
+            // new`, before this) are reported via the full SNAPSHOT (stamp 0,
+            // applied post-wipe), so their pre-set stamp is irrelevant; every
+            // RUNTIME insert/evict/read delta (produced only after the send
+            // loop below starts) then carries `(boot_epoch, counter)` so a
+            // restarted worker's fresh epoch dominates stale server state.
+            fs_store.set_map_boot_epoch(boot_epoch_id());
+
             // Create change tracker and register it on the FilesystemStore.
             let tracker = BlobChangeTracker::new(notify.clone());
             if let Err(err) = fs_store.clone().register_item_callback(tracker.clone()) {
@@ -7597,30 +7685,52 @@ mod tests {
         ));
     }
 
+    // (#locality-map-drift) Split a `swap()` result into (present, absent)
+    // digest sets for assertion. Under the LWW map, `added` and `touched` both
+    // collapse to `Present`; `evicted` is `Absent`.
+    fn present_absent(
+        changes: Vec<(DigestInfo, BlobState, Stamp)>,
+    ) -> (HashSet<DigestInfo>, HashSet<DigestInfo>) {
+        let mut present = HashSet::new();
+        let mut absent = HashSet::new();
+        for (d, state, _stamp) in changes {
+            match state {
+                BlobState::Present => {
+                    present.insert(d);
+                }
+                BlobState::Absent => {
+                    absent.insert(d);
+                }
+            }
+        }
+        (present, absent)
+    }
+
     #[test]
     fn test_blob_change_tracker_eviction_collects_and_swaps() {
         let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
         let d1 = DigestInfo::new([1u8; 32], 100);
         let d2 = DigestInfo::new([2u8; 32], 200);
 
-        // Evict two digests via the callback.
+        // Evict two digests via the callback (each carries its value's frozen
+        // logical-LWW ts).
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(tracker.callback(StoreKey::Digest(d1)));
-        rt.block_on(tracker.callback(StoreKey::Digest(d2)));
+        rt.block_on(tracker.callback(StoreKey::Digest(d1), 1, 1));
+        rt.block_on(tracker.callback(StoreKey::Digest(d2), 1, 2));
 
-        // Swap should return both as evicted.
-        let changes = tracker.swap();
-        assert!(changes.added.is_empty(), "Expected no added digests");
-        assert_eq!(changes.evicted.len(), 2, "Expected 2 evicted digests");
-        assert!(changes.evicted.contains(&d1), "Expected d1 in evicted set");
-        assert!(changes.evicted.contains(&d2), "Expected d2 in evicted set");
+        // Swap should return both as absent (evicted).
+        let (present, absent) = present_absent(tracker.swap());
+        assert!(present.is_empty(), "Expected no present digests");
+        assert_eq!(absent.len(), 2, "Expected 2 evicted digests");
+        assert!(absent.contains(&d1), "Expected d1 in absent set");
+        assert!(absent.contains(&d2), "Expected d2 in absent set");
 
         // Second swap should return empty.
-        let changes2 = tracker.swap();
-        assert!(changes2.added.is_empty());
-        assert!(changes2.evicted.is_empty());
+        let (present2, absent2) = present_absent(tracker.swap());
+        assert!(present2.is_empty());
+        assert!(absent2.is_empty());
     }
 
     #[test]
@@ -7631,14 +7741,14 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(tracker.callback(StoreKey::Str(Cow::Borrowed("some_key"))));
+        rt.block_on(tracker.callback(StoreKey::Str(Cow::Borrowed("some_key")), 1, 1));
 
         // Insert callback with a string key.
-        tracker.on_insert(StoreKey::Str(Cow::Borrowed("other_key")), 42);
+        tracker.on_insert(StoreKey::Str(Cow::Borrowed("other_key")), 42, 1, 2);
 
-        let changes = tracker.swap();
-        assert!(changes.added.is_empty());
-        assert!(changes.evicted.is_empty());
+        let (present, absent) = present_absent(tracker.swap());
+        assert!(present.is_empty());
+        assert!(absent.is_empty());
     }
 
     #[test]
@@ -7647,15 +7757,14 @@ mod tests {
         let d1 = DigestInfo::new([1u8; 32], 100);
         let d2 = DigestInfo::new([2u8; 32], 200);
 
-        tracker.on_insert(StoreKey::Digest(d1), 100);
-        tracker.on_insert(StoreKey::Digest(d2), 200);
+        tracker.on_insert(StoreKey::Digest(d1), 100, 1, 1);
+        tracker.on_insert(StoreKey::Digest(d2), 200, 1, 2);
 
-        let changes = tracker.swap();
-        assert_eq!(changes.added.len(), 2, "Expected 2 added digests");
-        assert!(changes.added.contains(&d1));
-        assert!(changes.added.contains(&d2));
-        assert!(changes.evicted.is_empty());
-        assert!(changes.touched.is_empty());
+        let (present, absent) = present_absent(tracker.swap());
+        assert_eq!(present.len(), 2, "Expected 2 present digests");
+        assert!(present.contains(&d1));
+        assert!(present.contains(&d2));
+        assert!(absent.is_empty());
     }
 
     #[test]
@@ -7665,23 +7774,23 @@ mod tests {
         let d2 = DigestInfo::new([2u8; 32], 200);
 
         // Accumulate an insert and an eviction.
-        tracker.on_insert(StoreKey::Digest(d1), 100);
+        tracker.on_insert(StoreKey::Digest(d1), 100, 1, 1);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(tracker.callback(StoreKey::Digest(d2)));
+        rt.block_on(tracker.callback(StoreKey::Digest(d2), 1, 2));
 
         // First swap returns the accumulated changes.
-        let changes = tracker.swap();
-        assert_eq!(changes.added.len(), 1);
-        assert!(changes.added.contains(&d1));
-        assert_eq!(changes.evicted.len(), 1);
-        assert!(changes.evicted.contains(&d2));
+        let (present, absent) = present_absent(tracker.swap());
+        assert_eq!(present.len(), 1);
+        assert!(present.contains(&d1));
+        assert_eq!(absent.len(), 1);
+        assert!(absent.contains(&d2));
 
         // Second swap should be empty.
-        let changes2 = tracker.swap();
-        assert!(changes2.added.is_empty());
-        assert!(changes2.evicted.is_empty());
+        let (present2, absent2) = present_absent(tracker.swap());
+        assert!(present2.is_empty());
+        assert!(absent2.is_empty());
     }
 
     #[test]
@@ -7689,48 +7798,72 @@ mod tests {
         let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
         let d1 = DigestInfo::new([1u8; 32], 100);
 
-        // Insert then evict the same digest — the eviction must still be
-        // recorded so the server knows the blob is no longer available.
-        tracker.on_insert(StoreKey::Digest(d1), 100);
+        // Insert@(1,1) then evict@(1,1) the SAME value (same frozen ts): the
+        // eviction must win the ABSENT≻PRESENT tie-break so the server learns
+        // the blob is gone.
+        tracker.on_insert(StoreKey::Digest(d1), 100, 1, 1);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(tracker.callback(StoreKey::Digest(d1)));
+        rt.block_on(tracker.callback(StoreKey::Digest(d1), 1, 1));
 
-        let changes = tracker.swap();
-        // The digest was inserted then evicted within the same tick.
-        // It should be removed from `added` (no longer available) and
-        // appear in `evicted` so the server is notified.
+        let (present, absent) = present_absent(tracker.swap());
         assert!(
-            !changes.added.contains(&d1),
-            "Expected d1 to NOT be in added after insert+evict"
+            !present.contains(&d1),
+            "Expected d1 to NOT be present after insert+evict (same ts, ABSENT wins tie-break)"
         );
         assert!(
-            changes.evicted.contains(&d1),
-            "Expected d1 in evicted (it was evicted, removing it from added)"
+            absent.contains(&d1),
+            "Expected d1 absent (it was evicted at its value's frozen ts)"
         );
     }
 
     #[test]
-    fn test_blob_change_tracker_evict_then_reinsert_cancels_out() {
+    fn test_blob_change_tracker_evict_then_reinsert_supersedes() {
         let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
         let d1 = DigestInfo::new([1u8; 32], 100);
 
-        // Evict then reinsert the same digest — should show as added only.
+        // Evict V1@(1,1) then RE-INSERT V2@(1,2) (a NEW value, strictly-higher
+        // counter — exactly what the real map mints). The re-insert's newer ts
+        // must SUPERSEDE the stale evict: d1 ends PRESENT. This is the
+        // false-missing fix at the tracker's local-LWW layer.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        rt.block_on(tracker.callback(StoreKey::Digest(d1)));
-        tracker.on_insert(StoreKey::Digest(d1), 100);
+        rt.block_on(tracker.callback(StoreKey::Digest(d1), 1, 1));
+        tracker.on_insert(StoreKey::Digest(d1), 100, 1, 2);
 
-        let changes = tracker.swap();
+        let (present, absent) = present_absent(tracker.swap());
         assert!(
-            changes.added.contains(&d1),
-            "Expected d1 in added after evict+reinsert"
+            present.contains(&d1),
+            "Expected d1 present after evict@1+reinsert@2 (newer ts supersedes stale evict)"
         );
         assert!(
-            !changes.evicted.contains(&d1),
-            "Expected d1 NOT in evicted after evict+reinsert"
+            !absent.contains(&d1),
+            "Expected d1 NOT absent after the higher-ts re-insert"
+        );
+    }
+
+    #[test]
+    fn test_blob_change_tracker_stale_evict_suppressed_by_prior_reinsert() {
+        // (#locality-map-drift) The core false-missing guard at the tracker
+        // layer: a re-insert V2@(1,2) followed by a LATE, out-of-order evict of
+        // V1@(1,1) — the stale evict must LOSE, d1 stays PRESENT.
+        let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
+        let d1 = DigestInfo::new([7u8; 32], 100);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // Re-insert lands first (higher ts), then the stale evict arrives late.
+        tracker.on_insert(StoreKey::Digest(d1), 100, 1, 2);
+        rt.block_on(tracker.callback(StoreKey::Digest(d1), 1, 1));
+
+        let (present, absent) = present_absent(tracker.swap());
+        assert!(
+            present.contains(&d1) && !absent.contains(&d1),
+            "stale evict (ts=1) must NOT overwrite a re-insert (ts=2) at the \
+             tracker LWW layer — d1 must stay present"
         );
     }
 
@@ -7749,16 +7882,37 @@ mod tests {
         use nativelink_util::moka_evicting_map::MokaEvictingMap;
         use nativelink_util::store_trait::StoreKeyBorrow;
 
-        // Simple value type for the MokaEvictingMap.
-        #[derive(Clone, Debug)]
-        struct TestValue(u64);
+        // Simple value type for the MokaEvictingMap. (#locality-map-drift)
+        // Carries the value's frozen logical-LWW counter in an `AtomicU64`,
+        // exactly as `FileEntryImpl` does, so the eviction callback reports the
+        // value's INSERT counter (not 0) — the value-carried ts the LWW needs.
+        use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        #[derive(Debug)]
+        struct TestValue {
+            size: u64,
+            stamp: AtomicU64,
+        }
+        impl TestValue {
+            fn new(size: u64) -> Arc<Self> {
+                Arc::new(Self {
+                    size,
+                    stamp: AtomicU64::new(0),
+                })
+            }
+        }
 
         impl LenEntry for TestValue {
             fn len(&self) -> u64 {
-                self.0
+                self.size
             }
             fn is_empty(&self) -> bool {
-                self.0 == 0
+                self.size == 0
+            }
+            fn stamp(&self) -> u64 {
+                self.stamp.load(AtomicOrdering::Acquire)
+            }
+            fn set_stamp(&self, s: u64) {
+                self.stamp.store(s, AtomicOrdering::Release);
             }
         }
 
@@ -7776,7 +7930,7 @@ mod tests {
             let evicting_map = std::sync::Arc::new(MokaEvictingMap::<
                 StoreKeyBorrow,
                 StoreKey<'static>,
-                TestValue,
+                Arc<TestValue>,
                 SystemTime,
                 ItemCallbackHolder,
             >::with_anchor(
@@ -7803,19 +7957,19 @@ mod tests {
             // Insert two items at capacity for max_count=2.
             let key1: StoreKeyBorrow = StoreKey::Digest(d1).into();
             let key2: StoreKeyBorrow = StoreKey::Digest(d2).into();
-            evicting_map.insert(key1, TestValue(30)).await;
-            evicting_map.insert(key2, TestValue(40)).await;
+            evicting_map.insert(key1, TestValue::new(30)).await;
+            evicting_map.insert(key2, TestValue::new(40)).await;
 
-            // Swap and verify both digests appear in `added`.
-            let changes = tracker.swap();
+            // Swap and verify both digests appear as present.
+            let (present, absent) = present_absent(tracker.swap());
             assert_eq!(
-                changes.added.len(),
+                present.len(),
                 2,
-                "Expected 2 added digests after initial inserts"
+                "Expected 2 present digests after initial inserts"
             );
-            assert!(changes.added.contains(&d1), "Expected d1 in added set");
-            assert!(changes.added.contains(&d2), "Expected d2 in added set");
-            assert!(changes.evicted.is_empty(), "Expected no evictions yet");
+            assert!(present.contains(&d1), "Expected d1 present");
+            assert!(present.contains(&d2), "Expected d2 present");
+            assert!(absent.is_empty(), "Expected no evictions yet");
 
             // Now insert a third item — exceeds max_count=2 so the LRU
             // entry (d1) must be evicted. Promote d2 explicitly via get
@@ -7824,7 +7978,7 @@ mod tests {
             let _ = evicting_map.get(&d2_key).await;
             let d3 = DigestInfo::new([3u8; 32], 50);
             let key3: StoreKeyBorrow = StoreKey::Digest(d3).into();
-            evicting_map.insert(key3, TestValue(50)).await;
+            evicting_map.insert(key3, TestValue::new(50)).await;
 
             // Wait for the background drainer to fire the eviction
             // callback. start_background_eviction owns the drain task; a
@@ -7835,17 +7989,21 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
-            let changes = tracker.swap();
+            // (#locality-map-drift) d1's eviction callback carries d1's frozen
+            // insert counter (a lower value than d3's insert), and d1 was NOT
+            // re-inserted, so the LWW records d1 ABSENT — the value-carried ts
+            // makes a genuine LRU eviction land.
+            let (present, absent) = present_absent(tracker.swap());
             assert!(
-                changes.added.contains(&d3),
-                "Expected d3 in added set after third insert"
+                present.contains(&d3),
+                "Expected d3 present after third insert"
             );
             assert!(
-                changes.evicted.contains(&d1),
-                "Expected d1 in evicted set (LRU eviction)"
+                absent.contains(&d1),
+                "Expected d1 absent (LRU eviction, value-carried ts)"
             );
             assert!(
-                !changes.evicted.contains(&d2),
+                !absent.contains(&d2),
                 "Expected d2 to NOT be evicted (most recently used)"
             );
         });

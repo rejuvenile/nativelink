@@ -136,6 +136,10 @@ pub fn chunk_blobs_available(
     let mut all_digest_infos: Vec<BlobDigestInfo> = digest_infos;
     all_digest_infos.extend(legacy_digests.into_iter().map(|d| BlobDigestInfo {
         digest: Some(d),
+        // (#locality-map-drift) Legacy field-2 digests carry no logical-LWW ts
+        // (0 = unset → the server treats them as oldest, applied as before).
+        ts_boot_epoch: 0,
+        ts_counter: 0,
     }));
 
     let mut src = ChunkSources {
@@ -314,7 +318,10 @@ struct ChunkSources {
     cached_directory_digests: alloc::vec::IntoIter<Digest>,
     pinned_mirror_entries: alloc::vec::IntoIter<MirrorPinEntry>,
     pinned_ac_mirror_entries: alloc::vec::IntoIter<MirrorPinEntry>,
-    evicted_digests: alloc::vec::IntoIter<Digest>,
+    // (#locality-map-drift) `evicted_digests` upgraded from `Digest` to
+    // `BlobDigestInfo` so each evicted digest carries its frozen
+    // `(boot_epoch, counter)` logical-LWW ts.
+    evicted_digests: alloc::vec::IntoIter<BlobDigestInfo>,
     added_subtree_digests: alloc::vec::IntoIter<Digest>,
     removed_subtree_digests: alloc::vec::IntoIter<Digest>,
     pinned_mirror_digests: alloc::vec::IntoIter<Digest>,
@@ -362,7 +369,11 @@ mod tests {
     }
 
     fn bdi(i: u64) -> BlobDigestInfo {
-        BlobDigestInfo { digest: Some(d(i)) }
+        BlobDigestInfo {
+            digest: Some(d(i)),
+            ts_boot_epoch: 0,
+            ts_counter: 0,
+        }
     }
 
     fn mpe(i: u64, store: &str) -> MirrorPinEntry {
@@ -599,7 +610,7 @@ mod tests {
             cached_directory_digests: (10..12).map(d).collect(),
             pinned_mirror_entries: vec![mpe(20, "cas_STORE")],
             pinned_ac_mirror_entries: vec![mpe(30, "AC_MAIN_STORE")],
-            evicted_digests: (40..42).map(d).collect(),
+            evicted_digests: (40..42).map(bdi).collect(),
             ..Default::default()
         };
         let chunks = chunk_blobs_available(n, 1, 99, String::new(), 1)
