@@ -16,7 +16,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -302,6 +302,43 @@ pub struct WorkerProxyStore {
     peer_fetch_peer_unreachable_bytes: AtomicU64,
     /// Count of `get_part` calls where a known peer was unreachable.
     peer_fetch_peer_unreachable_count: AtomicU64,
+    // (#sbrace) SMALL-BLOB batch-read race outcome — the sibling of the
+    // peer_fetch_* family above, but for the worker input-fetch path in
+    // `running_actions_manager::batch_read_small_blobs` (≤1 MiB inputs raced
+    // via BatchReadBlobs), which was ENTIRELY uncounted. That path downcasts
+    // its race sources to concrete `GrpcStore` and cannot reuse the get_part
+    // race machinery, so it has its own outcome counters here on the store it
+    // already holds (`proxy`) — the registered metrics home (memory
+    // `worker-metrics-exposure-pattern`; a per-instance tree would be dark).
+    // Named `batch_read_*` (not `peer_fetch_*`) to keep the two race paths
+    // distinguishable in Prometheus while directly comparable field-for-field.
+    //
+    // Same bare-AtomicU64 rationale as peer_fetch_*: clean `_bytes`/`_count`
+    // literals, `fetch_add(_, Relaxed)` (observability-only, off any per-chunk
+    // loop — attributed once per digest at race resolution). Bytes = the blob
+    // size (`digest.size_bytes()`), the input amount the read is on the hook
+    // for; count buckets partition every raced small digest with no
+    // double-count.
+    //
+    /// A PEER served the digest — the peer batch's result was accepted first
+    /// (peers are raced ahead of the server; first source to return a digest
+    /// wins it). REALIZED small-blob offload. Bytes = blob size.
+    batch_read_peer_win_bytes: AtomicU64,
+    /// Count of small-blob digests a peer served first.
+    batch_read_peer_win_count: AtomicU64,
+    /// The SERVER served the digest despite a peer being tried — the digest
+    /// was assigned to a peer but only the server's batch returned it (peer
+    /// slow / evicted / stale-positive / batch failed). No offload achieved.
+    /// Bytes = blob size.
+    batch_read_server_won_bytes: AtomicU64,
+    /// Count of peer-assigned small-blob digests the server served.
+    batch_read_server_won_count: AtomicU64,
+    /// NO peer known — the digest's `lookup_workers` was empty, so it was
+    /// never assigned to a peer and went server-only. THE freshness gap the
+    /// P2P feature could convert (no_peer -> win). Bytes = blob size.
+    batch_read_no_peer_bytes: AtomicU64,
+    /// Count of small-blob digests with no peer in the locality map.
+    batch_read_no_peer_count: AtomicU64,
     /// #130 — singleflight/dedup map for concurrent same-digest peer
     /// fetches. Collapses the "N callers, same digest, ms apart" cohort
     /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
@@ -941,6 +978,60 @@ impl MetricsComponent for WorkerProxyStore {
             "(#p2p-prefetch-metrics) Count of worker-side get_part reads where a known \
              peer was unreachable."
         );
+        // (#sbrace) SMALL-BLOB batch-read race outcome — the sibling partition
+        // for the worker input-fetch path (running_actions_manager
+        // batch_read_small_blobs, ≤1 MiB inputs raced via BatchReadBlobs).
+        // Directly comparable to the peer_fetch_* family above: realized
+        // small-blob offload fraction =
+        //   batch_read_peer_win_bytes / (peer_win + server_won + no_peer)_bytes.
+        publish!(
+            "worker_proxy_batch_read_peer_win_bytes",
+            &self.batch_read_peer_win_bytes,
+            MetricKind::Counter,
+            "(#sbrace) Bytes a PEER served on the small-blob (≤1 MiB) input-fetch \
+             race (batch_read_small_blobs) — REALIZED offload, central CAS work \
+             avoided. Sibling of worker_proxy_peer_fetch_win_bytes for the batch \
+             path. Byte attribution = blob size. Numerator of the small-blob \
+             realized offload fraction."
+        );
+        publish!(
+            "worker_proxy_batch_read_peer_win_count",
+            &self.batch_read_peer_win_count,
+            MetricKind::Counter,
+            "(#sbrace) Count of small-blob input digests a peer served first."
+        );
+        publish!(
+            "worker_proxy_batch_read_server_won_bytes",
+            &self.batch_read_server_won_bytes,
+            MetricKind::Counter,
+            "(#sbrace) Bytes the SERVER served on the small-blob input-fetch race \
+             for a digest that WAS assigned to a peer but the peer did not serve it \
+             (slow / evicted / stale-positive / peer batch failed) — no offload \
+             achieved. Part of the small-blob offload-fraction denominator."
+        );
+        publish!(
+            "worker_proxy_batch_read_server_won_count",
+            &self.batch_read_server_won_count,
+            MetricKind::Counter,
+            "(#sbrace) Count of peer-assigned small-blob input digests the server \
+             served."
+        );
+        publish!(
+            "worker_proxy_batch_read_no_peer_bytes",
+            &self.batch_read_no_peer_bytes,
+            MetricKind::Counter,
+            "(#sbrace) Bytes the server served for small-blob input digests with NO \
+             peer in the locality map (never raced) — THE freshness gap the P2P \
+             feature could convert (no_peer -> peer_win). Part of the small-blob \
+             offload-fraction denominator."
+        );
+        publish!(
+            "worker_proxy_batch_read_no_peer_count",
+            &self.batch_read_no_peer_count,
+            MetricKind::Counter,
+            "(#sbrace) Count of small-blob input digests with no peer in the \
+             locality map."
+        );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
         // outside the lock so we never hold it across the macro's tracing
@@ -1213,6 +1304,12 @@ impl WorkerProxyStore {
             peer_fetch_no_peer_count: AtomicU64::new(0),
             peer_fetch_peer_unreachable_bytes: AtomicU64::new(0),
             peer_fetch_peer_unreachable_count: AtomicU64::new(0),
+            batch_read_peer_win_bytes: AtomicU64::new(0),
+            batch_read_peer_win_count: AtomicU64::new(0),
+            batch_read_server_won_bytes: AtomicU64::new(0),
+            batch_read_server_won_count: AtomicU64::new(0),
+            batch_read_no_peer_bytes: AtomicU64::new(0),
+            batch_read_no_peer_count: AtomicU64::new(0),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -1258,6 +1355,12 @@ impl WorkerProxyStore {
             peer_fetch_no_peer_count: AtomicU64::new(0),
             peer_fetch_peer_unreachable_bytes: AtomicU64::new(0),
             peer_fetch_peer_unreachable_count: AtomicU64::new(0),
+            batch_read_peer_win_bytes: AtomicU64::new(0),
+            batch_read_peer_win_count: AtomicU64::new(0),
+            batch_read_server_won_bytes: AtomicU64::new(0),
+            batch_read_server_won_count: AtomicU64::new(0),
+            batch_read_no_peer_bytes: AtomicU64::new(0),
+            batch_read_no_peer_count: AtomicU64::new(0),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -1329,6 +1432,121 @@ impl WorkerProxyStore {
             self.cdn_tee_cache_abandoned_full_total.load(Ordering::Relaxed),
             self.cdn_tee_cache_abandoned_consumer_eof_total
                 .load(Ordering::Relaxed),
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // (#sbrace) Small-blob (≤1 MiB) input-fetch race-outcome counters.
+    //
+    // The race itself lives in `running_actions_manager::batch_read_small_blobs`
+    // (a free fn in nativelink-worker) which already holds this `WorkerProxyStore`
+    // (`proxy`) — the registered metrics home. It downcasts its race sources to
+    // concrete `GrpcStore`, so it cannot reuse the get_part race machinery; these
+    // are its dedicated outcome counters. The three primitives below are simple
+    // `fetch_add`s; `record_batch_read_race_outcome` encapsulates the per-digest
+    // first-result-wins attribution decision so it is unit-testable WITHOUT a
+    // real GrpcStore (fed synthetic per-source digest sets). All are
+    // observability-only, no control-flow effect.
+    // ------------------------------------------------------------------
+
+    /// A peer served a small-blob input digest (peer result accepted first).
+    /// `bytes` = the blob size. Primitive counter bump.
+    pub fn record_batch_read_peer_win(&self, bytes: u64) {
+        self.batch_read_peer_win_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.batch_read_peer_win_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The server served a peer-assigned small-blob input digest (peer tried
+    /// but did not serve it). `bytes` = the blob size. Primitive counter bump.
+    pub fn record_batch_read_server_won(&self, bytes: u64) {
+        self.batch_read_server_won_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.batch_read_server_won_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A small-blob input digest had no peer in the locality map (server-only,
+    /// never raced). `bytes` = the blob size. Primitive counter bump.
+    pub fn record_batch_read_no_peer(&self, bytes: u64) {
+        self.batch_read_no_peer_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.batch_read_no_peer_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Attribute a completed small-blob batch-read race across the three
+    /// outcome buckets, then bump the corresponding counters.
+    ///
+    /// This is the testable attribution decision for
+    /// `running_actions_manager::batch_read_small_blobs`. Kept here (not inline
+    /// at the call site) because that call site downcasts its race sources to
+    /// concrete `GrpcStore` and so cannot be exercised in a unit test; feeding
+    /// this method synthetic per-source digest sets lets the attribution logic
+    /// be tested and mutation-verified against a real `WorkerProxyStore`.
+    ///
+    /// - `no_peer_digests`: digests whose `lookup_workers` was empty — assigned
+    ///   to no peer, went server-only. Each is a `no_peer` outcome. These are
+    ///   ALSO pre-marked as attributed so that their (expected) presence in the
+    ///   server source result below does NOT additionally count them as
+    ///   `server_won` — the three buckets are a DISJOINT partition: a digest is
+    ///   `no_peer` XOR `peer_win` XOR `server_won` (or, if no source returned
+    ///   it, none — it falls to the call site's miss-retry path). This lets the
+    ///   call site pass the server's FULL fetched set uniformly (the server
+    ///   races ALL small digests, including no-peer ones) with no filtering.
+    /// - `ordered_source_results`: `(is_server, digests_this_source_returned)`
+    ///   in RACE ORDER — peers first, the server last — mirroring the order the
+    ///   futures are pushed into (and `join_all` returns them in) at the call
+    ///   site. First source to return a digest WINS it (peers-first ⇒ a peer
+    ///   wins over the server when both return it, exactly matching the call
+    ///   site's `fetched`-set first-insertion semantics). A digest a peer WAS
+    ///   assigned to but that only the server returned counts as `server_won`.
+    ///
+    /// Byte attribution for every outcome = `DigestInfo::size_bytes()`.
+    pub fn record_batch_read_race_outcome(
+        &self,
+        no_peer_digests: &[DigestInfo],
+        ordered_source_results: &[(bool, &[DigestInfo])],
+    ) {
+        // First-result-wins bookkeeping. Pre-seed with the no_peer digests so
+        // they are counted ONCE (as no_peer) and excluded from peer_win /
+        // server_won even though the server source (which races every small
+        // digest) will report them. `attributed` is bounded by the number of
+        // small input digests this batch fetched (a subset of the caller's
+        // already-bounded `small_digests` slice); scalar keys, dropped at
+        // return — no owned bytes, off any per-chunk loop.
+        let mut attributed: HashSet<DigestInfo> = HashSet::new();
+        for &digest in no_peer_digests {
+            if attributed.insert(digest) {
+                self.record_batch_read_no_peer(digest.size_bytes());
+            }
+        }
+        for &(is_server, digests) in ordered_source_results {
+            for &digest in digests {
+                if attributed.insert(digest) {
+                    if is_server {
+                        self.record_batch_read_server_won(digest.size_bytes());
+                    } else {
+                        self.record_batch_read_peer_win(digest.size_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Test/observability: snapshot the (#sbrace) small-blob batch-read
+    /// race-outcome counters as
+    /// `(peer_win_bytes, peer_win_count, server_won_bytes, server_won_count,
+    /// no_peer_bytes, no_peer_count)`. Returns the same values
+    /// `MetricsComponent::publish` exposes via Prometheus.
+    #[must_use]
+    pub fn batch_read_counters_snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.batch_read_peer_win_bytes.load(Ordering::Relaxed),
+            self.batch_read_peer_win_count.load(Ordering::Relaxed),
+            self.batch_read_server_won_bytes.load(Ordering::Relaxed),
+            self.batch_read_server_won_count.load(Ordering::Relaxed),
+            self.batch_read_no_peer_bytes.load(Ordering::Relaxed),
+            self.batch_read_no_peer_count.load(Ordering::Relaxed),
         )
     }
 
@@ -6704,6 +6922,367 @@ mod tests {
             after.no_peer_count, before.no_peer_count,
             "unreachable-peer read must NOT increment peer_fetch_no_peer_count"
         );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // (#sbrace) SMALL-BLOB (≤1 MiB) input-fetch batch-read race outcome.
+    //
+    // Sibling of the peer_fetch_* tests above, but for the free fn
+    // `running_actions_manager::batch_read_small_blobs`. That fn downcasts its
+    // race sources to concrete `GrpcStore` and so cannot be driven from a unit
+    // test with fakeable `Store` peers; the attribution DECISION it makes is
+    // therefore factored into `WorkerProxyStore::record_batch_read_race_outcome`
+    // and tested here by feeding synthetic per-source digest sets to a real
+    // `WorkerProxyStore` (the production metrics home). Each test drives ONE
+    // outcome and asserts the bytes+count landed on the RIGHT batch_read_*
+    // counter and NO other batch_read_* counter moved. `batch_read_counters_
+    // snapshot` returns
+    //   (peer_win_bytes, peer_win_count, server_won_bytes, server_won_count,
+    //    no_peer_bytes, no_peer_count).
+    // ---------------------------------------------------------------
+
+    /// Build a distinct 64-hex digest keyed by `n` with the given size.
+    fn sbrace_digest(n: u8, size: u64) -> DigestInfo {
+        // 62 zeros + 2 hex digits of `n` => a valid, unique 64-char hash.
+        let hash = format!("{:0>62}{:02x}", "", n);
+        DigestInfo::try_new(&hash, size).expect("valid digest")
+    }
+
+    /// Outcome PEER-WIN — a peer returned the digest first (peers are raced
+    /// ahead of the server); bytes+count land on `batch_read_peer_win_*` and
+    /// no other batch_read_* counter moves.
+    ///
+    /// Mutation: change the peer-win arm in `record_batch_read_race_outcome`
+    /// (the `else` branch calling `record_batch_read_peer_win`) to a no-op /
+    /// wrong bucket; this test red-fails with the bespoke
+    ///   "peer-win must attribute the blob size to batch_read_peer_win_bytes".
+    #[nativelink_test]
+    async fn sbrace_peer_win_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        let size = 4096u64;
+        let d = sbrace_digest(1, size);
+
+        let before = proxy.batch_read_counters_snapshot();
+        // Peer (is_server=false) returned d first; server (is_server=true)
+        // ALSO returned it but loses the race by iteration order (peers first).
+        proxy.record_batch_read_race_outcome(
+            &[],
+            &[(false, &[d]), (true, &[d])],
+        );
+        let after = proxy.batch_read_counters_snapshot();
+
+        assert_eq!(
+            after.0,
+            before.0 + size,
+            "peer-win must attribute the blob size to batch_read_peer_win_bytes \
+             (was {}, now {})",
+            before.0,
+            after.0
+        );
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "peer-win must increment batch_read_peer_win_count"
+        );
+        assert_eq!(
+            after.2, before.2,
+            "peer-win must NOT attribute bytes to batch_read_server_won_bytes \
+             (the server returned the same digest but lost the peers-first race)"
+        );
+        assert_eq!(
+            after.3, before.3,
+            "peer-win must NOT increment batch_read_server_won_count"
+        );
+        assert_eq!(
+            after.5, before.5,
+            "peer-win must NOT increment batch_read_no_peer_count"
+        );
+        Ok(())
+    }
+
+    /// Outcome SERVER-WON — the digest WAS assigned to a peer but only the
+    /// server returned it (peer batch failed / stale-positive); bytes+count
+    /// land on `batch_read_server_won_*` and no other batch_read_* counter
+    /// moves.
+    ///
+    /// Mutation: change the server-win arm in `record_batch_read_race_outcome`
+    /// (the `if is_server` branch calling `record_batch_read_server_won`) to a
+    /// no-op / wrong bucket; this test red-fails with
+    ///   "server-won must attribute the blob size to batch_read_server_won_bytes".
+    #[nativelink_test]
+    async fn sbrace_server_won_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        let size = 8192u64;
+        let d = sbrace_digest(2, size);
+
+        let before = proxy.batch_read_counters_snapshot();
+        // d was peer-assigned (NOT in no_peer_digests) but the peer source
+        // returned nothing; only the server returned it => server_won.
+        proxy.record_batch_read_race_outcome(
+            &[],
+            &[(false, &[]), (true, &[d])],
+        );
+        let after = proxy.batch_read_counters_snapshot();
+
+        assert_eq!(
+            after.2,
+            before.2 + size,
+            "server-won must attribute the blob size to batch_read_server_won_bytes \
+             (was {}, now {})",
+            before.2,
+            after.2
+        );
+        assert_eq!(
+            after.3,
+            before.3 + 1,
+            "server-won must increment batch_read_server_won_count"
+        );
+        assert_eq!(
+            after.0, before.0,
+            "server-won must NOT attribute bytes to batch_read_peer_win_bytes"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "server-won must NOT increment batch_read_peer_win_count"
+        );
+        assert_eq!(
+            after.5, before.5,
+            "server-won must NOT increment batch_read_no_peer_count"
+        );
+        Ok(())
+    }
+
+    /// Outcome NO-PEER — a digest with no peer in the locality map (never
+    /// raced, server-only); bytes+count land on `batch_read_no_peer_*` and no
+    /// other batch_read_* counter moves.
+    ///
+    /// Mutation: change the no_peer loop in `record_batch_read_race_outcome`
+    /// (the `record_batch_read_no_peer` call) to a no-op; this test red-fails
+    /// with
+    ///   "no-peer digest must attribute the blob size to batch_read_no_peer_bytes".
+    #[nativelink_test]
+    async fn sbrace_no_peer_attributes_bytes() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        let size = 1024u64;
+        let d = sbrace_digest(3, size);
+
+        let before = proxy.batch_read_counters_snapshot();
+        // d had no peer assigned; the server serves it. Because the real
+        // batch_read_small_blobs races EVERY small digest against the server,
+        // d ALSO appears in the server source set here — the orchestrator must
+        // count it ONCE (no_peer), NOT double-count it as server_won.
+        proxy.record_batch_read_race_outcome(&[d], &[(true, &[d])]);
+        let after = proxy.batch_read_counters_snapshot();
+
+        assert_eq!(
+            after.4,
+            before.4 + size,
+            "no-peer digest must attribute the blob size to batch_read_no_peer_bytes \
+             (was {}, now {})",
+            before.4,
+            after.4
+        );
+        assert_eq!(
+            after.5,
+            before.5 + 1,
+            "no-peer digest must increment batch_read_no_peer_count"
+        );
+        // DISJOINT partition: a no_peer digest that the server also returns is
+        // counted ONLY as no_peer, never additionally as server_won — the
+        // orchestrator pre-seeds `attributed` with no_peer digests. If a future
+        // refactor drops that pre-seed, a no_peer digest would be double-counted
+        // as server_won and this assertion red-fails.
+        assert_eq!(
+            after.2, before.2,
+            "no-peer digest must NOT also count as server_won (disjoint partition; \
+             pre-seed of `attributed` with no_peer digests broke)"
+        );
+        assert_eq!(
+            after.3, before.3,
+            "no-peer digest must NOT increment batch_read_server_won_count"
+        );
+        assert_eq!(
+            after.0, before.0,
+            "no-peer digest must NOT increment batch_read_peer_win"
+        );
+        Ok(())
+    }
+
+    /// First-result-wins across a MIXED batch: two peer-assigned digests, one
+    /// served by a peer (peer_win) and one only by the server (server_won),
+    /// plus one no-peer digest — each lands in exactly its bucket. Guards the
+    /// per-digest partition (no cross-contamination when several outcomes
+    /// occur in one race).
+    ///
+    /// Mutation: break the `attributed.insert` first-result-wins guard (e.g.
+    /// remove the `if`, always attributing) and the peer_win/server_won counts
+    /// over-count; this test's exact-count asserts red-fail.
+    #[nativelink_test]
+    async fn sbrace_mixed_batch_partitions_per_digest() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        let size = 2000u64;
+        let d_peer = sbrace_digest(10, size); // peer serves this
+        let d_server = sbrace_digest(11, size); // only server serves this
+        let d_no_peer = sbrace_digest(12, size); // no peer assigned
+
+        let before = proxy.batch_read_counters_snapshot();
+        // Race order: peer source first (returns d_peer), then server source
+        // (returns d_peer AND d_server AND d_no_peer — server gets ALL digests).
+        proxy.record_batch_read_race_outcome(
+            &[d_no_peer],
+            &[
+                (false, &[d_peer]),
+                (true, &[d_peer, d_server, d_no_peer]),
+            ],
+        );
+        let after = proxy.batch_read_counters_snapshot();
+
+        // d_peer -> peer_win exactly once (server also returned it but lost).
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (size, 1),
+            "exactly one peer_win for d_peer (server returned it too but lost \
+             the peers-first race); over-counting = first-result-wins guard broke"
+        );
+        // d_server -> server_won exactly once. d_no_peer is in the server
+        // source set too but is pre-attributed to no_peer, so it is NOT counted
+        // as server_won (disjoint partition). d_peer already won for the peer.
+        assert_eq!(
+            (after.2 - before.2, after.3 - before.3),
+            (size, 1),
+            "exactly one server_won (d_server only): d_peer won for the peer, \
+             d_no_peer is pre-attributed to no_peer — neither may land here"
+        );
+        // d_no_peer -> no_peer exactly once.
+        assert_eq!(
+            (after.4 - before.4, after.5 - before.5),
+            (size, 1),
+            "exactly one no_peer for d_no_peer"
+        );
+        Ok(())
+    }
+
+    /// The three primitives bump their own counters and nothing else — the
+    /// wiring `record_batch_read_small_blobs` relies on (and the render test's
+    /// literals map to). Guards a mis-wired primitive.
+    #[nativelink_test]
+    async fn sbrace_primitives_bump_expected_counters() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        let b0 = proxy.batch_read_counters_snapshot();
+        proxy.record_batch_read_peer_win(100);
+        let b1 = proxy.batch_read_counters_snapshot();
+        assert_eq!(
+            (b1.0 - b0.0, b1.1 - b0.1),
+            (100, 1),
+            "record_batch_read_peer_win must bump peer_win_bytes+count only"
+        );
+        assert_eq!(
+            (b1.2, b1.3, b1.4, b1.5),
+            (b0.2, b0.3, b0.4, b0.5),
+            "record_batch_read_peer_win must not touch server_won / no_peer"
+        );
+
+        proxy.record_batch_read_server_won(200);
+        let b2 = proxy.batch_read_counters_snapshot();
+        assert_eq!(
+            (b2.2 - b1.2, b2.3 - b1.3),
+            (200, 1),
+            "record_batch_read_server_won must bump server_won_bytes+count only"
+        );
+
+        proxy.record_batch_read_no_peer(300);
+        let b3 = proxy.batch_read_counters_snapshot();
+        assert_eq!(
+            (b3.4 - b2.4, b3.5 - b2.5),
+            (300, 1),
+            "record_batch_read_no_peer must bump no_peer_bytes+count only"
+        );
+        Ok(())
+    }
+
+    /// RENDER VERIFICATION (memory `worker-metrics-exposure-pattern`): the six
+    /// (#sbrace) counters actually reach Prometheus through the SAME
+    /// `MetricsComponent::publish` body the production registry drives — not
+    /// merely as struct fields (a per-instance/unregistered tree renders
+    /// NOTHING). Registers a real `WorkerProxyStore` and asserts each literal
+    /// metric line appears in the rendered exposition with its bumped value.
+    ///
+    /// Mutation: comment out any of the six `publish!("worker_proxy_batch_read_*"
+    /// ...)` calls in `MetricsComponent::publish`; the corresponding assertion
+    /// red-fails with "...must render via MetricsComponent::publish".
+    #[nativelink_test]
+    async fn sbrace_counters_render_via_publish() -> Result<(), Error> {
+        use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+
+        // Bump each bucket to a DISTINCT value so a mis-wired publish (wrong
+        // field bound to a name) shows up as a wrong number, not just presence.
+        proxy.record_batch_read_peer_win(111);
+        proxy.record_batch_read_server_won(222);
+        proxy.record_batch_read_no_peer(333);
+
+        let registry = MetricsRegistry::new();
+        // Same prefix shape as production (`nativelink_WORKER_FAST_SLOW_STORE`
+        // wraps this store); any prefix works — we assert the literal suffix.
+        registry.register("nativelink_TEST", proxy.clone());
+        let body = render_prometheus(&registry);
+
+        for (needle, name) in [
+            (
+                "nativelink_TEST_worker_proxy_batch_read_peer_win_bytes 111\n",
+                "batch_read_peer_win_bytes",
+            ),
+            (
+                "nativelink_TEST_worker_proxy_batch_read_peer_win_count 1\n",
+                "batch_read_peer_win_count",
+            ),
+            (
+                "nativelink_TEST_worker_proxy_batch_read_server_won_bytes 222\n",
+                "batch_read_server_won_bytes",
+            ),
+            (
+                "nativelink_TEST_worker_proxy_batch_read_server_won_count 1\n",
+                "batch_read_server_won_count",
+            ),
+            (
+                "nativelink_TEST_worker_proxy_batch_read_no_peer_bytes 333\n",
+                "batch_read_no_peer_bytes",
+            ),
+            (
+                "nativelink_TEST_worker_proxy_batch_read_no_peer_count 1\n",
+                "batch_read_no_peer_count",
+            ),
+        ] {
+            assert!(
+                body.contains(needle),
+                "{name} must render via MetricsComponent::publish — expected line \
+                 `{}` absent from the rendered exposition. A per-instance or \
+                 unregistered tree would emit NOTHING (memory \
+                 worker-metrics-exposure-pattern); the counter must be published \
+                 in the SAME publish() body production drives.\n\
+                 --- rendered body ---\n{body}",
+                needle.trim_end()
+            );
+        }
         Ok(())
     }
 

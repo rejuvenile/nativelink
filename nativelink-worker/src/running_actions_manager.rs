@@ -1642,12 +1642,21 @@ async fn batch_read_small_blobs(
     if let Some(proxy) = slow_store.as_store_driver().as_any().downcast_ref::<WorkerProxyStore>() {
         // Assign digests to peer endpoints using the locality map.
         let mut endpoint_digests: HashMap<Arc<str>, Vec<DigestInfo>> = HashMap::new();
+        // (#sbrace) Small-blob race telemetry: digests with NO peer in the
+        // locality map (never raced, server-only) — the "no_peer" outcome
+        // bucket, recorded once below via the WorkerProxyStore metrics home.
+        // CAPPED AT small_digests.len(): a subset of the caller's already-
+        // bounded input digest slice; DigestInfo is a small POD (hash+size),
+        // no owned blob bytes; freed at end of fetch.
+        let mut no_peer_digests: Vec<DigestInfo> = Vec::new();
         {
             let locality = proxy.locality_map().read();
             let mut round_robin_idx: usize = 0;
             for &digest in small_digests {
                 let peers = locality.lookup_workers(&digest);
-                if !peers.is_empty() {
+                if peers.is_empty() {
+                    no_peer_digests.push(digest);
+                } else {
                     let endpoint = peers[round_robin_idx % peers.len()].clone();
                     round_robin_idx = round_robin_idx.wrapping_add(1);
                     endpoint_digests
@@ -1711,15 +1720,37 @@ async fn batch_read_small_blobs(
             // Execute all batches in parallel — peers and server race.
             let results = futures::future::join_all(race_futures).await;
 
-            let mut fetched = HashSet::new();
+            // Collect each source's completed digests in RACE ORDER (peers
+            // first, server last — join_all preserves input order). Feeds both
+            // the fetched-set fold (unchanged: fetched = union of all Ok sets)
+            // and the (#sbrace) offload attribution below. `is_server` is the
+            // "server" label the server batches were tagged with; peer
+            // endpoints are host:port URIs, never the literal "server".
+            // CAPPED AT (peers+1) x small_digests.len() DigestInfo (a small POD;
+            // no owned blob bytes); freed at end of fetch.
+            let mut source_completions: Vec<(bool, Vec<DigestInfo>)> = Vec::new();
             for (ep, result) in results {
                 match result {
-                    Ok(completed) => {
-                        fetched.extend(completed.into_iter());
-                    }
+                    Ok(completed) => source_completions.push((ep == "server", completed)),
                     Err(e) => info!(endpoint = ep, ?e, "BatchReadBlobs: batch failed"),
                 }
             }
+
+            let mut fetched = HashSet::new();
+            for (_is_server, completed) in &source_completions {
+                fetched.extend(completed.iter().copied());
+            }
+
+            // (#sbrace) Attribute the small-blob race outcome onto the
+            // WorkerProxyStore counters (the registered metrics home): each
+            // no-peer digest -> no_peer, each raced digest -> the FIRST source
+            // (peers-first) that returned it (peer_win, else server_won). Pure
+            // observability; does not affect `fetched` or control flow.
+            let ordered_results: Vec<(bool, &[DigestInfo])> = source_completions
+                .iter()
+                .map(|(is_server, completed)| (*is_server, completed.as_slice()))
+                .collect();
+            proxy.record_batch_read_race_outcome(&no_peer_digests, &ordered_results);
 
             // Retry misses via populate_fast_store_unchecked (full store chain).
             let misses: Vec<DigestInfo> = small_digests
@@ -1756,6 +1787,12 @@ async fn batch_read_small_blobs(
 
             return Ok(fetched);
         }
+
+        // (#sbrace) peer_blob_count == 0: no digest had ANY peer, so every
+        // small digest is a no_peer outcome. Record it here before falling
+        // through to the server-only path below (the racing block above
+        // returns, so reaching this point means the map was empty for all).
+        proxy.record_batch_read_race_outcome(&no_peer_digests, &[]);
     }
 
     // No peers available — server-only batch read.
