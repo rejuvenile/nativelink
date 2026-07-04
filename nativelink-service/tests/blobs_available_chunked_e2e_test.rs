@@ -252,6 +252,8 @@ fn build_notification(
                 hash: format!("{:064x}", i),
                 size_bytes: i64::try_from(i).unwrap_or(0),
             }),
+            ts_boot_epoch: 0,
+            ts_counter: 0,
         })
         .collect();
     nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsAvailableNotification {

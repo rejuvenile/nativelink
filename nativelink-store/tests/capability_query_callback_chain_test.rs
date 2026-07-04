@@ -283,6 +283,8 @@ impl ItemCallback for NoopCallback {
     fn callback<'a>(
         &'a self,
         _store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }

@@ -31,8 +31,9 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_scheduler::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    execute_result, update_for_worker, BlobsAvailableNotification, BlobsEvictedNotification,
-    ConnectWorkerRequest, ExecuteResult, KeepAliveRequest, MirrorPinEntry, UpdateForScheduler,
+    execute_result, update_for_worker, BlobDigestInfo, BlobsAvailableNotification,
+    BlobsEvictedNotification, ConnectWorkerRequest, ExecuteResult, KeepAliveRequest, MirrorPinEntry,
+    UpdateForScheduler,
 };
 use nativelink_proto::google::rpc::Status as ProtoStatus;
 use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
@@ -1525,7 +1526,18 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             worker_cas_endpoint: String::new(),
             digests: vec![],
             is_full_snapshot: false,
-            evicted_digests: vec![d1.into(), d2.into()],
+            evicted_digests: vec![
+                BlobDigestInfo {
+                    digest: Some(d1.into()),
+                    ts_boot_epoch: 0,
+                    ts_counter: 0,
+                },
+                BlobDigestInfo {
+                    digest: Some(d2.into()),
+                    ts_boot_epoch: 0,
+                    ts_counter: 0,
+                },
+            ],
             digest_infos: vec![],
             cpu_load_pct: 0,
             cached_directory_digests: vec![],

@@ -925,7 +925,11 @@ mod tests {
     }
 
     fn bdi(i: u64) -> BlobDigestInfo {
-        BlobDigestInfo { digest: Some(d(i)) }
+        BlobDigestInfo {
+            digest: Some(d(i)),
+            ts_boot_epoch: 0,
+            ts_counter: 0,
+        }
     }
 
     fn mpe(i: u64, store: &str) -> MirrorPinEntry {
@@ -1288,13 +1292,13 @@ mod tests {
         c0.cached_directory_digests = vec![d(10)];
         c0.pinned_mirror_entries = vec![mpe(20, "cas")];
         c0.pinned_ac_mirror_entries = vec![mpe(30, "ac")];
-        c0.evicted_digests = vec![d(40)];
+        c0.evicted_digests = vec![bdi(40)];
 
         let mut c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
         c1.cached_directory_digests = vec![d(11)];
         c1.pinned_mirror_entries = vec![mpe(21, "cas")];
         c1.pinned_ac_mirror_entries = vec![mpe(31, "ac")];
-        c1.evicted_digests = vec![d(41)];
+        c1.evicted_digests = vec![bdi(41)];
 
         assert!(acc.merge_chunk(c0).is_none());
         let out = acc.merge_chunk(c1).expect("terminal");
@@ -1903,7 +1907,7 @@ mod tests {
     #[test]
     fn proto_fields_exhaustive_bans_missing() {
         use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-            BlobsAvailableNotification, MirrorPinEntry,
+            BlobDigestInfo, BlobsAvailableNotification, MirrorPinEntry,
         };
         use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 
@@ -1911,7 +1915,8 @@ mod tests {
             worker_cas_endpoint: String::new(),
             digests: Vec::<Digest>::new(),
             is_full_snapshot: false,
-            evicted_digests: Vec::<Digest>::new(),
+            // (#locality-map-drift) evicted_digests upgraded Digest -> BlobDigestInfo.
+            evicted_digests: Vec::<BlobDigestInfo>::new(),
             digest_infos: Vec::new(),
             cpu_load_pct: 0,
             cached_directory_digests: Vec::<Digest>::new(),

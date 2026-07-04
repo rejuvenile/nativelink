@@ -215,11 +215,13 @@ impl ItemCallback for CountingCallback {
     fn callback<'a>(
         &'a self,
         _store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
 
-    fn on_insert(&self, _store_key: StoreKey<'_>, _size: u64) {
+    fn on_insert(&self, _store_key: StoreKey<'_>, _size: u64, _ts_boot_epoch: u64, _ts_counter: u64) {
         self.on_insert_count.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -247,7 +249,7 @@ impl ProbeStore {
     fn fire_all_inserts(&self, key: StoreKey<'_>) {
         let cbs = self.callbacks.lock().clone();
         for cb in cbs {
-            cb.on_insert(key.borrow(), 1);
+            cb.on_insert(key.borrow(), 1, 0, 0);
         }
     }
 }

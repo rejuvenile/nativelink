@@ -182,6 +182,8 @@ impl ItemCallback for CapturingCallback {
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
+        _ts_boot_epoch: u64,
+        _ts_counter: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let owned = store_key.into_owned();
         let notify = self.notify.clone();

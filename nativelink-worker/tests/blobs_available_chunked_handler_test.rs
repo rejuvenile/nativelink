@@ -98,6 +98,8 @@ fn make_digests(n: usize) -> Vec<BlobDigestInfo> {
                     hash: hex::encode(hash_bytes),
                     size_bytes: i64::try_from(i + 1).unwrap_or(1),
                 }),
+                ts_boot_epoch: 0,
+                ts_counter: 0,
             }
         })
         .collect()
