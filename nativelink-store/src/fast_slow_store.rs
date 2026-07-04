@@ -923,6 +923,29 @@ pub enum SelfRetryOutcome {
     FastTierMiss,
 }
 
+/// (#mapgap) OBSERVABILITY-ONLY 3-way split of the SERVER-flagged
+/// `missing_digests` on the worker input-materialization path, returned by
+/// [`FastSlowStore::probe_input_missing_sources`]. The three buckets
+/// partition the probed set exactly and mirror the branches of
+/// [`FastSlowStore::populate_fast_store`]: disk-hit (false-missing about
+/// REPORTED holdings — a map lag/report bug), mirror-hit (the held-but-
+/// unreported ≥2-replica gap — the smoking gun), and genuine fetch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputMissingProbe {
+    /// Server said missing but the blob was on the on-disk fast store.
+    pub disk_count: u64,
+    /// Byte mass of the disk-hit bucket.
+    pub disk_bytes: u64,
+    /// Server said missing but the blob sat in the in-memory mirror buffer.
+    pub mirror_count: u64,
+    /// Byte mass of the mirror-hit bucket.
+    pub mirror_bytes: u64,
+    /// Server said missing and the worker genuinely had to fetch it.
+    pub fetched_count: u64,
+    /// Byte mass of the genuine-fetch bucket.
+    pub fetched_bytes: u64,
+}
+
 /// #37 Phase 2 (Q4 / F1): cross-crate sink for the per-`store_class`
 /// slow-tier async-write failure counter. The worker installs an impl
 /// that dispatches to `Metrics::worker_slow_tier_async_fail_by_class`
@@ -1080,6 +1103,20 @@ pub struct FastSlowStore {
     /// Lock acquisition order: `mirror_blobs` BEFORE `mirror_changes`. See
     /// the comment on `mirror_changes` for the deadlock rationale.
     mirror_blobs: RwLock<HashMap<DigestInfo, (Bytes, Instant)>>,
+    /// (#mapgap) OBSERVABILITY-ONLY point-in-time count of distinct digests
+    /// held in the in-memory `mirror_blobs` buffer. Stored as the ABSOLUTE
+    /// `mirror_blobs.len()` under the SAME `mirror_blobs.write()` guard after
+    /// every insert/remove (NOT a delta accumulator — the live len, so a
+    /// missed site would surface as a divergence a test catches, and a
+    /// replace-in-place insert correctly leaves it unchanged). Rendered as a
+    /// `#[metric]` gauge so operators can see how much of the ≥2-replica
+    /// mirror durability buffer sits unreported by the locality map (pairs
+    /// with `input_server_missing_hit_mirror_count`). `Relaxed`: updated and
+    /// read under/near the write lock; brief scrape staleness is acceptable.
+    #[metric(
+        help = "(#mapgap) point-in-time distinct digests held in the in-memory mirror_blobs buffer (≥2-replica durability copies NOT on disk and NOT reported to the locality map); pairs with input_server_missing_hit_mirror_count"
+    )]
+    mirror_blobs_digest_count: AtomicU64,
     /// Parallel `(store_id, digest)`-keyed index of dispatcher-pushed
     /// pins (task #168 item 5; partial Plan B5). The values carry no
     /// payload — the bytes still live in `mirror_blobs` keyed by
@@ -1156,6 +1193,16 @@ pub struct FastSlowStore {
     ///   the existing pattern for other monotonic counters in this
     ///   struct (e.g. `populate_spawn_count`,
     ///   `mirror_blobs_cap_exceeded_total`).
+    ///
+    /// (#mapgap) Rendered as a `#[metric]` gauge (previously dark) so
+    /// operators can see the byte occupancy of the in-memory mirror
+    /// durability buffer — the held-but-unreported ≥2-replica mass the
+    /// locality map is blind to. Pairs with `mirror_blobs_digest_count`
+    /// (count) and `input_server_missing_hit_mirror_bytes` (the slice of it
+    /// that showed up as a false-missing on an input read).
+    #[metric(
+        help = "(#mapgap) point-in-time total bytes held in the in-memory mirror_blobs buffer (≥2-replica durability copies NOT on disk and NOT reported to the locality map)"
+    )]
     mirror_blobs_total_bytes: AtomicU64,
     /// Cap on aggregate mirror bytes; defaults to
     /// `DEFAULT_MIRROR_BLOBS_MAX_BYTES`. Mutable only via the
@@ -1491,6 +1538,7 @@ impl FastSlowStore {
             shutting_down: AtomicBool::new(false),
             failed_slow_writes,
             mirror_blobs: RwLock::new(HashMap::new()),
+            mirror_blobs_digest_count: AtomicU64::new(0),
             dispatched_mirror_pins: Mutex::new(BTreeMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
@@ -2498,6 +2546,9 @@ impl FastSlowStore {
             self.mirror_blobs_total_bytes
                 .fetch_add(data_len, Ordering::Relaxed);
         }
+        // (#mapgap) Store the ABSOLUTE live len under the write guard.
+        self.mirror_blobs_digest_count
+            .store(blobs.len() as u64, Ordering::Relaxed);
     }
 
     /// Diagnostic / test-only counter: every `tokio::spawn` performed by the
@@ -3457,6 +3508,7 @@ impl FastSlowStore {
             shutting_down: AtomicBool::new(false),
             failed_slow_writes: shared,
             mirror_blobs: RwLock::new(HashMap::new()),
+            mirror_blobs_digest_count: AtomicU64::new(0),
             dispatched_mirror_pins: Mutex::new(BTreeMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
@@ -3589,6 +3641,9 @@ impl FastSlowStore {
             }
         }
         drop(changes);
+        // (#mapgap) Store the ABSOLUTE live len BEFORE dropping the guard.
+        self.mirror_blobs_digest_count
+            .store(blobs.len() as u64, Ordering::Relaxed);
         drop(blobs);
         if freed > 0 {
             self.mirror_blobs_total_bytes
@@ -3801,6 +3856,9 @@ impl FastSlowStore {
         changes.removed.remove(&digest);
         changes.added.insert(digest);
         drop(changes);
+        // (#mapgap) Store the ABSOLUTE live len BEFORE dropping the guard.
+        self.mirror_blobs_digest_count
+            .store(blobs.len() as u64, Ordering::Relaxed);
         drop(blobs);
         self.mirror_changes_notify.notify_one();
         Ok(())
@@ -4898,6 +4956,91 @@ impl FastSlowStore {
         }
 
         self.copy_slow_to_fast(key).await
+    }
+
+    /// (#mapgap) OBSERVABILITY-ONLY. Resolve WHERE the worker actually held
+    /// each of the SERVER-flagged `missing_digests` (or didn't), for the
+    /// worker input-materialization false-missing probe, mirroring the exact
+    /// 3-way branch of [`populate_fast_store`](Self::populate_fast_store):
+    ///   - DISK: `fast_store.has()` == Some (on-disk FilesystemStore).
+    ///   - MIRROR: not on disk, but present in the in-memory `mirror_blobs`
+    ///     buffer (a ≥2-replica durability copy that skips disk + the
+    ///     tracker — THE held-but-unreported mirror gap).
+    ///   - FETCHED: neither → a genuine miss the worker fetched.
+    ///
+    /// Runs TWO batched in-memory reads under this store's own locks (the
+    /// fast-store `evicting_map` has() + one `mirror_blobs.read()`), then
+    /// returns the 3-way `(count, bytes)` split AND bumps the six
+    /// `input_server_missing_*` counters on `self.metrics` (rendered under
+    /// this store's registered tree; on the worker
+    /// `nativelink_WORKER_FAST_SLOW_STORE_...`). Encapsulates the private
+    /// `mirror_blobs` access here so the worker call-site
+    /// (`download_to_directory`) stays a single call. `Relaxed`: counts
+    /// only, off any hot per-chunk loop. NO state mutated, no fetch/hardlink
+    /// decision altered — the point-in-time mirror membership snapshot
+    /// matches what `populate_fast_store` would decide for the same digest.
+    ///
+    /// Returns `Err` only if the fast-store `has_with_results` errors; the
+    /// caller treats the probe as best-effort (logs + skips the count).
+    pub async fn probe_input_missing_sources(
+        &self,
+        digests: &[DigestInfo],
+    ) -> Result<InputMissingProbe, Error> {
+        // 1. Batched fast-store (disk) has() over the whole set. Chunked to
+        //    bound the evicting_map Mutex hold time (matches the worker
+        //    fallback branch's HAS_CHECK_CHUNK).
+        let keys: Vec<StoreKey<'_>> = digests.iter().map(|d| (*d).into()).collect();
+        let mut disk_results: Vec<Option<u64>> = vec![None; keys.len()];
+        const PROBE_CHUNK: usize = 2000;
+        for start in (0..keys.len()).step_by(PROBE_CHUNK) {
+            let end = (start + PROBE_CHUNK).min(keys.len());
+            self.fast_store
+                .has_with_results(&keys[start..end], &mut disk_results[start..end])
+                .await
+                .err_tip(|| "#mapgap probe: fast_store has_with_results")?;
+        }
+
+        // 2. For the digests NOT on disk, a single `mirror_blobs` read
+        //    resolves mirror-hit vs genuine-fetch. Snapshot membership under
+        //    one read guard (no per-digest lock re-acquire).
+        let mut probe = InputMissingProbe::default();
+        {
+            let mirror = self.mirror_blobs.read();
+            for (digest, disk) in digests.iter().zip(disk_results.iter()) {
+                let sz = digest.size_bytes();
+                if disk.is_some() {
+                    probe.disk_count += 1;
+                    probe.disk_bytes += sz;
+                } else if mirror.contains_key(digest) {
+                    probe.mirror_count += 1;
+                    probe.mirror_bytes += sz;
+                } else {
+                    probe.fetched_count += 1;
+                    probe.fetched_bytes += sz;
+                }
+            }
+        }
+
+        self.metrics
+            .input_server_missing_hit_disk_count
+            .fetch_add(probe.disk_count, Ordering::Relaxed);
+        self.metrics
+            .input_server_missing_hit_disk_bytes
+            .fetch_add(probe.disk_bytes, Ordering::Relaxed);
+        self.metrics
+            .input_server_missing_hit_mirror_count
+            .fetch_add(probe.mirror_count, Ordering::Relaxed);
+        self.metrics
+            .input_server_missing_hit_mirror_bytes
+            .fetch_add(probe.mirror_bytes, Ordering::Relaxed);
+        self.metrics
+            .input_server_missing_fetched_count
+            .fetch_add(probe.fetched_count, Ordering::Relaxed);
+        self.metrics
+            .input_server_missing_fetched_bytes
+            .fetch_add(probe.fetched_bytes, Ordering::Relaxed);
+
+        Ok(probe)
     }
 
     /// Like [`populate_fast_store`](Self::populate_fast_store) but skips the
@@ -8093,6 +8236,75 @@ struct FastSlowStoreMetrics {
         help = "Count of insert_mirror_blob calls rejected because the mirror_blobs byte cap would be exceeded"
     )]
     mirror_blobs_cap_exceeded_total: AtomicU64,
+    // ── (#mapgap) worker input-materialization FALSE-MISSING probe, SPLIT
+    // BY SOURCE ──
+    // OBSERVABILITY-ONLY. The gap being hunted: the scheduler flags input
+    // blobs "missing on worker X" that X demonstrably holds (the routing
+    // blob_locality_map under-reports holdings). On the worker's
+    // `download_to_directory` path, for each digest the SERVER flagged
+    // `missing_digests` in `StartExecute`, we resolve WHERE the worker
+    // actually had it (or didn't), mirroring the exact 3-way branch of
+    // `populate_fast_store`:
+    //   1. DISK  — `fast_store.has()` == Some. The blob is on the on-disk
+    //      FilesystemStore. Prefetch pushes are NORMAL writes (they hit
+    //      disk + fire `on_insert`/BlobChangeTracker → ARE reported), so a
+    //      HIGH disk-hit rate means the map is STALE about DISK holdings it
+    //      should already know (a report lag / tracking bug), NOT the
+    //      mirror gap.
+    //   2. MIRROR — served via `materialize_mirror_to_fast`: the blob sat in
+    //      the in-memory `mirror_blobs` buffer. Mirror (≥2-replica
+    //      durability) writes skip disk AND the tracker (`update` is_mirror
+    //      early-return), so THESE are the held-but-UNREPORTED holdings —
+    //      THE mirror gap. A high mirror-hit rate is the smoking gun.
+    //   3. FETCHED — neither on disk nor in mirror: a genuine miss the
+    //      worker fetched from the slow tier (slow-read fired).
+    // The three partition the server-flagged-missing set exactly. Pairs
+    // with the server-side `scheduler...locality_map.digest_count` gauge
+    // (map knowledge) + the worker `mirror_blobs_*` gauges below (buffer
+    // occupancy). `Relaxed`, off any hot per-chunk loop; counts only, no
+    // state mutated, no fetch/hardlink decision altered.
+    //
+    // NOTE (design-vs-code): a disk/mirror-hit digest is STILL fetched
+    // redundantly by the fetcher's `populate_fast_store_unchecked` (no
+    // has() short-circuit) — this OBSERVES the waste; it does not suppress
+    // the redundant fetch (that would be a behavior change, out of scope).
+    /// (#mapgap) DISK false-missing count: server flagged missing but
+    /// `fast_store.has()` held it. High = map stale about reported DISK
+    /// holdings (lag/report bug), not the mirror gap.
+    #[metric(
+        help = "(#mapgap) count of server-flagged-missing input digests the worker held ON DISK (fast_store.has()==Some); high = locality-map stale about REPORTED disk holdings (lag/report bug), not the mirror gap"
+    )]
+    input_server_missing_hit_disk_count: AtomicU64,
+    /// (#mapgap) DISK false-missing byte mass.
+    #[metric(
+        help = "(#mapgap) cumulative bytes of server-flagged-missing input digests the worker held on disk (fast_store.has()==Some)"
+    )]
+    input_server_missing_hit_disk_bytes: AtomicU64,
+    /// (#mapgap) MIRROR false-missing count: server flagged missing but the
+    /// blob sat in the in-memory `mirror_blobs` buffer (≥2-replica
+    /// durability copy, skips disk + tracker). THE mirror gap: held but
+    /// unreported. High = the locality map is blind to mirror replicas.
+    #[metric(
+        help = "(#mapgap) count of server-flagged-missing input digests the worker held in the in-memory MIRROR buffer (materialize_mirror_to_fast); THE mirror gap — held-but-unreported ≥2-replica copies the locality map is blind to"
+    )]
+    input_server_missing_hit_mirror_count: AtomicU64,
+    /// (#mapgap) MIRROR false-missing byte mass.
+    #[metric(
+        help = "(#mapgap) cumulative bytes of server-flagged-missing input digests the worker held in the in-memory mirror buffer (the mirror-gap byte mass)"
+    )]
+    input_server_missing_hit_mirror_bytes: AtomicU64,
+    /// (#mapgap) GENUINE-miss count: server flagged missing, worker held it
+    /// neither on disk nor in mirror → really fetched from the slow tier.
+    /// Denominator-complement of the two hit buckets.
+    #[metric(
+        help = "(#mapgap) count of server-flagged-missing input digests the worker genuinely did NOT hold (neither disk nor mirror → slow-read fired); true miss"
+    )]
+    input_server_missing_fetched_count: AtomicU64,
+    /// (#mapgap) GENUINE-miss byte mass.
+    #[metric(
+        help = "(#mapgap) cumulative bytes of server-flagged-missing input digests the worker genuinely did not hold (true-miss byte mass)"
+    )]
+    input_server_missing_fetched_bytes: AtomicU64,
 }
 
 impl Drop for FastSlowStore {

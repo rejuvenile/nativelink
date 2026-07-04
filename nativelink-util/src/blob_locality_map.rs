@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nativelink_error::{Error, make_input_err};
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, group, publish,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -387,6 +390,78 @@ impl BlobLocalityMap {
             .iter()
             .map(|(endpoint, digests)| (endpoint.clone(), digests.iter().copied().collect()))
             .collect()
+    }
+}
+
+/// (#mapgap) OBSERVABILITY-ONLY. Renders the routing-map's SIZE at scrape
+/// time so a `/metrics` scrape shows "the map knows N digests across E
+/// endpoints, and endpoint X holds K of them". This quantifies the
+/// locality-map completeness gap: the scheduler flags input blobs
+/// "missing on worker X" that X demonstrably has, so we need to see how
+/// far the map's knowledge (this gauge) diverges from the workers' actual
+/// FS contents (measured worker-side by the `input_server_missing_*`
+/// counters on the worker `FastSlowStore`).
+///
+/// This is a manual `MetricsComponent` impl (not a derive) so the counts
+/// are computed AT SCRAPE from the live map — never maintained as a
+/// running delta on the hot `register_blobs` / `evict_blobs` path (those
+/// process 500K+ digests/sec). The gauge therefore reflects every
+/// register/evict by construction: it is read, not accumulated.
+///
+/// Composition: the field this impl backs is
+/// `ApiWorkerScheduler.locality_map: Option<SharedBlobLocalityMap>` =
+/// `Option<Arc<parking_lot::RwLock<BlobLocalityMap>>>`. The library's
+/// `Option`, `Arc`, and `parking_lot::RwLock` `MetricsComponent` impls
+/// chain to this leaf; the `parking_lot::RwLock` impl uses `try_read()`
+/// (skip-on-contention → empty `Component`), so a contended map never
+/// parks the tokio worker running the metrics scrape
+/// (`metrics_publisher.rs` regression class). **No behavior change** — no
+/// state is mutated; this only reads counts.
+impl MetricsComponent for BlobLocalityMap {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        // Enter a group named after the field (`locality_map`) so the two
+        // headline gauges render as `<prefix>_locality_map_digest_count`
+        // and `<prefix>_locality_map_endpoint_count` — matching the
+        // FuncCounterWrapper/CounterWithTime manual-publish convention.
+        let _enter = group!(field_metadata.name).entered();
+
+        publish!(
+            "digest_count",
+            &(self.blobs.len() as u64),
+            MetricKind::Counter,
+            "(#mapgap) point-in-time distinct digests the routing blob_locality_map knows about across all endpoints; compare with worker-side input_server_missing_but_fast_hit_count to size the map-vs-FS completeness gap"
+        );
+        publish!(
+            "endpoint_count",
+            &(self.endpoint_blobs.len() as u64),
+            MetricKind::Counter,
+            "(#mapgap) point-in-time worker endpoints the routing blob_locality_map has any holdings for"
+        );
+
+        // Per-endpoint holdings: `<prefix>_locality_map_endpoints_<ep>_blob_count`.
+        // Lets a scrape read the per-worker domino (endpoint X knows K
+        // digests) so an under-reporting endpoint is visible against the
+        // fleet. Iterates the reverse index (`endpoint → digest set`), the
+        // same source `all_endpoints()`/`endpoint_count()` read — O(E)
+        // endpoints, each a `HashSet::len()`, at scrape only.
+        {
+            let _endpoints_enter = group!("endpoints").entered();
+            for (endpoint, digests) in &self.endpoint_blobs {
+                let _ep_enter = group!(endpoint.as_ref()).entered();
+                publish!(
+                    "blob_count",
+                    &(digests.len() as u64),
+                    MetricKind::Counter,
+                    "(#mapgap) point-in-time distinct digests this endpoint holds per the routing blob_locality_map"
+                );
+            }
+        }
+
+        Ok(MetricPublishKnownKindData::Component)
     }
 }
 
@@ -852,5 +927,149 @@ mod tests {
         // After eviction, no longer present.
         map.evict_blobs("worker-a:50081", &[d1]);
         assert!(!map.has_digest(&d1));
+    }
+
+    /// (#mapgap) Render-test: the routing-map SIZE gauges must appear on the
+    /// PRODUCTION `/metrics` collection path with the CORRECT counts, and
+    /// must TRACK register/evict (they are read at scrape, not accumulated).
+    ///
+    /// Drives the SAME walk `metrics_handler` uses in prod
+    /// (`metrics_publisher::render_prometheus`) against the EXACT field
+    /// composition `ApiWorkerScheduler` uses — a `#[derive(MetricsComponent)]`
+    /// struct with a `#[metric] locality_map: Option<SharedBlobLocalityMap>`
+    /// field (`Option<Arc<parking_lot::RwLock<BlobLocalityMap>>>`). The
+    /// library `Option`/`Arc`/`parking_lot::RwLock` impls chain to
+    /// `BlobLocalityMap::publish`, which self-namespaces under a
+    /// `group!("locality_map")` (bare `#[metric]` field → default empty
+    /// derive group, so the leaf owns its namespace, matching the
+    /// `CounterWithTime`/`FuncCounterWrapper` manual-publish precedent). The
+    /// resulting name shape is `<prefix>_locality_map_<leaf>`, matching prod.
+    ///
+    /// Mutation (per CLAUDE.md TDD): comment out the `digest_count`
+    /// `publish!` in `BlobLocalityMap::publish` — the first assertion
+    /// red-fails with its bespoke "#mapgap: ... dark on /metrics" message.
+    #[test]
+    fn blob_locality_map_size_gauges_render_on_metrics_endpoint() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // Minimal faithful composition: the field annotation + the leaf
+        // impl together (the real ApiWorkerScheduler field is
+        // `#[metric] locality_map: Option<SharedBlobLocalityMap>`).
+        #[derive(nativelink_metric::MetricsComponent)]
+        struct SchedLike {
+            #[metric]
+            locality_map: Option<SharedBlobLocalityMap>,
+        }
+
+        // Two endpoints, one shared digest: digest_count = 3 distinct,
+        // endpoint_count = 2, worker_a holds 2 (d1,d2), worker_b holds 2
+        // (d2,d3). Distinctive counts double as a wrong-field guard.
+        let mut map = BlobLocalityMap::new();
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 200);
+        let d3 = DigestInfo::new([3u8; 32], 300);
+        map.register_blobs("worker_a", &[d1, d2]);
+        map.register_blobs("worker_b", &[d2, d3]);
+        assert_eq!(map.digest_count(), 3);
+        assert_eq!(map.endpoint_count(), 2);
+
+        let sched = SchedLike {
+            locality_map: Some(Arc::new(RwLock::new(map))),
+        };
+
+        let registry = MetricsRegistry::new();
+        registry.register("scheduler.testsched.worker", Arc::new(sched));
+
+        // Warm the lazy span-thread-local path once (same de-flake the
+        // scheduler render test uses) then take the asserted render.
+        let _warm = render_prometheus(&registry);
+        let body = render_prometheus(&registry);
+
+        assert!(
+            body.contains("locality_map_digest_count"),
+            "#mapgap: BlobLocalityMap.digest_count dark on /metrics — the \
+             routing-map size gauge did not render; the map-vs-FS completeness \
+             gap is unmeasurable. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_digest_count 3\n"
+            ),
+            "#mapgap: locality_map digest_count rendered the wrong value \
+             (expected 3 distinct digests) — group/field routing is wrong. \
+             body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_endpoint_count 2\n"
+            ),
+            "#mapgap: locality_map endpoint_count rendered the wrong value \
+             (expected 2 endpoints). body=\n{body}"
+        );
+        // Per-endpoint domino: worker_a and worker_b each hold 2 digests.
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_endpoints_worker_a_blob_count 2\n"
+            ),
+            "#mapgap: per-endpoint blob_count for worker_a dark or wrong \
+             (expected 2) — the per-worker domino is not scrapeable. body=\n{body}"
+        );
+        assert!(
+            body.contains(
+                "\nscheduler_testsched_worker_locality_map_endpoints_worker_b_blob_count 2\n"
+            ),
+            "#mapgap: per-endpoint blob_count for worker_b dark or wrong \
+             (expected 2). body=\n{body}"
+        );
+    }
+
+    /// (#mapgap) The size gauges must DECREASE after an eviction — proving
+    /// they are read at scrape (reflect the live map) rather than a
+    /// monotonic accumulator. Evicts d1 from worker_a and re-renders.
+    #[test]
+    fn blob_locality_map_size_gauges_track_eviction() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        #[derive(nativelink_metric::MetricsComponent)]
+        struct SchedLike {
+            #[metric]
+            locality_map: Option<SharedBlobLocalityMap>,
+        }
+
+        let map = BlobLocalityMap::new();
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 200);
+        let shared: SharedBlobLocalityMap = Arc::new(RwLock::new(map));
+        shared.write().register_blobs("worker_a", &[d1, d2]);
+
+        let sched = SchedLike {
+            locality_map: Some(shared.clone()),
+        };
+        let registry = MetricsRegistry::new();
+        registry.register("sched.s.worker", Arc::new(sched));
+
+        let _warm = render_prometheus(&registry);
+        let before = render_prometheus(&registry);
+        assert!(
+            before.contains("\nsched_s_worker_locality_map_digest_count 2\n"),
+            "#mapgap: pre-eviction digest_count expected 2. body=\n{before}"
+        );
+
+        // Evict one digest; the gauge must now read 1 at scrape.
+        shared.write().evict_blobs("worker_a", &[d1]);
+        let after = render_prometheus(&registry);
+        assert!(
+            after.contains("\nsched_s_worker_locality_map_digest_count 1\n"),
+            "#mapgap: post-eviction digest_count expected 1 — the gauge did \
+             NOT track the evict, so it is accumulating rather than reading \
+             the live map. body=\n{after}"
+        );
+        assert!(
+            after.contains(
+                "\nsched_s_worker_locality_map_endpoints_worker_a_blob_count 1\n"
+            ),
+            "#mapgap: post-eviction per-endpoint blob_count expected 1. \
+             body=\n{after}"
+        );
     }
 }

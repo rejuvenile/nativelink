@@ -2777,6 +2777,64 @@ pub fn download_to_directory<'a>(
             "download_to_directory: batch existence check complete"
         );
 
+        // (#mapgap) OBSERVABILITY-ONLY false-missing probe, SPLIT BY SOURCE.
+        // The gap being hunted: the scheduler flags input blobs "missing on
+        // worker X" that X already holds (the routing blob_locality_map
+        // under-reports holdings). When the SERVER supplied `missing_digests`
+        // hints (the path above TRUSTS them and skips the per-digest
+        // `has_with_results` for latency), we do NOT otherwise learn whether
+        // those digests were truly absent — or, if present, from WHERE.
+        // `probe_input_missing_sources` resolves each server-flagged-missing
+        // digest 3 ways (mirroring `populate_fast_store`'s branch):
+        //   - DISK: on the on-disk FilesystemStore. Prefetch pushes are
+        //     NORMAL writes (hit disk + fire the tracker → reported), so a
+        //     high disk-hit rate means the map is STALE about REPORTED disk
+        //     holdings (lag/report bug), not the mirror gap.
+        //   - MIRROR: in the in-memory `mirror_blobs` buffer (≥2-replica
+        //     durability copy — skips disk + tracker → held-but-UNREPORTED).
+        //     THE mirror gap; a high mirror-hit rate is the smoking gun.
+        //   - FETCHED: neither → a genuine miss.
+        // Counts render under the worker CAS FSS tree
+        // (`nativelink_WORKER_FAST_SLOW_STORE_input_server_missing_hit_{disk,
+        // mirror}_*` + `_fetched_*`) and pair with the server-side
+        // `scheduler...locality_map.digest_count` gauge + the worker
+        // `mirror_blobs_{digest_count,total_bytes}` gauges.
+        //
+        // Gated to the server-hints branch (the only case where the gap
+        // exists) AND a non-empty missing set. Cost: one batched in-memory
+        // fast-store has() + one `mirror_blobs` read over the missing set
+        // (NO disk I/O) — dwarfed by the fetch it precedes; results feed
+        // counters only, never routing (the fetch pipeline still uses
+        // `missing_digests` unchanged). NO behavior change: no state mutated,
+        // no fetch/hardlink decision altered; the redundant fetch of a
+        // disk/mirror-hit digest by the fetcher's
+        // `populate_fast_store_unchecked` (no has() short-circuit) is
+        // OBSERVED here, not suppressed.
+        if server_missing_digests.is_some() && !missing_digests.is_empty() {
+            match cas_store.probe_input_missing_sources(&missing_digests).await {
+                Ok(probe) => {
+                    if probe.mirror_count > 0 || probe.disk_count > 0 {
+                        warn!(
+                            hit_disk_count = probe.disk_count,
+                            hit_disk_bytes = probe.disk_bytes,
+                            hit_mirror_count = probe.mirror_count,
+                            hit_mirror_bytes = probe.mirror_bytes,
+                            fetched_count = probe.fetched_count,
+                            server_missing = missing_digests.len(),
+                            "download_to_directory: #mapgap server flagged digests missing that the worker already held (false-missing; locality-map under-report). mirror_count = the held-but-unreported mirror gap"
+                        );
+                    }
+                }
+                Err(err) => {
+                    // Observability probe must never fail the action.
+                    warn!(
+                        ?err,
+                        "download_to_directory: #mapgap false-missing probe failed; skipping count for this action"
+                    );
+                }
+            }
+        }
+
         // Steps 4+5 (pipelined): Three concurrent futures:
         //
         //   Fetcher: launches ALL missing blob fetches at once with bounded
