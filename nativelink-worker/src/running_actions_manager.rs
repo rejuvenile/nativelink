@@ -3395,6 +3395,13 @@ pub async fn prepare_output_directory(
     // branch WILL fire — `fs::remove_file` on a real directory fails with
     // EISDIR and surfaces as "Failed to remove symlink: …", pointing nowhere
     // near the true cause. Name this invariant now so that change is caught.
+    //
+    // TIMING (post-#clonefile-fallback): [C] output-dir prep now runs
+    // sequentially AFTER [B2] materialises the input tree, so it walks over a
+    // clonefile'd tree. The invariant still holds because clonefile produces
+    // writable (0o755) dirs (`fs_util.rs` clone perms) — but a change to that
+    // clone-perms behavior, not just to `download_to_directory`, would now also
+    // trip this branch. Fence-watch both.
     let _guard = lock.lock().await;
     // #86: every acquire (denominator for slow-path rate). Routed to the
     // process-global singleton registered with MetricsRegistry so this
