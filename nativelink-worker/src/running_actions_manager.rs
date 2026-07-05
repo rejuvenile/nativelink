@@ -91,58 +91,6 @@ use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-// FU-8: injection seam for the O5 concurrency happens-before test.
-//
-// The seam injects a controllable gate at the entry of `batch_read_small_blobs`
-// so the test can:
-//   1. Block [B2] at the gate.
-//   2. Wait until [B2] has entered the gate (via `entered` Notify).
-//   3. Wait for [C] (output-dir prep) to complete while [B2] is frozen.
-//   4. Release the gate and await task completion.
-//
-// Gated behind `#[cfg(feature = "test-utils")]`: the static, struct, and
-// install function are compiled only when the test-utils feature is active.
-// The gate-check inside `batch_read_small_blobs` is guarded by the same cfg.
-// Integration tests that use this seam declare `required-features = ["test-utils"]`
-// in Cargo.toml. The default (production) build sees zero overhead — the
-// Mutex, LazyLock, and gate-check branch are absent from the binary.
-// See `.claude/audits/fu8-action-prep-bench-seam-design-2026-06-15.md`.
-#[cfg(feature = "test-utils")]
-pub struct BatchReadTestGate {
-    /// Notified once when `batch_read_small_blobs` has entered and is about
-    /// to block.  Test waits on this before asserting [C]'s output dirs.
-    pub entered: Notify,
-    /// Notified by the test to release `batch_read_small_blobs` so [B2]
-    /// can complete and the action can proceed.
-    pub release: Notify,
-}
-
-// UNBOUNDED-OK: single Arc<BatchReadTestGate> slot; bounded to one per process
-// in test; absent from production builds (cfg-gated).
-#[cfg(feature = "test-utils")]
-static BATCH_READ_TEST_GATE: std::sync::LazyLock<
-    parking_lot::Mutex<Option<std::sync::Arc<BatchReadTestGate>>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
-
-/// Install a `BatchReadTestGate` so the next call to `batch_read_small_blobs`
-/// (in any task running in this process) will block until `gate.release` is
-/// notified. Returns the installed gate.
-///
-/// The gate is removed after each use inside `batch_read_small_blobs` so it
-/// does not affect subsequent calls. Safe to call from multiple sequential
-/// tests (serial_test serialises the whole module).
-///
-/// Only available when the `test-utils` feature is enabled.
-#[cfg(feature = "test-utils")]
-pub fn install_batch_read_test_gate() -> std::sync::Arc<BatchReadTestGate> {
-    let gate = std::sync::Arc::new(BatchReadTestGate {
-        entered: Notify::new(),
-        release: Notify::new(),
-    });
-    *BATCH_READ_TEST_GATE.lock() = Some(gate.clone());
-    gate
-}
-
 // =============================================================================
 // Scheduler-rebalance calibration probes (P-A action-shape, P-B input-staging).
 //
@@ -882,7 +830,7 @@ static CLEANUP_DELETE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// Test-only injectable delete hook. When installed, [`bounded_remove_dir_all`]
 /// routes the delete through this closure (still under the real semaphore
 /// permit) instead of touching the filesystem, letting a test observe the
-/// max concurrent-delete count. Mirrors the `BATCH_READ_TEST_GATE` seam:
+/// max concurrent-delete count. Standard test-injection seam shape:
 /// `LazyLock<Mutex<Option<..>>>`, single slot, absent from production builds.
 #[cfg(feature = "test-utils")]
 #[expect(clippy::type_complexity, reason = "test-only injected async delete fn")]
@@ -1619,19 +1567,6 @@ async fn batch_read_small_blobs(
     cas_store: &FastSlowStore,
     small_digests: &[DigestInfo],
 ) -> Result<HashSet<DigestInfo>, Error> {
-    // FU-8 O5 concurrency seam: if a test has installed a gate, signal
-    // "entered" (so the test knows [B2] is blocked) and then park until
-    // the test calls gate.release.notify_one(). The gate is taken out of
-    // the static so it fires exactly once per install; subsequent calls
-    // (from the same action or a later test) are unaffected.
-    // Only compiled when the `test-utils` feature is active; zero production
-    // overhead in default builds.
-    #[cfg(feature = "test-utils")]
-    if let Some(gate) = BATCH_READ_TEST_GATE.lock().take() {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
-
     let slow_store = cas_store.slow_store();
 
     // Try locality-aware routing through WorkerProxyStore.
@@ -4655,35 +4590,39 @@ impl RunningActionImpl {
         //          on [B2] result — only needs command.{output_files,output_paths,
         //          working_directory} from [A])
         //
-        // Old shape: try_join([A],[B1]+[B2]) → [C]   (C waits on all of B)
-        // New shape (normal mode !is_direct_use):
-        //   [A] alone → [B1] alone → try_join([B2], [C])
-        //   [C] overlaps with the bulk of input download, saving ~2-10ms.
-        //   TODO(bench): 2-10ms is an unmeasured design estimate; the overlap
-        //   win has not been isolated in production. The in-process timing
-        //   measurement (FU-8) was confounded by spawn_blocking thread pool
-        //   contention between [B2]'s fast-store write phase and [C]'s mkdir
-        //   phase — a harness artefact absent in production where [B2]'s
-        //   dominant latency is network RTT. The exact production win requires
-        //   a production deployment trace (tracked as FU-12).
-        //   See .claude/audits/fu8-action-prep-bench-seam-design-2026-06-15.md.
-        //   The concurrency contract ([C] runs while [B2] is blocked) is
-        //   tested by o5_overlap_c_runs_while_b2_blocked (FU-8).
+        // Shape (normal mode !is_direct_use):
+        //   [A] alone → [B1] alone → [B2] alone → [C]
+        //   ([B2] materialises into the EMPTY work_dir, THEN [C] creates the
+        //   output-path parent dirs.)
         //
-        // Safety: the O5 prereq (commit 1) makes [B2]'s BFS mkdir tolerate
-        // AlreadyExists when the entry is already a directory — so [C]
-        // pre-creating a shared parent dir no longer causes a spurious failure.
+        // #clonefile-fallback (reverts the O5 [B2]∥[C] overlap, commit 333ce15e):
+        //   [B2]'s DirectoryCache-hit materialise bottoms out in
+        //   `hardlink_directory_tree` → `try_clonefile` (macOS), which requires
+        //   an empty/absent dst. The O5 overlap ran [C] concurrently with [B2]
+        //   into the SAME work_dir, so [C] pre-created output dirs (`bazel-out/`)
+        //   before the materialise ran → non-empty dst → clonefile ALWAYS
+        //   preempted → every action fell back to the ~600ms per-file hardlink
+        //   (`dir_cache_hit_clonefile_total = 0` fleet-wide). Serialising [B2]
+        //   before [C] restores the empty-dst precondition so the ~1ms
+        //   whole-tree clonefile(2) fires.
         //
-        // Direct-use mode guard: [C]'s create_dir_all MUST NOT create
-        // work_directory as a real directory before get_or_create_direct creates
-        // it as a symlink. Guard: in direct-use mode keep the original
-        // try_join([A],[B]) → [C] sequential structure (no overlap applied).
+        //   Chesterton / net tradeoff: O5 (333ce15e) hid [C]'s mkdir behind the
+        //   input download for an UNMEASURED design estimate of ~2-10ms
+        //   (data_plane_bench has zero action-prep cells; the in-process FU-8
+        //   measurement was confounded by spawn_blocking contention). The
+        //   clonefile it blocked is ~600ms measured (the sole
+        //   `record_hit_assemble_ms` site). Dropping the overlap to unblock
+        //   clonefile is a net-~600ms win on the critical path (hit AND
+        //   post-miss-construct), far exceeding the ~2-10ms overlap it gives up.
         //
-        // Behavior change: in !is_direct_use mode, [C] now runs concurrently
-        // with [B2] instead of sequentially after it. Total latency reduction
-        // is the fraction of [C]'s duration that previously waited on [B2].
-        // Unmeasured (data_plane_bench has zero action-prep cells); design
-        // estimate 2-10ms on the critical path.
+        // Safety: the O5 prereq (commit 21e51dce / 6305159d) that makes the
+        // materialise BFS tolerate AlreadyExists-on-directory is retained (it is
+        // now a pure no-op since [C] no longer pre-populates in normal mode, but
+        // it still guards the direct-use path and any future concurrency).
+        //
+        // Direct-use mode is unchanged: try_join([A],[B]) → [C] sequential;
+        // work_directory is a symlink created by get_or_create_direct before [C]
+        // runs. [C] is created in the shared post-block below in BOTH modes.
         let command_digest = self.action_info.command_digest;
         let is_direct_use = self.running_actions_manager.directory_cache
             .as_ref()
@@ -4756,9 +4695,11 @@ impl RunningActionImpl {
             command = cmd;
             direct_use_pin = pin;
         } else {
-            // Normal mode: O5 overlap — [A] first, then [B1], then [C]∥[B2].
+            // Normal mode (#clonefile-fallback): [A] → [B1] → [B2] → [C].
+            // [B2] materialises into the empty work_dir before [C] creates
+            // output dirs, so the macOS clonefile(2) fast path can fire.
             let op_id_for_cmd = operation_id.clone();
-            info!(%operation_id, "inner_prepare_action: fetching command [A] alone (O5 overlap, normal mode)");
+            info!(%operation_id, "inner_prepare_action: fetching command [A] alone (materialise-first, normal mode)");
             let cmd: ProtoCommand = self.metrics().get_proto_command_from_store.wrap(async {
                 info!(%op_id_for_cmd, ?command_digest, "inner_prepare_action: command_fut entered");
                 let res = get_and_decode_digest::<ProtoCommand>(
@@ -4783,11 +4724,10 @@ impl RunningActionImpl {
             })
             .await?;
 
-            // [B1]: Create work_directory before launching [B2]∥[C].
-            // This ensures work_directory exists before [C]'s create_dir_all
-            // descends into it (avoiding [C] pre-creating work_directory, which
-            // would cause [B1]'s create_dir to fail with AlreadyExists in the
-            // original pre-O5 shape — avoided by sequencing [B1] before [C]).
+            // [B1]: Create the (empty) work_directory before [B2] materialises
+            // into it. [B2]'s clonefile(2) fast path (macOS) removes this empty
+            // dir and re-creates it as the CoW clone root; a non-empty dir would
+            // preempt clonefile (see #clonefile-fallback note above).
             info!(%operation_id, "inner_prepare_action: creating work_directory [B1]");
             fs::create_dir(&self.work_directory)
                 .await
@@ -4795,82 +4735,41 @@ impl RunningActionImpl {
             // Mark cleanup needed once the directory exists.
             self.did_cleanup.store(false, Ordering::Release);
 
-            // [C]∥[B2]: Output-dir prep concurrently with input download.
+            // #clonefile-fallback: materialise the input tree [B2] into the
+            // EMPTY work_directory FIRST, then create the output-only dirs [C]
+            // AFTER (unified post-block, below). The prior O5 overlap ran [C]
+            // concurrently with [B2] into the same work_directory, so [C]
+            // pre-created output dirs (e.g. `bazel-out/`) before [B2]'s
+            // materialise ran — leaving the work dir non-empty. On macOS
+            // `try_clonefile` requires an empty/absent dst, so the whole-tree
+            // clonefile(2) fast path (~1ms CoW) was ALWAYS preempted and every
+            // action fell back to the ~600ms per-file hardlink
+            // (`dir_cache_hit_clonefile_total = 0` fleet-wide). Serialising the
+            // materialise before the output-dir mkdir restores the empty-dst
+            // precondition. See the O5 Chesterton note in the commit message:
+            // the overlap saved an unmeasured ~2-10ms; the clonefile it blocked
+            // saves ~600ms — a net-huge win even dropping the overlap entirely.
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
             let pre_resolved_tree = self.pre_resolved_tree.lock().take();
             let server_missing_digests = self.server_missing_digests.lock().take();
-            let op_id_for_inputs = operation_id.clone();
 
-            // [C] future: create parent directories for declared outputs.
-            // Clones of command fields needed since cmd is moved into [B2] scope.
-            let work_dir_for_output = self.work_directory.clone();
-            let symlink_fix_lock = Arc::new(tokio::sync::Mutex::new(()));
-            // #86: O14 counters via process-global symlink_fix_counters().
-            let working_directory_for_output = cmd.working_directory.clone();
-            // UNBOUNDED-OK: action-scoped path strings, freed after try_join;
-            // bounded by the REAPI Command proto size limit.
-            let output_files_for_c: Vec<String> = cmd.output_files.clone();
-            // UNBOUNDED-OK: action-scoped path strings, freed after try_join;
-            // bounded by the REAPI Command proto size limit.
-            let output_paths_for_c: Vec<String> = cmd.output_paths.clone();
-            let lock_c = symlink_fix_lock.clone();
-            // Clone metrics arc so it can be moved into the async block without
-            // borrowing self (which is already partially moved into [B2] scope).
-            let metrics_for_c = self.metrics().clone();
-            let output_dirs_fut = async move {
-                let prepare_output = |output_file: String| {
-                    let work_dir = work_dir_for_output.clone();
-                    let lock = lock_c.clone();
-                    let working_directory = working_directory_for_output.clone();
-                    async move {
-                        prepare_output_directory(
-                            &work_dir,
-                            &working_directory,
-                            &output_file,
-                            &lock,
-                        )
-                        .await
-                    }
-                };
-                metrics_for_c
-                    .prepare_output_files
-                    .wrap(try_join_all(
-                        output_files_for_c.into_iter().map(prepare_output.clone()),
-                    ))
-                    .await?;
-                metrics_for_c
-                    .prepare_output_paths
-                    .wrap(try_join_all(
-                        output_paths_for_c.into_iter().map(prepare_output),
-                    ))
-                    .await?;
-                Ok::<(), Error>(())
-            };
-
-            // [B2] future: download/materialise input tree.
-            let inputs_fut = async {
-                info!(%op_id_for_inputs, "inner_prepare_action: prepare_action_inputs [B2] entered (O5 overlap)");
-                let res = self.metrics()
-                    .download_to_directory
-                    .wrap(prepare_action_inputs(
-                        &self.running_actions_manager.directory_cache,
-                        &self.running_actions_manager.cas_store,
-                        filesystem_store_pin,
-                        &self.action_info.input_root_digest,
-                        &self.work_directory,
-                        pre_resolved_tree,
-                        server_missing_digests,
-                        Some(&calib_input_bytes),
-                    ))
-                    .await;
-                info!(%op_id_for_inputs, ok = res.is_ok(), "inner_prepare_action: prepare_action_inputs [B2] complete");
-                res
-            };
-
-            info!(%operation_id, "inner_prepare_action: try_join([B2], [C]) starting (O5 overlap)");
-            let (pin, ()) = try_join(inputs_fut, output_dirs_fut).await?;
-            info!(%operation_id, "inner_prepare_action: try_join([B2],[C]) complete (O5 overlap)");
+            // [B2]: download/materialise input tree into the empty work_dir.
+            info!(%operation_id, "inner_prepare_action: prepare_action_inputs [B2] into empty work_dir (materialise-first)");
+            let pin = self.metrics()
+                .download_to_directory
+                .wrap(prepare_action_inputs(
+                    &self.running_actions_manager.directory_cache,
+                    &self.running_actions_manager.cas_store,
+                    filesystem_store_pin,
+                    &self.action_info.input_root_digest,
+                    &self.work_directory,
+                    pre_resolved_tree,
+                    server_missing_digests,
+                    Some(&calib_input_bytes),
+                ))
+                .await?;
+            info!(%operation_id, "inner_prepare_action: prepare_action_inputs [B2] complete (materialise-first)");
 
             command = cmd;
             direct_use_pin = pin;
@@ -4880,16 +4779,29 @@ impl RunningActionImpl {
         // into `state.direct_use_pin`. There is no `.await` between
         // `direct_use_pin` (the local) going out of scope and the
         // assignment, so the ARMED guard is transferred atomically from
-        // any cancellation point. If `try_join` returned Err, the local
-        // never bound — the guard was dropped on the unwinding stack
-        // inside the `try_join` future, firing fetch_sub.
+        // any cancellation point. If the input-materialise (normal mode: the
+        // `?` on [B2]; direct-use mode: the `try_join`) returned Err, the local
+        // never bound — the guard was dropped on the unwinding stack inside the
+        // materialise future, firing fetch_sub.
         if let Some((digest, pin_guard)) = direct_use_pin {
             let mut state = self.state.lock();
             state.direct_use_pin = Some((digest, pin_guard));
         }
-        // In normal mode (O5 overlap), output dirs were already created by [C].
-        // In direct-use mode, create them now (sequential, post-join).
-        if is_direct_use {
+        // [C]: create the output-path parent directories AFTER the input-tree
+        // materialise [B2], in BOTH modes.
+        //
+        // #clonefile-fallback: normal mode now creates output dirs here
+        // (post-materialise) instead of concurrently with [B2] — so [B2]'s
+        // materialise ran against an empty work_dir and the macOS clonefile(2)
+        // fast path can fire. `prepare_output_directory` bottoms out in
+        // idempotent `create_dir_all`, so any input-tree directory the clone
+        // already brought is a no-op; the output-only dirs get created. This is
+        // exactly the sequence direct-use mode already used post-join.
+        //
+        // (Direct-use mode is unchanged: work_directory is a symlink into the
+        // cache created by get_or_create_direct; output dirs are created inside
+        // that symlinked tree here, as before.)
+        {
             // Create all directories needed for our output paths.
             let work_dir_for_output = self.work_directory.clone();
             // Mutex serializes the slow-path symlink replacement to avoid

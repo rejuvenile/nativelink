@@ -1069,6 +1069,16 @@ pub struct DirCacheCounters {
     pub hit_clonefile: AtomicU64,
     /// `dir_cache_hit_hardlink_total.counter` — hit materialised via hardlink.
     pub hit_hardlink: AtomicU64,
+    /// `dir_cache_hit_clonefile_preempted_total.counter` — a HIT-path materialise
+    /// found a NON-EMPTY destination directory. On macOS this preempts the
+    /// whole-tree `clonefile(2)` fast path (`try_clonefile` requires an
+    /// empty/absent dst), forcing the ~600ms per-file hardlink fallback; the
+    /// existing `hit_hardlink` counter conflates that preemption with a genuine
+    /// clonefile failure (cross-device, non-APFS), so this counter is the
+    /// disambiguating diagnostic (#clonefile-fallback). On Linux/Windows the
+    /// hit always hardlinks regardless, so a non-zero value there is
+    /// informational (no clonefile to preempt).
+    pub hit_clonefile_preempted: AtomicU64,
     // ---- #DC3 (scope ext): COLD-construct phase sub-cost decomposition ----
     // The decision instrument for dir-cache ideas #1/#2: red-team showed the
     // construct cost is blob-fetch-dominated, so the phase NAME is the
@@ -1132,6 +1142,7 @@ impl DirCacheCounters {
             fuzzy_match: AtomicU64::new(0),
             hit_clonefile: AtomicU64::new(0),
             hit_hardlink: AtomicU64::new(0),
+            hit_clonefile_preempted: AtomicU64::new(0),
             construct_resolve_ms: PhaseTiming::new(),
             construct_fetch_ms: PhaseTiming::new(),
             hit_assemble_ms: PhaseTiming::new(),
@@ -1167,6 +1178,12 @@ impl DirCacheCounters {
     /// Record a hit materialised via hardlink.
     pub fn record_hit_hardlink(&self) {
         self.hit_hardlink.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a HIT-path materialise that found a non-empty destination
+    /// (clonefile preempted on macOS; informational elsewhere).
+    pub fn record_hit_clonefile_preempted(&self) {
+        self.hit_clonefile_preempted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a COLD-construct resolve-phase observation (ms).
@@ -1240,6 +1257,15 @@ impl MetricsComponent for DirCacheCounters {
             &self.hit_hardlink,
             "Directory-cache hit materialised via hardlink (the shared-inode \
              hit mechanism).",
+        )?;
+        emit(
+            "hit_clonefile_preempted",
+            &self.hit_clonefile_preempted,
+            "Directory-cache hit whose materialise found a NON-EMPTY destination \
+             directory, preempting the macOS clonefile(2) whole-tree fast path \
+             (forcing the per-file hardlink fallback). Disambiguates preemption \
+             from a genuine clonefile failure that hit_hardlink alone conflates \
+             (#clonefile-fallback). Informational on non-macOS (no clonefile).",
         )?;
 
         // #DC3 (scope ext): cold-construct phase sub-cost decomposition.
@@ -2398,6 +2424,9 @@ mod tests {
         for _ in 0..4 {
             counters.record_hit_hardlink();
         }
+        for _ in 0..5 {
+            counters.record_hit_clonefile_preempted();
+        }
 
         let registry = MetricsRegistry::new();
         // Register under "dir_cache" — the prefix production nativelink.rs uses.
@@ -2418,6 +2447,7 @@ mod tests {
             ("dir_cache_fuzzy_match_total_counter", 2),
             ("dir_cache_hit_clonefile_total_counter", 1),
             ("dir_cache_hit_hardlink_total_counter", 4),
+            ("dir_cache_hit_clonefile_preempted_total_counter", 5),
         ] {
             let needle = format!("\n{name} {value}\n");
             assert!(

@@ -513,6 +513,22 @@ async fn validate_constructed_tree(
     ))
 }
 
+/// Returns `true` if `dst` exists AND contains at least one directory entry.
+/// An absent dst returns `false` (absent == empty for the clonefile-eligibility
+/// check). Used by [`DirectoryCache::try_hardlink_cached`] to record the
+/// clonefile-preempted diagnostic (#clonefile-fallback): a non-empty dst at
+/// materialise time forces the macOS `clonefile(2)` fast path to fall back to
+/// per-file hardlink. Reads at most one entry — the presence check does not
+/// walk the tree.
+async fn dst_has_entries(dst: &Path) -> bool {
+    match fs::read_dir(dst).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(Some(_))),
+        // Absent dst (NotFound) or unreadable → treat as empty; the materialise
+        // itself will surface any real error.
+        Err(_) => false,
+    }
+}
+
 impl DirectoryCache {
     /// Creates a new `DirectoryCache`.
     ///
@@ -1892,6 +1908,19 @@ impl DirectoryCache {
             cached_size_bytes = cached_size,
             "DirectoryCache: found in cache, hardlinking",
         );
+
+        // #clonefile-fallback: the macOS `clonefile(2)` whole-tree fast path in
+        // `hardlink_directory_tree` requires an empty/absent dst. If `dest_path`
+        // already contains entries when the materialise runs (e.g. output-dir
+        // prep [C] pre-populated the work dir before this input-tree materialise
+        // [B2]), clonefile is preempted and the hit falls back to the ~600ms
+        // per-file hardlink. Record that preemption as a distinct diagnostic —
+        // `hit_hardlink` alone conflates it with a genuine clonefile failure.
+        // Absent dst = empty = clonefile-eligible (no counter). On non-macOS the
+        // hit always hardlinks regardless, so this is informational there.
+        if dst_has_entries(dest_path).await {
+            dir_cache_counters().record_hit_clonefile_preempted();
+        }
 
         let hardlink_start = Instant::now();
         let result = hardlink_directory_tree(&src_path, dest_path).await;
