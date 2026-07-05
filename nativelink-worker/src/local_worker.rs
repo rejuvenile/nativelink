@@ -2097,11 +2097,16 @@ impl ItemCallback for BlobChangeTracker {
         }
     }
 
-    // On read (cache hit): record PRESENT@stamp with a FRESH counter (a read is
-    // a fresh present transition). Under LWW this SUPERSEDES a stale evict for
-    // the same digest — re-deriving the old `evicted`-set self-suppression: a
-    // blob the worker reads every action can no longer be stranded ABSENT by an
-    // earlier eviction event in the same window.
+    // On read (cache hit): record PRESENT carrying the RESIDENT VALUE'S FROZEN
+    // insert stamp (threaded from `fire_on_get`), NOT a fresh mint — so this
+    // delta is idempotent with the value's own insert delta. It STILL supersedes
+    // a STALE evict (which carries a PREVIOUS value's older stamp) — re-deriving
+    // the old `evicted`-set self-suppression so a blob read every action can't be
+    // stranded ABSENT by an earlier eviction — but it does NOT out-rank the
+    // value's OWN genuine eviction (same stamp → ABSENT wins the tie). A fresh
+    // mint WOULD have gate-killed that genuine eviction (systematic false-
+    // positive; TLC HoldingsTouch: A_GateKill VIOLATES NoGateKilledGenuineEvict,
+    // B HOLDS 3.43M states).
     fn on_get(&self, store_key: StoreKey<'_>, ts_boot_epoch: u64, ts_counter: u64) {
         if let StoreKey::Digest(digest) = store_key {
             let mut pending = self.pending.lock();
