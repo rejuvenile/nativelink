@@ -716,38 +716,12 @@ where
             }
         }
         let result = self.cache.get(key);
-        if result.is_some() {
-            self.fire_on_get(key);
+        if let Some(ref value) = result {
+            // (#locality-map-drift) Carry the value's frozen insert stamp so the
+            // on_get delta matches the insert delta (see `fire_on_get`).
+            self.fire_on_get(key, value.stamp());
         }
         result
-    }
-
-    /// (#locality-map-drift) Like [`Self::get`] but does NOT fire the `on_get`
-    /// callback. For INTERNAL, non-logical lookups (e.g. `FilesystemStore`'s
-    /// post-emplace `still_ours` ptr-eq verification) that must NOT emit a
-    /// "recently read" heat signal.
-    ///
-    /// Why this matters for the holdings LWW: `on_get` mints a FRESH logical-LWW
-    /// counter (so a genuine materialization read can supersede a stale
-    /// out-of-order evict — the false-missing fix). But that fresh counter is
-    /// HIGHER than the value's own frozen insert-counter, so if a spurious read
-    /// fires between a value's insert and its GENUINE eviction, the eviction
-    /// (carrying the value's lower insert-counter) LOSES the LWW and the blob is
-    /// reported PRESENT while gone — a systematic false-POSITIVE on EVERY
-    /// evicted-after-write blob. The `still_ours` check runs on exactly that
-    /// insert→evict seam, so it must use this non-signalling lookup. Genuine
-    /// materialization reads (`get`) still fire `on_get` (the design accepts the
-    /// resulting transient, force_evict-healed false-positive for real reads).
-    ///
-    /// Still promotes the moka LRU (like `get`) — a just-written blob staying
-    /// warm is desirable and independent of the holdings signal.
-    pub async fn get_no_touch(&self, key: &Q) -> Option<T> {
-        if self.has_pinned() {
-            if let Some(entry) = self.pinned.get(key) {
-                return Some(entry.data.clone());
-            }
-        }
-        self.cache.get(key)
     }
 
     /// Retrieve multiple values by key. Sequential iteration is intentional:
@@ -769,8 +743,8 @@ where
                     }
                 }
                 let result = self.cache.get(key);
-                if result.is_some() {
-                    self.fire_on_get(key);
+                if let Some(ref value) = result {
+                    self.fire_on_get(key, value.stamp());
                 }
                 result
             })
@@ -1063,16 +1037,28 @@ where
     /// itself is parameterized over `Q`. Using `&K` would force the
     /// caller to materialize an owned `K`, defeating the fast path.
     #[inline]
-    fn fire_on_get(&self, key: &Q) {
+    fn fire_on_get(&self, key: &Q, ts_counter: u64) {
         if !self.has_callbacks_flag.load(Ordering::Relaxed) {
             return;
         }
-        // (#locality-map-drift) A read is a fresh PRESENT transition (`touched`)
-        // that must be able to SUPERSEDE a stale evict — so it mints a FRESH
-        // counter (higher than any prior evict of an older value of this key),
-        // not the value's insert counter. This is what lets a worker that reads
-        // a hot blob every action rescue it from a persistent false-missing.
-        let ts_counter = self.next_stamp();
+        // (#locality-map-drift) A read carries the RESIDENT VALUE'S FROZEN insert
+        // counter (`value.stamp()`), NOT a fresh mint. So the on_get delta is
+        // PRESENT@(boot_epoch, c_insert) — IDENTICAL to the value's insert delta
+        // (idempotent at the tracker + server LWW).
+        //
+        // Why NOT a fresh mint (this was the original design, DISPROVEN — TLC
+        // HoldingsTouch A_GateKill VIOLATES NoGateKilledGenuineEvict): a fresh
+        // counter would be HIGHER than the value's own insert counter, so a read
+        // between insert and the value's GENUINE eviction would out-rank that
+        // eviction (which carries the low insert counter) → the blob would stay
+        // falsely PRESENT forever (systematic false-positive on every
+        // read-then-evicted blob). Carrying the value stamp avoids that.
+        //
+        // The false-NEGATIVE rescue still works: a STALE evict carries a
+        // PREVIOUS value's OLDER counter (re-admission mints a strictly-higher
+        // insert counter), so this read's PRESENT@c_current still supersedes it
+        // (c_current > c_prev). (TLC HoldingsTouch B: StaleEvictSuppressed still
+        // exercised.)
         let callbacks = self.callbacks.read();
         for cb in callbacks.iter() {
             cb.on_get(key, self.boot_epoch(), ts_counter);

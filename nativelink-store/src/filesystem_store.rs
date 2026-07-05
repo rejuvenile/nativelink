@@ -1550,15 +1550,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             // need to immediately use the entry must verify presence — see
             // FastSlowStore::populate_fast_store_unchecked which does
             // post-write has() + retry once.
-            // (#locality-map-drift) `get_no_touch`, NOT `get`: this is an
-            // internal ptr-eq verification on the insert→evict seam, not a
-            // logical materialization read. Firing `on_get` here would mint a
-            // fresh logical-LWW counter HIGHER than the value's frozen
-            // insert-counter, so the blob's subsequent GENUINE eviction (which
-            // carries the lower insert-counter) would LOSE the server LWW gate
-            // and the blob would be reported PRESENT while evicted — a
-            // systematic false-positive on every evicted-after-write blob.
-            let still_ours = match evicting_map.get_no_touch(&key).await {
+            // (#locality-map-drift) Plain `get` is fine here even though it fires
+            // `on_get`: `fire_on_get` now carries the resident value's FROZEN
+            // insert stamp (not a fresh mint), so this internal read re-registers
+            // PRESENT@(boot_epoch, c_insert) — the SAME stamp the insert already
+            // emitted, i.e. an idempotent no-op at the tracker/server LWW. (Under
+            // the earlier mint-fresh semantics this would have gate-killed the
+            // blob's own genuine eviction; that hazard is gone.)
+            let still_ours = match evicting_map.get(&key).await {
                 Some(map_entry) => Arc::ptr_eq(&map_entry, &entry),
                 None => false,
             };

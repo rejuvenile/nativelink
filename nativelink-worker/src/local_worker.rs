@@ -4130,11 +4130,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
         let new_or_touched_count = digest_infos.len();
         let evicted_count = evicted_blob_infos.len();
-        // (#locality-map-drift) DUAL-EMIT: derive the LEGACY `evicted_digests`
-        // (bare Digest, no ts) from the ts-carrying `evicted_blob_infos` so an
-        // OLD server (pre-tag-24) still reads the eviction from field 4. A NEW
-        // server prefers `evicted_blob_infos` (ts-gated). Same digests, same
-        // order — the two lists are the same eviction set.
+        // (#locality-map-drift) INVARIANT: the legacy `evicted_digests` (bare
+        // Digest, no ts) is DERIVED-FROM `evicted_blob_infos` (filter_map its
+        // digest) — NEVER populate it independently. The wire-skew safety proof
+        // (old server reads field 4, new server reads tag 24, both are the SAME
+        // eviction set) depends on the two lists carrying identical digests in
+        // identical order. An OLD server (pre-tag-24) reads this from field 4; a
+        // NEW server prefers the ts-carrying `evicted_blob_infos`.
         let evicted_digests: Vec<_> = evicted_blob_infos
             .iter()
             .filter_map(|bdi| bdi.digest.clone())

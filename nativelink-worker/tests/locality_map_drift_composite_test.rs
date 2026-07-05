@@ -370,11 +370,9 @@ async fn scenario3_ungated_force_evict_and_heal() {
 // genuine LRU eviction fires the removal callback carrying a NON-ZERO counter
 // (the value's frozen INSERT counter), NOT 0.
 //
-// We assert on the RAW eviction callback ts (captured directly), not on the
-// tracker's post-LWW state: a spurious internal read on the insert→evict seam
-// could otherwise supersede the eviction in the LWW (the exact false-positive
-// the `still_ours`→`get_no_touch` fix removes). Capturing the raw ts is the
-// faithful BLOCK-1 observable — "did the value carry its stamp to the evict".
+// We assert on the RAW eviction callback ts (captured directly by a second
+// ItemCallback), the faithful BLOCK-1 observable — "did the value carry its
+// stamp to the evict" — independent of any downstream LWW.
 //
 // MUTATION (documented): comment out `FileEntryImpl::set_stamp`'s body (make it
 // a no-op again, = pre-BLOCK-1). The eviction callback then fires with counter 0
@@ -508,8 +506,11 @@ async fn scenario4_filesystem_store_eviction_carries_nonzero_stamp() {
         );
 
         // The tracker (production consumer) must ALSO end with d1 ABSENT — the
-        // `still_ours`→`get_no_touch` fix ensures the genuine eviction is not
-        // suppressed by a spurious internal read on the insert→evict seam.
+        // emplace `still_ours` read fires on_get, but `fire_on_get` carries the
+        // value's frozen insert stamp (== the insert delta, idempotent), so it
+        // does NOT gate-kill d1's own genuine eviction. (scenario5 covers the
+        // general read-then-evict case; here we confirm it end-to-end through
+        // the REAL FilesystemStore emplace path.)
         let mut d1_absent_in_tracker = false;
         for _ in 0..50 {
             for (d, state, _stamp) in tracker.swap() {
@@ -526,11 +527,86 @@ async fn scenario4_filesystem_store_eviction_carries_nonzero_stamp() {
         assert!(
             d1_absent_in_tracker,
             "scenario4: the tracker did NOT report d1 ABSENT after a genuine \
-             eviction — a spurious internal read (e.g. the emplace `still_ours` \
-             get) minted a fresh counter that suppressed the eviction in the \
-             LWW. The `still_ours` check must use `get_no_touch` (no on_get)."
+             eviction — a read on the insert→evict seam (the emplace `still_ours` \
+             get) out-ranked the eviction in the LWW. `fire_on_get` must carry \
+             the value's frozen insert stamp so the read is idempotent."
         );
     })
     .await
     .expect("scenario4 deadlocked — composite drift detector");
+}
+
+// ===============================================================
+// Scenario 5: on_get must NOT gate-kill the value's own genuine eviction
+// (the fire_on_get carry-value-stamp fix; TLC HoldingsTouch A_GateKill →
+// NoGateKilledGenuineEvict VIOLATED under mint-fresh, HOLDS under
+// carry-value-stamp).
+//
+// A hot blob is read (on_get) between its insert and its GENUINE eviction. If
+// on_get mints a FRESH counter (> the value's insert counter), the read records
+// PRESENT@c_fresh; the subsequent genuine evict carries the value's LOW insert
+// counter and LOSES the LWW → the blob stays falsely PRESENT on the server
+// FOREVER (a systematic false-POSITIVE on every read-then-evicted blob — the
+// residual tail behind the still_ours patch, because genuine `get_part` reads
+// still fired on_get). The fix: on_get carries the resident value's frozen
+// insert counter (`value.stamp()`), so the on_get delta == the insert delta;
+// the genuine evict (same counter) then TIES and the ABSENT≻PRESENT tie-break
+// removes it → no false-positive.
+//
+// Composition: worker `MokaEvictingMap` + real `BlobChangeTracker` + server
+// `BlobLocalityMap` — crossing on_get producer → tracker apply → wire → server
+// gate (the exact seam the prover requested).
+//
+// MUTATION (documented): revert `fire_on_get` to mint-fresh (`self.next_stamp()`)
+// → the read out-ranks the value stamp, the genuine evict is gate-killed, and
+// this test RED-fails with its bespoke message.
+#[nativelink_test]
+async fn scenario5_on_get_does_not_gate_kill_genuine_eviction() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let endpoint = "grpc://worker-a:50081";
+        let (map, tracker) = build_map_with_tracker(1);
+        let mut server = BlobLocalityMap::new();
+        let d = digest(5);
+
+        // insert(d)@c_insert → tracker PRESENT@(1, c_insert). Apply to server so
+        // d is registered PRESENT there (the steady state a hot blob is in).
+        map.insert(key(d), StampedBytes::new(1000)).await;
+        // A genuine materialization READ of d — fires on_get. Under mint-fresh
+        // this records PRESENT@(1, c_fresh > c_insert); under the fix it records
+        // PRESENT@(1, c_insert) == the insert delta (idempotent).
+        assert!(
+            map.get(&key(d)).await.is_some(),
+            "scenario5: d must be resident to read"
+        );
+        apply_delta_to_server(&mut server, endpoint, &tracker);
+        assert!(
+            server.has_digest(&d),
+            "scenario5 precondition: after insert+read, the server must see d present"
+        );
+
+        // GENUINE eviction of d: the callback carries the VALUE's frozen insert
+        // counter (`value.stamp()`), delivered here deterministically.
+        let (frozen_counter, deliver) = map
+            .test_remove_defer_callback(&key(d))
+            .await
+            .expect("d must be resident to evict");
+        deliver(frozen_counter).await;
+
+        // Apply the eviction delta to the server. The genuine evict MUST remove
+        // d — it must NOT be gate-killed by the earlier read's stamp.
+        apply_delta_to_server(&mut server, endpoint, &tracker);
+
+        assert!(
+            !server.has_digest(&d),
+            "scenario5: on_get minted above the value stamp — the genuine \
+             eviction (carrying the value's insert counter) was GATE-KILLED by \
+             the read's higher fresh counter, so the blob is wrongly reported \
+             PRESENT on the server forever. `fire_on_get` MUST carry the \
+             resident value's frozen stamp (value.stamp()), not a fresh mint, \
+             so the on_get delta equals the insert delta and the value's own \
+             genuine eviction ties + wins the ABSENT≻PRESENT tie-break."
+        );
+    })
+    .await
+    .expect("scenario5 deadlocked — composite drift detector");
 }
