@@ -2723,21 +2723,27 @@ async fn v3c_drain_tick_suppressed_gate_release_confirms_arc_shared() -> Result<
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// #speculative-prefetch P0 — C3/C5 production-composition contention test.
+// #speculative-prefetch P0 — C3/C5 production-composition disjoint-budget test.
 //
 // invariant-prover BLOCK (TLC-proven `.claude/tla/SpeculativePinBudget.tla` →
 // NoStarve VIOLATED under the SHARED budget; `SpeculativePinBudgetFixed.tla` →
 // HOLDS with the DISJOINT sub-budget). This is the store-level realization of
 // that proof: a REAL `MokaEvictingMap`-backed `FilesystemStore` (the fast tier
-// the worker's speculative construct pins into), a small `pin_cap`, a
-// SPECULATIVE construct that pins blobs saturating its sub-budget, then a
-// concurrent REAL construct pinning a DIFFERENT digest → the real pin MUST be
-// admitted (its blob stays resident → its populate is NOT starved into
-// `Aborted`). Under the pre-fix shared budget the speculative pins consume the
-// real pin_cap headroom and the real pin is REFUSED.
+// the worker's speculative construct pins into), a small `pin_cap`, SPECULATIVE
+// pins saturating the sub-budget, then a REAL pin of a DIFFERENT digest → the
+// real pin MUST be admitted (its blob stays resident → its populate is NOT
+// starved into `Aborted`). Under the pre-fix shared budget the speculative pins
+// consume the real pin_cap headroom and the real pin is REFUSED.
+//
+// This test is SEQUENTIAL (pin spec, then pin real, one task): it guards the
+// disjoint-budget ARITHMETIC (the `.saturating_sub(speculative_pinned_bytes)`
+// subtraction), which the mutation red-fails. The genuine interleaved race (the
+// two-Relaxed-load TOCTOU) is machine-checked in
+// `.claude/tla/SpeculativePinBudgetImplTOCTOU.tla`, not here (invariant-prover
+// NIT: hence the name drops "concurrent").
 // ═══════════════════════════════════════════════════════════════════════════
 #[nativelink_test]
-async fn speculative_pins_never_starve_a_concurrent_real_pin() -> Result<(), Error> {
+async fn speculative_pins_never_refuse_a_real_pin() -> Result<(), Error> {
     // max_bytes = 40_000 → pin_cap = 10_000 (25%), speculative_pin_cap = 2_000
     // (5%). All blobs fit in the cache (total < 40_000), so eviction never
     // confounds the pin-admission assertion.
