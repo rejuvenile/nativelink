@@ -107,8 +107,12 @@ struct PinnedEntry<T> {
     /// SPECULATIVE pre-fetch construct and its size is counted in
     /// `speculative_pinned_bytes` (a subset of `pinned_bytes`). Mutually
     /// exclusive with `indefinite` (speculative pins are TIME-BOUNDED, held
-    /// against the small disjoint speculative sub-budget). Used by `unpin_key`
-    /// / `remove` to keep `speculative_pinned_bytes` symmetric on release.
+    /// against the small disjoint speculative sub-budget). The exclusion is
+    /// ENFORCED, not just documented: if `pin_key_indefinite` upgrades a
+    /// speculative entry, it RECLASSIFIES it spec→real (clears this flag +
+    /// moves the bytes out of `speculative_pinned_bytes`), since an indefinite
+    /// pin is a real pin (#speculative-prefetch C1). Used by `unpin_key` /
+    /// `remove` to keep `speculative_pinned_bytes` symmetric on release.
     speculative: bool,
 }
 
@@ -1532,6 +1536,21 @@ where
                 entry.indefinite = true;
                 self.indefinite_pinned_bytes
                     .fetch_add(size, Ordering::Relaxed);
+                // #speculative-prefetch C1: an indefinite pin IS a real pin
+                // (held until BIS-ack, TTL-exempt). If this digest was
+                // previously pinned SPECULATIVELY (input==F2-output digest
+                // coincidence), RECLASSIFY it spec→real: move its bytes OUT of
+                // `speculative_pinned_bytes` and clear the flag. Otherwise the
+                // entry would stay TTL-exempt yet keep inflating the speculative
+                // gauge (shrinking its own 5% sub-budget) AND keep being
+                // subtracted from the real-pin admission check (real headroom
+                // undercounted). This keeps the `PinnedEntry` speculative↔
+                // indefinite mutual-exclusion doc honest.
+                if entry.speculative {
+                    entry.speculative = false;
+                    self.speculative_pinned_bytes
+                        .fetch_sub(size, Ordering::Relaxed);
+                }
             }
             return true;
         }
@@ -3718,6 +3737,130 @@ mod tests {
         assert!(
             map.pin_key_speculative(10),
             "after unpin freed sub-budget headroom, a new speculative pin must succeed"
+        );
+    }
+
+    /// #speculative-prefetch C1 (perf-optimizer): promoting a SPECULATIVE pin to
+    /// INDEFINITE (`pin_key_indefinite` upgrade) must RECLASSIFY it spec→real —
+    /// an indefinite pin IS a real pin (held until BIS-ack, TTL-exempt). If the
+    /// upgrade left the entry counted in `speculative_pinned_bytes`, the entry
+    /// would (a) stay TTL-exempt yet inflate the speculative gauge
+    /// semi-permanently (shrinking its own 5% sub-budget → later legit
+    /// speculative pins wrongly refused) and (b) keep being SUBTRACTED from the
+    /// real-pin admission check (real headroom undercounted). The fix decrements
+    /// `speculative_pinned_bytes` and clears the `speculative` flag on upgrade,
+    /// making the `PinnedEntry` "mutually exclusive with indefinite" doc honest.
+    #[tokio::test]
+    async fn indefinite_upgrade_of_speculative_pin_reclassifies_to_real() {
+        // max_bytes = 100 KiB → pin_cap = 25 KiB, speculative_pin_cap = 5 KiB,
+        // indefinite_pin_cap defaults to pin_cap (25 KiB).
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        map.insert(1, BytesEntry(4 * 1024)).await;
+        assert!(
+            map.pin_key_speculative(1),
+            "the 4 KiB speculative pin fits the 5 KiB speculative sub-budget"
+        );
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            4 * 1024,
+            "speculative pin accounts 4 KiB in the speculative sub-budget"
+        );
+        assert_eq!(map.indefinite_pinned_bytes(), 0, "not yet indefinite");
+        assert_eq!(map.pinned_bytes(), 4 * 1024, "one 4 KiB pin in the shared total");
+
+        // UPGRADE the same digest to an indefinite pin (the input-digest ==
+        // F2-output-digest coincidence). The entry must be RECLASSIFIED: its
+        // 4 KiB moves OUT of `speculative_pinned_bytes` INTO the indefinite
+        // accounting; the shared `pinned_bytes` is unchanged (same entry).
+        assert!(
+            map.pin_key_indefinite(1),
+            "indefinite upgrade of an existing (speculative) pin must succeed"
+        );
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            0,
+            "C1: indefinite upgrade must DECREMENT speculative_pinned_bytes and \
+             clear the speculative flag — an indefinite pin is real, not speculative \
+             (leaving it inflates the gauge semi-permanently and undercounts real headroom)"
+        );
+        assert_eq!(
+            map.indefinite_pinned_bytes(),
+            4 * 1024,
+            "the reclassified pin is now counted as indefinite"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            4 * 1024,
+            "reclassification does not change the shared pinned_bytes (same entry)"
+        );
+
+        // Now that the entry is real (not subtracted from the real-pin check),
+        // real-pin admission sees the full 4 KiB as real. Fill the real budget
+        // to exactly pin_cap using the reclassified 4 KiB as real headroom: a
+        // 21 KiB real pin fits (4 + 21 = 25 = pin_cap), a further 1 KiB does NOT.
+        map.insert(2, BytesEntry(21 * 1024)).await;
+        assert!(
+            map.pin_key(2),
+            "a 21 KiB real pin fits: reclassified 4 KiB + 21 KiB = 25 KiB = pin_cap"
+        );
+        map.insert(3, BytesEntry(1024)).await;
+        assert!(
+            !map.pin_key(3),
+            "C1: real-pin admission must COUNT the reclassified pin as real — real \
+             total is already at the 25 KiB pin_cap (4 reclassified + 21), so a further \
+             1 KiB real pin must be REFUSED. If the 4 KiB were still subtracted as \
+             speculative, real_pinned would read 21 KiB and this pin would wrongly admit."
+        );
+    }
+
+    /// #speculative-prefetch testing-czar (a): the BATCH `pin_keys` real-pin
+    /// admission site must ALSO exclude speculative bytes (disjoint sub-budget).
+    /// The two existing no-starve tests exercise only the per-digest `pin_key`
+    /// path; `pin_keys` has its OWN `saturating_sub(speculative_pinned_bytes)`
+    /// site that is otherwise unexercised — and this is a sensitive pin path
+    /// (2026-05-08 OOM class). Saturate the speculative sub-budget, then assert a
+    /// BATCH real pin STILL admits every key.
+    #[tokio::test]
+    async fn batch_pin_keys_never_refuses_a_real_pin_over_speculative_pins() {
+        // max_bytes = 100 KiB → pin_cap = 25 KiB (25%), speculative cap = 5 KiB.
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // Saturate the 5 KiB speculative sub-budget (adds 5 KiB to the shared
+        // pinned_bytes) via the per-digest speculative path.
+        for k in 0..5u64 {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        for k in 0..5u64 {
+            assert!(map.pin_key_speculative(k), "speculative pin {k} fits the 5 KiB cap");
+        }
+        assert_eq!(map.speculative_pinned_bytes(), 5 * 1024);
+        assert_eq!(map.pinned_bytes(), 5 * 1024);
+
+        // A REAL BATCH pin of two DIFFERENT digests: 20 KiB + 4 KiB. Real-only
+        // total is 24 KiB ≤ 25 KiB pin_cap → BOTH must be admitted by `pin_keys`.
+        // Under the pre-fix shared budget the batch check would see
+        // 5 + 20 = 25 (ok) then 25 + 4 = 29 > 25 → `break` after the first,
+        // returning 1 (the second real pin starved by the speculative bytes).
+        map.insert(100, BytesEntry(20 * 1024)).await;
+        map.insert(101, BytesEntry(4 * 1024)).await;
+        let pinned = map.pin_keys(&[100, 101]);
+        assert_eq!(
+            pinned,
+            2,
+            "composite invariant violated (2026-07-05): the BATCH pin_keys real-pin \
+             check refused a real action's pins over saturated speculative bytes — \
+             real-only total is 24 KiB ≤ 25 KiB pin_cap; only the shared-budget bug \
+             (counting 5 KiB speculative into the batch check → 29 KiB > 25 KiB) can \
+             leave the second key unpinned. The disjoint speculative sub-budget must \
+             be subtracted from the pin_keys admission check too."
+        );
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            5 * 1024,
+            "a real batch pin must not be accounted as speculative"
         );
     }
 
