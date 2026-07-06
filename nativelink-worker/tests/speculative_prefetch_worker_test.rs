@@ -17,12 +17,19 @@
 //! Test matrix:
 //!  T5  – single-inflight guard: AtomicBool prevents second concurrent prefetch
 //!  T6  – TTL cap: max TTL forwarded to worker is capped at 120s
-//!  T7  – budget isolation: SPECULATIVE_POPULATE_BYTE_BUDGET < real-action budget
+//!
+//! T7 MIGRATED (2026-07-05): the old T7 pinned `SPECULATIVE_POPULATE_BYTE_BUDGET`
+//! (128 MiB) < the real-action budget (512 MiB). That constant + its semaphore
+//! were DELETED when the worker seam moved from fetch-half-into-CAS to
+//! DirectoryCache pre-CONSTRUCT: the construct's OWN 512 MiB `POPULATE_BYTE_BUDGET`
+//! is now the sole yield-first mechanism (it returns `Code::Aborted` under
+//! pressure → prewarm fails → the speculative arm aborts fail-fast = the yield).
+//! The yield-first invariant is now asserted at the true mechanism in
+//! `directory_cache.rs` mod tests as `t7_prewarm_propagates_aborted_yield_first`
+//! (prewarm propagates Aborted rather than retrying into the real budget).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-use nativelink_worker::running_actions_manager::SPECULATIVE_POPULATE_BYTE_BUDGET;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T5: Single-inflight guard — AtomicBool CAS prevents second concurrent fetch
@@ -112,36 +119,9 @@ fn t6_ttl_cap_is_120_seconds() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// T7: Budget isolation — SPECULATIVE_POPULATE_BYTE_BUDGET < real-action budget
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Spec (§10): the speculative populate budget (128 MiB) MUST be strictly less
-// than the real action's `populate_fast_store_unchecked` budget (512 MiB, a
-// separate semaphore at directory_cache.rs:2637). Speculation CANNOT starve
-// a real action's populate budget.
-//
-// This test pins the CONSTANT. A mutation bumping SPECULATIVE_POPULATE_BYTE_BUDGET
-// to 512 MiB or higher would cause this test to fail with the bespoke message.
-//
-// Bespoke failure message:
-//   "T7: SPECULATIVE_POPULATE_BYTE_BUDGET must be < real-action budget (512 MiB)"
-#[test]
-fn t7_speculative_budget_less_than_real_action_budget() {
-    const REAL_ACTION_POPULATE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
-    const EXPECTED_SPECULATIVE_BUDGET: usize = 128 * 1024 * 1024;
-
-    assert_eq!(
-        SPECULATIVE_POPULATE_BYTE_BUDGET,
-        EXPECTED_SPECULATIVE_BUDGET,
-        "T7: SPECULATIVE_POPULATE_BYTE_BUDGET must be exactly 128 MiB (got {}); \
-         mutation that changes this constant is caught here",
-        SPECULATIVE_POPULATE_BYTE_BUDGET
-    );
-
-    assert!(
-        SPECULATIVE_POPULATE_BYTE_BUDGET < REAL_ACTION_POPULATE_BUDGET_BYTES,
-        "T7: SPECULATIVE_POPULATE_BYTE_BUDGET must be < real-action budget (512 MiB) \
-         to prevent speculation from starving real action populate (§10)"
-    );
-}
+// T7 (budget-isolation constant pin) MIGRATED to
+// directory_cache.rs::tests::t7_prewarm_propagates_aborted_yield_first — see the
+// module doc-comment above. The SPECULATIVE_POPULATE_BYTE_BUDGET constant this
+// test pinned no longer exists (the speculative semaphore was deleted with the
+// fetch-half seam; the construct's own 512 MiB POPULATE_BYTE_BUDGET is now the
+// yield-first mechanism).

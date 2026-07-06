@@ -65,7 +65,6 @@ use tracing::{Level, debug, error, event, info, info_span, instrument, trace, wa
 use crate::running_actions_manager::{
     ExecutionConfiguration, Metrics as RunningActionManagerMetrics, RunningAction,
     RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
-    prefetch_tree_into_cas,
 };
 use crate::worker_api_client_wrapper::{WorkerApiClientTrait, WorkerApiClientWrapper};
 use crate::worker_utils::{boot_epoch_id, make_connect_worker_request};
@@ -3341,11 +3340,18 @@ struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsM
     // CAPPED AT 1: exactly one in-flight speculative fetch per worker; drop
     // the second (G5 / §1.10 confirm-necessity: map-presence = busy signal).
     speculative_prefetch_inflight: Arc<core::sync::atomic::AtomicBool>,
-    /// (speculative-prefetch) Digests pinned by the most recent speculative
-    /// prefetch. Released on adoption (real StartAction for this op) or TTL.
-    // CAPPED AT max-tree-digests (bounded by SPECULATIVE_POPULATE_BYTE_BUDGET
-    // semaphore cap on the prefetch side; only DigestInfo PODs stored).
-    speculative_pinned_digests: Arc<parking_lot::Mutex<Vec<nativelink_util::common::DigestInfo>>>,
+    /// (speculative-prefetch) The DirectoryCache entry-pin guard from the most
+    /// recent speculative pre-construct. Held so the pre-warmed entry stays
+    /// resident (ref_count > 0, evict-LAST) until the real StartAction adopts it
+    /// via a HIT, or the TTL timer drops it (entry → normal LRU / evict-first).
+    /// `core::mem::take`n on TTL wake; Drop is synchronous (`ref_count.fetch_sub`)
+    /// so the pin releases deterministically on every exit path including
+    /// cancellation.
+    // UNBOUNDED-OK: single Option, one entry-pin per worker (G5 single-inflight
+    // bounds it to 1). The guard holds only an Arc<AtomicUsize> ref_count handle,
+    // no owned bytes.
+    speculative_prefetch_guard:
+        Arc<parking_lot::Mutex<Option<crate::directory_cache::DirectoryCachePinGuard>>>,
 }
 
 pub async fn preconditions_met<H: BuildHasher + Sync>(
@@ -3479,7 +3485,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             ac_write_semaphore,
             ac_write_detached_inflight_count,
             speculative_prefetch_inflight: Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            speculative_pinned_digests: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            speculative_prefetch_guard: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -5272,26 +5278,18 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     }
                                 };
 
-                            // Get the CAS store and FilesystemStore needed for
-                            // prefetch_tree_into_cas.
-                            let Some(cas_store) = self.running_actions_manager.get_cas_store()
+                            // Get the DirectoryCache to PRE-CONSTRUCT the input-root
+                            // entry (fetch + resolve + subtree-reuse + hardlink into
+                            // the cache ENTRY) ahead of the real StartAction, so at
+                            // dispatch `get_or_create` is a clonefile HIT
+                            // (construct_resolve+construct_fetch ≈ 0). Replaces the
+                            // prior fetch-half-into-CAS seam.
+                            let Some(dir_cache) =
+                                self.running_actions_manager.get_directory_cache()
                             else {
                                 warn!(
                                     operation_id = prefetch.operation_id,
-                                    "speculative prefetch: no CAS store on this worker — skipping"
-                                );
-                                self.speculative_prefetch_inflight
-                                    .store(false, core::sync::atomic::Ordering::Release);
-                                continue;
-                            };
-                            let Some(fss_arc) = cas_store
-                                .fast_store()
-                                .downcast_ref::<nativelink_store::filesystem_store::FilesystemStore>(None)
-                                .and_then(|f| f.get_arc())
-                            else {
-                                warn!(
-                                    operation_id = prefetch.operation_id,
-                                    "speculative prefetch: no FilesystemStore fast tier — skipping"
+                                    "speculative prefetch: no DirectoryCache on this worker — skipping"
                                 );
                                 self.speculative_prefetch_inflight
                                     .store(false, core::sync::atomic::Ordering::Release);
@@ -5299,7 +5297,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             };
 
                             let inflight_flag = self.speculative_prefetch_inflight.clone();
-                            let pinned_store = self.speculative_pinned_digests.clone();
+                            let guard_slot = self.speculative_prefetch_guard.clone();
                             // TTL is a worker-local constant (60s default).
                             // MUST NOT be derived from worker_timeout_s (default=0 / disabled).
                             // The effective pin lifetime = min(60, PIN_TIMEOUT_SECS=120).
@@ -5308,49 +5306,63 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             let operation_id_log = prefetch.operation_id.clone();
                             let metrics = self.metrics.clone();
 
-                            // Spawn detached so we don't block the Update loop.
+                            // Spawn detached so we NEVER block the Update loop.
                             tokio::spawn(async move {
-                                let cas_ref: &nativelink_store::fast_slow_store::FastSlowStore
-                                    = &cas_store;
-                                match prefetch_tree_into_cas(
-                                    cas_ref,
-                                    &fss_arc,
-                                    input_root_digest,
-                                    ttl_s,
-                                )
-                                .await
+                                // The single-in-flight AtomicBool is held for the
+                                // ENTIRE spawn (construct + TTL window) so exactly
+                                // one speculative entry-pin exists at a time (G5).
+                                // Release fires on every exit path below.
+                                match dir_cache
+                                    .prewarm(
+                                        input_root_digest,
+                                        crate::directory_cache::OpPriority::Speculative,
+                                    )
+                                    .await
                                 {
-                                    Ok(pinned) => {
+                                    Ok(Some(guard)) => {
+                                        // Hold the entry-pin so the pre-warmed entry
+                                        // stays resident (evict-LAST) until adoption
+                                        // (real StartAction HIT) or the TTL timer.
+                                        *guard_slot.lock() = Some(guard);
                                         info!(
                                             operation_id = operation_id_log,
-                                            pinned = pinned.len(),
-                                            "speculative prefetch: complete — blobs pinned"
+                                            "speculative prefetch: entry pre-constructed + pinned"
                                         );
-                                        *pinned_store.lock() = pinned.clone();
 
-                                        // Self-fired TTL release timer. Runs to completion
-                                        // regardless of adoption (the real StartAction's
-                                        // unpin_digest on adoption releases them sooner;
-                                        // the timer provides the RAII backstop for ops
-                                        // that are never dispatched).
+                                        // Self-fired TTL timer. The real StartAction's
+                                        // HIT adopts the warm entry (no explicit
+                                        // hand-off needed — the entry is simply there);
+                                        // on TTL wake we DROP the guard so an
+                                        // un-adopted entry becomes normal-LRU
+                                        // (evict-first). Drop is synchronous
+                                        // (ref_count.fetch_sub), never caller-forgets.
                                         tokio::time::sleep(
                                             core::time::Duration::from_secs(ttl_s.min(120))
                                         ).await;
-                                        let to_release = core::mem::take(&mut *pinned_store.lock());
-                                        if !to_release.is_empty() {
-                                            // Blobs not yet adopted — release pins via unpin.
-                                            // This allows LRU eviction (pins no longer hold).
-                                            for digest in &to_release {
-                                                fss_arc.unpin_digest(digest);
-                                            }
+                                        let released = core::mem::take(&mut *guard_slot.lock());
+                                        if released.is_some() {
+                                            // Guard dropped here → entry ref_count
+                                            // drops, entry is now LRU-evictable.
                                             info!(
                                                 operation_id = operation_id_log,
-                                                released = to_release.len(),
-                                                "speculative prefetch: TTL expired, pins released"
+                                                "speculative prefetch: TTL expired, entry-pin released"
                                             );
                                         }
                                     }
+                                    Ok(None) => {
+                                        // Entry raced eviction between construct and
+                                        // pin re-check, or was not warmable. Skip;
+                                        // the real action falls through normally.
+                                        info!(
+                                            operation_id = operation_id_log,
+                                            "speculative prefetch: entry vanished/not-warmable — skip"
+                                        );
+                                    }
                                     Err(ref e) if e.code == nativelink_error::Code::Aborted => {
+                                        // Over-pressure: the construct's own
+                                        // POPULATE_BYTE_BUDGET semaphore returned
+                                        // Aborted (yield-first). Fail-fast; the real
+                                        // action's independent populate is unaffected.
                                         metrics.speculative_prefetch_aborted.inc();
                                         warn!(
                                             operation_id = operation_id_log,
@@ -5362,7 +5374,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         warn!(
                                             operation_id = operation_id_log,
                                             ?e,
-                                            "speculative prefetch: failed"
+                                            "speculative prefetch: pre-construct failed"
                                         );
                                     }
                                 }

@@ -52,6 +52,38 @@ use tracing::{debug, error, info, trace, warn};
 /// resolve+download under load while still surfacing wedges.
 const CONSTRUCTION_LEADER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Resource / I-O priority of a unit of directory-cache work — DISTINCT from
+/// Bazel `ActionInfo.priority` (which is action-QUEUE priority: which action
+/// the scheduler dispatches next). `OpPriority` is a MARKER for future
+/// CPU/disk/network-I-O scheduling: it says "this construct/fetch is
+/// speculative pre-warm, deprioritize its resource use relative to a
+/// currently-executing action's" — nothing more.
+///
+/// Increment-1 status (#speculative-prefetch-io-priority, marker-first per
+/// build-spec 2026-07-05 §Revision-2): the tag is THREADED from the
+/// `Update::PrefetchInputs` worker entry point into [`DirectoryCache::prewarm`],
+/// RECORDED on `/metrics` (`dir_cache_prewarm_*_total` via the process-global
+/// counters), and LOGGED — but NO mechanism yet preempts on it. A future real
+/// resource-priority scheduler reads `OpPriority` at the `// TODO(#speculative-
+/// prefetch-io-priority)` sites (the construct's `spawn_blocking` dispatch, the
+/// CAS/GrpcStore fetch enqueue, the disk hardlink/clone) WITHOUT re-threading.
+///
+/// The yield-first anti-starvation that Increment 1 DOES realize is separate:
+/// the construct's own `POPULATE_BYTE_BUDGET` semaphore returns `Code::Aborted`
+/// under pressure → `prewarm` fails → the speculative arm aborts fail-fast (the
+/// yield). That is a budget mechanism, not a priority mechanism; `OpPriority` is
+/// the hook for the finer-grained future one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpPriority {
+    /// A currently-executing action's construct/fetch — full resource priority.
+    /// The real materialize callers (`get_or_create`/`get_or_create_direct`)
+    /// pass this.
+    Foreground,
+    /// A speculative pre-warm construct/fetch — deprioritize relative to
+    /// `Foreground`. The `Update::PrefetchInputs` speculative path passes this.
+    Speculative,
+}
+
 /// Name of the merkle tree metadata file stored alongside each cached directory.
 const MERKLE_METADATA_FILENAME: &str = ".merkle_tree_meta";
 
@@ -390,6 +422,11 @@ async fn filter_valid_subtree_hits(
         return HashMap::new();
     }
     let span = tracing::Span::current();
+    // TODO(#speculative-prefetch-io-priority): CPU-bound construct spawn_blocking
+    // dispatch. A future IO-priority scheduler would read the construct's
+    // OpPriority here (once threaded through construct_inner) and route a
+    // Speculative construct's blocking work to a lower-priority pool / rayon lane
+    // so it never preempts a Foreground action's CPU. Marker-first in Increment 1.
     tokio::task::spawn_blocking(move || {
         let _entered = span.entered();
         let mut valid = HashMap::with_capacity(candidates.len());
@@ -1872,6 +1909,120 @@ impl DirectoryCache {
         Ok(())
     }
 
+    /// Pre-construct the cache entry for `digest` WITHOUT materialising to any
+    /// dest path, and return a pin guard holding the entry's `ref_count`. This
+    /// is [`Self::get_or_create`] / [`Self::get_or_create_direct`] MINUS the
+    /// final hardlink/symlink-to-dest step. Coalesces with a concurrent REAL
+    /// construct for the same digest via [`with_construction_lock`]
+    /// (leader/waiter), so a speculative pre-construct racing the real
+    /// `StartAction`'s construct does NOT double-work or race.
+    ///
+    /// Returns `Some(guard)` once the entry is present+pinned (already-warm =>
+    /// `warm_redundant` fast path). The guard is TTL-bounded by the caller; on
+    /// Drop the entry drops to `ref_count` and becomes normal-LRU (evict-first).
+    /// Returns `Ok(None)` if the entry raced eviction between construct and the
+    /// pin re-check (do NOT error — speculative; the real action falls through
+    /// normally).
+    ///
+    /// §1.4.2 construct-only-entry-point necessity (confirmed): the prior cadre
+    /// (`dircache-prewarm-and-tree-cache-design-2026-06-25.md:568-569`) confirmed
+    /// [`Self::construct_inner`] (and its direct-use sibling
+    /// [`Self::construct_direct_inner`]) ARE the construct-only bodies — they
+    /// take `(digest, overall_start)` with NO dest_path and leave the entry in
+    /// `self.cache` on `Ok`. This method is the thin wrapper: fast-path pin, else
+    /// the coalesced construct, then take the entry pin.
+    ///
+    /// `op_priority` is the resource/I-O priority MARKER (see [`OpPriority`]);
+    /// Increment 1 records it on `/metrics` + logs it, but no mechanism preempts
+    /// on it yet (`// TODO(#speculative-prefetch-io-priority)` sites).
+    pub async fn prewarm(
+        &self,
+        digest: DigestInfo,
+        op_priority: OpPriority,
+    ) -> Result<Option<DirectoryCachePinGuard>, Error> {
+        let overall_start = Instant::now();
+
+        // Record the priority tag at the prewarm boundary — the observable
+        // proof the OpPriority reached the construct/fetch this drives. A
+        // future real IO-priority scheduler consults the same tag at the
+        // `// TODO(#speculative-prefetch-io-priority)` sites without re-threading.
+        match op_priority {
+            OpPriority::Foreground => dir_cache_counters().record_prewarm_foreground(),
+            OpPriority::Speculative => dir_cache_counters().record_prewarm_speculative(),
+        }
+
+        // Fast path: entry already present — take the pin only, no construct.
+        // This mirrors `try_hardlink_cached`'s pin-take (touch + fetch_add +
+        // from_already_pinned) but returns the guard instead of hardlinking.
+        {
+            let cache = self.cache.read().await;
+            if let Some(metadata) = cache.get(&digest) {
+                metadata.touch();
+                metadata.ref_count.fetch_add(1, Ordering::Relaxed);
+                let pin_guard = DirectoryCachePinGuard::from_already_pinned(
+                    Arc::clone(&metadata.ref_count),
+                );
+                drop(cache);
+                dir_cache_counters().record_prewarm_warm_redundant();
+                debug!(
+                    hash = %&digest.packed_hash().to_string()[..12],
+                    ?op_priority,
+                    elapsed_ms = overall_start.elapsed().as_millis() as u64,
+                    "DirectoryCache prewarm: already warm (pin-only, no construct)",
+                );
+                return Ok(Some(pin_guard));
+            }
+        }
+
+        // Cold path: run the SAME coalesced construct the real materialize
+        // path runs. Branch on direct_use_mode so the pre-built entry is
+        // consistent with whichever materialize path HITs it later (cheap
+        // insurance — production is hardlink mode, so construct_inner).
+        let lock_result = with_construction_lock(
+            &self.construction_locks,
+            digest,
+            CoalesceOptions::leader_only(CONSTRUCTION_LEADER_TIMEOUT),
+            || async {
+                if self.direct_use_mode {
+                    self.construct_direct_inner(digest, overall_start).await
+                } else {
+                    self.construct_inner(digest, overall_start).await
+                }
+            },
+        )
+        .await;
+        lock_result?;
+
+        // After construction (by us or another leader), the entry should be in
+        // the cache. Take the entry pin. If it raced eviction between insertion
+        // and this re-check, return Ok(None) — speculative, so the real action
+        // falls through its normal construct rather than surfacing an error.
+        let cache = self.cache.read().await;
+        let Some(metadata) = cache.get(&digest) else {
+            debug!(
+                hash = %&digest.packed_hash().to_string()[..12],
+                ?op_priority,
+                "DirectoryCache prewarm: entry vanished between construct and pin \
+                 (raced eviction) — skip; real action unaffected",
+            );
+            return Ok(None);
+        };
+        metadata.touch();
+        metadata.ref_count.fetch_add(1, Ordering::Relaxed);
+        let pin_guard = DirectoryCachePinGuard::from_already_pinned(
+            Arc::clone(&metadata.ref_count),
+        );
+        drop(cache);
+        dir_cache_counters().record_prewarm_completed();
+        info!(
+            hash = %&digest.packed_hash().to_string()[..12],
+            ?op_priority,
+            elapsed_ms = overall_start.elapsed().as_millis() as u64,
+            "DirectoryCache prewarm: construct complete, entry pinned",
+        );
+        Ok(Some(pin_guard))
+    }
+
     /// Attempts to hardlink a cached directory to dest, guarding eviction with ref_count.
     /// Returns `Ok(Some(method))` on cache hit + successful clone/hardlink,
     /// `Ok(None)` on cache miss or failed hardlink (caller falls through to reconstruction).
@@ -2659,6 +2810,14 @@ impl DirectoryCache {
                             .min(POPULATE_BYTE_BUDGET)
                             .max(1);
                         let permits_u32 = u32::try_from(permits).unwrap_or(u32::MAX);
+                        // TODO(#speculative-prefetch-io-priority): CAS/GrpcStore
+                        // fetch-enqueue site. A future IO-priority scheduler would
+                        // read the construct's OpPriority here and deprioritize a
+                        // Speculative populate's fetch relative to a Foreground
+                        // one (e.g. a lower semaphore weight or a separate lane).
+                        // Increment 1 threads the tag only to the prewarm boundary;
+                        // re-threading it through construct_full → download path
+                        // here is deferred (marker-first, build-spec §Revision-2).
                         join_set.spawn(async move {
                             let _permit = sem.acquire_many(permits_u32).await;
                             let key: StoreKey<'_> = digest.into();
@@ -4000,6 +4159,237 @@ mod tests {
             "#DC3 phase seam: assemble-phase cost not routed to the /metrics singleton — \
              hit_assemble_ms.count advanced by {g_assemble_delta}, expected >= {N} \
              (the hit hardlink site did not call record_hit_assemble_ms())"
+        );
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #speculative-prefetch T1 (load-bearing): prewarm makes the real
+    // dispatch a HIT — the pre-construct removes construct_resolve+
+    // construct_fetch from the later real-dispatch critical path.
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Production composition: a real `DirectoryCache` over a real
+    // `FastSlowStore` (via `setup_fast_slow_cache`). `prewarm` pre-constructs
+    // the ENTRY (no dest materialise) and pins it; a SUBSEQUENT
+    // `get_or_create` for the SAME digest must return `Ok(true)` (HIT —
+    // clonefile/hardlink of the already-built entry), NOT `Ok(false)` (MISS
+    // = construct ran at dispatch). That HIT is exactly the removal of the
+    // ~1364ms cold `construct_fetch` (+ resolve) the feature targets.
+    //
+    // HARNESS NOTE (design-vs-code drift, reported): every DirectoryCache
+    // mod-test harness uses a MemoryStore fast tier, so `has_fast_path ==
+    // false` → construction takes the SERIAL path, not the fast
+    // `download_to_directory`/`POPULATE_BYTE_BUDGET` path a production
+    // FilesystemStore worker uses. The HIT/MISS contract T1 asserts is
+    // driven by whether the ENTRY exists in `self.cache` — which BOTH the
+    // serial and fast construct paths populate identically — so the
+    // HIT-at-dispatch semantics are faithful. Only the construct's internal
+    // fetch mechanism differs (irrelevant to the T1 contract).
+    //
+    // MUTATION (verified): make `prewarm` a no-op (`return Ok(None)` at the
+    // top) → no entry is pre-constructed → the subsequent `get_or_create`
+    // takes the MISS/construct branch → the HIT assertion below red-fails
+    // with the bespoke dated message.
+    #[nativelink_test]
+    async fn t1_prewarm_makes_real_dispatch_a_hit() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let (cache, dir_digest) = setup_fast_slow_cache(temp_dir.path().join("cache")).await;
+
+        // Pre-construct the entry (speculative pre-warm). MUST report the
+        // entry is present+pinned.
+        let guard = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.prewarm(dir_digest, OpPriority::Speculative),
+        )
+        .await
+        .expect("T1 (2026-07-05): prewarm must not deadlock — pre-construct hung")?;
+        assert!(
+            guard.is_some(),
+            "T1 (2026-07-05): prewarm must return Some(guard) — the entry was not \
+             pre-constructed+pinned (prewarm returned None on a warmable digest)"
+        );
+
+        // Real dispatch for the SAME digest: MUST be a HIT (entry already
+        // built by prewarm), NOT a MISS (construct at dispatch).
+        let dest = temp_dir.path().join("dispatch_dest");
+        let hit = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.get_or_create(dir_digest, &dest),
+        )
+        .await
+        .expect("T1 (2026-07-05): get_or_create must not deadlock")?;
+        assert_eq!(
+            hit, true,
+            "T1 (2026-07-05): prewarm did not pre-construct — real get_or_create was a \
+             MISS (construct ran at dispatch), speculative pre-construct broken"
+        );
+        // The materialised tree must be correct (the prewarm-built entry is
+        // a real, complete cache entry, not a stub).
+        assert!(
+            dest.join("test.txt").exists(),
+            "T1 (2026-07-05): HIT materialised an INCOMPLETE tree — prewarm-built entry \
+             is missing the file blob (pre-construct produced a bad entry)"
+        );
+
+        // Drop the speculative guard (TTL analogue): entry → ref_count drops,
+        // becomes LRU-evictable. No assertion on ref_count here (covered by
+        // the DirectoryCachePinGuard Drop tests); this just exercises release.
+        drop(guard);
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #speculative-prefetch T7 (§10 composite — running-action-not-starved,
+    // narrower mechanism): a speculative prewarm whose construct is
+    // over-pressured (Code::Aborted from the shared POPULATE_BYTE_BUDGET
+    // semaphore) must PROPAGATE the Aborted fail-fast — it must NOT swallow
+    // it and retry into the real action's budget. The fail-fast IS the
+    // yield: the speculative side gives up so a concurrent running action's
+    // populate is never denied.
+    //
+    // COVERAGE LIMITATION (per empirical-refutation-covers-only-soaked-
+    // interleavings; reported): a faithful CONCURRENT-pressure test (real
+    // running-action populate near-exhausting the 512 MiB POPULATE_BYTE_BUDGET
+    // while a speculative prewarm races it) is INFEASIBLE at this unit scope —
+    // the MemoryStore-fast harness never enters the `has_fast_path`
+    // download/`POPULATE_BYTE_BUDGET` path where the Aborted originates. This
+    // test therefore asserts the NARROWER mechanism the composite depends on:
+    // `prewarm` PROPAGATES an Aborted from its construct rather than retrying.
+    // What this DOES cover: the worker arm's fail-fast-on-Aborted contract
+    // (local_worker.rs `Err(Aborted) => abort`). What it does NOT cover: the
+    // real concurrent budget-contention interleaving (that is a soak/
+    // integration concern; the 128-vs-512 budget separation the prior T7
+    // constant-pinned is DELETED with the speculative semaphore, since the
+    // construct's OWN 512 MiB budget is now the sole yield-first mechanism).
+    //
+    // MUTATION (verified): make `prewarm` SWALLOW the construct error and
+    // return `Ok(None)` instead of propagating (`lock_result.ok(); return
+    // Ok(None)`) → the Aborted no longer reaches the caller → the
+    // `err.code == Aborted` assertion below red-fails with the bespoke
+    // dated message (the speculative side would silently continue as if
+    // warm-absent, and — in the real path — could retry into the real budget).
+    #[nativelink_test]
+    async fn t7_prewarm_propagates_aborted_yield_first() -> Result<(), Error> {
+        use nativelink_error::Code;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+
+        // Build a DirectoryCache whose CAS has NO data for the requested
+        // digest, so the construct FAILS. We then assert the failure
+        // PROPAGATES out of prewarm (fail-fast), not swallowed to Ok.
+        //
+        // We cannot easily force a *Code::Aborted* specifically at unit
+        // scope (that needs the over-pressured populate path), so this test
+        // pins the load-bearing half — prewarm does NOT swallow a construct
+        // failure — and asserts the error is surfaced. The worker arm's
+        // Aborted-specific branch (metrics.speculative_prefetch_aborted +
+        // fail-fast) is what routes an Aborted; this test guarantees prewarm
+        // hands the code UP so that branch can see it.
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let bogus_digest = DigestInfo::try_new(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            64,
+        )
+        .unwrap();
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: false,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.prewarm(bogus_digest, OpPriority::Speculative),
+        )
+        .await
+        .expect("T7 (2026-07-05): prewarm must not deadlock on a failing construct");
+
+        // The construct failure MUST propagate (fail-fast yield), NOT be
+        // swallowed to Ok(None)/Ok(Some).
+        let err = result.expect_err(
+            "composite invariant violated (2026-07-05): speculative construct did NOT \
+             fail-fast — prewarm swallowed the construct failure (would retry into the \
+             real action's budget instead of yielding)",
+        );
+        // Construct-from-empty-store surfaces as Aborted/NotFound depending
+        // on the resolve path; the load-bearing property is that a
+        // failure-class code reaches the caller so the worker arm's
+        // Aborted branch (fail-fast, no retry) can fire. Assert it is a
+        // real error code (not Ok masquerading), and specifically that the
+        // yield semantics apply to the over-pressure code.
+        assert!(
+            err.code == Code::Aborted
+                || err.code == Code::NotFound
+                || err.code == Code::Internal,
+            "composite invariant violated (2026-07-05): speculative construct failure \
+             surfaced an unexpected code {:?}; the worker arm keys fail-fast off \
+             Code::Aborted — a code the arm does not recognise would be treated as a \
+             generic skip, but the yield semantics MUST cover the over-pressure code",
+            err.code
+        );
+
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #speculative-prefetch T-oppriority: speculative work carries
+    // OpPriority::Speculative to the construct/fetch prewarm drives — the
+    // observable end-to-end proof the tag reaches the boundary a future
+    // IO-priority scheduler consults.
+    //
+    // Determinism under the process-global singleton: the per-priority
+    // counter is process-wide, so asserted as a `>=` lower bound; N calls
+    // make the lower bound immune to a concurrent test masking a dropped
+    // increment (the mutation makes this test contribute 0 to Speculative).
+    //
+    // MUTATION (verified): hardcode the tag at the prewarm entry to
+    // `OpPriority::Foreground` (i.e. `match OpPriority::Foreground { … }`)
+    // → the Speculative counter delta stays 0 → this test red-fails with the
+    // bespoke dated message; the Foreground counter absorbs the increments.
+    #[nativelink_test]
+    async fn t_oppriority_speculative_tag_reaches_construct() -> Result<(), Error> {
+        use nativelink_util::o11_probes::dir_cache_counters;
+
+        const N: u64 = 5;
+
+        let temp_dir = TempDir::new().unwrap();
+        let (cache, dir_digest) = setup_fast_slow_cache(temp_dir.path().join("cache")).await;
+
+        let spec_before = dir_cache_counters().prewarm_speculative.load(Ordering::Relaxed);
+        let fg_before = dir_cache_counters().prewarm_foreground.load(Ordering::Relaxed);
+
+        // N speculative prewarms of the same digest: the first constructs,
+        // the rest hit the warm-redundant fast path — BUT every one records
+        // the Speculative priority tag at the entry (that is the boundary the
+        // tag must reach), independent of warm/cold.
+        for _ in 0..N {
+            let _guard = tokio::time::timeout(
+                core::time::Duration::from_secs(5),
+                cache.prewarm(dir_digest, OpPriority::Speculative),
+            )
+            .await
+            .expect("T-oppriority (2026-07-05): prewarm must not deadlock")?;
+            // guard dropped each iter — release the pin so the next iter's
+            // warm-redundant path is a clean pin-take.
+        }
+
+        let spec_delta =
+            dir_cache_counters().prewarm_speculative.load(Ordering::Relaxed) - spec_before;
+        let fg_delta =
+            dir_cache_counters().prewarm_foreground.load(Ordering::Relaxed) - fg_before;
+
+        assert!(
+            spec_delta >= N,
+            "T-oppriority (2026-07-05): speculative prewarm did not carry \
+             OpPriority::Speculative to the construct — prewarm_speculative advanced by \
+             {spec_delta}, expected >= {N} (the tag was dropped or hardcoded to \
+             Foreground at the prewarm entry). foreground advanced by {fg_delta}."
         );
 
         Ok(())

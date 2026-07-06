@@ -1102,6 +1102,33 @@ pub struct DirCacheCounters {
     /// (`hardlink_directory_tree` in `try_hardlink_cached`: cached entry →
     /// dest). This is the cost dir-cache ideas #1/#2 would make MORE frequent.
     pub hit_assemble_ms: PhaseTiming,
+    // ---- #speculative-prefetch: DirectoryCache::prewarm outcome + priority ----
+    // The speculative pre-construct entry point (`DirectoryCache::prewarm`)
+    // records its outcome here so the fleet can measure pre-warm efficacy
+    // (how often a pre-warm found the entry already warm vs did a real
+    // construct) WITHOUT threading a new metrics tree into the worker.
+    /// `dir_cache_prewarm_warm_redundant_total.counter` — a `prewarm` found the
+    /// entry ALREADY present in the cache (fast-path pin-only, no construct).
+    /// A high ratio vs `prewarm_completed` means the pre-warm is racing an
+    /// already-cached digest — the speculation added no work but also saved none.
+    pub prewarm_warm_redundant: AtomicU64,
+    /// `dir_cache_prewarm_completed_total.counter` — a `prewarm` ran the real
+    /// coalesced construct (leader or waiter) and left the entry present+pinned.
+    /// This is the pre-warm that actually moved a cold `construct_fetch` off the
+    /// later real-dispatch critical path.
+    pub prewarm_completed: AtomicU64,
+    /// `dir_cache_prewarm_foreground_total.counter` — a `prewarm` entered tagged
+    /// `OpPriority::Foreground` (a real materialize path routed through prewarm).
+    /// In Increment 1 the real materialize callers do NOT route through prewarm,
+    /// so this is expected to stay 0 in production; it exists so the priority
+    /// dimension is observable end-to-end (T-oppriority pins it).
+    pub prewarm_foreground: AtomicU64,
+    /// `dir_cache_prewarm_speculative_total.counter` — a `prewarm` entered tagged
+    /// `OpPriority::Speculative` (the `Update::PrefetchInputs` path). This is the
+    /// observable proof the speculative tag reached the construct/fetch boundary
+    /// (the `// TODO(#speculative-prefetch-io-priority)` hook a future scheduler
+    /// consults). MUST equal the count of speculative pre-warms driven.
+    pub prewarm_speculative: AtomicU64,
 }
 
 /// Sum+count pair for a single dir-cache construct phase. `sum` is the
@@ -1146,6 +1173,10 @@ impl DirCacheCounters {
             construct_resolve_ms: PhaseTiming::new(),
             construct_fetch_ms: PhaseTiming::new(),
             hit_assemble_ms: PhaseTiming::new(),
+            prewarm_warm_redundant: AtomicU64::new(0),
+            prewarm_completed: AtomicU64::new(0),
+            prewarm_foreground: AtomicU64::new(0),
+            prewarm_speculative: AtomicU64::new(0),
         }
     }
 
@@ -1199,6 +1230,34 @@ impl DirCacheCounters {
     /// Record a HIT-path assemble-phase (hardlink materialise) observation (ms).
     pub fn record_hit_assemble_ms(&self, elapsed_ms: u64) {
         self.hit_assemble_ms.observe_ms(elapsed_ms);
+    }
+
+    /// Record a `DirectoryCache::prewarm` that found the entry already warm
+    /// (fast-path pin-only; no construct ran).
+    pub fn record_prewarm_warm_redundant(&self) {
+        self.prewarm_warm_redundant.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a `DirectoryCache::prewarm` that ran the real coalesced construct
+    /// (leader or waiter) and left the entry present+pinned.
+    pub fn record_prewarm_completed(&self) {
+        self.prewarm_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a `DirectoryCache::prewarm` entered under `OpPriority::Foreground`.
+    /// Split from `record_prewarm_speculative` because `OpPriority` lives in
+    /// `nativelink-worker` (the caller matches on it) and `nativelink-util`
+    /// cannot depend on `nativelink-worker` — so the priority is recorded via
+    /// two distinct entry points, one per label.
+    pub fn record_prewarm_foreground(&self) {
+        self.prewarm_foreground.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a `DirectoryCache::prewarm` entered under `OpPriority::Speculative`
+    /// (the `Update::PrefetchInputs` path). This is the observable proof the
+    /// speculative tag reached the construct/fetch boundary.
+    pub fn record_prewarm_speculative(&self) {
+        self.prewarm_speculative.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1310,6 +1369,37 @@ impl MetricsComponent for DirCacheCounters {
              cached entry → action dest). Boundary: the hardlink_directory_tree \
              span in try_hardlink_cached. This is the cost dir-cache ideas #1/#2 \
              would make more frequent.",
+        )?;
+
+        // #speculative-prefetch: DirectoryCache::prewarm outcome + priority.
+        emit(
+            "prewarm_warm_redundant",
+            &self.prewarm_warm_redundant,
+            "Directory-cache prewarm that found the entry ALREADY cached \
+             (speculative pre-construct raced an already-warm digest: pin-only, \
+             no construct). High vs prewarm_completed = speculation adds no work.",
+        )?;
+        emit(
+            "prewarm_completed",
+            &self.prewarm_completed,
+            "Directory-cache prewarm that ran the real coalesced construct and \
+             left the entry present+pinned — the pre-warm that moved a cold \
+             construct_fetch off the later real-dispatch critical path.",
+        )?;
+        emit(
+            "prewarm_foreground",
+            &self.prewarm_foreground,
+            "Directory-cache prewarm entered under OpPriority::Foreground (a real \
+             materialize routed through prewarm). Expected 0 in Increment 1 \
+             (real materialize does not route through prewarm); exists so the \
+             priority dimension is observable end-to-end.",
+        )?;
+        emit(
+            "prewarm_speculative",
+            &self.prewarm_speculative,
+            "Directory-cache prewarm entered under OpPriority::Speculative (the \
+             Update::PrefetchInputs path). Observable proof the speculative tag \
+             reached the construct/fetch boundary (the future IO-priority hook).",
         )?;
         Ok(MetricPublishKnownKindData::Component)
     }
@@ -2427,6 +2517,17 @@ mod tests {
         for _ in 0..5 {
             counters.record_hit_clonefile_preempted();
         }
+        // #speculative-prefetch prewarm outcome + priority counters.
+        for _ in 0..6 {
+            counters.record_prewarm_warm_redundant();
+        }
+        for _ in 0..8 {
+            counters.record_prewarm_completed();
+        }
+        for _ in 0..9 {
+            counters.record_prewarm_speculative();
+        }
+        counters.record_prewarm_foreground();
 
         let registry = MetricsRegistry::new();
         // Register under "dir_cache" — the prefix production nativelink.rs uses.
@@ -2448,6 +2549,10 @@ mod tests {
             ("dir_cache_hit_clonefile_total_counter", 1),
             ("dir_cache_hit_hardlink_total_counter", 4),
             ("dir_cache_hit_clonefile_preempted_total_counter", 5),
+            ("dir_cache_prewarm_warm_redundant_total_counter", 6),
+            ("dir_cache_prewarm_completed_total_counter", 8),
+            ("dir_cache_prewarm_speculative_total_counter", 9),
+            ("dir_cache_prewarm_foreground_total_counter", 1),
         ] {
             let needle = format!("\n{name} {value}\n");
             assert!(

@@ -73,7 +73,7 @@ use nativelink_util::o11_probes::symlink_fix_counters;
 use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::store_trait::{
-    IS_WORKER_REQUEST, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    IS_WORKER_REQUEST, Store, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
@@ -1106,245 +1106,6 @@ const BATCH_READ_MAX_BLOB_SIZE: u64 = 1024 * 1024;
 /// Maximum total payload per BatchReadBlobs request (4 MiB), per REAPI recommendation.
 const BATCH_READ_MAX_REQUEST_SIZE: u64 = 4 * 1024 * 1024;
 
-/// (speculative-prefetch §10) Byte budget cap for speculative pre-fetch
-/// populates. DISTINCT from the per-call 512 MiB `POPULATE_BYTE_BUDGET`
-/// in `directory_cache.rs`; that semaphore is per-call local and not
-/// reachable from here. This shared static ensures that all concurrent
-/// speculative prefetches together CANNOT exhaust the fast store with
-/// blob bytes ahead of real actions.
-///
-/// 128 MiB = ¼ of the real 512 MiB budget: leaves ¾ free for the real
-/// action's independent populate, so a speculative fetch in flight can
-/// NEVER starve the real action (§10 composite invariant). The semaphore
-/// is evict-first by construction: `populate_fast_store_unchecked` returns
-/// `Code::Aborted` under pressure, and the speculative arm fail-fasts on
-/// Aborted (see T6). Permits are held per blob for the duration of the
-/// populate only; they are released before the pin call so the pin does
-/// not tie up budget in the guard period.
-// CAPPED AT SPECULATIVE_POPULATE_BYTE_BUDGET (128 MiB): bounds concurrent
-// speculative blob populates so speculation can NEVER starve a real
-// action's independent 512 MiB populate budget (§10, T7).
-pub const SPECULATIVE_POPULATE_BYTE_BUDGET: usize = 128 * 1024 * 1024;
-/// Process-singleton semaphore for speculative prefetch byte budget. Shared
-/// across all concurrent speculative fetches on this worker so the combined
-/// in-flight populate cannot exceed `SPECULATIVE_POPULATE_BYTE_BUDGET`.
-static SPECULATIVE_POPULATE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(SPECULATIVE_POPULATE_BYTE_BUDGET));
-
-/// (speculative-prefetch Increment 1) FETCH-HALF helper: resolve the input
-/// tree for `input_root_digest`, determine which file blobs are not already
-/// in the fast store, fetch each missing blob into the fast store under the
-/// `SPECULATIVE_POPULATE_SEMAPHORE` (so speculative fetches cannot starve
-/// real actions), then time-bounded pin the fetched blobs.
-///
-/// This is the "slot-wait CAS pre-fetch" for the speculative pre-fetch
-/// feature. It does NOT create directories, symlinks, hardlinks, or a
-/// work directory — fetch-half only. The real `StartAction` path finds the
-/// blobs already resident and skips the slow populate step.
-///
-/// Returns the set of digests that were successfully pinned.
-///
-/// Errors:
-/// - `Code::Aborted` from `populate_fast_store_unchecked` → abort the
-///   entire speculative fetch fail-fast (caller logs + skips).
-/// - `Code::NotFound` → log + skip that digest (no PENDING; Increment 2).
-/// - Tree resolution failure → abort fail-fast.
-pub async fn prefetch_tree_into_cas(
-    cas_store: &FastSlowStore,
-    filesystem_store: &Arc<FilesystemStore>,
-    input_root_digest: DigestInfo,
-    ttl_s: u64,
-) -> Result<Vec<DigestInfo>, Error> {
-    info!(
-        root = ?input_root_digest,
-        ttl_s,
-        "speculative prefetch: resolving input tree",
-    );
-
-    // Step 1: resolve the input tree (GetTree RPC or recursive fallback).
-    let tree = resolve_directory_tree(cas_store, &input_root_digest).await.err_tip(|| {
-        format!("speculative prefetch: tree resolution failed for {input_root_digest:?}")
-    })?;
-
-    // Step 2: collect all file digests from the tree (no work dir, no paths
-    // needed — we only need the digest set for populate + pin).
-    let mut all_digests: HashSet<DigestInfo> = HashSet::new();
-    for directory in tree.values() {
-        for file in &directory.files {
-            let Some(ref proto_digest) = file.digest else {
-                continue;
-            };
-            let Ok(digest) = DigestInfo::try_from(proto_digest) else {
-                continue;
-            };
-            if !is_zero_digest(digest) {
-                all_digests.insert(digest);
-            }
-        }
-    }
-
-    if all_digests.is_empty() {
-        info!(
-            root = ?input_root_digest,
-            "speculative prefetch: no file digests in tree (directory-only or empty action)",
-        );
-        return Ok(Vec::new());
-    }
-
-    // Step 3: has-check — find which blobs are missing from the fast store.
-    let unique_digests: Vec<DigestInfo> = all_digests.into_iter().collect();
-    let store_keys: Vec<StoreKey<'_>> = unique_digests.iter().map(|d| (*d).into()).collect();
-    let mut has_results = vec![None; store_keys.len()];
-
-    // Route via the FastSlowStore wrapper (checks mirror_blobs too, like the
-    // real download_to_directory path).
-    let cas_store_arc = cas_store.get_arc().ok_or_else(|| {
-        make_err!(Code::Internal, "speculative prefetch: cas_store Arc lost")
-    })?;
-    let cas_store_wrapped = Store::new(cas_store_arc);
-    const HAS_CHECK_CHUNK: usize = 2000;
-    for start in (0..store_keys.len()).step_by(HAS_CHECK_CHUNK) {
-        let end = (start + HAS_CHECK_CHUNK).min(store_keys.len());
-        cas_store_wrapped
-            .has_with_results(&store_keys[start..end], &mut has_results[start..end])
-            .await
-            .err_tip(|| "speculative prefetch: batch has_with_results failed")?;
-    }
-
-    let missing_digests: Vec<DigestInfo> = unique_digests
-        .iter()
-        .zip(has_results.iter())
-        .filter_map(|(d, h)| if h.is_none() { Some(*d) } else { None })
-        .collect();
-
-    if missing_digests.is_empty() {
-        info!(
-            root = ?input_root_digest,
-            cached = unique_digests.len(),
-            "speculative prefetch: all blobs already in fast store (no-op populate)",
-        );
-        // Even though nothing was fetched, pin what's there so the real
-        // action's construct is guaranteed to find them resident.
-        let all_digests_for_pin: Vec<DigestInfo> = unique_digests;
-        let fss_pin = Pin::new(filesystem_store.as_ref());
-        let pin_results = fss_pin.pin_digests_with_results(&all_digests_for_pin);
-        let pinned: Vec<DigestInfo> = all_digests_for_pin
-            .into_iter()
-            .zip(pin_results.into_iter())
-            .filter_map(|(d, pinned)| if pinned { Some(d) } else { None })
-            .collect();
-        info!(
-            root = ?input_root_digest,
-            pinned = pinned.len(),
-            ttl_s,
-            "speculative prefetch: pinned all cached blobs (no fetch needed)",
-        );
-        return Ok(pinned);
-    }
-
-    let missing_bytes: u64 = missing_digests.iter().map(|d| d.size_bytes()).sum();
-    info!(
-        root = ?input_root_digest,
-        total = unique_digests.len(),
-        missing = missing_digests.len(),
-        missing_bytes,
-        "speculative prefetch: fetching missing blobs under speculative budget",
-    );
-
-    // Step 4: fetch each missing blob under the speculative byte-budget semaphore.
-    // Aborted → abort the entire prefetch fail-fast.
-    // NotFound → log + skip that digest (Increment 2 handles PENDING).
-    let mut fetched: Vec<DigestInfo> = Vec::new();
-    for digest in missing_digests {
-        let permit_cost = usize::try_from(digest.size_bytes())
-            .unwrap_or(SPECULATIVE_POPULATE_BYTE_BUDGET)
-            .min(SPECULATIVE_POPULATE_BYTE_BUDGET)
-            .max(1);
-        // Try non-blocking acquire — under sustained over-pressure the
-        // semaphore may be fully subscribed; fail-fast rather than blocking
-        // (a blocked speculative fetch would HOL-block a later real action's
-        // populate on the same permit).
-        let _permit = match SPECULATIVE_POPULATE_SEMAPHORE.try_acquire_many(
-            u32::try_from(permit_cost).unwrap_or(u32::MAX),
-        ) {
-            Ok(permit) => permit,
-            Err(_) => {
-                warn!(
-                    ?digest,
-                    "speculative prefetch: semaphore exhausted, skipping digest (over-pressure)"
-                );
-                continue;
-            }
-        };
-        match cas_store.populate_fast_store_unchecked(digest.into()).await {
-            Ok(()) => {
-                fetched.push(digest);
-            }
-            Err(ref e) if e.code == Code::Aborted => {
-                // Over-pressure: abort this entire speculative prefetch.
-                // The real action falls through normally with no penalty.
-                warn!(
-                    ?digest,
-                    "speculative prefetch: populate returned Aborted (over-pressure) — \
-                     aborting entire speculative fetch; real action unaffected"
-                );
-                return Err(make_err!(
-                    Code::Aborted,
-                    "speculative prefetch aborted: fast store over-pressured at {digest:?}"
-                ));
-            }
-            Err(ref e) if e.code == Code::NotFound => {
-                // Blob not on server: log + skip. No PENDING in Increment 1.
-                warn!(
-                    ?digest,
-                    "speculative prefetch: digest not found on server — skipping \
-                     (Increment 2 will handle PENDING case)"
-                );
-                continue;
-            }
-            Err(e) => {
-                // Other errors: log + skip (don't abort the whole batch).
-                warn!(
-                    ?digest,
-                    ?e,
-                    "speculative prefetch: populate error — skipping digest"
-                );
-                continue;
-            }
-        }
-    }
-
-    if fetched.is_empty() {
-        info!(
-            root = ?input_root_digest,
-            "speculative prefetch: no blobs fetched (all skipped or already present)",
-        );
-        return Ok(Vec::new());
-    }
-
-    // Step 5: time-bounded pin fetched blobs. Lifetime = min(ttl_s, PIN_TIMEOUT_SECS=120).
-    // pin_digests_with_results is time-bounded (evict-first, count against pin_cap).
-    // Returns per-digest bool: true=pinned, false=eviction race lost.
-    let effective_ttl = ttl_s.min(120); // min(ttl_s, PIN_TIMEOUT_SECS)
-    let _ = effective_ttl; // TTL is self-fired in the worker arm; the pin expires via moka sweep.
-    let pin_results = Pin::new(filesystem_store.as_ref()).pin_digests_with_results(&fetched);
-    let pinned: Vec<DigestInfo> = fetched
-        .iter()
-        .zip(pin_results.iter())
-        .filter_map(|(d, &ok)| if ok { Some(*d) } else { None })
-        .collect();
-    let eviction_races = fetched.len() - pinned.len();
-    info!(
-        root = ?input_root_digest,
-        fetched = fetched.len(),
-        pinned = pinned.len(),
-        eviction_races,
-        ttl_s,
-        "speculative prefetch: complete",
-    );
-    Ok(pinned)
-}
-
 /// Resolve the full directory tree starting from `root_digest`.
 ///
 /// Tries the `GetTree` RPC (single streaming call) if the slow store is a `GrpcStore`.
@@ -1563,6 +1324,12 @@ async fn resolve_directory_tree_parallel(
         let level_size = queue.len();
 
         // Fetch all directories in the current BFS level concurrently.
+        // TODO(#speculative-prefetch-io-priority): parallel-BFS network
+        // fetch-enqueue site (resolve phase, shared by real + speculative
+        // constructs). A future IO-priority scheduler would read the driving
+        // OpPriority here and deprioritize a Speculative resolve's fetches so
+        // they never delay a Foreground action's resolve. Marker-first: the tag
+        // is not threaded into this shared helper yet (build-spec §Revision-2).
         let results: Vec<Result<(DigestInfo, ProtoDirectory), Error>> =
             futures::stream::iter(queue.drain(..).map(|digest| {
                 async move {
@@ -2698,6 +2465,12 @@ async fn hardlink_and_set_metadata_prefetched(
     // Apply mtime.
     if let Some(mtime) = file.mtime {
         let dest_owned = dest.clone();
+        // TODO(#speculative-prefetch-io-priority): disk-materialize spawn_blocking
+        // site in the construct's download path. A future IO-priority scheduler
+        // would read the driving OpPriority here (once threaded through
+        // download_to_directory) and route Speculative disk writes/hardlinks to a
+        // lower-priority blocking pool so they never contend with a Foreground
+        // action's disk I/O. Marker-first in Increment 1 (build-spec §Revision-2).
         spawn_blocking!("download_to_directory_set_mtime", move || {
             set_file_mtime(
                 &dest_owned,
@@ -6615,6 +6388,14 @@ pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
         None
     }
 
+    /// Returns this worker's `DirectoryCache` if one is configured. Used by the
+    /// speculative pre-fetch (`Update::PrefetchInputs`) path to pre-construct an
+    /// action's input-root cache entry ahead of real dispatch. Default `None`
+    /// for stubs / workers without a directory cache.
+    fn get_directory_cache(&self) -> Option<Arc<crate::directory_cache::DirectoryCache>> {
+        None
+    }
+
     /// (FL-681 re-saturation gate) Returns whether this worker's local CAS
     /// `FilesystemStore` indefinite-pin cap is currently saturated. This is the
     /// SAME value the worker-side admission gate checks in
@@ -8787,6 +8568,10 @@ impl RunningActionsManager for RunningActionsManagerImpl {
 
     fn get_cas_store(&self) -> Option<Arc<FastSlowStore>> {
         Some(self.cas_store.clone())
+    }
+
+    fn get_directory_cache(&self) -> Option<Arc<crate::directory_cache::DirectoryCache>> {
+        self.directory_cache.clone()
     }
 
     #[inline]
