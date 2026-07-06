@@ -231,13 +231,12 @@ pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<C
 
         match clone_result {
             Ok(()) => return Ok(CloneMethod::Clonefile),
-            Err(e) => {
-                tracing::debug!(
-                    src = %src.display(),
-                    dst = %dst.display(),
-                    "clonefile failed, falling back to hardlink: {e}",
-                );
-            }
+            // #clonefile-fallback: the fallback is logged authoritatively INSIDE
+            // `try_clonefile` at the classifying site (genuine syscall/fs failure
+            // → error!, the perf-critical ~600× slowdown; expected dst-non-empty
+            // precondition → warn!). Only the class-blind Err flows back here, so
+            // do NOT re-log — it would double-emit and lose the class distinction.
+            Err(_) => {}
         }
     }
 
@@ -326,6 +325,32 @@ pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<C
     Ok(CloneMethod::Hardlink)
 }
 
+/// #clonefile-fallback: emit the GENUINE (perf-critical) clonefile-fallback log
+/// at `error!` level. `stage` names which step failed (the syscall itself, or
+/// the pre-syscall dst-clear); `err` carries the OS reason (errno).
+///
+/// This is a genuine failure — NOT the expected dst-non-empty precondition (the
+/// O5 race), which is a normal fallback logged at `warn!` inline. A genuine
+/// clonefile fallback means EVERY directory materialise takes the ~600×-slower
+/// per-file hardlink path instead of the ~1ms whole-tree CoW clone, so it MUST
+/// be loud. `error!` survives the workspace `release_max_level_info` strip (a
+/// prior `debug!` was compiled OUT of the prod binary → the failure was
+/// invisible → a fleet-wide 600× slowdown hid for hours; #clonefile-fallback).
+///
+/// Not `#[cfg(target_os = "macos")]`-gated (though its only callers are) so the
+/// error-level discipline is unit-testable on every platform (a macOS-only test
+/// cannot run on the Linux build box).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn log_clonefile_genuine_failure(src: &Path, dst: &Path, stage: &str, err: &std::io::Error) {
+    tracing::error!(
+        src = %src.display(),
+        dst = %dst.display(),
+        stage,
+        os_error = %err,
+        "clonefile FAILED (genuine, NOT the normal dst-non-empty precondition); fell back to (slow) per-file hardlink — expect ~600× slower directory materialisation on EVERY action. Investigate the OS error (cross-device / non-APFS / permissions)"
+    );
+}
+
 /// Uses macOS `clonefile(2)` to CoW-clone an entire directory tree in one syscall.
 /// Handles pre-existing (empty) destination by removing it first.
 ///
@@ -382,6 +407,17 @@ fn try_clonefile(src: &Path, dst: &Path) -> Result<(), Error> {
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                 // dst already has content from concurrent [C]; clonefile
                 // cannot proceed. Signal the caller to use the hardlink path.
+                // #clonefile-fallback: this is an EXPECTED precondition-miss (the
+                // O5 [C]-pre-populates-work-dir race), a NORMAL fallback — NOT a
+                // genuine failure. Log at warn! (visible in release under
+                // release_max_level_info) so it can be quantified, without the
+                // error!-level alarm reserved for the perf-critical syscall
+                // failure below.
+                tracing::warn!(
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    "clonefile dst non-empty (concurrent output-dir prep pre-populated it); falling back to (slow) hardlink"
+                );
                 return Err(make_err!(
                     nativelink_error::Code::Internal,
                     "clonefile {} → {}: dst non-empty (concurrent [C] pre-populated); falling back to hardlink",
@@ -390,6 +426,11 @@ fn try_clonefile(src: &Path, dst: &Path) -> Result<(), Error> {
                 ));
             }
             Err(e) => {
+                // A remove_dir failure that is NOT dst-non-empty is a genuine fs
+                // error preventing the whole-tree CoW fast path → the ~600×-slower
+                // per-file hardlink fallback. Loud (error!) via the shared helper —
+                // a real problem, not the expected O5 precondition.
+                log_clonefile_genuine_failure(src, dst, "clonefile dst-clear (remove_dir)", &e);
                 return Err(make_err!(
                     nativelink_error::Code::Internal,
                     "Failed to remove existing dst for clonefile {}: {e}",
@@ -403,6 +444,11 @@ fn try_clonefile(src: &Path, dst: &Path) -> Result<(), Error> {
     let ret = unsafe { clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
+        // #clonefile-fallback (user directive: "a failed clonefile on macos
+        // should be logged as error"): the GENUINE, PERF-CRITICAL failure — the
+        // whole-tree ~1ms CoW clone did not happen. Emit at error! (survives
+        // release_max_level_info) via the shared helper.
+        log_clonefile_genuine_failure(src, dst, "clonefile(2) syscall", &err);
         return Err(make_err!(
             nativelink_error::Code::Internal,
             "clonefile {} → {}: {err}",
@@ -902,5 +948,57 @@ mod tests {
         assert_eq!(content1, "Hello, World!");
 
         Ok(())
+    }
+
+    /// #clonefile-fallback (user directive: "a failed clonefile on macos should
+    /// be logged as error"): the GENUINE clonefile fallback log MUST emit at
+    /// `error!` level so it survives the workspace `release_max_level_info` strip
+    /// in the prod binary. A prior `debug!` was compiled OUT of release → the
+    /// failure was invisible → a fleet-wide ~600× slowdown hid for hours.
+    ///
+    /// The genuine syscall-failure path (`clonefile(2)` returning non-zero) is
+    /// `#[cfg(target_os = "macos")]` and needs a REAL cross-device / non-APFS
+    /// failure to trigger — not deterministically forcible in a unit test, and
+    /// not even compiled on the Linux build box. So the error-level discipline is
+    /// factored into the non-gated `log_clonefile_genuine_failure` helper (the
+    /// single emit site both macOS callers use) and asserted directly here on
+    /// every platform.
+    ///
+    /// Filtering on the ` ERROR ` level prefix is load-bearing: `tracing-test`
+    /// captures all levels in test builds, so a bare substring match would still
+    /// pass if the emit regressed to `warn!`/`debug!`. The level filter is what
+    /// makes the mutation step bite.
+    ///
+    /// Mutation: change `tracing::error!` → `tracing::debug!` (or `warn!`) in
+    /// `log_clonefile_genuine_failure` → this test red-fails with the bespoke
+    /// message (a `debug!`/`warn!` line does not carry the ` ERROR ` prefix).
+    #[nativelink_test("crate")]
+    async fn clonefile_genuine_failure_logs_at_error_level() {
+        let err = std::io::Error::from_raw_os_error(18); // EXDEV (cross-device)
+        log_clonefile_genuine_failure(
+            Path::new("/cache/src-tree"),
+            Path::new("/work/dst-tree"),
+            "clonefile(2) syscall",
+            &err,
+        );
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(" ERROR ")
+                        && l.contains("clonefile FAILED (genuine")
+                        && l.contains("600× slower")
+                })
+                .count();
+            if n == 0 {
+                Err("clonefile genuine-fallback must emit at ERROR level — a \
+                     regression to debug!/warn! would be stripped/quieted and the \
+                     perf-critical fallback would be invisible in the prod journal \
+                     (release_max_level_info)"
+                    .to_string())
+            } else {
+                Ok(())
+            }
+        });
     }
 }
