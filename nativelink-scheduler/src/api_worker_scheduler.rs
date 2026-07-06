@@ -2306,6 +2306,14 @@ impl ApiWorkerSchedulerImpl {
                 }
             }
         }
+        // #speculative-prefetch D2: reap the coalesce record on the
+        // unreserve/reroute path too (symmetric with immediate_evict_worker's
+        // dead-worker drain). An assign-Aborted reroute re-queues the op onto a
+        // different worker, so its stale coalesce entry MUST be removed or a
+        // fresh prefetch to the new worker would be suppressed by the dedup
+        // `contains` check (hit-rate loss). Keyed on the same `operation_id`
+        // (== client_operation_id) `send_prefetch_inputs` inserted it with.
+        self.prefetch_coalesce_guard.pop(operation_id);
         // (#schedmetric) Recompute after slot freed.
         self.recompute_capacity_gauges();
     }

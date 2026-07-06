@@ -597,6 +597,109 @@ async fn t4_coalesce_guard_reaped_on_worker_evict() -> Result<(), Error> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// D2 (reap on reroute): coalesce guard is REAPED on unreserve/reroute, not only
+// on worker eviction
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// distsys MINOR-1 (D2): the coalesce-guard reap previously fired ONLY in
+// immediate_evict_worker (dead-worker drain). An assign-Aborted reroute goes
+// through unreserve_worker (a re-queue that is NOT a worker death), so its stale
+// coalesce entry persisted until the LRU cap evicted it — meanwhile a legitimate
+// re-prefetch of the rerouted op was suppressed by the dedup `contains` check
+// (hit-rate loss). The reap is now mirrored in inner_unreserve_worker, keyed on
+// the SAME client_operation_id the guard was inserted with. This test: emit for
+// an op (guard populated), a second emit is coalesced, reserve the op onto the
+// worker, then unreserve it (reroute) — the guard MUST be reaped so a fresh emit
+// for the SAME op succeeds.
+//
+// Vacuity/mutation probe: remove the `prefetch_coalesce_guard.pop(operation_id)`
+// reap in inner_unreserve_worker → the guard len stays 1 and the re-emit is still
+// coalesced (returns false) → both asserts red-fail.
+#[nativelink_test]
+async fn d2_coalesce_guard_reaped_on_unreserve_reroute() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(3, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+
+    let worker_a = WorkerId("d2_worker_a".to_string());
+    let _rx_a = add_worker(&scheduler, worker_a.clone(), PlatformProperties::default()).await?;
+    let ws = scheduler.worker_scheduler_for_test();
+
+    let op_id = OperationId::default();
+    let input_root = DigestInfo::new([9u8; 32], 555);
+
+    // 1) First emit for the op → recorded in the coalesce guard (goes to A, the
+    //    only idle worker).
+    assert!(
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+            .await,
+        "D2: first emit must succeed"
+    );
+    assert_eq!(
+        ws.prefetch_coalesce_guard_len().await,
+        1,
+        "D2: precondition — the coalesce guard must hold exactly the one emitted op"
+    );
+    // 2) A second emit for the same op is coalesced (proves the entry exists).
+    assert!(
+        !ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+            .await,
+        "D2: second emit must be coalesced (entry present)"
+    );
+
+    // 3) Reserve the op onto worker A (so unreserve_worker has a live reservation
+    //    to release — find_and_reserve_worker records it under
+    //    client_operation_id, the same key the reap pops).
+    let action_info = {
+        let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([1u8; 32], 1));
+        Arc::make_mut(&mut ai).input_root_digest = input_root;
+        ActionInfoWithProps {
+            inner: ai,
+            platform_properties: PlatformProperties::default(),
+        }
+    };
+    let reserved = ws
+        .find_and_reserve_worker(&PlatformProperties::default(), &op_id, &action_info, false)
+        .await;
+    assert!(
+        reserved.is_some(),
+        "D2: precondition — the op must reserve onto worker A so the reroute can unreserve it"
+    );
+
+    // 4) Unreserve the op from worker A (the reroute path, NOT a worker death).
+    //    inner_unreserve_worker must reap the op's coalesce entry.
+    ws.unreserve_worker(&worker_a, &op_id).await;
+    tokio::task::yield_now().await;
+
+    // The guard must now be empty (reaped) — the direct observable.
+    assert_eq!(
+        ws.prefetch_coalesce_guard_len().await,
+        0,
+        "D2 (2026-07-06): coalesce guard NOT reaped on unreserve/reroute — the rerouted \
+         op's stale entry persisted (only immediate_evict_worker reaped, not \
+         inner_unreserve_worker). It must pop the coalesce entry for the unreserved op."
+    );
+
+    // 5) Worker A is idle again; re-emitting for the SAME op MUST now succeed
+    //    because the reap cleared the stale entry (the end-to-end consequence).
+    assert!(
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+            .await,
+        "D2 (2026-07-06): re-prefetch of a rerouted op was suppressed by the stale coalesce \
+         entry — inner_unreserve_worker must reap it so the op can re-prefetch after reroute."
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // send_prefetch_inputs with NO eligible idle worker → no emit (renamed from the
 // mislabeled "t4_platform_mismatch"; it tests the no-idle-worker path, not a
 // spec-T4 reap — distsys F5 numbering fix)
