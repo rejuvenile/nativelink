@@ -4447,6 +4447,74 @@ mod tests {
         Ok(())
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // #speculative-prefetch cross-path coalesce (spec item 5, testing-czar
+    // G-A): a speculative `prewarm` racing a real `get_or_create` for the SAME
+    // digest must COALESCE via the shared `construction_locks` leader/waiter —
+    // one leader constructs, the other waits and adopts, NO deadlock, NO
+    // double-work, NO race, and the lock map is cleaned up after.
+    #[tokio::test]
+    async fn cross_path_prewarm_and_get_or_create_coalesce() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let (cache, dir_digest) = setup_fast_slow_cache(temp_dir.path().join("cache")).await;
+        let cache = Arc::new(cache);
+
+        // Race a speculative prewarm and a real get_or_create for the SAME
+        // digest. A 5s timeout is the deadlock detector (a leader/waiter
+        // coalesce bug would hang one side).
+        let dest = temp_dir.path().join("race_dest");
+        let cache_a = Arc::clone(&cache);
+        let cache_b = Arc::clone(&cache);
+        let dest_b = dest.clone();
+        let prewarm_fut =
+            tokio::spawn(async move { cache_a.prewarm(dir_digest, OpPriority::Speculative).await });
+        let get_fut = tokio::spawn(async move { cache_b.get_or_create(dir_digest, &dest_b).await });
+        let (prewarm_res, get_res) = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            async { tokio::join!(prewarm_fut, get_fut) },
+        )
+        .await
+        .expect(
+            "cross-path coalesce (2026-07-05): prewarm and get_or_create for the same digest \
+             DEADLOCKED — the leader/waiter coalesce wedged one side",
+        );
+
+        let guard = prewarm_res
+            .expect("prewarm task panicked")
+            .expect("prewarm returned Err");
+        assert!(
+            guard.is_some(),
+            "cross-path coalesce: prewarm must return Some(guard) even when racing a real \
+             get_or_create (leader OR adopting waiter — both yield a pinned entry)"
+        );
+        let _hit_or_built = get_res
+            .expect("get_or_create task panicked")
+            .expect("get_or_create returned Err");
+        assert!(
+            dest.join("test.txt").exists(),
+            "cross-path coalesce: the real get_or_create materialised an INCOMPLETE tree — \
+             coalescing produced a bad shared entry"
+        );
+
+        // Exactly ONE cache entry (no split-brain double entry) and the
+        // construction-lock map cleaned up (no leaked leader slot).
+        drop(guard);
+        let stats = cache.stats().await;
+        assert_eq!(
+            stats.entries, 1,
+            "cross-path coalesce: expected exactly ONE cache entry for the shared digest, got \
+             {} — prewarm and get_or_create did not coalesce onto one construct",
+            stats.entries
+        );
+        assert!(
+            cache.construction_locks.lock().is_empty(),
+            "cross-path coalesce: construction_locks not cleaned up after both paths completed \
+             — a leader slot leaked (would wedge a future construct of this digest)"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_hardlink_into_existing_directory() -> Result<(), Error> {
         let temp_dir = TempDir::new().unwrap();

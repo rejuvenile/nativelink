@@ -21,6 +21,7 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_util::action_messages::{ActionResult, OperationId};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_worker::directory_cache::DirectoryCache;
 use nativelink_worker::running_actions_manager::{Metrics, RunningAction, RunningActionsManager};
 use tokio::sync::mpsc;
 
@@ -77,6 +78,12 @@ pub(crate) struct MockRunningActionsManager {
     // `get_cas_store` trait method is synchronous; the store is installed
     // once before the backfill call and never contended.
     cas_store: std::sync::Mutex<Option<Arc<FastSlowStore>>>,
+
+    // #speculative-prefetch: when set, `get_directory_cache()` returns this real
+    // DirectoryCache so the `Update::PrefetchInputs` worker arm can be driven
+    // end-to-end (single-in-flight, TTL release, prewarm adoption). `None` (the
+    // default) exercises the arm's "no DirectoryCache → skip" branch.
+    directory_cache: std::sync::Mutex<Option<Arc<DirectoryCache>>>,
 }
 
 impl Default for MockRunningActionsManager {
@@ -106,6 +113,7 @@ impl MockRunningActionsManager {
             cache_action_result_err: Mutex::new(None),
             indefinite_pin_saturated: std::sync::atomic::AtomicBool::new(false),
             cas_store: std::sync::Mutex::new(None),
+            directory_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -117,6 +125,17 @@ impl MockRunningActionsManager {
     #[allow(dead_code, reason = "consumed by #FL-688 backfill retry test")]
     pub(crate) fn set_cas_store(&self, cas_store: Arc<FastSlowStore>) {
         *self.cas_store.lock().expect("cas_store mutex poisoned") = Some(cas_store);
+    }
+
+    /// #speculative-prefetch: install the real `DirectoryCache` returned by
+    /// `get_directory_cache()`, so the `Update::PrefetchInputs` worker arm can be
+    /// driven end-to-end against production composition.
+    #[allow(dead_code, reason = "consumed by #speculative-prefetch worker-arm tests")]
+    pub(crate) fn set_directory_cache(&self, cache: Arc<DirectoryCache>) {
+        *self
+            .directory_cache
+            .lock()
+            .expect("directory_cache mutex poisoned") = Some(cache);
     }
 
     /// #O15 (2026-06-07): install a `Notify` that `cache_action_result`
@@ -302,6 +321,13 @@ impl RunningActionsManager for MockRunningActionsManager {
         self.cas_store
             .lock()
             .expect("cas_store mutex poisoned")
+            .clone()
+    }
+
+    fn get_directory_cache(&self) -> Option<Arc<DirectoryCache>> {
+        self.directory_cache
+            .lock()
+            .expect("directory_cache mutex poisoned")
             .clone()
     }
 

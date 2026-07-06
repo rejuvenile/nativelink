@@ -114,6 +114,13 @@ tracing-test = { version = "0.2.5", default-features = false, features = [
 ignored = ["tracing-test"]
 
 [[test]]
+# #speculative-prefetch: worker-arm integration test uses
+# tests/utils/local_worker_test_utils.rs (MockRunningActionsManager +
+# setup_local_worker), gated behind test-utils like the other utils-using tests.
+name = "speculative_prefetch_worker_test"
+required-features = ["test-utils"]
+
+[[test]]
 # (#p2p-prefetch) Worker-side inline peer-hint registration. The production-
 # composition seam test uses `WorkerProxyStore::inject_worker_connection`,
 # gated behind `cfg(any(test, feature = "test-utils"))` in nativelink-store.
