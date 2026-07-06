@@ -325,13 +325,14 @@ pub struct SimpleSpec {
     pub speculative_prefetch_backlog_threshold: u64,
 
     /// (speculative-prefetch Increment 1) Time-to-live for a speculative pin
-    /// in seconds. The worker self-fires a release timer after this many
-    /// seconds if the real StartAction has not arrived. Must be <= 120s
-    /// (`PIN_TIMEOUT_SECS`); the effective lifetime is
-    /// `min(speculative_prefetch_ttl_s, 120)`. Default 60s: long enough
-    /// for typical scheduler latency under backlog, short enough to reclaim
-    /// pins before the 120s sweep catches them (keeps the speculative-pin
-    /// sub-budget from saturating on stale ops).
+    /// in seconds. FORWARDED on the wire (`PrefetchInputs.ttl_s`) so this knob
+    /// is LIVE end-to-end: the worker self-fires a pin release after
+    /// `min(this, PIN_TIMEOUT_SECS=120)` seconds if the real StartAction has
+    /// not arrived. Default 60s: long enough for typical scheduler latency
+    /// under backlog, short enough to reclaim pins before the 120s sweep
+    /// catches them (keeps the speculative-pin sub-budget from saturating on
+    /// stale ops). A worker receiving `0` (e.g. an older scheduler) uses its
+    /// own 60s default.
     ///
     /// MUST NOT be derived from `worker_timeout_s` (default 0 = disabled).
     #[serde(default = "default_speculative_prefetch_ttl_s")]

@@ -14,13 +14,22 @@
 
 //! Tests for the speculative input pre-fetch feature (tag-15 `PrefetchInputs`).
 //!
-//! Test matrix:
-//!  T1  – feature gate OFF (default): no PrefetchInputs emitted
-//!  T2  – backlog trigger: idle worker receives PrefetchInputs when queue >= threshold
-//!  T3  – coalesce guard: second do_try_match cycle does NOT re-emit for same op
-//!  T4  – platform mismatch: no PrefetchInputs when no idle worker matches
-//!  T8  – config deserialization: enable_speculative_prefetch defaults false
-//!  T9  – proto roundtrip: PrefetchInputs serializes/deserializes correctly
+//! Test matrix (numbers match what each test ACTUALLY asserts, not the spec's
+//! original T-matrix — see distsys F5 on decorative numbering):
+//!  T1   – feature gate OFF (default): no PrefetchInputs emitted (config + scheduling)
+//!  T1b  – feature-OFF inertness: do_try_match leaves the coalesce guard empty
+//!  T2   – emission: send_prefetch_inputs DELIVERS a PrefetchInputs to an idle
+//!         worker (direct-call; vacuity probe = disable emission → red-fail)
+//!  T3   – coalesce guard: a 2nd emit for the same op is SUPPRESSED + counter bumps
+//!  T4   – coalesce guard is REAPED on worker evict so a rerouted op re-prefetches
+//!         (the distsys/red-team/testing-czar convergent must-fix)
+//!  (renamed) send_prefetch_inputs_no_eligible_idle_worker_no_emit – platform
+//!         mismatch → no emit (was the mislabeled "t4_platform_mismatch")
+//!  T8   – config deserialization: enable_speculative_prefetch defaults false
+//!  T9   – proto roundtrip: PrefetchInputs serializes/deserializes correctly
+//!
+//! Worker-side arm coverage (Update::PrefetchInputs) lives in
+//! nativelink-worker/tests/speculative_prefetch_worker_test.rs.
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -36,7 +45,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
-use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker::{ActionInfoWithProps, Worker};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::common::DigestInfo;
@@ -243,426 +252,363 @@ async fn t1_feature_gate_off_no_prefetch_inputs() -> Result<(), Error> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// T2: Backlog trigger — idle worker receives PrefetchInputs
+// T1b: feature-OFF path inertness — do_try_match leaves the coalesce guard EMPTY
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Spec: with `enable_speculative_prefetch = true` and queue depth >= threshold,
-// `do_try_match` MUST emit a `PrefetchInputs` message to an idle worker for a
-// still-queued action (one that couldn't be matched because all candidate
-// workers were saturated).
+// testing-czar G-C. Two halves:
+//  (1) NON-VACUITY: the guard CAN be non-empty — a direct send_prefetch_inputs
+//      populates it (proves prefetch_coalesce_guard_len observes a real value,
+//      not a constant 0). This is the same production fn the backlog block calls.
+//  (2) CONTRACT: a gate-OFF SimpleScheduler running do_try_match over a real
+//      backlog (more queued actions than idle-worker slots) leaves ITS guard
+//      EMPTY and emits NO PrefetchInputs — byte-identical to pre-feature.
 //
-// Setup (max_inflight_tasks=1 makes workers truly saturate):
-//   - Worker A: max_inflight_tasks=1 → saturates after action 1
-//   - Worker B: max_inflight_tasks=1 → saturates after action 2
-//   - Worker C: max_inflight_tasks=1, idle (no action dispatched to it yet)
-//   - Action 3: stays queued (no idle slot among A/B); backlog=1 >= threshold=1
-//   - Explicit do_try_match_for_test: fires PrefetchInputs to C (the idle worker)
-//
-// Bespoke failure message:
-//   "T2: PrefetchInputs not received on any worker — backlog trigger broken"
+// Coverage limitation (recorded in deferred_tasks, #speculative-prefetch-t1b-
+// gate-mutation): the greedy normal match drains the backlog before the trigger
+// ever sees a still-queued action WITH an idle worker in a single do_try_match
+// cycle, so the gate-ON path cannot be driven to POPULATE the guard through
+// do_try_match in this harness; the trigger's guts are covered by T2/T3/T4's
+// direct calls instead. This test therefore pins the OFF contract + non-vacuity
+// of the inspection, not a do_try_match-scope gate-removal mutation.
 #[nativelink_test]
-async fn t2_backlog_trigger_emits_prefetch_inputs() -> Result<(), Error> {
-    let task_change_notify = Arc::new(Notify::new());
-    let spec = spec_with_prefetch(1, 60);
-    let (scheduler, _worker_sched) = SimpleScheduler::new_with_callback(
-        &spec,
-        memory_awaited_action_db_factory(
-            0,
-            &task_change_notify.clone(),
+async fn t1b_feature_off_leaves_coalesce_guard_empty() -> Result<(), Error> {
+    // (1) NON-VACUITY via a direct emit on a gate-ON scheduler.
+    {
+        let task_change_notify = Arc::new(Notify::new());
+        let spec_on = spec_with_prefetch(1, 60);
+        let (scheduler_on, _ws) = SimpleScheduler::new_with_callback(
+            &spec_on,
+            memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+            || async move {},
+            task_change_notify,
             MockInstantWrapped::default,
-        ),
+            None, None, None, None,
+        );
+        let _rx = add_worker(&scheduler_on, WorkerId("t1b_on".to_string()), PlatformProperties::default()).await?;
+        let ws = scheduler_on.worker_scheduler_for_test();
+        assert_eq!(ws.prefetch_coalesce_guard_len().await, 0, "guard starts empty");
+        assert!(
+            ws.send_prefetch_inputs(
+                &PlatformProperties::default(), &OperationId::default(),
+                DigestInfo::new([1u8; 32], 1), vec![], 60,
+            ).await,
+            "non-vacuity precondition: a direct emit to an idle worker must succeed"
+        );
+        assert_eq!(
+            ws.prefetch_coalesce_guard_len().await, 1,
+            "non-vacuity: prefetch_coalesce_guard_len must observe the recorded entry (proves the \
+             OFF assertion below is not comparing against a constant 0)"
+        );
+    }
+
+    // (2) CONTRACT: gate OFF + a backlog → guard stays empty, no PrefetchInputs.
+    let task_change_notify = Arc::new(Notify::new());
+    let spec_off = SimpleSpec {
+        enable_speculative_prefetch: false,
+        speculative_prefetch_backlog_threshold: 1,
+        speculative_prefetch_ttl_s: 60,
+        ..Default::default()
+    };
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec_off,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
         || async move {},
         task_change_notify,
         MockInstantWrapped::default,
-        None, // maybe_origin_event_tx
-        None, // cas_store
-        None, // locality_map
-        None, // worker_tls_config
+        None, None, None, None,
     );
-
-    // Workers A and B: max_inflight_tasks=1 so they saturate after one action.
-    let worker_a = WorkerId("t2_worker_a".to_string());
-    let mut rx_a = add_worker_with_slots(
-        &scheduler, worker_a.clone(), PlatformProperties::default(), 1,
+    // One worker, max_inflight=1; queue THREE actions → 1 dispatched, 2 remain
+    // queued (backlog=2 >= threshold=1). Gate OFF ⇒ backlog block never runs.
+    let mut rx = add_worker_with_slots(
+        &scheduler, WorkerId("t1b_off".to_string()), PlatformProperties::default(), 1,
     ).await?;
-
-    let worker_b = WorkerId("t2_worker_b".to_string());
-    let mut rx_b = add_worker_with_slots(
-        &scheduler, worker_b.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Worker C: idle, max_inflight_tasks=1.
-    let worker_c = WorkerId("t2_worker_c".to_string());
-    let mut rx_c = add_worker_with_slots(
-        &scheduler, worker_c.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Queue action 1 → dispatched to worker A (StartAction, A saturated).
-    let digest_1 = DigestInfo::new([10u8; 32], 10);
-    let root_1 = DigestInfo::new([11u8; 32], 100);
-    queue_action(&scheduler, digest_1, root_1, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    // Drain StartAction on A (or B or C — whichever LRU picked).
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
+    for i in 0..3u8 {
+        queue_action(
+            &scheduler,
+            DigestInfo::new([i + 1; 32], u64::from(i) + 1),
+            DigestInfo::new([i + 100; 32], u64::from(i) + 100),
+            HashMap::new(),
+        ).await?;
     }
-    // One of A/B/C received StartAction. Drain all to clear state.
-    while rx_a.try_recv().is_ok() {}
-    while rx_b.try_recv().is_ok() {}
-    while rx_c.try_recv().is_ok() {}
-
-    // Queue action 2 → dispatched to the next available worker.
-    let digest_2 = DigestInfo::new([20u8; 32], 20);
-    let root_2 = DigestInfo::new([21u8; 32], 200);
-    queue_action(&scheduler, digest_2, root_2, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    while rx_a.try_recv().is_ok() {}
-    while rx_b.try_recv().is_ok() {}
-    while rx_c.try_recv().is_ok() {}
-
-    // Queue action 3 with a distinctive input_root_digest.
-    // Two of the three workers are now saturated; one is still idle.
-    // The normal match dispatches action 3 to the remaining idle worker.
-    let digest_3 = DigestInfo::new([30u8; 32], 30);
-    let root_3 = DigestInfo::new([33u8; 32], 300);
-    queue_action(&scheduler, digest_3, root_3, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    // All three workers saturated now. Drain.
-    while rx_a.try_recv().is_ok() {}
-    while rx_b.try_recv().is_ok() {}
-    while rx_c.try_recv().is_ok() {}
-
-    // Queue action 4: ALL workers are at max_inflight_tasks=1 (saturated).
-    // The normal match cannot assign it → it stays queued (backlog=1 >= threshold=1).
-    // The backlog trigger in do_try_match fires send_prefetch_inputs, but
-    // inner_find_worker_for_action finds NO idle worker (all saturated) → returns false.
-    //
-    // For PrefetchInputs to actually fire, we need an idle worker. Add worker D.
-    let worker_d = WorkerId("t2_worker_d".to_string());
-    let mut rx_d = add_worker_with_slots(
-        &scheduler, worker_d.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Queue action 4. Worker D is idle. The NORMAL match dispatches to D immediately.
-    // Then queue action 5 — D is now saturated. Queue action 6 — stays queued.
-    let digest_4 = DigestInfo::new([40u8; 32], 40);
-    let root_4 = DigestInfo::new([44u8; 32], 400);
-    queue_action(&scheduler, digest_4, root_4, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    while rx_d.try_recv().is_ok() {} // Drain StartAction on D.
-
-    // All 4 workers saturated. Queue action 5 → stays queued.
-    let digest_5 = DigestInfo::new([50u8; 32], 50);
-    let root_5 = DigestInfo::new([55u8; 32], 500);
-    queue_action(&scheduler, digest_5, root_5, HashMap::new()).await?;
-
-    // Add worker E: idle.
-    let worker_e = WorkerId("t2_worker_e".to_string());
-    let mut rx_e = add_worker_with_slots(
-        &scheduler, worker_e.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Explicit do_try_match cycle:
-    //   normal match: dispatches action 5 → worker E (StartAction). E is now saturated.
-    //   backlog trigger: queue is now empty (action 5 was matched) → threshold NOT met.
-    //   → no PrefetchInputs.
-    // Queue action 6 right before the match to ensure backlog exists.
-    // Action 5 is matched to E in this cycle; action 6 stays queued.
-    let digest_6 = DigestInfo::new([60u8; 32], 60);
-    let root_6 = DigestInfo::new([66u8; 32], 600);
-    queue_action(&scheduler, digest_6, root_6, HashMap::new()).await?;
-
-    // Worker F: idle — will receive PrefetchInputs for action 6.
-    let worker_f = WorkerId("t2_worker_f".to_string());
-    let mut rx_f = add_worker_with_slots(
-        &scheduler, worker_f.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Explicit cycle: action 5 → E (StartAction), action 6 → F (StartAction) since F is idle.
-    // After normal match, if any action remains queued, backlog trigger fires.
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-
-    // Collect ALL messages from ALL workers after the cycle.
-    let all_msgs: Vec<UpdateForWorker> = [&mut rx_a, &mut rx_b, &mut rx_c, &mut rx_d, &mut rx_e, &mut rx_f]
-        .iter_mut()
-        .flat_map(|rx| {
-            let mut v = vec![];
-            while let Ok(m) = rx.try_recv() {
-                v.push(m);
-            }
-            v
-        })
-        .collect();
-
-    // Both action 5 and action 6 likely matched normally (workers E and F).
-    // To test the backlog trigger specifically, we need a scenario where the queue
-    // has more items than idle workers WITHIN a SINGLE match cycle.
-    //
-    // The reliable observable: at least one of the messages is StartAction (normal match
-    // works) OR PrefetchInputs (speculative trigger works). The key invariant is that
-    // the feature doesn't CRASH and at least the normal path works.
-    //
-    // For a strict PrefetchInputs assertion: add 3 actions simultaneously so some
-    // remain queued after E and F are matched.
-    let got_start = all_msgs.iter().any(|m| {
-        matches!(m.update, Some(update_for_worker::Update::StartAction(_)))
-    });
-    let got_prefetch = all_msgs.iter().any(|m| {
-        matches!(m.update, Some(update_for_worker::Update::PrefetchInputs(_)))
-    });
-    assert!(
-        got_start || got_prefetch,
-        "T2: PrefetchInputs not received on any worker — backlog trigger broken \
-         (also no StartAction — scheduling completely broken; msgs: {all_msgs:?})"
-    );
-
-    // Strict PrefetchInputs test: queue 3 actions into a fully-saturated fleet
-    // (E and F from above are now saturated too if they got StartAction).
-    // All 6 workers saturated. Add an idle worker G.
-    let worker_g = WorkerId("t2_worker_g".to_string());
-    let mut rx_g = add_worker_with_slots(
-        &scheduler, worker_g.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Queue 3 more actions simultaneously. Worker G can only take 1 (max_inflight=1).
-    // Actions 7+8+9 queued; G gets action 7 via normal match; actions 8+9 stay queued.
-    // Backlog trigger fires PrefetchInputs for actions 8+9 but no idle worker → none sent.
-    //
-    // Final: the strict T2 assertion is that send_prefetch_inputs is called and
-    // returns false (no idle workers). The feature didn't crash. The positive path
-    // (PrefetchInputs actually delivered) requires a worker that stays idle through the
-    // normal match cycle AND has a still-queued action after the match. This is hard
-    // to arrange deterministically in a unit test since the matching is concurrent
-    // (MATCH_CONCURRENCY=32). We verify the positive path via T1 mutation-verify instead.
-    //
-    // T2 passes if: (a) the scheduler didn't crash, (b) at least StartAction was dispatched.
-    assert!(
-        got_start,
-        "T2: no StartAction dispatched — normal scheduling broken even without prefetch path"
-    );
-
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// T3: Coalesce guard — second do_try_match cycle does NOT re-emit for same op
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Spec: `prefetch_affinity` records the (op_id → worker_id) on first emission.
-// A second `do_try_match` cycle for the SAME still-queued op MUST skip it
-// (coalesce). This prevents duplicate speculative fetches per op.
-//
-// Setup (max_inflight_tasks=1 so workers truly saturate):
-//   - Saturate workers A and B with actions 1 and 2.
-//   - Worker C: idle.
-//   - Queue action 3: stays queued (A+B full), backlog=1 >= threshold=1.
-//   - Cycle 1: PrefetchInputs → C (for action 3) — coalesced into prefetch_affinity.
-//   - Cycle 2: same action 3 still queued; coalesce guard should block re-emission.
-//   - Total PrefetchInputs across both cycles: ≤ 1.
-//
-// Bespoke failure message:
-//   "T3: PrefetchInputs emitted N times for same op — coalesce guard broken"
-#[nativelink_test]
-async fn t3_coalesce_guard_no_duplicate_prefetch() -> Result<(), Error> {
-    let task_change_notify = Arc::new(Notify::new());
-    let spec = spec_with_prefetch(1, 60);
-    let (scheduler, _worker_sched) = SimpleScheduler::new_with_callback(
-        &spec,
-        memory_awaited_action_db_factory(
-            0,
-            &task_change_notify.clone(),
-            MockInstantWrapped::default,
-        ),
-        || async move {},
-        task_change_notify,
-        MockInstantWrapped::default,
-        None, // maybe_origin_event_tx
-        None, // cas_store
-        None, // locality_map
-        None, // worker_tls_config
-    );
-
-    // Workers A and B: max_inflight_tasks=1.
-    let worker_a = WorkerId("t3_worker_a".to_string());
-    let mut rx_a = add_worker_with_slots(
-        &scheduler, worker_a.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    let worker_b = WorkerId("t3_worker_b".to_string());
-    let mut rx_b = add_worker_with_slots(
-        &scheduler, worker_b.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Worker C: idle (max_inflight_tasks=1).
-    let worker_c = WorkerId("t3_worker_c".to_string());
-    let mut rx_c = add_worker_with_slots(
-        &scheduler, worker_c.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Queue action 1 → dispatched to A; A saturated.
-    let digest_1 = DigestInfo::new([50u8; 32], 50);
-    let root_1 = DigestInfo::new([51u8; 32], 500);
-    queue_action(&scheduler, digest_1, root_1, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 { tokio::task::yield_now().await; }
-    while rx_a.try_recv().is_ok() {}
-    while rx_b.try_recv().is_ok() {}
-    while rx_c.try_recv().is_ok() {}
-
-    // Queue action 2 → dispatched to B (or C); saturates one more worker.
-    let digest_2 = DigestInfo::new([60u8; 32], 60);
-    let root_2 = DigestInfo::new([61u8; 32], 600);
-    queue_action(&scheduler, digest_2, root_2, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 { tokio::task::yield_now().await; }
-    while rx_a.try_recv().is_ok() {}
-    while rx_b.try_recv().is_ok() {}
-    while rx_c.try_recv().is_ok() {}
-
-    // Queue action 3 → the third worker takes it. Now all saturated.
-    let digest_3 = DigestInfo::new([70u8; 32], 70);
-    let root_3 = DigestInfo::new([71u8; 32], 700);
-    queue_action(&scheduler, digest_3, root_3, HashMap::new()).await?;
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 { tokio::task::yield_now().await; }
-    while rx_a.try_recv().is_ok() {}
-    while rx_b.try_recv().is_ok() {}
-    while rx_c.try_recv().is_ok() {}
-
-    // Add idle worker D.
-    let worker_d = WorkerId("t3_worker_d".to_string());
-    let mut rx_d = add_worker_with_slots(
-        &scheduler, worker_d.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Queue action 4: A/B/C saturated; D is idle.
-    // Cycle 1: normal match dispatches to D (StartAction). D now saturated.
-    // After D's StartAction, action 4 is gone. No still-queued action for prefetch.
-    //
-    // To get PrefetchInputs, we need action 5 to stay queued after D is also saturated.
-    let digest_4 = DigestInfo::new([80u8; 32], 80);
-    let root_4 = DigestInfo::new([81u8; 32], 800);
-    queue_action(&scheduler, digest_4, root_4, HashMap::new()).await?;
-
-    // Immediately also queue action 5 (before do_try_match): BOTH stay queued.
-    // do_try_match: dispatches action 4 → D (StartAction, D saturated).
-    // Action 5 remains queued → backlog=1 >= threshold=1.
-    // Backlog trigger: no idle worker (A/B/C/D all saturated) → PrefetchInputs NOT sent.
-    //
-    // To observe PrefetchInputs we need yet another idle worker E.
-    let digest_5 = DigestInfo::new([90u8; 32], 90);
-    let root_5 = DigestInfo::new([95u8; 32], 950);
-    queue_action(&scheduler, digest_5, root_5, HashMap::new()).await?;
-
-    let worker_e = WorkerId("t3_worker_e".to_string());
-    let mut rx_e = add_worker_with_slots(
-        &scheduler, worker_e.clone(), PlatformProperties::default(), 1,
-    ).await?;
-
-    // Cycle 1: matches action 4 → D, action 5 → E.
-    // After: all saturated, queue empty. No PrefetchInputs fired.
-    // Cycle 2: queue empty → no backlog trigger.
-    // In both cycles, total PrefetchInputs on any worker: 0.
-    //
-    // This means the T3 "coalesce guard prevents duplicates" is impossible to
-    // exercise without the queue having a PERSISTENT unmatched action AND an
-    // idle worker on two consecutive cycles — which requires that the normal match
-    // did NOT consume the action (it must truly stay queued).
-    //
-    // The only way to have a persistent queued action is if NO worker can accept it
-    // (ALL saturated) but an idle worker DOES exist for the speculative path.
-    // These are contradictory: `inner_find_worker_for_action` (used by both normal
-    // match and speculative prefetch) picks the SAME workers. If a worker is idle
-    // for prefetch, the normal match would dispatch to it first.
-    //
-    // Conclusion: the coalesce guard fires ONLY when the scheduler's internal
-    // `prefetch_affinity` cache is non-empty AND the same op is still queued
-    // on a subsequent cycle. Testing via do_try_match integration requires that
-    // the first cycle successfully sent PrefetchInputs AND the action didn't
-    // get consumed by a StartAction.
-    //
-    // For this test, we DIRECTLY call send_prefetch_inputs twice to verify
-    // the coalesce guard via the exported scheduler API.
-    //
-    // Use scheduler.worker_scheduler via the Arc<dyn WorkerScheduler> downcast.
-    // Since send_prefetch_inputs is on ApiWorkerScheduler (not the trait), we
-    // test coalesce indirectly: call do_try_match twice with an unmatched action.
-    //
-    // Add worker F with action 5 and 6 both queued before a cycle.
-    // Saturate A/B/C/D/E by emptying their slots in the previous cycles.
     scheduler.do_try_match_for_test().await?;
     for _ in 0..5 { tokio::task::yield_now().await; }
-    while rx_d.try_recv().is_ok() {}
-    while rx_e.try_recv().is_ok() {}
 
-    // Worker F: idle.
-    let worker_f = WorkerId("t3_worker_f".to_string());
-    let mut rx_f = add_worker_with_slots(
-        &scheduler, worker_f.clone(), PlatformProperties::default(), 1,
-    ).await?;
+    assert_eq!(
+        scheduler.worker_scheduler_for_test().prefetch_coalesce_guard_len().await,
+        0,
+        "T1b (2026-07-05): feature-OFF is NOT inert — the coalesce guard is non-empty after \
+         do_try_match with the gate OFF. The `if self.enable_speculative_prefetch` gate must \
+         skip the entire backlog block."
+    );
+    while let Ok(m) = rx.try_recv() {
+        assert!(
+            !matches!(m.update, Some(update_for_worker::Update::PrefetchInputs(_))),
+            "T1b: PrefetchInputs emitted with the gate OFF — the backlog block must not run"
+        );
+    }
 
-    // Queue 2 more actions; A/B/C/D/E saturated, F is idle.
-    let digest_6 = DigestInfo::new([100u8; 32], 100);
-    let root_6 = DigestInfo::new([101u8; 32], 1000);
-    queue_action(&scheduler, digest_6, root_6, HashMap::new()).await?;
-    let digest_7 = DigestInfo::new([110u8; 32], 110);
-    let root_7 = DigestInfo::new([111u8; 32], 1100);
-    queue_action(&scheduler, digest_7, root_7, HashMap::new()).await?;
+    Ok(())
+}
 
-    // Cycle 1: dispatches action 6 → F (StartAction, F saturated).
-    // Action 7 remains queued. Backlog trigger: no idle worker → no PrefetchInputs.
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 { tokio::task::yield_now().await; }
+// ─────────────────────────────────────────────────────────────────────────────
+// T2: emission — send_prefetch_inputs delivers a PrefetchInputs to an idle worker
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// testing-czar C1: the prior T2 was VACUOUS (it passed with emission fully
+// disabled). This drives the emission path DETERMINISTICALLY by calling the
+// production `ApiWorkerScheduler::send_prefetch_inputs` directly (the same fn
+// `do_try_match`'s backlog trigger calls) with one idle worker, and asserts the
+// worker's rx receives exactly one `PrefetchInputs` carrying the op_id +
+// input_root_digest. Vacuity probe: disabling `send_prefetch_inputs`
+// (unconditional early `return false`) makes this red-fail.
+//
+// Bespoke failure message:
+//   "T2: idle worker did not receive PrefetchInputs — send_prefetch_inputs emission broken"
+#[nativelink_test]
+async fn t2_send_prefetch_inputs_delivers_to_idle_worker() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(3, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
 
-    let mut cycle1_msgs: Vec<UpdateForWorker> = vec![];
-    while let Ok(m) = rx_f.try_recv() { cycle1_msgs.push(m); }
+    let worker_id = WorkerId("t2_idle_worker".to_string());
+    let mut rx = add_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
 
-    // Cycle 2: action 7 still queued, all workers saturated → no idle for prefetch.
-    scheduler.do_try_match_for_test().await?;
-    for _ in 0..3 { tokio::task::yield_now().await; }
-
-    let mut cycle2_msgs: Vec<UpdateForWorker> = vec![];
-    while let Ok(m) = rx_f.try_recv() { cycle2_msgs.push(m); }
-
-    let total_prefetch = cycle1_msgs.iter().chain(cycle2_msgs.iter())
-        .filter(|m| matches!(m.update, Some(update_for_worker::Update::PrefetchInputs(_))))
-        .count();
-
+    let op_id = OperationId::default();
+    let input_root = DigestInfo::new([7u8; 32], 4242);
+    let sent = scheduler
+        .worker_scheduler_for_test()
+        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        .await;
     assert!(
-        total_prefetch <= 1,
-        "T3: PrefetchInputs emitted {total_prefetch} times for same op — coalesce guard broken \
-         (expected ≤ 1 across two consecutive cycles)"
+        sent,
+        "T2: send_prefetch_inputs returned false with one idle matching worker present — \
+         emission should have found the worker and sent"
+    );
+    tokio::task::yield_now().await;
+
+    // The idle worker must have received exactly one PrefetchInputs matching
+    // the op_id + input_root_digest we asked for.
+    let mut got: Option<PrefetchInputs> = None;
+    while let Ok(m) = rx.try_recv() {
+        if let Some(update_for_worker::Update::PrefetchInputs(p)) = m.update {
+            got = Some(p);
+        }
+    }
+    let p = got.expect(
+        "T2: idle worker did not receive PrefetchInputs — send_prefetch_inputs emission broken",
+    );
+    assert_eq!(
+        p.operation_id,
+        op_id.to_string(),
+        "T2: PrefetchInputs carried the wrong operation_id"
+    );
+    let got_root: DigestInfo = p
+        .input_root_digest
+        .as_ref()
+        .expect("T2: PrefetchInputs missing input_root_digest")
+        .try_into()
+        .expect("T2: PrefetchInputs input_root_digest not a valid DigestInfo");
+    assert_eq!(
+        got_root, input_root,
+        "T2: PrefetchInputs carried the wrong input_root_digest"
     );
 
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// T4: Platform mismatch — no PrefetchInputs when no idle worker matches
+// T3: coalesce guard — a second emit for the SAME op is suppressed (G5 fan-out=1)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Spec: `inner_find_worker_for_action` filters candidates by platform. If no
-// idle worker satisfies the queued action's platform properties, `send_prefetch_inputs`
-// returns false and no `PrefetchInputs` is emitted.
+// testing-czar C2: the prior T3's `total_prefetch <= 1` bound was satisfied by
+// ZERO (no emit ever fired). This drives the real dedup: two `send_prefetch_inputs`
+// calls for the SAME op → the worker receives EXACTLY ONE message, the second
+// call returns `false`, and `speculative_prefetch_coalesce_suppressed` increments
+// by exactly one. Vacuity probe: remove the `prefetch_coalesce_guard.contains`
+// check → the second emit fires (worker gets 2) and the counter stays 0.
 //
-// Bespoke failure message:
-//   "T4: PrefetchInputs emitted despite platform mismatch — must not emit to ineligible worker"
+// Bespoke failure message baked into the asserts.
 #[nativelink_test]
-async fn t4_platform_mismatch_no_prefetch_inputs() -> Result<(), Error> {
+async fn t3_coalesce_guard_suppresses_duplicate_emit() -> Result<(), Error> {
     let task_change_notify = Arc::new(Notify::new());
-    // Threshold 1 so any single queued action triggers the prefetch path.
+    let spec = spec_with_prefetch(3, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+
+    let worker_id = WorkerId("t3_idle_worker".to_string());
+    let mut rx = add_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    let ws = scheduler.worker_scheduler_for_test();
+
+    let op_id = OperationId::default();
+    let input_root = DigestInfo::new([8u8; 32], 900);
+
+    let suppressed_before = ws
+        .get_metrics()
+        .speculative_prefetch_coalesce_suppressed
+        .load(core::sync::atomic::Ordering::Relaxed);
+
+    let first = ws
+        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        .await;
+    assert!(first, "T3: first emit for a fresh op must succeed");
+
+    let second = ws
+        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        .await;
+    assert!(
+        !second,
+        "T3: second emit for the SAME op must be coalesced (return false) — G5 fan-out=1 broken"
+    );
+
+    let suppressed_after = ws
+        .get_metrics()
+        .speculative_prefetch_coalesce_suppressed
+        .load(core::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        suppressed_after - suppressed_before,
+        1,
+        "T3: speculative_prefetch_coalesce_suppressed must increment by exactly 1 on the \
+         coalesced second emit (the observability the reviewers demanded)"
+    );
+
+    tokio::task::yield_now().await;
+    let prefetch_count = {
+        let mut n = 0;
+        while let Ok(m) = rx.try_recv() {
+            if matches!(m.update, Some(update_for_worker::Update::PrefetchInputs(_))) {
+                n += 1;
+            }
+        }
+        n
+    };
+    assert_eq!(
+        prefetch_count, 1,
+        "T3: worker received {prefetch_count} PrefetchInputs for the same op — coalesce guard \
+         must deliver EXACTLY one (dedup broken)"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T4 (reap): coalesce guard is REAPED on worker eviction so a rerouted op can
+// re-prefetch
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// distsys BLOCK-1 / testing-czar C5 / red-team A-F1 (convergent): a stale
+// coalesce entry for an op whose worker died must NOT permanently suppress a
+// fresh prefetch to a HEALTHY worker. `immediate_evict_worker` (reached via the
+// public `remove_worker`) reaps the coalesce entry for every op the dead worker
+// held (keyed on client_operation_id, matching the map). This test: emit for an
+// op to worker A (succeeds), a second emit is coalesced (suppressed), remove
+// worker A (reap), then emit AGAIN for the SAME op to idle worker B — it MUST
+// succeed because the reap cleared the stale entry.
+//
+// Vacuity/mutation probe: remove the `prefetch_coalesce_guard.pop(&operation_id)`
+// reap in immediate_evict_worker → the third emit is still coalesced (returns
+// false) and this red-fails.
+#[nativelink_test]
+async fn t4_coalesce_guard_reaped_on_worker_evict() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(3, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+
+    let worker_a = WorkerId("t4_worker_a".to_string());
+    let _rx_a = add_worker(&scheduler, worker_a.clone(), PlatformProperties::default()).await?;
+    let ws = scheduler.worker_scheduler_for_test();
+
+    let op_id = OperationId::default();
+    let input_root = DigestInfo::new([9u8; 32], 555);
+
+    // 1) First emit for the op → recorded in the coalesce guard (goes to A, the
+    //    only idle worker).
+    assert!(
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+            .await,
+        "T4: first emit must succeed"
+    );
+    // 2) A second emit for the same op is coalesced (proves the entry exists).
+    assert!(
+        !ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+            .await,
+        "T4: second emit must be coalesced (entry present)"
+    );
+
+    // 3) Simulate worker A holding then dropping the op: reserve it to A (so the
+    //    evict-drain reaps it), then remove A. `find_and_reserve_worker` records
+    //    the op in A's running_action_infos under client_operation_id — the same
+    //    key immediate_evict_worker drains and reaps.
+    let action_info = {
+        let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([1u8; 32], 1));
+        Arc::make_mut(&mut ai).input_root_digest = input_root;
+        ActionInfoWithProps {
+            inner: ai,
+            platform_properties: PlatformProperties::default(),
+        }
+    };
+    let reserved = ws
+        .find_and_reserve_worker(&PlatformProperties::default(), &op_id, &action_info, false)
+        .await;
+    assert!(
+        reserved.is_some(),
+        "T4: precondition — the op must reserve onto worker A so the evict-drain reaps it"
+    );
+
+    // Evict worker A → immediate_evict_worker drains A's held ops and reaps their
+    // coalesce entries.
+    ws.remove_worker(&worker_a)
+        .await
+        .err_tip(|| "T4: remove_worker A failed")?;
+    tokio::task::yield_now().await;
+
+    // 4) A fresh idle worker B is available; re-emitting for the SAME op MUST now
+    //    succeed because the reap cleared the stale entry.
+    let worker_b = WorkerId("t4_worker_b".to_string());
+    let _rx_b = add_worker(&scheduler, worker_b.clone(), PlatformProperties::default()).await?;
+    assert!(
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+            .await,
+        "distsys BLOCK-1 (2026-07-05): coalesce guard NOT reaped on worker evict — a rerouted \
+         op's stale entry permanently suppressed its re-prefetch to a healthy worker. \
+         immediate_evict_worker must pop the coalesce entry for every op the dead worker held."
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// send_prefetch_inputs with NO eligible idle worker → no emit (renamed from the
+// mislabeled "t4_platform_mismatch"; it tests the no-idle-worker path, not a
+// spec-T4 reap — distsys F5 numbering fix)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `send_prefetch_inputs` peeks for an idle worker matching the platform
+// properties; if none matches it returns false and emits nothing. Here the only
+// worker lacks the required "gpu" property, so a gpu-requiring prefetch finds no
+// eligible worker and must NOT emit.
+#[nativelink_test]
+async fn send_prefetch_inputs_no_eligible_idle_worker_no_emit() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
     let spec = SimpleSpec {
         enable_speculative_prefetch: true,
         speculative_prefetch_backlog_threshold: 1,
@@ -674,48 +620,46 @@ async fn t4_platform_mismatch_no_prefetch_inputs() -> Result<(), Error> {
         }),
         ..Default::default()
     };
-    let (scheduler, _worker_sched) = SimpleScheduler::new_with_callback(
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
         &spec,
-        memory_awaited_action_db_factory(
-            0,
-            &task_change_notify.clone(),
-            MockInstantWrapped::default,
-        ),
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
         || async move {},
         task_change_notify,
         MockInstantWrapped::default,
-        None, // maybe_origin_event_tx
-        None, // cas_store
-        None, // locality_map
-        None, // worker_tls_config
+        None, None, None, None,
     );
 
-    // Worker: supports no "gpu" property.
-    let worker_id = WorkerId("t4_worker_no_gpu".to_string());
+    // Worker supports NO "gpu" property.
+    let worker_id = WorkerId("mismatch_worker_no_gpu".to_string());
     let mut rx = add_worker(&scheduler, worker_id, PlatformProperties::default()).await?;
 
-    // Action requires "gpu=required".
-    let digest = DigestInfo::new([90u8; 32], 90);
-    let root = DigestInfo::new([91u8; 32], 900);
-    let mut props = HashMap::new();
-    props.insert("gpu".to_string(), "required".to_string());
-    queue_action(&scheduler, digest, root, props).await?;
-
-    // Run multiple do_try_match cycles.
-    for _ in 0..3 {
-        scheduler.do_try_match_for_test().await?;
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    // Worker MUST NOT have received a PrefetchInputs message.
-    // (It may have received ConnectionResult already drained; only new messages
-    // from here on matter. The channel was already drained by add_worker.)
+    // A prefetch that REQUIRES gpu=required has no eligible idle worker.
+    let mut gpu_props = PlatformProperties::default();
+    gpu_props.properties.insert(
+        "gpu".to_string(),
+        nativelink_util::platform_properties::PlatformPropertyValue::Exact("required".to_string()),
+    );
+    let op_id = OperationId::default();
+    let sent = scheduler
+        .worker_scheduler_for_test()
+        .send_prefetch_inputs(
+            &gpu_props,
+            &op_id,
+            DigestInfo::new([91u8; 32], 900),
+            vec![],
+            60,
+        )
+        .await;
+    assert!(
+        !sent,
+        "send_prefetch_inputs must return false when no idle worker satisfies the platform \
+         properties — must not emit to an ineligible worker"
+    );
+    tokio::task::yield_now().await;
     while let Ok(m) = rx.try_recv() {
         assert!(
             !matches!(m.update, Some(update_for_worker::Update::PrefetchInputs(_))),
-            "T4: PrefetchInputs emitted despite platform mismatch — must not emit to ineligible worker"
+            "PrefetchInputs emitted despite platform mismatch — must not emit to ineligible worker"
         );
     }
 
@@ -793,6 +737,7 @@ async fn t9_proto_roundtrip_prefetch_inputs() -> Result<(), Error> {
         operation_id: "op-roundtrip-test".to_string(),
         input_root_digest: Some(proto_digest.clone()),
         missing_digest_peers: vec![],
+        ttl_s: 90,
     };
 
     let mut buf = Vec::new();
@@ -814,6 +759,10 @@ async fn t9_proto_roundtrip_prefetch_inputs() -> Result<(), Error> {
         decoded.input_root_digest.as_ref().map(|d| d.size_bytes),
         Some(12345_i64),
         "T9: input_root_digest.size_bytes corrupted in proto roundtrip"
+    );
+    assert_eq!(
+        decoded.ttl_s, 90,
+        "T9: ttl_s field corrupted in proto roundtrip (the forwarded operator TTL)"
     );
     Ok(())
 }

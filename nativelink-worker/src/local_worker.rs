@@ -5298,11 +5298,18 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
                             let inflight_flag = self.speculative_prefetch_inflight.clone();
                             let guard_slot = self.speculative_prefetch_guard.clone();
-                            // TTL is a worker-local constant (60s default).
-                            // MUST NOT be derived from worker_timeout_s (default=0 / disabled).
-                            // The effective pin lifetime = min(60, PIN_TIMEOUT_SECS=120).
-                            const SPECULATIVE_PREFETCH_TTL_S: u64 = 60;
-                            let ttl_s = SPECULATIVE_PREFETCH_TTL_S;
+                            // #speculative-prefetch: honor the operator-configured
+                            // TTL forwarded on the wire (SimpleSpec.speculative_prefetch_ttl_s
+                            // → PrefetchInputs.ttl_s). 0 means "use the worker default".
+                            // NOT derived from worker_timeout_s (default=0 / disabled).
+                            // The effective pin lifetime is clamped to PIN_TIMEOUT_SECS
+                            // (120s) at the sleep below.
+                            const SPECULATIVE_PREFETCH_TTL_DEFAULT_S: u64 = 60;
+                            let ttl_s = if prefetch.ttl_s == 0 {
+                                SPECULATIVE_PREFETCH_TTL_DEFAULT_S
+                            } else {
+                                prefetch.ttl_s
+                            };
                             let operation_id_log = prefetch.operation_id.clone();
                             let metrics = self.metrics.clone();
 

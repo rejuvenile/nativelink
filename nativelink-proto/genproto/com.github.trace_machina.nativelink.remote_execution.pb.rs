@@ -1139,6 +1139,13 @@ pub struct PrefetchInputs {
     /// MAX_PEERS_PER_MISSING_BLOB=4).
     #[prost(message, repeated, tag = "3")]
     pub missing_digest_peers: ::prost::alloc::vec::Vec<MissingBlobPeers>,
+    /// / #speculative-prefetch: operator-configured pin TTL in seconds
+    /// / (SimpleSpec.speculative_prefetch_ttl_s). The worker self-fires a pin
+    /// / release after min(ttl_s, PIN_TIMEOUT_SECS=120) seconds. 0 = worker
+    /// / default (60s). Forwarded so the config knob is LIVE end-to-end (was
+    /// / previously dead: the worker hardcoded 60s and ignored the config).
+    #[prost(uint64, tag = "4")]
+    pub ttl_s: u64,
 }
 /// / (FL-688 v3 Stage C) Signals the worker that reconcile is complete.
 /// / Carries no payload: the affected worker is implicit (the message is

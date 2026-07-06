@@ -153,6 +153,13 @@ pub struct SchedulerMetrics {
     /// Total number of batch RPCs sent to workers during prefetch.
     #[metric(help = "total number of batch rpcs sent to workers during prefetch")]
     pub prefetch_batches_sent: AtomicU64,
+    /// #speculative-prefetch: number of speculative `PrefetchInputs` emits
+    /// SUPPRESSED because a FRESH coalesce-guard entry already existed for the
+    /// op (the dedup that enforces G5 fan-out=1). A non-zero value is expected
+    /// under sustained backlog; it makes the otherwise-silent coalesce skip
+    /// observable (the map is dedup-only, not routing-consulted).
+    #[metric(help = "speculative prefetch emits suppressed by the coalesce guard (dedup)")]
+    pub speculative_prefetch_coalesce_suppressed: AtomicU64,
     /// Total number of server-side cache warm tasks spawned.
     #[metric(help = "total number of server-side cache warm tasks spawned")]
     pub cache_warm_spawned: CounterWithTime,
@@ -1036,12 +1043,20 @@ struct ApiWorkerSchedulerImpl {
     /// re-cloning the proto Vec<Digest> per worker.
     bis_resend_buffers: HashMap<String, BisResendBuffer>,
 
-    /// (#specprefetch) Map from `operation_id` → `WorkerId` recording which
-    /// idle worker was sent a `PrefetchInputs` for a queued action.
-    /// Used to reaped on eviction, assignment, and TTL expiry.
+    /// (#speculative-prefetch) Coalesce/dedup guard for speculative
+    /// `PrefetchInputs` emits. Maps `client_operation_id` → the worker most
+    /// recently sent a prefetch for that op. This is a DEDUP SET, NOT a routing
+    /// tier: it is READ ONLY by `send_prefetch_inputs`'s `contains` check to
+    /// suppress a duplicate emit (G5 fan-out=1); the matching engine
+    /// (`inner_find_worker_for_action` / `inner_find_and_reserve_worker`) NEVER
+    /// consults it, so a stale entry can never misroute. It is REAPED in
+    /// `immediate_evict_worker` (the drained worker's held ops are re-queued and
+    /// must be eligible to re-prefetch to a healthy worker) — the drain is keyed
+    /// on `client_operation_id`, matching this map's key. The LRU cap is the
+    /// backstop against unbounded growth if a reap is ever missed.
     // CAPPED AT PREFETCH_AFFINITY_CAP (64): LRU of recent speculative prefetch
-    // assignments; over-cap evicts the oldest. Only a `WorkerId` (String) per entry.
-    prefetch_affinity: LruCache<OperationId, WorkerId>,
+    // coalesce records; over-cap evicts the oldest. `WorkerId` (String) per entry.
+    prefetch_coalesce_guard: LruCache<OperationId, WorkerId>,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -2583,6 +2598,13 @@ impl ApiWorkerSchedulerImpl {
                 UpdateOperationType::UpdateWithError(err)
             };
             for (operation_id, _) in worker.running_action_infos.drain() {
+                // #speculative-prefetch: reap the coalesce record for every op
+                // this dead worker held. The op is about to be re-queued
+                // (update_operation below), so its stale coalesce entry MUST be
+                // removed or a fresh prefetch to a HEALTHY worker would be
+                // suppressed by the dedup `contains` check. Keyed on
+                // `client_operation_id`, matching `prefetch_coalesce_guard`.
+                self.prefetch_coalesce_guard.pop(&operation_id);
                 result = result.merge(
                     self.worker_state_manager
                         .update_operation(&operation_id, worker_id, update.clone())
@@ -3251,7 +3273,7 @@ impl ApiWorkerScheduler {
                 scores_cache: scores_cache.clone(),
                 metrics: metrics.clone(),
                 bis_resend_buffers: HashMap::new(),
-                prefetch_affinity: LruCache::new(
+                prefetch_coalesce_guard: LruCache::new(
                     NonZeroUsize::new(PREFETCH_AFFINITY_CAP).unwrap(),
                 ),
             }),
@@ -3441,18 +3463,29 @@ impl ApiWorkerScheduler {
         &self.metrics
     }
 
-    /// (#specprefetch) Emits a `PrefetchInputs` (tag-15) message to the best
-    /// idle worker that can accept the given platform properties, WITHOUT
-    /// reserving a slot. Records the assignment in `prefetch_affinity` so
-    /// `immediate_evict_worker` can reap it.
+    /// #speculative-prefetch test hook: current number of entries in the
+    /// coalesce guard. Used by the feature-OFF inertness test (T1) to assert the
+    /// gate keeps the map EMPTY — a reliable red-fail signal if the
+    /// `if self.enable_speculative_prefetch` gate is ever removed (the map would
+    /// become non-empty because `send_prefetch_inputs` would run + record).
+    #[must_use]
+    pub async fn prefetch_coalesce_guard_len(&self) -> usize {
+        self.inner.read().await.prefetch_coalesce_guard.len()
+    }
+
+    /// (#speculative-prefetch) Emits a `PrefetchInputs` (tag-15) message to the
+    /// best idle worker that can accept the given platform properties, WITHOUT
+    /// reserving a slot. Records the op in `prefetch_coalesce_guard` so
+    /// `immediate_evict_worker` reaps it when the op is re-queued.
     ///
-    /// Coalesces per `(op_id, worker)`: if an affinity record for `op_id`
-    /// already exists (a prior cycle emitted a prefetch), skips. This enforces
-    /// G5 at the scheduler side: at most ONE in-flight prefetch per
-    /// (op_id, target worker) pair.
+    /// Coalesces per `op_id`: if a coalesce record for `op_id` already exists (a
+    /// prior cycle emitted a prefetch), skips and bumps
+    /// `speculative_prefetch_coalesce_suppressed`. This enforces G5 at the
+    /// scheduler side: at most ONE in-flight prefetch per op.
     ///
-    /// Returns `true` if a worker was found and the message sent, `false`
-    /// otherwise (no idle worker or op already has affinity).
+    /// Returns `true` ONLY if a worker was found AND the message was actually
+    /// sent; `false` if no idle worker, the op was already coalesced, or the
+    /// `tx.send` failed (worker disconnected mid-emit).
     pub async fn send_prefetch_inputs(
         &self,
         platform_properties: &PlatformProperties,
@@ -3463,8 +3496,13 @@ impl ApiWorkerScheduler {
     ) -> bool {
         let mut inner = self.inner.write().await;
 
-        // Coalesce: skip if already emitted for this op.
-        if inner.prefetch_affinity.contains(operation_id) {
+        // Coalesce: skip if a record already exists for this op (G5 fan-out=1).
+        // The record is reaped in `immediate_evict_worker` when the op is
+        // re-queued, so a rerouted op becomes eligible to re-prefetch.
+        if inner.prefetch_coalesce_guard.contains(operation_id) {
+            self.metrics
+                .speculative_prefetch_coalesce_suppressed
+                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -3484,7 +3522,7 @@ impl ApiWorkerScheduler {
         // Record affinity BEFORE sending (send may fail if worker just disconnected,
         // but that's fine — the TTL self-reaps, and the record prevents duplicate
         // sends in subsequent cycles which is the important guarantee).
-        inner.prefetch_affinity.put(operation_id.clone(), worker_id.clone());
+        inner.prefetch_coalesce_guard.put(operation_id.clone(), worker_id.clone());
         drop(inner);
 
         let msg = UpdateForWorker {
@@ -3492,6 +3530,9 @@ impl ApiWorkerScheduler {
                 operation_id: operation_id.to_string(),
                 input_root_digest: Some(input_root_digest.into()),
                 missing_digest_peers,
+                // #speculative-prefetch: forward the operator TTL so the config
+                // knob is LIVE (the worker clamps it to PIN_TIMEOUT_SECS).
+                ttl_s,
             })),
         };
 
@@ -3500,18 +3541,21 @@ impl ApiWorkerScheduler {
             warn!(
                 ?worker_id,
                 %operation_id,
-                "PrefetchInputs send failed (worker disconnected); affinity recorded, TTL reaps",
+                "PrefetchInputs send failed (worker disconnected); coalesce record left                  intact (dead worker is reaped by immediate_evict_worker)",
             );
-            // Leave affinity intact — coalesces further retries this cycle,
-            // and the LRU cap prevents unbounded accumulation.
-        } else {
-            debug!(
-                ?worker_id,
-                %operation_id,
-                ttl_s,
-                "PrefetchInputs emitted for queued action",
-            );
+            // Leave the coalesce record intact — it prevents re-emit to the same
+            // dead worker THIS cycle; the imminent immediate_evict_worker reap
+            // (or the LRU cap) removes it so the re-queued op can re-prefetch.
+            // Return false: the message was NOT delivered (S2 — the caller must
+            // not treat a failed send as a successful emit).
+            return false;
         }
+        debug!(
+            ?worker_id,
+            %operation_id,
+            ttl_s,
+            "PrefetchInputs emitted for queued action",
+        );
         true
     }
 

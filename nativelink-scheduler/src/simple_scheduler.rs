@@ -1661,6 +1661,16 @@ impl SimpleScheduler {
         self.do_try_match(true).await
     }
 
+    /// #speculative-prefetch test hook: expose the concrete
+    /// [`ApiWorkerScheduler`] so integration tests can drive
+    /// `send_prefetch_inputs` (and the coalesce-guard reap) DETERMINISTICALLY,
+    /// without arranging the hard-to-force backlog-more-than-idle-workers race
+    /// (which made the prior emission tests vacuous — testing-czar C1/C2).
+    #[must_use]
+    pub fn worker_scheduler_for_test(&self) -> &Arc<crate::api_worker_scheduler::ApiWorkerScheduler> {
+        &self.worker_scheduler
+    }
+
     // TODO(palfrey) This is an O(n*m) (aka n^2) algorithm. In theory we
     // can create a map of capabilities of each worker and then try and match
     // the actions to the worker using the map lookup (ie. map reduce).
@@ -1713,6 +1723,12 @@ impl SimpleScheduler {
         // resolved by the existing error handling (Aborted codes, None from
         // find_worker, etc.).
         let queued_actions: Vec<Box<dyn ActionStateResult>> = stream.collect().await;
+        // #speculative-prefetch (perf MINOR-1): remember the pre-match queue
+        // depth (already owned, free) so the backlog trigger below can
+        // SHORT-CIRCUIT — skipping its second get_queued_operations query + the
+        // per-op store GETs entirely when the queue was already below the
+        // threshold. Without this, every do_try_match cycle paid the re-query.
+        let primary_queue_depth = queued_actions.len() as u64;
 
         // (#batch-affinity, dimension A) OBSERVABILITY-ONLY: over the current
         // pending set, measure the co-location surplus a batch assignment could
@@ -1790,7 +1806,14 @@ impl SimpleScheduler {
         // StartAction arrives with peer hints. No per-RPC timeout: worker has its
         // own self-fired TTL (min(ttl_s, 120)s). Gate: feature flag OFF = no-op
         // (byte-identical to pre-feature behavior).
-        if self.enable_speculative_prefetch {
+        if self.enable_speculative_prefetch
+            && primary_queue_depth >= self.speculative_prefetch_backlog_threshold
+        {
+            // Re-query for the FRESHEST still-queued view (other concurrent
+            // do_try_match callers may have matched some) ONLY now that the
+            // pre-match depth already cleared the threshold — this bounds the
+            // extra query + per-op GETs to the backlog regime the feature
+            // targets, instead of every cycle (perf MINOR-1 / code-review S1).
             if let Ok(stream) = self.get_queued_operations().await {
                 let still_queued: Vec<Box<dyn ActionStateResult>> = stream.collect().await;
                 let queue_depth = still_queued.len() as u64;
