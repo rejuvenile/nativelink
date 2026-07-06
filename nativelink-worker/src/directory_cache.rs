@@ -380,6 +380,15 @@ pub struct DirectoryCache {
     hit_hardlink_count: AtomicU64,
     /// Cumulative fuzzy match count (cache miss resolved via best-match patching)
     fuzzy_match_count: AtomicU64,
+    /// #speculative-prefetch (testing-czar b): count of actual construct-body
+    /// runs — incremented inside `construct_inner` ONLY when it passes the
+    /// leader-election double-check and actually constructs (not the "already
+    /// present, return early" fast path). Per-instance (robust to concurrent
+    /// tests sharing the process-global `dir_cache_counters`). Lets the
+    /// cross-path coalesce test assert EXACTLY ONE construct ran for a shared
+    /// digest — a double-construct (coalesce regression) would make this 2 while
+    /// the idempotent cache insert keeps `entries == 1`.
+    construct_runs: AtomicU64,
     /// Reverse index: maps each subtree digest to the set of root digests
     /// whose cached entries contain that subtree. Used for fuzzy matching --
     /// when a new root misses the cache, we score each cached root by how
@@ -859,6 +868,7 @@ impl DirectoryCache {
             hit_clonefile_count: AtomicU64::new(0),
             hit_hardlink_count: AtomicU64::new(0),
             fuzzy_match_count: AtomicU64::new(0),
+            construct_runs: AtomicU64::new(0),
             subtree_to_roots: RwLock::new(initial_subtree_to_roots),
             direct_use_mode,
         })
@@ -1617,6 +1627,11 @@ impl DirectoryCache {
         if self.cache.read().await.contains_key(&digest) {
             return Ok(());
         }
+
+        // #speculative-prefetch (testing-czar b): this is a REAL construct body
+        // (past the leader-election double-check). Count it so a coalesce test
+        // can assert exactly ONE construct ran for a shared digest.
+        self.construct_runs.fetch_add(1, Ordering::Relaxed);
 
         // Construct in a temp path, rename to final path on success.
         // This prevents orphaned partial directories on failure.
@@ -3802,6 +3817,7 @@ impl DirectoryCache {
             in_use_entries: in_use,
             fuzzy_matches: self.fuzzy_match_count.load(Ordering::Relaxed),
             reverse_index_entries: reverse_index_size,
+            construct_runs: self.construct_runs.load(Ordering::Relaxed),
         }
     }
 }
@@ -3816,6 +3832,11 @@ pub struct CacheStats {
     pub fuzzy_matches: u64,
     /// Number of entries in the subtree-to-roots reverse index
     pub reverse_index_entries: usize,
+    /// #speculative-prefetch (testing-czar b): cumulative count of actual
+    /// construct-body runs (past the leader-election double-check). Used to
+    /// assert construct-count in coalesce tests (exactly one construct for a
+    /// shared digest).
+    pub construct_runs: u64,
 }
 
 #[cfg(test)]
@@ -4496,10 +4517,24 @@ mod tests {
              coalescing produced a bad shared entry"
         );
 
-        // Exactly ONE cache entry (no split-brain double entry) and the
-        // construction-lock map cleaned up (no leaked leader slot).
+        // Exactly ONE construct BODY ran (the load-bearing coalesce assertion):
+        // a single leader constructs, the other path adopts the result. This is
+        // strictly stronger than `entries == 1` — a double-construct (coalesce
+        // failure where both paths run construct_inner) would leave
+        // construct_runs == 2 while the idempotent cache insert still yields
+        // entries == 1, so the entry-count alone cannot catch it. The cache is
+        // freshly created in this test, so before==0 and the whole-test delta is
+        // exactly the construct(s) for this shared digest.
         drop(guard);
         let stats = cache.stats().await;
+        assert_eq!(
+            stats.construct_runs, 1,
+            "cross-path coalesce (2026-07-06): expected EXACTLY ONE construct body to run for \
+             the shared digest (one leader; the other path adopts), got {} — prewarm and \
+             get_or_create did NOT coalesce onto one construct (both ran construct_inner). \
+             entries==1 alone would miss this because the second insert is idempotent.",
+            stats.construct_runs
+        );
         assert_eq!(
             stats.entries, 1,
             "cross-path coalesce: expected exactly ONE cache entry for the shared digest, got \
