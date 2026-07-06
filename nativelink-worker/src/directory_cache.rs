@@ -1156,7 +1156,18 @@ impl DirectoryCache {
                         );
                         let t0 = Instant::now();
                         let res = self
-                            .construct_from_fuzzy_match(&digest, tree, &best_root, &temp_path)
+                            // #speculative-prefetch P0: this is the DIRECT-USE
+                            // (symlink) leader path — construct_from_fuzzy_match
+                            // dispatches to construct_with_subtrees_direct (which
+                            // does NOT pin blobs), so the priority marker is
+                            // unused here. Pass Foreground as the inert default.
+                            .construct_from_fuzzy_match(
+                                &digest,
+                                tree,
+                                &best_root,
+                                &temp_path,
+                                OpPriority::Foreground,
+                            )
                             .await;
                         info!(
                             ?digest,
@@ -1554,7 +1565,7 @@ impl DirectoryCache {
             &self.construction_locks,
             digest,
             CoalesceOptions::leader_only(CONSTRUCTION_LEADER_TIMEOUT),
-            || self.construct_inner(digest, overall_start),
+            || self.construct_inner(digest, overall_start, OpPriority::Foreground),
         )
         .await;
         info!(
@@ -1591,6 +1602,12 @@ impl DirectoryCache {
         &self,
         digest: DigestInfo,
         overall_start: Instant,
+        // #speculative-prefetch P0: resource/I-O priority marker threaded from
+        // the caller (prewarm=Speculative, get_or_create=Foreground). Routes
+        // the blob pin in `construct_with_subtrees` to the disjoint speculative
+        // sub-budget when Speculative, so a speculative construct's pins never
+        // refuse a concurrent real action's pin.
+        op_priority: OpPriority,
     ) -> Result<(), Error> {
         // Double-check after winning leadership — another task may have
         // just constructed it before we acquired the slot. We only check
@@ -1703,6 +1720,7 @@ impl DirectoryCache {
                         tree,
                         &subtree_hits,
                         &temp_path,
+                        op_priority,
                     )
                     .await
                     .err_tip(|| "Failed subtree-aware construction")?;
@@ -1729,6 +1747,7 @@ impl DirectoryCache {
                             tree,
                             &best_root,
                             &temp_path,
+                            op_priority,
                         )
                         .await
                         .err_tip(|| "Failed fuzzy-match construction")?;
@@ -1984,9 +2003,11 @@ impl DirectoryCache {
             CoalesceOptions::leader_only(CONSTRUCTION_LEADER_TIMEOUT),
             || async {
                 if self.direct_use_mode {
+                    // Direct-use (symlink) path does NOT pin blobs, so the
+                    // priority marker is not needed there (no pin_digests call).
                     self.construct_direct_inner(digest, overall_start).await
                 } else {
-                    self.construct_inner(digest, overall_start).await
+                    self.construct_inner(digest, overall_start, op_priority).await
                 }
             },
         )
@@ -2314,6 +2335,9 @@ impl DirectoryCache {
         new_tree: &HashMap<DigestInfo, ProtoDirectory>,
         best_root: &DigestInfo,
         temp_path: &Path,
+        // #speculative-prefetch P0: priority marker forwarded to
+        // construct_with_subtrees for the speculative-vs-real pin dispatch.
+        op_priority: OpPriority,
     ) -> Result<(), Error> {
         let fuzzy_start = Instant::now();
 
@@ -2372,6 +2396,7 @@ impl DirectoryCache {
                 new_tree,
                 &subtree_hits,
                 temp_path,
+                op_priority,
             )
             .await
             .err_tip(|| "Failed fuzzy-match subtree-aware construction")?;
@@ -2492,6 +2517,11 @@ impl DirectoryCache {
         tree: &HashMap<DigestInfo, ProtoDirectory>,
         subtree_hits: &HashMap<DigestInfo, PathBuf>,
         dest_path: &Path,
+        // #speculative-prefetch P0: when `Speculative`, blob pins draw from the
+        // small DISJOINT speculative sub-budget (`pin_digests_speculative_with_results`)
+        // instead of the shared real-action `pin_cap` — so they can never refuse
+        // a concurrent real action's pin (invariant-prover BLOCK, TLC-proven).
+        op_priority: OpPriority,
     ) -> Result<(), Error> {
         let construction_start = Instant::now();
 
@@ -2805,6 +2835,9 @@ impl DirectoryCache {
                         let sem = semaphore.clone();
                         let fss = fss.clone();
                         let digest = *d;
+                        // #speculative-prefetch P0: copy the priority marker into
+                        // each spawned pin task (OpPriority is Copy).
+                        let op_priority = op_priority;
                         let permits = usize::try_from(digest.size_bytes())
                             .unwrap_or(POPULATE_BYTE_BUDGET)
                             .min(POPULATE_BYTE_BUDGET)
@@ -2850,7 +2883,26 @@ impl DirectoryCache {
                             // and the FastSlowStore wrapper would also forward
                             // the pin to the slow GrpcStore where it is a no-op.
                             #[allow(clippy::disallowed_methods)]
-                            fss.fast_store().pin_digests(&[digest]);
+                            match op_priority {
+                                // #speculative-prefetch P0: a speculative
+                                // pre-fetch construct pins into the small
+                                // DISJOINT speculative sub-budget so its pins
+                                // can NEVER refuse a concurrent real action's
+                                // pin (the C3/C5 starvation, TLC-proven in
+                                // SpeculativePinBudgetFixed.tla). A refusal here
+                                // (sub-budget full / eviction race) is benign:
+                                // the blob stays LRU-evictable and the
+                                // populate's own verify-and-retry is the net.
+                                OpPriority::Speculative => {
+                                    fss.fast_store()
+                                        .pin_digests_speculative_with_results(&[digest]);
+                                }
+                                // Real-action construct: the pre-existing
+                                // real-action pin against the shared pin_cap.
+                                OpPriority::Foreground => {
+                                    fss.fast_store().pin_digests(&[digest]);
+                                }
+                            }
                             Ok::<(), Error>(())
                         });
                     }

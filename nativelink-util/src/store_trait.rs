@@ -760,6 +760,16 @@ impl Store {
         self.inner.pin_digests_indefinite_with_results(digests)
     }
 
+    /// #speculative-prefetch P0: take a SPECULATIVE (pre-fetch) pin drawing
+    /// from the small disjoint speculative sub-budget and report per-digest
+    /// success. Delegates to [`StoreDriver::pin_digests_speculative_with_results`].
+    /// Used by the worker's `DirectoryCache::prewarm` construct so a burst of
+    /// speculative pins can never refuse a concurrent real action's pin.
+    #[inline]
+    pub fn pin_digests_speculative_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        self.inner.pin_digests_speculative_with_results(digests)
+    }
+
     /// Release pins acquired via [`Self::pin_digests`]. Used by the
     /// server-side BlobsInStableStorage broadcast loop after notifying
     /// workers that a digest is durably mirrored — see
@@ -1769,6 +1779,42 @@ pub trait StoreDriver:
                 let mut combined = vec![false; digests.len()];
                 for child in children {
                     let per_child = child.pin_digests_indefinite_with_results(digests);
+                    debug_assert_eq!(per_child.len(), digests.len());
+                    for (slot, result) in combined.iter_mut().zip(per_child) {
+                        *slot |= result;
+                    }
+                }
+                combined
+            }
+        }
+    }
+
+    /// #speculative-prefetch P0: like [`Self::pin_digests_with_results`] but
+    /// takes a SPECULATIVE pin from the small DISJOINT speculative sub-budget
+    /// (`MokaEvictingMap::pin_key_speculative`). A speculative pin is
+    /// TIME-BOUNDED (evict-first, subject to the 120 s sweep) and — the
+    /// load-bearing property — is EXCLUDED from the real-action pin admission
+    /// check, so a burst of speculative pre-fetch pins can NEVER refuse a
+    /// concurrent real action's pin (the C3/C5 starvation the invariant-prover
+    /// machine-checked; fix proven in `SpeculativePinBudgetFixed.tla`).
+    /// Returns `true` per digest only if now held under a speculative pin;
+    /// `false` if absent (eviction race) OR the speculative sub-budget is full
+    /// (BACKPRESSURE — the caller leaves the blob LRU-evictable, real actions
+    /// unaffected). The default body dispatches via [`Self::pin_delegation`],
+    /// mirroring `pin_digests_indefinite_with_results`.
+    fn pin_digests_speculative_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        match self.pin_delegation() {
+            PinDelegation::Leaf => {
+                // Non-pinning leaves (Memory, Noop) cannot pin; report all-false.
+                vec![false; digests.len()]
+            }
+            PinDelegation::Inner(s) | PinDelegation::Passthrough(s) => {
+                s.pin_digests_speculative_with_results(digests)
+            }
+            PinDelegation::Many(children) => {
+                let mut combined = vec![false; digests.len()];
+                for child in children {
+                    let per_child = child.pin_digests_speculative_with_results(digests);
                     debug_assert_eq!(per_child.len(), digests.len());
                     for (slot, result) in combined.iter_mut().zip(per_child) {
                         *slot |= result;

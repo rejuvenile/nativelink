@@ -40,6 +40,16 @@ use crate::metrics_utils::{Counter, CounterWithTime};
 
 /// Maximum fraction of max_bytes that can be pinned (25%).
 const PIN_CAP_FRACTION: f64 = 0.25;
+/// #speculative-prefetch P0: fraction of max_bytes reserved for SPECULATIVE
+/// pins (5% — a fifth of the 25% total `pin_cap`). Speculative pins draw from
+/// this small, DISJOINT sub-budget so they can never consume the headroom a
+/// real-action pin needs (the C3/C5 starvation the invariant-prover
+/// machine-checked; fix proven in `.claude/tla/SpeculativePinBudgetFixed.tla`).
+/// 5% is conservative: on a 20 GiB worker that is ~1 GiB — enough for one cold
+/// input tree's blob set (single-in-flight G5 bounds it to one speculative
+/// construct at a time) yet small enough that the remaining ~4 GiB of the
+/// 5 GiB `pin_cap` is untouched by speculation.
+const SPECULATIVE_PIN_CAP_FRACTION: f64 = 0.05;
 /// Seconds before a pin automatically expires.
 ///
 /// `pub` so downstream crates (e.g. `nativelink-service`'s chunked
@@ -93,6 +103,13 @@ struct PinnedEntry<T> {
     /// same data-loss reason). A normal (time-bounded) pin sets this
     /// `false` and keeps the TTL backstop.
     indefinite: bool,
+    /// #speculative-prefetch P0: when `true`, this pin was taken by a
+    /// SPECULATIVE pre-fetch construct and its size is counted in
+    /// `speculative_pinned_bytes` (a subset of `pinned_bytes`). Mutually
+    /// exclusive with `indefinite` (speculative pins are TIME-BOUNDED, held
+    /// against the small disjoint speculative sub-budget). Used by `unpin_key`
+    /// / `remove` to keep `speculative_pinned_bytes` symmetric on release.
+    speculative: bool,
 }
 
 /// An eviction event captured by the moka listener and sent to the
@@ -184,6 +201,22 @@ pub struct MokaEvictingMap<
     // Mirrors the `FastSlowStore::slow_writes_in_flight_max_bytes` cap +
     // typed-backpressure pattern.
     indefinite_pin_cap: u64,
+    /// #speculative-prefetch P0: subset of `pinned_bytes` held by SPECULATIVE
+    /// (pre-fetch) pins. Tracked separately so (a) the small speculative cap is
+    /// enforced independently, and (b) — the load-bearing part — the real-action
+    /// pin admission check SUBTRACTS this from `pinned_bytes`, so speculative
+    /// bytes never consume real-pin headroom. `speculative_pinned_bytes <=
+    /// pinned_bytes` always. Speculative pins are TIME-BOUNDED (NOT indefinite):
+    /// they stay subject to the `PIN_TIMEOUT_SECS` sweep (evict-first).
+    speculative_pinned_bytes: AtomicU64,
+    // CAPPED AT speculative_pin_cap (5% of max_bytes): a DISJOINT, smaller
+    // sub-budget so a burst of speculative pre-fetch pins can never refuse a
+    // concurrent real action's `pin_key` (invariant-prover BLOCK, TLC-proven in
+    // SpeculativePinBudgetFixed.tla). Over-cap behavior is BACKPRESSURE, never
+    // drop: `pin_key_speculative` REFUSES (returns `false`); the caller leaves
+    // the blob LRU-evictable and the prefetch simply does less — a real action
+    // is never harmed. `max_bytes==0` (no byte budget) never gates.
+    speculative_pin_cap: u64,
     /// Optional BTreeSet index for range queries. Shared with the
     /// eviction listener for cleanup on eviction.
     btree: Arc<RwLock<Option<BTreeSet<K>>>>,
@@ -356,6 +389,9 @@ where
         // FL-681 Fix A: indefinite (pinned-until-BIS-ack) subset gauge.
         let indefinite_pinned_bytes: u64 =
             self.indefinite_pinned_bytes.load(Ordering::Relaxed);
+        // #speculative-prefetch P0: speculative (pre-fetch) subset gauge.
+        let speculative_pinned_bytes: u64 =
+            self.speculative_pinned_bytes.load(Ordering::Relaxed);
 
         // Pinned-bytes gauge — load-bearing for #332 prophylactic pin-cap
         // headroom falsifiability. If this exceeds `pin_cap` in
@@ -390,6 +426,18 @@ where
             &self.indefinite_pin_cap,
             nativelink_metric::MetricKind::Default,
             "FL-681 Fix A: configured cap on indefinite_pinned_bytes. Over-cap behavior is backpressure (pin_key_indefinite refuses; caller retries — never drops). Defaults to pin_cap when configured 0."
+        );
+        nativelink_metric::publish!(
+            "speculative_pinned_bytes",
+            &speculative_pinned_bytes,
+            nativelink_metric::MetricKind::Default,
+            "#speculative-prefetch P0: bytes held by SPECULATIVE (pre-fetch) pins — a DISJOINT subset of pinned_bytes EXCLUDED from the real-action pin_cap admission check so speculation can never refuse a real action's pin. Time-bounded (evict-first via the 120s sweep); capped by speculative_pin_cap with backpressure over-cap."
+        );
+        nativelink_metric::publish!(
+            "speculative_pin_cap",
+            &self.speculative_pin_cap,
+            nativelink_metric::MetricKind::Default,
+            "#speculative-prefetch P0: configured cap on speculative_pinned_bytes = max_bytes * 5% (SPECULATIVE_PIN_CAP_FRACTION, a fifth of the 25% pin_cap). Over-cap behavior is backpressure (pin_key_speculative refuses; the prefetch pins less — never drops, never harms a real action)."
         );
         nativelink_metric::publish!(
             "entry_count",
@@ -649,6 +697,10 @@ where
 
         let cache = builder.build();
         let pin_cap = (max_bytes as f64 * PIN_CAP_FRACTION) as u64;
+        // #speculative-prefetch P0: the disjoint speculative sub-budget
+        // (5% of max_bytes, a fifth of the 25% pin_cap). Speculative pins draw
+        // only from this; the real-pin check excludes speculative bytes.
+        let speculative_pin_cap = (max_bytes as f64 * SPECULATIVE_PIN_CAP_FRACTION) as u64;
         // FL-681 Fix A: an explicit `0` indefinite cap means "use the
         // total pin_cap" so indefinite pins can never exceed the overall
         // pin budget; a non-zero value is the operator-tuned cap.
@@ -663,8 +715,10 @@ where
             pinned,
             pinned_bytes: AtomicU64::new(0),
             indefinite_pinned_bytes: AtomicU64::new(0),
+            speculative_pinned_bytes: AtomicU64::new(0),
             pin_cap,
             indefinite_pin_cap,
+            speculative_pin_cap,
             btree,
             pending_evictions,
             eviction_tx,
@@ -885,12 +939,20 @@ where
             // that is currently pinned-until-BIS-ack MUST NOT silently
             // demote it to time-bounded (that would re-open the TTL leak).
             let mut was_indefinite = false;
+            // #speculative-prefetch P0: preserve the speculative flag across a
+            // re-insert too, and keep `speculative_pinned_bytes` symmetric.
+            let mut was_speculative = false;
             let old = self.pinned.remove(key.borrow()).map(|(_, entry)| {
                 self.pinned_bytes
                     .fetch_sub(entry.size, Ordering::Relaxed);
                 if entry.indefinite {
                     was_indefinite = true;
                     self.indefinite_pinned_bytes
+                        .fetch_sub(entry.size, Ordering::Relaxed);
+                }
+                if entry.speculative {
+                    was_speculative = true;
+                    self.speculative_pinned_bytes
                         .fetch_sub(entry.size, Ordering::Relaxed);
                 }
                 entry.data
@@ -908,11 +970,16 @@ where
                     pinned_at: Instant::now(),
                     size,
                     indefinite: was_indefinite,
+                    speculative: was_speculative,
                 },
             );
             self.pinned_bytes.fetch_add(size, Ordering::Relaxed);
             if was_indefinite {
                 self.indefinite_pinned_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+            }
+            if was_speculative {
+                self.speculative_pinned_bytes
                     .fetch_add(size, Ordering::Relaxed);
             }
             self.fire_on_insert_callbacks(&key, size, ts_counter);
@@ -1113,12 +1180,20 @@ where
             // that is currently pinned-until-BIS-ack MUST NOT silently
             // demote it to time-bounded (that would re-open the TTL leak).
             let mut was_indefinite = false;
+            // #speculative-prefetch P0: preserve the speculative flag across a
+            // re-insert too, and keep `speculative_pinned_bytes` symmetric.
+            let mut was_speculative = false;
             let old = self.pinned.remove(key.borrow()).map(|(_, entry)| {
                 self.pinned_bytes
                     .fetch_sub(entry.size, Ordering::Relaxed);
                 if entry.indefinite {
                     was_indefinite = true;
                     self.indefinite_pinned_bytes
+                        .fetch_sub(entry.size, Ordering::Relaxed);
+                }
+                if entry.speculative {
+                    was_speculative = true;
+                    self.speculative_pinned_bytes
                         .fetch_sub(entry.size, Ordering::Relaxed);
                 }
                 entry.data
@@ -1136,11 +1211,16 @@ where
                     pinned_at: Instant::now(),
                     size,
                     indefinite: was_indefinite,
+                    speculative: was_speculative,
                 },
             );
             self.pinned_bytes.fetch_add(size, Ordering::Relaxed);
             if was_indefinite {
                 self.indefinite_pinned_bytes
+                    .fetch_add(size, Ordering::Relaxed);
+            }
+            if was_speculative {
+                self.speculative_pinned_bytes
                     .fetch_add(size, Ordering::Relaxed);
             }
             self.fire_on_insert_callbacks(&key, size, ts_counter);
@@ -1188,6 +1268,14 @@ where
                 // exact 120s-TTL silent-loss leak FL-681 fixes.
                 if entry.indefinite {
                     self.indefinite_pinned_bytes
+                        .fetch_sub(entry.size, Ordering::Relaxed);
+                }
+                // #speculative-prefetch P0: symmetric to indefinite — a
+                // speculative-pinned blob removed via the explicit-remove path
+                // must free the speculative sub-budget, else it leaks upward
+                // and later speculative pins are wrongly refused.
+                if entry.speculative {
+                    self.speculative_pinned_bytes
                         .fetch_sub(entry.size, Ordering::Relaxed);
                 }
                 self.update_btree_remove(key);
@@ -1461,10 +1549,20 @@ where
         // never drop): the blob stays in the LRU cache for the caller to
         // retry.
         if self.max_bytes != 0 {
-            let current_pinned = self.pinned_bytes.load(Ordering::Relaxed);
-            if current_pinned.saturating_add(entry_size) > self.pin_cap {
+            // #speculative-prefetch P0 (invariant-prover BLOCK, TLC-proven):
+            // EXCLUDE speculative bytes from the real-action pin admission
+            // check so a burst of speculative pre-fetch pins can NEVER refuse
+            // a real action's pin (the C3/C5 starvation). The two budgets are
+            // DISJOINT: real pins see `pin_cap`, speculative pins see their own
+            // smaller `speculative_pin_cap`.
+            // (`.claude/tla/SpeculativePinBudgetFixed.tla`, NoStarve HOLDS.)
+            let real_pinned = self
+                .pinned_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.speculative_pinned_bytes.load(Ordering::Relaxed));
+            if real_pinned.saturating_add(entry_size) > self.pin_cap {
                 warn!(
-                    pinned_bytes = current_pinned,
+                    real_pinned,
                     entry_size,
                     pin_cap = self.pin_cap,
                     ?key,
@@ -1497,6 +1595,9 @@ where
                 pinned_at: Instant::now(),
                 size: entry_size,
                 indefinite,
+                // #speculative-prefetch P0: pin_key / pin_key_indefinite are
+                // real-action pins, never speculative.
+                speculative: false,
             },
         );
         self.pinned_bytes.fetch_add(entry_size, Ordering::Relaxed);
@@ -1509,6 +1610,78 @@ where
         self.cache.invalidate(q);
         self.cache.run_pending_tasks();
         true
+    }
+
+    /// #speculative-prefetch P0: pin `key` as a SPECULATIVE (pre-fetch) pin,
+    /// drawing ONLY from the small disjoint `speculative_pin_cap` sub-budget.
+    /// TIME-BOUNDED (subject to the `PIN_TIMEOUT_SECS` sweep — evict-first),
+    /// NOT indefinite. Returns `false` if the digest was absent (eviction race)
+    /// OR the speculative sub-budget is full (BACKPRESSURE — the caller leaves
+    /// the blob LRU-evictable and the pre-fetch simply pins less). Crucially,
+    /// a speculative pin is EXCLUDED from the real-action pin admission check
+    /// (`pin_key`), so it can NEVER refuse a concurrent real action's pin —
+    /// the disjoint-sub-budget property the invariant-prover machine-checked
+    /// (`.claude/tla/SpeculativePinBudgetFixed.tla`, NoStarve HOLDS).
+    pub fn pin_key_speculative(&self, key: K) -> bool {
+        let q: &Q = key.borrow();
+
+        // Already pinned — just refresh the pin time. Do NOT change its
+        // speculative/real classification (a real pin that already exists for
+        // this digest stays real; a speculative refresh keeps it speculative).
+        if let Some(mut entry) = self.pinned.get_mut(q) {
+            entry.pinned_at = Instant::now();
+            return true;
+        }
+
+        let value = match self.cache.get(q) {
+            Some(v) => v,
+            None => return false,
+        };
+        let entry_size = value.len();
+
+        // Speculative sub-budget check ONLY (disjoint from pin_cap). Over-cap
+        // is BACKPRESSURE (refuse, never drop).
+        if !self.speculative_cap_admits(entry_size) {
+            warn!(
+                speculative_pinned_bytes =
+                    self.speculative_pinned_bytes.load(Ordering::Relaxed),
+                entry_size,
+                speculative_pin_cap = self.speculative_pin_cap,
+                ?key,
+                "speculative pin cap exceeded, refusing to pin (backpressure) — real actions unaffected"
+            );
+            return false;
+        }
+
+        // Insert into pinned FIRST, then invalidate (same ordering as pin_key).
+        self.pinned.insert(
+            key.clone(),
+            PinnedEntry {
+                data: value,
+                pinned_at: Instant::now(),
+                size: entry_size,
+                indefinite: false,
+                speculative: true,
+            },
+        );
+        self.pinned_bytes.fetch_add(entry_size, Ordering::Relaxed);
+        self.speculative_pinned_bytes
+            .fetch_add(entry_size, Ordering::Relaxed);
+
+        self.cache.invalidate(q);
+        self.cache.run_pending_tasks();
+        true
+    }
+
+    /// #speculative-prefetch P0: snapshot check of the speculative-pin
+    /// sub-budget. Mirrors [`Self::indefinite_cap_admits`]. `max_bytes == 0`
+    /// (no byte budget) never gates.
+    fn speculative_cap_admits(&self, entry_size: u64) -> bool {
+        if self.max_bytes == 0 {
+            return true;
+        }
+        let current = self.speculative_pinned_bytes.load(Ordering::Relaxed);
+        current.saturating_add(entry_size) <= self.speculative_pin_cap
     }
 
     /// FL-681 Fix A: snapshot check of the indefinite-pin byte cap.
@@ -1546,10 +1719,16 @@ where
 
             let entry_size = value.len();
             if self.max_bytes != 0 {
-                let current = self.pinned_bytes.load(Ordering::Relaxed);
-                if current.saturating_add(entry_size) > self.pin_cap {
+                // #speculative-prefetch P0: EXCLUDE speculative bytes from the
+                // real-action batch-pin check (disjoint sub-budget). Same
+                // property as pin_key_with_mode above.
+                let real_pinned = self
+                    .pinned_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.speculative_pinned_bytes.load(Ordering::Relaxed));
+                if real_pinned.saturating_add(entry_size) > self.pin_cap {
                     warn!(
-                        pinned_bytes = current,
+                        real_pinned,
                         entry_size,
                         pin_cap = self.pin_cap,
                         attempted = keys.len(),
@@ -1568,6 +1747,8 @@ where
                     pinned_at: Instant::now(),
                     size: entry_size,
                     indefinite: false,
+                    // #speculative-prefetch P0: pin_keys is a real-action batch pin.
+                    speculative: false,
                 },
             );
             self.pinned_bytes.fetch_add(entry_size, Ordering::Relaxed);
@@ -1592,6 +1773,12 @@ where
                 self.indefinite_pinned_bytes
                     .fetch_sub(entry.size, Ordering::Relaxed);
             }
+            // #speculative-prefetch P0: keep the speculative sub-budget
+            // symmetric on release (adoption / explicit unpin).
+            if entry.speculative {
+                self.speculative_pinned_bytes
+                    .fetch_sub(entry.size, Ordering::Relaxed);
+            }
             // Move back into moka cache. Under LRU there is no admission
             // filter to fight, so a bare insert is sufficient.
             // (#locality-map-drift) Intentionally a bare `cache.insert` — NO
@@ -1607,6 +1794,14 @@ where
 
     pub fn pinned_bytes(&self) -> u64 {
         self.pinned_bytes.load(Ordering::Relaxed)
+    }
+
+    /// #speculative-prefetch P0: bytes currently held by SPECULATIVE
+    /// (pre-fetch) pins. A subset of [`Self::pinned_bytes`], bounded by the
+    /// small disjoint `speculative_pin_cap`. EXCLUDED from the real-action
+    /// pin admission check so speculation never starves a real pin.
+    pub fn speculative_pinned_bytes(&self) -> u64 {
+        self.speculative_pinned_bytes.load(Ordering::Relaxed)
     }
 
     /// FL-681 Fix A: bytes currently held by INDEFINITE
@@ -2133,6 +2328,12 @@ where
                     "auto-unpinning expired pin"
                 );
                 self.pinned_bytes.fetch_sub(size, Ordering::Relaxed);
+                // #speculative-prefetch P0: a speculative pin is TIME-BOUNDED,
+                // so it reaches this sweep (evict-first). Free its sub-budget.
+                if entry.speculative {
+                    self.speculative_pinned_bytes
+                        .fetch_sub(size, Ordering::Relaxed);
+                }
                 // Put back into cache so it can be evicted normally.
                 //
                 // NOTE: this is NOT an eviction — the blob is still
@@ -3379,4 +3580,145 @@ mod tests {
             MAX_TICKS,
         );
     }
+    // ---------------------------------------------------------------
+    // #speculative-prefetch P0 (invariant-prover BLOCK, TLC-proven):
+    // the speculative pin sub-budget is DISJOINT from the real-action
+    // pin budget — a speculative pin can NEVER refuse a real pin.
+    // See `.claude/tla/SpeculativePinBudgetFixed.tla` (NoStarve HOLDS).
+    // ---------------------------------------------------------------
+
+    /// A speculative pin that has consumed the *shared* `pinned_bytes`
+    /// must NOT count against the real-action `pin_cap` — otherwise a
+    /// concurrent real action's `pin_key` is refused, its blob stays
+    /// LRU-evictable, and its populate is starved (the C3/C5 corner the
+    /// invariant-prover machine-checked as BROKEN under the shared
+    /// budget). The fix subtracts `speculative_pinned_bytes` from the
+    /// real-pin admission check, making the two budgets disjoint.
+    #[tokio::test]
+    async fn speculative_pin_never_refuses_a_real_pin() {
+        // max_bytes = 100 KiB -> pin_cap = 25 KiB (25%). Speculative pins
+        // are held under their OWN small cap; here we saturate the SHARED
+        // `pinned_bytes` with speculative pins, then assert a real pin
+        // STILL succeeds. Under the pre-fix shared budget it would be refused.
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // Speculative cap = 5% of max_bytes = 5 KiB. Insert + speculatively
+        // pin blobs totalling 5 KiB — fills the speculative sub-budget AND
+        // adds 5 KiB to the shared `pinned_bytes`.
+        for k in 0..5u64 {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        for k in 0..5u64 {
+            assert!(
+                map.pin_key_speculative(k),
+                "speculative pin {k} must fit under the 5 KiB speculative sub-budget"
+            );
+        }
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            5 * 1024,
+            "5 speculative pins of 1 KiB each account for exactly 5 KiB"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            5 * 1024,
+            "speculative pins are a SUBSET of the shared pinned_bytes total"
+        );
+
+        // A REAL action pins a 20 KiB blob then a 4 KiB blob -> real-only
+        // total 24 KiB (<= 25 KiB pin_cap -> both must ADMIT). Under the
+        // pre-fix shared accounting the shared total would be 5 + 24 = 29 KiB
+        // > 25 KiB pin_cap, refusing the real pin — the starvation bug.
+        map.insert(100, BytesEntry(20 * 1024)).await;
+        map.insert(101, BytesEntry(4 * 1024)).await;
+        assert!(
+            map.pin_key(100),
+            "composite invariant violated (2026-07-05): speculative pins refused a \
+             real action's 20 KiB pin via the shared pin_cap (disjoint sub-budget \
+             not subtracted from the real-pin admission check)"
+        );
+        assert!(
+            map.pin_key(101),
+            "composite invariant violated (2026-07-05): speculative pins refused a \
+             real action's 4 KiB pin — real-only total is 24 KiB <= 25 KiB pin_cap; \
+             only the shared-budget bug (counting 5 KiB speculative into the real \
+             check -> 29 KiB > 25 KiB) can refuse it"
+        );
+        // Real pins are NOT speculative -> speculative total unchanged.
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            5 * 1024,
+            "a real pin must not be accounted as speculative"
+        );
+    }
+
+    /// The speculative sub-budget is itself bounded (evict-first, not
+    /// unbounded): a speculative pin over the small speculative cap is
+    /// REFUSED (backpressure), never dropped. Mirrors the FL-681
+    /// indefinite-cap backpressure contract.
+    #[tokio::test]
+    async fn speculative_pin_cap_refuses_over_budget_not_drops() {
+        // max_bytes = 100 KiB -> speculative cap = 5 KiB (5%).
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        for k in 0..7u64 {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        // First 5 fit (5 KiB); the 6th would push to 6 KiB > 5 KiB cap.
+        for k in 0..5u64 {
+            assert!(map.pin_key_speculative(k), "speculative pin {k} fits under cap");
+        }
+        assert!(
+            !map.pin_key_speculative(5),
+            "speculative pin over the 5 KiB sub-budget must REFUSE (backpressure)"
+        );
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            5 * 1024,
+            "over-cap speculative pin must not be accounted (refused, not dropped)"
+        );
+        // The refused blob is still present — NOT lost.
+        assert!(
+            map.get(&5).await.is_some(),
+            "backpressure must NOT drop the blob: refused speculative-pin source stays readable"
+        );
+    }
+
+    /// Releasing a speculative pin (`unpin_key` on TTL sweep / adoption)
+    /// must decrement `speculative_pinned_bytes` symmetrically, so the
+    /// sub-budget headroom is reclaimed — otherwise the speculative total
+    /// leaks upward and every later speculative pin is wrongly refused.
+    #[tokio::test]
+    async fn unpin_of_speculative_pin_restores_speculative_bytes() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        for k in 0..5u64 {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        for k in 0..5u64 {
+            assert!(map.pin_key_speculative(k));
+        }
+        assert_eq!(map.speculative_pinned_bytes(), 5 * 1024);
+        // Unpin one -> speculative total drops by exactly that blob's size.
+        map.unpin_key(&0);
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            4 * 1024,
+            "unpin of a speculative pin must decrement speculative_pinned_bytes \
+             (leak -> sub-budget saturates -> later speculative pins wrongly refused)"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            4 * 1024,
+            "unpin must also decrement the shared pinned_bytes for the removed entry"
+        );
+        // Reclaimed headroom is reusable: a fresh speculative pin now fits.
+        map.insert(10, BytesEntry(1024)).await;
+        assert!(
+            map.pin_key_speculative(10),
+            "after unpin freed sub-budget headroom, a new speculative pin must succeed"
+        );
+    }
+
 }

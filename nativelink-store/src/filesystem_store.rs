@@ -2785,6 +2785,23 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .collect()
     }
 
+    fn pin_digests_speculative_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        // #speculative-prefetch P0: take a SPECULATIVE pin per digest from the
+        // small DISJOINT speculative sub-budget. `pin_key_speculative` returns
+        // `false` on eviction race OR speculative-cap backpressure — the
+        // speculative construct treats either as "pinned less" (a real action
+        // is never harmed because speculative bytes are excluded from the
+        // real-pin admission check in `MokaEvictingMap`).
+        digests
+            .iter()
+            .map(|d| {
+                let key: StoreKey<'static> = (*d).into();
+                self.evicting_map
+                    .pin_key_speculative(StoreKeyBorrow::from(key))
+            })
+            .collect()
+    }
+
     /// #334 Fix C: trait-method form of the existing public
     /// [`Self::unpin_digest`] (singular). Routed through the
     /// `pin_delegation` chain so the server-side BIS broadcast loop

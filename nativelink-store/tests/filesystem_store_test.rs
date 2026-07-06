@@ -38,7 +38,7 @@ use nativelink_store::filesystem_store::{
 use nativelink_util::buf_channel::{make_buf_channel_pair, make_buf_channel_pair_with_size};
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::evicting_map::LenEntry;
-use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn};
 use opentelemetry::context::{Context, FutureExt as OtelFutureExt};
 use parking_lot::Mutex;
@@ -2716,6 +2716,82 @@ async fn v3c_drain_tick_suppressed_gate_release_confirms_arc_shared() -> Result<
          MUTATION target: change `Ordering::Release` to `Ordering::Relaxed` in \
          moka_evicting_map.rs::release_startup_reconcile_gate — no observable change here, \
          but the drain-tick suppression test in moka_evicting_map.rs will catch it."
+    );
+
+    Ok(())
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #speculative-prefetch P0 — C3/C5 production-composition contention test.
+//
+// invariant-prover BLOCK (TLC-proven `.claude/tla/SpeculativePinBudget.tla` →
+// NoStarve VIOLATED under the SHARED budget; `SpeculativePinBudgetFixed.tla` →
+// HOLDS with the DISJOINT sub-budget). This is the store-level realization of
+// that proof: a REAL `MokaEvictingMap`-backed `FilesystemStore` (the fast tier
+// the worker's speculative construct pins into), a small `pin_cap`, a
+// SPECULATIVE construct that pins blobs saturating its sub-budget, then a
+// concurrent REAL construct pinning a DIFFERENT digest → the real pin MUST be
+// admitted (its blob stays resident → its populate is NOT starved into
+// `Aborted`). Under the pre-fix shared budget the speculative pins consume the
+// real pin_cap headroom and the real pin is REFUSED.
+// ═══════════════════════════════════════════════════════════════════════════
+#[nativelink_test]
+async fn speculative_pins_never_starve_a_concurrent_real_pin() -> Result<(), Error> {
+    // max_bytes = 40_000 → pin_cap = 10_000 (25%), speculative_pin_cap = 2_000
+    // (5%). All blobs fit in the cache (total < 40_000), so eviction never
+    // confounds the pin-admission assertion.
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: make_temp_path("content_path"),
+        temp_path: make_temp_path("temp_path"),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 40_000,
+            ..Default::default()
+        }),
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    // SPECULATIVE side: two 1000-byte blobs fill the 2000-byte speculative
+    // sub-budget exactly. These add 2000 bytes to the SHARED pinned_bytes.
+    let spec0 = make_distinct_blob(&store, 0, 1000).await?;
+    let spec1 = make_distinct_blob(&store, 1, 1000).await?;
+    let spec_res = store.pin_digests_speculative_with_results(&[spec0, spec1]);
+    assert_eq!(
+        spec_res,
+        vec![true, true],
+        "both speculative pins (2 × 1000 = 2000 = speculative_pin_cap) must be admitted"
+    );
+
+    // REAL side: a 9000-byte blob for a DIFFERENT digest. Real-pin admission
+    // check EXCLUDES speculative bytes: (2000 − 2000) + 9000 = 9000 ≤ 10_000
+    // pin_cap → ADMIT. Under the pre-fix shared budget it would be
+    // 2000 + 9000 = 11_000 > 10_000 → REFUSED (the C3/C5 starvation: the real
+    // action's blob stays LRU-evictable and its populate can be Aborted).
+    let real = make_distinct_blob(&store, 2, 9000).await?;
+    let real_res = store.pin_digests_with_results(&[real]);
+    assert_eq!(
+        real_res,
+        vec![true],
+        "composite invariant violated (2026-07-05): a speculative construct's pins \
+         (2000 bytes) refused a concurrent real action's 9000-byte pin via the shared \
+         pin_cap — the real blob would stay evictable and its populate could be \
+         Aborted (the C3/C5 starvation the invariant-prover machine-checked). The \
+         disjoint speculative sub-budget must be subtracted from the real-pin check."
+    );
+
+    // A second real pin adds up to the pin_cap boundary using ONLY real bytes:
+    // real-only total 9000 + 900 = 9900 ≤ 10_000 → still admitted; counting the
+    // 2000 speculative bytes (11_900 > 10_000) would refuse it under the bug.
+    let real2 = make_distinct_blob(&store, 3, 900).await?;
+    let real2_res = store.pin_digests_with_results(&[real2]);
+    assert_eq!(
+        real2_res,
+        vec![true],
+        "composite invariant violated (2026-07-05): real-only pinned total is 9900 ≤ \
+         10_000 pin_cap; only the shared-budget bug (adding 2000 speculative bytes → \
+         11_900 > 10_000) can refuse this second real pin"
     );
 
     Ok(())
