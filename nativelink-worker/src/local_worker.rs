@@ -65,6 +65,7 @@ use tracing::{Level, debug, error, event, info, info_span, instrument, trace, wa
 use crate::running_actions_manager::{
     ExecutionConfiguration, Metrics as RunningActionManagerMetrics, RunningAction,
     RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
+    prefetch_tree_into_cas,
 };
 use crate::worker_api_client_wrapper::{WorkerApiClientTrait, WorkerApiClientWrapper};
 use crate::worker_utils::{boot_epoch_id, make_connect_worker_request};
@@ -3327,6 +3328,24 @@ struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsM
     /// permit is acquired; decremented when the spawn body exits (RAII
     /// `InflightGuard`).
     ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
+
+    /// (speculative-prefetch Increment 1) Single-in-flight guard for the
+    /// speculative prefetch (G5: ≤1 per worker). `true` = a speculative
+    /// fetch is currently running; `false` = idle. Set to `true` before
+    /// spawning; the spawned task resets it to `false` on completion
+    /// (normal, abort, or TTL). A second `Update::PrefetchInputs` arriving
+    /// while this is `true` is dropped + counted as `speculative_prefetch_busy_drop`.
+    /// No separate counter — presence (true) IS the busy signal.
+    ///
+    /// Shared via `Arc` so the spawned task can reset without holding self.
+    // CAPPED AT 1: exactly one in-flight speculative fetch per worker; drop
+    // the second (G5 / §1.10 confirm-necessity: map-presence = busy signal).
+    speculative_prefetch_inflight: Arc<core::sync::atomic::AtomicBool>,
+    /// (speculative-prefetch) Digests pinned by the most recent speculative
+    /// prefetch. Released on adoption (real StartAction for this op) or TTL.
+    // CAPPED AT max-tree-digests (bounded by SPECULATIVE_POPULATE_BYTE_BUDGET
+    // semaphore cap on the prefetch side; only DigestInfo PODs stored).
+    speculative_pinned_digests: Arc<parking_lot::Mutex<Vec<nativelink_util::common::DigestInfo>>>,
 }
 
 pub async fn preconditions_met<H: BuildHasher + Sync>(
@@ -3459,6 +3478,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             cas_shutdown_tx,
             ac_write_semaphore,
             ac_write_detached_inflight_count,
+            speculative_prefetch_inflight: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            speculative_pinned_digests: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -5184,6 +5205,170 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     "ReconcileComplete received but no FilesystemStore (no-op)"
                                 );
                             }
+                        }
+                        Update::PrefetchInputs(prefetch) => {
+                            // (speculative-prefetch Increment 1) Pre-fetch this
+                            // action's cold input blobs into the local CAS during
+                            // the slot-wait so that when the real StartAction
+                            // arrives the construct's populate finds them resident.
+                            //
+                            // G5 / §1.10: single in-flight per worker. Drop + count
+                            // a 2nd concurrent PrefetchInputs. Guard = AtomicBool;
+                            // no separate counter (presence = busy, confirmed necessary).
+                            //
+                            // Adoption is IMPLICIT: the real StartAction path's
+                            // populate call hits the already-resident+pinned blobs →
+                            // no-op. Pins are released by the TTL timer (self-fired
+                            // `speculative_prefetch_ttl_s`).
+                            if self.speculative_prefetch_inflight
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    core::sync::atomic::Ordering::AcqRel,
+                                    core::sync::atomic::Ordering::Relaxed,
+                                )
+                                .is_err()
+                            {
+                                // Another speculative prefetch is in-flight.
+                                self.metrics
+                                    .speculative_prefetch_busy_drop
+                                    .inc();
+                                debug!(
+                                    operation_id = prefetch.operation_id,
+                                    "speculative prefetch: dropping (already in-flight, G5)"
+                                );
+                                continue;
+                            }
+
+                            // Register P2P peer hints so cold blobs can pull from
+                            // a peer holding them (before resolve_directory_tree).
+                            register_missing_blob_peers(
+                                self.peer_locality_map.as_ref(),
+                                &prefetch.missing_digest_peers,
+                            );
+
+                            // Resolve input_root_digest from the proto field.
+                            let Some(ref proto_digest) = prefetch.input_root_digest else {
+                                warn!(
+                                    operation_id = prefetch.operation_id,
+                                    "speculative prefetch: missing input_root_digest — skipping"
+                                );
+                                self.speculative_prefetch_inflight
+                                    .store(false, core::sync::atomic::Ordering::Release);
+                                continue;
+                            };
+                            let input_root_digest =
+                                match nativelink_util::common::DigestInfo::try_from(proto_digest) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        warn!(
+                                            operation_id = prefetch.operation_id,
+                                            ?e,
+                                            "speculative prefetch: invalid digest — skipping"
+                                        );
+                                        self.speculative_prefetch_inflight
+                                            .store(false, core::sync::atomic::Ordering::Release);
+                                        continue;
+                                    }
+                                };
+
+                            // Get the CAS store and FilesystemStore needed for
+                            // prefetch_tree_into_cas.
+                            let Some(cas_store) = self.running_actions_manager.get_cas_store()
+                            else {
+                                warn!(
+                                    operation_id = prefetch.operation_id,
+                                    "speculative prefetch: no CAS store on this worker — skipping"
+                                );
+                                self.speculative_prefetch_inflight
+                                    .store(false, core::sync::atomic::Ordering::Release);
+                                continue;
+                            };
+                            let Some(fss_arc) = cas_store
+                                .fast_store()
+                                .downcast_ref::<nativelink_store::filesystem_store::FilesystemStore>(None)
+                                .and_then(|f| f.get_arc())
+                            else {
+                                warn!(
+                                    operation_id = prefetch.operation_id,
+                                    "speculative prefetch: no FilesystemStore fast tier — skipping"
+                                );
+                                self.speculative_prefetch_inflight
+                                    .store(false, core::sync::atomic::Ordering::Release);
+                                continue;
+                            };
+
+                            let inflight_flag = self.speculative_prefetch_inflight.clone();
+                            let pinned_store = self.speculative_pinned_digests.clone();
+                            // TTL is a worker-local constant (60s default).
+                            // MUST NOT be derived from worker_timeout_s (default=0 / disabled).
+                            // The effective pin lifetime = min(60, PIN_TIMEOUT_SECS=120).
+                            const SPECULATIVE_PREFETCH_TTL_S: u64 = 60;
+                            let ttl_s = SPECULATIVE_PREFETCH_TTL_S;
+                            let operation_id_log = prefetch.operation_id.clone();
+                            let metrics = self.metrics.clone();
+
+                            // Spawn detached so we don't block the Update loop.
+                            tokio::spawn(async move {
+                                let cas_ref: &nativelink_store::fast_slow_store::FastSlowStore
+                                    = &cas_store;
+                                match prefetch_tree_into_cas(
+                                    cas_ref,
+                                    &fss_arc,
+                                    input_root_digest,
+                                    ttl_s,
+                                )
+                                .await
+                                {
+                                    Ok(pinned) => {
+                                        info!(
+                                            operation_id = operation_id_log,
+                                            pinned = pinned.len(),
+                                            "speculative prefetch: complete — blobs pinned"
+                                        );
+                                        *pinned_store.lock() = pinned.clone();
+
+                                        // Self-fired TTL release timer. Runs to completion
+                                        // regardless of adoption (the real StartAction's
+                                        // unpin_digest on adoption releases them sooner;
+                                        // the timer provides the RAII backstop for ops
+                                        // that are never dispatched).
+                                        tokio::time::sleep(
+                                            core::time::Duration::from_secs(ttl_s.min(120))
+                                        ).await;
+                                        let to_release = core::mem::take(&mut *pinned_store.lock());
+                                        if !to_release.is_empty() {
+                                            // Blobs not yet adopted — release pins via unpin.
+                                            // This allows LRU eviction (pins no longer hold).
+                                            for digest in &to_release {
+                                                fss_arc.unpin_digest(digest);
+                                            }
+                                            info!(
+                                                operation_id = operation_id_log,
+                                                released = to_release.len(),
+                                                "speculative prefetch: TTL expired, pins released"
+                                            );
+                                        }
+                                    }
+                                    Err(ref e) if e.code == nativelink_error::Code::Aborted => {
+                                        metrics.speculative_prefetch_aborted.inc();
+                                        warn!(
+                                            operation_id = operation_id_log,
+                                            "speculative prefetch: aborted (over-pressure) — \
+                                             real action unaffected"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            operation_id = operation_id_log,
+                                            ?e,
+                                            "speculative prefetch: failed"
+                                        );
+                                    }
+                                }
+                                // Release the single-in-flight guard on exit (any path).
+                                inflight_flag.store(false, core::sync::atomic::Ordering::Release);
+                            });
                         }
                         Update::StartAction(start_execute) => {
                             // (FL-688 v3 Stage C — Ordering A, item 4)
@@ -7393,6 +7578,22 @@ pub struct Metrics {
         help = "Times the startup reconcile gate released via fail-open timer (not ReconcileComplete); monotonic — alert on RATE not level; sustained rate>0 post-rollout = server version mismatch."
     )]
     reconcile_gate_fail_open_total: Counter,
+    /// (speculative-prefetch Increment 1) Counts PrefetchInputs messages
+    /// dropped because a prior speculative fetch was already in-flight
+    /// (G5 / §1.10 single-in-flight guard). Non-zero = prefetch signals
+    /// arriving faster than the worker can service them; may indicate
+    /// the backlog threshold is too low or the TTL is too long.
+    #[metric(
+        help = "PrefetchInputs dropped: prior speculative fetch in-flight (G5 guard)."
+    )]
+    speculative_prefetch_busy_drop: Counter,
+    /// (speculative-prefetch Increment 1) Counts speculative prefetches
+    /// that aborted because the fast store was over-pressured (populate
+    /// returned Code::Aborted). The real action is unaffected.
+    #[metric(
+        help = "Speculative prefetches aborted: fast store over-pressure (Aborted from populate)."
+    )]
+    speculative_prefetch_aborted: Counter,
 }
 
 impl RootMetricsComponent for Metrics {}
@@ -7411,6 +7612,8 @@ impl Metrics {
             ac_write_detached_inflight_count,
             reconcile_pin_time_bounded_fallback_total: Counter::default(),
             reconcile_gate_fail_open_total: Counter::default(),
+            speculative_prefetch_busy_drop: Counter::default(),
+            speculative_prefetch_aborted: Counter::default(),
         }
     }
 }
