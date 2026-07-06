@@ -1848,7 +1848,8 @@ impl SimpleScheduler {
                                     }
                                 }
                             };
-                            // Retrieve the matching engine's internal operation_id.
+                            // Retrieve the matching engine's client operation_id (the prefetch
+                            // coalesce-guard + reserve key).
                             let operation_id = match action_state_result.as_state().await {
                                 Ok((action_state, _)) => action_state.client_operation_id.clone(),
                                 Err(_) => continue,

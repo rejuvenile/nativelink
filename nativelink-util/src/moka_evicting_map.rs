@@ -1546,6 +1546,18 @@ where
                 // subtracted from the real-pin admission check (real headroom
                 // undercounted). This keeps the `PinnedEntry` speculative↔
                 // indefinite mutual-exclusion doc honest.
+                //
+                // INVARIANT NOTE (corrects this change's commit invariant-walk
+                // over-claim of "tightens, never loosens"): the spec->indef move
+                // is NOT atomic. For a ~1-instruction window a concurrent real-pin
+                // check-then-act can still see these bytes in `speculative_pinned_bytes`
+                // and transiently over-admit a real pin by <= speculative_pin_cap.
+                // DEGRADED-not-broken: the physical ceiling (pin_cap +
+                // speculative_pin_cap) is UNCHANGED from the pre-C1 base, it self-heals
+                // <= PIN_TIMEOUT_SECS, and it REPLACES a worse DURABLE hole (persistent
+                // speculative-gauge inflation + real-headroom undercount). TLC-modeled:
+                // `.claude/tla/SpeculativePinBudgetReclassify.tla` (NoOverPinQuiescent
+                // violated on the transient, PhysicalOverShootBounded HOLDS).
                 if entry.speculative {
                     entry.speculative = false;
                     self.speculative_pinned_bytes
