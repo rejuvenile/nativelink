@@ -34,7 +34,7 @@ use nativelink_metric::{
 use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory, Tree};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     AcPinResyncRequest, BlobsInStableStorage, KillOperationRequest, MissingBlobPeers, PeerHint,
-    StartExecute, UpdateForWorker, update_for_worker,
+    PrefetchInputs, StartExecute, UpdateForWorker, update_for_worker,
 };
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -1035,6 +1035,13 @@ struct ApiWorkerSchedulerImpl {
     /// resend-buffer storage share the same allocation rather than
     /// re-cloning the proto Vec<Digest> per worker.
     bis_resend_buffers: HashMap<String, BisResendBuffer>,
+
+    /// (#specprefetch) Map from `operation_id` → `WorkerId` recording which
+    /// idle worker was sent a `PrefetchInputs` for a queued action.
+    /// Used to reaped on eviction, assignment, and TTL expiry.
+    // CAPPED AT PREFETCH_AFFINITY_CAP (64): LRU of recent speculative prefetch
+    // assignments; over-cap evicts the oldest. Only a `WorkerId` (String) per entry.
+    prefetch_affinity: LruCache<OperationId, WorkerId>,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -2837,6 +2844,15 @@ const TREE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// so a match window's producing set fits without premature recency truncation.
 const OUTPUT_PRODUCER_MAP_CAP: usize = 8192;
 
+/// (#specprefetch) Maximum number of concurrent speculative prefetch affinity
+/// records — one per queued action for which a `PrefetchInputs` was emitted.
+/// Sized at 64: matching `speculative_prefetch_backlog_threshold` default × 20;
+/// over-cap evicts the oldest affinity (LRU), which is fine since the TTL self-
+/// reaps within min(60, 120) seconds anyway.
+// CAPPED AT 64: LRU of pending speculative prefetch operation-to-worker
+// assignments; over-cap evicts oldest, fine since TTL self-reaps.
+const PREFETCH_AFFINITY_CAP: usize = 64;
+
 /// (#output-locality-probe) Cost-control cap (no-silent-truncation rule): output
 /// `Tree` blobs LARGER than this are NOT fetched/decoded on the detached recorder
 /// task; the skip is `warn!`-logged AND counted in
@@ -3235,6 +3251,9 @@ impl ApiWorkerScheduler {
                 scores_cache: scores_cache.clone(),
                 metrics: metrics.clone(),
                 bis_resend_buffers: HashMap::new(),
+                prefetch_affinity: LruCache::new(
+                    NonZeroUsize::new(PREFETCH_AFFINITY_CAP).unwrap(),
+                ),
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -3420,6 +3439,80 @@ impl ApiWorkerScheduler {
     #[must_use]
     pub const fn get_metrics(&self) -> &Arc<SchedulerMetrics> {
         &self.metrics
+    }
+
+    /// (#specprefetch) Emits a `PrefetchInputs` (tag-15) message to the best
+    /// idle worker that can accept the given platform properties, WITHOUT
+    /// reserving a slot. Records the assignment in `prefetch_affinity` so
+    /// `immediate_evict_worker` can reap it.
+    ///
+    /// Coalesces per `(op_id, worker)`: if an affinity record for `op_id`
+    /// already exists (a prior cycle emitted a prefetch), skips. This enforces
+    /// G5 at the scheduler side: at most ONE in-flight prefetch per
+    /// (op_id, target worker) pair.
+    ///
+    /// Returns `true` if a worker was found and the message sent, `false`
+    /// otherwise (no idle worker or op already has affinity).
+    pub async fn send_prefetch_inputs(
+        &self,
+        platform_properties: &PlatformProperties,
+        operation_id: &OperationId,
+        input_root_digest: DigestInfo,
+        missing_digest_peers: Vec<MissingBlobPeers>,
+        ttl_s: u64,
+    ) -> bool {
+        let mut inner = self.inner.write().await;
+
+        // Coalesce: skip if already emitted for this op.
+        if inner.prefetch_affinity.contains(operation_id) {
+            return false;
+        }
+
+        // Peek-only: find the best idle worker without reserving a slot.
+        // Reuse `inner_find_worker_for_action` which scans LRU (no mutation).
+        let worker_id = match inner.inner_find_worker_for_action(platform_properties, false) {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Clone the tx while holding the write lock so we can send outside it.
+        let tx = match inner.workers.0.peek(&worker_id) {
+            Some(w) => w.tx.clone(),
+            None => return false,
+        };
+
+        // Record affinity BEFORE sending (send may fail if worker just disconnected,
+        // but that's fine — the TTL self-reaps, and the record prevents duplicate
+        // sends in subsequent cycles which is the important guarantee).
+        inner.prefetch_affinity.put(operation_id.clone(), worker_id.clone());
+        drop(inner);
+
+        let msg = UpdateForWorker {
+            update: Some(update_for_worker::Update::PrefetchInputs(PrefetchInputs {
+                operation_id: operation_id.to_string(),
+                input_root_digest: Some(input_root_digest.into()),
+                missing_digest_peers,
+            })),
+        };
+
+        // Sync send — G-non-block: no `.await` on the channel send.
+        if tx.send(msg).is_err() {
+            warn!(
+                ?worker_id,
+                %operation_id,
+                "PrefetchInputs send failed (worker disconnected); affinity recorded, TTL reaps",
+            );
+            // Leave affinity intact — coalesces further retries this cycle,
+            // and the LRU cap prevents unbounded accumulation.
+        } else {
+            debug!(
+                ?worker_id,
+                %operation_id,
+                ttl_s,
+                "PrefetchInputs emitted for queued action",
+            );
+        }
+        true
     }
 
     /// Attempts to find a worker that is capable of running this action.

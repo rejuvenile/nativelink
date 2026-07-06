@@ -1540,6 +1540,19 @@ pub struct SimpleScheduler {
     /// path — not worth it for an observability probe). Derived from
     /// `spec.experimental_backend` at construction; does NOT change assignment.
     pending_affinity_probe_enabled: bool,
+
+    /// (#specprefetch) Feature gate. When `true`, `do_try_match` emits
+    /// `PrefetchInputs` to idle workers for still-queued actions once the
+    /// backlog depth exceeds `speculative_prefetch_backlog_threshold`.
+    enable_speculative_prefetch: bool,
+
+    /// (#specprefetch) Minimum queue depth before speculative prefetch is
+    /// triggered. Mirrors `SimpleSpec::speculative_prefetch_backlog_threshold`.
+    speculative_prefetch_backlog_threshold: u64,
+
+    /// (#specprefetch) TTL forwarded in the `PrefetchInputs` proto so the
+    /// worker self-fires a cleanup timer. Mirrors `SimpleSpec::speculative_prefetch_ttl_s`.
+    speculative_prefetch_ttl_s: u64,
 }
 
 impl core::fmt::Debug for SimpleScheduler {
@@ -1760,6 +1773,74 @@ impl SimpleScheduler {
                 query_ms = query_elapsed.as_millis(),
                 "Slow do_try_match cycle"
             );
+        }
+
+        // (#specprefetch) Speculative prefetch backlog trigger.
+        //
+        // After the normal match cycle, if the feature is enabled and the still-
+        // queued depth is at or above the threshold, emit `PrefetchInputs` (tag-15)
+        // to the best idle worker for each top-priority still-queued action. We
+        // re-query rather than carrying a "not-matched" list because actions may
+        // have been matched by OTHER concurrent `do_try_match` callers and we want
+        // the freshest view of what is still truly queued.
+        //
+        // Fan-out is capped by `PREFETCH_AFFINITY_CAP` inside `send_prefetch_inputs`
+        // (coalesces if already emitted for this op). The missing_digest_peers field
+        // is empty here; the worker's `WorkerProxyStore` initiates P2P pulls when
+        // StartAction arrives with peer hints. No per-RPC timeout: worker has its
+        // own self-fired TTL (min(ttl_s, 120)s). Gate: feature flag OFF = no-op
+        // (byte-identical to pre-feature behavior).
+        if self.enable_speculative_prefetch {
+            if let Ok(stream) = self.get_queued_operations().await {
+                let still_queued: Vec<Box<dyn ActionStateResult>> = stream.collect().await;
+                let queue_depth = still_queued.len() as u64;
+                if queue_depth >= self.speculative_prefetch_backlog_threshold {
+                    for action_state_result in still_queued
+                        .into_iter()
+                        .take(self.speculative_prefetch_backlog_threshold as usize)
+                    {
+                        if let Ok((action_info, _)) = action_state_result.as_action_info().await {
+                            // Build platform properties for candidate selection.
+                            let mut cache_key: Vec<(String, String)> =
+                                action_info.platform_properties.clone().into_iter().collect();
+                            cache_key.sort();
+                            let platform_properties = match {
+                                let c = props_cache.lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                c.get(&cache_key).cloned()
+                            } {
+                                Some(pp) => pp,
+                                None => {
+                                    match self.platform_property_manager
+                                        .make_platform_properties(action_info.platform_properties.clone())
+                                    {
+                                        Ok(pp) => {
+                                            let pp = Arc::new(pp);
+                                            props_cache.lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .insert(cache_key, Arc::clone(&pp));
+                                            pp
+                                        }
+                                        Err(_) => continue,
+                                    }
+                                }
+                            };
+                            // Retrieve the matching engine's internal operation_id.
+                            let operation_id = match action_state_result.as_state().await {
+                                Ok((action_state, _)) => action_state.client_operation_id.clone(),
+                                Err(_) => continue,
+                            };
+                            self.worker_scheduler.send_prefetch_inputs(
+                                &platform_properties,
+                                &operation_id,
+                                action_info.input_root_digest,
+                                vec![],
+                                self.speculative_prefetch_ttl_s,
+                            ).await;
+                        }
+                    }
+                }
+            }
         }
 
         result
@@ -2626,6 +2707,9 @@ impl SimpleScheduler {
                 recent_roots_window: Mutex::new(RecentRootsWindow::new()),
                 affinity_clock,
                 pending_affinity_probe_enabled,
+                enable_speculative_prefetch: spec.enable_speculative_prefetch,
+                speculative_prefetch_backlog_threshold: spec.speculative_prefetch_backlog_threshold,
+                speculative_prefetch_ttl_s: spec.speculative_prefetch_ttl_s,
             }
         });
         (action_scheduler, worker_scheduler_clone)
