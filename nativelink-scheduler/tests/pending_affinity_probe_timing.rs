@@ -12,20 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! #sched-affinity-probe THRESHOLD-VALIDATION micro-timing (NOT a correctness
-//! test; run explicitly with `--ignored --nocapture`).
+//! #sched-affinity-probe QUADRATIC-COST EVIDENCE micro-timing — the evidence that
+//! the obs-only probe is quadratic and therefore ships default-OFF (user decision
+//! 2026-07-06). NOT a CI gate: `#[ignore]`d so CI never runs the 24s@512 case; run
+//! explicitly with `--ignored --nocapture` to regenerate the table.
 //!
 //! Times the DOMINANT probe kernel `compute_batch_sched_gain` (flamegraph:
 //! 17.84% of scheduler CPU during a live 27s match cycle — the pinned cost that
 //! `record_pending_affinity_surplus` pays synchronously inside the timed match
-//! region) as a function of the sampled-action count {16, 64, 256, 512} against
-//! a realistic prod-shaped worker set. Used to pick
-//! `PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH`: at the chosen depth the kernel must
-//! be bounded to single-digit ms so it can never blow the match budget.
+//! region) as a function of the sampled-action count against a realistic
+//! prod-shaped worker set. The table shows the cost is QUADRATIC in the
+//! sampled-action count (24.6s at the 512 sample cap), which is why the probe
+//! must not run always-on in prod and is instead OPT-IN via
+//! `pending_affinity_probe_enabled` — see
+//! `.claude/audits/affinity-probe-slow-match-2026-07-06/`.
 //!
 //! Prints a table; not asserted (timing on a shared build box is noisy). The
-//! chosen threshold constant is asserted for VALUE (not timing) in
-//! `pending_affinity_probe_guard_test.rs`.
+//! opt-in default (false) is pinned in `pending_affinity_probe_guard_test.rs` and
+//! `nativelink-config/tests/simple_spec_default_test.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -99,7 +103,7 @@ fn build_workers() -> Vec<BatchSchedWorker> {
 }
 
 #[test]
-#[ignore = "threshold-validation micro-timing; run with --ignored --nocapture"]
+#[ignore = "quadratic-cost evidence micro-timing (default-OFF justification); run with --ignored --nocapture"]
 fn pending_affinity_probe_kernel_timing() {
     // Prod gate config: enabled, threshold 0 (v1), override 2 (inert at 0).
     let gate_cfg = BatchSchedGateCfg {
@@ -115,9 +119,10 @@ fn pending_affinity_probe_kernel_timing() {
          worker_cache={WORKER_CACHE_SIZE})"
     );
     println!("  sample_actions |  median_ms | p_of_5s_match_budget | iters");
-    // Low regime is where the guard operates — measure it densely with many
-    // iterations. High regime (256/512) documents the quadratic blow-up the
-    // guard exists to prevent; single-iter so the harness never wedges.
+    // Low regime (a shallow queue an investigation would enable the probe on) —
+    // measure it densely with many iterations. High regime (256/512) documents the
+    // quadratic blow-up that justifies keeping the probe OFF by default; single-iter
+    // so the harness never wedges.
     for &(n, iters) in &[
         (8usize, 15usize),
         (16, 15),

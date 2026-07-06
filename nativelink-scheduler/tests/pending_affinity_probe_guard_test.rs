@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! #sched-affinity-probe guard tests for the OBSERVABILITY-ONLY pending-affinity
+//! #sched-affinity-probe flag tests for the OBSERVABILITY-ONLY pending-affinity
 //! probe (`record_pending_affinity_surplus`), which was pinned at 17.84% of
 //! scheduler CPU during a live 27s match cycle (its dominant kernel
 //! `compute_batch_sched_gain` is quadratic in the sampled-action count) and ran
 //! SYNCHRONOUSLY inside the timed match region, collapsing throughput under a
 //! deep backlog. See `.claude/audits/affinity-probe-slow-match-2026-07-06/`.
+//!
+//! The fix makes the probe OPT-IN, default OFF (user decision 2026-07-06): the
+//! deployed prod config does not set the flag, so the probe never runs and the
+//! 20-27s `do_try_match` collapse cannot occur. An investigation enables it
+//! deliberately via `pending_affinity_probe_enabled: true` in the scheduler
+//! config. The probe is observability-only — it never affects worker selection.
 //!
 //! The `sampled_ops` gauge is the WITNESS: it is 0 by default and set to the
 //! sampled pending count ONLY when the probe runs. These tests drive
@@ -25,14 +31,14 @@
 //! off the REAL `/metrics` render path (same as
 //! `batch_affinity_metrics_render_test.rs`).
 //!
-//! Fix under test (two gates on the `do_try_match` call site):
-//!   `self.pending_affinity_probe_enabled` (config flag, default true, Redis
-//!   force-off) `&& primary_queue_depth <= PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH`.
+//! Fix under test (single gate on the `do_try_match` call site):
+//!   `self.pending_affinity_probe_enabled` — derived from the config flag
+//!   (default false) AND a non-Redis backend force-off.
 //!
 //! Mutation rules:
-//!   - remove the `primary_queue_depth <=` clause  → skip-under-backlog RED.
-//!   - force the guard false unconditionally        → runs-when-shallow RED.
-//!   - ignore `pending_affinity_probe_enabled`       → flag-off RED.
+//!   - force the gate `true` unconditionally         → default-off RED.
+//!   - force the gate `false` unconditionally        → flag-enabled RED.
+//!   - ignore `pending_affinity_probe_enabled`        → flag-off RED.
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -43,9 +49,7 @@ use nativelink_config::schedulers::SimpleSpec;
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
-use nativelink_scheduler::simple_scheduler::{
-    PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH, SimpleScheduler,
-};
+use nativelink_scheduler::simple_scheduler::SimpleScheduler;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId,
@@ -124,10 +128,7 @@ fn register(
 }
 
 /// Enqueue `n` distinct pending ops, one match cycle, return the rendered body.
-async fn enqueue_and_match(
-    scheduler: &Arc<SimpleScheduler>,
-    n: u64,
-) -> Result<(), Error> {
+async fn enqueue_and_match(scheduler: &Arc<SimpleScheduler>, n: u64) -> Result<(), Error> {
     for i in 0..n {
         scheduler
             .add_action(OperationId::default(), make_action_info(root(i), i, i))
@@ -141,33 +142,31 @@ async fn enqueue_and_match(
     Ok(())
 }
 
-/// The threshold constant is authoritative at its declaration line (numeric-
-/// constant rule). This pins the shipped value so a doc-comment / commit-message
-/// drift cannot masquerade as the constant.
-#[test]
-fn pending_affinity_probe_max_queue_depth_is_64() {
-    assert_eq!(
-        PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH, 64,
-        "#sched-affinity-probe: the guard threshold must be 64 (validated by \
-         tests/pending_affinity_probe_timing.rs — the quadratic probe kernel is \
-         ~5% of the 5s budget at 64, vs 492% at 512). If this value changes, \
-         re-run the timing harness and update the audit."
-    );
-}
-
-/// SKIP-UNDER-BACKLOG (the core throughput fix). Enqueue MORE than the threshold
-/// pending ops with the default (enabled) config; the probe must be SKIPPED, so
-/// `sampled_ops` stays 0.
+/// DEFAULT-OFF (the core opt-in fix). With `SimpleSpec::default()` the probe is
+/// OFF (the deployed prod shape — the flag is absent from config), so a match
+/// cycle over a shallow queue that WOULD sample if the probe ran leaves
+/// `sampled_ops` at 0. This is the guarantee that prod never pays the quadratic
+/// probe: it does not run at all unless an investigation opts in.
 #[nativelink_test]
-async fn probe_skipped_when_queue_deeper_than_threshold() -> Result<(), Error> {
+async fn probe_never_runs_by_default() -> Result<(), Error> {
+    // Only set `worker_timeout_s` (a match-loop knob); leave the probe flag at its
+    // default so this test pins the DEFAULT = OFF behavior, not an explicit false.
     let spec = SimpleSpec {
         worker_timeout_s: 100,
         ..Default::default()
     };
+    // Guard: this fixture is only meaningful if the default really is OFF.
+    assert!(
+        !spec.pending_affinity_probe_enabled,
+        "#sched-affinity-probe: SimpleSpec::default() must leave \
+         pending_affinity_probe_enabled = false (the probe is opt-in). If this \
+         flips, the deployed prod config would run the quadratic probe."
+    );
     let (scheduler, worker_scheduler, _notify) = new_scheduler_with_spec(&spec);
 
-    // One more than the guard depth → the pre-match queue exceeds the threshold.
-    let depth = PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH + 1;
+    // A shallow queue that WOULD sample (produce sampled_ops == depth) if the probe
+    // ran — so the ONLY reason sampled_ops stays 0 is the default-off gate.
+    let depth = 3u64;
     enqueue_and_match(&scheduler, depth).await?;
 
     let registry = register(scheduler.clone(), worker_scheduler.clone());
@@ -175,28 +174,31 @@ async fn probe_skipped_when_queue_deeper_than_threshold() -> Result<(), Error> {
 
     assert!(
         body.contains("\nscheduler_test_action_batch_affinity_sampled_ops 0\n"),
-        "#sched-affinity-probe GUARD FAILED: with {depth} queued ops (> threshold \
-         {PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH}) the observability probe must be \
-         SKIPPED so it cannot collapse the match cycle — sampled_ops must stay 0. \
-         A non-zero value means the quadratic probe ran under backlog. body=\n{body}"
+        "#sched-affinity-probe DEFAULT FAILED: with the default (opt-in, OFF) config \
+         the probe must NOT run even for a shallow queue ({depth} ops) — sampled_ops \
+         must stay 0. A non-zero value means the probe ran by default, so prod would \
+         pay the quadratic cost. body=\n{body}"
     );
 
     Ok(())
 }
 
-/// RUNS-WHEN-SHALLOW. Enqueue AT MOST the threshold pending ops with the default
-/// (enabled) config; the probe must RUN, so `sampled_ops` equals the pending
-/// count (the gauge is preserved during normal shallow-queue operation).
+/// FLAG-ENABLED. With `pending_affinity_probe_enabled = true` explicitly set (and
+/// a non-Redis backend), the probe RUNS on ANY queue depth — there is no
+/// depth guard — so `sampled_ops` equals the pending count. This is how an
+/// investigation opts in.
 #[nativelink_test]
-async fn probe_runs_when_queue_at_or_below_threshold() -> Result<(), Error> {
+async fn probe_runs_when_flag_enabled() -> Result<(), Error> {
     let spec = SimpleSpec {
         worker_timeout_s: 100,
+        pending_affinity_probe_enabled: true,
         ..Default::default()
     };
     let (scheduler, worker_scheduler, _notify) = new_scheduler_with_spec(&spec);
 
-    // Exactly at the guard depth (inclusive `<=`) → the probe runs.
-    let depth = PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH;
+    // A non-trivial queue depth to prove the probe runs regardless of depth (the
+    // former depth guard, now removed, would have SKIPPED anything > 64).
+    let depth = 100u64;
     enqueue_and_match(&scheduler, depth).await?;
 
     let registry = register(scheduler.clone(), worker_scheduler.clone());
@@ -206,18 +208,19 @@ async fn probe_runs_when_queue_at_or_below_threshold() -> Result<(), Error> {
         body.contains(&format!(
             "\nscheduler_test_action_batch_affinity_sampled_ops {depth}\n"
         )),
-        "#sched-affinity-probe GUARD FAILED: with {depth} queued ops (== threshold \
-         {PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH}, inclusive) the probe must RUN and \
-         sample all {depth} ops so the measurement is preserved during normal \
-         shallow-queue operation — sampled_ops must be {depth}. body=\n{body}"
+        "#sched-affinity-probe FLAG FAILED: with pending_affinity_probe_enabled=true \
+         and {depth} queued ops the probe must RUN and sample all {depth} ops (there \
+         is no depth guard — the investigation opts in for exactly this deep-backlog \
+         regime) — sampled_ops must be {depth}. A value of 0 means the flag was \
+         ignored. body=\n{body}"
     );
 
     Ok(())
 }
 
-/// FLAG-OFF. With `pending_affinity_probe_enabled = false` the probe must NEVER
-/// run, regardless of queue depth — even a shallow queue that would otherwise
-/// pass the depth guard leaves `sampled_ops` at 0.
+/// FLAG-OFF (explicit). With `pending_affinity_probe_enabled = false` set
+/// explicitly the probe must NEVER run — redundant with the default today, but
+/// pins that an explicit false is honored (and guards a future default flip).
 #[nativelink_test]
 async fn probe_never_runs_when_flag_disabled() -> Result<(), Error> {
     let spec = SimpleSpec {
@@ -227,9 +230,7 @@ async fn probe_never_runs_when_flag_disabled() -> Result<(), Error> {
     };
     let (scheduler, worker_scheduler, _notify) = new_scheduler_with_spec(&spec);
 
-    // Shallow queue (below the depth guard) so ONLY the flag can suppress it.
     let depth = 3u64;
-    assert!(depth <= PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH);
     enqueue_and_match(&scheduler, depth).await?;
 
     let registry = register(scheduler.clone(), worker_scheduler.clone());
@@ -238,8 +239,8 @@ async fn probe_never_runs_when_flag_disabled() -> Result<(), Error> {
     assert!(
         body.contains("\nscheduler_test_action_batch_affinity_sampled_ops 0\n"),
         "#sched-affinity-probe FLAG FAILED: with pending_affinity_probe_enabled=false \
-         the probe must NOT run even for a shallow queue ({depth} ops) — sampled_ops \
-         must stay 0. A non-zero value means the config flag was ignored. body=\n{body}"
+         the probe must NOT run ({depth} ops) — sampled_ops must stay 0. A non-zero \
+         value means the config flag was ignored. body=\n{body}"
     );
 
     Ok(())

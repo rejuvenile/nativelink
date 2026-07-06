@@ -270,46 +270,6 @@ impl RecentRootsWindow {
 // UNDERCOUNTS the true surplus — a conservative bias for an observability metric.
 pub const MAX_PENDING_AFFINITY_SAMPLE: usize = 512;
 
-/// (#sched-affinity-probe) Maximum PRE-MATCH queue depth at which the
-/// OBSERVABILITY-ONLY pending-affinity probe (`record_pending_affinity_surplus`)
-/// is allowed to run. When `primary_queue_depth` (the collected pending set
-/// size, already owned at the call site) EXCEEDS this, the probe is SKIPPED for
-/// the cycle — the exact deep-backlog regime where its dominant kernel
-/// (`compute_batch_sched_gain`, which is O(sampled_actions² · workers ·
-/// dir_digests) via `batch_assignment_score`) collapses the match cycle to
-/// tens of seconds and where its gauge is least actionable. `pub` so the guard
-/// value can be pinned in a test.
-///
-/// # Threshold measurement (`tests/pending_affinity_probe_timing.rs`, release,
-/// 12 workers / 20k cached subtrees each / 128 dir digests per action — a warm
-/// prod-shaped fleet; median of N runs):
-///
-/// | sampled_actions | kernel median | % of 5s slow-cycle budget |
-/// |----------------:|--------------:|--------------------------:|
-/// |               8 |        23 ms  |                     0.47% |
-/// |              16 |        40 ms  |                     0.80% |
-/// |              32 |        96 ms  |                     1.92% |
-/// |              64 |       255 ms  |                     5.09% |
-/// |             128 |      1153 ms  |                    23.07% |
-/// |             256 |      5441 ms  |                   108.82% |
-/// |             512 |     24614 ms  |                   492.28% |
-///
-/// The kernel is QUADRATIC in the sampled-action count, so the cost explodes
-/// past ~128 (256 already exceeds a full 5s cycle; 512 reproduces the observed
-/// 20-27s pathology). At the chosen depth 64 the probe is bounded to ~255 ms
-/// worst-case on a warm fleet (~5% of the 5s slow-cycle warn threshold, and a
-/// ~96× reduction from the 512-depth 24.6s) while still covering far more than
-/// the worker count and preserving the gauge at the shallow depths where a
-/// batch scheduler would imminently assign. NOTE: this is BOUNDED, not
-/// single-digit-ms — the probe is intentionally still non-trivial at 64 but can
-/// no longer blow the match budget. Because 64 < `MAX_PENDING_AFFINITY_SAMPLE`
-/// (512), the inner 512 sample cap now only binds if this guard is raised
-/// above 512; at 64 the probe samples at most 64 ops.
-///
-/// Numeric-constant rule: the literal below is authoritative — verify HERE, not
-/// via the doc table above.
-pub const PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH: u64 = 64;
-
 /// (#batch-sched) Bytes-equivalent weight of a single cached input file when
 /// blending the `(cached_bytes, cached_files)` returned by
 /// `compute_dedup_cached_score` into a scalar match score `s`:
@@ -1572,13 +1532,15 @@ pub struct SimpleScheduler {
     /// dim-B window is driven by the mockable clock, not the wall clock.
     affinity_clock: AffinityClock,
 
-    /// (#batch-affinity, dimension A) Gate for the dimension-A pending-set
-    /// surplus pass. `true` on the memory backend (cheap in-memory
-    /// `as_action_info()` per op) and `false` on the Redis/store backend (each
+    /// (#batch-affinity, dimension A / #sched-affinity-probe) Gate for the
+    /// dimension-A pending-set surplus pass. OPT-IN: `true` only when the operator
+    /// set `spec.pending_affinity_probe_enabled` (default FALSE — the quadratic
+    /// obs-only probe is opt-in) AND the backend is non-Redis (on Redis each
     /// `as_action_info()` is a store round-trip, so up to
     /// `MAX_PENDING_AFFINITY_SAMPLE` sequential GETs on the match-cycle critical
-    /// path — not worth it for an observability probe). Derived from
-    /// `spec.experimental_backend` at construction; does NOT change assignment.
+    /// path — force-OFF there regardless of the flag). Derived from
+    /// `spec.pending_affinity_probe_enabled` && `spec.experimental_backend` at
+    /// construction; does NOT change assignment.
     pending_affinity_probe_enabled: bool,
 
     /// (#specprefetch) Feature gate. When `true`, `do_try_match` emits
@@ -1770,30 +1732,23 @@ impl SimpleScheduler {
         // threshold. Without this, every do_try_match cycle paid the re-query.
         let primary_queue_depth = queued_actions.len() as u64;
 
-        // (#batch-affinity, dimension A) OBSERVABILITY-ONLY: over the current
-        // pending set, measure the co-location surplus a batch assignment could
-        // exploit that greedy one-at-a-time misses. This reuses the already-
-        // collected `queued_actions` (by reference — it is NOT consumed here;
-        // matching below still owns every op) and samples only the first
-        // MAX_PENDING_AFFINITY_SAMPLE highest-priority ops to keep the probe
-        // O(cap) under burst load. It does NOT change which worker is chosen or
-        // introduce any delay — it only records gauges. Gated OFF on the
-        // Redis/store backend (each `as_action_info()` would be a store GET);
-        // see `pending_affinity_probe_enabled`.
+        // (#batch-affinity, dimension A / #sched-affinity-probe) OBSERVABILITY-ONLY
+        // and OPT-IN (default OFF): over the current pending set, measure the
+        // co-location surplus a batch assignment could exploit that greedy
+        // one-at-a-time misses. This reuses the already-collected `queued_actions`
+        // (by reference — it is NOT consumed here; matching below still owns every
+        // op) and samples only the first MAX_PENDING_AFFINITY_SAMPLE highest-priority
+        // ops. It does NOT change which worker is chosen or introduce any delay — it
+        // only records gauges.
         //
-        // (#sched-affinity-probe) SECOND gate: SKIP the probe under a deep
-        // backlog. Its dominant kernel `compute_batch_sched_gain` is QUADRATIC in
-        // the sampled-action count (measured 24.6s at the 512 sample cap on a warm
-        // fleet — the observed 20-27s match-cycle collapse), so running it while
-        // the queue is deep starves the match loop (17.84% of scheduler CPU during
-        // a live 27s cycle). Below `PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH` ops the
-        // gauge is both cheap and most actionable; above it the probe is skipped
-        // for the cycle (`primary_queue_depth` is already owned above — no extra
-        // work). Observability-only: skipping only stales the gauges for that
-        // cycle, never affects assignment.
-        if self.pending_affinity_probe_enabled
-            && primary_queue_depth <= PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH
-        {
+        // Gated on `pending_affinity_probe_enabled`, which is FALSE by default (the
+        // probe's dominant kernel `compute_batch_sched_gain` is quadratic — 24.6s at
+        // the 512 sample cap on a warm fleet, the observed 20-27s match-cycle
+        // collapse — and nothing auto-consumes its gauges, so it must not run
+        // always-on in prod; an investigation opts in via config). It is
+        // additionally force-OFF on the Redis/store backend (each `as_action_info()`
+        // would be a store GET) — see `pending_affinity_probe_enabled`.
+        if self.pending_affinity_probe_enabled {
             self.record_pending_affinity_surplus(&queued_actions).await;
         }
 
@@ -2411,15 +2366,13 @@ impl SimpleScheduler {
             Arc::new(move || now_fn().now())
         };
         // (#batch-affinity, dim A / #sched-affinity-probe) Gate the pending-set
-        // surplus pass. Requires BOTH: (1) the explicit operator flag
-        // `spec.pending_affinity_probe_enabled` (default true — see
-        // `default_pending_affinity_probe_enabled`; set false for ZERO probe
-        // overhead) AND (2) a non-Redis backend (on Redis each sampled
-        // `as_action_info()` is a store round-trip on the match-cycle critical
-        // path, so the probe is force-OFF there regardless of the flag). The
-        // per-cycle deep-backlog skip is a SEPARATE guard at the call site
-        // (`primary_queue_depth <= PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH`).
-        // Observability only — does not affect assignment.
+        // surplus pass. Requires BOTH: (1) the explicit opt-in flag
+        // `spec.pending_affinity_probe_enabled` (default FALSE — see
+        // `default_pending_affinity_probe_enabled`; the quadratic obs-only probe is
+        // opt-in, an investigation sets it true) AND (2) a non-Redis backend (on
+        // Redis each sampled `as_action_info()` is a store round-trip on the
+        // match-cycle critical path, so the probe is force-OFF there regardless of
+        // the flag). Observability only — does not affect assignment.
         let pending_affinity_probe_enabled = spec.pending_affinity_probe_enabled
             && !matches!(
                 spec.experimental_backend,

@@ -297,16 +297,21 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub enable_p2p_input_prefetch: bool,
 
-    /// (#sched-affinity-probe) Master gate for the OBSERVABILITY-ONLY pending-set
-    /// affinity/batch-scheduling probe (`record_pending_affinity_surplus`). When
-    /// `true` (the DEFAULT — `default_pending_affinity_probe_enabled`) the probe
-    /// updates its `batch_affinity` / `output_affinity` gauges each match cycle
-    /// EXCEPT when the pre-match queue depth exceeds
-    /// `PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH` (the probe's dominant kernel,
-    /// `compute_batch_sched_gain`, was pinned at 17.84% of scheduler CPU during a
-    /// live 27s match cycle under a deep backlog — see
-    /// `.claude/audits/affinity-probe-slow-match-2026-07-06/`). Set `false` for
-    /// ZERO probe overhead. The probe NEVER affects worker selection.
+    /// (#sched-affinity-probe) OPT-IN master gate for the OBSERVABILITY-ONLY
+    /// pending-set affinity/batch-scheduling probe (`record_pending_affinity_surplus`).
+    /// When `true` the probe updates its `batch_affinity` / `output_affinity`
+    /// gauges each match cycle; when `false` (the DEFAULT —
+    /// `default_pending_affinity_probe_enabled`) it never runs (ZERO overhead).
+    ///
+    /// Default is OFF because the probe is R&D instrumentation that NOTHING
+    /// auto-consumes, its dominant kernel `compute_batch_sched_gain` is QUADRATIC
+    /// (`O(actions² · workers · digests)` — 24.6s at the 512 sample cap on a warm
+    /// fleet; pinned at 17.84% of scheduler CPU during a live 27s match cycle), and
+    /// its signal only exists under a deep backlog — exactly the regime that the
+    /// quadratic cost collapses to a 20-27s `do_try_match` cycle. It must therefore
+    /// NOT run always-on in prod; an investigation enables it deliberately. See
+    /// `.claude/audits/affinity-probe-slow-match-2026-07-06/`. The probe NEVER
+    /// affects worker selection.
     ///
     /// Independent of the backend force-off: on the Redis/store backend the probe
     /// is ALWAYS disabled regardless of this flag (each sampled op would be a
@@ -410,8 +415,8 @@ impl Default for SimpleSpec {
             // #[serde(default)] → bool default (false) = P2P input prefetch OFF
             // (byte-identical to today until an operator enables it).
             enable_p2p_input_prefetch: false,
-            // #[serde(default = "default_pending_affinity_probe_enabled")] → true.
-            // NOT the bool type default (false), which would disable the probe.
+            // #[serde(default = "default_pending_affinity_probe_enabled")] → false
+            // (probe is OPT-IN; an absent-in-config scheduler leaves it OFF).
             pending_affinity_probe_enabled: default_pending_affinity_probe_enabled(),
             // #[serde(default)] → bool default (false) = speculative prefetch OFF
             // (bit-identical to pre-Increment-1; T9 regression test pins this).
@@ -448,16 +453,19 @@ pub const fn default_p_headroom_override_factor() -> u32 {
     2
 }
 
-/// (#sched-affinity-probe) Default for `pending_affinity_probe_enabled`: `true`,
-/// so the observability probe's behavior is PRESERVED for the deployed
-/// (non-Redis) backend when the key is absent from config. MUST be a named
-/// default fn — a bare `#[serde(default)]` on a `bool` yields `false`, which
-/// would silently DISABLE the probe on every existing config and change prod
-/// telemetry. `pub` for the single-source-of-truth reason as the other defaults.
+/// (#sched-affinity-probe) Default for `pending_affinity_probe_enabled`: `false`
+/// (OPT-IN). The probe is observability-only R&D instrumentation that nothing
+/// auto-consumes, its kernel is quadratic, and its signal only exists under the
+/// deep backlog that same quadratic cost collapses (20-27s `do_try_match`), so it
+/// must NOT run always-on in prod; an investigation enables it deliberately by
+/// setting the flag `true` in the scheduler config (user decision 2026-07-06). A
+/// bare `#[serde(default)]` on a `bool` also yields `false`, but keeping a named
+/// default fn holds the single-source-of-truth shape of the sibling defaults and
+/// documents the intent. `pub` for the same single-source-of-truth reason.
 ///
 /// Numeric-constant rule: the literal below is the authoritative default.
 pub const fn default_pending_affinity_probe_enabled() -> bool {
-    true
+    false
 }
 
 /// (speculative-prefetch Increment 1) Conservative ship default for the

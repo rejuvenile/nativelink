@@ -134,10 +134,9 @@ fn simple_spec_default_matches_deserialize_empty() {
     );
     assert_eq!(
         derived.pending_affinity_probe_enabled, deserialized.pending_affinity_probe_enabled,
-        "pending_affinity_probe_enabled default drift — serde default is TRUE \
-         (default_pending_affinity_probe_enabled); a bare #[serde(default)] on a \
-         bool would yield FALSE and silently disable the observability probe on \
-         every existing config"
+        "pending_affinity_probe_enabled default drift — serde default is FALSE \
+         (default_pending_affinity_probe_enabled); the quadratic observability probe \
+         is OPT-IN, so an absent-in-config scheduler must leave it OFF"
     );
 }
 
@@ -186,10 +185,10 @@ fn simple_spec_default_concrete_values() {
          OFF until an operator enables it — never worse than today)"
     );
     assert!(
-        spec.pending_affinity_probe_enabled,
-        "pending_affinity_probe_enabled default must be TRUE \
-         (default_pending_affinity_probe_enabled) so the observability probe's \
-         behavior is preserved for the deployed non-Redis backend; NOT the bool \
-         type default false, which would disable it"
+        !spec.pending_affinity_probe_enabled,
+        "pending_affinity_probe_enabled default must be FALSE \
+         (default_pending_affinity_probe_enabled) — the quadratic observability probe \
+         is OPT-IN (user decision 2026-07-06); the deployed prod config leaves the \
+         flag absent → probe OFF → the 20-27s do_try_match collapse cannot occur"
     );
 }
