@@ -211,5 +211,13 @@ pub(crate) fn update_eq(
             }
             _ => false,
         },
+        // (#specprefetch) Speculative prefetch signal (tag-15). Scheduler tests
+        // compare this variant by operation_id + input_root_digest.
+        update_for_worker::Update::PrefetchInputs(actual_update) => match expected_update {
+            update_for_worker::Update::PrefetchInputs(expected_update) => {
+                expected_update == actual_update
+            }
+            _ => false,
+        },
     }
 }
