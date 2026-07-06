@@ -947,7 +947,7 @@ pub struct KillOperationRequest {
 pub struct UpdateForWorker {
     #[prost(
         oneof = "update_for_worker::Update",
-        tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14"
+        tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15"
     )]
     pub update: ::core::option::Option<update_for_worker::Update>,
 }
@@ -1100,7 +1100,45 @@ pub mod update_for_worker {
         /// / (MAJOR-2 fix). NO capability flag required.
         #[prost(message, tag = "14")]
         ReconcileComplete(super::ReconcileCompleteRequest),
+        /// / (speculative-prefetch Increment 1) Instructs the worker to
+        /// / pre-fetch the action's cold input blobs into its local CAS
+        /// / and hold them with a time-bounded pin during the slot-wait,
+        /// / so that when the real StartAction arrives the construct's
+        /// / populate is a no-op. Feature-gated OFF by default
+        /// / (enable_speculative_prefetch=false on SimpleSpec).
+        /// /
+        /// / Back-compat: old workers `continue` on unknown oneof tag
+        /// / (the `None`/catch-all in `local_worker.rs`'s `Update` match
+        /// / `continue`s). NO capability flag needed.
+        #[prost(message, tag = "15")]
+        PrefetchInputs(super::PrefetchInputs),
     }
+}
+/// / (speculative-prefetch Increment 1) Scheduler→worker signal to
+/// / pre-fetch cold input blobs during the slot-wait. Carries ONLY
+/// / (op_id, digest, bounded peer hints) — NEVER the ≤32 MiB input tree.
+/// /
+/// / G2 invariant: this message must not carry tree bytes; it carries only
+/// / the root digest so the worker can resolve the tree itself. The
+/// / missing_digest_peers field is bounded by the existing MAX_INLINE_PEER_HINTS
+/// / / MAX_PEERS_PER_MISSING_BLOB caps already enforced on MissingBlobPeers.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrefetchInputs {
+    /// / The operation ID for matching with the subsequent StartAction.
+    #[prost(string, tag = "1")]
+    pub operation_id: ::prost::alloc::string::String,
+    /// / Root input digest to resolve and pre-fetch. The worker calls
+    /// / resolve_directory_tree itself; the tree is NOT sent on the wire.
+    #[prost(message, optional, tag = "2")]
+    pub input_root_digest: ::core::option::Option<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / P2P peer hints for the missing blobs (same shape as StartExecute).
+    /// UNBOUNDED-OK: op_id+digest+bounded-hint, ≤ existing peer-hint msg
+    /// (MissingBlobPeers already capped MAX_INLINE_PEER_HINTS=4096 /
+    /// MAX_PEERS_PER_MISSING_BLOB=4).
+    #[prost(message, repeated, tag = "3")]
+    pub missing_digest_peers: ::prost::alloc::vec::Vec<MissingBlobPeers>,
 }
 /// / (FL-688 v3 Stage C) Signals the worker that reconcile is complete.
 /// / Carries no payload: the affected worker is implicit (the message is

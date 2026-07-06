@@ -3448,6 +3448,7 @@ dependencies = [
 name = "nativelink-proto"
 version = "1.0.0"
 dependencies = [
+ "clap",
  "derive_more",
  "prost 0.14.3",
  "prost-build 0.14.3",

@@ -1001,8 +1001,40 @@ message UpdateForWorker {
         /// (20s) by the bounded fail-open timer in `local_worker.rs`
         /// (MAJOR-2 fix). NO capability flag required.
         ReconcileCompleteRequest reconcile_complete = 14;
+        /// (speculative-prefetch Increment 1) Instructs the worker to
+        /// pre-fetch the action's cold input blobs into its local CAS
+        /// and hold them with a time-bounded pin during the slot-wait,
+        /// so that when the real StartAction arrives the construct's
+        /// populate is a no-op. Feature-gated OFF by default
+        /// (enable_speculative_prefetch=false on SimpleSpec).
+        ///
+        /// Back-compat: old workers `continue` on unknown oneof tag
+        /// (the `None`/catch-all in `local_worker.rs`'s `Update` match
+        /// `continue`s). NO capability flag needed.
+        PrefetchInputs prefetch_inputs = 15;
     }
     reserved 6; // Previously NextId, now reserved.
+}
+
+/// (speculative-prefetch Increment 1) Scheduler→worker signal to
+/// pre-fetch cold input blobs during the slot-wait. Carries ONLY
+/// (op_id, digest, bounded peer hints) — NEVER the ≤32 MiB input tree.
+///
+/// G2 invariant: this message must not carry tree bytes; it carries only
+/// the root digest so the worker can resolve the tree itself. The
+/// missing_digest_peers field is bounded by the existing MAX_INLINE_PEER_HINTS
+/// / MAX_PEERS_PER_MISSING_BLOB caps already enforced on MissingBlobPeers.
+message PrefetchInputs {
+    /// The operation ID for matching with the subsequent StartAction.
+    string operation_id = 1;
+    /// Root input digest to resolve and pre-fetch. The worker calls
+    /// resolve_directory_tree itself; the tree is NOT sent on the wire.
+    build.bazel.remote.execution.v2.Digest input_root_digest = 2;
+    /// P2P peer hints for the missing blobs (same shape as StartExecute).
+    // UNBOUNDED-OK: op_id+digest+bounded-hint, ≤ existing peer-hint msg
+    // (MissingBlobPeers already capped MAX_INLINE_PEER_HINTS=4096 /
+    // MAX_PEERS_PER_MISSING_BLOB=4).
+    repeated MissingBlobPeers missing_digest_peers = 3;
 }
 
 /// (FL-688 v3 Stage C) Signals the worker that reconcile is complete.

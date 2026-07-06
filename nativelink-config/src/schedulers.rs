@@ -296,6 +296,46 @@ pub struct SimpleSpec {
     /// on a canary (design §7).
     #[serde(default)]
     pub enable_p2p_input_prefetch: bool,
+
+    /// (speculative-prefetch Increment 1) Master gate. When `false` (the
+    /// DEFAULT) the scheduler emits NO tag-15 `PrefetchInputs` signals, the
+    /// `prefetch_affinity` map stays empty, and the worker pre-fetch path is
+    /// unreachable — byte-identical to pre-Increment-1 (T9 regression test).
+    /// When `true`, a backlog of `speculative_prefetch_backlog_threshold` or
+    /// more queued actions triggers the speculative pre-fetch for the highest-
+    /// priority not-yet-eligible action.
+    #[serde(default)]
+    pub enable_speculative_prefetch: bool,
+
+    /// (speculative-prefetch Increment 1) Minimum queued-action backlog count
+    /// that triggers a speculative `PrefetchInputs` signal. Conservative ship
+    /// default = 3: "at least 3 actions are queued waiting for a slot" is a
+    /// reliable signal that cold-input latency will dominate the next dispatch
+    /// window. Lower values increase prefetch frequency (more bandwidth use);
+    /// higher values reduce it (more critical-path cold fetches). 0 means
+    /// "never trigger" when `enable_speculative_prefetch` is false (the gate
+    /// collapses to `false && ...`); a non-zero default here is irrelevant
+    /// when the master gate is off. The value 3 was chosen because at ≥3
+    /// queued actions a single cold construct (~1364ms) is unlikely to drain
+    /// the backlog before the next prefetch window opens.
+    ///
+    /// Numeric-constant note (reviewer rule): verify at this decl line, not
+    /// from doc-comment. The literal value below is the ship default.
+    #[serde(default = "default_speculative_prefetch_backlog_threshold")]
+    pub speculative_prefetch_backlog_threshold: u64,
+
+    /// (speculative-prefetch Increment 1) Time-to-live for a speculative pin
+    /// in seconds. The worker self-fires a release timer after this many
+    /// seconds if the real StartAction has not arrived. Must be <= 120s
+    /// (`PIN_TIMEOUT_SECS`); the effective lifetime is
+    /// `min(speculative_prefetch_ttl_s, 120)`. Default 60s: long enough
+    /// for typical scheduler latency under backlog, short enough to reclaim
+    /// pins before the 120s sweep catches them (keeps the speculative-pin
+    /// sub-budget from saturating on stale ops).
+    ///
+    /// MUST NOT be derived from `worker_timeout_s` (default 0 = disabled).
+    #[serde(default = "default_speculative_prefetch_ttl_s")]
+    pub speculative_prefetch_ttl_s: u64,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -351,6 +391,14 @@ impl Default for SimpleSpec {
             // #[serde(default)] → bool default (false) = P2P input prefetch OFF
             // (byte-identical to today until an operator enables it).
             enable_p2p_input_prefetch: false,
+            // #[serde(default)] → bool default (false) = speculative prefetch OFF
+            // (bit-identical to pre-Increment-1; T9 regression test pins this).
+            enable_speculative_prefetch: false,
+            // #[serde(default = "default_speculative_prefetch_backlog_threshold")] → 3.
+            speculative_prefetch_backlog_threshold:
+                default_speculative_prefetch_backlog_threshold(),
+            // #[serde(default = "default_speculative_prefetch_ttl_s")] → 60.
+            speculative_prefetch_ttl_s: default_speculative_prefetch_ttl_s(),
         }
     }
 }
@@ -376,6 +424,28 @@ pub const fn default_assume_core_count() -> u32 {
 /// `pub` for the same single-source-of-truth reason as `default_load_byte_cost`.
 pub const fn default_p_headroom_override_factor() -> u32 {
     2
+}
+
+/// (speculative-prefetch Increment 1) Conservative ship default for the
+/// speculative prefetch backlog trigger threshold. 3 queued actions is a
+/// reliable signal that cold-input latency will dominate the next dispatch
+/// window; at ≥3 queued actions a single cold construct (~1364ms) is unlikely
+/// to drain the backlog before the next prefetch window opens.
+///
+/// Numeric-constant rule: the literal below is the authoritative value;
+/// doc-comments and commit messages may drift without updating the constant.
+pub const fn default_speculative_prefetch_backlog_threshold() -> u64 {
+    3
+}
+
+/// (speculative-prefetch Increment 1) Default TTL for speculative pins (60s).
+/// Long enough for typical scheduler latency under backlog, short enough to
+/// reclaim pins before the 120s `PIN_TIMEOUT_SECS` sweep catches them.
+/// The effective lifetime is `min(speculative_prefetch_ttl_s, PIN_TIMEOUT_SECS)`.
+///
+/// Numeric-constant rule: the literal below is the authoritative value.
+pub const fn default_speculative_prefetch_ttl_s() -> u64 {
+    60
 }
 
 #[derive(Deserialize, Serialize, Debug)]
