@@ -132,6 +132,13 @@ fn simple_spec_default_matches_deserialize_empty() {
         "enable_p2p_input_prefetch default drift (both should be false = P2P \
          input prefetch OFF, byte-identical to today)"
     );
+    assert_eq!(
+        derived.pending_affinity_probe_enabled, deserialized.pending_affinity_probe_enabled,
+        "pending_affinity_probe_enabled default drift — serde default is TRUE \
+         (default_pending_affinity_probe_enabled); a bare #[serde(default)] on a \
+         bool would yield FALSE and silently disable the observability probe on \
+         every existing config"
+    );
 }
 
 /// Direct assertions on the concrete default values, so the intent is legible
@@ -177,5 +184,12 @@ fn simple_spec_default_concrete_values() {
         !spec.enable_p2p_input_prefetch,
         "enable_p2p_input_prefetch default must be false (P2P input prefetch \
          OFF until an operator enables it — never worse than today)"
+    );
+    assert!(
+        spec.pending_affinity_probe_enabled,
+        "pending_affinity_probe_enabled default must be TRUE \
+         (default_pending_affinity_probe_enabled) so the observability probe's \
+         behavior is preserved for the deployed non-Redis backend; NOT the bool \
+         type default false, which would disable it"
     );
 }

@@ -297,6 +297,24 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub enable_p2p_input_prefetch: bool,
 
+    /// (#sched-affinity-probe) Master gate for the OBSERVABILITY-ONLY pending-set
+    /// affinity/batch-scheduling probe (`record_pending_affinity_surplus`). When
+    /// `true` (the DEFAULT — `default_pending_affinity_probe_enabled`) the probe
+    /// updates its `batch_affinity` / `output_affinity` gauges each match cycle
+    /// EXCEPT when the pre-match queue depth exceeds
+    /// `PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH` (the probe's dominant kernel,
+    /// `compute_batch_sched_gain`, was pinned at 17.84% of scheduler CPU during a
+    /// live 27s match cycle under a deep backlog — see
+    /// `.claude/audits/affinity-probe-slow-match-2026-07-06/`). Set `false` for
+    /// ZERO probe overhead. The probe NEVER affects worker selection.
+    ///
+    /// Independent of the backend force-off: on the Redis/store backend the probe
+    /// is ALWAYS disabled regardless of this flag (each sampled op would be a
+    /// store round-trip on the match-cycle critical path); the effective gate is
+    /// `this && !matches!(experimental_backend, Redis)`.
+    #[serde(default = "default_pending_affinity_probe_enabled")]
+    pub pending_affinity_probe_enabled: bool,
+
     /// (speculative-prefetch Increment 1) Master gate. When `false` (the
     /// DEFAULT) the scheduler emits NO tag-15 `PrefetchInputs` signals, the
     /// `prefetch_affinity` map stays empty, and the worker pre-fetch path is
@@ -392,6 +410,9 @@ impl Default for SimpleSpec {
             // #[serde(default)] → bool default (false) = P2P input prefetch OFF
             // (byte-identical to today until an operator enables it).
             enable_p2p_input_prefetch: false,
+            // #[serde(default = "default_pending_affinity_probe_enabled")] → true.
+            // NOT the bool type default (false), which would disable the probe.
+            pending_affinity_probe_enabled: default_pending_affinity_probe_enabled(),
             // #[serde(default)] → bool default (false) = speculative prefetch OFF
             // (bit-identical to pre-Increment-1; T9 regression test pins this).
             enable_speculative_prefetch: false,
@@ -425,6 +446,18 @@ pub const fn default_assume_core_count() -> u32 {
 /// `pub` for the same single-source-of-truth reason as `default_load_byte_cost`.
 pub const fn default_p_headroom_override_factor() -> u32 {
     2
+}
+
+/// (#sched-affinity-probe) Default for `pending_affinity_probe_enabled`: `true`,
+/// so the observability probe's behavior is PRESERVED for the deployed
+/// (non-Redis) backend when the key is absent from config. MUST be a named
+/// default fn — a bare `#[serde(default)]` on a `bool` yields `false`, which
+/// would silently DISABLE the probe on every existing config and change prod
+/// telemetry. `pub` for the single-source-of-truth reason as the other defaults.
+///
+/// Numeric-constant rule: the literal below is the authoritative default.
+pub const fn default_pending_affinity_probe_enabled() -> bool {
+    true
 }
 
 /// (speculative-prefetch Increment 1) Conservative ship default for the

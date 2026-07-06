@@ -56,7 +56,9 @@ use nativelink_config::schedulers::{
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
-use nativelink_scheduler::simple_scheduler::{MAX_PENDING_AFFINITY_SAMPLE, SimpleScheduler};
+use nativelink_scheduler::simple_scheduler::{
+    MAX_PENDING_AFFINITY_SAMPLE, PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH, SimpleScheduler,
+};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId,
@@ -228,16 +230,24 @@ async fn batch_affinity_all_distinct_surplus_zero_render() -> Result<(), Error> 
     Ok(())
 }
 
-/// (FIX 4 / F3) When the pending set exceeds `MAX_PENDING_AFFINITY_SAMPLE`, the
-/// dim-A pass samples only the cap and `sampled_ops` SATURATES at the cap — so
-/// operators can see the surplus is a lower bound. Adds `cap + 8` all-DISTINCT
-/// pending ops → sampled_ops == 512, and (because the sampled prefix is all
-/// distinct) surplus 0 / max_group 1.
+/// (#sched-affinity-probe — MIGRATED from the former "saturates at cap" test)
+/// The dim-A pass is now SKIPPED under a deep backlog: the call-site guard
+/// requires `primary_queue_depth <= PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH` (64).
+/// Adding `MAX_PENDING_AFFINITY_SAMPLE + 8` (= 520) pending ops puts the queue far
+/// above the guard (and above the 512 inner sample cap, which is now SHADOWED by
+/// the smaller queue guard), so the probe does NOT run and `sampled_ops` stays 0.
+/// This is the deep-backlog regime whose 20-27s probe cost the guard exists to
+/// eliminate — the observability gauge is intentionally sacrificed there. (The
+/// 512 inner sample cap is still correct in code and would re-bind only if the
+/// queue guard were raised above 512.)
 #[nativelink_test]
-async fn batch_affinity_sampled_ops_saturates_at_cap_render() -> Result<(), Error> {
+async fn batch_affinity_sampled_ops_skipped_under_deep_backlog_render() -> Result<(), Error> {
     let (scheduler, worker_scheduler, _notify) = new_scheduler();
 
     let total = MAX_PENDING_AFFINITY_SAMPLE + 8;
+    // Sanity: this fixture must sit ABOVE the queue-depth guard so it exercises
+    // the skip (not merely the 512 sample cap).
+    assert!(total as u64 > PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH);
     for i in 0..total {
         // Distinct input root AND distinct action per op.
         let mut root_hash = [0u8; 32];
@@ -275,12 +285,12 @@ async fn batch_affinity_sampled_ops_saturates_at_cap_render() -> Result<(), Erro
     let body = render_prometheus(&registry);
 
     assert!(
-        body.contains(&format!(
-            "\nscheduler_test_action_batch_affinity_sampled_ops {MAX_PENDING_AFFINITY_SAMPLE}\n"
-        )),
-        "#batch-affinity MISSING or WRONG VALUE: sampled_ops must SATURATE at the sample cap \
-         {MAX_PENDING_AFFINITY_SAMPLE} when the pending set ({total}) exceeds it — the surplus \
-         gauge is then a lower bound and operators must be able to see the saturation. body=\n{body}"
+        body.contains("\nscheduler_test_action_batch_affinity_sampled_ops 0\n"),
+        "#sched-affinity-probe GUARD FAILED: with {total} queued ops (> the queue-depth guard \
+         {PENDING_AFFINITY_PROBE_MAX_QUEUE_DEPTH}) the dim-A probe must be SKIPPED so it cannot \
+         collapse the match cycle — sampled_ops must stay 0. A value of {MAX_PENDING_AFFINITY_SAMPLE} \
+         (the old sample-cap saturation) means the guard did not fire and the quadratic probe ran \
+         under deep backlog. body=\n{body}"
     );
 
     Ok(())
