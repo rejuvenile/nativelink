@@ -175,6 +175,7 @@ fn blobs_available(cas_endpoint: &str, digests: Vec<DigestInfo>) -> Update {
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     })
 }
 

@@ -420,6 +420,24 @@ message BlobsAvailableNotification {
     /// ignores this unknown tag and reads `evicted_digests`. Only meaningful
     /// when is_full_snapshot == false (per legacy field-4 semantics).
     repeated BlobDigestInfo evicted_blob_infos = 24;
+
+    /// (#obs-tuning) OBSERVABILITY-ONLY. The worker's mean COLD dir-cache
+    /// construct latency in MILLISECONDS — `construct_fetch_ms.sum /
+    /// max(construct_fetch_ms.count, 1)` from the worker's global
+    /// `DirCacheCounters` (`o11_probes.rs`), the COLD full fetch+assemble cost
+    /// (`directory_cache.rs` `record_construct_fetch_ms`). `0` when the worker
+    /// has run no cold constructs yet (count == 0) OR is a pre-#obs-tuning
+    /// worker (proto3 default). Additive, backward-compatible field: an old
+    /// server ignores the unknown tag; a new worker packs it every tick.
+    ///
+    /// This is the real cold-tree reconstruct cost that `T_SETUP`
+    /// (`api_worker_scheduler.rs`) should EVENTUALLY equal. It is gossiped so
+    /// the scheduler can LOG it (`tag = "worker_construct_latency"`) for tuning
+    /// `T_SETUP` against MEASURED data. It is NOT yet consumed by the hold gate
+    /// — LOGGED only, changing NO scheduling decision. (Despite the `_ewma`
+    /// suffix the worker currently packs a cumulative MEAN, not an EWMA; the
+    /// name reserves the field for a future decayed estimate.)
+    uint32 construct_latency_ms_ewma = 25;
 }
 
 /// One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
@@ -777,6 +795,14 @@ message BlobsAvailableChunk {
     /// the legacy `evicted_digests` (tag 13). Only meaningful when
     /// `is_full_snapshot=false`.
     repeated BlobDigestInfo evicted_blob_infos = 28;
+
+    /// (#obs-tuning) OBSERVABILITY-ONLY worker cold dir-cache construct latency
+    /// (mean ms) — only meaningful on chunk 0; subsequent chunks leave at
+    /// proto3 default `0`. The accumulator carries chunk 0's value forward into
+    /// the reassembled `BlobsAvailableNotification.construct_latency_ms_ewma`
+    /// (field 25). LOGGED for `T_SETUP` tuning; NOT consumed by any routing
+    /// decision.
+    uint32 construct_latency_ms_ewma = 29;
 }
 
 /// A streaming-message envelope shared across the cas→worker, scheduler→

@@ -564,6 +564,45 @@ impl SchedulerMetrics {
     }
 }
 
+/// (#obs-tuning) OBSERVABILITY-ONLY: emit ONE `info!` line carrying the
+/// Stage-A (speculative-prefetch) and Stage-B (speculative-hold) decision
+/// counters, so they are scrapeable from journalctl even though the
+/// `SchedulerMetrics` tree is DARK on the HTTP `/metrics` endpoint (empty on
+/// all ports in production). Mirrors the release-visibility of the sibling
+/// `tag = "p_headroom_gate_exclusion"` info-log: MUST be `info!` (not
+/// `debug!`/`trace!`), because the release build pins `release_max_level_info`
+/// and would compile the lower levels out — leaving the soak's `T_SETUP` /
+/// hold-cap tuning with ZERO production data.
+///
+/// Reads every counter `Relaxed` (telemetry — no ordering dependency) and
+/// changes NO scheduling decision. Called once per
+/// `HOLD_COUNTERS_LOG_INTERVAL_S` from the scheduler's periodic task, NEVER
+/// per-match (that would be the expensive-obs-probe-in-hot-loop class). The
+/// value pairs `hold_paid_off / (hold_paid_off + hold_regret)` (hold success
+/// rate) and `prefetch_hit / (prefetch_hit + prefetch_miss)` (prewarm-landing
+/// rate) are what the soak operator uses to tune the hold gate against
+/// measured data.
+pub fn emit_speculative_hold_counters_log(metrics: &SchedulerMetrics) {
+    info!(
+        tag = "speculative_hold_counters",
+        // Stage B (temporal hold-vs-rebind gate) counters.
+        speculative_hold_count = metrics.speculative_hold_count.load(Ordering::Relaxed),
+        hold_paid_off = metrics.hold_paid_off.load(Ordering::Relaxed),
+        hold_regret = metrics.hold_regret.load(Ordering::Relaxed),
+        hold_expired = metrics.hold_expired.load(Ordering::Relaxed),
+        // Stage A (speculative PrefetchInputs) counters.
+        prefetch_emitted = metrics
+            .speculative_prefetch_emitted
+            .load(Ordering::Relaxed),
+        prefetch_hit = metrics.speculative_prefetch_hit.load(Ordering::Relaxed),
+        prefetch_miss = metrics.speculative_prefetch_miss.load(Ordering::Relaxed),
+        prefetch_no_target = metrics
+            .speculative_prefetch_no_target
+            .load(Ordering::Relaxed),
+        "stage A/B decision counters"
+    );
+}
+
 /// Point-in-time intersection of an action's `file_digests` and the
 /// scheduler's locality map, captured under the same read lock that
 /// builds the scoring result.
@@ -3503,6 +3542,21 @@ const HOLD_MAX_CYCLES: u32 = 20;
 /// closed-form upper bound from counts alone; this gates on the band, not the value.)
 const HOLD_MAX_K: usize = 8;
 
+/// (#obs-tuning) OBSERVABILITY-ONLY cadence for the periodic Stage-A/Stage-B
+/// decision-counter info-log (`emit_speculative_hold_counters_log`). The
+/// counters are `AtomicU64` on `SchedulerMetrics` but the metrics tree is DARK
+/// on the HTTP `/metrics` endpoint (empty on all ports in production), so a
+/// journalctl `info!` line is the only scrape surface for tuning `T_SETUP` /
+/// the hold caps against MEASURED hold success/regret. 15 s is a coarse fleet-
+/// scrape cadence — long enough that the once-per-interval emit is negligible
+/// overhead (one `info!` + eight relaxed atomic loads per tick), short enough
+/// that a soak run captures the counters at useful resolution. This is a
+/// SPAWN-once interval, NOT per-match: the log MUST NOT ride the `do_try_match`
+/// hot path (that would be the expensive-obs-probe-in-hot-loop class). No
+/// behavior change — the emit reads the atomics `Relaxed` and touches no
+/// scheduling decision.
+pub(crate) const HOLD_COUNTERS_LOG_INTERVAL_S: u64 = 15;
+
 /// (#specprefetch-rebind Stage B) Per-op hold-state record: the first instant this
 /// op was held (from the injected `exec_clock`) plus the cumulative count of hold
 /// cycles. The max-hold cap trips when EITHER `exec_clock_now − first_hold_at ≥
@@ -4330,6 +4384,23 @@ impl ApiWorkerScheduler {
     #[must_use]
     pub const fn get_metrics(&self) -> &Arc<SchedulerMetrics> {
         &self.metrics
+    }
+
+    /// (#obs-tuning) OBSERVABILITY-ONLY snapshot of every registered worker's
+    /// last-gossiped `(worker_id, construct_latency_ms_ewma)`, taken under the
+    /// read lock (does NOT promote LRU order — `iter()` is a peek). Consumed by
+    /// the periodic `tag = "worker_construct_latency"` log so the per-worker
+    /// cold-construct cost is journalctl-scrapeable for `T_SETUP` tuning. Reads
+    /// only; changes NO scheduling decision.
+    #[must_use]
+    pub async fn construct_latency_snapshot(&self) -> Vec<(WorkerId, u32)> {
+        self.inner
+            .read()
+            .await
+            .workers
+            .iter()
+            .map(|(worker_id, worker)| (worker_id.clone(), worker.construct_latency_ms_ewma))
+            .collect()
     }
 
     /// #speculative-prefetch test hook: current number of entries in the
@@ -8586,6 +8657,31 @@ impl WorkerScheduler for ApiWorkerScheduler {
         if !disk_pressured {
             inner.worker_change_notify.notify_one();
         }
+        Ok(())
+    }
+
+    async fn update_worker_construct_latency(
+        &self,
+        worker_id: &WorkerId,
+        construct_latency_ms_ewma: u32,
+    ) -> Result<(), Error> {
+        // (#obs-tuning) OBSERVABILITY-ONLY: store the worker's gossiped mean
+        // cold-construct latency. `peek_mut` to avoid LRU promotion — a
+        // telemetry report must not reorder scheduling (mirrors
+        // update_worker_disk_pressure). Does NOT wake the matcher and does NOT
+        // feed any selection tier: the field is LOGGED for `T_SETUP` tuning
+        // only. A missing worker is benign (a report can race an eviction) —
+        // return the same not-found error the sibling setters use so the
+        // caller can log it, but this never happens on the steady-state path.
+        let mut inner = self.inner.write().await;
+        let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+            make_input_err!(
+                "Worker not found in worker map in \
+                 update_worker_construct_latency() {}",
+                worker_id
+            )
+        })?;
+        worker.construct_latency_ms_ewma = construct_latency_ms_ewma;
         Ok(())
     }
 

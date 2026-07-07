@@ -46,7 +46,10 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tracing::{debug, error, info, info_span, warn};
 
-use crate::api_worker_scheduler::{ApiWorkerScheduler, compute_dedup_cached_score};
+use crate::api_worker_scheduler::{
+    ApiWorkerScheduler, HOLD_COUNTERS_LOG_INTERVAL_S, compute_dedup_cached_score,
+    emit_speculative_hold_counters_log,
+};
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::simple_scheduler_state_manager::SimpleSchedulerStateManager;
@@ -1488,6 +1491,17 @@ pub struct SimpleScheduler {
     /// is dropped the spawn will be cancelled as well.
     task_worker_matching_spawn: JoinHandleDropGuard<()>,
 
+    /// (#obs-tuning) OBSERVABILITY-ONLY periodic task that emits ONE
+    /// `tag = "speculative_hold_counters"` info-log (Stage-A/Stage-B decision
+    /// counters) plus one `tag = "worker_construct_latency"` line per worker
+    /// every `HOLD_COUNTERS_LOG_INTERVAL_S`, so those DARK-on-`/metrics`
+    /// counters are scrapeable from journalctl for tuning `T_SETUP` / the hold
+    /// caps against measured data. Interval-driven (NOT per-match); holds a
+    /// `Weak<ApiWorkerScheduler>` so it exits when the scheduler drops. If this
+    /// struct is dropped the spawn is cancelled as well. Reads the atomics +
+    /// per-worker gossip `Relaxed`; changes NO scheduling decision.
+    task_hold_counters_log_spawn: JoinHandleDropGuard<()>,
+
     /// Every duration, do logging of worker matching
     /// e.g. "worker busy", "can't find any worker"
     /// Set to None to disable. This is quite noisy, so we limit it
@@ -1566,6 +1580,10 @@ impl core::fmt::Debug for SimpleScheduler {
             .field(
                 "task_worker_matching_spawn",
                 &self.task_worker_matching_spawn,
+            )
+            .field(
+                "task_hold_counters_log_spawn",
+                &self.task_hold_counters_log_spawn,
             )
             .finish_non_exhaustive()
     }
@@ -2773,6 +2791,45 @@ impl SimpleScheduler {
                     // Unreachable.
                 });
 
+            // (#obs-tuning) OBSERVABILITY-ONLY periodic decision-counter log.
+            // A SEPARATE interval-driven task (NOT folded into the match loop,
+            // which is `select`-driven and would emit per-match — the
+            // expensive-obs-probe-in-hot-loop class). Holds a
+            // `Weak<ApiWorkerScheduler>` so it exits when the scheduler drops;
+            // the `JoinHandleDropGuard` also cancels it on struct drop. Reads
+            // the atomics + per-worker gossip `Relaxed`; NO scheduling effect.
+            let weak_worker_scheduler = Arc::downgrade(&worker_scheduler);
+            let task_hold_counters_log_spawn =
+                spawn!("simple_scheduler_hold_counters_log", async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(
+                        HOLD_COUNTERS_LOG_INTERVAL_S,
+                    ));
+                    // The first tick fires immediately; skip it so the first
+                    // emit lands one full interval after startup (the counters
+                    // are all zero at t=0 — no information).
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        let Some(worker_scheduler) = weak_worker_scheduler.upgrade() else {
+                            // Scheduler dropped — nothing left to observe.
+                            return;
+                        };
+                        emit_speculative_hold_counters_log(worker_scheduler.get_metrics());
+                        for (worker_id, construct_latency_ms_ewma) in
+                            worker_scheduler.construct_latency_snapshot().await
+                        {
+                            info!(
+                                tag = "worker_construct_latency",
+                                worker_id = %worker_id.0,
+                                construct_latency_ms_ewma,
+                                "worker-gossiped cold dir-cache construct latency (mean ms); \
+                                 T_SETUP tuning input — LOGGED only, not yet consumed by the hold gate"
+                            );
+                        }
+                    }
+                    // Unreachable.
+                });
+
             let worker_match_logging_interval = match spec.worker_match_logging_interval_s {
                 // -1 or 0 means disabled (0 used to cause expensive logging on every call)
                 -1 | 0 => None,
@@ -2795,6 +2852,7 @@ impl SimpleScheduler {
                 platform_property_manager,
                 maybe_origin_event_tx,
                 task_worker_matching_spawn,
+                task_hold_counters_log_spawn,
                 worker_match_logging_interval,
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
                 batch_affinity_metrics: BatchAffinityMetrics::default(),
@@ -2969,6 +3027,16 @@ impl WorkerScheduler for SimpleScheduler {
     ) -> Result<(), Error> {
         self.worker_scheduler
             .update_worker_disk_pressure(worker_id, disk_pressured, available_disk_bytes)
+            .await
+    }
+
+    async fn update_worker_construct_latency(
+        &self,
+        worker_id: &WorkerId,
+        construct_latency_ms_ewma: u32,
+    ) -> Result<(), Error> {
+        self.worker_scheduler
+            .update_worker_construct_latency(worker_id, construct_latency_ms_ewma)
             .await
     }
 

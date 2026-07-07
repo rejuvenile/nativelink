@@ -129,6 +129,8 @@ pub fn chunk_blobs_available(
         available_disk_bytes,
         disk_pressured,
         evicted_blob_infos,
+        // (#obs-tuning) OBSERVABILITY-ONLY chunk-0 scalar (like cpu_load_pct).
+        construct_latency_ms_ewma,
     } = notification;
 
     // Fold legacy field 2 (`digests`) into `digest_infos` for backwards
@@ -203,6 +205,14 @@ pub fn chunk_blobs_available(
             // reassembled notification.
             available_disk_bytes: if sequence == 0 { available_disk_bytes } else { 0 },
             disk_pressured: if sequence == 0 { disk_pressured } else { false },
+            // (#obs-tuning) Cold-construct latency: chunk-0-only scalar (like
+            // cpu_load_pct); the accumulator carries chunk 0's value forward
+            // into the reassembled notification. OBSERVABILITY-ONLY.
+            construct_latency_ms_ewma: if sequence == 0 {
+                construct_latency_ms_ewma
+            } else {
+                0
+            },
             digests: Vec::new(),
             cached_directory_digests: Vec::new(),
             pinned_mirror_entries: Vec::new(),
@@ -723,6 +733,64 @@ mod tests {
                  default false (chunk-0-only scalar)"
             );
         }
+    }
+
+    /// (#obs-tuning) `construct_latency_ms_ewma` is a chunk-0-only scalar (like
+    /// cpu_load_pct): the accumulator carries chunk 0's value forward, and
+    /// subsequent chunks MUST leave it at the proto3 default `0` so the value is
+    /// not double-counted or contradicted across chunks.
+    ///
+    /// Mutation step: in `chunk_blobs_available`, change the
+    /// `construct_latency_ms_ewma`'s `if sequence == 0 { .. } else { 0 }` to
+    /// carry the value on EVERY chunk. The non-zero-chunk assertion red-fails.
+    #[test]
+    fn construct_latency_rides_chunk_zero_only() {
+        let n = BlobsAvailableNotification {
+            construct_latency_ms_ewma: 4_242,
+            digest_infos: (0..10).map(bdi).collect(),
+            ..Default::default()
+        };
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 3)
+            .expect("multi-chunk must succeed");
+        assert!(chunks.len() >= 3, "need >1 chunk to test scalar placement");
+        assert_eq!(
+            chunks[0].construct_latency_ms_ewma, 4_242,
+            "#obs-tuning: chunk 0 must carry construct_latency_ms_ewma"
+        );
+        for c in &chunks[1..] {
+            assert_eq!(
+                c.construct_latency_ms_ewma, 0,
+                "#obs-tuning: non-zero chunks must leave construct_latency_ms_ewma \
+                 at the proto3 default (chunk-0-only scalar)"
+            );
+        }
+    }
+
+    /// (#obs-tuning) Prost encode→decode round-trip of the new field 25 on
+    /// `BlobsAvailableNotification`. Proves (a) the field is wired into the
+    /// generated struct with the right tag/type and survives the wire, and (b)
+    /// the addition is backward-compatible (an additive uint32 tag). Mutation:
+    /// change the proto tag or drop the field from the genproto → the decoded
+    /// value no longer equals the encoded one.
+    #[test]
+    fn construct_latency_proto_roundtrip() {
+        use prost::Message;
+        let n = BlobsAvailableNotification {
+            construct_latency_ms_ewma: 1_337,
+            digest_infos: vec![bdi(1), bdi(2)],
+            ..Default::default()
+        };
+        let bytes = n.encode_to_vec();
+        let decoded = BlobsAvailableNotification::decode(&bytes[..])
+            .expect("#obs-tuning: BlobsAvailableNotification must round-trip through prost");
+        assert_eq!(
+            decoded.construct_latency_ms_ewma, 1_337,
+            "#obs-tuning: construct_latency_ms_ewma (tag 25) did not survive the \
+             prost encode/decode round-trip"
+        );
+        // Co-resident fields must also survive (additive field did not corrupt
+        // the message).
+        assert_eq!(decoded.digest_infos.len(), 2);
     }
 
     #[test]

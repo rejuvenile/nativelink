@@ -400,6 +400,7 @@ async fn send_blobs_available(
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))
@@ -850,6 +851,7 @@ async fn v3c_block1_reconcile_complete_follows_upload_missing_blobs()
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }))
     .await
     .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
@@ -1031,6 +1033,7 @@ async fn v3c_reconcile_complete_exactly_once_fall_through_path()
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }))
     .await
     .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
@@ -1198,6 +1201,7 @@ async fn v3c_gap1a_no_locality_map_sends_reconcile_complete()
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }))
     .await
     .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
@@ -1253,6 +1257,7 @@ async fn v3c_gap1a_no_locality_map_sends_reconcile_complete()
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }))
     .await
     .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
@@ -1403,6 +1408,7 @@ async fn v3c_gap1b_empty_endpoint_sends_reconcile_complete()
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }))
     .await
     .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;
@@ -1458,6 +1464,7 @@ async fn v3c_gap1b_empty_endpoint_sends_reconcile_complete()
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }))
     .await
     .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))?;

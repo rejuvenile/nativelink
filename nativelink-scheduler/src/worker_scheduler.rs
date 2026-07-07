@@ -135,6 +135,23 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
         Ok(())
     }
 
+    /// (#obs-tuning) OBSERVABILITY-ONLY. Updates the worker's last-gossiped
+    /// mean COLD dir-cache construct latency (ms) — `construct_fetch_ms.sum /
+    /// max(count, 1)` from the worker's global `DirCacheCounters`, carried on
+    /// the `BlobsAvailable` chunk-0 header. This is the real cold-tree
+    /// reconstruct cost `T_SETUP` should eventually equal; it is currently only
+    /// LOGGED (periodic `tag = "worker_construct_latency"`) for tuning — the
+    /// hold gate does NOT consume it, so this setter changes NO scheduling
+    /// decision. Default impl is a no-op so schedulers without a worker pool
+    /// need not implement it (mirrors `update_worker_disk_pressure`).
+    async fn update_worker_construct_latency(
+        &self,
+        _worker_id: &WorkerId,
+        _construct_latency_ms_ewma: u32,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Updates the set of cached directory digests for a worker.
     /// The scheduler uses this to give routing preference to workers that
     /// already have the action's input_root_digest cached in their directory cache.

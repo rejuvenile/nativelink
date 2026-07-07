@@ -992,6 +992,7 @@ pub async fn mirror_capacity_report_plumbed_to_picker_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1077,6 +1078,7 @@ pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test(
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1132,6 +1134,7 @@ pub async fn blobs_available_plumbs_indefinite_pin_saturation_to_scheduler_test(
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1196,6 +1199,7 @@ pub async fn zero_mirror_max_does_not_record_capacity_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1258,6 +1262,7 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -1327,6 +1332,7 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1369,6 +1375,7 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1434,6 +1441,7 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1467,6 +1475,7 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1524,6 +1533,7 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1557,6 +1567,7 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1619,6 +1630,7 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1711,6 +1723,7 @@ pub async fn blobs_available_with_malformed_digests_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1772,6 +1785,7 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1944,6 +1958,7 @@ async fn send_blobs_and_wait(
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -3080,6 +3095,7 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -3264,6 +3280,7 @@ pub async fn handle_blobs_available_a2_fold_merged_field13_and_field16_test()
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
+            construct_latency_ms_ewma: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;

@@ -281,6 +281,7 @@ fn build_notification(
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
+        construct_latency_ms_ewma: 0,
     }
 }
 
