@@ -31,6 +31,7 @@
 //! Worker-side arm coverage (Update::PrefetchInputs) lives in
 //! nativelink-worker/tests/speculative_prefetch_worker_test.rs.
 
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1258,6 +1259,403 @@ async fn prefetch_selector_is_peek_only_assignment_unchanged() -> Result<(), Err
         "A4 (peek-only): after one real reserve the worker must have exactly 1 running op — the \
          prefetch peek must have added 0"
     );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A4-LRU (pair-b T-1): the selector is LRU-NEUTRAL — a prefetch peek does NOT
+// promote the chosen worker in the workers LRU, so a subsequent real match's
+// LRU tiebreak still sees the SAME order.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A4 above uses a SINGLE worker, so an LRU-promotion mutation (`.peek()`→`.get()`
+// on the chosen worker) is unobservable — there is no second worker to reorder
+// relative to, and A4 asserts only `running_action_infos.len()` (type-enforced).
+// This variant adds a SECOND idle worker so the workers LRU has an observable
+// MRU→LRU order, prefetches to one of them, and asserts the order is UNCHANGED.
+//
+// MUTATION: change the chosen-worker `peek` in `send_prefetch_inputs`
+// (`inner.workers.0.peek(&worker_id)`) or a `peek` inside
+// `find_prefetch_target_worker` to `.get()` / `.get_mut()` (both promote the
+// entry to MRU in `lru::LruCache`) → the peeked worker jumps to the front of the
+// order and this assertion red-fails. That promotion would silently bias the
+// NEXT real match's LRU-fallback tiebreak toward the prewarmed worker — a routing
+// side effect the peek-only contract (§2.1) forbids.
+#[nativelink_test]
+async fn prefetch_selector_lru_neutral_two_workers() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+    let ws = scheduler.worker_scheduler_for_test();
+
+    // Two idle workers. `add_worker` inserts (put) → each becomes MRU, so after
+    // both inserts the LRU iteration order (MRU→LRU) is [w1, w0].
+    let w0 = WorkerId("a4lru_w0".to_string());
+    let w1 = WorkerId("a4lru_w1".to_string());
+    let _rx0 = add_worker(&scheduler, w0.clone(), PlatformProperties::default()).await?;
+    let _rx1 = add_worker(&scheduler, w1.clone(), PlatformProperties::default()).await?;
+
+    let order_before = ws.worker_lru_order_for_test().await;
+    assert_eq!(
+        order_before,
+        vec![w1.clone(), w0.clone()],
+        "A4-LRU precondition: two workers added w0 then w1 must be ordered [w1(MRU), w0(LRU)] — \
+         the fixture cannot observe promotion otherwise. Got {order_before:?}"
+    );
+
+    // Give w0 (the LRU/back entry) locality so the selector chooses IT — a
+    // `.get()` mutation on the chosen worker would promote w0 to the FRONT,
+    // flipping the order to [w0, w1] and making this test fail.
+    let input_root = DigestInfo::new([0xB4; 32], 42);
+    ws.update_cached_directories(&w0, HashSet::from([input_root]))
+        .await
+        .err_tip(|| "A4-LRU: update_cached_directories failed")?;
+
+    let op_p = OperationId::default();
+    let mut per_cycle = HashMap::new();
+    let peeked = ws
+        .send_prefetch_inputs(
+            &PlatformProperties::default(), &op_p, input_root, vec![], 60, &mut per_cycle,
+        )
+        .await;
+    assert!(
+        peeked,
+        "A4-LRU: prefetch peek to the locality-holder idle worker should emit (non-vacuity: an \
+         empty peek would never exercise the promotion the mutation targets)"
+    );
+
+    let order_after = ws.worker_lru_order_for_test().await;
+    assert_eq!(
+        order_after, order_before,
+        "A4-LRU (peek-only / no LRU promotion): the prefetch selector PROMOTED the chosen worker \
+         in the workers LRU — order changed from {order_before:?} to {order_after:?}. The selector \
+         must use `peek` (non-promoting); a `.get()`/`.get_mut()` on the chosen worker biases the \
+         NEXT real match's LRU-fallback tiebreak toward the prewarmed worker (§2.1 forbids this)."
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMIT-COUNTER: `speculative_prefetch_emitted` bumps by exactly 1 on a DELIVERED
+// PrefetchInputs send (the positive-emit instrument the soak asserts `> 0`).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// distsys MAJOR-1 / red-team convergent: the feature's defining incident (§0)
+// was SILENT zero-emission; the soak needs a positive-emit counter to prove
+// Stage A fires under load. One idle worker; a direct `send_prefetch_inputs`
+// delivers a PrefetchInputs → `speculative_prefetch_emitted` goes 0→1 and
+// `speculative_prefetch_no_target` stays 0 (a delivered send is neither a
+// no-target nor a coalesce skip).
+//
+// MUTATION: remove the `speculative_prefetch_emitted.fetch_add(1, ...)` on the
+// delivered-send path (`send_prefetch_inputs` `true` return) → the counter stays
+// 0 and this red-fails with its bespoke message.
+#[nativelink_test]
+async fn prefetch_emitted_counter_increments_on_delivered_send() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+    let ws = scheduler.worker_scheduler_for_test();
+    let _rx = add_worker(&scheduler, WorkerId("emit_w".to_string()), PlatformProperties::default()).await?;
+
+    let emitted_before = ws.get_metrics().speculative_prefetch_emitted.load(Ordering::Relaxed);
+    let no_target_before = ws.get_metrics().speculative_prefetch_no_target.load(Ordering::Relaxed);
+
+    let sent = ws
+        .send_prefetch_inputs(
+            &PlatformProperties::default(), &OperationId::default(),
+            DigestInfo::new([0xE1; 32], 1), vec![], 60, &mut HashMap::new(),
+        )
+        .await;
+    assert!(sent, "EMIT precondition: a direct emit to an idle worker must deliver");
+
+    let emitted_after = ws.get_metrics().speculative_prefetch_emitted.load(Ordering::Relaxed);
+    let no_target_after = ws.get_metrics().speculative_prefetch_no_target.load(Ordering::Relaxed);
+    assert_eq!(
+        emitted_after - emitted_before,
+        1,
+        "EMIT: speculative_prefetch_emitted did not increment by 1 on a DELIVERED PrefetchInputs \
+         send. Without this positive-emit counter the soak cannot prove Stage A fires (the \
+         boondoggle's silent-zero-emission signature). before={emitted_before} after={emitted_after}"
+    );
+    assert_eq!(
+        no_target_after, no_target_before,
+        "EMIT: speculative_prefetch_no_target moved on a SUCCESSFUL delivery — a delivered send is \
+         not a no-target case. before={no_target_before} after={no_target_after}"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NO-TARGET-COUNTER: `speculative_prefetch_no_target` bumps when EVERY capable
+// worker is health-pressured → the selector returns None (the silent no-op path
+// that hid the original boondoggle).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// distsys MAJOR-1 / red-team pre-mortem: a fleet-wide pressure event drives
+// `find_prefetch_target_worker` to None for the whole backlog and the feature
+// silently emits nothing. This test makes that observable: the ONLY capable
+// worker holds the input_root but is swap-pressured → selector None →
+// `speculative_prefetch_no_target` goes 0→1 while `speculative_prefetch_emitted`
+// stays flat (fired, found no viable target, delivered nothing).
+//
+// MUTATION: bump `speculative_prefetch_emitted` instead of
+// `speculative_prefetch_no_target` on the `None` arm of the selector call in
+// `send_prefetch_inputs` → `no_target` stays 0 and this red-fails.
+#[nativelink_test]
+async fn prefetch_no_target_counter_increments_when_all_workers_pressured() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+    let ws = scheduler.worker_scheduler_for_test();
+
+    // The ONLY capable worker: perfect locality, but swap-pressured (a health
+    // gate the selector honors) → no viable target for the op.
+    let worker = WorkerId("notarget_pressured".to_string());
+    let _rx = add_busy_healthy_worker(&scheduler, worker.clone(), PlatformProperties::default()).await?;
+    let input_root = DigestInfo::new([0xE2; 32], 2);
+    ws.update_cached_directories(&worker, HashSet::from([input_root]))
+        .await
+        .err_tip(|| "NO-TARGET: update_cached_directories failed")?;
+    ws.update_worker_swap_pressure(&worker, true, 50_000)
+        .await
+        .err_tip(|| "NO-TARGET: update_worker_swap_pressure failed")?;
+
+    let emitted_before = ws.get_metrics().speculative_prefetch_emitted.load(Ordering::Relaxed);
+    let no_target_before = ws.get_metrics().speculative_prefetch_no_target.load(Ordering::Relaxed);
+
+    let sent = ws
+        .send_prefetch_inputs(
+            &PlatformProperties::default(), &OperationId::default(), input_root, vec![], 60,
+            &mut HashMap::new(),
+        )
+        .await;
+    assert!(
+        !sent,
+        "NO-TARGET precondition: with the sole capable worker swap-pressured the selector must \
+         return None and send_prefetch_inputs must return false"
+    );
+
+    let emitted_after = ws.get_metrics().speculative_prefetch_emitted.load(Ordering::Relaxed);
+    let no_target_after = ws.get_metrics().speculative_prefetch_no_target.load(Ordering::Relaxed);
+    assert_eq!(
+        no_target_after - no_target_before,
+        1,
+        "NO-TARGET: speculative_prefetch_no_target did not increment when every capable worker was \
+         health-pressured (selector None). This is the silent zero-benefit path that hid the \
+         original boondoggle — the soak must be able to distinguish 'fired but no target' from a \
+         real emit. before={no_target_before} after={no_target_after}"
+    );
+    assert_eq!(
+        emitted_after, emitted_before,
+        "NO-TARGET: speculative_prefetch_emitted moved on a no-target case — nothing was delivered. \
+         Bumping emitted instead of no_target on the selector's None arm makes this red-fail. \
+         before={emitted_before} after={emitted_after}"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HIT-VS-MISS: at ASSIGNMENT, when the coalesce guard holds a recorded prefetch
+// target `op→W`, `speculative_prefetch_hit` bumps if the op is assigned to W and
+// `speculative_prefetch_miss` bumps if it is assigned elsewhere. MEASUREMENT
+// ONLY — the matcher must NOT route/bias on the recorded target.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// red-team A1 (gossip-window): Stage A ships no instrument for how often a
+// prewarm actually LANDS on the run worker vs is wasted by a reroute. This test
+// drives both arms:
+//   HIT : one idle worker W holds R → prefetch op_P→W → reserve op_P lands on W
+//         (Tier-1 holder) → assigned == recorded → hit.
+//   MISS: W (busy holder of R) + X (idle non-holder) → prefetch op_M→W (selector
+//         is capacity-agnostic, picks the holder W) → reserve op_M: the real
+//         matcher SKIPS busy W (worker_is_viable requires can_accept_work) and
+//         lands op_M on X → assigned X != recorded W → miss.
+// The MISS arm ALSO proves the matcher did NOT route by the recorded target: an
+// IDENTICAL reserve with NO coalesce record lands on the SAME worker X (the
+// record changes the metric, not the assignment).
+//
+// MUTATION: swap the hit/miss increments at the assignment read
+// (`prepare_worker_run_action`) — the HIT case then bumps miss and the MISS case
+// bumps hit → both assertions red-fail.
+#[nativelink_test]
+async fn prefetch_hit_vs_miss() -> Result<(), Error> {
+    // ── HIT: prewarm lands on the run worker ──────────────────────────────────
+    {
+        let task_change_notify = Arc::new(Notify::new());
+        let spec = spec_with_prefetch(1, 60);
+        let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+            &spec,
+            memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+            || async move {},
+            task_change_notify,
+            MockInstantWrapped::default,
+            None, None, None, None,
+        );
+        let ws = scheduler.worker_scheduler_for_test();
+
+        // One IDLE worker holding R (so the real reserve can land on it).
+        let w = WorkerId("hit_w".to_string());
+        let _rx = add_worker(&scheduler, w.clone(), PlatformProperties::default()).await?;
+        let input_root = DigestInfo::new([0xC1; 32], 11);
+        ws.update_cached_directories(&w, HashSet::from([input_root]))
+            .await
+            .err_tip(|| "HIT: update_cached_directories failed")?;
+
+        let op_p = OperationId::default();
+        let sent = ws
+            .send_prefetch_inputs(
+                &PlatformProperties::default(), &op_p, input_root, vec![], 60, &mut HashMap::new(),
+            )
+            .await;
+        assert!(sent, "HIT precondition: prefetch to the idle holder must emit (records op_p→W)");
+
+        let hit_before = ws.get_metrics().speculative_prefetch_hit.load(Ordering::Relaxed);
+        let miss_before = ws.get_metrics().speculative_prefetch_miss.load(Ordering::Relaxed);
+
+        // Reserve the SAME op (op_p) carrying input_root R → Tier-1 holder match
+        // lands it on W == the recorded prefetch target.
+        let ai = {
+            let mut inner = make_base_action_info(make_system_time(1), DigestInfo::new([0x31; 32], 1));
+            Arc::make_mut(&mut inner).input_root_digest = input_root;
+            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default() }
+        };
+        let reserved = ws
+            .find_and_reserve_worker(&PlatformProperties::default(), &op_p, &ai, false)
+            .await;
+        let (assigned, _, _) = reserved.expect("HIT: op_p must reserve onto the sole idle worker");
+        assert_eq!(assigned, w, "HIT precondition: op_p must land on the holder W");
+
+        let hit_after = ws.get_metrics().speculative_prefetch_hit.load(Ordering::Relaxed);
+        let miss_after = ws.get_metrics().speculative_prefetch_miss.load(Ordering::Relaxed);
+        assert_eq!(
+            hit_after - hit_before,
+            1,
+            "HIT: op assigned to the SAME worker its prefetch targeted, but speculative_prefetch_hit \
+             did not increment. before={hit_before} after={hit_after}"
+        );
+        assert_eq!(
+            miss_after, miss_before,
+            "HIT: speculative_prefetch_miss moved on a prewarm that LANDED on the run worker — \
+             swapping the hit/miss increments makes this red-fail. before={miss_before} after={miss_after}"
+        );
+    }
+
+    // ── MISS: prewarm target rerouted (op lands elsewhere) ────────────────────
+    {
+        let task_change_notify = Arc::new(Notify::new());
+        let spec = spec_with_prefetch(1, 60);
+        let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+            &spec,
+            memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+            || async move {},
+            task_change_notify,
+            MockInstantWrapped::default,
+            None, None, None, None,
+        );
+        let ws = scheduler.worker_scheduler_for_test();
+
+        // W: BUSY holder of R (selector picks it; real matcher skips it as busy).
+        // X: idle non-holder (where the op actually lands).
+        let w = WorkerId("miss_w_busy_holder".to_string());
+        let x = WorkerId("miss_x_idle".to_string());
+        let _rxw = add_busy_healthy_worker(&scheduler, w.clone(), PlatformProperties::default()).await?;
+        let _rxx = add_worker(&scheduler, x.clone(), PlatformProperties::default()).await?;
+        let input_root = DigestInfo::new([0xC2; 32], 22);
+        ws.update_cached_directories(&w, HashSet::from([input_root]))
+            .await
+            .err_tip(|| "MISS: update_cached_directories failed")?;
+
+        // Prefetch op_M: the capacity-agnostic selector picks the best-locality
+        // holder W (even though W is busy) → records op_M→W.
+        let op_m = OperationId::default();
+        let sent = ws
+            .send_prefetch_inputs(
+                &PlatformProperties::default(), &op_m, input_root, vec![], 60, &mut HashMap::new(),
+            )
+            .await;
+        assert!(sent, "MISS precondition: prefetch to the busy holder W must emit (records op_m→W)");
+
+        let hit_before = ws.get_metrics().speculative_prefetch_hit.load(Ordering::Relaxed);
+        let miss_before = ws.get_metrics().speculative_prefetch_miss.load(Ordering::Relaxed);
+
+        // Reserve op_M carrying R: the real matcher SKIPS busy W (worker_is_viable
+        // requires can_accept_work) and lands op_M on idle X → assigned != recorded.
+        let ai = {
+            let mut inner = make_base_action_info(make_system_time(1), DigestInfo::new([0x32; 32], 2));
+            Arc::make_mut(&mut inner).input_root_digest = input_root;
+            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default() }
+        };
+        let reserved = ws
+            .find_and_reserve_worker(&PlatformProperties::default(), &op_m, &ai, false)
+            .await;
+        let (assigned, _, _) = reserved.expect("MISS: op_m must reserve onto the idle worker X");
+        assert_eq!(
+            assigned, x,
+            "MISS precondition: op_m must land on idle X (the real matcher skips busy holder W). \
+             If it landed on W the matcher illegally routed by the coalesce record."
+        );
+
+        let hit_after = ws.get_metrics().speculative_prefetch_hit.load(Ordering::Relaxed);
+        let miss_after = ws.get_metrics().speculative_prefetch_miss.load(Ordering::Relaxed);
+        assert_eq!(
+            miss_after - miss_before,
+            1,
+            "MISS: op assigned to a DIFFERENT worker than its prefetch targeted, but \
+             speculative_prefetch_miss did not increment (the wasted-prewarm case the soak needs \
+             to size the gossip window). before={miss_before} after={miss_after}"
+        );
+        assert_eq!(
+            hit_after, hit_before,
+            "MISS: speculative_prefetch_hit moved on a rerouted prewarm — swapping the hit/miss \
+             increments makes this red-fail. before={hit_before} after={hit_after}"
+        );
+
+        // The matcher did NOT route by the recorded target: an IDENTICAL reserve
+        // for a DIFFERENT op with NO coalesce record lands on the SAME worker X.
+        let op_control = OperationId::default();
+        let control_ai = {
+            let mut inner = make_base_action_info(make_system_time(1), DigestInfo::new([0x33; 32], 3));
+            Arc::make_mut(&mut inner).input_root_digest = input_root;
+            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default() }
+        };
+        let control = ws
+            .find_and_reserve_worker(&PlatformProperties::default(), &op_control, &control_ai, false)
+            .await;
+        let (control_assigned, _, _) =
+            control.expect("MISS control: the no-record op must also reserve onto X");
+        assert_eq!(
+            control_assigned, x,
+            "MISS (measurement-only): an identical reserve with NO coalesce record landed on \
+             {control_assigned:?}, not X — the assignment must be IDENTICAL with and without the \
+             prefetch record. The hit/miss read must READ the record, never route on it (§2.2)."
+        );
+    }
 
     Ok(())
 }

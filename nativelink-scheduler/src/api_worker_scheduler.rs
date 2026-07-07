@@ -160,6 +160,43 @@ pub struct SchedulerMetrics {
     /// observable (the map is dedup-only, not routing-consulted).
     #[metric(help = "speculative prefetch emits suppressed by the coalesce guard (dedup)")]
     pub speculative_prefetch_coalesce_suppressed: AtomicU64,
+    /// (#specprefetch-rebind) Number of speculative `PrefetchInputs` that were
+    /// actually DELIVERED to a worker (the `true` return of
+    /// `send_prefetch_inputs`, bumped AFTER the failed-send early-return so a
+    /// send to a just-disconnected worker does NOT count). The feature's
+    /// defining incident (design §0) was SILENT zero-emission; this is the
+    /// positive-emit instrument the soak asserts `> 0` under a real backlog to
+    /// prove Stage A fires (distinct from the coalesce-suppressed dedup count).
+    #[metric(help = "speculative prefetch PrefetchInputs actually delivered to a worker")]
+    pub speculative_prefetch_emitted: AtomicU64,
+    /// (#specprefetch-rebind) Number of times `find_prefetch_target_worker`
+    /// returned `None` — NO health-viable, capability-matched, under-cap worker
+    /// existed for a queued op (every candidate swap/disk/pin-pressured or
+    /// quarantined, or all at the per-cycle placement cap, or no capability
+    /// match). This is a CORRECT no-op (prefetching to a pressured worker wastes
+    /// its scarce resource) that would otherwise be SILENT — the exact signature
+    /// that hid the original boondoggle. Distinct from `coalesce_suppressed`
+    /// (dedup): this is "fired but found no target", that is "fired but already
+    /// prefetched this op".
+    #[metric(help = "speculative prefetch fired but the selector found no health-viable target")]
+    pub speculative_prefetch_no_target: AtomicU64,
+    /// (#specprefetch-rebind) MEASUREMENT-ONLY prewarm-landing counter: at
+    /// assignment (`prepare_worker_run_action`), when an op is reserved to a
+    /// worker AND the coalesce guard holds a recorded prefetch-target `op→W` for
+    /// it, `hit` bumps if the assigned worker EQUALS W (the prewarm landed on the
+    /// run worker) and `miss` bumps otherwise (the gossip window / a reroute sent
+    /// the op elsewhere → the prewarm was wasted). Reads the coalesce-guard
+    /// `WorkerId` for MEASUREMENT ONLY (peek, non-promoting); the matcher still
+    /// does NOT route or bias on it — the binding stays the self-truthing Tier-1
+    /// (§2.2). Together `hit / (hit + miss)` is the Stage-A prewarm-landing rate
+    /// the Stage-B build/skip decision needs.
+    #[metric(help = "speculative prefetch prewarm landed on the worker the op was assigned to")]
+    pub speculative_prefetch_hit: AtomicU64,
+    /// (#specprefetch-rebind) Companion to `speculative_prefetch_hit`: the
+    /// assigned worker differed from the recorded prefetch target (gossip-window
+    /// reroute → wasted prewarm). See `speculative_prefetch_hit`.
+    #[metric(help = "speculative prefetch prewarm target differed from the assigned worker (wasted)")]
+    pub speculative_prefetch_miss: AtomicU64,
     /// Total number of server-side cache warm tasks spawned.
     #[metric(help = "total number of server-side cache warm tasks spawned")]
     pub cache_warm_spawned: CounterWithTime,
@@ -2642,6 +2679,27 @@ impl ApiWorkerSchedulerImpl {
                 action_info: action_info.clone(),
             },
         );
+        // (#specprefetch-rebind) MEASUREMENT-ONLY prewarm-landing read: if this op
+        // was speculatively prefetched, the coalesce guard holds its recorded
+        // target `op→W`. Compare the ASSIGNED worker against W → `hit` if the
+        // prewarm landed on the run worker, `miss` if a reroute / the gossip
+        // window sent it elsewhere (wasted prewarm). `peek` is NON-PROMOTING and
+        // does NOT reap — the matcher above already chose `worker_id` via Tier-1
+        // WITHOUT consulting this record (§2.2 binding stays self-truthing); this
+        // only OBSERVES the outcome. Ops that were never prefetched (no record)
+        // are counted as neither. The existing reap stays in `inner_unreserve_
+        // worker` / `immediate_evict_worker`.
+        if let Some(prefetch_target) = self.prefetch_coalesce_guard.peek(operation_id) {
+            if prefetch_target == worker_id {
+                self.metrics
+                    .speculative_prefetch_hit
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .speculative_prefetch_miss
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // #36 Phase 6 §6 Phase 0 probe P-SCHED-DISPATCH: mark the
         // wall-clock at which the scheduler dispatches a StartAction to a
         // worker. Paired with P-SCHED-COMPLETE-RECV; the gap = scheduler
@@ -3679,7 +3737,17 @@ impl ApiWorkerScheduler {
             per_cycle_targets,
         ) {
             Some(id) => id,
-            None => return false,
+            None => {
+                // (#specprefetch-rebind) No health-viable, under-cap, capability-
+                // matched worker for this op — a CORRECT no-op (prefetching to a
+                // pressured worker wastes its scarce resource) that would otherwise
+                // be silent (the boondoggle's zero-emission signature). Count it so
+                // the soak can distinguish "fired but no target" from a real emit.
+                self.metrics
+                    .speculative_prefetch_no_target
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
         };
 
         // Clone the tx while holding the write lock so we can send outside it.
@@ -3724,6 +3792,14 @@ impl ApiWorkerScheduler {
         // once this worker hits PREFETCH_PER_WORKER_PER_CYCLE_CAP. Only bumped on
         // a delivered send (not on coalesce-skip / no-target / failed send).
         *per_cycle_targets.entry(worker_id.clone()).or_insert(0) += 1;
+        // (#specprefetch-rebind) Count the DELIVERED emit (reached only after the
+        // failed-send early-return above, so a send to a just-disconnected worker
+        // does NOT count). The soak asserts this `> 0` under a real backlog to
+        // prove Stage A fires — the positive-emit instrument the original
+        // boondoggle lacked.
+        self.metrics
+            .speculative_prefetch_emitted
+            .fetch_add(1, Ordering::Relaxed);
         debug!(
             ?worker_id,
             %operation_id,
@@ -4313,6 +4389,18 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| (w.p_core_count, w.e_core_count))
+    }
+
+    /// (#specprefetch-rebind) The worker LRU order (MRU→LRU, the `lru` crate's
+    /// `iter()` order). Test-only — asserts the Stage-A prefetch selector is
+    /// LRU-NEUTRAL: a `find_prefetch_target_worker` scan + the chosen-worker tx
+    /// clone use `peek` (non-promoting), so the LRU order is UNCHANGED after a
+    /// prefetch. A `.get()`/`.get_mut()` on the peeked worker would promote it to
+    /// MRU and flip this order (biasing the next real match's LRU tiebreak).
+    #[must_use]
+    pub async fn worker_lru_order_for_test(&self) -> Vec<WorkerId> {
+        let inner = self.inner.read().await;
+        inner.workers.0.iter().map(|(id, _)| id.clone()).collect()
     }
 
     /// (#specprefetch-rebind) Number of ops in a worker's `running_action_infos`.
@@ -12464,6 +12552,15 @@ mod tests {
         scheduler.metrics.tree_resolution_ms_le_5000.fetch_add(207, Ordering::Relaxed);
         scheduler.metrics.tree_resolution_ms_le_30000.fetch_add(208, Ordering::Relaxed);
         scheduler.metrics.tree_resolution_ms_gt_30000.fetch_add(209, Ordering::Relaxed);
+        // (#specprefetch-rebind) distinctive values on the four Stage-A emit-
+        // observability counters so a misrouted group/field renders a different
+        // number (wrong-field guard) and a dark field (declared-but-never-
+        // rendered) is caught — the feature's defining incident was a SILENT
+        // metric, so a counter that does not reach /metrics defeats the fix.
+        scheduler.metrics.speculative_prefetch_emitted.fetch_add(211, Ordering::Relaxed);
+        scheduler.metrics.speculative_prefetch_no_target.fetch_add(212, Ordering::Relaxed);
+        scheduler.metrics.speculative_prefetch_hit.fetch_add(213, Ordering::Relaxed);
+        scheduler.metrics.speculative_prefetch_miss.fetch_add(214, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -12602,6 +12699,13 @@ mod tests {
             ("tree_resolution_ms_le_5000", 207),
             ("tree_resolution_ms_le_30000", 208),
             ("tree_resolution_ms_gt_30000", 209),
+            // (#specprefetch-rebind) the four Stage-A emit-observability counters
+            // — dark fields here re-create the silent-zero-emission blind spot the
+            // feature exists to close (the soak asserts `emitted > 0`).
+            ("speculative_prefetch_emitted", 211),
+            ("speculative_prefetch_no_target", 212),
+            ("speculative_prefetch_hit", 213),
+            ("speculative_prefetch_miss", 214),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),

@@ -1845,6 +1845,16 @@ impl SimpleScheduler {
                     // received a prefetch this cycle, bounded by fleet size;
                     // dropped at end of cycle.
                     let mut per_cycle_prefetch_targets: HashMap<WorkerId, usize> = HashMap::new();
+                    // (#specprefetch-rebind) Consume `send_prefetch_inputs`'s
+                    // return so a delivered emit is not a SILENT drop (MAJOR-1:
+                    // the boondoggle hid behind a discarded bool). The reason-
+                    // aware counters (`speculative_prefetch_emitted` /
+                    // `_no_target` / `_coalesce_suppressed`) live inside the fn —
+                    // the bool alone cannot distinguish no-target from coalesced —
+                    // so this per-cycle tally is a greppable dev summary; the
+                    // process-singleton counters carry the prod-visible signal.
+                    let mut delivered_this_cycle = 0usize;
+                    let mut considered_this_cycle = 0usize;
                     for action_state_result in still_queued
                         .into_iter()
                         .take(self.speculative_prefetch_backlog_threshold as usize)
@@ -1881,16 +1891,30 @@ impl SimpleScheduler {
                                 Ok((action_state, _)) => action_state.client_operation_id.clone(),
                                 Err(_) => continue,
                             };
-                            self.worker_scheduler.send_prefetch_inputs(
+                            considered_this_cycle += 1;
+                            if self.worker_scheduler.send_prefetch_inputs(
                                 &platform_properties,
                                 &operation_id,
                                 action_info.input_root_digest,
                                 vec![],
                                 self.speculative_prefetch_ttl_s,
                                 &mut per_cycle_prefetch_targets,
-                            ).await;
+                            ).await {
+                                delivered_this_cycle += 1;
+                            }
                         }
                     }
+                    // (#specprefetch-rebind) Per-cycle emit summary — makes a
+                    // backlog cycle that considered ops but delivered ZERO
+                    // prefetches visible in dev logs (the silent-no-op the
+                    // process counters also catch). `queue_depth` is the
+                    // re-queried still-queued count that cleared the threshold.
+                    debug!(
+                        considered = considered_this_cycle,
+                        delivered = delivered_this_cycle,
+                        queue_depth,
+                        "speculative prefetch backlog cycle emit summary",
+                    );
                 }
             }
         }
