@@ -51,13 +51,12 @@
 //!  p_core_count_zero_no_candidate – A5 legacy worker is never a hold candidate.
 //!  hold_paid_off_counter / hold_regret_counter – the two landing-outcome counters.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mock_instant::thread_local::MockClock;
 use nativelink_config::schedulers::SimpleSpec;
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
@@ -79,17 +78,61 @@ mod utils {
 
 use utils::scheduler_utils::make_base_action_info;
 
-/// Mock-clock base so exec-start stamps (`UNIX_EPOCH + MockClock::time()`) are
-/// coherent with the worker keepalive timestamp passed to `Worker::new*`.
+/// (BLOCK-1 fix, distsys `8f1b8b88` route 1) A PER-SCHEDULER, `AtomicU64`-backed
+/// exec clock. Each test injects its OWN instance via `set_exec_clock`
+/// (`api_worker_scheduler.rs`), so the scheduler's exec-start stamping and the
+/// hold gate's `t_wait_w_locked` read a clock that NO other concurrently-running
+/// test can perturb — replacing the process-global thread-local
+/// `mock_instant::thread_local::MockClock` the v3 tests originally drove. Under
+/// libtest's 64-way concurrency (`#[nativelink_test]` = current-thread tokio, so
+/// `block_on` bodies multiplex across shared libtest OS threads) the thread-local
+/// clock cross-contaminated the tight `t_wait=2s` vs `T_SETUP=3s` boundary → the
+/// failing set wandered across runs of the UNCHANGED binary. A contention-free
+/// atomic per scheduler makes the mutation-verification DETERMINISTIC (TDD step 5).
+///
+/// Holds nanoseconds since `UNIX_EPOCH`; `.now_fn()` yields the `ExecClock` closure
+/// (`SystemTime`), `.advance` drives it deterministically (mirroring
+/// `MockClock::advance`); the base is set once at construction (`new`).
+#[derive(Clone)]
+struct TestExecClock(Arc<AtomicU64>);
+
+impl TestExecClock {
+    /// A fresh clock anchored at `base` (nanos since `UNIX_EPOCH`).
+    fn new(base: Duration) -> Self {
+        Self(Arc::new(AtomicU64::new(
+            u64::try_from(base.as_nanos()).expect("test clock base fits u64 nanos"),
+        )))
+    }
+
+    /// Advance the clock by `by` (mirrors `MockClock::advance`).
+    fn advance(&self, by: Duration) {
+        self.0.fetch_add(
+            u64::try_from(by.as_nanos()).expect("test clock advance fits u64 nanos"),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The injectable `ExecClock` closure over THIS clock's atomic (contention-free
+    /// per scheduler; the returned `Arc<dyn Fn() -> SystemTime + Send + Sync>` is
+    /// exactly the `ExecClock` type `set_exec_clock` expects).
+    fn now_fn(&self) -> Arc<dyn Fn() -> SystemTime + Send + Sync> {
+        let counter = Arc::clone(&self.0);
+        Arc::new(move || UNIX_EPOCH + Duration::from_nanos(counter.load(Ordering::SeqCst)))
+    }
+}
+
+/// Clock base so exec-start stamps are coherent with the worker keepalive
+/// timestamp passed to `Worker::new*`. Each test seeds its per-scheduler
+/// `TestExecClock` to this base (see `build_hold_scheduler`).
 const NOW_TIME: u64 = 10_000;
 
 /// `DEFAULT_DURATION_ESTIMATE` (api_worker_scheduler) = 30 s, the per-action
 /// estimate before any completion. `T_SETUP` = 3 s. On a just-P-saturated W
 /// (`running == p_core_count` → k=1) `T_wait_W = 30 s − elapsed` (the MIN
-/// remaining); advancing the clock to `elapsed = 28 s` yields `T_wait_W = 2 s <
-/// T_SETUP` while NOT overdue (28 s < 30 s). These constants mirror the production
-/// values under test (asserted at their declaration site by the numeric-const
-/// block, not here).
+/// remaining); advancing the per-scheduler clock to `elapsed = 28 s` yields
+/// `T_wait_W = 2 s < T_SETUP` while NOT overdue (28 s < 30 s). These constants
+/// mirror the production values under test (asserted at their declaration site by
+/// the numeric-const block, not here).
 const DEFAULT_ESTIMATE_SECS: u64 = 30;
 const ELAPSED_UNDER_ESTIMATE_SECS: u64 = 28; // → T_wait_W = 2 s (< T_SETUP = 3 s)
 
@@ -180,7 +223,7 @@ fn unique_filler_root(worker_id: &WorkerId, idx: u32) -> DigestInfo {
 /// carries a per-index UNIQUE root that only W holds → Tier-1 exact match lands it
 /// on W (W keeps P-headroom until the last filler, so it wins each one) without
 /// disturbing any idle peer. Fillers' exec-starts are stamped at the current
-/// `MockClock::time()`, so advancing the clock drives `T_wait_W`.
+/// per-scheduler `TestExecClock` time, so advancing that clock drives `T_wait_W`.
 ///
 /// `also_subtree`: additionally register `input_root` as a SUBTREE digest (for the
 /// subtree-disjunct test); `false` for the common directory-holder case.
@@ -263,8 +306,14 @@ fn action_with_root(input_root: DigestInfo, action_hash: u8) -> ActionInfoWithPr
     }
 }
 
-/// Construct a scheduler with the hold-gate spec, mock-clock-anchored.
-fn build_hold_scheduler(enable_hold: bool) -> Arc<SimpleScheduler> {
+/// Construct a scheduler with the hold-gate spec and inject a FRESH per-scheduler
+/// `TestExecClock` (seeded at `NOW_TIME`), returning both. The injected clock
+/// OVERRIDES the `MockInstantWrapped`-derived exec clock `SimpleScheduler::new`
+/// wires by default, so the hold gate's timing is isolated to THIS scheduler's
+/// atomic — no cross-test thread-local contention (BLOCK-1). The action DB keeps
+/// the `MockInstantWrapped` clock (irrelevant to the hold boundary, which reads
+/// only `exec_clock`). Each test drives the returned clock via `.set`/`.advance`.
+fn build_hold_scheduler(enable_hold: bool) -> (Arc<SimpleScheduler>, TestExecClock) {
     let task_change_notify = Arc::new(Notify::new());
     let spec = spec_with_hold(enable_hold);
     let (scheduler, _ws) = SimpleScheduler::new_with_callback(
@@ -278,7 +327,11 @@ fn build_hold_scheduler(enable_hold: bool) -> Arc<SimpleScheduler> {
         None,
         None,
     );
+    let clock = TestExecClock::new(Duration::from_secs(NOW_TIME));
     scheduler
+        .worker_scheduler_for_test()
+        .set_exec_clock(clock.now_fn());
+    (scheduler, clock)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -316,11 +369,10 @@ fn build_hold_scheduler(enable_hold: bool) -> Arc<SimpleScheduler> {
 // green.
 #[nativelink_test]
 async fn hold_no_deadlock_under_write_lock() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
 
     let input_root = DigestInfo::new([0xB1; 32], 100);
-    // W: P-saturated holder of R (stamps filler exec-starts at MockClock base).
+    // W: P-saturated holder of R (stamps filler exec-starts at the injected clock base).
     let w = WorkerId("hold_deadlock_w".to_string());
     let _rxw = add_p_saturated_holder(&scheduler, w.clone(), input_root, 4, false).await?;
     // X: idle, cold (does not hold R), has P-headroom → dir_cache_winner is None
@@ -331,7 +383,7 @@ async fn hold_no_deadlock_under_write_lock() -> Result<(), Error> {
 
     // Advance so T_wait_W(W) = 30 − 28 = 2 s < T_SETUP (3 s) → the gate takes the
     // HOLD branch (return None), exercising the full gate path under the lock.
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let op = OperationId::default();
     let ai = action_with_root(input_root, 0x11);
@@ -380,8 +432,7 @@ async fn hold_no_deadlock_under_write_lock() -> Result<(), Error> {
 // assertions red-fail.
 #[nativelink_test]
 async fn hold_fires_for_p_saturated_holder() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB2; 32], 200);
@@ -390,7 +441,7 @@ async fn hold_fires_for_p_saturated_holder() -> Result<(), Error> {
     let x = WorkerId("hold_fire_x_idle".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -452,8 +503,7 @@ async fn hold_fires_for_p_saturated_holder() -> Result<(), Error> {
 // red-fails here and that C1 alone does NOT catch it.)
 #[nativelink_test]
 async fn no_hold_when_p_gate_inactive() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB9; 32], 900);
@@ -476,7 +526,7 @@ async fn no_hold_when_p_gate_inactive() -> Result<(), Error> {
         .await
         .err_tip(|| "pgate: saturate Z load failed")?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -527,8 +577,7 @@ async fn no_hold_when_p_gate_inactive() -> Result<(), Error> {
 // this red-fails (None instead of assigning X).
 #[nativelink_test]
 async fn no_hold_when_gossip_subtree_holder_x() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB4; 32], 400);
@@ -543,7 +592,7 @@ async fn no_hold_when_gossip_subtree_holder_x() -> Result<(), Error> {
         .await
         .err_tip(|| "no_hold_when_gossip_subtree_holder_x: update_cached_subtrees(X) failed")?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -592,8 +641,7 @@ async fn no_hold_when_gossip_subtree_holder_x() -> Result<(), Error> {
 // red-fails (Some expected, None seen).
 #[nativelink_test]
 async fn deep_backlog_declines() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xBA; 32], 1000);
@@ -626,7 +674,7 @@ async fn deep_backlog_declines() -> Result<(), Error> {
         assert_eq!(assigned, w, "deep_backlog: old filler {i} must land on W");
     }
     // Age the 4 old fillers to nearly done (remaining ~2 s, well < T_setup).
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
     // Reserve 4 more (FRESH) fillers — remaining ~full estimate (≫ T_setup).
     for i in 4..8u32 {
         let filler_root = unique_filler_root(&w, i);
@@ -676,6 +724,107 @@ async fn deep_backlog_declines() -> Result<(), Error> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// perf_deep_backlog_skipped_without_select — perf R1 band pre-filter (§2.3-v3.7-#4).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `find_p_saturated_holder` band pre-filter: a holder oversubscribed beyond
+// `HOLD_MAX_K` (= 8) — i.e. `running − p_core_count > HOLD_MAX_K` — is SKIPPED
+// WITHOUT paying the O(running) k-th select in `t_wait_w_locked`, because a hold
+// is jointly reachable only in the just-saturated band (perf-optimizer MEDIUM,
+// `8f1b8b88`; design v3.7-#4). This is a HEURISTIC skip in the always-declines
+// regime, so it must NOT be observable on a genuine decline — but it IS observable
+// on the PATHOLOGICAL case the const doc names: a deep-backlog holder whose k-th
+// remaining WOULD be < T_setup (all its running actions near-done at once) is
+// skipped and DECLINES, whereas WITHOUT the pre-filter the select would run,
+// compute a small k-th, and HOLD. That divergence is exactly this test.
+//
+// W: p_core_count=4, running=13 → oversub = 13 − 4 = 9 > HOLD_MAX_K (8) → SKIPPED.
+// All 13 fillers are aged to elapsed 28 s (remaining 2 s each), so the k-th (k=10)
+// remaining is 2 s < T_setup and NOT overdue — the select WOULD hold if it ran.
+// With the pre-filter the select is skipped → no holder → the gate DECLINES → the
+// op is assigned to the cold idle X. (This is the documented MISSED-OPTIMIZATION,
+// NOT a correctness bug: the op still runs, just rebound to X rather than held.)
+//
+// MUTATION: remove the `running − p_core_count > HOLD_MAX_K { continue }`
+// pre-filter from `find_p_saturated_holder` → the O(running) select runs for W →
+// k-th remaining 2 s < T_setup, not overdue → the gate HOLDS → this red-fails
+// (None instead of a reservation, and speculative_hold_count moves).
+#[nativelink_test]
+async fn perf_deep_backlog_skipped_without_select() -> Result<(), Error> {
+    let (scheduler, clock) = build_hold_scheduler(true);
+    let ws = scheduler.worker_scheduler_for_test();
+
+    let input_root = DigestInfo::new([0xBD; 32], 1300);
+    let w = WorkerId("perf_skip_w".to_string());
+    let p_core_count = 4u32;
+    // W is the ONLY worker during the fill, so it wins all 13 fillers (each carries
+    // a unique root; while W is the sole candidate the P-gate is inactive → W wins
+    // Tier-1 past p_core_count, exactly as deep_backlog_declines fills its W).
+    let _rxw = add_worker_pcores(&scheduler, w.clone(), p_core_count).await?;
+    const RUNNING: u32 = 13; // oversub = 13 − 4 = 9 > HOLD_MAX_K (8) → skipped.
+    let mut dirs: HashSet<DigestInfo> = HashSet::from([input_root]);
+    for i in 0..RUNNING {
+        dirs.insert(unique_filler_root(&w, i));
+    }
+    ws.update_cached_directories(&w, dirs)
+        .await
+        .err_tip(|| "perf_skip: update_cached_directories failed")?;
+    // Reserve all RUNNING fillers at the base clock (all stamped at the same instant
+    // → all remainings identical after the single age advance below).
+    for i in 0..RUNNING {
+        let filler_root = unique_filler_root(&w, i);
+        let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0x10 + i as u8; 32], 7));
+        Arc::make_mut(&mut ai).input_root_digest = filler_root;
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let (assigned, _, _) = ws
+            .find_and_reserve_worker(&PlatformProperties::default(), &OperationId::default(), &filler_ai, false)
+            .await
+            .expect("perf_skip: filler must reserve onto W");
+        assert_eq!(assigned, w, "perf_skip: filler must land on W");
+    }
+    assert_eq!(
+        ws.worker_running_action_count_for_test(&w).await,
+        Some(RUNNING as usize),
+        "perf_skip: W must run exactly RUNNING (13) actions so oversub = 9 > HOLD_MAX_K (8)"
+    );
+    // Age ALL fillers uniformly to elapsed 28 s → every remaining is 2 s, so the
+    // k-th (k = 13 − 4 + 1 = 10) remaining is 2 s < T_setup and not overdue: the
+    // select WOULD hold if it ran. Only the band pre-filter prevents it.
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+
+    // Add the idle cold X (p_core_count=4, headroom) so p_gate_active is TRUE (W is
+    // excluded, so the op reaches find_p_saturated_holder) and X is the cold rebind.
+    let x = WorkerId("perf_skip_x_idle".to_string());
+    let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
+
+    let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
+    let op = OperationId::default();
+    let ai = action_with_root(input_root, 0xBD);
+    let result = ws
+        .find_and_reserve_worker(&PlatformProperties::default(), &op, &ai, false)
+        .await;
+
+    let (assigned, _, _) = result.expect(
+        "perf_deep_backlog_skipped_without_select: W is oversubscribed by 9 (> HOLD_MAX_K=8), so \
+         find_p_saturated_holder must SKIP the O(running) k-th select and DECLINE the hold — the op \
+         must be assigned to the cold idle X (the documented missed-optimization). Got None: the \
+         band pre-filter (`running − p_core_count > HOLD_MAX_K`) was removed, so the select ran, \
+         found the small (all-near-done) k-th remaining < T_setup, and HELD.",
+    );
+    assert_eq!(
+        assigned, x,
+        "perf_skip: the op must land on the idle X (hold declined via the band skip), got {assigned:?}."
+    );
+    assert_eq!(
+        ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed),
+        hold_before,
+        "perf_skip: speculative_hold_count moved — the deep-backlog holder was NOT skipped (the \
+         O(running) select ran and held on an all-near-done W). before={hold_before}"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // k_th_completion_frees_one_p_slot — the k-th order-statistic correctness (v3.3).
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -694,8 +843,7 @@ async fn deep_backlog_declines() -> Result<(), Error> {
 // by the Stage-C `worker_time_to_free` unit test migrated to k-th semantics.)
 #[nativelink_test]
 async fn k_th_completion_frees_one_p_slot() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xBB; 32], 1100);
@@ -721,7 +869,7 @@ async fn k_th_completion_frees_one_p_slot() -> Result<(), Error> {
             .expect("kth: old filler must reserve onto W");
         assert_eq!(assigned, w);
     }
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
     // 4 FRESH fillers.
     for i in 2..6u32 {
         let filler_root = unique_filler_root(&w, i);
@@ -781,8 +929,7 @@ async fn k_th_completion_frees_one_p_slot() -> Result<(), Error> {
 // bespoke bimodal-risk message below.
 #[nativelink_test]
 async fn no_hold_on_overdue_w() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB3; 32], 300);
@@ -792,7 +939,7 @@ async fn no_hold_on_overdue_w() -> Result<(), Error> {
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
 
     // Advance PAST the estimate: elapsed = 31 s > 30 s → W's k-soonest is OVERDUE.
-    MockClock::advance(Duration::from_secs(DEFAULT_ESTIMATE_SECS + 1));
+    clock.advance(Duration::from_secs(DEFAULT_ESTIMATE_SECS + 1));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -836,8 +983,7 @@ async fn no_hold_on_overdue_w() -> Result<(), Error> {
 // expected, Some seen).
 #[nativelink_test]
 async fn overdue_boundary_elapsed_equals_estimate() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xBD; 32], 1300);
@@ -848,7 +994,7 @@ async fn overdue_boundary_elapsed_equals_estimate() -> Result<(), Error> {
 
     // Advance to EXACTLY the estimate: elapsed = 30 s == estimate → NOT overdue,
     // remaining = 0 < T_setup → HOLD.
-    MockClock::advance(Duration::from_secs(DEFAULT_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(DEFAULT_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -886,8 +1032,7 @@ async fn overdue_boundary_elapsed_equals_estimate() -> Result<(), Error> {
 // (None expected, Some seen).
 #[nativelink_test]
 async fn subtree_holder_disjunct() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xBE; 32], 1400);
@@ -897,7 +1042,7 @@ async fn subtree_holder_disjunct() -> Result<(), Error> {
     let x = WorkerId("subtree_x_idle".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -935,8 +1080,7 @@ async fn subtree_holder_disjunct() -> Result<(), Error> {
 // reserve returns None instead of assigning X).
 #[nativelink_test]
 async fn no_hold_when_x_is_holder() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB7; 32], 700);
@@ -950,7 +1094,7 @@ async fn no_hold_when_x_is_holder() -> Result<(), Error> {
         .await
         .err_tip(|| "no_hold_when_x_is_holder: update_cached_directories(X) failed")?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -994,8 +1138,7 @@ async fn no_hold_when_x_is_holder() -> Result<(), Error> {
 // (expected Some/X).
 #[nativelink_test]
 async fn max_hold_cap_abandons() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB5; 32], 500);
@@ -1007,7 +1150,7 @@ async fn max_hold_cap_abandons() -> Result<(), Error> {
     let _rxw1 = add_p_saturated_holder(&scheduler, w1.clone(), input_root, 4, false).await?;
     let x = WorkerId("cap_x_idle".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
     let first = ws
         .find_and_reserve_worker(&PlatformProperties::default(), &op, &ai, false)
         .await;
@@ -1019,14 +1162,14 @@ async fn max_hold_cap_abandons() -> Result<(), Error> {
     let expired_before = ws.get_metrics().hold_expired.load(Ordering::Relaxed);
 
     // ── Advance the wall past HOLD_MAX_WALL (10 s) since first_hold_at ──
-    MockClock::advance(Duration::from_secs(20));
+    clock.advance(Duration::from_secs(20));
 
     // ── Cycle 2: a FRESH just-P-saturated holder W2 with T_wait_W < T_setup, so the
     // ONLY reason not to hold is the cap. W2's fillers are stamped NOW; advance so
     // their elapsed = 28 s → T_wait_W(W2) = 2 s < T_setup. ──
     let w2 = WorkerId("cap_w2_psat_holder".to_string());
     let _rxw2 = add_p_saturated_holder(&scheduler, w2.clone(), input_root, 4, false).await?;
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let second = ws
         .find_and_reserve_worker(&PlatformProperties::default(), &op, &ai, false)
@@ -1068,8 +1211,7 @@ async fn max_hold_cap_abandons() -> Result<(), Error> {
 // the 21st reserve, None seen).
 #[nativelink_test]
 async fn hold_max_cycles_arm() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xBF; 32], 1500);
@@ -1117,7 +1259,7 @@ async fn hold_max_cycles_arm() -> Result<(), Error> {
     // advances after, so ONLY the cycle counter grows.
     let w = WorkerId("cyc_w_psat_holder".to_string());
     let _rxw = add_p_saturated_holder(&scheduler, w.clone(), input_root, 4, false).await?;
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS)); // age W's fillers once
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS)); // age W's fillers once
     let expired_before = ws.get_metrics().hold_expired.load(Ordering::Relaxed);
 
     for c in 0..HOLD_MAX_CYCLES {
@@ -1174,8 +1316,8 @@ async fn hold_max_cycles_arm() -> Result<(), Error> {
 // classification is mutation-verified by hold_paid_off_counter / hold_regret_counter.)
 #[nativelink_test]
 async fn defensive_reap_on_reroute() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    // No clock advance: this reap test does not depend on the hold-timing boundary.
+    let (scheduler, _clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xC1; 32], 1600);
@@ -1227,8 +1369,8 @@ async fn defensive_reap_on_reroute() -> Result<(), Error> {
 // the reachable, verifiable property.
 #[nativelink_test]
 async fn defensive_reap_on_evict() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    // No clock advance: this reap test does not depend on the hold-timing boundary.
+    let (scheduler, _clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xC2; 32], 1700);
@@ -1275,8 +1417,7 @@ async fn defensive_reap_on_evict() -> Result<(), Error> {
 // gets assigned to X or the hold counter stays 0).
 #[nativelink_test]
 async fn do_try_match_none_requeue_seam() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xC3; 32], 1800);
@@ -1287,7 +1428,7 @@ async fn do_try_match_none_requeue_seam() -> Result<(), Error> {
         add_idle_worker(&scheduler, x.clone()).await?
     };
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     // Enqueue the op through the real client path so do_try_match sees it.
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
@@ -1340,8 +1481,9 @@ async fn do_try_match_none_requeue_seam() -> Result<(), Error> {
 // the hold counter moves).
 #[nativelink_test]
 async fn flag_off_no_hold() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    // DISCRIMINATING config: hold flag OFF, pcore-first gate ON.
+    // DISCRIMINATING config: hold flag OFF, pcore-first gate ON. Built manually
+    // (not via `build_hold_scheduler`) to set that exact spec; inject a fresh
+    // per-scheduler `TestExecClock` so the timing is isolated (BLOCK-1).
     let task_change_notify = Arc::new(Notify::new());
     let spec = SimpleSpec {
         enable_speculative_hold: false,
@@ -1360,6 +1502,8 @@ async fn flag_off_no_hold() -> Result<(), Error> {
         None,
     );
     let ws = scheduler.worker_scheduler_for_test();
+    let clock = TestExecClock::new(Duration::from_secs(NOW_TIME));
+    ws.set_exec_clock(clock.now_fn());
 
     let input_root = DigestInfo::new([0xB6; 32], 600);
     let w = WorkerId("flagoff_w_psat_holder".to_string());
@@ -1367,7 +1511,7 @@ async fn flag_off_no_hold() -> Result<(), Error> {
     let x = WorkerId("flagoff_x_idle".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let op = OperationId::default();
     let ai = action_with_root(input_root, 0x66);
@@ -1413,8 +1557,7 @@ async fn flag_off_no_hold() -> Result<(), Error> {
 // (None / not-W).
 #[nativelink_test]
 async fn p_core_count_zero_no_candidate() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xC0; 32], 1900);
@@ -1445,7 +1588,7 @@ async fn p_core_count_zero_no_candidate() -> Result<(), Error> {
     let x = WorkerId("legacy_x_idle_realcores".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
 
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let hold_before = ws.get_metrics().speculative_hold_count.load(Ordering::Relaxed);
     let op = OperationId::default();
@@ -1489,8 +1632,7 @@ async fn p_core_count_zero_no_candidate() -> Result<(), Error> {
 // `hold_regret` when assigned_holds_root) → `hold_paid_off` stays 0 → red-fail.
 #[nativelink_test]
 async fn hold_paid_off_counter() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xB8; 32], 800);
@@ -1503,7 +1645,7 @@ async fn hold_paid_off_counter() -> Result<(), Error> {
     let _rxw = add_p_saturated_holder(&scheduler, w.clone(), input_root, 4, false).await?;
     let x = WorkerId("paid_x_idle_cold".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?;
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
     let first = ws
         .find_and_reserve_worker(&PlatformProperties::default(), &op, &ai, false)
         .await;
@@ -1559,8 +1701,7 @@ async fn hold_paid_off_counter() -> Result<(), Error> {
 // `hold_paid_off` when NOT assigned_holds_root) → `hold_regret` stays 0 → red-fail.
 #[nativelink_test]
 async fn hold_regret_counter() -> Result<(), Error> {
-    MockClock::set_time(Duration::from_secs(NOW_TIME));
-    let scheduler = build_hold_scheduler(true);
+    let (scheduler, clock) = build_hold_scheduler(true);
     let ws = scheduler.worker_scheduler_for_test();
 
     let input_root = DigestInfo::new([0xBC; 32], 1200);
@@ -1572,7 +1713,7 @@ async fn hold_regret_counter() -> Result<(), Error> {
     let _rxw1 = add_p_saturated_holder(&scheduler, w1.clone(), input_root, 4, false).await?;
     let x = WorkerId("regret_x_idle_cold".to_string());
     let _rxx = add_idle_worker(&scheduler, x.clone()).await?; // cold non-holder
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
     let first = ws
         .find_and_reserve_worker(&PlatformProperties::default(), &op, &ai, false)
         .await;
@@ -1585,10 +1726,10 @@ async fn hold_regret_counter() -> Result<(), Error> {
     // holder W2 (T_wait_W2 < T_setup) so the CAP — not an overdue W — is the abandon
     // cause. The op is then assigned to cold X; held_for (≥ 20 s) ≥ T_setup and X is
     // a non-holder → regret.
-    MockClock::advance(Duration::from_secs(20));
+    clock.advance(Duration::from_secs(20));
     let w2 = WorkerId("regret_w2_psat_holder".to_string());
     let _rxw2 = add_p_saturated_holder(&scheduler, w2.clone(), input_root, 4, false).await?;
-    MockClock::advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
+    clock.advance(Duration::from_secs(ELAPSED_UNDER_ESTIMATE_SECS));
 
     let second = ws
         .find_and_reserve_worker(&PlatformProperties::default(), &op, &ai, false)

@@ -1982,6 +1982,14 @@ impl ApiWorkerSchedulerImpl {
     /// `cached_subtree_digests` Tier-1 uses. It NEVER reads the coalesce guard's
     /// `op→W` (that is measurement-only — §2.2).
     ///
+    /// (perf R1 / v3.7-#4) A cheap BAND PRE-FILTER runs before the O(running) k-th
+    /// select: a holder oversubscribed beyond `HOLD_MAX_K` (`running − p_core_count
+    /// > HOLD_MAX_K`) cannot be in the just-saturated band where a hold is jointly
+    /// reachable, so it is skipped WITHOUT paying `t_wait_w_locked`'s partial-select
+    /// + alloc. The `running`/`p_core_count` come from the `p_gated_excluded` tuple
+    /// (snapshotted in the pre-scan) — zero extra lock reads. A heuristic skip in
+    /// the always-declines regime; see `HOLD_MAX_K` for the missed-hold tradeoff.
+    ///
     /// Returns `(WorkerId, t_wait, overdue)` for the best P-saturated holder to hold
     /// for, or `None` if no P-saturated holder of the root exists. `t_wait`/`overdue`
     /// come from `t_wait_w_locked` (the k-th-soonest completion + overdue over the
@@ -2001,7 +2009,19 @@ impl ApiWorkerSchedulerImpl {
         p_gated_excluded: &[(WorkerId, usize, u32, u32)],
     ) -> Option<(WorkerId, Duration, bool)> {
         let mut best: Option<(WorkerId, Duration, bool)> = None;
-        for (worker_id, _running, _p_core_count, _p_load) in p_gated_excluded {
+        for (worker_id, running, p_core_count, _p_load) in p_gated_excluded {
+            // (perf R1 / v3.7-#4) Band pre-filter using the pre-scan snapshot —
+            // NO extra lock read, NO alloc. A hold is jointly reachable only in the
+            // JUST-SATURATED band (k≈1); a holder oversubscribed beyond HOLD_MAX_K
+            // has `t_wait ≫ T_SETUP` and always declines, so skip the O(running)
+            // k-th select for it. Heuristic skip in the decline regime (can miss a
+            // pathological all-k-finish-at-once hold — a missed optimization, not a
+            // correctness bug). Excludes the 352-scale domino select from the
+            // reachable crit-section. `running`/`p_core_count` are the owned copies
+            // snapshotted while the worker was `peek`ed in the pre-scan (`:2211`).
+            if running.saturating_sub(*p_core_count as usize) > HOLD_MAX_K {
+                continue;
+            }
             let Some(w) = self.workers.0.peek(worker_id) else {
                 continue;
             };
@@ -3458,6 +3478,30 @@ const HOLD_MAX_WALL: Duration = Duration::from_secs(10);
 /// arm trips first abandons. 20 cycles is generous relative to the expected
 /// handful of cycles a genuine `T_wait_W < T_SETUP` hold needs before W frees.
 const HOLD_MAX_CYCLES: u32 = 20;
+
+/// (#specprefetch-rebind Stage B v3, perf R1 / design §2.3-v3.7-#4) Max
+/// oversubscription (`running − p_core_count`) at which `find_p_saturated_holder`
+/// still pays the O(running) k-th-order-statistic select in `t_wait_w_locked`.
+/// A hold is JOINTLY reachable (P-saturated ∧ `t_wait < T_SETUP`) only in the
+/// JUST-SATURATED band (`k = running − p_core_count + 1 ≈ 1`, so `t_wait` = the
+/// MIN remaining): the k-th SMALLEST remaining GROWS with k (a k>1 hold needs k
+/// actions all about to finish at once), so a deeply-backlogged holder (`running`
+/// up to 352 in the Phase-2-lift + `max_inflight_tasks=0` domino, design v3.7-#4)
+/// has `t_wait ≫ T_SETUP` and ALWAYS declines. Skipping the select for such a
+/// holder — using the `running`/`p_core_count` snapshot ALREADY carried in
+/// `p_gated_excluded` (no extra lock read, no alloc) — removes the 352-scale
+/// O(running) partial-select + `Vec` alloc from the reachable crit-section
+/// (perf-optimizer MEDIUM, `8f1b8b88`). This is a HEURISTIC skip that changes
+/// behavior ONLY in the regime where the gate declines anyway: it can miss a
+/// PATHOLOGICAL hold (all k oversubscribed actions finishing simultaneously so
+/// the k-th remaining is still < T_SETUP) — a MISSED OPTIMIZATION, NOT a
+/// correctness bug (the op still runs, just rebound to X rather than held for W).
+/// 8 is generous above the reachable band (k≈1): it admits a full "wave" of
+/// near-simultaneous completions (≈2× a 4-P-core worker's cores) while excluding
+/// the deep-backlog regime; scrape-tune alongside `hold_regret` if the soak shows
+/// missed holds. (NOT a `t_wait`-from-`k` bound — the k-th smallest has NO
+/// closed-form upper bound from counts alone; this gates on the band, not the value.)
+const HOLD_MAX_K: usize = 8;
 
 /// (#specprefetch-rebind Stage B) Per-op hold-state record: the first instant this
 /// op was held (from the injected `exec_clock`) plus the cumulative count of hold
@@ -15204,6 +15248,87 @@ mod b1_lock_decouple_tests {
             );
         }
 
+        // ── (#specprefetch-rebind Stage B v3, C1) subtree_coverage_winner blocks the hold ──
+        // (testing-czar Important Gap, `8f1b8b88`) The C1 gate condition requires
+        // `subtree_coverage_winner.is_none()` (design §2.3-v3.7-#5): a Tier-1.5
+        // partial-subtree winner X is a CHEAP partial-locality rebind (it can hardlink
+        // the cached subtree), the residual regime where REBIND wins — so the gate must
+        // NOT hold for a P-saturated root-holder W when such an X exists. The tested
+        // sibling `c1_locality_winner_blocks_hold` proves the Tier-2 `locality_winner`
+        // arm; the three winners are computed by DIFFERENT mechanisms (Tier-1.5 needs a
+        // `resolved_tree` + `compute_dedup_cached_score` + `blended_s > 0`; Tier-2 needs
+        // `endpoint_scores`), so this arm needs its own coverage — the untested disjunct.
+        //
+        // Setup mirrors `c1_locality_winner_blocks_hold` but drives the Tier-1.5 winner
+        // via a hand-built `resolved_tree` (not `endpoint_scores`): W is a P-saturated
+        // (running=4 = p_core_count) DIRECTORY holder of the root R → excluded from
+        // Tier-1 (`dir_cache_winner = None`); X_SUB is idle (P-headroom) and caches a
+        // CHILD subtree of R with a large direct-byte count → a positive-`blended_s`
+        // Tier-1.5 `subtree_coverage_winner`; no `endpoint_scores` → `locality_winner`
+        // None. So only `subtree_coverage_winner.is_none()` stands between the op and a
+        // hold. W's running actions are un-timed (`set_worker_running`) → t_wait 0 <
+        // T_SETUP, not overdue → the gate WOULD hold if C1 passed.
+        //
+        // MUTATION: drop `&& subtree_coverage_winner.is_none()` from the gate condition
+        // → the gate finds W (P-saturated root-holder, t_wait 0) and HOLDS (returns None)
+        // instead of assigning the op to the Tier-1.5 winner X_SUB → this red-fails with
+        // the C1 message below.
+        #[nativelink_test]
+        async fn c1_subtree_coverage_winner_blocks_hold() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+
+            // W: P-saturated (p_core_count=4, running=4) DIRECTORY holder of R.
+            add_tier1_worker(&scheduler, "W_HOLDER", 4, 0, 10, 10, 0).await;
+            set_worker_running(&scheduler, "W_HOLDER", 4).await;
+
+            // A tree whose root R has two child subtrees; X_SUB caches child_a with a
+            // LARGE direct-byte count (3 MiB ≫ its idle load_penalty) → a positive
+            // blended_s Tier-1.5 winner (the same big-cache shape as t_r5a's second half).
+            let child_a = DigestInfo::new([0xa7u8; 32], 1);
+            let child_b = DigestInfo::new([0xb7u8; 32], 1);
+            let tree = build_tree(child_a, child_b, 3 * 1024 * 1024);
+
+            // X_SUB: idle (P-headroom), does NOT hold R as a root/subtree — it caches
+            // only the CHILD subtree child_a → NOT a Tier-1 match, but a Tier-1.5
+            // subtree_coverage_winner. add_tier15_worker sets counts+load and the
+            // cached subtree; running=0 → has P-headroom → p_gate_active is TRUE.
+            add_tier15_worker(&scheduler, "X_SUB", 4, 0, 5, 0, vec![child_a]).await;
+
+            let op = OperationId::default();
+            let action = pool_action();
+            let chosen = {
+                let mut inner = scheduler.inner.write().await;
+                inner
+                    .inner_find_and_reserve_worker(
+                        &props_pool(),
+                        &op,
+                        &action,
+                        false,
+                        None, // no endpoint_scores → locality_winner None
+                        Some(&tree), // resolved_tree → Tier-1.5 subtree_coverage_winner = X_SUB
+                    )
+                    .map(|(wid, _tx, _msg)| wid)
+            };
+            assert_eq!(
+                chosen,
+                Some(WorkerId("X_SUB".to_string())),
+                "C1 (§2.3-v3.7-#5): a Tier-1.5 subtree_coverage_winner X_SUB is a cheap \
+                 partial-locality rebind, so the temporal hold gate must NOT hold for the \
+                 P-saturated root-holder W_HOLDER — the op must be assigned to X_SUB \
+                 (subtree_coverage_winner). Got a hold (None) or the wrong worker: the \
+                 `subtree_coverage_winner.is_none()` C1 guard was dropped, so the gate held \
+                 over a genuine subtree rebind."
+            );
+            assert_eq!(
+                scheduler.get_metrics().speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "C1: speculative_hold_count moved despite a Tier-1.5 subtree_coverage_winner \
+                 being available — the gate held over a cheap-rebind X_SUB (C1 subtree \
+                 disjunct violated)."
+            );
+        }
+
         // ── T-tier1-subtree-not-overcredited (design §4.1 D4) ──
         // Tier 1 fires on `has_root_match OR has_subtree_match` (a worker
         // whose cache holds the action's input_root as a *subtree* of some
@@ -15982,13 +16107,15 @@ mod b1_lock_decouple_tests {
     // (#specprefetch-rebind Stage C) T_wait_W plumbing: exec-start stamping,
     // duration EWMA, and worker_time_to_free (Stage B's T_wait_W input).
     // Pure instrumentation — these tests also assert ZERO scheduling-behavior
-    // change (the plumbing only ADDS readable state). Timing is driven by the
-    // injected mock clock (`set_exec_clock` + `MockClock`), the same mechanism
-    // the whole-scheduler `batch_affinity` render test uses.
+    // change (the plumbing only ADDS readable state). Timing is driven by a
+    // per-scheduler injected `TestExecClock` (via `set_exec_clock`), a
+    // contention-free `AtomicU64` — NOT the process-global thread-local
+    // `MockClock` (BLOCK-1 flake fix, distsys `8f1b8b88`).
     // ════════════════════════════════════════════════════════════════════
     mod stage_c_t_wait_w {
+        use core::sync::atomic::AtomicU64;
+
         use super::*;
-        use mock_instant::thread_local::MockClock;
         use nativelink_util::action_messages::{ActionResult, ActionStage};
         use nativelink_util::operation_state_manager::UpdateOperationType;
 
@@ -15996,24 +16123,54 @@ mod b1_lock_decouple_tests {
         // root (private); reach them by absolute crate path.
         use crate::api_worker_scheduler::{DEFAULT_DURATION_ESTIMATE, ExecClock};
 
-        /// A mock-clock-driven `ExecClock`, mirroring `MockInstantWrapped::now()`
-        /// (`UNIX_EPOCH + MockClock::time()`), so `MockClock::advance` moves the
-        /// scheduler's exec-start/duration clock deterministically.
-        fn mock_exec_clock() -> ExecClock {
-            Arc::new(|| UNIX_EPOCH + MockClock::time())
+        /// (BLOCK-1 fix, distsys `8f1b8b88`) A PER-SCHEDULER, `AtomicU64`-backed
+        /// exec clock (nanos since `UNIX_EPOCH`), replacing the process-global
+        /// thread-local `mock_instant::thread_local::MockClock` these Stage-C tests
+        /// originally drove. Under libtest's concurrency (`#[nativelink_test]` =
+        /// current-thread tokio → `block_on` bodies multiplex across shared libtest
+        /// OS threads) the thread-local clock let a sibling test's `MockClock::set_
+        /// time`/`advance` perturb THIS test's exec-start-vs-now math between the
+        /// reserve stamp and the `worker_time_to_free` read → flaky exact-duration
+        /// asserts. A contention-free atomic per scheduler isolates the timing.
+        #[derive(Clone)]
+        struct TestExecClock(Arc<AtomicU64>);
+
+        impl TestExecClock {
+            /// A fresh clock anchored at `base` (nanos since `UNIX_EPOCH`).
+            fn new(base: Duration) -> Self {
+                Self(Arc::new(AtomicU64::new(
+                    u64::try_from(base.as_nanos()).expect("clock base fits u64 nanos"),
+                )))
+            }
+
+            /// Advance the clock by `by` (mirrors `MockClock::advance`).
+            fn advance(&self, by: Duration) {
+                self.0.fetch_add(
+                    u64::try_from(by.as_nanos()).expect("clock advance fits u64 nanos"),
+                    Ordering::SeqCst,
+                );
+            }
+
+            /// The injectable `ExecClock` closure over THIS clock's atomic.
+            fn exec_clock(&self) -> ExecClock {
+                let counter = Arc::clone(&self.0);
+                Arc::new(move || UNIX_EPOCH + Duration::from_nanos(counter.load(Ordering::SeqCst)))
+            }
         }
 
-        /// Anchor the mock clock at a non-zero base and inject it, so a stamped
-        /// `exec_start_time` (`Some(UNIX_EPOCH + base)`) is distinguishable from
-        /// the proto/`UNIX_EPOCH` default and elapsed math is unambiguous.
+        /// Build a scheduler and inject a FRESH per-scheduler `TestExecClock`
+        /// anchored at a non-zero `base`, returning both. A non-zero base makes a
+        /// stamped `exec_start_time` (`Some(UNIX_EPOCH + base)`) distinguishable
+        /// from the proto/`UNIX_EPOCH` default and keeps elapsed math unambiguous.
+        /// The injected clock is per-scheduler (no thread-local contention).
         async fn scheduler_with_mock_clock(
             wsm: Arc<BarrierWorkerStateManager>,
             base: Duration,
-        ) -> Arc<ApiWorkerScheduler> {
-            MockClock::set_time(base);
+        ) -> (Arc<ApiWorkerScheduler>, TestExecClock) {
             let scheduler = build_scheduler(wsm);
-            scheduler.set_exec_clock(mock_exec_clock());
-            scheduler
+            let clock = TestExecClock::new(base);
+            scheduler.set_exec_clock(clock.exec_clock());
+            (scheduler, clock)
         }
 
         /// Reserve `op` on worker `name` via the PRODUCTION reserve path
@@ -16083,7 +16240,7 @@ mod b1_lock_decouple_tests {
         async fn stage_c_exec_start_stamped_and_elapsed_advances() {
             let base = Duration::from_secs(1_000);
             let wsm = BarrierWorkerStateManager::new();
-            let scheduler = scheduler_with_mock_clock(wsm, base).await;
+            let (scheduler, clock) = scheduler_with_mock_clock(wsm, base).await;
             let _rx = add_worker_named(&scheduler, "W", 4).await;
 
             let op = OperationId::default();
@@ -16102,7 +16259,7 @@ mod b1_lock_decouple_tests {
 
             // Advance the mock clock; elapsed must grow by exactly the advance.
             let advance = Duration::from_secs(7);
-            MockClock::advance(advance);
+            clock.advance(advance);
             let after_advance = scheduler
                 .worker_time_to_free(&WorkerId("W".to_string()))
                 .await;
@@ -16133,7 +16290,7 @@ mod b1_lock_decouple_tests {
         async fn stage_c_ewma_seeds_first_then_blends() {
             let base = Duration::from_secs(2_000);
             let wsm = BarrierWorkerStateManager::new();
-            let scheduler = scheduler_with_mock_clock(wsm.clone(), base).await;
+            let (scheduler, clock) = scheduler_with_mock_clock(wsm.clone(), base).await;
             let _rx = add_worker_named(&scheduler, "W", 4).await;
 
             // Before any completion: the coarse default.
@@ -16148,7 +16305,7 @@ mod b1_lock_decouple_tests {
             let op1 = OperationId::default();
             reserve_on(&scheduler, "W", &op1, 0x21).await;
             let obs1 = Duration::from_secs(5);
-            MockClock::advance(obs1);
+            clock.advance(obs1);
             complete_on(&scheduler, &wsm, "W", &op1).await;
             assert_eq!(
                 scheduler.duration_estimate_for_test().await,
@@ -16162,7 +16319,7 @@ mod b1_lock_decouple_tests {
             let op2 = OperationId::default();
             reserve_on(&scheduler, "W", &op2, 0x22).await;
             let obs2 = Duration::from_secs(15);
-            MockClock::advance(obs2);
+            clock.advance(obs2);
             complete_on(&scheduler, &wsm, "W", &op2).await;
             // 0.20*15 + 0.80*5 = 3 + 4 = 7 s.
             let expected_blend = Duration::from_secs(7);
@@ -16192,7 +16349,7 @@ mod b1_lock_decouple_tests {
         async fn stage_c_worker_time_to_free_kth_soonest() {
             let base = Duration::from_secs(3_000);
             let wsm = BarrierWorkerStateManager::new();
-            let scheduler = scheduler_with_mock_clock(wsm, base).await;
+            let (scheduler, clock) = scheduler_with_mock_clock(wsm, base).await;
             // p_core_count=1, unlimited slots → running=2 makes it P-saturated and
             // k = 2 − 1 + 1 = 2 (need 2 completions to drop running below 1).
             let _rx = add_worker_named_cores(&scheduler, "W", 0, 1).await;
@@ -16202,12 +16359,12 @@ mod b1_lock_decouple_tests {
             reserve_on(&scheduler, "W", &op1, 0x31).await;
 
             // Advance 4s, then reserve op2 (so op1.elapsed = op2.elapsed + 4s).
-            MockClock::advance(Duration::from_secs(4));
+            clock.advance(Duration::from_secs(4));
             let op2 = OperationId::default();
             reserve_on(&scheduler, "W", &op2, 0x32).await;
 
             // Advance 3s more. Now: op1 elapsed 7s, op2 elapsed 3s.
-            MockClock::advance(Duration::from_secs(3));
+            clock.advance(Duration::from_secs(3));
 
             let est = DEFAULT_DURATION_ESTIMATE; // no completion yet → default.
             let rem1 = est - Duration::from_secs(7); // op1 remaining (23s, SMALLER).
@@ -16252,7 +16409,8 @@ mod b1_lock_decouple_tests {
         async fn stage_c_zero_behavior_change_assignment_identical() {
             let base = Duration::from_secs(4_000);
             let wsm = BarrierWorkerStateManager::new();
-            let scheduler = scheduler_with_mock_clock(wsm, base).await;
+            // No clock advance: this test only checks assignment identity.
+            let (scheduler, _clock) = scheduler_with_mock_clock(wsm, base).await;
             let _rx_a = add_worker_named(&scheduler, "WA", 4).await;
             let _rx_b = add_worker_named(&scheduler, "WB", 4).await;
 
