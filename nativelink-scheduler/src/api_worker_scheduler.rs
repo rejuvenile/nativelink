@@ -3485,25 +3485,33 @@ const DURATION_EWMA_ALPHA_PCT: u128 = 20;
 /// worker gossips its cold-construct latency — from `record_construct_fetch_ms`
 /// (`directory_cache.rs:2472`, the COLD full-reconstruct span; NOT the warm
 /// `record_hit_assemble_ms`) — on the chunked `BlobsAvailable` protocol; the
-/// scheduler stores it on `Worker` and logs it every 15 s (journalctl tag
-/// `worker_construct_latency`). But it is currently a SINCE-BOOT CUMULATIVE MEAN
-/// (`construct_latency_ms_mean`), NOT a decayed EWMA or percentile — a
-/// human/diagnostic signal only. Because the construct-cost distribution is
-/// bimodal, a single mean lands in the valley between the two modes, so this
-/// signal MUST NOT be read programmatically to derive `T_SETUP` until it is
-/// conditioned into a percentile/decayed estimate (tracked:
-/// `deferred_tasks.md` #obs-tuning-construct-latency-conditioning). So a constant
-/// remains the only sound option for now. Its value is a THRESHOLD, not a bound: a wrong
-/// `T_SETUP` shifts WHERE the hold-vs-rebind crossover sits (hold slightly more or
-/// slightly less often), but NEVER breaks correctness (the max-hold cap bounds
-/// starvation regardless, and the overdue-refusal bounds the bimodal risk
+/// scheduler stores it on `Worker.construct_latency_ms_p95` and logs it every
+/// 15 s (journalctl tag `worker_construct_latency`). As of
+/// #obs-tuning-construct-latency-conditioning it is a DECAYED p95
+/// (`DecayingP95Histogram`, `o11_probes.rs`: a time-decayed fixed-bucket
+/// histogram whose 95th-percentile upper edge is gossiped), NOT the earlier
+/// since-boot cumulative mean. That conditioning resolves BOTH prior objections
+/// to reading it programmatically: (a) the exponential decay removes the
+/// since-boot fossilisation (the p95 tracks the RECENT cold-construct regime,
+/// not an all-time average dominated by boot); and (b) because the estimator is
+/// a high PERCENTILE — not a central mean — it does NOT land in the empty valley
+/// between the bimodal construct-cost modes; it reports the expensive tail, which
+/// is the correct pessimistic input for a hold-vs-rebind decision that pays
+/// asymmetrically for UNDER-estimating construct cost. So the signal is now sound
+/// in FORM for a programmatic `T_SETUP` read; it is NOT yet wired as one only
+/// because that consumer needs the ordinary soak any new programmatic feed does
+/// (confirm the per-worker p95 is populated and stable on the live fleet under
+/// the intended cold-heavy workload before letting it move a scheduling
+/// decision), and the hold gate that would consume it is itself still gated.
+/// Until then a constant is retained. Its value is a THRESHOLD, not a bound: a
+/// wrong `T_SETUP` shifts WHERE the hold-vs-rebind crossover sits (hold slightly
+/// more or slightly less often), but NEVER breaks correctness (the max-hold cap
+/// bounds starvation regardless, and the overdue-refusal bounds the bimodal risk
 /// regardless). 3 s is a COARSE GUESS for the setup-dominated regime — an
 /// order-of-magnitude anchor for an uncached-tree construct (fetch blobs +
-/// assemble), NOT a measured value: the gossiped `construct_latency_ms_mean` is
-/// only a diagnostic cross-check (an all-time mean of a bimodal distribution, not
-/// yet conditioned), so `T_SETUP` MUST STILL be tuned via the soak (scrape
-/// `hold_regret` / `hold_paid_off` and adjust) with the gossip as a sanity check.
-/// Bounded-sensitivity (design §2.3.5): the decision
+/// assemble): the gossiped `construct_latency_ms_p95` is the diagnostic
+/// cross-check to tune it against, alongside the soak (scrape `hold_regret` /
+/// `hold_paid_off` and adjust). Bounded-sensitivity (design §2.3.5): the decision
 /// is dominated by the observed-duration EWMA within seconds of warm-up, so a wrong
 /// guess self-corrects as the EWMA converges.
 const T_SETUP: Duration = Duration::from_secs(3);
@@ -4398,7 +4406,7 @@ impl ApiWorkerScheduler {
     }
 
     /// (#obs-tuning) OBSERVABILITY-ONLY snapshot of every registered worker's
-    /// last-gossiped `(worker_id, construct_latency_ms_mean)`, taken under the
+    /// last-gossiped `(worker_id, construct_latency_ms_p95)`, taken under the
     /// read lock (does NOT promote LRU order — `iter()` is a peek). Consumed by
     /// the periodic `tag = "worker_construct_latency"` log so the per-worker
     /// cold-construct cost is journalctl-scrapeable for `T_SETUP` tuning. Reads
@@ -4410,7 +4418,7 @@ impl ApiWorkerScheduler {
             .await
             .workers
             .iter()
-            .map(|(worker_id, worker)| (worker_id.clone(), worker.construct_latency_ms_mean))
+            .map(|(worker_id, worker)| (worker_id.clone(), worker.construct_latency_ms_p95))
             .collect()
     }
 
@@ -8674,10 +8682,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
     async fn update_worker_construct_latency(
         &self,
         worker_id: &WorkerId,
-        construct_latency_ms_mean: u32,
+        construct_latency_ms_p95: u32,
     ) -> Result<(), Error> {
-        // (#obs-tuning) OBSERVABILITY-ONLY: store the worker's gossiped mean
-        // cold-construct latency. `peek_mut` to avoid LRU promotion — a
+        // (#obs-tuning) OBSERVABILITY-ONLY: store the worker's gossiped decayed
+        // p95 cold-construct latency. `peek_mut` to avoid LRU promotion — a
         // telemetry report must not reorder scheduling (mirrors
         // update_worker_disk_pressure). Does NOT wake the matcher and does NOT
         // feed any selection tier: the field is LOGGED for `T_SETUP` tuning
@@ -8692,7 +8700,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 worker_id
             )
         })?;
-        worker.construct_latency_ms_mean = construct_latency_ms_mean;
+        worker.construct_latency_ms_p95 = construct_latency_ms_p95;
         Ok(())
     }
 

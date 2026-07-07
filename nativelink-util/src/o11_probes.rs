@@ -139,6 +139,133 @@ impl O11LatencyHistogram {
     }
 }
 
+/// (#obs-tuning-construct-latency-conditioning) Decay keep-fraction applied to
+/// every bucket on each new observation of [`DecayingP95Histogram`]. The
+/// effective observation window is `~1 / (1 - KEEP)`; at `0.98` that is ~50
+/// observations, after which an old regime's mass has decayed to `0.98^50 ≈
+/// 0.36` and by ~150 observations to `≈0.05`. Chosen so the p95 tracks the
+/// RECENT cold-construct regime (fixing the since-boot fossilisation of a
+/// cumulative estimator) while staying stable over a handful of cold
+/// constructs — the cold-construct rate is a few per minute under cold-heavy
+/// load, so ~50 samples is minutes-scale memory, fast enough to not fossilise
+/// and slow enough not to jitter on a single outlier.
+const P95_DECAY_KEEP: f64 = 0.98;
+
+/// (#obs-tuning-construct-latency-conditioning) Exponentially-decayed
+/// fixed-bucket latency histogram producing a CONSERVATIVE p95 (upper-edge of
+/// the 95th-percentile bucket). Purpose-built for the worker→scheduler
+/// cold-construct latency gossip (`construct_latency_ms_p95`, worker_api proto
+/// field 25/29): the eventual `T_SETUP` consumer pays asymmetrically for
+/// estimation error — holding a queued op on an UNDER-estimate is the costly
+/// direction — so a high percentile that biases toward the expensive tail is
+/// the right estimator, NOT a central mean/EWMA (which of a heavy-tailed cold
+/// population lands below the mode that matters). The exponential decay
+/// (`P95_DECAY_KEEP`) removes the since-boot fossilisation a cumulative
+/// histogram would share with the old `sum/count` mean.
+///
+/// Buckets reuse [`O11_LATENCY_BUCKETS_MS`] (1ms..30s) — the cold full-tree
+/// reconstruct span is hundreds of ms to seconds, well inside that ladder. A
+/// synchronous `parking_lot::Mutex` guards the decay+insert (the read-modify-
+/// write of all buckets is not lock-free-composable), which is negligible: the
+/// sole producer is the COLD full-reconstruct path (`record_construct_fetch_ms`
+/// at `directory_cache.rs`, no cached subtree), the coldest and least-frequent
+/// worker path — a few-nanosecond critical section behind a hundreds-of-ms
+/// operation. No `.await` is ever held across the lock.
+#[derive(Debug)]
+pub struct DecayingP95Histogram {
+    /// Decayed per-bucket weights. Index `i` (`i < BUCKETS.len()`) holds the
+    /// weight of observations that fell in bucket `i` (value `<= BUCKETS[i]`
+    /// and `> BUCKETS[i-1]`); the final slot is the overflow bucket
+    /// (value `> BUCKETS.last()`). Guarded by a synchronous mutex; `f64`
+    /// (not atomics) because the whole decay+insert is done under the lock.
+    // UNBOUNDED-OK: fixed-length array (`BUCKETS.len() + 1` slots), NOT a
+    // growable buffer — the histogram is O(1) memory regardless of observation
+    // count; weights decay toward a bounded steady state (sum ≤ 1/(1-KEEP)).
+    weights: parking_lot::Mutex<[f64; O11_LATENCY_BUCKETS_MS.len() + 1]>,
+}
+
+impl DecayingP95Histogram {
+    pub const fn new() -> Self {
+        Self {
+            weights: parking_lot::Mutex::new([0.0; O11_LATENCY_BUCKETS_MS.len() + 1]),
+        }
+    }
+
+    /// Bucket index for `value_ms`: the first ladder index whose boundary is
+    /// `>= value_ms`, else the overflow slot (`BUCKETS.len()`).
+    fn bucket_index(value_ms: u64) -> usize {
+        for (idx, boundary) in O11_LATENCY_BUCKETS_MS.iter().enumerate() {
+            if value_ms <= *boundary {
+                return idx;
+            }
+        }
+        O11_LATENCY_BUCKETS_MS.len()
+    }
+
+    /// Record one observation of `value_ms` milliseconds. Decays EVERY bucket
+    /// by `P95_DECAY_KEEP` (so historical mass fades — the boot-domination
+    /// fix), then adds one unit of weight to the matching bucket. Cost: one
+    /// mutex acquire + a fixed `BUCKETS.len()+1` f64 multiplies.
+    pub fn observe(&self, value_ms: u64) {
+        let idx = Self::bucket_index(value_ms);
+        let mut w = self.weights.lock();
+        // Decay EVERY bucket by `P95_DECAY_KEEP` on each observation so an old
+        // regime's mass fades geometrically (the boot-domination fix — a
+        // non-decayed histogram would fossilise on the since-boot distribution
+        // exactly like the `sum/count` mean it replaces). Then add one unit to
+        // the matching bucket.
+        for slot in w.iter_mut() {
+            *slot *= P95_DECAY_KEEP;
+        }
+        w[idx] += 1.0;
+    }
+
+    /// Conservative p95 in milliseconds: walk buckets low→high accumulating
+    /// decayed weight; return the UPPER edge of the first bucket at which the
+    /// cumulative weight reaches `0.95 * total`. The upper edge (rather than a
+    /// bucket midpoint) is the conservative choice — it never UNDER-reports the
+    /// tail, matching the asymmetric `T_SETUP` cost. Returns `0` when no
+    /// observations have been recorded (total weight ~0). The overflow slot
+    /// reports the last ladder boundary (30000 ms) as a saturating upper edge
+    /// (a construct >30s is implausible; the wire field is `u32` ms).
+    pub fn p95_ms(&self) -> u64 {
+        let w = self.weights.lock();
+        let total: f64 = w.iter().sum();
+        // No observations yet (or fully decayed away): report 0 (the same
+        // "no cold constructs observed" sentinel the mean form used).
+        if total <= f64::EPSILON {
+            return 0;
+        }
+        let target = total * 0.95;
+        let mut cumulative = 0.0;
+        for (idx, weight) in w.iter().enumerate() {
+            cumulative += *weight;
+            if cumulative >= target {
+                return O11_LATENCY_BUCKETS_MS
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        // Overflow slot: saturate at the top ladder boundary.
+                        *O11_LATENCY_BUCKETS_MS
+                            .last()
+                            .expect("O11_LATENCY_BUCKETS_MS is non-empty")
+                    });
+            }
+        }
+        // Unreachable (cumulative reaches `total >= target` in the last slot),
+        // but return the top boundary defensively rather than panic.
+        *O11_LATENCY_BUCKETS_MS
+            .last()
+            .expect("O11_LATENCY_BUCKETS_MS is non-empty")
+    }
+}
+
+impl Default for DecayingP95Histogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // =====================================================================
 // P1 — MAX_CONCURRENT_UPLOADS observation-only inflight + waiters
 // =====================================================================
@@ -1098,6 +1225,17 @@ pub struct DirCacheCounters {
     /// `download_to_directory` and are not separable without entering
     /// `running_actions_manager.rs`).
     pub construct_fetch_ms: PhaseTiming,
+    /// (#obs-tuning-construct-latency-conditioning) Decayed p95 of the SAME
+    /// cold-construct fetch span as `construct_fetch_ms`, fed from the same
+    /// `record_construct_fetch_ms` observation. This is the CONDITIONED estimate
+    /// the worker gossips (`construct_latency_ms_p95`, worker_api field 25/29):
+    /// a decay-windowed conservative tail estimate that (unlike the cumulative
+    /// `construct_fetch_ms.sum/count` mean) does not fossilise since boot and
+    /// biases toward the expensive tail the eventual `T_SETUP` consumer must not
+    /// under-price. `construct_fetch_ms` is KEPT alongside it (unchanged) — it
+    /// backs the `/metrics` DC3 phase decomposition (sum+count, rate-friendly);
+    /// the two are complementary, not redundant.
+    pub construct_fetch_p95: DecayingP95Histogram,
     /// `dir_cache_hit_assemble_ms_{sum,count}` — the HIT-path materialise span
     /// (`hardlink_directory_tree` in `try_hardlink_cached`: cached entry →
     /// dest). This is the cost dir-cache ideas #1/#2 would make MORE frequent.
@@ -1172,6 +1310,7 @@ impl DirCacheCounters {
             hit_clonefile_preempted: AtomicU64::new(0),
             construct_resolve_ms: PhaseTiming::new(),
             construct_fetch_ms: PhaseTiming::new(),
+            construct_fetch_p95: DecayingP95Histogram::new(),
             hit_assemble_ms: PhaseTiming::new(),
             prewarm_warm_redundant: AtomicU64::new(0),
             prewarm_completed: AtomicU64::new(0),
@@ -1223,8 +1362,13 @@ impl DirCacheCounters {
     }
 
     /// Record a COLD-construct fetch+materialise-phase observation (ms).
+    /// Feeds BOTH the cumulative `construct_fetch_ms` sum+count (the `/metrics`
+    /// DC3 phase decomposition) AND the decayed p95 estimator
+    /// (`construct_fetch_p95`, the conditioned `construct_latency_ms_p95`
+    /// gossip). One observation, two derived signals.
     pub fn record_construct_fetch_ms(&self, elapsed_ms: u64) {
         self.construct_fetch_ms.observe_ms(elapsed_ms);
+        self.construct_fetch_p95.observe(elapsed_ms);
     }
 
     /// Record a HIT-path assemble-phase (hardlink materialise) observation (ms).
@@ -2831,6 +2975,203 @@ mod tests {
             !body.contains("dir_cache_dir_cache"),
             "#DC3 doubled metric name (phase): rendered output contains `dir_cache_dir_cache`. \
              body=\n{body}"
+        );
+    }
+
+    /// (#obs-tuning-construct-latency-conditioning) BOOT-DOMINATION FIX — the
+    /// core contract of the conditioning task. A decayed p95 must TRACK a
+    /// sustained regime shift; a since-boot cumulative estimator (mean or
+    /// non-decayed histogram) would FOSSILISE on the early regime and never
+    /// track the new one.
+    ///
+    /// Scenario: 1000 observations in a MID bucket (100 ms → the `<=100`
+    /// bucket) so the p95 sits at 100; then a SUSTAINED low regime of 300
+    /// observations at 5 ms (the `<=5` bucket). With decay (`P95_DECAY_KEEP =
+    /// 0.98`) the 1000 old-mid weights decay to `1000 * 0.98^300 ≈ 2.4` while
+    /// the 300 recent-low weights dominate → the p95 DROPS to 5. Without decay
+    /// (cumulative), the 1000 mid observations still hold the 95th-percentile
+    /// mass (total 1300, p95 index 1235 > the 300 low) → the p95 STAYS
+    /// fossilised at 100.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): comment out the decay loop
+    /// (`for slot in w.iter_mut() { *slot *= P95_DECAY_KEEP; }`) in
+    /// `DecayingP95Histogram::observe`. The histogram becomes cumulative; the
+    /// p95 stays at 100 and this test red-fails with the bespoke
+    /// "boot-domination NOT fixed" message.
+    #[test]
+    fn p95_decays_toward_new_regime_not_fossilised_since_boot() {
+        let h = DecayingP95Histogram::new();
+        // Old regime: a large mass in the 100ms bucket.
+        for _ in 0..1000 {
+            h.observe(100);
+        }
+        assert_eq!(
+            h.p95_ms(),
+            100,
+            "sanity: after 1000×100ms observations the p95 must be the 100ms \
+             bucket upper edge (got {})",
+            h.p95_ms()
+        );
+        // Sustained regime shift: 300 low observations.
+        for _ in 0..300 {
+            h.observe(5);
+        }
+        let p95 = h.p95_ms();
+        assert!(
+            p95 <= 5,
+            "#obs-tuning boot-domination NOT fixed: after a SUSTAINED low regime \
+             (300×5ms following 1000×100ms) the decayed p95 must track the new \
+             regime and fall to <=5ms, but it stayed at {p95}ms — the early-regime \
+             mass never decayed (the decay multiply in observe() was removed, \
+             making the histogram a since-boot cumulative fossil, exactly the \
+             defect this task fixes)"
+        );
+    }
+
+    /// (#obs-tuning-construct-latency-conditioning) The estimator tracks an
+    /// UPWARD regime shift too (the direction that matters most for `T_SETUP`:
+    /// cold-construct cost rising). After a low regime then a sustained high
+    /// regime, the p95 must rise into the high bucket. Complements the
+    /// downward-tracking test above (both directions of the contract).
+    #[test]
+    fn p95_tracks_upward_regime_shift() {
+        let h = DecayingP95Histogram::new();
+        for _ in 0..500 {
+            h.observe(5); // low regime → p95 at 5
+        }
+        assert_eq!(h.p95_ms(), 5, "sanity: low regime p95 is 5ms");
+        for _ in 0..300 {
+            h.observe(8_000); // high regime: 8000 > 5000 → the <=30000 bucket
+        }
+        let p95 = h.p95_ms();
+        assert!(
+            p95 >= 5_000,
+            "#obs-tuning upward-tracking: after a sustained 8000ms regime the p95 \
+             must rise to the high bucket (>=5000ms), got {p95}ms — the estimator \
+             is not tracking the recent expensive-construct regime"
+        );
+    }
+
+    /// (#obs-tuning-construct-latency-conditioning) CONSERVATIVE p95 bucket math
+    /// on a known distribution. 95 observations at 10ms + 5 observations at
+    /// 5000ms: the exact 95th percentile lands ABOVE the 10ms mass, so the
+    /// conservative p95 must be the UPPER edge of the high bucket (5000ms), NOT
+    /// 10ms — under-reporting the tail is the costly `T_SETUP` direction the
+    /// upper-edge choice guards against. Uses a fresh (undecayed-dominant)
+    /// window so the ratio is well-defined.
+    ///
+    /// Mutation: change `p95_ms`'s `cumulative >= target` to accumulate the
+    /// WRONG edge (e.g. return `BUCKETS[idx-1]`), or set `target = total * 0.5`
+    /// → the returned percentile no longer equals the 5000ms conservative edge.
+    #[test]
+    fn p95_is_conservative_upper_edge_on_known_distribution() {
+        let h = DecayingP95Histogram::new();
+        // Interleave so decay does not fully erase the minority tail before we
+        // read: 5000ms tail samples spread through the 10ms bulk.
+        for i in 0..100 {
+            if i % 20 == 19 {
+                h.observe(5_000); // 5 tail samples (indices 19,39,59,79,99)
+            } else {
+                h.observe(10); // 95 bulk samples
+            }
+        }
+        let p95 = h.p95_ms();
+        assert_eq!(
+            p95, 5_000,
+            "#obs-tuning conservative-p95: with 95% mass at 10ms and a 5% tail at \
+             5000ms, the p95 must be the 5000ms bucket upper edge (the tail the \
+             95th percentile reaches), got {p95}ms — a non-conservative or \
+             wrong-target extraction would under-report the tail T_SETUP must not \
+             under-price"
+        );
+    }
+
+    /// (#obs-tuning-construct-latency-conditioning) Empty-histogram sentinel:
+    /// with no observations the p95 is 0 (the same "no cold constructs observed
+    /// yet" sentinel the prior `sum/max(count,1)` mean produced), so a freshly
+    /// booted worker gossips 0, NOT a spurious bucket edge.
+    #[test]
+    fn p95_empty_is_zero_sentinel() {
+        let h = DecayingP95Histogram::new();
+        assert_eq!(
+            h.p95_ms(),
+            0,
+            "#obs-tuning: an unobserved p95 histogram must report 0 (no cold \
+             constructs yet), got {}",
+            h.p95_ms()
+        );
+    }
+
+    /// (#obs-tuning-construct-latency-conditioning) `record_construct_fetch_ms`
+    /// feeds BOTH derived signals from ONE observation: the cumulative
+    /// `construct_fetch_ms` sum+count (the `/metrics` DC3 decomposition, KEPT)
+    /// AND the decayed `construct_fetch_p95` estimator (the conditioned gossip).
+    /// Guards against a future edit dropping one feed.
+    ///
+    /// Mutation: comment out `self.construct_fetch_p95.observe(elapsed_ms);` in
+    /// `record_construct_fetch_ms` → the p95 stays 0 while sum/count update;
+    /// this test red-fails on the p95 assertion.
+    #[test]
+    fn record_construct_fetch_ms_feeds_both_sum_count_and_p95() {
+        let c = DirCacheCounters::new();
+        for _ in 0..50 {
+            c.record_construct_fetch_ms(250);
+        }
+        // Cumulative sum/count (the /metrics DC3 signal) still accumulates.
+        assert_eq!(
+            c.construct_fetch_ms.count.load(Ordering::Relaxed),
+            50,
+            "record_construct_fetch_ms must still feed the cumulative count for \
+             the /metrics DC3 decomposition"
+        );
+        assert_eq!(
+            c.construct_fetch_ms.sum_ms.load(Ordering::Relaxed),
+            50 * 250,
+        );
+        // The conditioned p95 estimator is also fed from the SAME call.
+        assert_eq!(
+            c.construct_fetch_p95.p95_ms(),
+            250,
+            "#obs-tuning: record_construct_fetch_ms must ALSO feed the p95 \
+             estimator (50×250ms → p95 in the <=250 bucket = 250ms), got {} — the \
+             `construct_fetch_p95.observe(..)` feed was dropped",
+            c.construct_fetch_p95.p95_ms()
+        );
+    }
+
+    /// (#obs-tuning-construct-latency-conditioning) EMPIRICAL GROUNDING — the p95
+    /// biases toward the pessimistic cold-construct tail `T_SETUP` must not
+    /// under-price, where the replaced `sum/count` mean landed in the cheap
+    /// middle. Feeds the exact per-worker cold-construct population MEASURED live
+    /// on the fleet under a forced cold-input cascade (2026-07-07): 34, 61, 69,
+    /// 75, 92, 141, 149, 210, 225, 229 ms. Their arithmetic mean is 128.5 ms (the
+    /// old signal's value), but the buckets are `50×1, 100×4, 250×5`, so the 95th
+    /// percentile lands in the `<=250` bucket → p95 = 250 ms. The gate compares
+    /// `T_wait_W` against a construct COST; the mean understates that cost by ~2×
+    /// against this real distribution, so a `T_SETUP` derived from it would hold
+    /// too rarely. The p95 reports the tail the gate actually needs.
+    #[test]
+    fn p95_on_live_measured_cold_population_reports_tail_not_mean_valley() {
+        let h = DecayingP95Histogram::new();
+        // The frozen-across-reads live per-worker means the dispatch measured;
+        // here treated as one worker's recent cold-construct SAMPLES.
+        for ms in [34, 61, 69, 75, 92, 141, 149, 210, 225, 229] {
+            h.observe(ms);
+        }
+        let p95 = h.p95_ms();
+        // Arithmetic mean of the same population = 1285/10 = 128 ms (would fall in
+        // the <=250 bucket's LOWER neighbours). The p95 must be the 250ms edge.
+        assert_eq!(
+            p95, 250,
+            "#obs-tuning: p95 of the live-measured cold population (mean 128.5ms) \
+             must report the pessimistic 250ms tail edge, not the ~100ms a mean \
+             gives — got {p95}ms; T_SETUP needs the tail, not the valley"
+        );
+        assert!(
+            p95 > 128,
+            "#obs-tuning: the p95 ({p95}ms) must exceed the population mean \
+             (128.5ms) — the whole point of conditioning is to stop understating \
+             the cold-construct cost the way the replaced mean did"
         );
     }
 

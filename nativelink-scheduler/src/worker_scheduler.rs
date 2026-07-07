@@ -136,8 +136,9 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     }
 
     /// (#obs-tuning) OBSERVABILITY-ONLY. Updates the worker's last-gossiped
-    /// mean COLD dir-cache construct latency (ms) — `construct_fetch_ms.sum /
-    /// max(count, 1)` from the worker's global `DirCacheCounters`, carried on
+    /// DECAYED p95 COLD dir-cache construct latency (ms) — the
+    /// `construct_fetch_p95` estimator (a time-decayed fixed-bucket histogram)
+    /// from the worker's global `DirCacheCounters`, carried on
     /// the `BlobsAvailable` chunk-0 header. This is the real cold-tree
     /// reconstruct cost `T_SETUP` should eventually equal; it is currently only
     /// LOGGED (periodic `tag = "worker_construct_latency"`) for tuning — the
@@ -147,7 +148,7 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     async fn update_worker_construct_latency(
         &self,
         _worker_id: &WorkerId,
-        _construct_latency_ms_mean: u32,
+        _construct_latency_ms_p95: u32,
     ) -> Result<(), Error> {
         Ok(())
     }

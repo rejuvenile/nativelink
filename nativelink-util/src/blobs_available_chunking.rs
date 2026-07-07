@@ -130,7 +130,7 @@ pub fn chunk_blobs_available(
         disk_pressured,
         evicted_blob_infos,
         // (#obs-tuning) OBSERVABILITY-ONLY chunk-0 scalar (like cpu_load_pct).
-        construct_latency_ms_mean,
+        construct_latency_ms_p95,
     } = notification;
 
     // Fold legacy field 2 (`digests`) into `digest_infos` for backwards
@@ -208,8 +208,8 @@ pub fn chunk_blobs_available(
             // (#obs-tuning) Cold-construct latency: chunk-0-only scalar (like
             // cpu_load_pct); the accumulator carries chunk 0's value forward
             // into the reassembled notification. OBSERVABILITY-ONLY.
-            construct_latency_ms_mean: if sequence == 0 {
-                construct_latency_ms_mean
+            construct_latency_ms_p95: if sequence == 0 {
+                construct_latency_ms_p95
             } else {
                 0
             },
@@ -735,18 +735,18 @@ mod tests {
         }
     }
 
-    /// (#obs-tuning) `construct_latency_ms_mean` is a chunk-0-only scalar (like
+    /// (#obs-tuning) `construct_latency_ms_p95` is a chunk-0-only scalar (like
     /// cpu_load_pct): the accumulator carries chunk 0's value forward, and
     /// subsequent chunks MUST leave it at the proto3 default `0` so the value is
     /// not double-counted or contradicted across chunks.
     ///
     /// Mutation step: in `chunk_blobs_available`, change the
-    /// `construct_latency_ms_mean`'s `if sequence == 0 { .. } else { 0 }` to
+    /// `construct_latency_ms_p95`'s `if sequence == 0 { .. } else { 0 }` to
     /// carry the value on EVERY chunk. The non-zero-chunk assertion red-fails.
     #[test]
     fn construct_latency_rides_chunk_zero_only() {
         let n = BlobsAvailableNotification {
-            construct_latency_ms_mean: 4_242,
+            construct_latency_ms_p95: 4_242,
             digest_infos: (0..10).map(bdi).collect(),
             ..Default::default()
         };
@@ -754,13 +754,13 @@ mod tests {
             .expect("multi-chunk must succeed");
         assert!(chunks.len() >= 3, "need >1 chunk to test scalar placement");
         assert_eq!(
-            chunks[0].construct_latency_ms_mean, 4_242,
-            "#obs-tuning: chunk 0 must carry construct_latency_ms_mean"
+            chunks[0].construct_latency_ms_p95, 4_242,
+            "#obs-tuning: chunk 0 must carry construct_latency_ms_p95"
         );
         for c in &chunks[1..] {
             assert_eq!(
-                c.construct_latency_ms_mean, 0,
-                "#obs-tuning: non-zero chunks must leave construct_latency_ms_mean \
+                c.construct_latency_ms_p95, 0,
+                "#obs-tuning: non-zero chunks must leave construct_latency_ms_p95 \
                  at the proto3 default (chunk-0-only scalar)"
             );
         }
@@ -776,7 +776,7 @@ mod tests {
     fn construct_latency_proto_roundtrip() {
         use prost::Message;
         let n = BlobsAvailableNotification {
-            construct_latency_ms_mean: 1_337,
+            construct_latency_ms_p95: 1_337,
             digest_infos: vec![bdi(1), bdi(2)],
             ..Default::default()
         };
@@ -784,8 +784,8 @@ mod tests {
         let decoded = BlobsAvailableNotification::decode(&bytes[..])
             .expect("#obs-tuning: BlobsAvailableNotification must round-trip through prost");
         assert_eq!(
-            decoded.construct_latency_ms_mean, 1_337,
-            "#obs-tuning: construct_latency_ms_mean (tag 25) did not survive the \
+            decoded.construct_latency_ms_p95, 1_337,
+            "#obs-tuning: construct_latency_ms_p95 (tag 25) did not survive the \
              prost encode/decode round-trip"
         );
         // Co-resident fields must also survive (additive field did not corrupt

@@ -340,7 +340,7 @@ fn empty_ba(endpoint: &str) -> BlobsAvailableNotification {
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
-        construct_latency_ms_mean: 0,
+        construct_latency_ms_p95: 0,
     }
 }
 

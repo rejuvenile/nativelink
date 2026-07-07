@@ -1355,22 +1355,25 @@ fn get_e_core_load_pct() -> u32 {
     E_CORE_PCT.load(Ordering::Relaxed)
 }
 
-/// (#obs-tuning) OBSERVABILITY-ONLY. Returns the worker's mean COLD dir-cache
-/// construct latency in milliseconds — `construct_fetch_ms.sum /
-/// max(construct_fetch_ms.count, 1)` from the process-global `DirCacheCounters`
-/// (`o11_probes.rs`). `construct_fetch_ms` is the COLD full fetch+assemble span
-/// recorded in `directory_cache.rs` (`record_construct_fetch_ms`) — the real
-/// cold-tree reconstruct cost `T_SETUP` should eventually equal. Returns `0`
-/// when no cold constructs have been observed yet (count == 0). Gossiped on the
-/// `BlobsAvailable` chunk-0 header so the scheduler can LOG it for `T_SETUP`
-/// tuning; NOT consumed by any routing decision. Cheap: two relaxed atomic
-/// loads, no lock, no await. Saturating cast to `u32` (a mean latency in ms fits
-/// `u32` for any realistic construct; saturates rather than wraps defensively).
-fn get_construct_latency_ms_mean() -> u32 {
+/// (#obs-tuning-construct-latency-conditioning) OBSERVABILITY-ONLY. DECAYED p95
+/// of the worker's COLD
+/// dir-cache construct latency, read from the process-global `DirCacheCounters`
+/// `construct_fetch_p95` estimator (`o11_probes.rs`). Fed from the same
+/// `record_construct_fetch_ms` observation as the cumulative `construct_fetch_ms`
+/// sum+count, but conditioned: an exponentially time-decayed fixed-bucket
+/// histogram whose p95 tracks the RECENT cold-construct regime (not a since-boot
+/// fossil) and biases toward the expensive tail `T_SETUP` must not under-price.
+/// The COLD full fetch+assemble span is recorded in `directory_cache.rs`
+/// (`record_construct_fetch_ms`) — the real cold-tree reconstruct cost `T_SETUP`
+/// should eventually equal. Returns `0` when no cold constructs have been
+/// observed yet (empty histogram). Gossiped on the `BlobsAvailable` chunk-0
+/// header so the scheduler can LOG it for `T_SETUP` tuning; NOT consumed by any
+/// routing decision. Cheap: one mutex acquire + a fixed bucket walk, no await.
+/// Saturating cast to `u32` (a p95 latency in ms fits `u32` for any realistic
+/// construct; saturates rather than wraps defensively).
+fn get_construct_latency_ms_p95() -> u32 {
     let counters = nativelink_util::o11_probes::dir_cache_counters();
-    let sum_ms = counters.construct_fetch_ms.sum_ms.load(Ordering::Relaxed);
-    let count = counters.construct_fetch_ms.count.load(Ordering::Relaxed);
-    u32::try_from(sum_ms / count.max(1)).unwrap_or(u32::MAX)
+    u32::try_from(counters.construct_fetch_p95.p95_ms()).unwrap_or(u32::MAX)
 }
 
 /// Returns host swap-used bytes sampled by the dedicated sampler thread.
@@ -4298,11 +4301,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // is the free-bytes gauge (observability + fail-open ranking).
         let available_disk_bytes = get_available_disk_bytes();
         let disk_pressured = disk_gate_sampler_pressured();
-        // (#obs-tuning) OBSERVABILITY-ONLY: mean cold dir-cache construct
+        // (#obs-tuning) OBSERVABILITY-ONLY: decayed p95 cold dir-cache construct
         // latency (ms) from the global DirCacheCounters. Rides chunk 0; LOGGED
         // by the scheduler for T_SETUP tuning; not a routing input.
-        let construct_latency_ms_mean = get_construct_latency_ms_mean();
-        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} memory_pressure_level={memory_pressure_level} memory_pressured={memory_pressured} available_disk_bytes={available_disk_bytes} disk_pressured={disk_pressured} construct_latency_ms_mean={construct_latency_ms_mean}");
+        let construct_latency_ms_p95 = get_construct_latency_ms_p95();
+        debug!("BlobsAvailable cpu_load_pct={load} p_core={p_load} e_core={e_load} indefinite_pin_saturated={indefinite_pin_saturated} swap_used_bytes={swap_used_bytes} memory_pressure_level={memory_pressure_level} memory_pressured={memory_pressured} available_disk_bytes={available_disk_bytes} disk_pressured={disk_pressured} construct_latency_ms_p95={construct_latency_ms_p95}");
         let notification = BlobsAvailableNotification {
             worker_cas_endpoint: state.cas_endpoint.clone(),
             digests: Vec::new(),
@@ -4386,8 +4389,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // the local atomic + statvfs fallback, not this wire boolean).
             available_disk_bytes,
             disk_pressured,
-            // (#obs-tuning) OBSERVABILITY-ONLY cold-construct latency (mean ms).
-            construct_latency_ms_mean,
+            // (#obs-tuning) OBSERVABILITY-ONLY cold-construct latency (p95 ms).
+            construct_latency_ms_p95,
         };
 
         // (#99) Partition into bounded `BlobsAvailableChunk` envelopes and
@@ -5946,13 +5949,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             // (#obs-tuning)
                                                             // OBSERVABILITY-ONLY cold
                                                             // dir-cache construct latency
-                                                            // (mean ms); the one-shot
+                                                            // (p95 ms); the one-shot
                                                             // post-action delta carries
                                                             // the AUTHORITATIVE current
                                                             // value (global counters),
                                                             // like the periodic heartbeat.
-                                                            construct_latency_ms_mean:
-                                                                get_construct_latency_ms_mean(),
+                                                            construct_latency_ms_p95:
+                                                                get_construct_latency_ms_p95(),
                                                         };
                                                     // (FL-688 v3 §3.8 part 2) Route the
                                                     // post-action output-digest delta through

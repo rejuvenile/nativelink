@@ -2815,14 +2815,14 @@ impl SimpleScheduler {
                             return;
                         };
                         emit_speculative_hold_counters_log(worker_scheduler.get_metrics());
-                        for (worker_id, construct_latency_ms_mean) in
+                        for (worker_id, construct_latency_ms_p95) in
                             worker_scheduler.construct_latency_snapshot().await
                         {
                             info!(
                                 tag = "worker_construct_latency",
                                 worker_id = %worker_id.0,
-                                construct_latency_ms_mean,
-                                "worker-gossiped cold dir-cache construct latency (mean ms); \
+                                construct_latency_ms_p95,
+                                "worker-gossiped cold dir-cache construct latency (decayed p95 ms); \
                                  T_SETUP tuning input — LOGGED only, not yet consumed by the hold gate"
                             );
                         }
@@ -3033,10 +3033,10 @@ impl WorkerScheduler for SimpleScheduler {
     async fn update_worker_construct_latency(
         &self,
         worker_id: &WorkerId,
-        construct_latency_ms_mean: u32,
+        construct_latency_ms_p95: u32,
     ) -> Result<(), Error> {
         self.worker_scheduler
-            .update_worker_construct_latency(worker_id, construct_latency_ms_mean)
+            .update_worker_construct_latency(worker_id, construct_latency_ms_p95)
             .await
     }
 

@@ -2912,20 +2912,20 @@ impl WorkerConnection {
             warn!(worker_id=?self.worker_id, ?err, disk_pressured, available_disk_bytes, "Failed to update worker disk pressure");
         }
 
-        // (#obs-tuning) OBSERVABILITY-ONLY. Plumb the worker's gossiped mean
-        // cold dir-cache construct latency (chunk-0 scalar) into the scheduler
+        // (#obs-tuning) OBSERVABILITY-ONLY. Plumb the worker's gossiped decayed
+        // p95 cold dir-cache construct latency (chunk-0 scalar) into the scheduler
         // so the periodic `tag = "worker_construct_latency"` log can surface it
         // for `T_SETUP` tuning. Unconditional plumb of the real value (`0` when
         // the worker has run no cold constructs yet). Stored on the `Worker`
         // ONLY — the hold gate does NOT consume it, so this changes NO
         // scheduling decision.
-        let construct_latency_ms_mean = notification.construct_latency_ms_mean;
+        let construct_latency_ms_p95 = notification.construct_latency_ms_p95;
         if let Err(err) = self
             .scheduler
-            .update_worker_construct_latency(&self.worker_id, construct_latency_ms_mean)
+            .update_worker_construct_latency(&self.worker_id, construct_latency_ms_p95)
             .await
         {
-            warn!(worker_id=?self.worker_id, ?err, construct_latency_ms_mean, "Failed to update worker construct latency");
+            warn!(worker_id=?self.worker_id, ?err, construct_latency_ms_p95, "Failed to update worker construct latency");
         }
 
         // Mirror capacity report (review #1): the worker advertises its

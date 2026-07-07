@@ -174,17 +174,18 @@ pub struct Worker {
     #[metric(help = "E-core load percentage reported by the worker.")]
     pub e_core_load_pct: u32,
 
-    /// (#obs-tuning) OBSERVABILITY-ONLY. The worker's last-gossiped mean COLD
-    /// dir-cache construct latency in milliseconds — `construct_fetch_ms.sum /
-    /// max(count, 1)` from the worker's global `DirCacheCounters`, carried on
-    /// every `BlobsAvailable` heartbeat (chunk-0 scalar). This is the real
-    /// cold-tree reconstruct cost `T_SETUP` should eventually equal; it is
+    /// (#obs-tuning) OBSERVABILITY-ONLY. The worker's last-gossiped DECAYED p95
+    /// COLD dir-cache construct latency in milliseconds — the `construct_fetch_p95`
+    /// estimator (a time-decayed fixed-bucket histogram, `o11_probes.rs`) from the
+    /// worker's global `DirCacheCounters`, carried on every `BlobsAvailable`
+    /// heartbeat (chunk-0 scalar). This is the real cold-tree reconstruct cost
+    /// `T_SETUP` should eventually equal (biased to the expensive tail); it is
     /// currently only LOGGED (periodic `tag = "worker_construct_latency"`) for
     /// tuning — the hold gate does NOT consume it, so this field changes NO
     /// scheduling decision. `0` means the worker reported no cold constructs yet
-    /// (count == 0) or is a pre-#obs-tuning worker (proto3 default).
-    #[metric(help = "Worker-gossiped mean cold dir-cache construct latency (ms); T_SETUP tuning input, LOGGED only.")]
-    pub construct_latency_ms_mean: u32,
+    /// (empty histogram) or is a pre-#obs-tuning worker (proto3 default).
+    #[metric(help = "Worker-gossiped decayed-p95 cold dir-cache construct latency (ms); T_SETUP tuning input, LOGGED only.")]
+    pub construct_latency_ms_p95: u32,
 
     /// (#sched-blend) Number of performance (P) logical CPUs the worker
     /// reported on its connect hello frame. Static for the worker's
@@ -366,7 +367,7 @@ impl Worker {
             e_core_load_pct: 0,
             // (#obs-tuning) OBSERVABILITY-ONLY: 0 until the worker gossips a
             // cold-construct latency; never a scheduling input.
-            construct_latency_ms_mean: 0,
+            construct_latency_ms_p95: 0,
             has_reported_load: false,
             p_core_count,
             e_core_count,
