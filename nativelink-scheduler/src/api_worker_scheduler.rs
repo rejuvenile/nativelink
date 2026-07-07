@@ -1729,6 +1729,127 @@ impl ApiWorkerSchedulerImpl {
         worker_id
     }
 
+    /// (#specprefetch-rebind §2.1) Peek-only selector for the SPECULATIVE
+    /// prefetch target: the capability-matched, best-locality worker MOST LIKELY
+    /// to run the op — regardless of CAPACITY (a busy / 100%-CPU worker is a
+    /// valid target). This is the fix for the boondoggle (design §0): the old
+    /// path routed prefetch through `inner_find_worker_for_action`, whose first
+    /// line returns `None` unless some worker `can_accept_work()` (IDLE) — but
+    /// the trigger fires only on a BACKLOG (all workers busy), so the two are
+    /// mutually exclusive and the feature NEVER fired.
+    ///
+    /// Differences from `inner_find_worker_for_action` (the real matcher):
+    /// - RESERVES NOTHING and PROMOTES NOTHING in the LRU — it takes `&self`,
+    ///   peeks worker state read-only. A prefetch is speculative; the real
+    ///   assignment still runs through `inner_find_and_reserve_worker` later, and
+    ///   the binding to this worker is the EXISTING self-truthing Tier-1
+    ///   (`cached_directory_digests` gossip → `has_root_match`), not this pick
+    ///   (§2.2). So it must not perturb the matcher's state.
+    /// - DROPS the CAPACITY gates (`can_accept_work()` / `is_paused` /
+    ///   `max_inflight_tasks`): a busy worker is exactly the intended target
+    ///   (pipeline the next tree's construction against the current execution).
+    /// - KEEPS the HEALTH gates (`quarantined_at`, `indefinite_pin_saturated`,
+    ///   `swap_pressured`, `disk_pressured`) — prefetching to a pressured worker
+    ///   wastes its already-scarce resource. This is the exact health subset of
+    ///   `worker_is_viable` (`:1798`) MINUS `can_accept_work()`.
+    ///
+    /// Ranking (reusing the matcher's signals, no new scoring):
+    /// - Tier-1 locality: among health-OK candidates that already HOLD the
+    ///   `input_root_digest` (`cached_directory_digests` or
+    ///   `cached_subtree_digests`, the same signal Tier-1 at `:2050` uses), pick
+    ///   the one with the lowest `effective_load_score` (the freest predicted
+    ///   landing spot among holders).
+    /// - Cold-tree fallback: no health-OK holder → pick the lowest
+    ///   `effective_load_score` health-OK candidate — the load-balanced predicted
+    ///   pick, i.e. where the op would actually land when a slot frees.
+    ///
+    /// `per_cycle_targets` (§2.4 placement cap): the caller's per-`do_try_match`
+    /// per-worker prefetch counter. A worker at `PREFETCH_PER_WORKER_PER_CYCLE_CAP`
+    /// this cycle is SKIPPED so a same-input fan-out spreads across the top-K
+    /// locality holders instead of piling on one. The selector only READS this
+    /// map (peek-only); the caller bumps the chosen worker's count after a
+    /// successful send.
+    ///
+    /// Returns `None` when no capability-matched, health-OK, under-cap worker
+    /// exists (the caller emits nothing).
+    fn find_prefetch_target_worker(
+        &self,
+        platform_properties: &PlatformProperties,
+        input_root_digest: &DigestInfo,
+        per_cycle_targets: &HashMap<WorkerId, usize>,
+    ) -> Option<WorkerId> {
+        let candidates = self
+            .capability_index
+            .find_matching_workers(platform_properties, false);
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // The HEALTH subset of `worker_is_viable` (`:1798`) MINUS the capacity
+        // gate: capability match + dynamic Minimum props + NOT quarantined /
+        // pin-saturated / swap-pressured / disk-pressured. Also honors the §2.4
+        // per-cycle placement cap (a worker already at the cap this cycle is not
+        // a valid target). `can_accept_work()` is DELIBERATELY absent — a busy
+        // worker is the intended prefetch target.
+        let health_ok = |worker_id: &WorkerId| -> bool {
+            if per_cycle_targets.get(worker_id).copied().unwrap_or(0)
+                >= PREFETCH_PER_WORKER_PER_CYCLE_CAP
+            {
+                return false;
+            }
+            let Some(w) = self.workers.0.peek(worker_id) else {
+                return false;
+            };
+            if w.quarantined_at.is_some()
+                || w.indefinite_pin_saturated
+                || w.swap_pressured
+                || w.disk_pressured
+            {
+                return false;
+            }
+            platform_properties.is_satisfied_by(&w.platform_properties, false)
+        };
+
+        let load_of = |worker_id: &WorkerId| -> u64 {
+            self.workers
+                .0
+                .peek(worker_id)
+                .map(|w| {
+                    effective_load_score(
+                        w.p_core_load_pct,
+                        w.e_core_load_pct,
+                        w.cpu_load_pct,
+                        w.has_reported_load,
+                    )
+                })
+                .unwrap_or(u64::MAX)
+        };
+
+        // Tier-1 locality: freest health-OK holder of the exact input_root.
+        let holder = candidates
+            .iter()
+            .filter(|wid| health_ok(wid))
+            .filter(|wid| {
+                self.workers.0.peek(wid).is_some_and(|w| {
+                    w.cached_directory_digests.contains(input_root_digest)
+                        || w.cached_subtree_digests.contains(input_root_digest)
+                })
+            })
+            .min_by_key(|wid| load_of(wid))
+            .cloned();
+        if let Some(wid) = holder {
+            return Some(wid);
+        }
+
+        // Cold-tree fallback: the load-balanced predicted pick among health-OK
+        // candidates (where the op would actually land when a slot frees).
+        candidates
+            .iter()
+            .filter(|wid| health_ok(wid))
+            .min_by_key(|wid| load_of(wid))
+            .cloned()
+    }
+
     /// Atomically finds a suitable worker AND reserves it for the given
     /// operation by mutating the worker's state (reducing platform properties,
     /// inserting into `running_action_infos`). Returns the worker ID, the
@@ -2883,6 +3004,24 @@ const OUTPUT_PRODUCER_MAP_CAP: usize = 8192;
 // assignments; over-cap evicts oldest, fine since TTL self-reaps.
 const PREFETCH_AFFINITY_CAP: usize = 64;
 
+/// (#specprefetch-rebind §2.4) Per-worker PLACEMENT cap on speculative prefetch
+/// emits within a single `do_try_match` cycle. A same-input fan-out (the common
+/// Bazel shape — N queued ops sharing one `input_root_digest`) makes the
+/// capacity-agnostic locality selector return the SAME best-locality worker for
+/// every op, which would pile the whole fan-out's prewarm onto one worker. This
+/// cap makes the selector SPREAD prewarms across the top-K locality holders: once
+/// a worker has received K prefetches this cycle it is skipped and the next-best
+/// locality worker is chosen.
+///
+/// K = 2: prewarm the top-2 holders so more than one worker is warm when a slot
+/// frees (resilience if the first worker's slot does not free soon, or it dies),
+/// WITHOUT turning a large fan-out into fleet-wide speculative construction (each
+/// prewarm competes for the shared spawn_blocking pool / `/srv/bulk` ZFS — §2.5).
+/// With the default `speculative_prefetch_backlog_threshold = 3` (top-3 ops per
+/// cycle), a same-input triple spreads onto 2 workers rather than 1. This is a
+/// PLACEMENT bound (distinct from the pin sub-budget, which bounds disk — §2.4).
+const PREFETCH_PER_WORKER_PER_CYCLE_CAP: usize = 2;
+
 /// (#output-locality-probe) Cost-control cap (no-silent-truncation rule): output
 /// `Tree` blobs LARGER than this are NOT fetched/decoded on the detached recorder
 /// task; the skip is `warn!`-logged AND counted in
@@ -3481,18 +3620,33 @@ impl ApiWorkerScheduler {
         self.inner.read().await.prefetch_coalesce_guard.len()
     }
 
-    /// (#speculative-prefetch) Emits a `PrefetchInputs` (tag-15) message to the
-    /// best idle worker that can accept the given platform properties, WITHOUT
-    /// reserving a slot. Records the op in `prefetch_coalesce_guard` so
-    /// `immediate_evict_worker` reaps it when the op is re-queued.
+    /// (#speculative-prefetch, #specprefetch-rebind §2.1) Emits a `PrefetchInputs`
+    /// (tag-15) message to the capability-matched, best-locality worker MOST
+    /// LIKELY to run the op — regardless of CAPACITY (a busy / 100%-CPU worker is
+    /// a valid target) — WITHOUT reserving a slot. Records the op in
+    /// `prefetch_coalesce_guard` so `immediate_evict_worker` reaps it when the op
+    /// is re-queued.
+    ///
+    /// The target is chosen by `find_prefetch_target_worker` (peek-only,
+    /// capacity-agnostic, HEALTH-gated). This fixes the boondoggle (design §0):
+    /// the prior implementation routed through `inner_find_worker_for_action`,
+    /// which returns `None` unless some worker is IDLE — but the trigger fires
+    /// only on a BACKLOG (all workers busy), so it NEVER fired under load.
     ///
     /// Coalesces per `op_id`: if a coalesce record for `op_id` already exists (a
     /// prior cycle emitted a prefetch), skips and bumps
     /// `speculative_prefetch_coalesce_suppressed`. This enforces G5 at the
     /// scheduler side: at most ONE in-flight prefetch per op.
     ///
+    /// `per_cycle_targets` (§2.4 placement cap): the caller's per-`do_try_match`
+    /// per-worker prefetch counter. `find_prefetch_target_worker` skips a worker
+    /// already at `PREFETCH_PER_WORKER_PER_CYCLE_CAP` this cycle so a same-input
+    /// fan-out SPREADS across the top-K locality holders instead of piling on one.
+    /// On a successful send the chosen worker's count is bumped here (a lone
+    /// direct call passes a fresh empty map → the cap is inert for a single emit).
+    ///
     /// Returns `true` ONLY if a worker was found AND the message was actually
-    /// sent; `false` if no idle worker, the op was already coalesced, or the
+    /// sent; `false` if no target worker, the op was already coalesced, or the
     /// `tx.send` failed (worker disconnected mid-emit).
     pub async fn send_prefetch_inputs(
         &self,
@@ -3501,6 +3655,7 @@ impl ApiWorkerScheduler {
         input_root_digest: DigestInfo,
         missing_digest_peers: Vec<MissingBlobPeers>,
         ttl_s: u64,
+        per_cycle_targets: &mut HashMap<WorkerId, usize>,
     ) -> bool {
         let mut inner = self.inner.write().await;
 
@@ -3514,9 +3669,15 @@ impl ApiWorkerScheduler {
             return false;
         }
 
-        // Peek-only: find the best idle worker without reserving a slot.
-        // Reuse `inner_find_worker_for_action` which scans LRU (no mutation).
-        let worker_id = match inner.inner_find_worker_for_action(platform_properties, false) {
+        // Peek-only, capacity-agnostic, health-gated target: the predicted
+        // worker (best-locality holder, else load-balanced pick) even if busy.
+        // Reserves nothing, promotes nothing in the LRU (§2.1). Honors the
+        // per-cycle per-worker placement cap (§2.4).
+        let worker_id = match inner.find_prefetch_target_worker(
+            platform_properties,
+            &input_root_digest,
+            per_cycle_targets,
+        ) {
             Some(id) => id,
             None => return false,
         };
@@ -3558,6 +3719,11 @@ impl ApiWorkerScheduler {
             // not treat a failed send as a successful emit).
             return false;
         }
+        // (§2.4) Count this successful placement so a same-input fan-out within
+        // the SAME do_try_match cycle spreads onto the next-best locality holder
+        // once this worker hits PREFETCH_PER_WORKER_PER_CYCLE_CAP. Only bumped on
+        // a delivered send (not on coalesce-skip / no-target / failed send).
+        *per_cycle_targets.entry(worker_id.clone()).or_insert(0) += 1;
         debug!(
             ?worker_id,
             %operation_id,
@@ -4147,6 +4313,23 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| (w.p_core_count, w.e_core_count))
+    }
+
+    /// (#specprefetch-rebind) Number of ops in a worker's `running_action_infos`.
+    /// Test-only — asserts the Stage-A prefetch selector is PEEK-ONLY: a prefetch
+    /// selection must not reserve a slot (must not grow `running_action_infos`).
+    /// `None` when the worker is absent.
+    #[must_use]
+    pub async fn worker_running_action_count_for_test(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Option<usize> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .0
+            .peek(worker_id)
+            .map(|w| w.running_action_infos.len())
     }
 
     /// (#sched-zeroload) Returns the current `workers_never_reported_load` gauge

@@ -1799,18 +1799,25 @@ impl SimpleScheduler {
             );
         }
 
-        // (#specprefetch) Speculative prefetch backlog trigger.
+        // (#specprefetch, #specprefetch-rebind §2.1) Speculative prefetch backlog
+        // trigger.
         //
         // After the normal match cycle, if the feature is enabled and the still-
         // queued depth is at or above the threshold, emit `PrefetchInputs` (tag-15)
-        // to the best idle worker for each top-priority still-queued action. We
-        // re-query rather than carrying a "not-matched" list because actions may
-        // have been matched by OTHER concurrent `do_try_match` callers and we want
-        // the freshest view of what is still truly queued.
+        // to the PREDICTED (capability-matched, best-locality) worker for each
+        // top-priority still-queued action — capacity-agnostic, so a BUSY worker
+        // is a valid target (that is the whole point: a backlog means workers are
+        // busy; the old idle-only target NEVER fired — design §0). We re-query
+        // rather than carrying a "not-matched" list because actions may have been
+        // matched by OTHER concurrent `do_try_match` callers and we want the
+        // freshest view of what is still truly queued.
         //
-        // Fan-out is capped by `PREFETCH_AFFINITY_CAP` inside `send_prefetch_inputs`
-        // (coalesces if already emitted for this op). The missing_digest_peers field
-        // is empty here; the worker's `WorkerProxyStore` initiates P2P pulls when
+        // Per-op dedup: `send_prefetch_inputs` coalesces if a prefetch was already
+        // emitted for this op (G5 fan-out=1). Per-worker PLACEMENT: a same-input
+        // fan-out is spread across the top-K locality holders by the per-cycle
+        // per-worker cap (`PREFETCH_PER_WORKER_PER_CYCLE_CAP`, §2.4), threaded via
+        // `per_cycle_prefetch_targets` below. The missing_digest_peers field is
+        // empty here; the worker's `WorkerProxyStore` initiates P2P pulls when
         // StartAction arrives with peer hints. No per-RPC timeout: worker has its
         // own self-fired TTL (min(ttl_s, 120)s). Gate: feature flag OFF = no-op
         // (byte-identical to pre-feature behavior).
@@ -1826,6 +1833,18 @@ impl SimpleScheduler {
                 let still_queued: Vec<Box<dyn ActionStateResult>> = stream.collect().await;
                 let queue_depth = still_queued.len() as u64;
                 if queue_depth >= self.speculative_prefetch_backlog_threshold {
+                    // (#specprefetch-rebind §2.4) Per-cycle per-worker prefetch
+                    // counter. A same-input fan-out makes the capacity-agnostic
+                    // selector return the SAME best-locality worker for every
+                    // queued op; this map lets `send_prefetch_inputs` cap emits
+                    // per worker (PREFETCH_PER_WORKER_PER_CYCLE_CAP) so prewarms
+                    // SPREAD across the top-K locality holders instead of piling
+                    // on one. Scoped to THIS do_try_match cycle (dropped at the
+                    // end of the block).
+                    // CAPPED AT candidates.len(): one entry per worker that
+                    // received a prefetch this cycle, bounded by fleet size;
+                    // dropped at end of cycle.
+                    let mut per_cycle_prefetch_targets: HashMap<WorkerId, usize> = HashMap::new();
                     for action_state_result in still_queued
                         .into_iter()
                         .take(self.speculative_prefetch_backlog_threshold as usize)
@@ -1868,6 +1887,7 @@ impl SimpleScheduler {
                                 action_info.input_root_digest,
                                 vec![],
                                 self.speculative_prefetch_ttl_s,
+                                &mut per_cycle_prefetch_targets,
                             ).await;
                         }
                     }

@@ -32,7 +32,7 @@
 //! nativelink-worker/tests/speculative_prefetch_worker_test.rs.
 
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -290,7 +290,7 @@ async fn t1b_feature_off_leaves_coalesce_guard_empty() -> Result<(), Error> {
         assert!(
             ws.send_prefetch_inputs(
                 &PlatformProperties::default(), &OperationId::default(),
-                DigestInfo::new([1u8; 32], 1), vec![], 60,
+                DigestInfo::new([1u8; 32], 1), vec![], 60, &mut HashMap::new(),
             ).await,
             "non-vacuity precondition: a direct emit to an idle worker must succeed"
         );
@@ -384,7 +384,7 @@ async fn t2_send_prefetch_inputs_delivers_to_idle_worker() -> Result<(), Error> 
     let input_root = DigestInfo::new([7u8; 32], 4242);
     let sent = scheduler
         .worker_scheduler_for_test()
-        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
         .await;
     assert!(
         sent,
@@ -461,12 +461,12 @@ async fn t3_coalesce_guard_suppresses_duplicate_emit() -> Result<(), Error> {
         .load(core::sync::atomic::Ordering::Relaxed);
 
     let first = ws
-        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
         .await;
     assert!(first, "T3: first emit for a fresh op must succeed");
 
     let second = ws
-        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        .send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
         .await;
     assert!(
         !second,
@@ -543,13 +543,13 @@ async fn t4_coalesce_guard_reaped_on_worker_evict() -> Result<(), Error> {
     // 1) First emit for the op → recorded in the coalesce guard (goes to A, the
     //    only idle worker).
     assert!(
-        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
             .await,
         "T4: first emit must succeed"
     );
     // 2) A second emit for the same op is coalesced (proves the entry exists).
     assert!(
-        !ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        !ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
             .await,
         "T4: second emit must be coalesced (entry present)"
     );
@@ -586,7 +586,7 @@ async fn t4_coalesce_guard_reaped_on_worker_evict() -> Result<(), Error> {
     let worker_b = WorkerId("t4_worker_b".to_string());
     let _rx_b = add_worker(&scheduler, worker_b.clone(), PlatformProperties::default()).await?;
     assert!(
-        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
             .await,
         "distsys BLOCK-1 (2026-07-05): coalesce guard NOT reaped on worker evict — a rerouted \
          op's stale entry permanently suppressed its re-prefetch to a healthy worker. \
@@ -638,7 +638,7 @@ async fn d2_coalesce_guard_reaped_on_unreserve_reroute() -> Result<(), Error> {
     // 1) First emit for the op → recorded in the coalesce guard (goes to A, the
     //    only idle worker).
     assert!(
-        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
             .await,
         "D2: first emit must succeed"
     );
@@ -649,7 +649,7 @@ async fn d2_coalesce_guard_reaped_on_unreserve_reroute() -> Result<(), Error> {
     );
     // 2) A second emit for the same op is coalesced (proves the entry exists).
     assert!(
-        !ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        !ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
             .await,
         "D2: second emit must be coalesced (entry present)"
     );
@@ -690,7 +690,7 @@ async fn d2_coalesce_guard_reaped_on_unreserve_reroute() -> Result<(), Error> {
     // 5) Worker A is idle again; re-emitting for the SAME op MUST now succeed
     //    because the reap cleared the stale entry (the end-to-end consequence).
     assert!(
-        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60)
+        ws.send_prefetch_inputs(&PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut HashMap::new())
             .await,
         "D2 (2026-07-06): re-prefetch of a rerouted op was suppressed by the stale coalesce \
          entry — inner_unreserve_worker must reap it so the op can re-prefetch after reroute."
@@ -751,6 +751,7 @@ async fn send_prefetch_inputs_no_eligible_idle_worker_no_emit() -> Result<(), Er
             DigestInfo::new([91u8; 32], 900),
             vec![],
             60,
+            &mut HashMap::new(),
         )
         .await;
     assert!(
@@ -867,5 +868,396 @@ async fn t9_proto_roundtrip_prefetch_inputs() -> Result<(), Error> {
         decoded.ttl_s, 90,
         "T9: ttl_s field corrupted in proto roundtrip (the forwarded operator TTL)"
     );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage A helpers (§2.1 capacity-agnostic selector + §2.4 per-worker cap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Add a worker with `max_inflight_tasks = 1` and reserve one dummy op onto it,
+/// so `can_accept_work() == false` (BUSY) while the worker stays HEALTHY (no
+/// quarantine / pressure). This is the exact regime the boondoggle failed on:
+/// a backlog means every capable worker is busy. Returns the worker's rx (with
+/// the ConnectionResult already drained; no StartAction is sent because
+/// `find_and_reserve_worker` returns the tx/msg to the caller unsent).
+async fn add_busy_healthy_worker(
+    scheduler: &SimpleScheduler,
+    worker_id: WorkerId,
+    props: PlatformProperties,
+) -> Result<mpsc::UnboundedReceiver<UpdateForWorker>, Error> {
+    let rx = add_worker_with_slots(scheduler, worker_id.clone(), props.clone(), 1).await?;
+    // Reserve a filler op so running_action_infos.len() (1) == max_inflight (1)
+    // → can_accept_work() is false. A UNIQUE digest per worker so the filler
+    // reserves onto THIS worker (the reserve is capacity-gated + locality-aware;
+    // a shared digest could pile all fillers onto one holder).
+    let filler_root = DigestInfo::new(
+        {
+            let mut h = [0u8; 32];
+            h[0] = 0xF0;
+            // Cheap uniqueness from the worker id bytes.
+            for (i, b) in worker_id.0.bytes().take(31).enumerate() {
+                h[i + 1] = b;
+            }
+            h
+        },
+        7,
+    );
+    let filler_op = OperationId::default();
+    let filler_ai = {
+        let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0xEE; 32], 7));
+        // Carry the worker's platform properties as the HashMap<String,String>
+        // the action model expects (only used by restore on unreserve; the
+        // capability match uses the `props` passed to find_and_reserve below).
+        Arc::make_mut(&mut ai).platform_properties = props
+            .properties
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().into_owned()))
+            .collect();
+        Arc::make_mut(&mut ai).input_root_digest = filler_root;
+        ActionInfoWithProps {
+            inner: ai,
+            platform_properties: props.clone(),
+        }
+    };
+    let reserved = scheduler
+        .worker_scheduler_for_test()
+        .find_and_reserve_worker(&props, &filler_op, &filler_ai, false)
+        .await;
+    assert!(
+        reserved.is_some(),
+        "add_busy_healthy_worker precondition: filler op must reserve onto the fresh worker"
+    );
+    Ok(rx)
+}
+
+/// Drain the worker rx and return the number of `PrefetchInputs` messages it
+/// received.
+fn count_prefetch_inputs(rx: &mut mpsc::UnboundedReceiver<UpdateForWorker>) -> usize {
+    let mut n = 0;
+    while let Ok(m) = rx.try_recv() {
+        if matches!(m.update, Some(update_for_worker::Update::PrefetchInputs(_))) {
+            n += 1;
+        }
+    }
+    n
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A1 (the anti-regression test for the whole redesign): prefetch FIRES under a
+// backlog where EVERY capable worker is BUSY but HEALTHY.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The boondoggle (design §0): `send_prefetch_inputs` targeted
+// `inner_find_worker_for_action`, whose FIRST line returns None unless some
+// worker `can_accept_work()` (IDLE). The trigger fires only on a BACKLOG (all
+// workers busy). Backlog ∧ idle are mutually exclusive → 0 emission under load.
+//
+// This test sets up exactly that regime: ONE capable worker, BUSY (max_inflight=1
+// with a reserved filler op → can_accept_work()==false) but HEALTHY. The Stage-A
+// capacity-agnostic selector MUST target it and deliver a PrefetchInputs.
+//
+// MUTATION (the anti-regression guarantee): revert the selector to the old
+// idle-only `inner_find_worker_for_action` (change
+// `find_prefetch_target_worker(...)` back to
+// `inner_find_worker_for_action(platform_properties, false)`) → this red-fails
+// with 0 emission because no worker can_accept_work() under the backlog.
+#[nativelink_test]
+async fn prefetch_fires_under_backlog_with_all_workers_busy() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+
+    // The ONLY capable worker is busy (can_accept_work()==false) but healthy.
+    let worker_busy = WorkerId("a1_busy_healthy".to_string());
+    let mut rx = add_busy_healthy_worker(&scheduler, worker_busy.clone(), PlatformProperties::default()).await?;
+    let ws = scheduler.worker_scheduler_for_test();
+
+    // Sanity: the OLD idle-only matcher finds NOTHING here (this is what made the
+    // feature never fire). This pins the boondoggle precondition.
+    assert!(
+        ws.find_worker_for_action(&PlatformProperties::default(), false).await.is_none(),
+        "A1 precondition: the idle-only matcher must return None under the backlog \
+         (every capable worker is busy) — this is the boondoggle regime"
+    );
+
+    // Stage-A selector: a PrefetchInputs MUST be emitted to the BUSY worker.
+    let op_id = OperationId::default();
+    let input_root = DigestInfo::new([0xA1; 32], 4242);
+    let mut per_cycle = HashMap::new();
+    let sent = ws
+        .send_prefetch_inputs(
+            &PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut per_cycle,
+        )
+        .await;
+    assert!(
+        sent,
+        "A1 (boondoggle): send_prefetch_inputs returned false under a backlog where the only \
+         capable worker is BUSY-but-HEALTHY. The capacity-agnostic selector must target the \
+         predicted (busy) worker — the idle-only inner_find_worker_for_action NEVER fires here."
+    );
+
+    let got = count_prefetch_inputs(&mut rx);
+    assert_eq!(
+        got, 1,
+        "A1 (boondoggle): the busy-but-healthy worker received {got} PrefetchInputs; expected \
+         exactly 1. Reverting the selector to the idle-only inner_find_worker_for_action makes \
+         this 0 (0-emission-under-load — the whole redesign's anti-regression contract)."
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A2: prefetch SKIPS a busy-but-HEALTH-PRESSURED worker even when it is the best
+// locality holder.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// §2.1: the selector DROPS the capacity gates but KEEPS the health gates
+// (`swap_pressured`/`disk_pressured`/`indefinite_pin_saturated`/`quarantined_at`).
+// Prefetching to a pressured worker wastes its scarce resource. Here the sole
+// capable worker holds the input_root (perfect Tier-1 locality) but is
+// swap-pressured → the selector must decline (no emit), NOT target it.
+//
+// MUTATION: drop the health gate in `find_prefetch_target_worker` (remove the
+// `swap_pressured` skip from its viability predicate) → the pressured holder is
+// selected, `sent` becomes true, and this red-fails.
+#[nativelink_test]
+async fn prefetch_skips_health_pressured_worker() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+
+    let worker = WorkerId("a2_pressured_holder".to_string());
+    let mut rx = add_busy_healthy_worker(&scheduler, worker.clone(), PlatformProperties::default()).await?;
+    let ws = scheduler.worker_scheduler_for_test();
+
+    let input_root = DigestInfo::new([0xA2; 32], 555);
+    // Give the worker PERFECT locality (holds the exact input_root) …
+    ws.update_cached_directories(&worker, HashSet::from([input_root]))
+        .await
+        .err_tip(|| "A2: update_cached_directories failed")?;
+    // … then mark it swap-pressured (a health gate the selector MUST honor).
+    ws.update_worker_swap_pressure(&worker, true, 50_000)
+        .await
+        .err_tip(|| "A2: update_worker_swap_pressure failed")?;
+
+    let op_id = OperationId::default();
+    let mut per_cycle = HashMap::new();
+    let sent = ws
+        .send_prefetch_inputs(
+            &PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut per_cycle,
+        )
+        .await;
+    assert!(
+        !sent,
+        "A2 (health gate): send_prefetch_inputs targeted a swap-pressured worker (its best \
+         locality holder). The selector KEEPS the health gates — a pressured worker is NOT a \
+         valid prefetch target (prefetch would waste its scarce resource)."
+    );
+
+    let got = count_prefetch_inputs(&mut rx);
+    assert_eq!(
+        got, 0,
+        "A2 (health gate): the swap-pressured worker received {got} PrefetchInputs; expected 0. \
+         Dropping the swap_pressured skip from the selector's viability predicate makes this 1."
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A3: same-input fan-out is CAPPED per worker per cycle — prewarms SPREAD across
+// the top-K locality workers instead of all piling on one.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// §2.4: same-input fan-out (common Bazel shape) makes §2.1 return the SAME W for
+// all N queued ops → all prewarm on W. A per-cycle per-worker cap (K, small)
+// spreads the prewarms across the top-K locality workers. Here THREE busy-healthy
+// workers all hold the same input_root (equal Tier-1 locality); N=6 distinct ops
+// prefetch through ONE shared per-cycle counter. With cap K, no single worker
+// may receive more than K prefetches this cycle.
+//
+// MUTATION: remove the per-worker cap check in the selector (stop consulting /
+// bumping `per_cycle_targets`) → the selector returns the same (first-ranked)
+// worker for all 6 ops → that worker receives all 6 → the ≤K assertion red-fails.
+#[nativelink_test]
+async fn prefetch_fanout_capped_per_worker() -> Result<(), Error> {
+    const PREFETCH_PER_WORKER_PER_CYCLE_CAP: usize = 2;
+
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+    let ws = scheduler.worker_scheduler_for_test();
+
+    let input_root = DigestInfo::new([0xA3; 32], 999);
+    // Three busy-healthy workers, ALL holding the exact input_root (equal Tier-1
+    // locality) → without the cap the selector would return the same worker for
+    // every op.
+    let mut rxs = Vec::new();
+    let worker_names = ["a3_w0", "a3_w1", "a3_w2"];
+    for name in worker_names {
+        let wid = WorkerId(name.to_string());
+        let rx = add_busy_healthy_worker(&scheduler, wid.clone(), PlatformProperties::default()).await?;
+        ws.update_cached_directories(&wid, HashSet::from([input_root]))
+            .await
+            .err_tip(|| "A3: update_cached_directories failed")?;
+        rxs.push((wid, rx));
+    }
+
+    // Fan out N=6 DISTINCT ops (same input_root) through ONE shared per-cycle
+    // counter — the do_try_match loop shape.
+    let mut per_cycle: HashMap<WorkerId, usize> = HashMap::new();
+    let n_ops = 6;
+    let mut total_sent = 0;
+    for _ in 0..n_ops {
+        let op_id = OperationId::default();
+        if ws
+            .send_prefetch_inputs(
+                &PlatformProperties::default(), &op_id, input_root, vec![], 60, &mut per_cycle,
+            )
+            .await
+        {
+            total_sent += 1;
+        }
+    }
+
+    // Per-worker delivered counts.
+    let mut per_worker: Vec<(String, usize)> = Vec::new();
+    for (wid, rx) in &mut rxs {
+        per_worker.push((wid.0.clone(), count_prefetch_inputs(rx)));
+    }
+    let max_on_one = per_worker.iter().map(|(_, c)| *c).max().unwrap_or(0);
+    let total_delivered: usize = per_worker.iter().map(|(_, c)| *c).sum();
+
+    assert!(
+        max_on_one <= PREFETCH_PER_WORKER_PER_CYCLE_CAP,
+        "A3 (placement cap): one worker received {max_on_one} prefetches in a single cycle \
+         (cap = {PREFETCH_PER_WORKER_PER_CYCLE_CAP}); per-worker counts {per_worker:?}. Removing \
+         the per-cycle per-worker cap in the selector piles the whole same-input fan-out onto one \
+         worker instead of spreading across the top-K locality holders."
+    );
+    // Consistency: delivered count matches the number of successful sends (no
+    // ghost emits) and every emit landed on some worker.
+    assert_eq!(
+        total_delivered, total_sent,
+        "A3: delivered PrefetchInputs ({total_delivered}) must equal successful send count \
+         ({total_sent})"
+    );
+    // With 3 workers × cap 2 = 6 slots and 6 ops, the fan-out should SPREAD onto
+    // more than one worker (the whole point of the cap).
+    let workers_hit = per_worker.iter().filter(|(_, c)| *c > 0).count();
+    assert!(
+        workers_hit >= 2,
+        "A3 (spread): the same-input fan-out landed on only {workers_hit} worker(s); the cap must \
+         spread prewarms across multiple locality holders. Per-worker counts {per_worker:?}"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A4: the selector is PEEK-ONLY — it reserves nothing and does not perturb real
+// assignment. A prefetch peek followed by a real find_and_reserve produces the
+// SAME assignment it would without the peek.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// §2.1: "peek-only, reserves nothing". A prefetch selection must not mutate
+// worker state (no running_action_infos change, no LRU promotion that flips the
+// matcher's pick). Here an IDLE worker is the sole capable worker; we run a
+// prefetch peek for an op, then a real find_and_reserve_worker for a different
+// op, and assert the real assignment still lands on that worker AND the prefetch
+// peek left running_action_infos untouched (only the real reserve added an op).
+#[nativelink_test]
+async fn prefetch_selector_is_peek_only_assignment_unchanged() -> Result<(), Error> {
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = spec_with_prefetch(1, 60);
+    let (scheduler, _ws) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None, None, None, None,
+    );
+
+    // Idle worker, unlimited slots (so the real reserve succeeds).
+    let worker = WorkerId("a4_worker".to_string());
+    let _rx = add_worker(&scheduler, worker.clone(), PlatformProperties::default()).await?;
+    let ws = scheduler.worker_scheduler_for_test();
+
+    // Baseline: no ops running.
+    assert_eq!(
+        ws.worker_running_action_count_for_test(&worker).await,
+        Some(0),
+        "A4 precondition: worker starts with 0 running actions"
+    );
+
+    // A prefetch peek for op-P (peek-only; reserves nothing).
+    let op_p = OperationId::default();
+    let mut per_cycle = HashMap::new();
+    let peeked = ws
+        .send_prefetch_inputs(
+            &PlatformProperties::default(), &op_p, DigestInfo::new([0xA4; 32], 1), vec![], 60,
+            &mut per_cycle,
+        )
+        .await;
+    assert!(peeked, "A4: prefetch peek to the idle worker should emit");
+
+    // The peek reserved NOTHING — running_action_infos is still empty.
+    assert_eq!(
+        ws.worker_running_action_count_for_test(&worker).await,
+        Some(0),
+        "A4 (peek-only): the prefetch selector RESERVED a slot — running_action_infos changed \
+         after a peek-only prefetch. The selector must not mutate worker reservation state."
+    );
+
+    // A real find_and_reserve for a DIFFERENT op lands on the same (only) worker.
+    let op_real = OperationId::default();
+    let real_ai = {
+        let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0x11; 32], 1));
+        Arc::make_mut(&mut ai).input_root_digest = DigestInfo::new([0x22; 32], 2);
+        ActionInfoWithProps {
+            inner: ai,
+            platform_properties: PlatformProperties::default(),
+        }
+    };
+    let reserved = ws
+        .find_and_reserve_worker(&PlatformProperties::default(), &op_real, &real_ai, false)
+        .await;
+    let (assigned, _, _) = reserved.expect("A4: the real op must reserve onto the idle worker");
+    assert_eq!(
+        assigned, worker,
+        "A4: real assignment must still land on the sole capable worker after a peek-only prefetch"
+    );
+    // Exactly ONE running op now (the real reserve), confirming the peek added none.
+    assert_eq!(
+        ws.worker_running_action_count_for_test(&worker).await,
+        Some(1),
+        "A4 (peek-only): after one real reserve the worker must have exactly 1 running op — the \
+         prefetch peek must have added 0"
+    );
+
     Ok(())
 }
