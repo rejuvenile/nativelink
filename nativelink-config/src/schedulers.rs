@@ -330,6 +330,28 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub enable_speculative_prefetch: bool,
 
+    /// (#specprefetch-rebind Stage B) Master gate for the TEMPORAL hold-vs-rebind
+    /// decision. SEPARATE from `enable_speculative_prefetch` (Stage A): when this
+    /// is `false` (the DEFAULT) the matcher NEVER holds a queued op for a busy
+    /// pre-built holder — `inner_find_and_reserve_worker` assigns to the best
+    /// available worker exactly as it does today (byte-identical; the
+    /// `flag_off_no_hold` regression test pins this). When `true`, the matcher may
+    /// return `None` (re-queue the op) instead of rebinding to a free-but-cold
+    /// worker X when a busy-because-full holder W of the op's `input_root_digest`
+    /// is expected to free (`T_wait_W < T_setup`) before X could re-construct the
+    /// tree — trading a bounded queue wait for a saved tree construction on the
+    /// critical path (design §2.3).
+    ///
+    /// Lands DARK and is enabled deliberately for a measurement window: unlike
+    /// Stage A's prefetch, the hold has a p99-regression risk on a BIMODAL fleet
+    /// (a single global duration EWMA mis-estimates a long-compile worker as
+    /// "about to free" → holds → p99 regresses). The `hold_regret` counter
+    /// (design §2.3.6) sizes that risk during the soak. §1's "no measurement gate"
+    /// governs the WORKLOAD-class decision, not this safety gate on a new
+    /// latency-affecting behavior (design §2.3.7).
+    #[serde(default)]
+    pub enable_speculative_hold: bool,
+
     /// (speculative-prefetch Increment 1) Minimum queued-action backlog count
     /// that triggers a speculative `PrefetchInputs` signal. Conservative ship
     /// default = 3: "at least 3 actions are queued waiting for a slot" is a
@@ -421,6 +443,10 @@ impl Default for SimpleSpec {
             // #[serde(default)] → bool default (false) = speculative prefetch OFF
             // (bit-identical to pre-Increment-1; T9 regression test pins this).
             enable_speculative_prefetch: false,
+            // (#specprefetch-rebind Stage B) #[serde(default)] → bool default
+            // (false) = temporal hold gate OFF (byte-identical assignment until an
+            // operator enables it; `flag_off_no_hold` pins this).
+            enable_speculative_hold: false,
             // #[serde(default = "default_speculative_prefetch_backlog_threshold")] → 3.
             speculative_prefetch_backlog_threshold:
                 default_speculative_prefetch_backlog_threshold(),

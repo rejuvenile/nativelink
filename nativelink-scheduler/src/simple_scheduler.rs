@@ -2489,6 +2489,10 @@ impl SimpleScheduler {
             // OFF (byte-identical to today — full server-push prefetch + empty
             // inline field until an operator enables it).
             spec.enable_p2p_input_prefetch,
+            // (#specprefetch-rebind Stage B) temporal hold-vs-rebind gate;
+            // default OFF (byte-identical assignment until an operator enables
+            // it — the hold has a p99-regression risk Stage A does not).
+            spec.enable_speculative_hold,
         );
 
         // (#specprefetch-rebind Stage C) Wire the SAME `now_fn`-derived clock the

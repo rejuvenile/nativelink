@@ -197,6 +197,41 @@ pub struct SchedulerMetrics {
     /// reroute → wasted prewarm). See `speculative_prefetch_hit`.
     #[metric(help = "speculative prefetch prewarm target differed from the assigned worker (wasted)")]
     pub speculative_prefetch_miss: AtomicU64,
+    /// (#specprefetch-rebind Stage B) Number of times the temporal hold gate
+    /// HELD a queued op (returned `None` from `inner_find_and_reserve_worker` to
+    /// re-queue it) for a busy-because-full holder W with `T_wait_W < T_setup`,
+    /// instead of rebinding to a free-but-cold worker. Counts EACH hold cycle (an
+    /// op held across N cycles bumps this N times), so `hold_count / hold_paid_off`
+    /// gives the mean cycles-per-successful-hold. Zero when `enable_speculative_hold`
+    /// is off (the whole gate is gated on the flag). LIVE, `Relaxed`.
+    #[metric(help = "(#specprefetch-rebind) times the temporal gate held a queued op for a busy holder")]
+    pub speculative_hold_count: AtomicU64,
+    /// (#specprefetch-rebind Stage B) Number of held ops that PAID OFF: at
+    /// assignment the op was reserved onto a worker that HOLDS its
+    /// `input_root_digest` (root or subtree) — the locality bet the hold made was
+    /// realized (design §2.3.6: "W freed within window → op ran on a holder").
+    /// Read at the single reserve point where the op lands. `hold_paid_off /
+    /// (hold_paid_off + hold_regret)` is the hold success rate the soak scrapes.
+    #[metric(help = "(#specprefetch-rebind) held ops assigned to a worker that holds their input root (bet realized)")]
+    pub hold_paid_off: AtomicU64,
+    /// (#specprefetch-rebind Stage B) Number of held ops that hit the max-hold
+    /// CAP (`HOLD_MAX_WALL` wall-time OR `HOLD_MAX_CYCLES` cycles) and were
+    /// ABANDONED — the gate reserved the best available (cold) worker rather than
+    /// hold longer (the starvation bound firing, design §2.3.4). A non-zero,
+    /// growing value means holds are frequently NOT paying off before the cap → the
+    /// bimodal-EWMA risk (§2.3.4); pair with `hold_regret`.
+    #[metric(help = "(#specprefetch-rebind) held ops that hit the max-hold cap and were abandoned to a cold worker")]
+    pub hold_expired: AtomicU64,
+    /// (#specprefetch-rebind Stage B) The BIMODAL-RISK detector (design §2.3.6):
+    /// number of previously-held ops that were assigned to a worker that does NOT
+    /// hold their `input_root_digest` AFTER having been held for at least `T_setup`
+    /// of wall-time — i.e. the op waited a full construct-cost worth of time on a
+    /// hold that did not land on a holder, so an immediate rebind-and-reconstruct
+    /// would have been faster. High `hold_regret` on the soak ⇒ the single global
+    /// EWMA is mis-estimating (long-compile workers read "about to free"); the
+    /// principled fix is a per-mnemonic/platform EWMA (deferred follow-up).
+    #[metric(help = "(#specprefetch-rebind) held-then-assigned-elsewhere after T_setup elapsed (a reconstruct would have been faster)")]
+    pub hold_regret: AtomicU64,
     /// Total number of server-side cache warm tasks spawned.
     #[metric(help = "total number of server-side cache warm tasks spawned")]
     pub cache_warm_spawned: CounterWithTime,
@@ -1095,6 +1130,28 @@ struct ApiWorkerSchedulerImpl {
     // coalesce records; over-cap evicts the oldest. `WorkerId` (String) per entry.
     prefetch_coalesce_guard: LruCache<OperationId, WorkerId>,
 
+    /// (#specprefetch-rebind Stage B) Master gate for the temporal hold-vs-rebind
+    /// decision (`SimpleSpec::enable_speculative_hold`). Default OFF: the matcher
+    /// NEVER holds — `inner_find_and_reserve_worker` assigns the best available
+    /// worker byte-identically to the pre-Stage-B path. Read once per reserve under
+    /// the same write lock. Independent of `enable_speculative_prefetch` (Stage A).
+    enable_speculative_hold: bool,
+
+    /// (#specprefetch-rebind Stage B) Hold-state home for the max-hold cap.
+    /// `do_try_match` keeps NO cross-cycle per-op matcher state, so the starvation
+    /// cap needs NET-NEW state: this maps a HELD op → its first-hold instant +
+    /// cumulative hold-cycle count. Incremented on each hold; on cap expiry
+    /// (`HOLD_MAX_WALL` wall-time OR `HOLD_MAX_CYCLES` cycles) the op is NOT held —
+    /// it reserves the best available worker (abandons the hold), the exact
+    /// starvation bound the cap claims. REAPED on assignment
+    /// (`prepare_worker_run_action`) and on reroute/evict — mirroring
+    /// `prefetch_coalesce_guard`'s reap sites — so a landed op does not carry a
+    /// stale hold record. Read+mutated only under the `inner` write lock.
+    // CAPPED AT HOLD_STATE_CAP (256): LRU of in-flight held-op records; over-cap
+    // evicts the oldest (a lapsed hold record ⇒ that op is then treated as
+    // never-held, so it can hold up to the cap again — a bounded, benign reset).
+    speculative_hold_state: LruCache<OperationId, HoldRecord>,
+
     /// (#specprefetch-rebind Stage C) Injectable clock stamping an op's
     /// Executing-transition instant at the reserve point
     /// (`prepare_worker_run_action`) and measuring observed duration at
@@ -1904,6 +1961,67 @@ impl ApiWorkerSchedulerImpl {
             .cloned()
     }
 
+    /// (#specprefetch-rebind Stage B, §2.3.2) Identify W for the temporal hold
+    /// gate: a holder of the op's `input_root_digest` that is BUSY *because at
+    /// capacity*, with the SOONEST expected time-to-free among such holders.
+    ///
+    /// A holder qualifies iff `!is_paused && !is_draining &&
+    /// running_action_infos.len() >= max_inflight_tasks` AND `max_inflight_tasks
+    /// > 0` — a paused/draining holder's slot may never free (holding on it just
+    /// burns `T_max`), and an UNLIMITED-slot worker (`max_inflight_tasks == 0`) is
+    /// never "full" so it would already be a viable rebind target, not a wait. The
+    /// holder signal is the SAME per-`Worker` `cached_directory_digests`/
+    /// `cached_subtree_digests` Tier-1 uses (gossip-fed for ALL workers with no
+    /// availability filter — design §2.3.2). This is DELIBERATELY not
+    /// `find_prefetch_target_worker` (which returns the FREEST holder): Stage B
+    /// needs the same read pattern with a BUSY-FULL predicate, ranked by SOONEST
+    /// `t_wait_w_locked` (the holder we would wait the LEAST for). It NEVER reads
+    /// the coalesce guard's `op→W` (that is measurement-only — §2.2).
+    ///
+    /// Returns `(WorkerId, t_wait, overdue)` for the best busy-full holder to hold
+    /// for, or `None` if no busy-full holder of the root exists. `t_wait`/`overdue`
+    /// are returned so the caller applies the `< T_setup` and not-overdue tests
+    /// without recomputing `t_wait_w_locked`.
+    ///
+    /// Ranking key `(overdue, t_wait)` ascending: a NON-overdue holder always beats
+    /// an overdue one, then ties break to the SOONEST time-to-free. This encodes
+    /// the "∃ busy-full W with `t_wait < T_setup` AND NOT overdue" semantics
+    /// (design §2.3.3): if any non-overdue holder exists it is returned (so the
+    /// caller's `< T_setup` + `!overdue` checks can hold on it), and a single stuck
+    /// (overdue) holder does NOT block a hold for a genuinely-about-to-free peer.
+    /// When ALL holders are overdue the soonest overdue one is returned so the
+    /// caller's explicit `!overdue` check still refuses the hold (the pure-stuck
+    /// case, §2.3.4).
+    fn find_busy_full_holder(
+        &self,
+        input_root_digest: &DigestInfo,
+    ) -> Option<(WorkerId, Duration, bool)> {
+        let mut best: Option<(WorkerId, Duration, bool)> = None;
+        for (worker_id, w) in self.workers.iter() {
+            // Busy-BECAUSE-FULL: at/over its finite slot cap, not paused/draining.
+            let running = w.running_action_infos.len() as u64;
+            let is_full = w.max_inflight_tasks > 0 && running >= w.max_inflight_tasks;
+            if w.is_paused || w.is_draining || !is_full {
+                continue;
+            }
+            // Holder of the exact input_root (root OR subtree) — the Tier-1 signal.
+            let holds_root = w.cached_directory_digests.contains(input_root_digest)
+                || w.cached_subtree_digests.contains(input_root_digest);
+            if !holds_root {
+                continue;
+            }
+            let (t_wait, overdue) = t_wait_w_locked(self, worker_id);
+            // Prefer NON-overdue (false < true), then SOONEST time-to-free.
+            let better = best.as_ref().is_none_or(|(_, best_wait, best_overdue)| {
+                (overdue, t_wait) < (*best_overdue, *best_wait)
+            });
+            if better {
+                best = Some((worker_id.clone(), t_wait, overdue));
+            }
+        }
+        best
+    }
+
     /// Atomically finds a suitable worker AND reserves it for the given
     /// operation by mutating the worker's state (reducing platform properties,
     /// inserting into `running_action_infos`). Returns the worker ID, the
@@ -2438,6 +2556,84 @@ impl ApiWorkerSchedulerImpl {
             None
         };
 
+        // ── (#specprefetch-rebind Stage B, §2.3) Temporal hold-vs-rebind gate ──
+        // Runs UNDER the `self.inner.write()` held at the reserve call site and
+        // BEFORE any winner LRU promotion below, so a HOLD is the EXISTING no-match
+        // outcome (`None`) that mutates no worker state (only the hold-state map).
+        // HOLD iff `enable_speculative_hold` AND (a) the best available X is not
+        // itself a good-locality holder of the root — `dir_cache_winner.is_none()`,
+        // since a Some winner IS the exact root/subtree holder (Tier-1, `:2225`) →
+        // it can hardlink now, no reason to wait — AND (b) ∃ a busy-because-full
+        // holder W of the root with `t_wait_w_locked(W) < T_SETUP` AND W not
+        // OVERDUE. On the max-hold cap (wall-time OR cycle count) the op is NOT
+        // held — it reserves X (abandons the hold, the starvation bound §2.3.4).
+        // Returns `None` (NEVER `Err` — a hold must not bump consecutive_match_
+        // errors); the freed op is re-served next cycle and the EXISTING Tier-1
+        // routes it to whichever viable holder frees (§2.3.3 A1).
+        if self.enable_speculative_hold && dir_cache_winner.is_none() {
+            if let Some((hold_w, t_wait, overdue)) =
+                self.find_busy_full_holder(&input_root_digest)
+            {
+                if t_wait < T_SETUP && !overdue {
+                    // A busy-full holder is expected to free before X could
+                    // re-construct the tree — the hold is worth taking UNLESS this
+                    // op has already exhausted its max-hold cap.
+                    let now = (self.exec_clock)();
+                    let cap_hit = self
+                        .speculative_hold_state
+                        .peek(operation_id)
+                        .is_some_and(|rec| {
+                            let held_for =
+                                now.duration_since(rec.first_hold_at).unwrap_or(Duration::ZERO);
+                            held_for >= HOLD_MAX_WALL || rec.cycles >= HOLD_MAX_CYCLES
+                        });
+                    if cap_hit {
+                        // Abandon: count the cap firing and FALL THROUGH to reserve
+                        // the best available worker (the starvation bound). The hold
+                        // RECORD is intentionally NOT reaped here — it is reaped at
+                        // the assignment point (`prepare_worker_run_action`), which
+                        // reads it to classify the landing (`hold_paid_off` vs
+                        // `hold_regret`). A cap-abandoned op that then lands on a
+                        // cold worker after `T_setup` is BOTH expired AND a regret
+                        // (the bimodal detector must see it); popping here would hide
+                        // that classification.
+                        self.metrics.hold_expired.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %operation_id,
+                            %hold_w,
+                            %input_root_digest,
+                            t_wait_ms = t_wait.as_millis(),
+                            "speculative hold cap hit — abandoning hold, reserving best \
+                             available worker (max-hold bound, #specprefetch-rebind)"
+                        );
+                    } else {
+                        // HOLD: record/advance the hold state and re-queue the op.
+                        match self.speculative_hold_state.get_mut(operation_id) {
+                            Some(rec) => rec.cycles = rec.cycles.saturating_add(1),
+                            None => {
+                                self.speculative_hold_state.put(
+                                    operation_id.clone(),
+                                    HoldRecord { first_hold_at: now, cycles: 1 },
+                                );
+                            }
+                        }
+                        self.metrics
+                            .speculative_hold_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            %operation_id,
+                            %hold_w,
+                            %input_root_digest,
+                            t_wait_ms = t_wait.as_millis(),
+                            "speculative hold — holding op for busy-full holder \
+                             (T_wait_W < T_setup), re-queuing (#specprefetch-rebind)"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
         let worker_id = if let Some(wid) = dir_cache_winner {
             // Exact root match trumps all other scoring.
             self.workers.get_mut(&wid);
@@ -2489,6 +2685,12 @@ impl ApiWorkerSchedulerImpl {
         // `contains` check (hit-rate loss). Keyed on the same `operation_id`
         // (== client_operation_id) `send_prefetch_inputs` inserted it with.
         self.prefetch_coalesce_guard.pop(operation_id);
+        // (#specprefetch-rebind Stage B) Defensively reap any hold record on the
+        // reroute path (normally already reaped at `prepare_worker_run_action`
+        // during the reserve that preceded this unreserve; pop-on-absent is a
+        // no-op). Keeps the hold-state map from leaking on odd assign-Aborted
+        // interleavings.
+        self.speculative_hold_state.pop(operation_id);
         // (#schedmetric) Recompute after slot freed.
         self.recompute_capacity_gauges();
     }
@@ -2715,11 +2917,15 @@ impl ApiWorkerSchedulerImpl {
             &action_info.platform_properties,
         );
         // (#specprefetch-rebind Stage C) Stamp the Executing-transition instant
-        // from the injected clock at THE single reserve point, so `worker_time_
-        // to_free` can compute `elapsed = now − start` for this op and the
-        // completion path can measure its observed duration for the EWMA. This is
-        // the ONLY production insert into `running_action_infos` (the
-        // `Worker::run_action` reconnect insert is dead — see its `None` stamp).
+        // from the injected clock here, so `worker_time_to_free` can compute
+        // `elapsed = now − start` for this op and the completion path can measure
+        // its observed duration for the EWMA. `prepare_worker_run_action` is ONE
+        // function reached by TWO callers — `inner_find_and_reserve_worker` (the
+        // hot dispatch path) and `worker_notify_run_action` (the reconnect-notify
+        // path) — and is the ONLY production insert into `running_action_infos`
+        // that stamps a live start (the `Worker::run_action` reconnect insert is
+        // dead — see its `None` stamp), so both reserve callers funnel through this
+        // single stamp point.
         let exec_start_time = Some((self.exec_clock)());
         worker.running_action_infos.insert(
             operation_id.clone(),
@@ -2747,6 +2953,36 @@ impl ApiWorkerSchedulerImpl {
                 self.metrics
                     .speculative_prefetch_miss
                     .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // (#specprefetch-rebind Stage B) Hold-outcome accounting + REAP. If this op
+        // was HELD (a `speculative_hold_state` record exists), classify the landing
+        // and reap the record (mirroring the coalesce-guard reap so a landed op
+        // does not carry a stale hold record — the `speculative_hold_state` LRU is
+        // reaped HERE on assignment and in `inner_unreserve_worker` /
+        // `immediate_evict_worker` on reroute/evict). `hold_paid_off` iff the
+        // assigned worker HOLDS the op's `input_root_digest` (root or subtree) — the
+        // locality bet was realized (§2.3.6). `hold_regret` (the BIMODAL detector)
+        // iff it does NOT hold the root AND the op had been held ≥ `T_SETUP` of
+        // wall-time — a full construct-cost was spent on a hold that did not land on
+        // a holder, so an immediate reconstruct would have been faster. A hold
+        // abandoned by the cap before `T_SETUP` counts as neither (the cap already
+        // bumped `hold_expired`). Reads the assigned worker's cached sets via a
+        // fresh peek (the `worker` &mut borrow ended above).
+        if let Some(rec) = self.speculative_hold_state.pop(operation_id) {
+            let assigned_holds_root = self.workers.peek(worker_id).is_some_and(|w| {
+                w.cached_directory_digests.contains(&action_info.inner.input_root_digest)
+                    || w.cached_subtree_digests.contains(&action_info.inner.input_root_digest)
+            });
+            if assigned_holds_root {
+                self.metrics.hold_paid_off.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let held_for = (self.exec_clock)()
+                    .duration_since(rec.first_hold_at)
+                    .unwrap_or(Duration::ZERO);
+                if held_for >= T_SETUP {
+                    self.metrics.hold_regret.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         // #36 Phase 6 §6 Phase 0 probe P-SCHED-DISPATCH: mark the
@@ -2841,6 +3077,12 @@ impl ApiWorkerSchedulerImpl {
                 // suppressed by the dedup `contains` check. Keyed on
                 // `client_operation_id`, matching `prefetch_coalesce_guard`.
                 self.prefetch_coalesce_guard.pop(&operation_id);
+                // (#specprefetch-rebind Stage B) Defensively reap any hold record
+                // for a re-queued op (normally reaped at assignment; held ops are
+                // queued, not in `running_action_infos`, so this is a no-op in the
+                // common case). Prevents a stale record from surviving on odd
+                // reserved-then-evicted interleavings.
+                self.speculative_hold_state.pop(&operation_id);
                 result = result.merge(
                     self.worker_state_manager
                         .update_operation(&operation_id, worker_id, update.clone())
@@ -3150,6 +3392,73 @@ const DEFAULT_DURATION_ESTIMATE: Duration = Duration::from_secs(30);
 /// on the completion path.
 const DURATION_EWMA_ALPHA_PCT: u128 = 20;
 
+/// (#specprefetch-rebind Stage B, §2.3.5) `T_setup`: the coarse construction-cost
+/// constant the temporal hold gate compares `T_wait_W` against. A queued op is
+/// HELD for a busy-because-full holder W (rather than rebound to a free-but-cold
+/// worker X that must re-construct the tree) only when W is expected to free
+/// SOONER than X could re-construct — i.e. `T_wait_W < T_SETUP`.
+///
+/// No scheduler-visible construct-latency signal exists (the worker's
+/// `record_hit_assemble_ms` at `directory_cache.rs` is never gossiped to the
+/// scheduler — design §2.3.5), so a constant is the only option without new
+/// cross-component plumbing. Its value is a THRESHOLD, not a bound: a wrong
+/// `T_SETUP` shifts WHERE the hold-vs-rebind crossover sits (hold slightly more or
+/// slightly less often), but NEVER breaks correctness (the max-hold cap bounds
+/// starvation regardless, and the overdue-refusal bounds the bimodal risk
+/// regardless). 3 s is the setup-dominated-regime anchor: the #p1p2 cold-tree
+/// resolution histogram put the p50 cold construct near ~1.4 s and a long tail to
+/// seconds, so a busy holder expected to free within ~3 s is worth waiting for vs
+/// paying a fresh uncached construct. Bounded-sensitivity (design §2.3.5): the
+/// decision is dominated by the observed-duration EWMA within seconds of warm-up.
+const T_SETUP: Duration = Duration::from_secs(3);
+
+/// (#specprefetch-rebind Stage B, §2.3.4) `T_max` (wall-time arm of the max-hold
+/// cap): the maximum WALL-CLOCK time a single op may remain held across cycles
+/// before the gate ABANDONS the hold and reserves the best available worker. The
+/// starvation bound: without it a high-priority op under sustained backlog would
+/// hold INDEFINITELY (the exact starvation the cap claims to bound — design
+/// §2.3.4). 10 s caps the worst-case added queue latency for a held op at one
+/// order of magnitude over `T_SETUP`, so a hold that keeps losing its bet (W never
+/// frees) costs a bounded, small latency premium before falling back to a cold
+/// construct — while still allowing several `T_SETUP`-scale waits to pay off.
+const HOLD_MAX_WALL: Duration = Duration::from_secs(10);
+
+/// (#specprefetch-rebind Stage B, §2.3.4) `T_max` (cycle-count arm of the max-hold
+/// cap): the maximum number of `do_try_match` cycles an op may be held before the
+/// gate abandons. A SECOND, independent arm to `HOLD_MAX_WALL` so a fast
+/// match-cycle cadence (which would take many cycles to accumulate 10 s of
+/// wall-time) cannot spin an op through hundreds of hold cycles, and a slow cadence
+/// (few cycles but long wall-time) is still bounded by `HOLD_MAX_WALL`. Whichever
+/// arm trips first abandons. 20 cycles is generous relative to the expected
+/// handful of cycles a genuine `T_wait_W < T_SETUP` hold needs before W frees.
+const HOLD_MAX_CYCLES: u32 = 20;
+
+/// (#specprefetch-rebind Stage B) Per-op hold-state record: the first instant this
+/// op was held (from the injected `exec_clock`) plus the cumulative count of hold
+/// cycles. The max-hold cap trips when EITHER `exec_clock_now − first_hold_at ≥
+/// HOLD_MAX_WALL` OR `cycles ≥ HOLD_MAX_CYCLES`.
+#[derive(Debug, Clone, Copy)]
+struct HoldRecord {
+    /// The `exec_clock` instant of the FIRST cycle this op was held. The wall-time
+    /// cap measures `now − first_hold_at` against `HOLD_MAX_WALL`.
+    first_hold_at: SystemTime,
+    /// The number of cycles this op has been held so far (≥ 1 once recorded). The
+    /// cycle cap trips at `HOLD_MAX_CYCLES`.
+    cycles: u32,
+}
+
+/// (#specprefetch-rebind Stage B) Max number of concurrently-held op records in
+/// `speculative_hold_state`. One entry per op currently being held for a busy
+/// holder; a held op is reaped the moment it is assigned or rerouted, so the live
+/// set is bounded by the number of ops simultaneously mid-hold (≪ the queue).
+/// 256 is generously above the top-of-queue batch a single match cycle processes
+/// (`MATCH_CONCURRENCY = 32`) so a lapsed-record LRU eviction (which merely resets
+/// an op to "never held", letting it hold up to the cap again) is not reached
+/// under normal backlog. Over-cap: LRU evicts the oldest record.
+// CAPPED AT 256: LRU of in-flight held-op records; over-cap evicts oldest (a
+// benign per-op cap reset, never a correctness issue — the hold still re-bounds).
+const HOLD_STATE_CAP: usize = 256;
+
 /// (#specprefetch-rebind Stage C) Injectable clock producing the `SystemTime`
 /// that stamps an op's Executing-transition instant (`exec_start_time`) and,
 /// on completion, measures the observed action duration for the EWMA.
@@ -3203,6 +3512,62 @@ impl DurationEwma {
             None => DEFAULT_DURATION_ESTIMATE,
         }
     }
+}
+
+/// (#specprefetch-rebind Stage B, §2.3.1) The LOCK-FREE core of `T_wait_W` — the
+/// worker's expected time-to-free (`Duration`) plus an `overdue` flag — computed
+/// over an ALREADY-BORROWED `&ApiWorkerSchedulerImpl`. This is the fix for the
+/// FATAL self-deadlock (design §2.3.1 BLOCKING): the Stage-B hold gate runs inside
+/// `inner_find_and_reserve_worker` under the `self.inner.write()` held at the
+/// reserve call site, so it MUST NOT call the async `worker_time_to_free` (whose
+/// first line re-acquires `self.inner.read()` on the SAME non-reentrant `RwLock` →
+/// silent hang of the whole match cycle). It calls THIS free fn directly on the
+/// already-locked `inner`. The async `worker_time_to_free` is a thin `read()`
+/// wrapper delegating here (single source of truth — also closes Stage-C nit C1).
+///
+/// Returns `(time_to_free, overdue)`:
+/// - `time_to_free` = Σ over ALL of W's in-flight actions of each action's
+///   estimated REMAINING time (`max(0, estimate − elapsed)`), using the single
+///   global duration EWMA as the per-action estimate. Full in-flight set, NOT just
+///   the head action (distsys BLOCK-2: a best-locality worker holds several affine
+///   ops; the head-only form under-counts exactly in the concentration regime). A
+///   single-slot worker reduces to its one action's remaining time. Un-timed
+///   records (`exec_start_time = None`, e.g. the dead reconnect insert) contribute
+///   0. `Duration::ZERO` if the worker is absent (already freed / never existed).
+/// - `overdue` = TRUE iff ANY in-flight action has `elapsed > estimate` (its
+///   remaining saturated to ~0 — the action has run PAST its predicted duration).
+///   The hold gate REFUSES to hold on an overdue W (design §2.3.4, red-team's
+///   most-dangerous case): an overdue action is ambiguous — about-to-finish (just
+///   take X) OR a mis-estimated long compile on a bimodal fleet (holding is wrong,
+///   p99 regresses) — so the gate does not bet. Un-timed records do not set it.
+fn t_wait_w_locked(
+    inner: &ApiWorkerSchedulerImpl,
+    worker_id: &WorkerId,
+) -> (Duration, bool) {
+    let estimate = inner.duration_estimate_ewma.estimate();
+    let Some(worker) = inner.workers.peek(worker_id) else {
+        return (Duration::ZERO, false);
+    };
+    let now = (inner.exec_clock)();
+    let mut total = Duration::ZERO;
+    let mut overdue = false;
+    for pending in worker.running_action_infos.values() {
+        // Un-timed record: invisible to the temporal estimate AND cannot be
+        // overdue (no start instant to measure elapsed against).
+        let Some(start) = pending.exec_start_time else {
+            continue;
+        };
+        // `elapsed = now − start`, guarded against a wall clock that ran backwards
+        // (NTP step) — a backwards jump yields ZERO elapsed, so the action counts
+        // as its full estimate rather than underflowing (and is not flagged
+        // overdue, since ZERO elapsed < any positive estimate).
+        let elapsed = now.duration_since(start).unwrap_or(Duration::ZERO);
+        if elapsed > estimate {
+            overdue = true;
+        }
+        total += estimate.saturating_sub(elapsed);
+    }
+    (total, overdue)
 }
 
 /// (#output-locality-probe) Cost-control cap (no-silent-truncation rule): output
@@ -3522,6 +3887,9 @@ impl ApiWorkerScheduler {
             // (#p2p-prefetch) P2P input prefetch shed OFF on the no-config
             // constructor path — byte-identical to today.
             false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF on the
+            // no-config constructor path — byte-identical to today.
+            false,
         )
     }
 
@@ -3542,6 +3910,7 @@ impl ApiWorkerScheduler {
         p_idle_threshold_pct: u32,
         p_headroom_override_factor: u32,
         enable_p2p_input_prefetch: bool,
+        enable_speculative_hold: bool,
     ) -> Arc<Self> {
         let memory_store_threshold = cas_store
             .as_ref()
@@ -3605,6 +3974,13 @@ impl ApiWorkerScheduler {
                 bis_resend_buffers: HashMap::new(),
                 prefetch_coalesce_guard: LruCache::new(
                     NonZeroUsize::new(PREFETCH_AFFINITY_CAP).unwrap(),
+                ),
+                // (#specprefetch-rebind Stage B) Temporal hold gate flag (default
+                // OFF via the no-config `new` path / config default) + its hold-
+                // state home for the max-hold cap.
+                enable_speculative_hold,
+                speculative_hold_state: LruCache::new(
+                    NonZeroUsize::new(HOLD_STATE_CAP).unwrap(),
                 ),
                 // (#specprefetch-rebind Stage C) Default to the wall clock; the
                 // production wiring (`SimpleScheduler::new`) injects its
@@ -3717,28 +4093,17 @@ impl ApiWorkerScheduler {
     /// PEEK-ONLY: acquires the read lock and mutates nothing. Returns
     /// `Duration::ZERO` if the worker is not present (already freed / never
     /// existed) — an absent worker has no pending wait.
+    ///
+    /// (#specprefetch-rebind Stage B) A thin `read()`-guarded WRAPPER: the actual
+    /// computation lives in the lock-free `t_wait_w_locked` free fn so the Stage-B
+    /// hold gate — which runs INSIDE the `inner.write()` critical section — can
+    /// call the core DIRECTLY on the already-locked `inner` WITHOUT re-acquiring
+    /// the non-reentrant `RwLock` (which would self-deadlock the whole match
+    /// cycle; design §2.3.1 BLOCKING fix). This wrapper discards the `overdue`
+    /// flag the core also returns (Stage C's only consumer wants the duration).
     pub async fn worker_time_to_free(&self, worker_id: &WorkerId) -> Duration {
         let inner = self.inner.read().await;
-        let estimate = inner.duration_estimate_ewma.estimate();
-        let Some(worker) = inner.workers.peek(worker_id) else {
-            return Duration::ZERO;
-        };
-        let now = (inner.exec_clock)();
-        worker
-            .running_action_infos
-            .values()
-            .map(|pending| match pending.exec_start_time {
-                // `elapsed = now − start`, guarded against a wall clock that ran
-                // backwards (NTP step) — a backwards jump yields ZERO elapsed, so
-                // the action counts as its full estimate rather than underflowing.
-                Some(start) => {
-                    let elapsed = now.duration_since(start).unwrap_or(Duration::ZERO);
-                    estimate.saturating_sub(elapsed)
-                }
-                // Un-timed record: invisible to the temporal estimate.
-                None => Duration::ZERO,
-            })
-            .sum()
+        t_wait_w_locked(&inner, worker_id).0
     }
 
     /// Removes cached prefetch connection and semaphore for a specific endpoint.
@@ -10113,6 +10478,8 @@ mod tests {
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
             false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
+            false,
         );
 
         // First call: cache miss, inline resolution succeeds and caches.
@@ -10290,6 +10657,8 @@ mod tests {
             0,
             2,
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         );
 
@@ -10601,6 +10970,8 @@ mod tests {
             2,
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
             false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
+            false,
         );
         (scheduler, dir_digest)
     }
@@ -10706,6 +11077,8 @@ mod tests {
             0,    // p_idle_threshold_pct = 0 (v1 behavior, matching prod)
             2,    // p_headroom_override_factor (prod default; inert at threshold 0)
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         );
         (scheduler, r1_digest, r2_digest, c_digest)
@@ -11144,6 +11517,8 @@ mod tests {
             0,
             2,
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         )
     }
@@ -11773,6 +12148,8 @@ mod tests {
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
             false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
+            false,
         );
 
         // First, verify guard wiring against the real shared map. Pre-insert
@@ -11907,6 +12284,8 @@ mod tests {
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         )
     }
@@ -12779,6 +13158,14 @@ mod tests {
         scheduler.metrics.speculative_prefetch_no_target.fetch_add(212, Ordering::Relaxed);
         scheduler.metrics.speculative_prefetch_hit.fetch_add(213, Ordering::Relaxed);
         scheduler.metrics.speculative_prefetch_miss.fetch_add(214, Ordering::Relaxed);
+        // (#specprefetch-rebind Stage B) distinctive values on the four hold-gate
+        // counters — the hold has a p99-regression risk that Stage A's prefetch
+        // does not (bimodal EWMA), so a DARK hold_regret / hold_expired defeats the
+        // exact soak instrument that gates enabling the flag fleet-wide.
+        scheduler.metrics.speculative_hold_count.fetch_add(215, Ordering::Relaxed);
+        scheduler.metrics.hold_paid_off.fetch_add(216, Ordering::Relaxed);
+        scheduler.metrics.hold_expired.fetch_add(217, Ordering::Relaxed);
+        scheduler.metrics.hold_regret.fetch_add(218, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -12924,6 +13311,13 @@ mod tests {
             ("speculative_prefetch_no_target", 212),
             ("speculative_prefetch_hit", 213),
             ("speculative_prefetch_miss", 214),
+            // (#specprefetch-rebind Stage B) the four hold-gate counters — dark
+            // fields here blind the bimodal-risk soak the flag's default-OFF
+            // safety gate depends on (§2.3.6/§2.3.7).
+            ("speculative_hold_count", 215),
+            ("hold_paid_off", 216),
+            ("hold_expired", 217),
+            ("hold_regret", 218),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),
@@ -13029,6 +13423,8 @@ mod tests {
             false,
             0,
             2,
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         );
 
@@ -13234,6 +13630,8 @@ mod b1_lock_decouple_tests {
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
             false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
+            false,
         )
     }
 
@@ -13261,6 +13659,8 @@ mod b1_lock_decouple_tests {
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         )
     }
@@ -13881,6 +14281,8 @@ mod b1_lock_decouple_tests {
                 p_idle_threshold_pct,
                 p_headroom_override_factor,
                 // (#p2p-prefetch) P2P input prefetch OFF (test default)
+                false,
+                // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
                 false,
             )
         }
@@ -14545,6 +14947,8 @@ mod b1_lock_decouple_tests {
                 0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
                 2, // (#sched M1 rebalance v2) p_headroom_override_factor
                 // (#p2p-prefetch) P2P input prefetch OFF (test default)
+                false,
+                // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
                 false,
             );
             // X_ROOT: Tier-1 root match (cached_directory_digests ∋ input_root),
@@ -15865,6 +16269,8 @@ mod deferred_proto_clone_tests {
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
             false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
+            false,
         )
     }
 
@@ -15885,6 +16291,8 @@ mod deferred_proto_clone_tests {
             0, // (#sched M1 rebalance v2) p_idle_threshold_pct 0 = override OFF
             2, // (#sched M1 rebalance v2) p_headroom_override_factor
             // (#p2p-prefetch) P2P input prefetch OFF (test default)
+            false,
+            // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
         )
     }
