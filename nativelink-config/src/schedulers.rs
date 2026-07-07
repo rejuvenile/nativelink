@@ -234,10 +234,13 @@ pub struct SimpleSpec {
     /// existing LRU/MRU fallback (no wedge). A worker advertising
     /// `p_core_count == 0` is treated as ungated (never frozen out).
     ///
-    /// Default: false (OFF) — the matcher behaves byte-identically to today
-    /// until an operator enables it. Selection-only; no data-plane, ack, pin,
-    /// or memory-gate effect.
-    #[serde(default)]
+    /// Default: true (ENABLED, drift-proof — per user 2026-07-07: don't default
+    /// features to OFF, it delays fixing their bugs; config drift already
+    /// silently reverted this once). The flag remains an operational
+    /// KILL-SWITCH: setting it `false` in config restores the byte-identical
+    /// pre-gate matcher. Selection-only; no data-plane, ack, pin, or
+    /// memory-gate effect.
+    #[serde(default = "default_true")]
     pub p_headroom_gate_enabled: bool,
 
     /// (#sched M1 rebalance v2) `p_core_load_pct` below which a worker's P
@@ -320,22 +323,24 @@ pub struct SimpleSpec {
     #[serde(default = "default_pending_affinity_probe_enabled")]
     pub pending_affinity_probe_enabled: bool,
 
-    /// (speculative-prefetch Increment 1) Master gate. When `false` (the
-    /// DEFAULT) the scheduler emits NO tag-15 `PrefetchInputs` signals, the
-    /// `prefetch_affinity` map stays empty, and the worker pre-fetch path is
-    /// unreachable — byte-identical to pre-Increment-1 (T9 regression test).
-    /// When `true`, a backlog of `speculative_prefetch_backlog_threshold` or
-    /// more queued actions triggers the speculative pre-fetch for the highest-
-    /// priority not-yet-eligible action.
-    #[serde(default)]
+    /// (speculative-prefetch Increment 1) Master gate. Default: true (ENABLED,
+    /// drift-proof — per user 2026-07-07: don't default features to OFF, it
+    /// delays fixing their bugs). When enabled, a backlog of
+    /// `speculative_prefetch_backlog_threshold` or more queued actions triggers
+    /// the speculative pre-fetch for the highest-priority not-yet-eligible
+    /// action. The flag remains an operational KILL-SWITCH: setting it `false`
+    /// in config emits NO tag-15 `PrefetchInputs` signals, leaves the
+    /// `prefetch_affinity` map empty, and makes the worker pre-fetch path
+    /// unreachable — byte-identical to pre-Increment-1 (the off-path is pinned
+    /// by the `t1_feature_gate_off_no_prefetch_inputs` regression test, which
+    /// sets the flag `false` explicitly).
+    #[serde(default = "default_true")]
     pub enable_speculative_prefetch: bool,
 
     /// (#specprefetch-rebind Stage B) Master gate for the TEMPORAL hold-vs-rebind
-    /// decision. SEPARATE from `enable_speculative_prefetch` (Stage A): when this
-    /// is `false` (the DEFAULT) the matcher NEVER holds a queued op for a busy
-    /// pre-built holder — `inner_find_and_reserve_worker` assigns to the best
-    /// available worker exactly as it does today (byte-identical; the
-    /// `flag_off_no_hold` regression test pins this). When `true`, the matcher may
+    /// decision. SEPARATE from `enable_speculative_prefetch` (Stage A). Default:
+    /// true (ENABLED, drift-proof — per user 2026-07-07: don't default features
+    /// to OFF, it delays fixing their bugs). When enabled, the matcher may
     /// return `None` (re-queue the op) instead of rebinding to a free-but-cold
     /// worker X when a P-SATURATED holder W of the op's `input_root_digest` (a
     /// holder that pcore-first excluded from the cache tiers for lack of P-headroom)
@@ -344,15 +349,19 @@ pub struct SimpleSpec {
     /// construction on the critical path (design §2.3-v3). Gated internally on
     /// `p_gate_active` (the pcore-first gate ON and some worker with P-headroom), so
     /// it is a refinement of pcore-first, inert when that gate is off or lifted.
+    /// The flag remains an operational KILL-SWITCH: setting it `false` in config
+    /// makes the matcher NEVER hold — `inner_find_and_reserve_worker` assigns to
+    /// the best available worker exactly as before (byte-identical; the
+    /// `flag_off_no_hold` regression test, which sets the flag `false`
+    /// explicitly, pins this).
     ///
-    /// Lands DARK and is enabled deliberately for a measurement window: unlike
-    /// Stage A's prefetch, the hold has a p99-regression risk on a BIMODAL fleet
-    /// (a single global duration EWMA mis-estimates a long-compile worker as
-    /// "about to free" → holds → p99 regresses). The `hold_regret` counter
-    /// (design §2.3.6) sizes that risk during the soak. §1's "no measurement gate"
-    /// governs the WORKLOAD-class decision, not this safety gate on a new
-    /// latency-affecting behavior (design §2.3.7).
-    #[serde(default)]
+    /// p99-regression risk on a BIMODAL fleet (a single global duration EWMA
+    /// mis-estimates a long-compile worker as "about to free" → holds → p99
+    /// regresses) is why the kill-switch exists: the `hold_regret` counter
+    /// (design §2.3.6) sizes that risk, and if it fires in prod the operator
+    /// sets the flag `false`. §1's "no measurement gate" governs the
+    /// WORKLOAD-class decision (design §2.3.7).
+    #[serde(default = "default_true")]
     pub enable_speculative_hold: bool,
 
     /// (speculative-prefetch Increment 1) Minimum queued-action backlog count
@@ -430,8 +439,9 @@ impl Default for SimpleSpec {
             load_byte_cost: default_load_byte_cost(),
             // #[serde(default = "default_assume_core_count")] → 8.
             assume_core_count: default_assume_core_count(),
-            // #[serde(default)] → bool default (false).
-            p_headroom_gate_enabled: false,
+            // #[serde(default = "default_true")] → true (ENABLED by default,
+            // drift-proof, per user 2026-07-07; kill-switch via config `false`).
+            p_headroom_gate_enabled: true,
             // #[serde(default)] → type default (0) = override OFF (exact v1).
             p_idle_threshold_pct: 0,
             // #[serde(default = "default_p_headroom_override_factor")] → 2.
@@ -443,13 +453,16 @@ impl Default for SimpleSpec {
             // #[serde(default = "default_pending_affinity_probe_enabled")] → false
             // (probe is OPT-IN; an absent-in-config scheduler leaves it OFF).
             pending_affinity_probe_enabled: default_pending_affinity_probe_enabled(),
-            // #[serde(default)] → bool default (false) = speculative prefetch OFF
-            // (bit-identical to pre-Increment-1; T9 regression test pins this).
-            enable_speculative_prefetch: false,
-            // (#specprefetch-rebind Stage B) #[serde(default)] → bool default
-            // (false) = temporal hold gate OFF (byte-identical assignment until an
-            // operator enables it; `flag_off_no_hold` pins this).
-            enable_speculative_hold: false,
+            // #[serde(default = "default_true")] → true = speculative prefetch
+            // ENABLED by default (drift-proof, per user 2026-07-07; kill-switch
+            // via config `false`, off-path pinned by
+            // `t1_feature_gate_off_no_prefetch_inputs`).
+            enable_speculative_prefetch: true,
+            // (#specprefetch-rebind Stage B) #[serde(default = "default_true")]
+            // → true = temporal hold gate ENABLED by default (drift-proof, per
+            // user 2026-07-07; kill-switch via config `false`, off-path pinned by
+            // `flag_off_no_hold`).
+            enable_speculative_hold: true,
             // #[serde(default = "default_speculative_prefetch_backlog_threshold")] → 3.
             speculative_prefetch_backlog_threshold:
                 default_speculative_prefetch_backlog_threshold(),
@@ -457,6 +470,17 @@ impl Default for SimpleSpec {
             speculative_prefetch_ttl_s: default_speculative_prefetch_ttl_s(),
         }
     }
+}
+
+/// Serde default of `true` for scheduler feature flags that are ON by default.
+/// Used by `p_headroom_gate_enabled`, `enable_speculative_prefetch`, and
+/// `enable_speculative_hold` so that omitting the flag from a config leaves the
+/// feature ENABLED (config drift can no longer silently dark it). The flag stays
+/// a kill-switch: setting it `false` in config still disables the feature.
+/// Ship features ON — a default-off flag never runs, so its bugs never surface
+/// and its counters are dark (per user 2026-07-07).
+const fn default_true() -> bool {
+    true
 }
 
 /// (#sched-blend) Default cache-vs-load crossover anchor (512 KiB).

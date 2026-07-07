@@ -205,8 +205,9 @@ async fn simple_spec_v2_defaults_are_override_off_factor_two() -> Result<(), Err
          would make the ceiling p_count*0 == 0 and silently disable the override)"
     );
     assert!(
-        !spec.p_headroom_gate_enabled,
-        "default p_headroom_gate_enabled must be false (v2 inert until enabled)"
+        spec.p_headroom_gate_enabled,
+        "default p_headroom_gate_enabled must be TRUE (ENABLED by default, \
+         drift-proof, per user 2026-07-07; config `false` is the kill-switch)"
     );
     Ok(())
 }

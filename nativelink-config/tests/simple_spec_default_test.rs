@@ -114,7 +114,8 @@ fn simple_spec_default_matches_deserialize_empty() {
     );
     assert_eq!(
         derived.p_headroom_gate_enabled, deserialized.p_headroom_gate_enabled,
-        "p_headroom_gate_enabled default drift (both should be false)"
+        "p_headroom_gate_enabled default drift (both should be true — \
+         ENABLED by default, drift-proof, per user 2026-07-07)"
     );
     assert_eq!(
         derived.p_idle_threshold_pct, deserialized.p_idle_threshold_pct,
@@ -137,6 +138,16 @@ fn simple_spec_default_matches_deserialize_empty() {
         "pending_affinity_probe_enabled default drift — serde default is FALSE \
          (default_pending_affinity_probe_enabled); the quadratic observability probe \
          is OPT-IN, so an absent-in-config scheduler must leave it OFF"
+    );
+    assert_eq!(
+        derived.enable_speculative_prefetch, deserialized.enable_speculative_prefetch,
+        "enable_speculative_prefetch default drift (both should be true — ENABLED \
+         by default, drift-proof, per user 2026-07-07; config `false` is the kill-switch)"
+    );
+    assert_eq!(
+        derived.enable_speculative_hold, deserialized.enable_speculative_hold,
+        "enable_speculative_hold default drift (both should be true — ENABLED \
+         by default, drift-proof, per user 2026-07-07; config `false` is the kill-switch)"
     );
 }
 
@@ -164,8 +175,9 @@ fn simple_spec_default_concrete_values() {
          (default_worker_match_logging_interval_s)"
     );
     assert!(
-        !spec.p_headroom_gate_enabled,
-        "p_headroom_gate_enabled default must be false (gate OFF until enabled)"
+        spec.p_headroom_gate_enabled,
+        "p_headroom_gate_enabled default must be TRUE (ENABLED by default, \
+         drift-proof, per user 2026-07-07; config `false` is the kill-switch)"
     );
     assert_eq!(
         spec.p_idle_threshold_pct, 0,

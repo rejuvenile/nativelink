@@ -138,30 +138,36 @@ fn spec_with_prefetch(
 // Spec: with `enable_speculative_prefetch = false`, the backlog trigger block
 // in `do_try_match` MUST NOT execute. Verified at two observable layers:
 //
-// Layer A (config): `SimpleSpec::default()` must have `enable_speculative_prefetch = false`.
-//   Mutation: change the default to `true` → T1 fails with bespoke message.
-//   (T8 also covers this; T1 is the primary gate-contract test.)
+// Layer A (config default): `SimpleSpec::default()` now has
+//   `enable_speculative_prefetch = true` — the feature is ENABLED by default,
+//   drift-proof (per user 2026-07-07: don't default features to OFF, it delays
+//   fixing their bugs). This layer pins the shipped default; T8 also covers it.
+//   Config `false` is the operational kill-switch, and the OFF path itself is
+//   proven by Layer B below (which SETS the flag `false` explicitly).
 //
-// Layer B (scheduling): with gate=OFF, threshold=1, ALL workers saturated PLUS
-//   a platform-mismatched idle worker, do_try_match MUST NOT emit PrefetchInputs.
-//   The mismatch worker is present so that IF the gate were removed (mutation),
-//   the code would reach `inner_find_worker_for_action`, fail on mismatch, and
-//   return None → still no PrefetchInputs. Gate-removal is therefore only
-//   PARTIALLY catchable via scheduling output (the gate guards the entire block,
-//   but when `inner_find_worker_for_action` returns None the end result is identical).
+// Layer B (scheduling, OFF path): with the flag SET `false`, threshold=1, ALL
+//   workers saturated PLUS a platform-mismatched idle worker, do_try_match MUST
+//   NOT emit PrefetchInputs. The mismatch worker is present so that IF the gate
+//   were removed (mutation), the code would reach `inner_find_worker_for_action`,
+//   fail on mismatch, and return None → still no PrefetchInputs. Gate-removal is
+//   therefore only PARTIALLY catchable via scheduling output (the gate guards the
+//   entire block, but when `inner_find_worker_for_action` returns None the end
+//   result is identical).
 //
-// The AUTHORITATIVE gate test is Layer A: the config default.
+// The AUTHORITATIVE OFF-path test is now Layer B (explicit flag `false`); Layer A
+// pins the drift-proof ON default.
 //
 // Bespoke failure messages:
-//   Layer A: "T1: enable_speculative_prefetch MUST default to false — gate-OFF regression"
+//   Layer A: "T1: enable_speculative_prefetch MUST default to TRUE — drift-proof ON default"
 //   Layer B: "T1: PrefetchInputs emitted with gate OFF — MUST NOT emit when feature disabled"
 #[nativelink_test]
 async fn t1_feature_gate_off_no_prefetch_inputs() -> Result<(), Error> {
-    // ── Layer A: config default assertion ──────────────────────────────────────
+    // ── Layer A: config default assertion (default is now ON, drift-proof) ──────
     let spec = SimpleSpec::default();
     assert!(
-        !spec.enable_speculative_prefetch,
-        "T1: enable_speculative_prefetch MUST default to false — gate-OFF regression"
+        spec.enable_speculative_prefetch,
+        "T1: enable_speculative_prefetch MUST default to TRUE — drift-proof ON default \
+         (per user 2026-07-07; config `false` is the kill-switch, off-path pinned by Layer B)"
     );
 
     // ── Layer B: scheduling output — gate=OFF, all matching workers saturated, ──
@@ -772,14 +778,19 @@ async fn send_prefetch_inputs_no_eligible_idle_worker_no_emit() -> Result<(), Er
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// T8: Config deserialization — enable_speculative_prefetch defaults false
+// T8: Config deserialization — enable_speculative_prefetch defaults TRUE
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Spec: `SimpleSpec::default()` must have `enable_speculative_prefetch = false`
-// (feature gate OFF). Deserializing `{}` must produce the same value.
+// Spec: `SimpleSpec::default()` must have `enable_speculative_prefetch = true`
+// (feature ENABLED by default, drift-proof — per user 2026-07-07: don't default
+// features to OFF, it delays fixing their bugs). Deserializing `{}` must produce
+// the same value, so config drift (an omitted flag) can no longer dark the
+// feature; config `false` is the operational kill-switch.
 //
-// This is the registry's serde contract test. If this fails, the production
-// deployment would have the feature accidentally ON.
+// This is the registry's serde contract test: it pins that the manual
+// `impl Default` and the `#[serde(default = "default_true")]` agree on the
+// shipped default. The backlog-threshold (3) and TTL (60) defaults are NOT
+// flipped and are asserted unchanged.
 //
 // Bespoke failure message baked into assert_eq!.
 #[nativelink_test]
@@ -787,9 +798,10 @@ async fn t8_config_defaults_gate_off() -> Result<(), Error> {
     let default_spec = SimpleSpec::default();
     assert_eq!(
         default_spec.enable_speculative_prefetch,
-        false,
-        "T8: SimpleSpec::default() must have enable_speculative_prefetch=false (gate OFF); \
-         found true — production would activate the feature on every deploy"
+        true,
+        "T8: SimpleSpec::default() must have enable_speculative_prefetch=true (ENABLED \
+         by default, drift-proof, per user 2026-07-07); found false — config drift or a \
+         reverted default would silently dark the feature"
     );
     assert_eq!(
         default_spec.speculative_prefetch_backlog_threshold,
@@ -809,8 +821,9 @@ async fn t8_config_defaults_gate_off() -> Result<(), Error> {
         .expect("T8: deserialize SimpleSpec from empty JSON object failed");
     assert_eq!(
         from_json.enable_speculative_prefetch,
-        false,
-        "T8: serde-deserialized SimpleSpec{{}} must have enable_speculative_prefetch=false"
+        true,
+        "T8: serde-deserialized SimpleSpec{{}} must have enable_speculative_prefetch=true \
+         (the #[serde(default = \"default_true\")] must fire on an omitted flag)"
     );
     assert_eq!(
         from_json.speculative_prefetch_backlog_threshold,
