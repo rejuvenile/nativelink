@@ -2919,13 +2919,13 @@ impl WorkerConnection {
         // the worker has run no cold constructs yet). Stored on the `Worker`
         // ONLY — the hold gate does NOT consume it, so this changes NO
         // scheduling decision.
-        let construct_latency_ms_ewma = notification.construct_latency_ms_ewma;
+        let construct_latency_ms_mean = notification.construct_latency_ms_mean;
         if let Err(err) = self
             .scheduler
-            .update_worker_construct_latency(&self.worker_id, construct_latency_ms_ewma)
+            .update_worker_construct_latency(&self.worker_id, construct_latency_ms_mean)
             .await
         {
-            warn!(worker_id=?self.worker_id, ?err, construct_latency_ms_ewma, "Failed to update worker construct latency");
+            warn!(worker_id=?self.worker_id, ?err, construct_latency_ms_mean, "Failed to update worker construct latency");
         }
 
         // Mirror capacity report (review #1): the worker advertises its

@@ -147,7 +147,7 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     async fn update_worker_construct_latency(
         &self,
         _worker_id: &WorkerId,
-        _construct_latency_ms_ewma: u32,
+        _construct_latency_ms_mean: u32,
     ) -> Result<(), Error> {
         Ok(())
     }

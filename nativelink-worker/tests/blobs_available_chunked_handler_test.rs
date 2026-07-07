@@ -315,7 +315,7 @@ async fn token_mismatch_mid_broadcast_only_second_commits() -> Result<(), Error>
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
-        construct_latency_ms_ewma: 0,
+        construct_latency_ms_mean: 0,
     };
 
     // Second broadcast (token B): seq=0 (rebuild) + seq=1 terminal.
@@ -434,7 +434,7 @@ async fn sequence_gap_terminal_rejected_by_completeness_gate() -> Result<(), Err
         memory_pressured: false,
         available_disk_bytes: 0,
         disk_pressured: false,
-        construct_latency_ms_ewma: 0,
+        construct_latency_ms_mean: 0,
     };
     // Skip sequence 1; seq 2 is terminal — completeness gate must
     // reject.

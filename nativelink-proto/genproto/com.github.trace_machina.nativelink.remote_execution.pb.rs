@@ -423,11 +423,14 @@ pub struct BlobsAvailableNotification {
     /// / (`api_worker_scheduler.rs`) should EVENTUALLY equal. It is gossiped so
     /// / the scheduler can LOG it (`tag = "worker_construct_latency"`) for tuning
     /// / `T_SETUP` against MEASURED data. It is NOT yet consumed by the hold gate
-    /// / — LOGGED only, changing NO scheduling decision. (Despite the `_ewma`
-    /// / suffix the worker currently packs a cumulative MEAN, not an EWMA; the
-    /// / name reserves the field for a future decayed estimate.)
+    /// / — LOGGED only, changing NO scheduling decision. The worker currently
+    /// / packs a cumulative MEAN (`sum/count`, no decay/window), NOT an EWMA or
+    /// / percentile — hence the `_mean` name. Because the construct-cost
+    /// / distribution is bimodal, this mean must NOT be read programmatically to
+    /// / set `T_SETUP` until conditioned into a percentile/decayed estimate
+    /// / (tracked: `deferred_tasks.md` #obs-tuning-construct-latency-conditioning).
     #[prost(uint32, tag = "25")]
-    pub construct_latency_ms_ewma: u32,
+    pub construct_latency_ms_mean: u32,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -862,11 +865,11 @@ pub struct BlobsAvailableChunk {
     /// / (#obs-tuning) OBSERVABILITY-ONLY worker cold dir-cache construct latency
     /// / (mean ms) — only meaningful on chunk 0; subsequent chunks leave at
     /// / proto3 default `0`. The accumulator carries chunk 0's value forward into
-    /// / the reassembled `BlobsAvailableNotification.construct_latency_ms_ewma`
+    /// / the reassembled `BlobsAvailableNotification.construct_latency_ms_mean`
     /// / (field 25). LOGGED for `T_SETUP` tuning; NOT consumed by any routing
     /// / decision.
     #[prost(uint32, tag = "29")]
-    pub construct_latency_ms_ewma: u32,
+    pub construct_latency_ms_mean: u32,
 }
 /// / A streaming-message envelope shared across the cas→worker, scheduler→
 /// / worker, and worker→scheduler chunk producers. Exactly ONE of the

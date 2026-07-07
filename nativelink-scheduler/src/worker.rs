@@ -184,7 +184,7 @@ pub struct Worker {
     /// scheduling decision. `0` means the worker reported no cold constructs yet
     /// (count == 0) or is a pre-#obs-tuning worker (proto3 default).
     #[metric(help = "Worker-gossiped mean cold dir-cache construct latency (ms); T_SETUP tuning input, LOGGED only.")]
-    pub construct_latency_ms_ewma: u32,
+    pub construct_latency_ms_mean: u32,
 
     /// (#sched-blend) Number of performance (P) logical CPUs the worker
     /// reported on its connect hello frame. Static for the worker's
@@ -366,7 +366,7 @@ impl Worker {
             e_core_load_pct: 0,
             // (#obs-tuning) OBSERVABILITY-ONLY: 0 until the worker gossips a
             // cold-construct latency; never a scheduling input.
-            construct_latency_ms_ewma: 0,
+            construct_latency_ms_mean: 0,
             has_reported_load: false,
             p_core_count,
             e_core_count,

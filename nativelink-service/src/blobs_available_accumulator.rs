@@ -175,7 +175,7 @@ struct HeaderScalars {
     // (mean ms), carried from chunk 0. LOGGED (`tag =
     // "worker_construct_latency"`) after reassembly for `T_SETUP` tuning; NOT
     // consumed by any routing decision.
-    construct_latency_ms_ewma: u32,
+    construct_latency_ms_mean: u32,
 }
 
 /// One in-flight broadcast's accumulated state.
@@ -293,7 +293,7 @@ impl BroadcastAccumulator {
                 memory_pressured: chunk.memory_pressured,
                 available_disk_bytes: chunk.available_disk_bytes,
                 disk_pressured: chunk.disk_pressured,
-                construct_latency_ms_ewma: chunk.construct_latency_ms_ewma,
+                construct_latency_ms_mean: chunk.construct_latency_ms_mean,
             });
         }
 
@@ -892,7 +892,7 @@ impl BlobsAvailableAccumulator {
                     body.memory_pressured = headers.memory_pressured;
                     body.available_disk_bytes = headers.available_disk_bytes;
                     body.disk_pressured = headers.disk_pressured;
-                    body.construct_latency_ms_ewma = headers.construct_latency_ms_ewma;
+                    body.construct_latency_ms_mean = headers.construct_latency_ms_mean;
                 }
                 body.is_full_snapshot = removed.is_full_snapshot;
                 MergeOutcome::Accepted(Some(body))
@@ -994,7 +994,7 @@ mod tests {
             memory_pressured: false,
             available_disk_bytes: 0,
             disk_pressured: false,
-            construct_latency_ms_ewma: 0,
+            construct_latency_ms_mean: 0,
         }
     }
 
@@ -1565,7 +1565,7 @@ mod tests {
         );
     }
 
-    /// (#obs-tuning) `construct_latency_ms_ewma` rides chunk 0 and the
+    /// (#obs-tuning) `construct_latency_ms_mean` rides chunk 0 and the
     /// accumulator MUST carry it forward into the reassembled notification
     /// (same half-applied-header bug class as the swap/disk fields). Because
     /// the CHUNKED path is the PRODUCTION path (all ByteStream CAS writes),
@@ -1573,22 +1573,22 @@ mod tests {
     /// constant 0 in prod.
     ///
     /// Mutation step (CLAUDE.md TDD #5): comment out the
-    /// `body.construct_latency_ms_ewma = headers.construct_latency_ms_ewma;`
+    /// `body.construct_latency_ms_mean = headers.construct_latency_ms_mean;`
     /// line in the terminal-commit arm of `merge_chunk`. This test red-fails
     /// with the bespoke "lost in chunked reassembly" message below.
     #[test]
     fn construct_latency_carried_forward_from_chunk_zero() {
         let acc = BlobsAvailableAccumulator::new();
         let mut c0 = chunk(1, 0, false, 99, vec![bdi(1)]);
-        c0.construct_latency_ms_ewma = 4_242;
+        c0.construct_latency_ms_mean = 4_242;
 
         let c1 = chunk(1, 1, true, 99, vec![bdi(2)]);
 
         assert!(acc.merge_chunk(c0).is_none());
         let out = acc.merge_chunk(c1).expect("terminal commits");
         assert_eq!(
-            out.construct_latency_ms_ewma, 4_242,
-            "#obs-tuning: chunk-0 construct_latency_ms_ewma was lost in chunked \
+            out.construct_latency_ms_mean, 4_242,
+            "#obs-tuning: chunk-0 construct_latency_ms_mean was lost in chunked \
              reassembly (the terminal chunk's default 0 clobbered the carried \
              value — accumulator carry-forward missing)"
         );
@@ -1989,7 +1989,7 @@ mod tests {
             available_disk_bytes: 0,
             disk_pressured: false,
             evicted_blob_infos: Vec::<BlobDigestInfo>::new(),
-            construct_latency_ms_ewma: 0,
+            construct_latency_ms_mean: 0,
         };
         // The test is a compile-time check; no runtime assertions needed.
     }

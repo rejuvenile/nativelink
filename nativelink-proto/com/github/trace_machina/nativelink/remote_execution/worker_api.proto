@@ -434,10 +434,13 @@ message BlobsAvailableNotification {
     /// (`api_worker_scheduler.rs`) should EVENTUALLY equal. It is gossiped so
     /// the scheduler can LOG it (`tag = "worker_construct_latency"`) for tuning
     /// `T_SETUP` against MEASURED data. It is NOT yet consumed by the hold gate
-    /// — LOGGED only, changing NO scheduling decision. (Despite the `_ewma`
-    /// suffix the worker currently packs a cumulative MEAN, not an EWMA; the
-    /// name reserves the field for a future decayed estimate.)
-    uint32 construct_latency_ms_ewma = 25;
+    /// — LOGGED only, changing NO scheduling decision. The worker currently
+    /// packs a cumulative MEAN (`sum/count`, no decay/window), NOT an EWMA or
+    /// percentile — hence the `_mean` name. Because the construct-cost
+    /// distribution is bimodal, this mean must NOT be read programmatically to
+    /// set `T_SETUP` until conditioned into a percentile/decayed estimate
+    /// (tracked: `deferred_tasks.md` #obs-tuning-construct-latency-conditioning).
+    uint32 construct_latency_ms_mean = 25;
 }
 
 /// One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
@@ -799,10 +802,10 @@ message BlobsAvailableChunk {
     /// (#obs-tuning) OBSERVABILITY-ONLY worker cold dir-cache construct latency
     /// (mean ms) — only meaningful on chunk 0; subsequent chunks leave at
     /// proto3 default `0`. The accumulator carries chunk 0's value forward into
-    /// the reassembled `BlobsAvailableNotification.construct_latency_ms_ewma`
+    /// the reassembled `BlobsAvailableNotification.construct_latency_ms_mean`
     /// (field 25). LOGGED for `T_SETUP` tuning; NOT consumed by any routing
     /// decision.
-    uint32 construct_latency_ms_ewma = 29;
+    uint32 construct_latency_ms_mean = 29;
 }
 
 /// A streaming-message envelope shared across the cas→worker, scheduler→

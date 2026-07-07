@@ -3481,18 +3481,29 @@ const DURATION_EWMA_ALPHA_PCT: u128 = 20;
 /// that must re-construct the tree) only when W is expected to REGAIN a P-slot
 /// SOONER than X could re-construct — i.e. `T_wait_W < T_SETUP`.
 ///
-/// No scheduler-visible construct-latency signal exists (the worker's
-/// `record_hit_assemble_ms` at `directory_cache.rs` is never gossiped to the
-/// scheduler — design §2.3.5), so a constant is the only option without new
-/// cross-component plumbing. Its value is a THRESHOLD, not a bound: a wrong
+/// A scheduler-visible construct-latency signal now exists (#obs-tuning): each
+/// worker gossips its cold-construct latency — from `record_construct_fetch_ms`
+/// (`directory_cache.rs:2472`, the COLD full-reconstruct span; NOT the warm
+/// `record_hit_assemble_ms`) — on the chunked `BlobsAvailable` protocol; the
+/// scheduler stores it on `Worker` and logs it every 15 s (journalctl tag
+/// `worker_construct_latency`). But it is currently a SINCE-BOOT CUMULATIVE MEAN
+/// (`construct_latency_ms_mean`), NOT a decayed EWMA or percentile — a
+/// human/diagnostic signal only. Because the construct-cost distribution is
+/// bimodal, a single mean lands in the valley between the two modes, so this
+/// signal MUST NOT be read programmatically to derive `T_SETUP` until it is
+/// conditioned into a percentile/decayed estimate (tracked:
+/// `deferred_tasks.md` #obs-tuning-construct-latency-conditioning). So a constant
+/// remains the only sound option for now. Its value is a THRESHOLD, not a bound: a wrong
 /// `T_SETUP` shifts WHERE the hold-vs-rebind crossover sits (hold slightly more or
 /// slightly less often), but NEVER breaks correctness (the max-hold cap bounds
 /// starvation regardless, and the overdue-refusal bounds the bimodal risk
 /// regardless). 3 s is a COARSE GUESS for the setup-dominated regime — an
 /// order-of-magnitude anchor for an uncached-tree construct (fetch blobs +
-/// assemble), NOT a measured value: no scheduler-visible construct-latency signal
-/// exists to derive it from, so it MUST be tuned via the soak (scrape `hold_regret`
-/// / `hold_paid_off` and adjust). Bounded-sensitivity (design §2.3.5): the decision
+/// assemble), NOT a measured value: the gossiped `construct_latency_ms_mean` is
+/// only a diagnostic cross-check (an all-time mean of a bimodal distribution, not
+/// yet conditioned), so `T_SETUP` MUST STILL be tuned via the soak (scrape
+/// `hold_regret` / `hold_paid_off` and adjust) with the gossip as a sanity check.
+/// Bounded-sensitivity (design §2.3.5): the decision
 /// is dominated by the observed-duration EWMA within seconds of warm-up, so a wrong
 /// guess self-corrects as the EWMA converges.
 const T_SETUP: Duration = Duration::from_secs(3);
@@ -4387,7 +4398,7 @@ impl ApiWorkerScheduler {
     }
 
     /// (#obs-tuning) OBSERVABILITY-ONLY snapshot of every registered worker's
-    /// last-gossiped `(worker_id, construct_latency_ms_ewma)`, taken under the
+    /// last-gossiped `(worker_id, construct_latency_ms_mean)`, taken under the
     /// read lock (does NOT promote LRU order — `iter()` is a peek). Consumed by
     /// the periodic `tag = "worker_construct_latency"` log so the per-worker
     /// cold-construct cost is journalctl-scrapeable for `T_SETUP` tuning. Reads
@@ -4399,7 +4410,7 @@ impl ApiWorkerScheduler {
             .await
             .workers
             .iter()
-            .map(|(worker_id, worker)| (worker_id.clone(), worker.construct_latency_ms_ewma))
+            .map(|(worker_id, worker)| (worker_id.clone(), worker.construct_latency_ms_mean))
             .collect()
     }
 
@@ -8663,7 +8674,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
     async fn update_worker_construct_latency(
         &self,
         worker_id: &WorkerId,
-        construct_latency_ms_ewma: u32,
+        construct_latency_ms_mean: u32,
     ) -> Result<(), Error> {
         // (#obs-tuning) OBSERVABILITY-ONLY: store the worker's gossiped mean
         // cold-construct latency. `peek_mut` to avoid LRU promotion — a
@@ -8681,7 +8692,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 worker_id
             )
         })?;
-        worker.construct_latency_ms_ewma = construct_latency_ms_ewma;
+        worker.construct_latency_ms_mean = construct_latency_ms_mean;
         Ok(())
     }
 
