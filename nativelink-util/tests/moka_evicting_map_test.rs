@@ -358,6 +358,128 @@ async fn range_queries() {
 }
 
 // ---------------------------------------------------------------------------
+// 11b. range() must not self-deadlock when a get() inside it triggers eviction
+// ---------------------------------------------------------------------------
+//
+// Regression for the 2026-07-07 graceful-shutdown drain deadlock. During
+// SIGTERM, `StoreManager::flush_slow_writes` calls `MemoryStore::list`, which
+// delegates to `MokaEvictingMap::range`. `range` holds `self.btree.read()`
+// across the iteration loop and calls `self.cache.get(q)` on each key. moka's
+// `sync::Cache::get` performs amortized maintenance (`do_run_pending_tasks` →
+// `evict_lru_entries`) and fires the eviction listener SYNCHRONOUSLY on the
+// same stack; that listener acquires `self.btree.write()`. parking_lot's
+// RwLock is non-reentrant and write-preferring, so the write acquire blocks
+// forever waiting for the read guard held above it on the same stack — a
+// self-deadlock (proven by addr2line of the wedged production binary:
+// listener stuck in `RawRwLock::lock_exclusive_slow`, held under `range`'s
+// `btree.read()` via `MemoryStore::list`).
+//
+// The fix snapshots the matching keys under the read lock, releases the lock,
+// then does the `cache.get()` + handler pass with NO btree lock held, so the
+// listener's `btree.write()` can never contend with a same-stack read guard.
+//
+// This test drives the exact re-entrancy: it over-fills the cache far past
+// capacity via the deferred `insert_with_time` path (which does NOT call
+// `run_pending_tasks`, so moka's write-op buffer fills and pending
+// size-evictions queue up), then calls `range()`. The first `cache.get()`
+// inside `range` runs the deferred maintenance → eviction listener →
+// `btree.write()`. Without the fix `range` never returns; the timeout is the
+// deadlock detector.
+#[tokio::test]
+async fn range_does_not_deadlock_on_eviction_during_iteration() {
+    // Small byte cap (8 KiB) with 1 KiB entries: capacity ~8 entries. This
+    // reproduces the exact production re-entrancy that wedged the server on
+    // SIGTERM. moka's `sync::Cache::get` runs amortized maintenance
+    // (`do_run_pending_tasks` → `evict_lru_entries`) once the read-op log
+    // crosses READ_LOG_FLUSH_POINT (64) OR a prior partial eviction left the
+    // `more_entries_to_evict` flag set — firing the eviction listener
+    // SYNCHRONOUSLY on the calling stack. `range` calls `cache.get` while
+    // holding `btree.read()`, and the listener acquires `btree.write()`.
+    //
+    // NOTE ON THE DEADLOCK DETECTOR: the bug is a parking_lot RwLock wait
+    // (`lock_exclusive_slow`), which BLOCKS the OS thread — it does NOT yield
+    // to the async runtime. So a plain `tokio::time::timeout` around `range`
+    // cannot fire (its timer future never gets polled once the worker thread
+    // is wedged). We therefore run `range` on a DEDICATED std::thread with
+    // its own current-thread runtime and detect the hang by joining that
+    // thread with a wall-clock deadline on THIS thread. If `range` wedges,
+    // the dedicated thread never signals and we fail with a bespoke message.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_thread = Arc::clone(&done);
+    let count_slot: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+    let count_thread = Arc::clone(&count_slot);
+
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(async move {
+            let cfg = policy(8 * 1024, 0, 0, 0);
+            let map = make_map(&cfg);
+            map.enable_filtering().await;
+
+            // Phase 1: load + settle a full cache. These runtime inserts DO
+            // run moka maintenance internally (moka's `insert` calls
+            // `apply_reads_writes_if_needed`), so their evictions fire the
+            // listener NOW — on the insert stack, where the btree lock is NOT
+            // held (safe) — and drain to steady state. Keys 0..200.
+            for i in 0..200u64 {
+                map.insert(i, BytesEntry(1024)).await;
+            }
+            // Force any residual maintenance to completion so the cache is at
+            // cap with an EMPTY pending-eviction backlog before phase 2.
+            let _ = map.len_for_test().await;
+
+            // Phase 2: queue fresh evictions via the STARTUP path
+            // (`insert_with_time` → `insert_startup`), which deliberately
+            // does NOT call `run_pending_tasks`. Keep the count under
+            // WRITE_LOG_FLUSH_POINT (64) so moka does NOT auto-drain during
+            // these inserts — the resulting size-driven evictions stay QUEUED
+            // in moka's write log, to be processed by the first `get()` that
+            // trips the flush point inside `range`. Keys 200..240 (40 < 64).
+            for i in 200..240u64 {
+                map.insert_with_time(i, BytesEntry(1024), -(i as i32)).await;
+            }
+
+            // Phase 3: `range` over the full key space (240 keys ⇒ >64
+            // `cache.get` calls, guaranteeing the read-log flush point trips
+            // and moka drains the queued phase-2 evictions mid-iteration →
+            // eviction listener → `btree.write()`). If `range` holds
+            // `btree.read()` across that `cache.get()`, the non-reentrant
+            // write acquire blocks forever HERE and the thread never signals.
+            let count = map
+                .range(0u64..240u64, |_key, _val| true)
+                .await;
+            count_thread.store(count, Ordering::SeqCst);
+            done_thread.store(true, Ordering::SeqCst);
+        });
+    });
+
+    // Deadlock detector: poll the completion flag on THIS (independent)
+    // thread for up to 10 s. `tokio::time::sleep` yields, so this loop stays
+    // responsive even though the worker thread under test is blocked.
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(10);
+    while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(core::time::Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        done.load(Ordering::SeqCst),
+        "range() self-deadlocked: an eviction listener triggered by cache.get() \
+         inside the iteration tried to take btree.write() while range held \
+         btree.read() on the same stack (graceful-shutdown drain deadlock)"
+    );
+    // Thread finished; join it (returns immediately since it signaled done).
+    handle.join().expect("range worker thread panicked");
+    let count = count_slot.load(Ordering::SeqCst);
+    assert!(
+        count > 0 && count <= 240,
+        "range should iterate the surviving entries, got count={count}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 12. Concurrent stress test
 // ---------------------------------------------------------------------------
 

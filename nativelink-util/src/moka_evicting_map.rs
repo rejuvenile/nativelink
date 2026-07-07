@@ -1937,11 +1937,37 @@ where
             }
         }
 
-        let btree = self.btree.read();
-        let set = btree.as_ref().expect("btree should be built");
+        // DEADLOCK-SAFETY (2026-07-07 graceful-shutdown drain deadlock):
+        // Snapshot the matching keys under the btree READ lock, then RELEASE
+        // the lock BEFORE touching moka's `cache.get()`. We must NOT hold
+        // `self.btree.read()` across `cache.get()`: moka's `sync::Cache::get`
+        // performs amortized maintenance (`do_run_pending_tasks` →
+        // `evict_lru_entries`) and fires the eviction listener SYNCHRONOUSLY
+        // on this stack, and that listener acquires `self.btree.write()`
+        // (line ~674). parking_lot's RwLock is non-reentrant and
+        // write-preferring, so a write acquire under a same-stack read guard
+        // blocks forever — the exact self-deadlock that wedged the server on
+        // SIGTERM (`StoreManager::flush_slow_writes` → `MemoryStore::list` →
+        // this `range` → `cache.get` → listener → `btree.write()`). The
+        // snapshot iterates the BTreeSet (pure in-memory, no moka) under the
+        // read lock only, so no lock is held when the listener needs to write.
+        //
+        // CAPPED AT btree size (= `max_count`, the map's configured entry cap;
+        // 1M for the production cas_FAST_SLOW MemoryStore): the snapshot is a
+        // subset of the resident key set, which moka bounds by `max_count`.
+        // This is the SAME bound the sole caller
+        // (`FastSlowStore::flush_fast_to_slow_at_shutdown`) already allocates
+        // when it collects the full key set — the snapshot is moved earlier
+        // (and lock-released-first), not newly unbounded.
+        let candidates: Vec<K> = {
+            let btree = self.btree.read();
+            let set = btree.as_ref().expect("btree should be built");
+            set.range(prefix_range).cloned().collect()
+        };
+
         let check_pinned = self.has_pinned();
         let mut count = 0;
-        for key in set.range(prefix_range) {
+        for key in &candidates {
             let q: &Q = key.borrow();
             let value = if check_pinned {
                 if let Some(entry) = self.pinned.get(q) {
@@ -1952,7 +1978,8 @@ where
             } else {
                 self.cache.get(q)
             };
-            // Skip keys evicted by moka but still in BTree (stale).
+            // Skip keys evicted by moka but still in BTree (stale) — including
+            // any evicted by the maintenance a `cache.get()` above triggers.
             if let Some(ref v) = value {
                 if !handler(key, v) {
                     break;
