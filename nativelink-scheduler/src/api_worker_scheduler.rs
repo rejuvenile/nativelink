@@ -199,12 +199,12 @@ pub struct SchedulerMetrics {
     pub speculative_prefetch_miss: AtomicU64,
     /// (#specprefetch-rebind Stage B) Number of times the temporal hold gate
     /// HELD a queued op (returned `None` from `inner_find_and_reserve_worker` to
-    /// re-queue it) for a busy-because-full holder W with `T_wait_W < T_setup`,
-    /// instead of rebinding to a free-but-cold worker. Counts EACH hold cycle (an
-    /// op held across N cycles bumps this N times), so `hold_count / hold_paid_off`
-    /// gives the mean cycles-per-successful-hold. Zero when `enable_speculative_hold`
-    /// is off (the whole gate is gated on the flag). LIVE, `Relaxed`.
-    #[metric(help = "(#specprefetch-rebind) times the temporal gate held a queued op for a busy holder")]
+    /// re-queue it) for a P-SATURATED holder W with `T_wait_W < T_setup`, instead of
+    /// rebinding to a free-but-cold worker. Counts EACH hold cycle (an op held across
+    /// N cycles bumps this N times), so `hold_count / hold_paid_off` gives the mean
+    /// cycles-per-successful-hold. Zero when `enable_speculative_hold` is off (the
+    /// whole gate is gated on the flag). LIVE, `Relaxed`.
+    #[metric(help = "(#specprefetch-rebind) times the temporal gate held a queued op for a P-saturated holder")]
     pub speculative_hold_count: AtomicU64,
     /// (#specprefetch-rebind Stage B) Number of held ops that PAID OFF: at
     /// assignment the op was reserved onto a worker that HOLDS its
@@ -1961,57 +1961,60 @@ impl ApiWorkerSchedulerImpl {
             .cloned()
     }
 
-    /// (#specprefetch-rebind Stage B, §2.3.2) Identify W for the temporal hold
-    /// gate: a holder of the op's `input_root_digest` that is BUSY *because at
-    /// capacity*, with the SOONEST expected time-to-free among such holders.
+    /// (#specprefetch-rebind Stage B v3, §2.3-v3.1/v3.7-#3) Identify W for the
+    /// temporal hold gate: a holder of the op's `input_root_digest` that is
+    /// **P-SATURATED** (excluded from the cache tiers by pcore-first), with the
+    /// SOONEST expected time to REGAIN a P-slot among such holders.
     ///
-    /// A holder qualifies iff `!is_paused && !is_draining &&
-    /// running_action_infos.len() >= max_inflight_tasks` AND `max_inflight_tasks
-    /// > 0` — a paused/draining holder's slot may never free (holding on it just
-    /// burns `T_max`), and an UNLIMITED-slot worker (`max_inflight_tasks == 0`) is
-    /// never "full" so it would already be a viable rebind target, not a wait. The
-    /// holder signal is the SAME per-`Worker` `cached_directory_digests`/
-    /// `cached_subtree_digests` Tier-1 uses (gossip-fed for ALL workers with no
-    /// availability filter — design §2.3.2). This is DELIBERATELY not
-    /// `find_prefetch_target_worker` (which returns the FREEST holder): Stage B
-    /// needs the same read pattern with a BUSY-FULL predicate, ranked by SOONEST
-    /// `t_wait_w_locked` (the holder we would wait the LEAST for). It NEVER reads
-    /// the coalesce guard's `op→W` (that is measurement-only — §2.2).
+    /// v3 re-derivation: "busy" is P-SATURATION (`!worker_has_p_headroom`,
+    /// `running >= p_core_count` at the default threshold), NOT slot-full — the live
+    /// fleet runs `max_inflight_tasks=0` (unlimited slots), so the v2 slot-full
+    /// predicate could NEVER fire (design §2.3-v3.1). This does NOT re-scan
+    /// `self.workers`: it FILTERS the ALREADY-MATERIALIZED `p_gated_excluded` set
+    /// (the viable workers pcore-first excluded for lack of P-headroom, computed once
+    /// in the pre-scan at the call site — design §2.3-v3.7-#3) for those holding the
+    /// op's root. Because that set is built from `worker_is_viable` candidates
+    /// (capability-index match ∩ platform `is_satisfied_by` ∩ health-OK), the
+    /// capability filter (v3.7-#6) and the paused/draining/pressured exclusions hold
+    /// BY CONSTRUCTION — no extra filtering needed here.
     ///
-    /// Returns `(WorkerId, t_wait, overdue)` for the best busy-full holder to hold
-    /// for, or `None` if no busy-full holder of the root exists. `t_wait`/`overdue`
-    /// are returned so the caller applies the `< T_setup` and not-overdue tests
-    /// without recomputing `t_wait_w_locked`.
+    /// The holder signal is the SAME per-`Worker` `cached_directory_digests`/
+    /// `cached_subtree_digests` Tier-1 uses. It NEVER reads the coalesce guard's
+    /// `op→W` (that is measurement-only — §2.2).
+    ///
+    /// Returns `(WorkerId, t_wait, overdue)` for the best P-saturated holder to hold
+    /// for, or `None` if no P-saturated holder of the root exists. `t_wait`/`overdue`
+    /// come from `t_wait_w_locked` (the k-th-soonest completion + overdue over the
+    /// k-soonest set) so the caller applies the `< T_setup` and not-overdue tests
+    /// without recomputing.
     ///
     /// Ranking key `(overdue, t_wait)` ascending: a NON-overdue holder always beats
-    /// an overdue one, then ties break to the SOONEST time-to-free. This encodes
-    /// the "∃ busy-full W with `t_wait < T_setup` AND NOT overdue" semantics
-    /// (design §2.3.3): if any non-overdue holder exists it is returned (so the
-    /// caller's `< T_setup` + `!overdue` checks can hold on it), and a single stuck
-    /// (overdue) holder does NOT block a hold for a genuinely-about-to-free peer.
-    /// When ALL holders are overdue the soonest overdue one is returned so the
-    /// caller's explicit `!overdue` check still refuses the hold (the pure-stuck
-    /// case, §2.3.4).
-    fn find_busy_full_holder(
+    /// an overdue one, then ties break to the SOONEST time-to-regain-a-P-slot. This
+    /// encodes the "∃ P-saturated W with `t_wait < T_setup` AND NOT overdue"
+    /// semantics (design §2.3.3): if any non-overdue holder exists it is returned, a
+    /// single stuck (overdue) holder does NOT block a hold for a genuinely-about-to-
+    /// free peer, and when ALL holders are overdue the soonest overdue one is
+    /// returned so the caller's explicit `!overdue` check still refuses the hold.
+    fn find_p_saturated_holder(
         &self,
         input_root_digest: &DigestInfo,
+        p_gated_excluded: &[(WorkerId, usize, u32, u32)],
     ) -> Option<(WorkerId, Duration, bool)> {
         let mut best: Option<(WorkerId, Duration, bool)> = None;
-        for (worker_id, w) in self.workers.iter() {
-            // Busy-BECAUSE-FULL: at/over its finite slot cap, not paused/draining.
-            let running = w.running_action_infos.len() as u64;
-            let is_full = w.max_inflight_tasks > 0 && running >= w.max_inflight_tasks;
-            if w.is_paused || w.is_draining || !is_full {
+        for (worker_id, _running, _p_core_count, _p_load) in p_gated_excluded {
+            let Some(w) = self.workers.0.peek(worker_id) else {
                 continue;
-            }
+            };
             // Holder of the exact input_root (root OR subtree) — the Tier-1 signal.
+            // (P-saturation + viability/health/capability already hold: this set is
+            // the viable-but-no-P-headroom workers from the pre-scan — v3.7-#3/#6.)
             let holds_root = w.cached_directory_digests.contains(input_root_digest)
                 || w.cached_subtree_digests.contains(input_root_digest);
             if !holds_root {
                 continue;
             }
             let (t_wait, overdue) = t_wait_w_locked(self, worker_id);
-            // Prefer NON-overdue (false < true), then SOONEST time-to-free.
+            // Prefer NON-overdue (false < true), then SOONEST time-to-regain-a-P-slot.
             let better = best.as_ref().is_none_or(|(_, best_wait, best_overdue)| {
                 (overdue, t_wait) < (*best_overdue, *best_wait)
             });
@@ -2556,27 +2559,48 @@ impl ApiWorkerSchedulerImpl {
             None
         };
 
-        // ── (#specprefetch-rebind Stage B, §2.3) Temporal hold-vs-rebind gate ──
+        // ── (#specprefetch-rebind Stage B v3, §2.3-v3) Temporal hold-vs-rebind gate ──
         // Runs UNDER the `self.inner.write()` held at the reserve call site and
         // BEFORE any winner LRU promotion below, so a HOLD is the EXISTING no-match
         // outcome (`None`) that mutates no worker state (only the hold-state map).
-        // HOLD iff `enable_speculative_hold` AND (a) the best available X is not
-        // itself a good-locality holder of the root — `dir_cache_winner.is_none()`,
-        // since a Some winner IS the exact root/subtree holder (Tier-1, `:2225`) →
-        // it can hardlink now, no reason to wait — AND (b) ∃ a busy-because-full
-        // holder W of the root with `t_wait_w_locked(W) < T_SETUP` AND W not
-        // OVERDUE. On the max-hold cap (wall-time OR cycle count) the op is NOT
-        // held — it reserves X (abandons the hold, the starvation bound §2.3.4).
-        // Returns `None` (NEVER `Err` — a hold must not bump consecutive_match_
-        // errors); the freed op is re-served next cycle and the EXISTING Tier-1
-        // routes it to whichever viable holder frees (§2.3.3 A1).
-        if self.enable_speculative_hold && dir_cache_winner.is_none() {
+        //
+        // v3: the hold is the TEMPORAL exception to pcore-first's SPATIAL route-away
+        // (design §2.3-v3.2). HOLD iff:
+        //  * `enable_speculative_hold` (default-OFF master gate), AND
+        //  * `p_gate_active` (design §2.3-v3.7-#1, distsys BLOCK-2): the pcore-first
+        //    gate is ON *and* some viable worker has P-headroom → a P-saturated
+        //    holder W is genuinely being routed-away-from. On a FULLY-P-saturated
+        //    fleet the gate LIFTS (`p_gate_active=false`) and pcore-first SPREADS
+        //    work — the hold must NOT fire then (it would violate the spread-under-
+        //    saturation invariant); with the flag OFF, W is not excluded and wins
+        //    Tier-1 anyway, so no hold is needed. Gating on `p_gate_active` closes
+        //    both cases, AND
+        //  * `dir_cache_winner.is_none() && subtree_coverage_winner.is_none() &&
+        //    locality_winner.is_none()` (C1, design §2.3-v3.7-#5): X is a genuinely
+        //    COLD reconstruct. A Some dir winner is the exact holder (can hardlink
+        //    now); a Some subtree/locality winner has PARTIAL locality → a CHEAP
+        //    cold reconstruct, the residual regime where REBIND wins — hold only
+        //    over a NON-locality X, AND
+        //  * ∃ a P-saturated holder W of the root (from the ALREADY-materialized
+        //    `p_gated_excluded` set) with `t_wait_w_locked(W) < T_SETUP` (W regains
+        //    a P-slot before X could reconstruct) AND W not OVERDUE.
+        // On the max-hold cap (wall-time OR cycle count) the op is NOT held — it
+        // reserves X (abandons the hold, the starvation bound §2.3.4). Returns
+        // `None` (NEVER `Err` — a hold must not bump consecutive_match_errors); the
+        // freed op is re-served next cycle and the EXISTING Tier-1 routes it to
+        // whichever viable holder frees (§2.3.3 A1).
+        if self.enable_speculative_hold
+            && p_gate_active
+            && dir_cache_winner.is_none()
+            && subtree_coverage_winner.is_none()
+            && locality_winner.is_none()
+        {
             if let Some((hold_w, t_wait, overdue)) =
-                self.find_busy_full_holder(&input_root_digest)
+                self.find_p_saturated_holder(&input_root_digest, &p_gated_excluded)
             {
                 if t_wait < T_SETUP && !overdue {
-                    // A busy-full holder is expected to free before X could
-                    // re-construct the tree — the hold is worth taking UNLESS this
+                    // A P-saturated holder is expected to regain a P-slot before X
+                    // could re-construct the tree — the hold is worth taking UNLESS this
                     // op has already exhausted its max-hold cap.
                     let now = (self.exec_clock)();
                     let cap_hit = self
@@ -2625,7 +2649,7 @@ impl ApiWorkerSchedulerImpl {
                             %hold_w,
                             %input_root_digest,
                             t_wait_ms = t_wait.as_millis(),
-                            "speculative hold — holding op for busy-full holder \
+                            "speculative hold — holding op for P-saturated holder \
                              (T_wait_W < T_setup), re-queuing (#specprefetch-rebind)"
                         );
                         return None;
@@ -3394,8 +3418,8 @@ const DURATION_EWMA_ALPHA_PCT: u128 = 20;
 
 /// (#specprefetch-rebind Stage B, §2.3.5) `T_setup`: the coarse construction-cost
 /// constant the temporal hold gate compares `T_wait_W` against. A queued op is
-/// HELD for a busy-because-full holder W (rather than rebound to a free-but-cold
-/// worker X that must re-construct the tree) only when W is expected to free
+/// HELD for a P-saturated holder W (rather than rebound to a free-but-cold worker X
+/// that must re-construct the tree) only when W is expected to REGAIN a P-slot
 /// SOONER than X could re-construct — i.e. `T_wait_W < T_SETUP`.
 ///
 /// No scheduler-visible construct-latency signal exists (the worker's
@@ -3405,11 +3429,13 @@ const DURATION_EWMA_ALPHA_PCT: u128 = 20;
 /// `T_SETUP` shifts WHERE the hold-vs-rebind crossover sits (hold slightly more or
 /// slightly less often), but NEVER breaks correctness (the max-hold cap bounds
 /// starvation regardless, and the overdue-refusal bounds the bimodal risk
-/// regardless). 3 s is the setup-dominated-regime anchor: the #p1p2 cold-tree
-/// resolution histogram put the p50 cold construct near ~1.4 s and a long tail to
-/// seconds, so a busy holder expected to free within ~3 s is worth waiting for vs
-/// paying a fresh uncached construct. Bounded-sensitivity (design §2.3.5): the
-/// decision is dominated by the observed-duration EWMA within seconds of warm-up.
+/// regardless). 3 s is a COARSE GUESS for the setup-dominated regime — an
+/// order-of-magnitude anchor for an uncached-tree construct (fetch blobs +
+/// assemble), NOT a measured value: no scheduler-visible construct-latency signal
+/// exists to derive it from, so it MUST be tuned via the soak (scrape `hold_regret`
+/// / `hold_paid_off` and adjust). Bounded-sensitivity (design §2.3.5): the decision
+/// is dominated by the observed-duration EWMA within seconds of warm-up, so a wrong
+/// guess self-corrects as the EWMA converges.
 const T_SETUP: Duration = Duration::from_secs(3);
 
 /// (#specprefetch-rebind Stage B, §2.3.4) `T_max` (wall-time arm of the max-hold
@@ -3448,7 +3474,7 @@ struct HoldRecord {
 }
 
 /// (#specprefetch-rebind Stage B) Max number of concurrently-held op records in
-/// `speculative_hold_state`. One entry per op currently being held for a busy
+/// `speculative_hold_state`. One entry per op currently being held for a P-saturated
 /// holder; a held op is reaped the moment it is assigned or rerouted, so the live
 /// set is bounded by the number of ops simultaneously mid-hold (≪ the queue).
 /// 256 is generously above the top-of-queue batch a single match cycle processes
@@ -3525,21 +3551,33 @@ impl DurationEwma {
 /// already-locked `inner`. The async `worker_time_to_free` is a thin `read()`
 /// wrapper delegating here (single source of truth — also closes Stage-C nit C1).
 ///
-/// Returns `(time_to_free, overdue)`:
-/// - `time_to_free` = Σ over ALL of W's in-flight actions of each action's
-///   estimated REMAINING time (`max(0, estimate − elapsed)`), using the single
-///   global duration EWMA as the per-action estimate. Full in-flight set, NOT just
-///   the head action (distsys BLOCK-2: a best-locality worker holds several affine
-///   ops; the head-only form under-counts exactly in the concentration regime). A
-///   single-slot worker reduces to its one action's remaining time. Un-timed
-///   records (`exec_start_time = None`, e.g. the dead reconnect insert) contribute
-///   0. `Duration::ZERO` if the worker is absent (already freed / never existed).
-/// - `overdue` = TRUE iff ANY in-flight action has `elapsed > estimate` (its
-///   remaining saturated to ~0 — the action has run PAST its predicted duration).
-///   The hold gate REFUSES to hold on an overdue W (design §2.3.4, red-team's
-///   most-dangerous case): an overdue action is ambiguous — about-to-finish (just
+/// Returns `(time_to_regain_a_p_slot, overdue)`:
+/// - `time_to_regain_a_p_slot` = the **k-th SOONEST** completion among W's in-flight
+///   actions, where `k = running_action_infos.len() − p_core_count + 1` (design
+///   §2.3-v3.3): the time until ONE P-slot frees (the moment `running` drops back
+///   below `p_core_count` → W regains headroom and re-enters the cache tiers). This
+///   is the k-th SMALLEST `max(0, estimate − elapsed)` (order statistic), using the
+///   single global duration EWMA as the per-action estimate. It is NOT the SUM (the
+///   v2/Stage-C form summed the whole in-flight set — WRONG for "time to a free
+///   P-slot"; distsys BLOCK-2's "full queue" undercount does not apply, because W
+///   has no per-W pending queue, only running actions on cores). Just-P-saturated
+///   (`running == p_core_count` → k=1) reduces to the MIN remaining. Un-timed
+///   records (`exec_start_time = None`, e.g. the dead reconnect insert) are invisible
+///   to the estimate; `k` is clamped into `[1, timed_count]` so the order statistic
+///   stays well-defined when some actions are un-timed. A `p_core_count == 0` (A5
+///   legacy) worker yields `k = running + 1` → clamped to `timed_count` → the MAX
+///   remaining (time until ALL current actions finish); such a worker is never a
+///   hold candidate (it is never P-saturated), so this only affects the Stage-C
+///   `worker_time_to_free` wrapper. `Duration::ZERO` if the worker is absent or has
+///   no timed in-flight action.
+/// - `overdue` = TRUE iff any of the **k SOONEST** actions has `elapsed > estimate`
+///   (its remaining saturated to ~0 — it has run PAST its predicted duration).
+///   Computed over the k-soonest set ONLY (not the whole in-flight set — design
+///   §2.3-v3.7-#4, avoid over-refusal): an overdue slot-freeing action is the one
+///   whose completion the hold bets on, and it is ambiguous — about-to-finish (just
 ///   take X) OR a mis-estimated long compile on a bimodal fleet (holding is wrong,
-///   p99 regresses) — so the gate does not bet. Un-timed records do not set it.
+///   p99 regresses). The hold gate REFUSES to hold on such a W (design §2.3.4,
+///   red-team's most-dangerous case). Un-timed records do not set it.
 fn t_wait_w_locked(
     inner: &ApiWorkerSchedulerImpl,
     worker_id: &WorkerId,
@@ -3549,25 +3587,46 @@ fn t_wait_w_locked(
         return (Duration::ZERO, false);
     };
     let now = (inner.exec_clock)();
-    let mut total = Duration::ZERO;
-    let mut overdue = false;
+    // Collect (remaining, is_overdue) per TIMED in-flight action. Un-timed records
+    // (no exec_start_time) are invisible to the temporal estimate and cannot be
+    // overdue. `elapsed = now − start` is guarded against a wall clock that ran
+    // backwards (NTP step) — a backwards jump yields ZERO elapsed, so the action
+    // counts as its full estimate rather than underflowing (and is not overdue,
+    // since ZERO elapsed < any positive estimate).
+    let mut items: Vec<(Duration, bool)> = Vec::with_capacity(worker.running_action_infos.len());
     for pending in worker.running_action_infos.values() {
-        // Un-timed record: invisible to the temporal estimate AND cannot be
-        // overdue (no start instant to measure elapsed against).
         let Some(start) = pending.exec_start_time else {
             continue;
         };
-        // `elapsed = now − start`, guarded against a wall clock that ran backwards
-        // (NTP step) — a backwards jump yields ZERO elapsed, so the action counts
-        // as its full estimate rather than underflowing (and is not flagged
-        // overdue, since ZERO elapsed < any positive estimate).
         let elapsed = now.duration_since(start).unwrap_or(Duration::ZERO);
-        if elapsed > estimate {
-            overdue = true;
-        }
-        total += estimate.saturating_sub(elapsed);
+        items.push((estimate.saturating_sub(elapsed), elapsed > estimate));
     }
-    (total, overdue)
+    if items.is_empty() {
+        return (Duration::ZERO, false);
+    }
+    // k = running − p_core_count + 1 (the index of the completion that frees ONE
+    // P-slot), computed from the FULL running count (design §2.3-v3.3) and clamped
+    // into `[1, timed_count]` so the order statistic is well-defined even with
+    // un-timed records. `p_core_count == 0` → k = running + 1 → clamps to
+    // timed_count (MAX remaining; such a worker is never a hold candidate).
+    let running = worker.running_action_infos.len();
+    let p_core_count = worker.p_core_count as usize;
+    let timed_count = items.len();
+    let k = running
+        .saturating_sub(p_core_count)
+        .saturating_add(1)
+        .clamp(1, timed_count);
+    // Partial-select the k SOONEST (smallest remaining) at the k-1 boundary. After
+    // this, `items[..k]` are the k smallest remainings (unordered among themselves)
+    // and `items[k-1]` is exactly the k-th smallest — the time-to-regain-a-P-slot.
+    // O(running) average, no full sort. Order the tuple by remaining only (the bool
+    // is carried, not a sort key).
+    let (soonest, kth, _) = items.select_nth_unstable_by(k - 1, |a, b| a.0.cmp(&b.0));
+    let t_wait = kth.0;
+    // overdue over the k-soonest set: the k-1 strictly-smaller ones (`soonest`) plus
+    // the k-th itself.
+    let overdue = kth.1 || soonest.iter().any(|(_, od)| *od);
+    (t_wait, overdue)
 }
 
 /// (#output-locality-probe) Cost-control cap (no-silent-truncation rule): output
@@ -4078,17 +4137,17 @@ impl ApiWorkerScheduler {
             .exec_clock = clock;
     }
 
-    /// (#specprefetch-rebind Stage C) `T_wait_W`: the worker's expected
-    /// time-to-free — the sum over ALL of the worker's in-flight actions of each
-    /// action's estimated REMAINING time (`max(0, duration_estimate − elapsed)`),
-    /// using the single global duration EWMA as the per-action estimate.
-    ///
-    /// Per distsys BLOCK-2 this sums over the FULL in-flight set, NOT just the
-    /// head action: in the concentration regime a best-locality worker holds
-    /// several affine ops, and Stage B's hold-vs-rebind decision under-counts the
-    /// real wait if it looks at only one. For a single-slot worker this reduces to
-    /// the one running action's remaining time. Un-timed records
-    /// (`exec_start_time = None`, e.g. the dead reconnect insert) contribute 0.
+    /// (#specprefetch-rebind Stage B/C v3) `T_wait_W`: the worker's expected time to
+    /// REGAIN a P-slot — the **k-th SOONEST** completion among W's in-flight actions
+    /// (`k = running − p_core_count + 1`), using the single global duration EWMA as
+    /// the per-action estimate. This is the time until ONE P-slot frees (the moment
+    /// `running` drops below `p_core_count` → W re-enters the cache tiers), NOT the
+    /// SUM over the full in-flight set (design §2.3-v3.3): W has no per-W pending
+    /// queue, only running actions on cores, so the "full-queue" undercount does not
+    /// apply; the SUM would model the time for ALL of W's actions to finish, which is
+    /// not when a P-slot opens. Just-P-saturated (`running == p_core_count` → k=1)
+    /// reduces to the MIN remaining. See `t_wait_w_locked` for the k-clamp and the
+    /// A5 (`p_core_count == 0`) behaviour.
     ///
     /// PEEK-ONLY: acquires the read lock and mutates nothing. Returns
     /// `Duration::ZERO` if the worker is not present (already freed / never
@@ -13682,6 +13741,31 @@ mod b1_lock_decouple_tests {
         rx
     }
 
+    /// (#specprefetch-rebind Stage B v3) Like `add_worker_named` but with a
+    /// specified `p_core_count` (via `new_with_cas_endpoint`, whose counts ride the
+    /// connect frame in prod), so the k-th-soonest `worker_time_to_free` order
+    /// statistic — `k = running − p_core_count + 1` — is well-defined and testable.
+    async fn add_worker_named_cores(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+        max_inflight_tasks: u64,
+        p_core_count: u32,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new_with_cas_endpoint(
+            WorkerId(name.to_string()),
+            props_named(name),
+            tx,
+            42,
+            max_inflight_tasks,
+            String::new(),
+            p_core_count,
+            p_core_count,
+        );
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
     /// All workers in this pool share the SAME capability property
     /// (`pool=swap`) so a single action matches every one of them — the
     /// shape needed to test the #37 fleet fail-open (every candidate
@@ -14284,6 +14368,31 @@ mod b1_lock_decouple_tests {
                 false,
                 // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
                 false,
+            )
+        }
+
+        /// (#specprefetch-rebind Stage B v3) Like `build_scheduler_gate_on` but with
+        /// the temporal hold gate ON (`enable_speculative_hold = true`) — for the C1
+        /// gate-condition tests that need the hold to be reachable so a
+        /// `locality_winner`/`subtree_coverage_winner` guard can be shown to BLOCK it.
+        fn build_scheduler_hold_on(wsm: Arc<BarrierWorkerStateManager>) -> Arc<ApiWorkerScheduler> {
+            ApiWorkerScheduler::new_with_locality_map(
+                wsm,
+                Arc::new(PlatformPropertyManager::new(HashMap::new())),
+                WorkerAllocationStrategy::default(),
+                Arc::new(Notify::new()),
+                100,
+                Arc::new(WorkerRegistry::new()),
+                None,
+                None,
+                None,
+                512 * 1024,
+                8,
+                true, // p_headroom_gate ON (so p_gate_active can be true)
+                0,    // p_idle_threshold_pct (override inert)
+                2,    // p_headroom_override_factor
+                false, // P2P prefetch OFF
+                true, // temporal hold gate ON
             )
         }
 
@@ -15004,6 +15113,94 @@ mod b1_lock_decouple_tests {
                  blob-locality crumb (Y_BLOB, 100 MiB locality) — Tier 1 is consulted \
                  FIRST; collapsing to one global score would let blob-locality outrank \
                  a root hardlink"
+            );
+        }
+
+        // ── (#specprefetch-rebind Stage B v3, C1) locality_winner blocks the hold ──
+        // The C1 gate condition requires `locality_winner.is_none()` (design
+        // §2.3-v3.7-#5): a Tier-2 blob-locality winner X is a CHEAP partial-locality
+        // rebind (the residual regime where REBIND wins), so the gate must NOT hold
+        // for a P-saturated root-holder W when such an X exists. This drives
+        // `inner_find_and_reserve_worker` DIRECTLY with an explicit `endpoint_scores`
+        // (the only way to force a genuine Tier-2 `locality_winner` without wiring a
+        // full locality_map + CAS tree), which the integration `find_and_reserve_
+        // worker` path cannot do (it derives scores from a locality_map). W holds R
+        // and is P-saturated (excluded from Tier-1 → dir_cache_winner None); no
+        // resolved_tree is passed (→ subtree_coverage_winner None); X has a large
+        // Tier-2 crumb (→ locality_winner = X). So only `locality_winner.is_none()`
+        // stands between the op and a hold.
+        //
+        // MUTATION: drop `&& locality_winner.is_none()` from the gate condition → the
+        // gate finds W (P-saturated holder, t_wait 0 since its running actions are
+        // un-timed → < T_SETUP, not overdue) and HOLDS (returns None) instead of
+        // assigning the op to the Tier-2 winner X → this red-fails with the C1
+        // message below.
+        #[nativelink_test]
+        async fn c1_locality_winner_blocks_hold() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+
+            // W: P-saturated (p_core_count=4, running=4) DIRECTORY holder of R.
+            add_tier1_worker(&scheduler, "W_HOLDER", 4, 0, 10, 10, 0).await;
+            set_worker_running(&scheduler, "W_HOLDER", 4).await;
+
+            // X_BLOB: idle (P-headroom), does NOT hold R, registered with a
+            // cas_endpoint so it appears in endpoint_to_worker → a Tier-2
+            // locality_winner when its endpoint carries a score.
+            let x_endpoint = "grpc://x-blob.local:50081";
+            {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let worker = Worker::new_with_cas_endpoint(
+                    WorkerId("X_BLOB".to_string()),
+                    props_pool(),
+                    tx,
+                    42,
+                    0,
+                    x_endpoint.to_string(),
+                    8,
+                    0,
+                );
+                scheduler.add_worker(worker).await.expect("add X_BLOB");
+            }
+            scheduler
+                .update_worker_load(&WorkerId("X_BLOB".to_string()), 5, 5, 0)
+                .await
+                .expect("load X_BLOB");
+
+            // A large Tier-2 locality score for X_BLOB's endpoint → locality_winner = X.
+            let mut endpoint_scores: HashMap<Arc<str>, u64> = HashMap::new();
+            endpoint_scores.insert(Arc::from(x_endpoint), 100 * 1024 * 1024);
+
+            let op = OperationId::default();
+            let action = pool_action();
+            let chosen = {
+                let mut inner = scheduler.inner.write().await;
+                inner
+                    .inner_find_and_reserve_worker(
+                        &props_pool(),
+                        &op,
+                        &action,
+                        false,
+                        Some(&endpoint_scores),
+                        None, // no resolved_tree → subtree_coverage_winner None
+                    )
+                    .map(|(wid, _tx, _msg)| wid)
+            };
+            assert_eq!(
+                chosen,
+                Some(WorkerId("X_BLOB".to_string())),
+                "C1 (§2.3-v3.7-#5): a Tier-2 blob-locality winner X_BLOB is a cheap \
+                 partial-locality rebind, so the temporal hold gate must NOT hold for \
+                 the P-saturated root-holder W_HOLDER — the op must be assigned to X_BLOB \
+                 (locality_winner). Got a hold (None) or the wrong worker: the \
+                 `locality_winner.is_none()` C1 guard was dropped, so the gate held over \
+                 a genuine locality rebind."
+            );
+            assert_eq!(
+                scheduler.get_metrics().speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "C1: speculative_hold_count moved despite a Tier-2 locality_winner being \
+                 available — the gate held over a cheap-rebind X (C1 violated)."
             );
         }
 
@@ -15978,22 +16175,29 @@ mod b1_lock_decouple_tests {
             );
         }
 
-        /// `worker_time_to_free` sums over ALL of the worker's in-flight actions
-        /// (distsys BLOCK-2), not just the head. Drive a worker with TWO
-        /// concurrent in-flight ops with DIFFERENT elapseds and assert the result
-        /// is the SUM of the two remainings — strictly greater than either alone.
-        /// Mutation: replace the `.values().map(...).sum()` with
-        /// `.values().next().map(...)` (head-only) in `worker_time_to_free` →
-        /// this red-fails with the bespoke BLOCK-2 message.
+        /// (v3.3) `worker_time_to_free` = the **k-th SOONEST** completion (`k =
+        /// running − p_core_count + 1`), the time until ONE P-slot frees — NOT the
+        /// SUM over the full in-flight set (the v2 form; distsys BLOCK-2's full-queue
+        /// undercount does not apply — W has no per-W pending queue, only running
+        /// actions on cores). Drive a `p_core_count=1` worker with TWO in-flight ops
+        /// (running=2 → k=2) at DIFFERENT elapseds and assert the result is the k-th
+        /// (2nd) smallest remaining — NOT the sum, NOT the min.
+        ///
+        /// Mutations, each caught by a distinct assertion below:
+        ///  * SUM (`.map(...).sum()`) → ttf = rem1+rem2 (50s) ≠ rem2 → first assert.
+        ///  * MIN (`.min()`, i.e. k=1) → ttf = rem1 (23s) ≠ rem2 → first assert.
+        ///  * head-only (`.next()`) → ttf = an arbitrary single remaining, and the
+        ///    "must equal the k-th, not the sum, not the min" assert pins it.
         #[nativelink_test]
-        async fn stage_c_worker_time_to_free_sums_all_inflight() {
+        async fn stage_c_worker_time_to_free_kth_soonest() {
             let base = Duration::from_secs(3_000);
             let wsm = BarrierWorkerStateManager::new();
             let scheduler = scheduler_with_mock_clock(wsm, base).await;
-            // Two-slot worker so both ops can be in-flight simultaneously.
-            let _rx = add_worker_named(&scheduler, "W", 2).await;
+            // p_core_count=1, unlimited slots → running=2 makes it P-saturated and
+            // k = 2 − 1 + 1 = 2 (need 2 completions to drop running below 1).
+            let _rx = add_worker_named_cores(&scheduler, "W", 0, 1).await;
 
-            // op1 reserved at t=base (elapsed will be larger).
+            // op1 reserved at t=base (elapsed will be larger → SMALLER remaining).
             let op1 = OperationId::default();
             reserve_on(&scheduler, "W", &op1, 0x31).await;
 
@@ -16006,32 +16210,36 @@ mod b1_lock_decouple_tests {
             MockClock::advance(Duration::from_secs(3));
 
             let est = DEFAULT_DURATION_ESTIMATE; // no completion yet → default.
-            let rem1 = est - Duration::from_secs(7); // op1 remaining.
-            let rem2 = est - Duration::from_secs(3); // op2 remaining.
-            let expected_sum = rem1 + rem2;
+            let rem1 = est - Duration::from_secs(7); // op1 remaining (23s, SMALLER).
+            let rem2 = est - Duration::from_secs(3); // op2 remaining (27s, LARGER).
+            // Sorted ascending [rem1, rem2]; the k-th (2nd) smallest = rem2.
+            let expected_kth = rem2;
 
             let ttf = scheduler
                 .worker_time_to_free(&WorkerId("W".to_string()))
                 .await;
 
-            // Head-only would return just rem2 (or rem1) — strictly less than the
-            // sum. Assert the SUM, and separately that it exceeds either single
-            // remaining, so a head-only regression cannot pass.
             assert_eq!(
-                ttf, expected_sum,
-                "T_wait_W undercounts the queue (distsys BLOCK-2): \
-                 worker_time_to_free must SUM the remaining time over ALL of the \
-                 worker's in-flight actions (rem1 {rem1:?} + rem2 {rem2:?} = \
-                 {expected_sum:?}), not just the head action. A single-action \
-                 (head-only) estimate under-counts exactly in the concentration \
-                 regime Stage B targets, where a best-locality worker holds \
-                 several affine ops."
+                ttf, expected_kth,
+                "T_wait_W (v3.3) must be the k-th SOONEST completion — with running=2, \
+                 p_core_count=1 → k=2 → the 2nd-smallest remaining = rem2 ({rem2:?}), \
+                 the time until ONE P-slot frees. It must NOT be the SUM \
+                 ({sum:?}, the v2 form — W has no per-W pending queue) NOR the MIN \
+                 (rem1 {rem1:?}, which would mis-model a deep-backlog W as about to \
+                 free a P-slot).",
+                sum = rem1 + rem2,
             );
-            assert!(
-                ttf > rem1 && ttf > rem2,
-                "T_wait_W ({ttf:?}) must exceed EITHER single in-flight remaining \
-                 (rem1 {rem1:?}, rem2 {rem2:?}) — proof it summed both rather than \
-                 returning one (distsys BLOCK-2)"
+            // Discriminate SUM and MIN explicitly.
+            assert_ne!(
+                ttf,
+                rem1 + rem2,
+                "T_wait_W is the SUM (v2 form) — it must be the k-th order statistic \
+                 (v3.3), not the sum over the full in-flight set."
+            );
+            assert_ne!(
+                ttf, rem1,
+                "T_wait_W is the MIN (k=1) — with k=2 it must be the 2nd-soonest \
+                 (rem2), not the soonest single completion."
             );
         }
 

@@ -337,10 +337,13 @@ pub struct SimpleSpec {
     /// available worker exactly as it does today (byte-identical; the
     /// `flag_off_no_hold` regression test pins this). When `true`, the matcher may
     /// return `None` (re-queue the op) instead of rebinding to a free-but-cold
-    /// worker X when a busy-because-full holder W of the op's `input_root_digest`
-    /// is expected to free (`T_wait_W < T_setup`) before X could re-construct the
-    /// tree — trading a bounded queue wait for a saved tree construction on the
-    /// critical path (design §2.3).
+    /// worker X when a P-SATURATED holder W of the op's `input_root_digest` (a
+    /// holder that pcore-first excluded from the cache tiers for lack of P-headroom)
+    /// is expected to REGAIN a P-slot (`T_wait_W < T_setup`) before X could
+    /// re-construct the tree — trading a bounded queue wait for a saved tree
+    /// construction on the critical path (design §2.3-v3). Gated internally on
+    /// `p_gate_active` (the pcore-first gate ON and some worker with P-headroom), so
+    /// it is a refinement of pcore-first, inert when that gate is off or lifted.
     ///
     /// Lands DARK and is enabled deliberately for a measurement window: unlike
     /// Stage A's prefetch, the hold has a p99-regression risk on a BIMODAL fleet
