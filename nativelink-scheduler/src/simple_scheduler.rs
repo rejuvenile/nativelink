@@ -2491,6 +2491,17 @@ impl SimpleScheduler {
             spec.enable_p2p_input_prefetch,
         );
 
+        // (#specprefetch-rebind Stage C) Wire the SAME `now_fn`-derived clock the
+        // state manager uses into the worker scheduler, so exec-start stamping
+        // and the duration EWMA (Stage B's `T_wait_W` inputs) are driven by the
+        // mockable clock (`SystemTime::now` in prod, `MockInstantWrapped` in
+        // tests). `affinity_clock` is `Arc<dyn Fn() -> SystemTime + …>`,
+        // structurally identical to `ExecClock`. Synchronous (uncontended
+        // try_write on the freshly-built Arc) so this non-async constructor can
+        // wire it inline. Without this call the scheduler would fall back to the
+        // wall clock, which is correct in prod but not mockable in tests.
+        worker_scheduler.set_exec_clock(affinity_clock.clone());
+
         let worker_scheduler_clone = worker_scheduler.clone();
 
         let action_scheduler = Arc::new_cyclic(move |weak_self| -> Self {

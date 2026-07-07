@@ -58,6 +58,22 @@ pub enum WorkerUpdate {
 pub struct PendingActionInfoData {
     #[metric]
     pub action_info: ActionInfoWithProps,
+
+    /// (#specprefetch-rebind Stage C) Monotonic-ish wall-clock instant at which
+    /// this op was RESERVED to the worker (the Executing transition), stamped
+    /// from the scheduler's injected clock (`SystemTime::now` in prod,
+    /// `MockInstantWrapped`'s mock-clock in tests) at the single reserve point
+    /// (`ApiWorkerSchedulerImpl::prepare_worker_run_action`). `elapsed = now −
+    /// start` is the op's live in-flight time; it feeds `worker_time_to_free`
+    /// (Stage B's `T_wait_W`) and the duration EWMA on completion.
+    ///
+    /// `None` means "not stamped": the reconnect-notify `Worker::run_action`
+    /// insert path (dead in production — `notify_update` is only ever called
+    /// with `WorkerUpdate::Disconnect`) carries no clock, so a record inserted
+    /// there contributes ZERO to `worker_time_to_free` and does not update the
+    /// EWMA. This is the correct degenerate behavior: an un-timed record is
+    /// simply invisible to the temporal estimate.
+    pub exec_start_time: Option<SystemTime>,
 }
 
 /// (#sched-blend, security S1) Upper bound on the worker-reported P/E
@@ -437,7 +453,17 @@ impl Worker {
                     worker_platform_properties,
                     &action_info.platform_properties,
                 );
-                running_action_infos.insert(operation_id, PendingActionInfoData { action_info });
+                // (#specprefetch-rebind Stage C) `exec_start_time: None` — this
+                // reconnect-notify path (dead in prod: `notify_update` is only
+                // called with `Disconnect`) has no injected clock, so the record
+                // stays un-timed and invisible to `worker_time_to_free`/EWMA.
+                running_action_infos.insert(
+                    operation_id,
+                    PendingActionInfoData {
+                        action_info,
+                        exec_start_time: None,
+                    },
+                );
 
                 send_msg_to_worker(tx, update_for_worker::Update::StartAction(start_execute))
             })

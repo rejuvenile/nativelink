@@ -1094,6 +1094,23 @@ struct ApiWorkerSchedulerImpl {
     // CAPPED AT PREFETCH_AFFINITY_CAP (64): LRU of recent speculative prefetch
     // coalesce records; over-cap evicts the oldest. `WorkerId` (String) per entry.
     prefetch_coalesce_guard: LruCache<OperationId, WorkerId>,
+
+    /// (#specprefetch-rebind Stage C) Injectable clock stamping an op's
+    /// Executing-transition instant at the reserve point
+    /// (`prepare_worker_run_action`) and measuring observed duration at
+    /// completion (`update_action_cs2`). Defaults to `SystemTime::now`;
+    /// `SimpleScheduler::new` injects its `now_fn`-derived clock via
+    /// `set_exec_clock` so the whole-scheduler tests can drive it with
+    /// `MockClock`. NOT `#[metric]`-annotated (a clock closure has no metric).
+    exec_clock: ExecClock,
+
+    /// (#specprefetch-rebind Stage C) Single global EWMA of observed action
+    /// durations, updated on each Executing→Completed transition. Read by
+    /// `worker_time_to_free` to estimate a worker's remaining in-flight time
+    /// (Stage B's `T_wait_W`). Peek-only from the read side; mutated only on the
+    /// completion path under the `inner` write lock. Observability/decision-input
+    /// state only — it changes NO scheduling decision at Stage C.
+    duration_estimate_ewma: DurationEwma,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -2586,6 +2603,30 @@ impl ApiWorkerSchedulerImpl {
             return Cs2Outcome::AlreadyFinalized;
         }
 
+        // (#specprefetch-rebind Stage C) Fold this op's observed duration into
+        // the global EWMA BEFORE `complete_action` removes the record. `elapsed
+        // = now − exec_start`, using the SAME injected clock that stamped the
+        // reserve. Only STAMPED records (every reserved op) feed the EWMA; an
+        // un-timed record (`None`) is skipped. Guarded against a backwards wall
+        // clock (yields ZERO, which is then skipped as a non-observation). This
+        // is the Executing→Completed transition (`update_action_cs2` runs only on
+        // the `is_finished` path). NOTE: a future refinement could restrict the
+        // sample to SUCCESSFUL `Completed` (excluding error/disconnect
+        // finishes); Stage C keeps all finished transitions for simplicity, since
+        // a freed slot is a freed slot for `T_wait_W` purposes.
+        if let Some(start) = worker
+            .running_action_infos
+            .get(operation_id)
+            .and_then(|pending| pending.exec_start_time)
+        {
+            let elapsed = (self.exec_clock)()
+                .duration_since(start)
+                .unwrap_or(Duration::ZERO);
+            if elapsed > Duration::ZERO {
+                self.duration_estimate_ewma.update(elapsed);
+            }
+        }
+
         // complete_action's missing-op error is unreachable here (we just
         // confirmed presence under the same lock); any other error
         // propagates.
@@ -2673,10 +2714,18 @@ impl ApiWorkerSchedulerImpl {
             &mut worker.platform_properties,
             &action_info.platform_properties,
         );
+        // (#specprefetch-rebind Stage C) Stamp the Executing-transition instant
+        // from the injected clock at THE single reserve point, so `worker_time_
+        // to_free` can compute `elapsed = now − start` for this op and the
+        // completion path can measure its observed duration for the EWMA. This is
+        // the ONLY production insert into `running_action_infos` (the
+        // `Worker::run_action` reconnect insert is dead — see its `None` stamp).
+        let exec_start_time = Some((self.exec_clock)());
         worker.running_action_infos.insert(
             operation_id.clone(),
             PendingActionInfoData {
                 action_info: action_info.clone(),
+                exec_start_time,
             },
         );
         // (#specprefetch-rebind) MEASUREMENT-ONLY prewarm-landing read: if this op
@@ -3080,6 +3129,82 @@ const PREFETCH_AFFINITY_CAP: usize = 64;
 /// PLACEMENT bound (distinct from the pin sub-budget, which bounds disk — §2.4).
 const PREFETCH_PER_WORKER_PER_CYCLE_CAP: usize = 2;
 
+/// (#specprefetch-rebind Stage C) Coarse default action-duration estimate used
+/// by `worker_time_to_free` (Stage B's `T_wait_W` input) BEFORE any action has
+/// completed on this scheduler process (the `DurationEwma` has no observation
+/// yet). 30 s is a deliberately blunt placeholder for a "typical" remote-exec
+/// action so `T_wait_W` is non-degenerate on a cold scheduler; once the first
+/// action completes the EWMA replaces it entirely (`DurationEwma::update` seeds
+/// to the first observation). This value is NOT a tunable-sensitive constant —
+/// it only shapes the pre-history estimate; Stage B's hold-vs-rebind decision
+/// (`T_wait_W < T_setup`) is dominated by observed durations within seconds of
+/// warm-up.
+const DEFAULT_DURATION_ESTIMATE: Duration = Duration::from_secs(30);
+
+/// (#specprefetch-rebind Stage C) EWMA smoothing factor (α), as a percent, for
+/// the rolling action-duration estimate. `new = α·observed + (1−α)·old`. 20%
+/// weights recent observations enough to track a workload shift within a handful
+/// of actions while damping single-action outliers (a pathologically long or
+/// short action moves the estimate by at most 20% of the gap). Integer-percent
+/// math keeps the update allocation-free and avoids float determinism concerns
+/// on the completion path.
+const DURATION_EWMA_ALPHA_PCT: u128 = 20;
+
+/// (#specprefetch-rebind Stage C) Injectable clock producing the `SystemTime`
+/// that stamps an op's Executing-transition instant (`exec_start_time`) and,
+/// on completion, measures the observed action duration for the EWMA.
+/// `SystemTime::now` in prod; `MockInstantWrapped`'s `now()` (mock-clock-driven)
+/// in tests — structurally identical to `simple_scheduler::AffinityClock`, into
+/// which the production wiring (`SimpleScheduler::new`) injects the SAME
+/// `now_fn`-derived clock the state manager uses, so tests driving `MockClock`
+/// through the full scheduler exercise this path. Erased so
+/// `ApiWorkerScheduler` need not carry the `NowFn`/`InstantWrapper` generics.
+type ExecClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
+/// (#specprefetch-rebind Stage C) A single global exponentially-weighted moving
+/// average of observed action durations, updated on each Executing→Completed
+/// transition (`update_action_cs2`). Global (not per-`command`-mnemonic) by
+/// design — the SIMPLEST estimate that makes `worker_time_to_free` non-degenerate
+/// (confirm-necessity: a per-mnemonic `HashMap<mnemonic, DurationEwma>` would
+/// refine `T_setup`/`T_wait_W` for heterogeneous fleets, but Stage B does not yet
+/// consume a per-mnemonic split, so it is DEFERRED — add it only when the
+/// decision model demonstrably needs the granularity).
+#[derive(Debug, Clone, Copy, Default)]
+struct DurationEwma {
+    /// The current smoothed estimate; `None` until the first observation, at
+    /// which point `update` SEEDS it to that observation (no cold-start bias
+    /// toward zero or toward `DEFAULT_DURATION_ESTIMATE`).
+    value: Option<Duration>,
+}
+
+impl DurationEwma {
+    /// Fold one observed duration into the average. First observation seeds the
+    /// estimate exactly; subsequent ones apply the α blend. Computed in `u128`
+    /// nanos to avoid overflow/precision loss on multi-second durations.
+    fn update(&mut self, observed: Duration) {
+        self.value = Some(match self.value {
+            None => observed,
+            Some(prev) => {
+                let prev_ns = prev.as_nanos();
+                let obs_ns = observed.as_nanos();
+                let blended_ns = (DURATION_EWMA_ALPHA_PCT * obs_ns
+                    + (100 - DURATION_EWMA_ALPHA_PCT) * prev_ns)
+                    / 100;
+                Duration::from_nanos(u64::try_from(blended_ns).unwrap_or(u64::MAX))
+            }
+        });
+    }
+
+    /// The current estimate, or `DEFAULT_DURATION_ESTIMATE` when no action has
+    /// completed yet on this scheduler process.
+    const fn estimate(&self) -> Duration {
+        match self.value {
+            Some(v) => v,
+            None => DEFAULT_DURATION_ESTIMATE,
+        }
+    }
+}
+
 /// (#output-locality-probe) Cost-control cap (no-silent-truncation rule): output
 /// `Tree` blobs LARGER than this are NOT fetched/decoded on the detached recorder
 /// task; the skip is `warn!`-logged AND counted in
@@ -3481,6 +3606,12 @@ impl ApiWorkerScheduler {
                 prefetch_coalesce_guard: LruCache::new(
                     NonZeroUsize::new(PREFETCH_AFFINITY_CAP).unwrap(),
                 ),
+                // (#specprefetch-rebind Stage C) Default to the wall clock; the
+                // production wiring (`SimpleScheduler::new`) injects its
+                // `now_fn`-derived clock via `set_exec_clock` so mock-clock tests
+                // through the full scheduler drive exec-start/duration timing.
+                exec_clock: Arc::new(SystemTime::now),
+                duration_estimate_ewma: DurationEwma::default(),
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -3543,6 +3674,71 @@ impl ApiWorkerScheduler {
     /// Returns a reference to the worker registry.
     pub const fn worker_registry(&self) -> &SharedWorkerRegistry {
         &self.worker_registry
+    }
+
+    /// (#specprefetch-rebind Stage C) Inject the scheduler's `now_fn`-derived
+    /// clock so exec-start stamping and duration measurement use the SAME
+    /// mockable clock the state manager uses (`SystemTime::now` in prod,
+    /// `MockInstantWrapped` in tests). `SimpleScheduler::new` calls this once,
+    /// right after construction, with its `affinity_clock`. Without the call the
+    /// scheduler falls back to the wall clock (`SystemTime::now`), which is
+    /// correct in prod but not mockable — so tests that need deterministic
+    /// timing MUST inject a `MockClock`-driven closure here.
+    ///
+    /// SYNCHRONOUS by design: this is a one-shot WIRING call made immediately
+    /// after construction, on the freshly-returned `Arc<Self>` before any task
+    /// can hold `inner`, so `try_write()` is guaranteed uncontended. Keeping it
+    /// sync lets the NON-async `SimpleScheduler::new_with_callback` wire the
+    /// clock inline without an executor. The `expect` would only fire on a wiring
+    /// bug (someone called this while another task held the lock), not a runtime
+    /// condition.
+    pub fn set_exec_clock(&self, clock: ExecClock) {
+        self.inner
+            .try_write()
+            .expect(
+                "set_exec_clock must be called during one-shot wiring, before any \
+                 task holds the inner lock",
+            )
+            .exec_clock = clock;
+    }
+
+    /// (#specprefetch-rebind Stage C) `T_wait_W`: the worker's expected
+    /// time-to-free — the sum over ALL of the worker's in-flight actions of each
+    /// action's estimated REMAINING time (`max(0, duration_estimate − elapsed)`),
+    /// using the single global duration EWMA as the per-action estimate.
+    ///
+    /// Per distsys BLOCK-2 this sums over the FULL in-flight set, NOT just the
+    /// head action: in the concentration regime a best-locality worker holds
+    /// several affine ops, and Stage B's hold-vs-rebind decision under-counts the
+    /// real wait if it looks at only one. For a single-slot worker this reduces to
+    /// the one running action's remaining time. Un-timed records
+    /// (`exec_start_time = None`, e.g. the dead reconnect insert) contribute 0.
+    ///
+    /// PEEK-ONLY: acquires the read lock and mutates nothing. Returns
+    /// `Duration::ZERO` if the worker is not present (already freed / never
+    /// existed) — an absent worker has no pending wait.
+    pub async fn worker_time_to_free(&self, worker_id: &WorkerId) -> Duration {
+        let inner = self.inner.read().await;
+        let estimate = inner.duration_estimate_ewma.estimate();
+        let Some(worker) = inner.workers.peek(worker_id) else {
+            return Duration::ZERO;
+        };
+        let now = (inner.exec_clock)();
+        worker
+            .running_action_infos
+            .values()
+            .map(|pending| match pending.exec_start_time {
+                // `elapsed = now − start`, guarded against a wall clock that ran
+                // backwards (NTP step) — a backwards jump yields ZERO elapsed, so
+                // the action counts as its full estimate rather than underflowing.
+                Some(start) => {
+                    let elapsed = now.duration_since(start).unwrap_or(Duration::ZERO);
+                    estimate.saturating_sub(elapsed)
+                }
+                // Un-timed record: invisible to the temporal estimate.
+                None => Duration::ZERO,
+            })
+            .sum()
     }
 
     /// Removes cached prefetch connection and semaphore for a specific endpoint.
@@ -4418,6 +4614,16 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| w.running_action_infos.len())
+    }
+
+    /// (#specprefetch-rebind Stage C) Current action-duration EWMA estimate.
+    /// Test-only — asserts the EWMA seeds on the first observed completion,
+    /// blends on subsequent ones, and returns `DEFAULT_DURATION_ESTIMATE` before
+    /// any completion. Reads the same `estimate()` `worker_time_to_free` uses.
+    #[cfg(test)]
+    #[must_use]
+    pub async fn duration_estimate_for_test(&self) -> Duration {
+        self.inner.read().await.duration_estimate_ewma.estimate()
     }
 
     /// (#sched-zeroload) Returns the current `workers_never_reported_load` gauge
@@ -7285,9 +7491,15 @@ impl ApiWorkerScheduler {
                 }),
                 platform_properties: PlatformProperties::default(),
             };
-            worker
-                .running_action_infos
-                .insert(OperationId::default(), PendingActionInfoData { action_info: action });
+            worker.running_action_infos.insert(
+                OperationId::default(),
+                // (#specprefetch-rebind Stage C) test-only direct insert; no
+                // clock, so un-timed (invisible to worker_time_to_free/EWMA).
+                PendingActionInfoData {
+                    action_info: action,
+                    exec_start_time: None,
+                },
+            );
         }
         assert_eq!(
             worker.running_action_infos.len(),
@@ -8168,8 +8380,14 @@ mod tests {
                 }),
                 platform_properties: PlatformProperties::default(),
             };
-            w.running_action_infos
-                .insert(op, PendingActionInfoData { action_info: action });
+            w.running_action_infos.insert(
+                op,
+                // (#specprefetch-rebind Stage C) test-only direct insert; un-timed.
+                PendingActionInfoData {
+                    action_info: action,
+                    exec_start_time: None,
+                },
+            );
         }
         assert_eq!(
             w.running_action_infos.len(),
@@ -13683,7 +13901,11 @@ mod b1_lock_decouple_tests {
             for _ in 0..running {
                 w.running_action_infos.insert(
                     OperationId::default(),
-                    PendingActionInfoData { action_info: pool_action() },
+                    // (#specprefetch-rebind Stage C) test-only direct insert; un-timed.
+                    PendingActionInfoData {
+                        action_info: pool_action(),
+                        exec_start_time: None,
+                    },
                 );
             }
             assert_eq!(
@@ -15153,6 +15375,308 @@ mod b1_lock_decouple_tests {
              channel during registration, permanently destroying the \
              stalled-keepalive alert"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (#specprefetch-rebind Stage C) T_wait_W plumbing: exec-start stamping,
+    // duration EWMA, and worker_time_to_free (Stage B's T_wait_W input).
+    // Pure instrumentation — these tests also assert ZERO scheduling-behavior
+    // change (the plumbing only ADDS readable state). Timing is driven by the
+    // injected mock clock (`set_exec_clock` + `MockClock`), the same mechanism
+    // the whole-scheduler `batch_affinity` render test uses.
+    // ════════════════════════════════════════════════════════════════════
+    mod stage_c_t_wait_w {
+        use super::*;
+        use mock_instant::thread_local::MockClock;
+        use nativelink_util::action_messages::{ActionResult, ActionStage};
+        use nativelink_util::operation_state_manager::UpdateOperationType;
+
+        // The Stage C plumbing types live at the `api_worker_scheduler` module
+        // root (private); reach them by absolute crate path.
+        use crate::api_worker_scheduler::{DEFAULT_DURATION_ESTIMATE, ExecClock};
+
+        /// A mock-clock-driven `ExecClock`, mirroring `MockInstantWrapped::now()`
+        /// (`UNIX_EPOCH + MockClock::time()`), so `MockClock::advance` moves the
+        /// scheduler's exec-start/duration clock deterministically.
+        fn mock_exec_clock() -> ExecClock {
+            Arc::new(|| UNIX_EPOCH + MockClock::time())
+        }
+
+        /// Anchor the mock clock at a non-zero base and inject it, so a stamped
+        /// `exec_start_time` (`Some(UNIX_EPOCH + base)`) is distinguishable from
+        /// the proto/`UNIX_EPOCH` default and elapsed math is unambiguous.
+        async fn scheduler_with_mock_clock(
+            wsm: Arc<BarrierWorkerStateManager>,
+            base: Duration,
+        ) -> Arc<ApiWorkerScheduler> {
+            MockClock::set_time(base);
+            let scheduler = build_scheduler(wsm);
+            scheduler.set_exec_clock(mock_exec_clock());
+            scheduler
+        }
+
+        /// Reserve `op` on worker `name` via the PRODUCTION reserve path
+        /// (`find_and_reserve_worker` → `prepare_worker_run_action`, the single
+        /// stamp point).
+        async fn reserve_on(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            op: &OperationId,
+            seed: u8,
+        ) {
+            let action = make_action_info_with_props(name, seed);
+            let (reserved, _tx, _msg) = tokio::time::timeout(
+                Duration::from_secs(2),
+                scheduler.find_and_reserve_worker(&props_named(name), op, &action, false),
+            )
+            .await
+            .expect("reserve must not hang (deadlock detector)")
+            .expect("op must reserve the named worker");
+            assert_eq!(reserved, WorkerId(name.to_string()));
+        }
+
+        /// Drive an Executing→Completed transition through the production
+        /// `update_action` orchestration (cs1 → parked update_operation → cs2,
+        /// where the EWMA folds). Uses the barrier WSM: spawn the completion,
+        /// wait until it parks, release, and await Ok.
+        async fn complete_on(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            wsm: &Arc<BarrierWorkerStateManager>,
+            name: &str,
+            op: &OperationId,
+        ) {
+            let entered = wsm.entered.clone();
+            let release = wsm.release.clone();
+            let scheduler_c = Arc::clone(scheduler);
+            let op_c = op.clone();
+            let name_c = name.to_string();
+            let task = tokio::spawn(async move {
+                scheduler_c
+                    .update_action(
+                        &WorkerId(name_c),
+                        &op_c,
+                        UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(
+                            ActionResult::default(),
+                        )),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), entered.notified())
+                .await
+                .expect("completion must enter update_operation (parked in cs2 window)");
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("completion task must finish after release")
+                .expect("completion join")
+                .expect("completion must return Ok");
+        }
+
+        /// exec-start is stamped on reserve, and `elapsed` advances with the mock
+        /// clock: `worker_time_to_free` = `DEFAULT_DURATION_ESTIMATE − elapsed`,
+        /// so advancing the clock by D reduces it by exactly D. Mutation: stamp
+        /// `None` instead of `Some((self.exec_clock)())` in
+        /// `prepare_worker_run_action` → elapsed uncomputable → both reads equal
+        /// the full estimate → delta 0 → this test red-fails on the delta assert.
+        #[nativelink_test]
+        async fn stage_c_exec_start_stamped_and_elapsed_advances() {
+            let base = Duration::from_secs(1_000);
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = scheduler_with_mock_clock(wsm, base).await;
+            let _rx = add_worker_named(&scheduler, "W", 4).await;
+
+            let op = OperationId::default();
+            reserve_on(&scheduler, "W", &op, 0x11).await;
+
+            // Just reserved: elapsed ≈ 0, so time-to-free ≈ the full default.
+            let at_reserve = scheduler
+                .worker_time_to_free(&WorkerId("W".to_string()))
+                .await;
+            assert_eq!(
+                at_reserve, DEFAULT_DURATION_ESTIMATE,
+                "at reserve (elapsed 0) time-to-free must equal the full default \
+                 estimate — a stamped exec_start with elapsed 0 leaves the whole \
+                 estimate outstanding"
+            );
+
+            // Advance the mock clock; elapsed must grow by exactly the advance.
+            let advance = Duration::from_secs(7);
+            MockClock::advance(advance);
+            let after_advance = scheduler
+                .worker_time_to_free(&WorkerId("W".to_string()))
+                .await;
+            assert_eq!(
+                after_advance,
+                DEFAULT_DURATION_ESTIMATE - advance,
+                "after advancing the mock clock by {advance:?}, time-to-free must \
+                 DROP by exactly that much (elapsed = now − exec_start tracks the \
+                 injected clock); if exec_start were unstamped (None) elapsed would \
+                 be uncomputable and this would stay at the full estimate"
+            );
+            // The delta is the whole point: elapsed is live and clock-driven.
+            assert_eq!(
+                at_reserve - after_advance,
+                advance,
+                "elapsed did not advance with the mock clock — exec_start is not \
+                 being read as `now − start`"
+            );
+        }
+
+        /// The EWMA: `estimate()` returns `DEFAULT_DURATION_ESTIMATE` before any
+        /// completion; the FIRST completion SEEDS it exactly to the observed
+        /// duration; a SECOND blends by α=20%. Mutation: delete
+        /// `self.duration_estimate_ewma.update(elapsed)` in `update_action_cs2`
+        /// → estimate stays at the default → the post-first-completion assert
+        /// red-fails (default 30s ≠ observed 5s).
+        #[nativelink_test]
+        async fn stage_c_ewma_seeds_first_then_blends() {
+            let base = Duration::from_secs(2_000);
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = scheduler_with_mock_clock(wsm.clone(), base).await;
+            let _rx = add_worker_named(&scheduler, "W", 4).await;
+
+            // Before any completion: the coarse default.
+            assert_eq!(
+                scheduler.duration_estimate_for_test().await,
+                DEFAULT_DURATION_ESTIMATE,
+                "with no completed action the duration estimate must be the coarse \
+                 default (DEFAULT_DURATION_ESTIMATE), not zero"
+            );
+
+            // Completion 1: reserve, advance 5s, complete → seeds EWMA to 5s.
+            let op1 = OperationId::default();
+            reserve_on(&scheduler, "W", &op1, 0x21).await;
+            let obs1 = Duration::from_secs(5);
+            MockClock::advance(obs1);
+            complete_on(&scheduler, &wsm, "W", &op1).await;
+            assert_eq!(
+                scheduler.duration_estimate_for_test().await,
+                obs1,
+                "the FIRST completed action must SEED the EWMA exactly to its \
+                 observed duration (5s), replacing the default — a first \
+                 observation is not blended against the default/zero"
+            );
+
+            // Completion 2: reserve, advance 15s, complete → blend 20%·15 + 80%·5.
+            let op2 = OperationId::default();
+            reserve_on(&scheduler, "W", &op2, 0x22).await;
+            let obs2 = Duration::from_secs(15);
+            MockClock::advance(obs2);
+            complete_on(&scheduler, &wsm, "W", &op2).await;
+            // 0.20*15 + 0.80*5 = 3 + 4 = 7 s.
+            let expected_blend = Duration::from_secs(7);
+            assert_eq!(
+                scheduler.duration_estimate_for_test().await,
+                expected_blend,
+                "the SECOND completed action must BLEND at α=20% \
+                 (0.20·15s + 0.80·5s = 7s); a stale estimate (still 5s) means the \
+                 completion did not fold the new observation"
+            );
+        }
+
+        /// `worker_time_to_free` sums over ALL of the worker's in-flight actions
+        /// (distsys BLOCK-2), not just the head. Drive a worker with TWO
+        /// concurrent in-flight ops with DIFFERENT elapseds and assert the result
+        /// is the SUM of the two remainings — strictly greater than either alone.
+        /// Mutation: replace the `.values().map(...).sum()` with
+        /// `.values().next().map(...)` (head-only) in `worker_time_to_free` →
+        /// this red-fails with the bespoke BLOCK-2 message.
+        #[nativelink_test]
+        async fn stage_c_worker_time_to_free_sums_all_inflight() {
+            let base = Duration::from_secs(3_000);
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = scheduler_with_mock_clock(wsm, base).await;
+            // Two-slot worker so both ops can be in-flight simultaneously.
+            let _rx = add_worker_named(&scheduler, "W", 2).await;
+
+            // op1 reserved at t=base (elapsed will be larger).
+            let op1 = OperationId::default();
+            reserve_on(&scheduler, "W", &op1, 0x31).await;
+
+            // Advance 4s, then reserve op2 (so op1.elapsed = op2.elapsed + 4s).
+            MockClock::advance(Duration::from_secs(4));
+            let op2 = OperationId::default();
+            reserve_on(&scheduler, "W", &op2, 0x32).await;
+
+            // Advance 3s more. Now: op1 elapsed 7s, op2 elapsed 3s.
+            MockClock::advance(Duration::from_secs(3));
+
+            let est = DEFAULT_DURATION_ESTIMATE; // no completion yet → default.
+            let rem1 = est - Duration::from_secs(7); // op1 remaining.
+            let rem2 = est - Duration::from_secs(3); // op2 remaining.
+            let expected_sum = rem1 + rem2;
+
+            let ttf = scheduler
+                .worker_time_to_free(&WorkerId("W".to_string()))
+                .await;
+
+            // Head-only would return just rem2 (or rem1) — strictly less than the
+            // sum. Assert the SUM, and separately that it exceeds either single
+            // remaining, so a head-only regression cannot pass.
+            assert_eq!(
+                ttf, expected_sum,
+                "T_wait_W undercounts the queue (distsys BLOCK-2): \
+                 worker_time_to_free must SUM the remaining time over ALL of the \
+                 worker's in-flight actions (rem1 {rem1:?} + rem2 {rem2:?} = \
+                 {expected_sum:?}), not just the head action. A single-action \
+                 (head-only) estimate under-counts exactly in the concentration \
+                 regime Stage B targets, where a best-locality worker holds \
+                 several affine ops."
+            );
+            assert!(
+                ttf > rem1 && ttf > rem2,
+                "T_wait_W ({ttf:?}) must exceed EITHER single in-flight remaining \
+                 (rem1 {rem1:?}, rem2 {rem2:?}) — proof it summed both rather than \
+                 returning one (distsys BLOCK-2)"
+            );
+        }
+
+        /// ZERO scheduling-behavior change: Stage C only ADDS readable state.
+        /// With the exec-clock/EWMA plumbing fully wired, the reserve path still
+        /// assigns the op to the sole capable worker and the coalesce-guard /
+        /// running-action bookkeeping is unchanged. (The plumbing touches neither
+        /// the selector nor the cap — Stage A code — so assignment is identical.)
+        #[nativelink_test]
+        async fn stage_c_zero_behavior_change_assignment_identical() {
+            let base = Duration::from_secs(4_000);
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = scheduler_with_mock_clock(wsm, base).await;
+            let _rx_a = add_worker_named(&scheduler, "WA", 4).await;
+            let _rx_b = add_worker_named(&scheduler, "WB", 4).await;
+
+            // An action whose props match ONLY WA must be assigned to WA,
+            // exactly as without the plumbing — the exec-clock stamp is a pure
+            // side-write and changes no selection input.
+            let op = OperationId::default();
+            let action = make_action_info_with_props("WA", 0x41);
+            let (chosen, _tx, _msg) = scheduler
+                .find_and_reserve_worker(&props_named("WA"), &op, &action, false)
+                .await
+                .expect("the matching worker WA must be selected");
+            assert_eq!(
+                chosen,
+                WorkerId("WA".to_string()),
+                "Stage C must not change assignment: the props-matched worker WA \
+                 must still be chosen (the exec-start stamp is a pure side-write)"
+            );
+
+            // Exactly one op recorded on WA, none on WB (bookkeeping unchanged).
+            assert_eq!(
+                scheduler
+                    .worker_running_action_count_for_test(&WorkerId("WA".to_string()))
+                    .await,
+                Some(1),
+                "WA must hold exactly the one reserved op — Stage C does not add \
+                 or drop running-action records"
+            );
+            assert_eq!(
+                scheduler
+                    .worker_running_action_count_for_test(&WorkerId("WB".to_string()))
+                    .await,
+                Some(0),
+                "WB must hold no ops — the non-selected worker is untouched"
+            );
+        }
     }
 }
 
