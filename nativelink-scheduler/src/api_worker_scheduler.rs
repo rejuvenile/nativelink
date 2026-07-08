@@ -232,6 +232,50 @@ pub struct SchedulerMetrics {
     /// principled fix is a per-mnemonic/platform EWMA (deferred follow-up).
     #[metric(help = "(#specprefetch-rebind) held-then-assigned-elsewhere after T_setup elapsed (a reconstruct would have been faster)")]
     pub hold_regret: AtomicU64,
+    /// (#hold-gate-c1-conjunct-instrument) OBSERVABILITY-ONLY per-conjunct
+    /// attribution for the Stage-B C1 hold gate. On the live fleet the gate
+    /// records `hold_count == 0`; these five counters attribute WHICH conjunct
+    /// of the hold predicate short-circuits, so the "why doesn't it fire" question
+    /// is answered from journald/`/metrics` rather than by a risky enable-flip.
+    /// They change NO hold decision (the restructure is byte-identical to the
+    /// pre-instrument gate) — pure `Relaxed` monotone telemetry, incremented
+    /// under the reserve write lock with no new lock/`.await`/alloc.
+    ///
+    /// `c1_hold_gate_considered`: the gate was EVALUATED at all — both
+    /// `enable_speculative_hold` (default-ON) and `p_gate_active` held. The
+    /// baseline denominator: comparing it against the `find_and_reserve_worker`
+    /// call count captures the `p_gate_active == false` (fully-P-saturated spread)
+    /// case that is deliberately NOT attributed separately (design: out of scope).
+    #[metric(help = "(#hold-gate-c1-conjunct-instrument) C1 hold gate evaluated (enable_speculative_hold && p_gate_active held); denominator for the four block-reason counters")]
+    pub c1_hold_gate_considered: AtomicU64,
+    /// (#hold-gate-c1-conjunct-instrument) The winner-none conjunct failed: a
+    /// dir-cache / subtree-coverage / blob-locality winner existed, so the op is a
+    /// CHEAP partial-locality rebind, not a genuinely-cold reconstruct, and the
+    /// gate must not hold (design §2.3-v3.7-#5). The reviewers' PRIME suspect for
+    /// the `hold_count == 0` mystery on this high-locality fleet — if this is the
+    /// dominant block reason, C1 never reaches the threshold conjuncts.
+    #[metric(help = "(#hold-gate-c1-conjunct-instrument) C1 blocked: a dir/subtree/locality winner existed (cheap rebind — winner-none conjunct failed; PRIME suspect on the high-locality fleet)")]
+    pub c1_blocked_locality_winner: AtomicU64,
+    /// (#hold-gate-c1-conjunct-instrument) Winner-none held (a genuinely-cold X),
+    /// but `find_p_saturated_holder` returned `None`: no viable-but-P-saturated
+    /// holder of the input root exists to hold FOR. Distinguishes "no locality to
+    /// hold over" from "locality exists but the holder isn't saturated/present".
+    #[metric(help = "(#hold-gate-c1-conjunct-instrument) C1 blocked: winner-none but no P-saturated root-holder found (nothing to hold for)")]
+    pub c1_blocked_no_saturated_holder: AtomicU64,
+    /// (#hold-gate-c1-conjunct-instrument) A P-saturated root-holder W exists, but
+    /// `t_wait_W >= T_SETUP`: W will not regain a P-slot before X could reconstruct
+    /// the tree, so a hold is not worth taking. This is the THRESHOLD conjunct the
+    /// deferred #tsetup-dynamic wanted to tune — counted FIRST (ahead of `overdue`)
+    /// so the soak learns whether the `T_SETUP` constant is even the binder before
+    /// any threshold work.
+    #[metric(help = "(#hold-gate-c1-conjunct-instrument) C1 blocked: holder exists but t_wait_W >= T_SETUP (the threshold conjunct #tsetup-dynamic targets — is it the binder?)")]
+    pub c1_blocked_t_wait_ge_t_setup: AtomicU64,
+    /// (#hold-gate-c1-conjunct-instrument) A P-saturated root-holder W exists with
+    /// `t_wait_W < T_SETUP`, but W is OVERDUE (a k-soonest slot-freeing action has
+    /// already exceeded its estimate) — holding for a stuck holder risks the
+    /// bimodal p99 regression (design §2.3-v3.7-#4), so the gate refuses.
+    #[metric(help = "(#hold-gate-c1-conjunct-instrument) C1 blocked: holder with t_wait_W < T_SETUP but W is overdue (stuck holder — refuse to bound bimodal risk)")]
+    pub c1_blocked_overdue: AtomicU64,
     /// Total number of server-side cache warm tasks spawned.
     #[metric(help = "total number of server-side cache warm tasks spawned")]
     pub cache_warm_spawned: CounterWithTime,
@@ -590,6 +634,22 @@ pub fn emit_speculative_hold_counters_log(metrics: &SchedulerMetrics) {
         hold_paid_off = metrics.hold_paid_off.load(Ordering::Relaxed),
         hold_regret = metrics.hold_regret.load(Ordering::Relaxed),
         hold_expired = metrics.hold_expired.load(Ordering::Relaxed),
+        // (#hold-gate-c1-conjunct-instrument) C1 per-conjunct attribution: WHICH
+        // conjunct short-circuits the hold gate on the live fleet (hold_count == 0).
+        // `considered` is the denominator; the four `c1_blocked_*` counters sum to
+        // `considered − speculative_hold_count − hold_expired` (every considered op
+        // either holds, hits the cap, or is attributed to exactly one block reason).
+        c1_hold_gate_considered = metrics.c1_hold_gate_considered.load(Ordering::Relaxed),
+        c1_blocked_locality_winner = metrics
+            .c1_blocked_locality_winner
+            .load(Ordering::Relaxed),
+        c1_blocked_no_saturated_holder = metrics
+            .c1_blocked_no_saturated_holder
+            .load(Ordering::Relaxed),
+        c1_blocked_t_wait_ge_t_setup = metrics
+            .c1_blocked_t_wait_ge_t_setup
+            .load(Ordering::Relaxed),
+        c1_blocked_overdue = metrics.c1_blocked_overdue.load(Ordering::Relaxed),
         // Stage A (speculative PrefetchInputs) counters.
         prefetch_emitted = metrics
             .speculative_prefetch_emitted
@@ -2648,72 +2708,114 @@ impl ApiWorkerSchedulerImpl {
         // `None` (NEVER `Err` — a hold must not bump consecutive_match_errors); the
         // freed op is re-served next cycle and the EXISTING Tier-1 routes it to
         // whichever viable holder frees (§2.3.3 A1).
-        if self.enable_speculative_hold
-            && p_gate_active
-            && dir_cache_winner.is_none()
-            && subtree_coverage_winner.is_none()
-            && locality_winner.is_none()
-        {
-            if let Some((hold_w, t_wait, overdue)) =
-                self.find_p_saturated_holder(&input_root_digest, &p_gated_excluded)
+        // (#hold-gate-c1-conjunct-instrument) OBSERVABILITY-ONLY restructure: the
+        // gate below is UNWRAPPED from the single conjunction into nested branches
+        // so each failing conjunct increments its own attribution counter — WITHOUT
+        // changing the hold outcome. The hold still fires iff `enable_speculative_
+        // hold ∧ p_gate_active ∧ winner-none ∧ holder-Some ∧ t_wait < T_SETUP ∧
+        // !overdue ∧ !cap_hit` (the IDENTICAL predicate set); the cap/HOLD block is
+        // reproduced byte-for-byte in the innermost `else`. `find_p_saturated_
+        // holder` is still called ONLY in the winner-none branch (no new cost when a
+        // winner exists), under the same `self.inner.write()` — no new lock, no
+        // `.await`, no alloc. `t_wait >= T_SETUP` is counted FIRST (ahead of
+        // `overdue`) so the soak learns whether the threshold conjunct is the binder.
+        if self.enable_speculative_hold && p_gate_active {
+            self.metrics
+                .c1_hold_gate_considered
+                .fetch_add(1, Ordering::Relaxed);
+            if dir_cache_winner.is_none()
+                && subtree_coverage_winner.is_none()
+                && locality_winner.is_none()
             {
-                if t_wait < T_SETUP && !overdue {
-                    // A P-saturated holder is expected to regain a P-slot before X
-                    // could re-construct the tree — the hold is worth taking UNLESS this
-                    // op has already exhausted its max-hold cap.
-                    let now = (self.exec_clock)();
-                    let cap_hit = self
-                        .speculative_hold_state
-                        .peek(operation_id)
-                        .is_some_and(|rec| {
-                            let held_for =
-                                now.duration_since(rec.first_hold_at).unwrap_or(Duration::ZERO);
-                            held_for >= HOLD_MAX_WALL || rec.cycles >= HOLD_MAX_CYCLES
-                        });
-                    if cap_hit {
-                        // Abandon: count the cap firing and FALL THROUGH to reserve
-                        // the best available worker (the starvation bound). The hold
-                        // RECORD is intentionally NOT reaped here — it is reaped at
-                        // the assignment point (`prepare_worker_run_action`), which
-                        // reads it to classify the landing (`hold_paid_off` vs
-                        // `hold_regret`). A cap-abandoned op that then lands on a
-                        // cold worker after `T_setup` is BOTH expired AND a regret
-                        // (the bimodal detector must see it); popping here would hide
-                        // that classification.
-                        self.metrics.hold_expired.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            %operation_id,
-                            %hold_w,
-                            %input_root_digest,
-                            t_wait_ms = t_wait.as_millis(),
-                            "speculative hold cap hit — abandoning hold, reserving best \
-                             available worker (max-hold bound, #specprefetch-rebind)"
-                        );
-                    } else {
-                        // HOLD: record/advance the hold state and re-queue the op.
-                        match self.speculative_hold_state.get_mut(operation_id) {
-                            Some(rec) => rec.cycles = rec.cycles.saturating_add(1),
-                            None => {
-                                self.speculative_hold_state.put(
-                                    operation_id.clone(),
-                                    HoldRecord { first_hold_at: now, cycles: 1 },
-                                );
-                            }
-                        }
+                if let Some((hold_w, t_wait, overdue)) =
+                    self.find_p_saturated_holder(&input_root_digest, &p_gated_excluded)
+                {
+                    if t_wait >= T_SETUP {
+                        // The holder will not regain a P-slot before X could
+                        // reconstruct the tree — the hold is not worth taking (the
+                        // threshold conjunct #tsetup-dynamic targets).
                         self.metrics
-                            .speculative_hold_count
+                            .c1_blocked_t_wait_ge_t_setup
                             .fetch_add(1, Ordering::Relaxed);
-                        debug!(
-                            %operation_id,
-                            %hold_w,
-                            %input_root_digest,
-                            t_wait_ms = t_wait.as_millis(),
-                            "speculative hold — holding op for P-saturated holder \
-                             (T_wait_W < T_setup), re-queuing (#specprefetch-rebind)"
-                        );
-                        return None;
+                    } else if overdue {
+                        // A k-soonest slot-freeing action is overdue → holding for a
+                        // stuck holder risks the bimodal regression; refuse.
+                        self.metrics
+                            .c1_blocked_overdue
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // A P-saturated holder is expected to regain a P-slot before X
+                        // could re-construct the tree — the hold is worth taking UNLESS this
+                        // op has already exhausted its max-hold cap.
+                        let now = (self.exec_clock)();
+                        let cap_hit = self
+                            .speculative_hold_state
+                            .peek(operation_id)
+                            .is_some_and(|rec| {
+                                let held_for = now
+                                    .duration_since(rec.first_hold_at)
+                                    .unwrap_or(Duration::ZERO);
+                                held_for >= HOLD_MAX_WALL || rec.cycles >= HOLD_MAX_CYCLES
+                            });
+                        if cap_hit {
+                            // Abandon: count the cap firing and FALL THROUGH to reserve
+                            // the best available worker (the starvation bound). The hold
+                            // RECORD is intentionally NOT reaped here — it is reaped at
+                            // the assignment point (`prepare_worker_run_action`), which
+                            // reads it to classify the landing (`hold_paid_off` vs
+                            // `hold_regret`). A cap-abandoned op that then lands on a
+                            // cold worker after `T_setup` is BOTH expired AND a regret
+                            // (the bimodal detector must see it); popping here would hide
+                            // that classification.
+                            self.metrics.hold_expired.fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                %operation_id,
+                                %hold_w,
+                                %input_root_digest,
+                                t_wait_ms = t_wait.as_millis(),
+                                "speculative hold cap hit — abandoning hold, reserving best \
+                                 available worker (max-hold bound, #specprefetch-rebind)"
+                            );
+                        } else {
+                            // HOLD: record/advance the hold state and re-queue the op.
+                            match self.speculative_hold_state.get_mut(operation_id) {
+                                Some(rec) => rec.cycles = rec.cycles.saturating_add(1),
+                                None => {
+                                    self.speculative_hold_state.put(
+                                        operation_id.clone(),
+                                        HoldRecord { first_hold_at: now, cycles: 1 },
+                                    );
+                                }
+                            }
+                            self.metrics
+                                .speculative_hold_count
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                %operation_id,
+                                %hold_w,
+                                %input_root_digest,
+                                t_wait_ms = t_wait.as_millis(),
+                                "speculative hold — holding op for P-saturated holder \
+                                 (T_wait_W < T_setup), re-queuing (#specprefetch-rebind)"
+                            );
+                            return None;
+                        }
                     }
+                } else {
+                    // Winner-none held (a genuinely-cold X), but no viable-but-
+                    // P-saturated holder of the input root exists to hold FOR.
+                    self.metrics
+                        .c1_blocked_no_saturated_holder
+                        .fetch_add(1, Ordering::Relaxed);
                 }
+            } else {
+                // A dir-cache / subtree-coverage / blob-locality winner existed:
+                // the op is a cheap partial-locality rebind, not a cold reconstruct
+                // (design §2.3-v3.7-#5). PRIME suspect for hold_count == 0 on the
+                // high-locality fleet.
+                self.metrics
+                    .c1_blocked_locality_winner
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -13384,6 +13486,15 @@ mod tests {
         scheduler.metrics.hold_paid_off.fetch_add(216, Ordering::Relaxed);
         scheduler.metrics.hold_expired.fetch_add(217, Ordering::Relaxed);
         scheduler.metrics.hold_regret.fetch_add(218, Ordering::Relaxed);
+        // (#hold-gate-c1-conjunct-instrument) distinctive values on the five C1
+        // per-conjunct attribution counters — the whole point of this change is to
+        // answer "which conjunct short-circuits hold_count==0" from /metrics, so a
+        // DARK field here defeats the diagnostic (the dead-counter trap).
+        scheduler.metrics.c1_hold_gate_considered.fetch_add(219, Ordering::Relaxed);
+        scheduler.metrics.c1_blocked_locality_winner.fetch_add(220, Ordering::Relaxed);
+        scheduler.metrics.c1_blocked_no_saturated_holder.fetch_add(221, Ordering::Relaxed);
+        scheduler.metrics.c1_blocked_t_wait_ge_t_setup.fetch_add(222, Ordering::Relaxed);
+        scheduler.metrics.c1_blocked_overdue.fetch_add(223, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -13536,6 +13647,14 @@ mod tests {
             ("hold_paid_off", 216),
             ("hold_expired", 217),
             ("hold_regret", 218),
+            // (#hold-gate-c1-conjunct-instrument) the five C1 per-conjunct
+            // attribution counters — dark fields here defeat the whole diagnostic
+            // (answering WHICH conjunct short-circuits the live-fleet hold_count==0).
+            ("c1_hold_gate_considered", 219),
+            ("c1_blocked_locality_winner", 220),
+            ("c1_blocked_no_saturated_holder", 221),
+            ("c1_blocked_t_wait_ge_t_setup", 222),
+            ("c1_blocked_overdue", 223),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),
@@ -15441,6 +15560,424 @@ mod b1_lock_decouple_tests {
                 "C1: speculative_hold_count moved despite a Tier-1.5 subtree_coverage_winner \
                  being available — the gate held over a cheap-rebind X_SUB (C1 subtree \
                  disjunct violated)."
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // (#hold-gate-c1-conjunct-instrument) C1 per-conjunct attribution +
+        // behavior-preservation. The Stage-B hold gate records `hold_count == 0`
+        // on the live fleet; these tests (a) prove the OBSERVABILITY restructure
+        // did NOT change any hold outcome (the load-bearing behavior-preservation
+        // contract) and (b) drive each conjunct exit so the right attribution
+        // counter increments alongside the right hold/no-hold decision.
+        //
+        // The restructure is byte-identical to the pre-instrument gate: hold fires
+        // iff `enable ∧ p_gate ∧ winner-none ∧ holder-Some ∧ t_wait < T_SETUP ∧
+        // !overdue ∧ !cap_hit`. Each conjunct-failure branch only ADDS a `Relaxed`
+        // `fetch_add`; the cap/HOLD block is reproduced verbatim.
+        // ════════════════════════════════════════════════════════════════════
+
+        /// Insert exactly `starts.len()` running records on worker `name`, each
+        /// with the given `exec_start_time` (a TIMED record — visible to
+        /// `t_wait_w_locked`, unlike the un-timed `set_worker_running`). Distinct
+        /// v4-UUID ops so the map length is exact. Used to place a holder W with a
+        /// controlled `t_wait`/`overdue` under an injected fixed exec clock.
+        async fn set_worker_running_timed(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            starts: &[SystemTime],
+        ) {
+            use crate::worker::PendingActionInfoData;
+            let mut inner = scheduler.inner.write().await;
+            let w = inner
+                .workers
+                .0
+                .peek_mut(&WorkerId(name.to_string()))
+                .expect("worker exists");
+            w.running_action_infos.clear();
+            for start in starts {
+                w.running_action_infos.insert(
+                    OperationId::default(),
+                    PendingActionInfoData {
+                        action_info: pool_action(),
+                        exec_start_time: Some(*start),
+                    },
+                );
+            }
+            assert_eq!(
+                w.running_action_infos.len(),
+                starts.len(),
+                "fixture must set exactly the requested timed in-flight actions"
+            );
+        }
+
+        /// Pin the scheduler's `exec_clock` to a FIXED instant so
+        /// `t_wait_w_locked`'s `now − exec_start` math is deterministic (no
+        /// wall-clock drift between the fixture stamp and the gate read). Returns
+        /// the pinned `now`. Mirrors the per-scheduler injected-clock discipline of
+        /// `stage_c_t_wait_w::TestExecClock` (no thread-local `MockClock`).
+        fn pin_exec_clock(scheduler: &Arc<ApiWorkerScheduler>, at: SystemTime) {
+            scheduler.set_exec_clock(Arc::new(move || at));
+        }
+
+        /// Register an idle NON-holder pool worker X that supplies the
+        /// `p_gate_active` precondition (it has P-headroom) WITHOUT being a
+        /// Tier-1/1.5/2 winner (it caches no root/subtree and carries no endpoint
+        /// score). `p_core_count == 0` ⇒ always has P-headroom ⇒
+        /// `any_viable_has_p_headroom == true` ⇒ the gate is EVALUATED. It is never
+        /// itself a hold candidate (does not hold the root).
+        async fn add_idle_nonholder(scheduler: &Arc<ApiWorkerScheduler>, name: &str) {
+            let _rx = add_worker_in_pool(scheduler, name).await;
+            // Report a genuine idle load so it is not treated as never-reported
+            // (that would not change p_gate_active, but keeps X a clean idle X).
+            scheduler
+                .update_worker_load(&WorkerId(name.to_string()), 0, 0, 0)
+                .await
+                .expect("load X");
+        }
+
+        /// Run the gate directly (winner-none path reachable) and return the
+        /// selected worker (or `None` for a hold). No `endpoint_scores`, no
+        /// `resolved_tree` → `locality_winner`/`subtree_coverage_winner` are None;
+        /// a P-saturated root-holder that is excluded from Tier-1 leaves
+        /// `dir_cache_winner` None, so the C1 winner-none conjunct holds.
+        async fn gate_select(scheduler: &Arc<ApiWorkerScheduler>) -> Option<WorkerId> {
+            let op = OperationId::default();
+            let action = pool_action();
+            let mut inner = scheduler.inner.write().await;
+            inner
+                .inner_find_and_reserve_worker(&props_pool(), &op, &action, false, None, None)
+                .map(|(wid, _tx, _msg)| wid)
+        }
+
+        // ── (e) FULL HOLD PATH (behavior-preservation, load-bearing) ──
+        // W is a P-saturated (running=p_count) DIRECTORY holder of R with UN-TIMED
+        // running records → `t_wait_w_locked` returns (ZERO, false) → t_wait 0 <
+        // T_SETUP AND not overdue. X is an idle non-holder → `p_gate_active` true,
+        // no winner. So every hold conjunct holds and the gate HOLDS: it returns
+        // `None` and bumps `speculative_hold_count`. This is the first
+        // production-composition test that the gate ACTUALLY FIRES — the positive
+        // arm the restructure must not break.
+        //
+        // MUTATION (restructure): the branch order in the innermost `else` must
+        // still reach the cap/HOLD block iff `t_wait < T_SETUP && !overdue`. If the
+        // `else if overdue` were dropped or the `t_wait >= T_SETUP` arm swallowed
+        // this case, the hold would not fire → `chosen != None` → red-fail here.
+        #[nativelink_test]
+        async fn c1_behavior_preserved_hold_still_fires() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+
+            // W: P-saturated (p_count=4, running=4) DIRECTORY holder of R, un-timed.
+            add_tier1_worker(&scheduler, "W_HOLDER", 4, 0, 10, 10, 0).await;
+            set_worker_running(&scheduler, "W_HOLDER", 4).await;
+            // X: idle non-holder → supplies p_gate_active, not a winner.
+            add_idle_nonholder(&scheduler, "X_IDLE").await;
+
+            let chosen = gate_select(&scheduler).await;
+            assert_eq!(
+                chosen, None,
+                "(e) the full hold path must FIRE: enable ∧ p_gate ∧ winner-none ∧ \
+                 holder-Some ∧ t_wait(0) < T_SETUP ∧ !overdue ∧ !cap → the gate HOLDS \
+                 (returns None to re-queue). A Some here means the restructure changed \
+                 the positive hold outcome (behavior NOT preserved)."
+            );
+            let m = scheduler.get_metrics();
+            assert_eq!(
+                m.speculative_hold_count.load(Ordering::Relaxed),
+                1,
+                "(e) speculative_hold_count must bump on the fired hold — the verbatim \
+                 HOLD block did not run."
+            );
+            assert_eq!(
+                m.c1_hold_gate_considered.load(Ordering::Relaxed),
+                1,
+                "(e) c1_hold_gate_considered must bump: the gate was evaluated \
+                 (enable ∧ p_gate held)."
+            );
+            // On the fired-hold path NONE of the block-reason counters move.
+            assert_eq!(
+                m.c1_blocked_locality_winner.load(Ordering::Relaxed)
+                    + m.c1_blocked_no_saturated_holder.load(Ordering::Relaxed)
+                    + m.c1_blocked_t_wait_ge_t_setup.load(Ordering::Relaxed)
+                    + m.c1_blocked_overdue.load(Ordering::Relaxed),
+                0,
+                "(e) no block-reason counter may move when the gate HOLDS — a fired \
+                 hold is neither blocked nor mis-attributed."
+            );
+        }
+
+        // ── (a) locality_winner blocks the hold → c1_blocked_locality_winner ──
+        // Same shape as the tested `c1_locality_winner_blocks_hold` (a Tier-2
+        // blob-locality winner X exists), but this asserts the ATTRIBUTION counter:
+        // the winner-none conjunct fails, so `c1_blocked_locality_winner` bumps and
+        // NO hold occurs. MUTATION: comment out the `c1_blocked_locality_winner`
+        // fetch_add → this red-fails on the counter assert; drop the C1 winner-none
+        // guard → a hold fires (chosen None) → the assignment assert red-fails.
+        #[nativelink_test]
+        async fn c1_attrib_locality_winner() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+
+            add_tier1_worker(&scheduler, "W_HOLDER", 4, 0, 10, 10, 0).await;
+            set_worker_running(&scheduler, "W_HOLDER", 4).await;
+
+            let x_endpoint = "grpc://x-blob.local:50081";
+            {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let worker = Worker::new_with_cas_endpoint(
+                    WorkerId("X_BLOB".to_string()),
+                    props_pool(),
+                    tx,
+                    42,
+                    0,
+                    x_endpoint.to_string(),
+                    8,
+                    0,
+                );
+                scheduler.add_worker(worker).await.expect("add X_BLOB");
+            }
+            scheduler
+                .update_worker_load(&WorkerId("X_BLOB".to_string()), 5, 5, 0)
+                .await
+                .expect("load X_BLOB");
+            let mut endpoint_scores: HashMap<Arc<str>, u64> = HashMap::new();
+            endpoint_scores.insert(Arc::from(x_endpoint), 100 * 1024 * 1024);
+
+            let op = OperationId::default();
+            let action = pool_action();
+            let chosen = {
+                let mut inner = scheduler.inner.write().await;
+                inner
+                    .inner_find_and_reserve_worker(
+                        &props_pool(),
+                        &op,
+                        &action,
+                        false,
+                        Some(&endpoint_scores),
+                        None,
+                    )
+                    .map(|(wid, _tx, _msg)| wid)
+            };
+            assert_eq!(
+                chosen,
+                Some(WorkerId("X_BLOB".to_string())),
+                "(a) a Tier-2 locality winner must be ASSIGNED, not held (C1 winner-none \
+                 conjunct fails)."
+            );
+            let m = scheduler.get_metrics();
+            assert_eq!(
+                m.c1_blocked_locality_winner.load(Ordering::Relaxed),
+                1,
+                "(a) c1_blocked_locality_winner must bump exactly once — the winner-none \
+                 conjunct short-circuited because a locality_winner existed."
+            );
+            assert_eq!(
+                m.speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "(a) no hold may fire when a locality_winner blocks C1."
+            );
+            assert_eq!(
+                m.c1_hold_gate_considered.load(Ordering::Relaxed),
+                1,
+                "(a) the gate was evaluated (enable ∧ p_gate held), so considered bumps."
+            );
+        }
+
+        // ── (b) winner-none + no P-saturated holder → c1_blocked_no_saturated_holder ──
+        // No worker holds R: X is an idle non-holder (p_gate_active true, no winner)
+        // and there is NO P-saturated holder of the root. So winner-none holds, but
+        // `find_p_saturated_holder` returns None → `c1_blocked_no_saturated_holder`
+        // bumps and the op is reserved onto X (fall-through). MUTATION: comment out
+        // the `c1_blocked_no_saturated_holder` fetch_add → red-fails on the counter.
+        #[nativelink_test]
+        async fn c1_attrib_no_saturated_holder() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+
+            // A P-saturated NON-holder W_BUSY (running=p_count, does NOT cache R) so
+            // it lands in p_gated_excluded but is rejected by the holds_root filter.
+            add_worker_in_pool(&scheduler, "W_BUSY").await;
+            scheduler
+                .set_worker_core_counts(&WorkerId("W_BUSY".to_string()), 4, 0)
+                .await
+                .expect("counts W_BUSY");
+            scheduler
+                .update_worker_load(&WorkerId("W_BUSY".to_string()), 90, 90, 0)
+                .await
+                .expect("load W_BUSY");
+            set_worker_running(&scheduler, "W_BUSY", 4).await;
+            // X: idle non-holder → p_gate_active true, no winner, becomes the target.
+            add_idle_nonholder(&scheduler, "X_IDLE").await;
+
+            let chosen = gate_select(&scheduler).await;
+            assert!(
+                chosen.is_some(),
+                "(b) with no holder to hold for, the op must be RESERVED (fall-through), \
+                 not held — got a hold (None)."
+            );
+            let m = scheduler.get_metrics();
+            assert_eq!(
+                m.c1_blocked_no_saturated_holder.load(Ordering::Relaxed),
+                1,
+                "(b) c1_blocked_no_saturated_holder must bump exactly once — winner-none \
+                 held but find_p_saturated_holder returned None."
+            );
+            assert_eq!(
+                m.speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "(b) no hold may fire when there is no P-saturated root-holder."
+            );
+            assert_eq!(
+                m.c1_blocked_locality_winner.load(Ordering::Relaxed),
+                0,
+                "(b) the locality-winner block reason must NOT move — winner-none held."
+            );
+        }
+
+        // ── (c) holder + t_wait >= T_SETUP → c1_blocked_t_wait_ge_t_setup ──
+        // W is a P-saturated (p_count=1, running=1) DIRECTORY holder of R with a
+        // FRESH TIMED record: exec_start == pinned now → elapsed 0 → t_wait =
+        // remaining = DEFAULT_DURATION_ESTIMATE (30s) >= T_SETUP (3s), not overdue.
+        // So the threshold conjunct fails FIRST → `c1_blocked_t_wait_ge_t_setup`
+        // bumps and no hold occurs. This is the conjunct #tsetup-dynamic targets.
+        // MUTATION: comment out the `c1_blocked_t_wait_ge_t_setup` fetch_add →
+        // red-fails on the counter. Flip `t_wait >= T_SETUP` to `>` does NOT change
+        // this case (30s > 3s == 30s >= 3s); the boundary test below guards that.
+        #[nativelink_test]
+        async fn c1_attrib_t_wait_ge_t_setup() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+            let now = UNIX_EPOCH + Duration::from_secs(10_000);
+            pin_exec_clock(&scheduler, now);
+
+            // W: p_count=1 root holder; ONE fresh timed record → running=1 =
+            // p_count (P-saturated, in p_gated_excluded), t_wait 30s, not overdue.
+            add_tier1_worker(&scheduler, "W_HOLDER", 1, 0, 90, 90, 0).await;
+            set_worker_running_timed(&scheduler, "W_HOLDER", &[now]).await;
+            add_idle_nonholder(&scheduler, "X_IDLE").await;
+
+            let chosen = gate_select(&scheduler).await;
+            assert!(
+                chosen.is_some(),
+                "(c) with t_wait (30s) >= T_SETUP (3s) the gate must NOT hold — the op \
+                 must be reserved. Got a hold (None)."
+            );
+            let m = scheduler.get_metrics();
+            assert_eq!(
+                m.c1_blocked_t_wait_ge_t_setup.load(Ordering::Relaxed),
+                1,
+                "(c) c1_blocked_t_wait_ge_t_setup must bump exactly once — a holder \
+                 exists but will not free a P-slot before X could reconstruct."
+            );
+            assert_eq!(
+                m.c1_blocked_overdue.load(Ordering::Relaxed),
+                0,
+                "(c) the overdue block reason must NOT move — t_wait >= T_SETUP is \
+                 evaluated FIRST, so an above-threshold holder is attributed to the \
+                 threshold reason, not overdue."
+            );
+            assert_eq!(
+                m.speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "(c) no hold may fire when t_wait >= T_SETUP."
+            );
+        }
+
+        // ── (d) holder + t_wait < T_SETUP + overdue → c1_blocked_overdue ──
+        // W is a P-saturated (p_count=1, running=1) DIRECTORY holder of R with a
+        // STALE TIMED record: exec_start = now − 40s, so elapsed 40s >
+        // DEFAULT_DURATION_ESTIMATE (30s) → the action is OVERDUE and its remaining
+        // saturates to ZERO → t_wait 0 < T_SETUP (3s) AND overdue. So the overdue
+        // conjunct fails (after the threshold conjunct passes) →
+        // `c1_blocked_overdue` bumps and no hold occurs. MUTATION: comment out the
+        // `c1_blocked_overdue` fetch_add → red-fails on the counter.
+        #[nativelink_test]
+        async fn c1_attrib_overdue() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+            let now = UNIX_EPOCH + Duration::from_secs(10_000);
+            pin_exec_clock(&scheduler, now);
+
+            add_tier1_worker(&scheduler, "W_HOLDER", 1, 0, 90, 90, 0).await;
+            // exec_start 40s in the past → elapsed 40s > estimate 30s → overdue,
+            // remaining saturates to 0 → t_wait 0 < T_SETUP.
+            let stale = now - Duration::from_secs(40);
+            set_worker_running_timed(&scheduler, "W_HOLDER", &[stale]).await;
+            add_idle_nonholder(&scheduler, "X_IDLE").await;
+
+            let chosen = gate_select(&scheduler).await;
+            assert!(
+                chosen.is_some(),
+                "(d) an OVERDUE holder (t_wait 0 < T_SETUP but overdue) must NOT be held \
+                 for — the op must be reserved. Got a hold (None)."
+            );
+            let m = scheduler.get_metrics();
+            assert_eq!(
+                m.c1_blocked_overdue.load(Ordering::Relaxed),
+                1,
+                "(d) c1_blocked_overdue must bump exactly once — the holder's k-soonest \
+                 slot-freeing action is overdue, so the gate refuses (bimodal bound)."
+            );
+            assert_eq!(
+                m.c1_blocked_t_wait_ge_t_setup.load(Ordering::Relaxed),
+                0,
+                "(d) the threshold block reason must NOT move — t_wait (0) < T_SETUP, so \
+                 the overdue arm (not the threshold arm) is taken."
+            );
+            assert_eq!(
+                m.speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "(d) no hold may fire for an overdue holder."
+            );
+        }
+
+        // ── BEHAVIOR-PRESERVATION at the T_SETUP boundary (the >= vs > guard) ──
+        // W holds R and is P-saturated (p_count=1, running=1) with a TIMED record
+        // whose remaining is EXACTLY T_SETUP: exec_start = now − (ESTIMATE −
+        // T_SETUP), so elapsed = 27s → remaining = 30 − 27 = 3s == T_SETUP, not
+        // overdue. The production gate uses `t_wait >= T_SETUP` (STRICT boundary),
+        // so t_wait == T_SETUP BLOCKS the hold (attributed to
+        // c1_blocked_t_wait_ge_t_setup) — the op is reserved, NOT held.
+        //
+        // MUTATION (the restructure guard the dispatch names): flip `t_wait >=
+        // T_SETUP` to `t_wait > T_SETUP` → at the boundary the threshold arm no
+        // longer fires, the op falls to the HOLD block and the gate HOLDS (returns
+        // None) → this test red-fails on BOTH the `chosen.is_some()` assert AND the
+        // `speculative_hold_count == 0` assert. This pins the exact hold outcome at
+        // the boundary the observability restructure must preserve.
+        #[nativelink_test]
+        async fn c1_behavior_preserved_t_wait_eq_t_setup_boundary_blocks() {
+            let wsm = BarrierWorkerStateManager::new();
+            let scheduler = build_scheduler_hold_on(wsm);
+            let now = UNIX_EPOCH + Duration::from_secs(10_000);
+            pin_exec_clock(&scheduler, now);
+
+            add_tier1_worker(&scheduler, "W_HOLDER", 1, 0, 90, 90, 0).await;
+            // remaining = ESTIMATE(30s) − elapsed = T_SETUP(3s) ⇒ elapsed 27s.
+            let start = now - (Duration::from_secs(30) - Duration::from_secs(3));
+            set_worker_running_timed(&scheduler, "W_HOLDER", &[start]).await;
+            add_idle_nonholder(&scheduler, "X_IDLE").await;
+
+            let chosen = gate_select(&scheduler).await;
+            assert!(
+                chosen.is_some(),
+                "boundary: t_wait == T_SETUP must BLOCK the hold under the production \
+                 `>=` — the op must be reserved. A hold (None) here means the boundary \
+                 flipped to `>` (behavior NOT preserved)."
+            );
+            let m = scheduler.get_metrics();
+            assert_eq!(
+                m.speculative_hold_count.load(Ordering::Relaxed),
+                0,
+                "boundary: no hold may fire at t_wait == T_SETUP under `>=`; a bump means \
+                 the `>=`→`>` mutation slipped through (behavior NOT preserved)."
+            );
+            assert_eq!(
+                m.c1_blocked_t_wait_ge_t_setup.load(Ordering::Relaxed),
+                1,
+                "boundary: t_wait == T_SETUP is attributed to the threshold reason under \
+                 the `>=` boundary."
             );
         }
 
