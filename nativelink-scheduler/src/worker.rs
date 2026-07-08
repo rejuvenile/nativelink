@@ -182,8 +182,13 @@ pub struct Worker {
     /// `T_SETUP` should eventually equal (biased to the expensive tail); it is
     /// currently only LOGGED (periodic `tag = "worker_construct_latency"`) for
     /// tuning — the hold gate does NOT consume it, so this field changes NO
-    /// scheduling decision. `0` means the worker reported no cold constructs yet
-    /// (empty histogram) or is a pre-#obs-tuning worker (proto3 default).
+    /// scheduling decision. `0` is AMBIGUOUS (three meanings): the worker reported
+    /// no cold constructs yet (empty histogram); OR is a pre-#obs-tuning worker
+    /// (proto3 default); OR — added by the wall-clock-decay follow-up — an IDLE
+    /// worker's recent constructs all decayed below the mass sentinel. A future
+    /// programmatic `T_SETUP` consumer MUST map `0` → the `T_SETUP` floor ("no
+    /// signal → use the constant"), NEVER "0 ms construct cost" (that would invert
+    /// the hold-vs-rebind decision for every idle-then-cold worker).
     #[metric(help = "Worker-gossiped decayed-p95 cold dir-cache construct latency (ms); T_SETUP tuning input, LOGGED only.")]
     pub construct_latency_ms_p95: u32,
 
