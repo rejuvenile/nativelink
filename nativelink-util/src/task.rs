@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context as TaskContext, Poll};
 
 use futures::Future;
@@ -25,6 +26,33 @@ pub use tracing::error_span as __error_span;
 use tracing::{Instrument, Span};
 
 use crate::rayon_pool::fallback_handle;
+
+/// Cumulative count of spawns that took the off-runtime fallback-handle
+/// branch. Off-runtime callers (rayon/cpu_pool workers whose tokio context
+/// was not entered, and `Drop` impls firing on those threads) are expected
+/// and benign — the fallback handle is the single production runtime's own
+/// handle (`nativelink.rs` builds one runtime and passes its handle to
+/// `init_rayon_pool`), so the spawned task runs on the intended runtime.
+/// The counter drives sampled logging (see `fallback_log_gate`) and conveys
+/// cumulative volume in each emitted line.
+static FALLBACK_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Emit the fallback log on the first occurrence, then only every Nth. The
+/// raw `eprintln!` bypasses tracing (the appender thread may itself lack a
+/// runtime context on this path), so it cannot be rate-limited by the
+/// tracing layer; this count-based gate throttles it directly. Under
+/// chunked-write load the fallback bursts to hundreds/10 min (measured 762
+/// in one 10-min window 2026-07-07) — the same digest-sampling precedent as
+/// `CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD` in `chunked_write_handler.rs`.
+const FALLBACK_LOG_SAMPLE_PERIOD: u64 = 256;
+
+/// Returns `true` if the fallback log should be emitted for the given
+/// cumulative occurrence `count` (1-based). Logs the first occurrence and
+/// every `FALLBACK_LOG_SAMPLE_PERIOD`-th one thereafter; suppresses the
+/// rest. Pure and deterministic (count → bool) for testability.
+const fn fallback_log_gate(count: u64) -> bool {
+    count == 1 || count % FALLBACK_LOG_SAMPLE_PERIOD == 0
+}
 
 pub fn __spawn_with_span_and_context<F, T>(f: F, span: Span, ctx: Option<Context>) -> JoinHandle<T>
 where
@@ -51,7 +79,17 @@ where
     if let Some(handle) = fallback_handle() {
         // Direct stderr — if we're here the appender thread may also have
         // no runtime context, and `tracing::error!` could lose the message.
-        eprintln!("spawn invoked from non-tokio thread, using fallback handle");
+        // Sampled: log the first occurrence + every FALLBACK_LOG_SAMPLE_PERIOD-th
+        // thereafter (the cumulative count conveys volume) so a load-driven
+        // burst does not spam journald. The fallback is benign — this handle
+        // is the single production runtime's own handle, so the task runs on
+        // the intended runtime.
+        let count = FALLBACK_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if fallback_log_gate(count) {
+            eprintln!(
+                "spawn invoked from non-tokio thread, using fallback handle (cumulative={count})"
+            );
+        }
         return handle.spawn(future);
     }
     // Last resort: no runtime exists at all. This will still panic, but
@@ -124,6 +162,57 @@ macro_rules! spawn_blocking {
     ($name:expr, $fut:expr, target: $target:expr, $($fields:tt)*) => {{
         $crate::task::JoinHandleDropGuard::new($crate::task::__spawn_blocking($fut, $crate::task::__error_span!(target: $target, $name, $($fields)*)))
     }};
+}
+
+#[cfg(test)]
+mod fallback_log_gate_tests {
+    use super::{FALLBACK_LOG_SAMPLE_PERIOD, fallback_log_gate};
+
+    /// The fallback branch fires an unconditional `eprintln!` per invocation.
+    /// Under chunked-write load it bursts to hundreds/10 min (measured
+    /// 762 in one 10-min window 2026-07-07). The gate throttles the log to
+    /// the FIRST occurrence (so the operator sees it begin) plus every
+    /// `FALLBACK_LOG_SAMPLE_PERIOD`-th thereafter, while a running counter
+    /// (passed in as `count`) still conveys cumulative volume. This proves
+    /// the sampling contract deterministically without touching threads or
+    /// the runtime.
+    #[test]
+    fn emits_on_first_then_every_sample_period() {
+        // count starts at 1 for the first invocation (fetch_add + 1).
+        assert!(
+            fallback_log_gate(1),
+            "first fallback occurrence MUST log so the operator sees it start"
+        );
+        // Everything strictly between 1 and the period is suppressed.
+        for c in 2..FALLBACK_LOG_SAMPLE_PERIOD {
+            assert!(
+                !fallback_log_gate(c),
+                "occurrence {c} between first and period boundary MUST be suppressed (spam reduction)"
+            );
+        }
+        assert!(
+            fallback_log_gate(FALLBACK_LOG_SAMPLE_PERIOD),
+            "occurrence at the period boundary MUST log (periodic heartbeat)"
+        );
+        assert!(
+            !fallback_log_gate(FALLBACK_LOG_SAMPLE_PERIOD + 1),
+            "occurrence just past the period boundary MUST be suppressed"
+        );
+        assert!(
+            fallback_log_gate(2 * FALLBACK_LOG_SAMPLE_PERIOD),
+            "second period boundary MUST log"
+        );
+    }
+
+    /// The period must be a real throttle (>1); a period of 1 would emit
+    /// every time and defeat the fix.
+    #[test]
+    fn sample_period_actually_throttles() {
+        assert!(
+            FALLBACK_LOG_SAMPLE_PERIOD > 1,
+            "sample period must be >1 or the gate emits on every call — no throttle"
+        );
+    }
 }
 
 /// Simple wrapper that will abort a future that is running in another spawn in the
