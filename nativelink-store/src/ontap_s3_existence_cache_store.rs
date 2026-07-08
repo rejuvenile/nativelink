@@ -449,9 +449,18 @@ where
         keys: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
-        let cache = self.digests.read().await;
+        // Snapshot cache membership per key, then RELEASE the read lock
+        // before any inner-store `.await`. Holding `self.digests` across the
+        // inner S3 HEAD would block a concurrent `sync_cache` (which takes
+        // the write lock) for the whole RPC round-trip.
+        let cache_hit: Vec<bool> = {
+            let cache = self.digests.read().await;
+            keys.iter()
+                .map(|key| cache.contains(&key.borrow().into_digest()))
+                .collect()
+        };
 
-        for (key, result) in keys.iter().zip(results.iter_mut()) {
+        for ((key, result), in_cache) in keys.iter().zip(results.iter_mut()).zip(cache_hit) {
             // Handle zero digest case
             if is_zero_digest(key.borrow()) {
                 *result = Some(0);
@@ -459,24 +468,25 @@ where
                 continue;
             }
 
-            let digest = key.borrow().into_digest();
-
-            // If not in cache, definitely doesn't exist
-            if !cache.contains(&digest) {
-                *result = None;
+            if in_cache {
+                self.cache_hits.inc();
+            } else {
+                // #sibling-hunt V1: a cache MISS is NOT authoritative. The
+                // async `sync_cache` full-overwrite (`self.digests =
+                // new_digests`) can DROP a digest that a concurrent
+                // `update()` inserted after the S3 listing snapshot (put→list
+                // lag), so a miss here can be a stale-NEGATIVE for a blob that
+                // IS in S3. Fall back to the inner store's `has()` (an S3 HEAD)
+                // rather than returning NotFound — matching the sibling
+                // `ExistenceCacheStore::inner_has_with_results` cache-miss path.
+                // On a genuine absence the inner store returns None (correct);
+                // the cache still short-circuits the HEAD on every hit.
                 self.cache_misses.inc();
-                continue;
             }
-            // If in cache, check actual store
-            match self.inner_store.has(key.borrow()).await {
-                Ok(size) => {
-                    *result = size;
-                    self.cache_hits.inc();
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
+
+            // Query the inner store for both hits (confirm the cached claim)
+            // and misses (heal a possible stale-negative).
+            *result = self.inner_store.has(key.borrow()).await?;
         }
 
         Ok(())

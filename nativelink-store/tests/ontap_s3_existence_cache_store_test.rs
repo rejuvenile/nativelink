@@ -508,8 +508,22 @@ async fn test_cache_sync_multiple_objects() -> Result<(), Error> {
 }
 #[nativelink_test]
 async fn test_empty_bucket_handling() -> Result<(), Error> {
-    // Setup a mock client with an empty bucket listing
+    // #sibling-hunt V1 behavior change: `has()` on a cache MISS now falls
+    // back to the inner store's `has()` (an S3 HEAD) instead of returning
+    // NotFound unconditionally, so this test must mock the HEAD too. The
+    // intent is unchanged — the object is genuinely absent, so the inner
+    // HEAD returns NotFound and `has()` still returns `None` (now the
+    // authoritative answer rather than a bare cache-miss).
+    //
+    // Build the inner store directly with the mock-client config (the
+    // anonymous-credentials pattern used by the other cache tests). The
+    // previous `create_test_store` helper routes through
+    // `store_factory`/`DefaultCredentialsChain`, which resolves real AWS
+    // credentials — fine while `has()` never reached the inner store on a
+    // miss, but the V1 fallback now issues a real HEAD that needs a
+    // signable client.
     let mock_client = StaticReplayClient::new(vec![
+        // Cache-population sync: empty bucket.
         ReplayEvent::new(
             http::Request::builder()
                 .uri(format!(
@@ -533,14 +547,61 @@ async fn test_empty_bucket_handling() -> Result<(), Error> {
                 )
                 .unwrap(),
         ),
+        // Inner-store HEAD for the cache-miss fallback: object absent.
+        ReplayEvent::new(
+            http::Request::builder()
+                .uri(format!(
+                    "https://{BUCKET_NAME}.s3.{VSERVER_NAME}.amazonaws.com/{VALID_HASH1}-100?x-id=HeadObject"
+                ))
+                .body(SdkBody::empty())
+                .unwrap(),
+            http::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(SdkBody::empty())
+                .unwrap(),
+        ),
     ]);
 
-    let store = create_test_store(mock_client).await?;
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+    let cache_path = temp_dir
+        .path()
+        .join("cache_index.json")
+        .to_str()
+        .unwrap()
+        .to_string();
 
-    // Wait for cache initialization
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::v2025_08_07())
+        .region(Region::from_static(VSERVER_NAME))
+        .http_client(mock_client.clone())
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
 
-    // Check that no objects exist
+    let ontap_s3_store = OntapS3Store::new_with_client_and_jitter(
+        &(ExperimentalOntapS3Spec {
+            bucket: BUCKET_NAME.to_string(),
+            vserver_name: VSERVER_NAME.to_string(),
+            endpoint: "https://example.com".to_string(),
+            ..Default::default()
+        }),
+        s3_client.clone(),
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+
+    let existence_cache = OntapS3ExistenceCache::new_for_testing(
+        Store::new(ontap_s3_store),
+        Arc::new(s3_client),
+        cache_path,
+        std::collections::HashSet::new(),
+        10,
+        MockInstantWrapped::default,
+    );
+    // Run the cache sync (empty bucket → empty cache).
+    existence_cache.run_sync().await?;
+    let store = Store::new(existence_cache);
+
+    // Check that no objects exist. Cache miss → inner HEAD → NotFound → None.
     let test_digest = DigestInfo::try_new(VALID_HASH1, 100)?;
     let result = store.has(test_digest).await?;
 
@@ -548,6 +609,105 @@ async fn test_empty_bucket_handling() -> Result<(), Error> {
         result, None,
         "Empty bucket should not add any objects to cache"
     );
+    Ok(())
+}
+
+/// #sibling-hunt V1: a cache MISS must fall back to the inner store's
+/// `has()` rather than unconditionally returning NotFound. Without the
+/// fallback, the async `sync_cache` full-overwrite (`sync_cache` sets
+/// `self.digests = new_digests`) can DROP a digest `D` that a concurrent
+/// `update(D)` inserted after the S3 listing snapshot (put→list lag): the
+/// overwrite replaces the map with a listing that predates the insert, so
+/// `has(D)` served a stale-NEGATIVE (NotFound for a blob that IS in S3).
+///
+/// This test reproduces the POST-OVERWRITE stale state directly: the
+/// in-memory `digests` set does NOT contain `D` (as if a sync overwrite
+/// just dropped it) while the inner OntapS3Store DOES have `D` (S3 HEAD
+/// returns 200). The fix makes `has(D)` consult the inner store on the
+/// cache miss and return `Some(size)`.
+///
+/// Mutation: comment out the inner-store fallback branch in
+/// `has_with_results`; this test must fail with the bespoke
+/// "stale-NEGATIVE" message (the cache miss would return `None`).
+#[nativelink_test]
+async fn has_falls_back_to_inner_store_on_cache_miss() -> Result<(), Error> {
+    const MISSING_HASH: &str =
+        "00000000000000000000000000000000000000000000000000000000000000ff";
+    const BLOB_SIZE: i64 = 4242;
+
+    // The inner OntapS3Store's `has()` issues an S3 HEAD; reply 200 with
+    // the blob's content-length so the inner store reports it present.
+    let mock_client = StaticReplayClient::new(vec![ReplayEvent::new(
+        http::Request::builder()
+            .uri(format!(
+                "https://{BUCKET_NAME}.s3.{VSERVER_NAME}.amazonaws.com/{MISSING_HASH}-{BLOB_SIZE}?x-id=HeadObject"
+            ))
+            .body(SdkBody::empty())
+            .unwrap(),
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", BLOB_SIZE.to_string())
+            .body(SdkBody::empty())
+            .unwrap(),
+    )]);
+
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+    let cache_path = temp_dir
+        .path()
+        .join("cache_index.json")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::v2025_08_07())
+        .region(Region::from_static(VSERVER_NAME))
+        .http_client(mock_client.clone())
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+
+    let ontap_s3_store = OntapS3Store::new_with_client_and_jitter(
+        &(ExperimentalOntapS3Spec {
+            bucket: BUCKET_NAME.to_string(),
+            vserver_name: VSERVER_NAME.to_string(),
+            endpoint: "https://example.com".to_string(),
+            ..Default::default()
+        }),
+        s3_client.clone(),
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+
+    // Seed the existence cache with an EMPTY digest set — this is exactly
+    // the post-overwrite stale state where a fresh `D` was dropped by a
+    // racing `sync_cache`.
+    let existence_cache = OntapS3ExistenceCache::new_for_testing(
+        Store::new(ontap_s3_store),
+        Arc::new(s3_client),
+        cache_path,
+        std::collections::HashSet::new(),
+        10,
+        MockInstantWrapped::default,
+    );
+    let store = Store::new(existence_cache);
+
+    let missing_digest = DigestInfo::try_new(MISSING_HASH, BLOB_SIZE as u64)?;
+    let mut results = [None];
+    store
+        .has_with_results(&[missing_digest.into()], &mut results)
+        .await?;
+
+    assert_eq!(
+        results[0],
+        Some(BLOB_SIZE as u64),
+        "stale-NEGATIVE: has() returned {:?} for a digest absent from the \
+         in-memory cache but present in the inner store (S3). The \
+         sync_cache full-overwrite can drop a concurrently-inserted \
+         digest; has() MUST fall back to inner_store.has() on a cache \
+         miss instead of returning NotFound.",
+        results[0],
+    );
+
     Ok(())
 }
 
