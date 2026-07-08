@@ -361,6 +361,29 @@ impl SortedAwaitedActions {
     }
 }
 
+/// Metric handler: publish a `BTreeMap`'s live entry count as a single scalar.
+///
+/// (#metrics-scrape-59mb-per-op-cardinality) Used via the `MetricsComponent`
+/// derive's `handler` attribute so a per-operation map renders as ONE count line
+/// instead of recursing into the blanket `impl MetricsComponent for BTreeMap`
+/// (nativelink-metric/src/lib.rs), which emits every entry (and, for a
+/// `watch::Sender<AwaitedAction>` value, every `AwaitedAction` field of every
+/// entry). That per-entry render made `/metrics` O(live-operations) — ~131k
+/// series / 59 MB at ~1,345 retained ops. Removing the per-op render is also a
+/// security win: it stops publishing per-op `command_digest` / `input_root_digest`
+/// + platform properties on `/metrics`. Aggregate scheduler health is unchanged
+/// (the `sorted_action_infos` queued/executing/cache_check counts plus these
+/// per-map counts); unbounded per-op label cardinality is a Prometheus anti-pattern.
+fn btreemap_len<K, V>(m: &BTreeMap<K, V>) -> u64 {
+    m.len() as u64
+}
+
+/// Metric handler: publish a `HashMap`'s live entry count as a single scalar.
+/// See [`btreemap_len`] for rationale.
+fn hashmap_len<K, V, S>(m: &HashMap<K, V, S>) -> u64 {
+    m.len() as u64
+}
+
 /// The database for storing the state of all actions.
 #[derive(Debug, MetricsComponent)]
 pub struct AwaitedActionDbImpl<I: InstantWrapper, NowFn: Fn() -> I> {
@@ -370,11 +393,25 @@ pub struct AwaitedActionDbImpl<I: InstantWrapper, NowFn: Fn() -> I> {
         MokaEvictingMap<OperationId, OperationId, Arc<ClientAwaitedAction>, I>,
 
     /// A lookup table to lookup the state of an action by its worker operation id.
-    #[metric(group = "operation_ids")]
+    // (#metrics-scrape-59mb-per-op-cardinality) Emit a single live-entry COUNT,
+    // not a per-entry render. The prior `group = "operation_ids"` reached the
+    // blanket `BTreeMap` impl, emitting every `AwaitedAction`'s ~18 fields per
+    // live op (the dominant driver of the 59 MB scrape). The group is dropped
+    // because a single-scalar group only adds a redundant path segment.
+    #[metric(
+        help = "point-in-time count of operations tracked in operation_id_to_awaited_action \
+                (executing + completed-but-retained-until-keepalive)",
+        handler = btreemap_len
+    )]
     operation_id_to_awaited_action: BTreeMap<OperationId, watch::Sender<AwaitedAction>>,
 
     /// A lookup table to lookup the state of an action by its unique qualifier.
-    #[metric(group = "action_info_hash_key_to_awaited_action")]
+    // (#metrics-scrape-59mb-per-op-cardinality) Single live-entry COUNT (see above).
+    #[metric(
+        help = "point-in-time count of cacheable unique-key -> operation_id entries in \
+                action_info_hash_key_to_awaited_action",
+        handler = hashmap_len
+    )]
     action_info_hash_key_to_awaited_action: HashMap<ActionUniqueKey, OperationId>,
 
     /// A sorted set of [`AwaitedAction`]s. A wrapper is used to perform sorting
@@ -385,7 +422,13 @@ pub struct AwaitedActionDbImpl<I: InstantWrapper, NowFn: Fn() -> I> {
     sorted_action_info_hash_keys: SortedAwaitedActions,
 
     /// The number of connected clients for each operation id.
-    #[metric(group = "connected_clients_for_operation_id")]
+    // (#metrics-scrape-59mb-per-op-cardinality) Single live-entry COUNT (see
+    // operation_id_to_awaited_action above). Prior `group` rendered one entry per op.
+    #[metric(
+        help = "point-in-time count of operations with at least one connected client in \
+                connected_clients_for_operation_id",
+        handler = hashmap_len
+    )]
     connected_clients_for_operation_id: HashMap<OperationId, usize>,
 
     /// Where to send notifications about important events related to actions.
