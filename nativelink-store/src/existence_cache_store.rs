@@ -131,11 +131,26 @@ pub struct ExistenceCacheStore<I: InstantWrapper> {
     #[metric(group = "inner_store")]
     inner_store: Store,
     existence_cache: Arc<MokaEvictingMap<DigestInfo, DigestInfo, ExistenceItem, I>>,
-    // Eviction callbacks fire immediately (no queuing). If a blob is
-    // written and immediately evicted, the callback removes it from the
-    // existence cache, then update() re-inserts it. Any transient stale
-    // positive is self-correcting: get_part() removes on NotFound, and
-    // update() bypasses the cache to check the inner store.
+    // Inner-store eviction removes the digest from this cache via the
+    // registered callback (`ExistenceCacheCallback` → `Self::callback`).
+    // NOTE the callback path is NOT strictly ordered vs `update()`'s
+    // re-insert: for a `MokaEvictingMap`-backed inner (the production fast
+    // tier), the eviction listener enqueues the removal and a BACKGROUND
+    // drainer fires the item-callback ASYNCHRONOUSLY, so a stale eviction
+    // callback can arrive AFTER the re-insert. That reorder can only
+    // spuriously REMOVE a cached entry (a self-healing stale-NEGATIVE:
+    // the next `has()` cache-miss re-queries the inner store) — it cannot
+    // fabricate a positive, because every insert into this cache is
+    // guarded by a verified inner success or an inner `has()==Some`.
+    // Genuine stale POSITIVES (cache=Some, inner=NotFound) come from
+    // inner-store data loss AFTER population (STALE_POSITIVE_CAUSES cause
+    // (a): eviction / OOM-kill mid-write / disk corruption / a
+    // FastSlowStore background slow-write that failed after the ack), NOT
+    // from the eviction-callback reorder; those are self-correcting on the
+    // read path (`get_part` removes on NotFound) and on the write path
+    // (`update`/`update_oneshot` probe the inner store via `has_durably`,
+    // bypassing this cache). See the three `STALE_POSITIVE_CAUSES_*`
+    // constants for the full enumeration.
     /// Set to `true` when `inner_store.register_item_callback` failed
     /// at construction (e.g. wrapping a Redis store with
     /// `enable_keyspace_notifications=false`, or any other inner store
@@ -240,10 +255,15 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheCallback<I> {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let cache = self.cache.upgrade();
         if let Some(local_cache) = cache {
-            // Always fire callbacks immediately — removing a digest from
-            // the existence cache is cheap and idempotent. The update()
-            // path re-inserts after a successful write, so a concurrent
-            // eviction callback cannot create a stale positive.
+            // Removing a digest from the existence cache is cheap and
+            // idempotent. The `update()`/`update_oneshot` paths re-insert
+            // after a verified successful inner write, so a concurrent (or
+            // reordered, moka-async) eviction callback that fires around the
+            // re-insert can at worst spuriously drop the entry — a
+            // self-healing stale-NEGATIVE, NOT a stale positive (the cache
+            // never gains a positive that the inner store didn't back at
+            // insert time). See the field doc above `existence_cache` and
+            // the `STALE_POSITIVE_CAUSES_*` constants.
             let store_key = store_key.into_owned();
             return Box::pin(async move {
                 local_cache.callback(store_key, ts_boot_epoch, ts_counter).await;
@@ -648,10 +668,14 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                  stale entry and will re-upload",
             );
         }
-        // Track that an update is in progress. Eviction callbacks fire
-        // normally (no queuing) — they just remove from the existence
-        // cache, which is idempotent. We re-insert after a successful
-        // write, so a concurrent eviction cannot create a stale positive.
+        // Track that an update is in progress. Eviction callbacks just
+        // remove from the existence cache (idempotent). We re-insert after
+        // a verified successful inner write; a concurrent OR moka-reordered
+        // eviction callback around that re-insert can only spuriously DROP
+        // the entry (self-healing stale-NEGATIVE), never fabricate a stale
+        // positive. (Genuine stale positives come from inner data-loss
+        // after this insert — cause (a) — and self-correct on the read/
+        // write paths; see STALE_POSITIVE_CAUSES_WRITE.)
         trace!(?digest, "Inserting into inner cache");
 
         // Failpoint: simulate inner store write failure. Verifies that the
