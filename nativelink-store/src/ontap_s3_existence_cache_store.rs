@@ -477,10 +477,14 @@ where
                 // `update()` inserted after the S3 listing snapshot (put→list
                 // lag), so a miss here can be a stale-NEGATIVE for a blob that
                 // IS in S3. Fall back to the inner store's `has()` (an S3 HEAD)
-                // rather than returning NotFound — matching the sibling
-                // `ExistenceCacheStore::inner_has_with_results` cache-miss path.
-                // On a genuine absence the inner store returns None (correct);
-                // the cache still short-circuits the HEAD on every hit.
+                // rather than returning NotFound. This matches the sibling
+                // `ExistenceCacheStore::inner_has_with_results` ONLY on the
+                // cache-MISS path: unlike that sibling (which returns early on
+                // a hit and thus short-circuits the HEAD), this store issues an
+                // S3 HEAD on EVERY `has()` — both hits (to confirm the cached
+                // claim, per the `:489` call below the if/else) and misses (to
+                // heal the possible stale-negative). On a genuine absence the
+                // inner store returns None (correct).
                 self.cache_misses.inc();
             }
 

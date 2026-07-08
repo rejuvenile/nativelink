@@ -6097,11 +6097,17 @@ impl StoreDriver for FastSlowStore {
         let owned_key = key.borrow().into_owned();
         // #334 Fix B + #sibling-hunt I2: adjust the byte counter by the
         // DELTA against any prior same-digest entry, atomically UNDER the
-        // map lock. The map is keyed by digest, so a concurrent same-digest
-        // legacy write OVERWRITES the prior entry (one map slot); an
-        // unconditional `fetch_add(bytes_sent)` per write therefore
-        // double-counted while the single `remove()` on the losing bg-task
-        // only `fetch_sub`'d once → a permanent positive skew that corrupts
+        // map lock. This is the LIVE server CAS write path: server writes
+        // arrive as `update_oneshot` on the outermost `WorkerProxyStore`,
+        // which has no override, so `StoreDriver::update_oneshot`'s default
+        // (store_trait.rs:1224) converts them into this streaming `update`
+        // before they reach `FastSlowStore` (the `update_oneshot` insert
+        // site below is defensive-only for bare direct callers). The map is
+        // keyed by digest, so a concurrent same-digest legacy write
+        // OVERWRITES the prior entry (one map slot); an unconditional
+        // `fetch_add(bytes_sent)` per write therefore double-counted while
+        // the single `remove()` on the losing bg-task only `fetch_sub`'d
+        // once → a permanent positive skew that corrupts
         // `check_slow_writes_capacity_gate`. Subtracting the replaced
         // payload's bytes keeps the counter equal to the map's actual byte
         // content: two same-digest writes count ONE payload, and each
@@ -6497,9 +6503,15 @@ impl StoreDriver for FastSlowStore {
         // insert site for the full rationale (concurrent same-digest legacy
         // writes overwrite one digest-keyed slot; an unconditional
         // `fetch_add` per write leaked one payload on the losing bg-task's
-        // no-op `remove()`). BatchUpdateBlobs has no cross-request digest
-        // dedup, so two same-digest `update_oneshot` calls for a >16 KiB blob
-        // reach this site concurrently in production.
+        // no-op `remove()`). NOTE this `update_oneshot` site is DEFENSIVE
+        // only: server CAS writes do NOT reach `FastSlowStore::update_oneshot`
+        // — the outermost `WorkerProxyStore` has no `update_oneshot` override,
+        // so `StoreDriver::update_oneshot`'s default (store_trait.rs:1224)
+        // converts every oneshot into a streaming `update` before it reaches
+        // this store. The production-exercised leak site is therefore the
+        // streaming-`update` insert (`:6113`); this copy guards bare direct
+        // `FastSlowStore::update_oneshot` callers and keeps the two sites
+        // byte-identical.
         {
             let mut guard = self.in_flight_slow_writes.lock();
             let prior_bytes: u64 = guard
