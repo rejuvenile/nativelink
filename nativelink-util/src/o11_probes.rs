@@ -46,7 +46,7 @@
 
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, group, publish,
@@ -62,6 +62,21 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// without benefit.
 pub const O11_LATENCY_BUCKETS_MS: [u64; 11] =
     [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000];
+
+/// (#obs-tuning follow-up 2) DEDICATED bucket ladder for the cold-construct
+/// latency [`DecayingP95Histogram`]. SEPARATE from [`O11_LATENCY_BUCKETS_MS`]
+/// on purpose: that ladder backs the P3 (ByteStream) and P5 (EvictingMap)
+/// [`O11LatencyHistogram`]s and MUST NOT change (its consumers pin the exact
+/// 11-bucket set). This ladder refines the 50–500 ms band — where the live
+/// cold-construct population was measured (34–229 ms, 2026-07-07) — so the
+/// conservative p95 no longer snaps to 250 ms for anything in (100,250].
+/// Boundaries: 75/150/200/350 added to the shared set's 50/100/250/500 in
+/// this band. Below 50 ms and above 500 ms it matches the shared ladder (the
+/// cold-construct span is comfortably inside 50–500 ms; the wider bounds only
+/// catch outliers). Must stay strictly ascending — the p95 walk assumes it.
+pub const CONSTRUCT_LATENCY_BUCKETS_MS: [u64; 16] = [
+    1, 5, 10, 25, 50, 75, 100, 150, 200, 250, 350, 500, 750, 1000, 5000, 30000,
+];
 
 /// Histogram-style bucket recorder. Independent of the
 /// `LatencyHistogram` in `phase0_metrics` because the bucket boundaries
@@ -139,17 +154,31 @@ impl O11LatencyHistogram {
     }
 }
 
-/// (#obs-tuning-construct-latency-conditioning) Decay keep-fraction applied to
-/// every bucket on each new observation of [`DecayingP95Histogram`]. The
-/// effective observation window is `~1 / (1 - KEEP)`; at `0.98` that is ~50
-/// observations, after which an old regime's mass has decayed to `0.98^50 ≈
-/// 0.36` and by ~150 observations to `≈0.05`. Chosen so the p95 tracks the
-/// RECENT cold-construct regime (fixing the since-boot fossilisation of a
-/// cumulative estimator) while staying stable over a handful of cold
-/// constructs — the cold-construct rate is a few per minute under cold-heavy
-/// load, so ~50 samples is minutes-scale memory, fast enough to not fossilise
-/// and slow enough not to jitter on a single outlier.
-const P95_DECAY_KEEP: f64 = 0.98;
+/// (#obs-tuning-construct-latency-conditioning) Per-SECOND decay keep-fraction
+/// applied to every bucket of [`DecayingP95Histogram`] by ELAPSED WALL-TIME
+/// (#obs-tuning follow-up 1: time-aware decay). Over an interval of `Δt`
+/// seconds the mass is multiplied by `KEEP.powf(Δt)` (continuous exponential
+/// decay), so decay depends on WALL-TIME, not on how many observations arrived.
+/// At `0.98`/s the half-life is `ln(0.5)/ln(0.98) ≈ 34 s` and mass falls below
+/// half an observation after ~6 min of idle — so an IDLE worker (no new cold
+/// constructs) ages its p95 toward the empty sentinel instead of fossilising
+/// its last value forever (the follow-up-1 defect). The window still tracks the
+/// RECENT cold-construct regime: at a cold-heavy cadence (a few constructs/min)
+/// the ~34 s half-life keeps ~1–3 min of samples effective — fast enough not to
+/// fossilise, slow enough not to jitter on one outlier. NOTE the semantics
+/// changed from the prior PER-OBSERVATION `0.98` (a burst of N constructs in
+/// one second used to decay N times; now it decays once for that ~1 s).
+const P95_DECAY_KEEP_PER_SEC: f64 = 0.98;
+
+/// (#obs-tuning follow-up 1) Total decayed weight BELOW which the histogram is
+/// treated as "no recent cold constructs" and the p95 reports the empty
+/// sentinel 0. Half an observation of residual mass: after a long idle gap the
+/// geometric decay drives the surviving mass far below this, so an idle
+/// worker's stale p95 ages back to 0 (a scrape/gossip then reports "cold" as 0,
+/// same as a freshly-booted worker). Above this, even a single recent
+/// observation reports its bucket. Chosen at 0.5 so ONE recent construct is
+/// still reported (mass 1.0 > 0.5) but a fully-idle-decayed histogram is not.
+const P95_NEGLIGIBLE_MASS: f64 = 0.5;
 
 /// (#obs-tuning-construct-latency-conditioning) Exponentially-decayed
 /// fixed-bucket latency histogram producing a CONSERVATIVE p95 (upper-edge of
@@ -160,12 +189,26 @@ const P95_DECAY_KEEP: f64 = 0.98;
 /// direction — so a high percentile that biases toward the expensive tail is
 /// the right estimator, NOT a central mean/EWMA (which of a heavy-tailed cold
 /// population lands below the mode that matters). The exponential decay
-/// (`P95_DECAY_KEEP`) removes the since-boot fossilisation a cumulative
+/// (`P95_DECAY_KEEP_PER_SEC`) removes the since-boot fossilisation a cumulative
 /// histogram would share with the old `sum/count` mean.
 ///
-/// Buckets reuse [`O11_LATENCY_BUCKETS_MS`] (1ms..30s) — the cold full-tree
-/// reconstruct span is hundreds of ms to seconds, well inside that ladder. A
-/// synchronous `parking_lot::Mutex` guards the decay+insert (the read-modify-
+/// (#obs-tuning follow-up 1) Decay is WALL-CLOCK-driven, not per-observation:
+/// each access ([`observe`](Self::observe) / [`p95_ms`](Self::p95_ms)) first
+/// ages every bucket by the time elapsed since the last access
+/// ([`decay_to`](Self::decay_to)), so an IDLE worker's p95 decays toward the
+/// empty sentinel with real time even when no new observation arrives. The
+/// monotonic clock is [`std::time::Instant`]; production entry points read
+/// `Instant::now()`, and the `*_at` variants take an explicit `now` so tests
+/// drive decay deterministically (no real sleep). NOTE the `last_access` clock
+/// advances on READS too — a `p95_ms` scrape ages the histogram — which is
+/// correct: an observability read must not un-age an idle worker.
+///
+/// (#obs-tuning follow-up 2) Buckets are [`CONSTRUCT_LATENCY_BUCKETS_MS`] (a
+/// ladder refined in the measured 50–500 ms band), NOT the shared
+/// [`O11_LATENCY_BUCKETS_MS`] — so the p95 no longer snaps to 250 ms for a
+/// value in (100,250] and the shared P3/P5 ladder is untouched.
+///
+/// A synchronous `parking_lot::Mutex` guards the decay+insert (the read-modify-
 /// write of all buckets is not lock-free-composable), which is negligible: the
 /// sole producer is the COLD full-reconstruct path (`record_construct_fetch_ms`
 /// at `directory_cache.rs`, no cached subtree), the coldest and least-frequent
@@ -173,90 +216,143 @@ const P95_DECAY_KEEP: f64 = 0.98;
 /// operation. No `.await` is ever held across the lock.
 #[derive(Debug)]
 pub struct DecayingP95Histogram {
+    /// Decay state (weights + last-access clock), guarded by ONE mutex so the
+    /// wall-clock decay and the bucket weights stay mutually consistent.
+    inner: parking_lot::Mutex<DecayInner>,
+}
+
+/// (#obs-tuning follow-up 1) The mutex-guarded interior of
+/// [`DecayingP95Histogram`]: the decayed per-bucket weights AND the last-access
+/// instant that drives the wall-clock decay.
+#[derive(Debug)]
+struct DecayInner {
     /// Decayed per-bucket weights. Index `i` (`i < BUCKETS.len()`) holds the
     /// weight of observations that fell in bucket `i` (value `<= BUCKETS[i]`
     /// and `> BUCKETS[i-1]`); the final slot is the overflow bucket
-    /// (value `> BUCKETS.last()`). Guarded by a synchronous mutex; `f64`
-    /// (not atomics) because the whole decay+insert is done under the lock.
+    /// (value `> BUCKETS.last()`). `f64` (not atomics) because the whole
+    /// decay+insert is done under the lock.
     // UNBOUNDED-OK: fixed-length array (`BUCKETS.len() + 1` slots), NOT a
     // growable buffer — the histogram is O(1) memory regardless of observation
-    // count; weights decay toward a bounded steady state (sum ≤ 1/(1-KEEP)).
-    weights: parking_lot::Mutex<[f64; O11_LATENCY_BUCKETS_MS.len() + 1]>,
+    // count; weights decay toward a bounded steady state (sum ≤ rate/(1-KEEP)).
+    weights: [f64; CONSTRUCT_LATENCY_BUCKETS_MS.len() + 1],
+    /// Instant of the last decay application (`None` until the first access).
+    /// The next access decays every bucket by the elapsed wall-time since this
+    /// instant, then advances it. `None` initial state is required because
+    /// `Instant` has no `const` constructor (the histogram lives in a `static`).
+    last_access: Option<Instant>,
 }
 
 impl DecayingP95Histogram {
     pub const fn new() -> Self {
         Self {
-            weights: parking_lot::Mutex::new([0.0; O11_LATENCY_BUCKETS_MS.len() + 1]),
+            inner: parking_lot::Mutex::new(DecayInner {
+                weights: [0.0; CONSTRUCT_LATENCY_BUCKETS_MS.len() + 1],
+                last_access: None,
+            }),
         }
     }
 
     /// Bucket index for `value_ms`: the first ladder index whose boundary is
     /// `>= value_ms`, else the overflow slot (`BUCKETS.len()`).
     fn bucket_index(value_ms: u64) -> usize {
-        for (idx, boundary) in O11_LATENCY_BUCKETS_MS.iter().enumerate() {
+        for (idx, boundary) in CONSTRUCT_LATENCY_BUCKETS_MS.iter().enumerate() {
             if value_ms <= *boundary {
                 return idx;
             }
         }
-        O11_LATENCY_BUCKETS_MS.len()
+        CONSTRUCT_LATENCY_BUCKETS_MS.len()
     }
 
-    /// Record one observation of `value_ms` milliseconds. Decays EVERY bucket
-    /// by `P95_DECAY_KEEP` (so historical mass fades — the boot-domination
-    /// fix), then adds one unit of weight to the matching bucket. Cost: one
-    /// mutex acquire + a fixed `BUCKETS.len()+1` f64 multiplies.
-    pub fn observe(&self, value_ms: u64) {
-        let idx = Self::bucket_index(value_ms);
-        let mut w = self.weights.lock();
-        // Decay EVERY bucket by `P95_DECAY_KEEP` on each observation so an old
-        // regime's mass fades geometrically (the boot-domination fix — a
-        // non-decayed histogram would fossilise on the since-boot distribution
-        // exactly like the `sum/count` mean it replaces). Then add one unit to
-        // the matching bucket.
-        for slot in w.iter_mut() {
-            *slot *= P95_DECAY_KEEP;
+    /// (#obs-tuning follow-up 1) Age every bucket by the WALL-TIME elapsed since
+    /// the last access (`inner.last_access`), then advance the clock to `now`.
+    /// The decay factor over `Δt` seconds is `KEEP.powf(Δt)` — continuous, so
+    /// one big step equals many small steps summing to the same elapsed time
+    /// (an idle worker and a busy one age identically per second). Caller holds
+    /// the lock. On first access (`last_access == None`) there is nothing to
+    /// decay; just set the clock. `saturating_duration_since` guards a
+    /// non-monotone `now` (clock skew) — a backwards step decays by 0 s (`×1`),
+    /// never panics.
+    fn decay_to(inner: &mut DecayInner, now: Instant) {
+        if let Some(last) = inner.last_access {
+            let dt = now.saturating_duration_since(last).as_secs_f64();
+            if dt > 0.0 {
+                let factor = P95_DECAY_KEEP_PER_SEC.powf(dt);
+                for slot in &mut inner.weights {
+                    *slot *= factor;
+                }
+            }
         }
-        w[idx] += 1.0;
+        inner.last_access = Some(now);
     }
 
-    /// Conservative p95 in milliseconds: walk buckets low→high accumulating
-    /// decayed weight; return the UPPER edge of the first bucket at which the
-    /// cumulative weight reaches `0.95 * total`. The upper edge (rather than a
-    /// bucket midpoint) is the conservative choice — it never UNDER-reports the
-    /// tail, matching the asymmetric `T_SETUP` cost. Returns `0` when no
-    /// observations have been recorded (total weight ~0). The overflow slot
+    /// Record one observation of `value_ms` at wall-clock instant `now`. Ages
+    /// the histogram by the elapsed time since the last access
+    /// ([`decay_to`](Self::decay_to)), then adds one unit of weight to the
+    /// matching bucket. The `now` parameter makes decay test-controllable;
+    /// production calls [`observe`](Self::observe) which passes `Instant::now()`.
+    pub fn observe_at(&self, value_ms: u64, now: Instant) {
+        let idx = Self::bucket_index(value_ms);
+        let mut inner = self.inner.lock();
+        Self::decay_to(&mut inner, now);
+        inner.weights[idx] += 1.0;
+    }
+
+    /// Record one observation of `value_ms` milliseconds at the current
+    /// wall-clock time. Production entry point; see [`observe_at`](Self::observe_at).
+    pub fn observe(&self, value_ms: u64) {
+        self.observe_at(value_ms, Instant::now());
+    }
+
+    /// Conservative p95 in milliseconds AS OF wall-clock instant `now`: first
+    /// ages the histogram by the elapsed time since the last access (so an idle
+    /// worker's stale p95 decays even on a read), then walks buckets low→high
+    /// accumulating decayed weight and returns the UPPER edge of the first
+    /// bucket at which the cumulative weight reaches `0.95 * total`. The upper
+    /// edge (rather than a bucket midpoint) is the conservative choice — it
+    /// never UNDER-reports the tail, matching the asymmetric `T_SETUP` cost.
+    /// Returns `0` when the total decayed weight is below
+    /// [`P95_NEGLIGIBLE_MASS`] (no recent cold constructs — the same "none
+    /// observed" sentinel a freshly-booted worker reports). The overflow slot
     /// reports the last ladder boundary (30000 ms) as a saturating upper edge
-    /// (a construct >30s is implausible; the wire field is `u32` ms).
-    pub fn p95_ms(&self) -> u64 {
-        let w = self.weights.lock();
-        let total: f64 = w.iter().sum();
-        // No observations yet (or fully decayed away): report 0 (the same
-        // "no cold constructs observed" sentinel the mean form used).
-        if total <= f64::EPSILON {
+    /// (a construct >30 s is implausible; the wire field is `u32` ms). The `now`
+    /// parameter makes the age-on-read test-controllable; production calls
+    /// [`p95_ms`](Self::p95_ms) which passes `Instant::now()`.
+    pub fn p95_ms_at(&self, now: Instant) -> u64 {
+        let mut inner = self.inner.lock();
+        Self::decay_to(&mut inner, now);
+        let total: f64 = inner.weights.iter().sum();
+        // Below half an observation of residual mass → "no recent cold
+        // constructs" sentinel (an idle worker's mass has decayed away).
+        if total < P95_NEGLIGIBLE_MASS {
             return 0;
         }
         let target = total * 0.95;
         let mut cumulative = 0.0;
-        for (idx, weight) in w.iter().enumerate() {
+        for (idx, weight) in inner.weights.iter().enumerate() {
             cumulative += *weight;
             if cumulative >= target {
-                return O11_LATENCY_BUCKETS_MS
+                return CONSTRUCT_LATENCY_BUCKETS_MS
                     .get(idx)
                     .copied()
                     .unwrap_or_else(|| {
                         // Overflow slot: saturate at the top ladder boundary.
-                        *O11_LATENCY_BUCKETS_MS
+                        *CONSTRUCT_LATENCY_BUCKETS_MS
                             .last()
-                            .expect("O11_LATENCY_BUCKETS_MS is non-empty")
+                            .expect("CONSTRUCT_LATENCY_BUCKETS_MS is non-empty")
                     });
             }
         }
         // Unreachable (cumulative reaches `total >= target` in the last slot),
         // but return the top boundary defensively rather than panic.
-        *O11_LATENCY_BUCKETS_MS
+        *CONSTRUCT_LATENCY_BUCKETS_MS
             .last()
-            .expect("O11_LATENCY_BUCKETS_MS is non-empty")
+            .expect("CONSTRUCT_LATENCY_BUCKETS_MS is non-empty")
+    }
+
+    /// Conservative p95 in milliseconds as of now. Production entry point; see
+    /// [`p95_ms_at`](Self::p95_ms_at). Ages the histogram by wall-time on read.
+    pub fn p95_ms(&self) -> u64 {
+        self.p95_ms_at(Instant::now())
     }
 }
 
@@ -1236,6 +1332,26 @@ pub struct DirCacheCounters {
     /// backs the `/metrics` DC3 phase decomposition (sum+count, rate-friendly);
     /// the two are complementary, not redundant.
     pub construct_fetch_p95: DecayingP95Histogram,
+    /// (#obs-tuning follow-up 3) Monotone count of COLD-construct fetch
+    /// observations — one per `record_construct_fetch_ms` call. Makes the
+    /// cold-construct RATE (`Δcount / Δt`) observable so the decayed-p95 window
+    /// (`P95_DECAY_KEEP_PER_SEC`, ~34 s half-life, assumes "a few cold
+    /// constructs/min") can be VALIDATED against the live rate instead of
+    /// resting on an operator estimate. A wrong rate would make the effective
+    /// window seconds (jittery) or hours (re-fossilised); this counter is the
+    /// diagnostic that catches either. Surfaced on the worker's own `/metrics`
+    /// endpoint as `dir_cache_construct_fetch_count_total_counter` (the same
+    /// `MetricsRegistry` render the other DC3 counters use); the cold RATE is
+    /// then `rate()` of this series on a scrape. Numerically it tracks
+    /// `construct_fetch_ms.count` (both bump per cold construct); it is called
+    /// out as a DISTINCT named counter so the "cold-construct rate" is a
+    /// first-class, self-describing `/metrics` series next to the p95 gossip it
+    /// shapes — not an implied sub-field of the phase-timing decomposition.
+    /// (A future `T_SETUP` control-plane change may ALSO gossip it to the 15 s
+    /// `worker_construct_latency` scheduler log; that wiring is out of scope for
+    /// this observability-only change — see the tsetup-dynamic design doc.)
+    // UNBOUNDED-OK: a plain monotone AtomicU64 event counter (no buffered bytes).
+    pub construct_fetch_count: AtomicU64,
     /// `dir_cache_hit_assemble_ms_{sum,count}` — the HIT-path materialise span
     /// (`hardlink_directory_tree` in `try_hardlink_cached`: cached entry →
     /// dest). This is the cost dir-cache ideas #1/#2 would make MORE frequent.
@@ -1311,6 +1427,7 @@ impl DirCacheCounters {
             construct_resolve_ms: PhaseTiming::new(),
             construct_fetch_ms: PhaseTiming::new(),
             construct_fetch_p95: DecayingP95Histogram::new(),
+            construct_fetch_count: AtomicU64::new(0),
             hit_assemble_ms: PhaseTiming::new(),
             prewarm_warm_redundant: AtomicU64::new(0),
             prewarm_completed: AtomicU64::new(0),
@@ -1369,6 +1486,9 @@ impl DirCacheCounters {
     pub fn record_construct_fetch_ms(&self, elapsed_ms: u64) {
         self.construct_fetch_ms.observe_ms(elapsed_ms);
         self.construct_fetch_p95.observe(elapsed_ms);
+        // (#obs-tuning follow-up 3) Bump the monotone cold-construct rate
+        // counter so the decay-window (~few/min) assumption is observable.
+        self.construct_fetch_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a HIT-path assemble-phase (hardlink materialise) observation (ms).
@@ -1513,6 +1633,20 @@ impl MetricsComponent for DirCacheCounters {
              cached entry → action dest). Boundary: the hardlink_directory_tree \
              span in try_hardlink_cached. This is the cost dir-cache ideas #1/#2 \
              would make more frequent.",
+        )?;
+
+        // #obs-tuning follow-up 3: COLD-construct rate — a monotone count of
+        // record_construct_fetch_ms calls so the decayed-p95 window assumption
+        // ("a few cold constructs/min") is observable/validatable. Emitted via
+        // the same `emit` helper → dir_cache_construct_fetch_count_total_counter.
+        emit(
+            "construct_fetch_count",
+            &self.construct_fetch_count,
+            "Directory-cache COLD-construct count (one per record_construct_fetch_ms \
+             call): the cold-construct RATE (delta/interval) that shapes the gossiped \
+             construct_latency_ms_p95 decay window. Validates the ~few-per-min window \
+             assumption; a wrong rate makes that window jittery (seconds) or \
+             re-fossilised (hours).",
         )?;
 
         // #speculative-prefetch: DirectoryCache::prewarm outcome + priority.
@@ -1988,7 +2122,7 @@ impl MetricsComponent for ReconcilePinCountersHandle {
 #[cfg(target_os = "macos")]
 pub fn spawn_system_metrics_sampler() {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(core::time::Duration::from_secs(10));
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -2087,6 +2221,8 @@ fn sysctl_u64(name: &core::ffi::CStr) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+
     use super::*;
 
     /// #85 P1 (test stamp 2026-06-08): single-acquire path. Drives
@@ -2173,7 +2309,7 @@ mod tests {
         {
             let sem_for_third = Arc::clone(&sem);
             let acquire_fut = counters.acquire(&sem_for_third);
-            let timer = tokio::time::sleep(core::time::Duration::from_millis(100));
+            let timer = tokio::time::sleep(Duration::from_millis(100));
             tokio::select! {
                 _ = acquire_fut => panic!(
                     "P1 saturation: 33rd acquire did not block when 32 permits held"
@@ -2984,45 +3120,49 @@ mod tests {
     /// non-decayed histogram) would FOSSILISE on the early regime and never
     /// track the new one.
     ///
-    /// Scenario: 1000 observations in a MID bucket (100 ms → the `<=100`
-    /// bucket) so the p95 sits at 100; then a SUSTAINED low regime of 300
-    /// observations at 5 ms (the `<=5` bucket). With decay (`P95_DECAY_KEEP =
-    /// 0.98`) the 1000 old-mid weights decay to `1000 * 0.98^300 ≈ 2.4` while
-    /// the 300 recent-low weights dominate → the p95 DROPS to 5. Without decay
-    /// (cumulative), the 1000 mid observations still hold the 95th-percentile
-    /// mass (total 1300, p95 index 1235 > the 300 low) → the p95 STAYS
-    /// fossilised at 100.
+    /// Scenario: 1000 observations in a MID bucket (100 ms) at `t0` so the p95
+    /// sits at 100; then — after a 300 s WALL-CLOCK gap — a SUSTAINED low regime
+    /// of 300 observations at 5 ms. With WALL-TIME decay (`P95_DECAY_KEEP_PER_SEC
+    /// = 0.98`/s over the 300 s gap) the 1000 old-mid weights decay to
+    /// `1000 * 0.98^300 ≈ 2.4` while the 300 recent-low weights (weight 300)
+    /// dominate → the p95 DROPS to 5. Without decay (cumulative), the 1000 mid
+    /// observations still hold the 95th-percentile mass (total 1300) → the p95
+    /// STAYS fossilised at 100. (#obs-tuning follow-up 1: uses `observe_at` with
+    /// an explicit clock — decay is now wall-clock-driven, so a burst at one
+    /// instant does NOT self-decay; the 300 s gap is what ages the old regime.)
     ///
-    /// Mutation (CLAUDE.md TDD #5): comment out the decay loop
-    /// (`for slot in w.iter_mut() { *slot *= P95_DECAY_KEEP; }`) in
-    /// `DecayingP95Histogram::observe`. The histogram becomes cumulative; the
-    /// p95 stays at 100 and this test red-fails with the bespoke
-    /// "boot-domination NOT fixed" message.
+    /// Mutation (CLAUDE.md TDD #5): make the `decay_to` multiply a no-op in
+    /// `DecayingP95Histogram`. The histogram becomes cumulative; the p95 stays
+    /// at 100 and this test red-fails with the bespoke "boot-domination NOT
+    /// fixed" message.
     #[test]
     fn p95_decays_toward_new_regime_not_fossilised_since_boot() {
         let h = DecayingP95Histogram::new();
-        // Old regime: a large mass in the 100ms bucket.
+        let t0 = Instant::now();
+        // Old regime: a large mass in the 100ms bucket, all at t0.
         for _ in 0..1000 {
-            h.observe(100);
+            h.observe_at(100, t0);
         }
         assert_eq!(
-            h.p95_ms(),
+            h.p95_ms_at(t0),
             100,
             "sanity: after 1000×100ms observations the p95 must be the 100ms \
              bucket upper edge (got {})",
-            h.p95_ms()
+            h.p95_ms_at(t0)
         );
-        // Sustained regime shift: 300 low observations.
+        // Sustained regime shift 300 s LATER: 300 low observations. The 300 s
+        // wall-clock gap decays the old 1000-mass to ~2.4 (0.98^300).
+        let t1 = t0 + Duration::from_secs(300);
         for _ in 0..300 {
-            h.observe(5);
+            h.observe_at(5, t1);
         }
-        let p95 = h.p95_ms();
+        let p95 = h.p95_ms_at(t1);
         assert!(
             p95 <= 5,
             "#obs-tuning boot-domination NOT fixed: after a SUSTAINED low regime \
-             (300×5ms following 1000×100ms) the decayed p95 must track the new \
+             (300×5ms, 300s after 1000×100ms) the decayed p95 must track the new \
              regime and fall to <=5ms, but it stayed at {p95}ms — the early-regime \
-             mass never decayed (the decay multiply in observe() was removed, \
+             mass never aged (the wall-clock decay in decay_to was removed, \
              making the histogram a since-boot cumulative fossil, exactly the \
              defect this task fixes)"
         );
@@ -3036,14 +3176,17 @@ mod tests {
     #[test]
     fn p95_tracks_upward_regime_shift() {
         let h = DecayingP95Histogram::new();
+        let t0 = Instant::now();
         for _ in 0..500 {
-            h.observe(5); // low regime → p95 at 5
+            h.observe_at(5, t0); // low regime → p95 at 5
         }
-        assert_eq!(h.p95_ms(), 5, "sanity: low regime p95 is 5ms");
+        assert_eq!(h.p95_ms_at(t0), 5, "sanity: low regime p95 is 5ms");
+        // 300 s later, a sustained high regime. The gap ages the low mass away.
+        let t1 = t0 + Duration::from_secs(300);
         for _ in 0..300 {
-            h.observe(8_000); // high regime: 8000 > 5000 → the <=30000 bucket
+            h.observe_at(8_000, t1); // high regime: 8000 > 5000 → the <=30000 bucket
         }
-        let p95 = h.p95_ms();
+        let p95 = h.p95_ms_at(t1);
         assert!(
             p95 >= 5_000,
             "#obs-tuning upward-tracking: after a sustained 8000ms regime the p95 \
@@ -3063,19 +3206,24 @@ mod tests {
     /// Mutation: change `p95_ms`'s `cumulative >= target` to accumulate the
     /// WRONG edge (e.g. return `BUCKETS[idx-1]`), or set `target = total * 0.5`
     /// → the returned percentile no longer equals the 5000ms conservative edge.
+    /// (#obs-tuning follow-up 1: spaced 1 s per observation via `observe_at` so
+    /// the wall-clock decay weights the late-spread tail exactly as the prior
+    /// per-observation decay did — same conservative-edge contract.)
     #[test]
     fn p95_is_conservative_upper_edge_on_known_distribution() {
         let h = DecayingP95Histogram::new();
+        let t0 = Instant::now();
         // Interleave so decay does not fully erase the minority tail before we
-        // read: 5000ms tail samples spread through the 10ms bulk.
+        // read: 5000ms tail samples spread through the 10ms bulk, 1 s apart.
         for i in 0..100 {
+            let at = t0 + Duration::from_secs(i);
             if i % 20 == 19 {
-                h.observe(5_000); // 5 tail samples (indices 19,39,59,79,99)
+                h.observe_at(5_000, at); // 5 tail samples (indices 19,39,59,79,99)
             } else {
-                h.observe(10); // 95 bulk samples
+                h.observe_at(10, at); // 95 bulk samples
             }
         }
-        let p95 = h.p95_ms();
+        let p95 = h.p95_ms_at(t0 + Duration::from_secs(99));
         assert_eq!(
             p95, 5_000,
             "#obs-tuning conservative-p95: with 95% mass at 10ms and a 5% tail at \
@@ -3145,8 +3293,12 @@ mod tests {
     /// middle. Feeds the exact per-worker cold-construct population MEASURED live
     /// on the fleet under a forced cold-input cascade (2026-07-07): 34, 61, 69,
     /// 75, 92, 141, 149, 210, 225, 229 ms. Their arithmetic mean is 128.5 ms (the
-    /// old signal's value), but the buckets are `50×1, 100×4, 250×5`, so the 95th
-    /// percentile lands in the `<=250` bucket → p95 = 250 ms. The gate compares
+    /// old signal's value). On the finer [`CONSTRUCT_LATENCY_BUCKETS_MS`] ladder
+    /// the top three samples (210, 225, 229) land in the `<=250` bucket, so the
+    /// conservative 95th percentile still reports 250 ms (the genuine tail edge —
+    /// here the finer ladder AGREES with the coarse one because the tail truly
+    /// reaches ~229 ms; the follow-up-2 finer resolution matters for populations
+    /// whose p95 is BELOW ~200 ms, tested separately). The gate compares
     /// `T_wait_W` against a construct COST; the mean understates that cost by ~2×
     /// against this real distribution, so a `T_SETUP` derived from it would hold
     /// too rarely. The p95 reports the tail the gate actually needs.
@@ -3159,8 +3311,8 @@ mod tests {
             h.observe(ms);
         }
         let p95 = h.p95_ms();
-        // Arithmetic mean of the same population = 1285/10 = 128 ms (would fall in
-        // the <=250 bucket's LOWER neighbours). The p95 must be the 250ms edge.
+        // Arithmetic mean of the same population = 1285/10 = 128 ms. The p95 must
+        // be the 250ms edge (the tail the top three samples reach).
         assert_eq!(
             p95, 250,
             "#obs-tuning: p95 of the live-measured cold population (mean 128.5ms) \
@@ -3172,6 +3324,329 @@ mod tests {
             "#obs-tuning: the p95 ({p95}ms) must exceed the population mean \
              (128.5ms) — the whole point of conditioning is to stop understating \
              the cold-construct cost the way the replaced mean did"
+        );
+    }
+
+    // =================================================================
+    // #obs-tuning follow-up 1: TIME-AWARE (wall-clock) decay.
+    //
+    // The decay must age by ELAPSED WALL-TIME between accesses, not per
+    // observation, so an IDLE worker's p95 ages toward 0 instead of
+    // holding its last cold-construct value forever. Tests drive a
+    // deterministic clock by passing explicit `Instant`s to `observe_at`
+    // / `p95_ms_at` (production `observe`/`p95_ms` call `Instant::now()`),
+    // so no real sleep is used (no sleep-as-synchronization).
+    // =================================================================
+
+    /// (#obs-tuning follow-up 1) The CORE new contract: an IDLE worker's p95
+    /// AGES with wall-clock time even though NO new observation arrives. A
+    /// single cold construct at 250 ms sets the p95 to 250; after a long idle
+    /// gap (no further observations) a read must have decayed the mass away and
+    /// report the empty-sentinel 0 — the stale p95 no longer sticks forever.
+    ///
+    /// Mutation (TDD #5): make `decay_to` a no-op (or gate the whole time-aware
+    /// decay so `observe`/read stop aging) → the 250 ms mass never fades and the
+    /// idle read still reports 250 ms; this test red-fails with its bespoke
+    /// "idle p95 did NOT age" message.
+    #[test]
+    fn p95_ages_on_idle_wall_clock_gap() {
+        let h = DecayingP95Histogram::new();
+        let t0 = Instant::now();
+        h.observe_at(250, t0);
+        assert_eq!(
+            h.p95_ms_at(t0),
+            250,
+            "sanity: immediately after one 250ms cold construct the p95 is the \
+             250ms bucket edge (got {})",
+            h.p95_ms_at(t0)
+        );
+        // A LONG idle gap with NO new observations. With a per-second keep of
+        // 0.98 the mass after 600 s is 0.98^600 ≈ 5.6e-6, well below the
+        // empty-sentinel threshold, so the p95 must have aged back to 0.
+        let idle_read = h.p95_ms_at(t0 + Duration::from_secs(600));
+        assert_eq!(
+            idle_read, 0,
+            "#obs-tuning follow-up 1: idle p95 did NOT age — after a 600s idle \
+             gap with no new cold constructs the decayed p95 must fall back to \
+             the empty sentinel 0, but it stayed at {idle_read}ms. The decay is \
+             still per-observation (wall-time elapsed does not age it), so an \
+             idle worker fossilises its last cold-construct value forever — the \
+             exact defect this follow-up fixes"
+        );
+    }
+
+    /// (#obs-tuning follow-up 1) The wall-clock decay scales by Δt (CONTINUOUS
+    /// exponential), NOT by a fixed factor per access. A SINGLE observation
+    /// (mass 1.0), read ONCE after a 40 s idle gap, must have decayed by
+    /// `0.98^40 ≈ 0.446` — below the `P95_NEGLIGIBLE_MASS = 0.5` sentinel
+    /// threshold — so the read reports 0. A per-CALL multiply would apply only
+    /// ONE `×0.98` for that single read (mass 0.98, still > 0.5) and wrongly
+    /// report 250. This pins the Δt-exponent specifically (distinct from the
+    /// "decay entirely off" idle test): one big elapsed interval must apply the
+    /// FULL time-scaled decay in a single step, not one flat factor.
+    ///
+    /// Mutation: revert `decay_to` to a fixed per-CALL multiply (`factor =
+    /// P95_DECAY_KEEP_PER_SEC` instead of `.powf(dt)`) → the single 40 s read
+    /// decays by only `×0.98`, the mass stays above the sentinel, the p95 stays
+    /// 250 and this test red-fails.
+    #[test]
+    fn p95_decay_is_continuous_in_wall_time() {
+        let h = DecayingP95Histogram::new();
+        let t0 = Instant::now();
+        // Exactly one observation → mass 1.0 in the 250ms bucket.
+        h.observe_at(250, t0);
+        assert_eq!(
+            h.p95_ms_at(t0),
+            250,
+            "sanity: one 250ms observation reports the 250ms bucket (got {})",
+            h.p95_ms_at(t0)
+        );
+        // ONE read after a 40 s idle gap. Continuous decay: 0.98^40 ≈ 0.446 <
+        // 0.5 → sentinel 0. A per-call flat ×0.98 would keep mass 0.98 → 250.
+        let aged = h.p95_ms_at(t0 + Duration::from_secs(40));
+        assert_eq!(
+            aged, 0,
+            "#obs-tuning follow-up 1: wall-clock decay is not Δt-CONTINUOUS — a \
+             single observation read ONCE after a 40s gap must decay by the full \
+             0.98^40 (≈0.446, below the 0.5 sentinel) and report 0, but it \
+             reported {aged}ms. A per-CALL flat ×0.98 (dropping the Δt exponent) \
+             applies only one decay step for the single read, leaving stale mass \
+             above the sentinel — the exact Δt-scaling bug this pins"
+        );
+    }
+
+    /// (#obs-tuning follow-up 1) An ACTIVE worker at a steady cold cadence still
+    /// tracks its regime — the time-aware decay must not erase the current
+    /// distribution when constructs keep arriving. Ten cold constructs at a
+    /// realistic 5 s cadence, all in the 250 ms bucket, must still report the
+    /// 250 ms p95 (the recent regime), NOT decay to 0 the way a pure idle gap
+    /// does. Guards against over-aggressive aging that would blank a busy
+    /// worker's signal.
+    #[test]
+    fn p95_active_cadence_retains_regime() {
+        let h = DecayingP95Histogram::new();
+        let t0 = Instant::now();
+        // 10 constructs, 5 s apart (a plausible cold-heavy cadence).
+        for i in 0..10 {
+            h.observe_at(250, t0 + Duration::from_secs(i * 5));
+        }
+        let p95 = h.p95_ms_at(t0 + Duration::from_secs(9 * 5));
+        assert_eq!(
+            p95, 250,
+            "#obs-tuning follow-up 1: an ACTIVE worker (10× 250ms constructs at \
+             5s cadence) must still report its recent 250ms regime, got {p95}ms \
+             — the wall-clock decay is aging too aggressively and blanking a busy \
+             worker's live signal"
+        );
+    }
+
+    // =================================================================
+    // #obs-tuning follow-up 2: FINER ladder in the measured 34–229 ms band.
+    //
+    // The shared O11_LATENCY_BUCKETS_MS has only 50/100/250 boundaries in
+    // the measured band, so a p95 anywhere in (100,250] snaps to 250. The
+    // construct-latency histogram gets its OWN finer ladder
+    // (CONSTRUCT_LATENCY_BUCKETS_MS) so the shared P3/P5 ladder is
+    // untouched (it has other consumers — O11LatencyHistogram).
+    // =================================================================
+
+    /// (#obs-tuning follow-up 2) The construct-latency ladder resolves the
+    /// measured band FINER than the shared 50/100/250 ladder. A population whose
+    /// true 95th percentile is ~150 ms (34,61,69,75,92,110,120,130,141,149 —
+    /// all inside 34–149 ms) snaps to 250 ms on the shared ladder (its only
+    /// boundary above 100 is 250) but resolves to 150 ms on the finer ladder.
+    /// The 100 ms of quantization error the coarse ladder imposed is exactly the
+    /// snap this follow-up removes. Computed independently for cross-check.
+    ///
+    /// Mutation: point `DecayingP95Histogram` back at `O11_LATENCY_BUCKETS_MS`
+    /// (the coarse ladder) → the p95 snaps to 250 again and this test red-fails
+    /// with its bespoke "ladder too coarse" message.
+    #[test]
+    fn construct_p95_finer_ladder_resolves_measured_band() {
+        let pop = [34u64, 61, 69, 75, 92, 110, 120, 130, 141, 149];
+        // Cross-check what the COARSE shared ladder would report on this pop, so
+        // the "finer beats coarse" claim is grounded, not asserted.
+        let coarse = conservative_p95_on_ladder(&pop, &O11_LATENCY_BUCKETS_MS);
+        assert_eq!(
+            coarse, 250,
+            "cross-check: the coarse shared ladder snaps this 34–149ms population \
+             to 250ms (its only boundary >100 is 250); got {coarse}"
+        );
+
+        let h = DecayingP95Histogram::new();
+        let t0 = Instant::now();
+        for ms in pop {
+            h.observe_at(ms, t0);
+        }
+        let p95 = h.p95_ms_at(t0);
+        assert_eq!(
+            p95, 150,
+            "#obs-tuning follow-up 2: ladder too coarse — the construct-latency \
+             p95 of a 34–149ms population (true p95 ~149ms) must resolve to the \
+             150ms finer boundary, NOT snap to the 250ms the shared 50/100/250 \
+             ladder gives, got {p95}ms. The finer 50–500ms ladder is not in \
+             effect (still using the coarse shared O11_LATENCY_BUCKETS_MS)"
+        );
+        assert!(
+            p95 < coarse,
+            "#obs-tuning follow-up 2: the finer ladder ({p95}ms) must resolve the \
+             band STRICTLY finer than the coarse shared ladder ({coarse}ms)"
+        );
+    }
+
+    /// Independent reference implementation of the conservative upper-edge p95
+    /// for a sample slice against an arbitrary ascending ladder — used to
+    /// cross-check the production `DecayingP95Histogram` p95 against the coarse
+    /// shared ladder WITHOUT reimplementing decay (all samples share one t0).
+    fn conservative_p95_on_ladder(samples: &[u64], ladder: &[u64]) -> u64 {
+        let mut weights = vec![0u64; ladder.len() + 1];
+        for &s in samples {
+            let idx = ladder
+                .iter()
+                .position(|&b| s <= b)
+                .unwrap_or(ladder.len());
+            weights[idx] += 1;
+        }
+        let total: u64 = weights.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        // target = ceil-ish: first bucket whose cumulative >= 0.95*total.
+        let target = (total as f64) * 0.95;
+        let mut cumulative = 0u64;
+        for (idx, w) in weights.iter().enumerate() {
+            cumulative += *w;
+            if cumulative as f64 >= target {
+                return ladder.get(idx).copied().unwrap_or(*ladder.last().unwrap());
+            }
+        }
+        *ladder.last().unwrap()
+    }
+
+    /// (#obs-tuning follow-up 2) The construct-latency ladder is STRICTLY finer
+    /// than the shared ladder in the 50–500 ms band: it must contain at least
+    /// one boundary the shared `O11_LATENCY_BUCKETS_MS` lacks between 100 and
+    /// 250 ms (the specific gap that caused the snap). Also asserts the ladder is
+    /// sorted ascending (the p95 walk depends on monotone boundaries) and the
+    /// shared ladder is UNCHANGED (untouched for its P3/P5 consumers).
+    ///
+    /// Mutation: remove the added (100,250) boundaries from
+    /// `CONSTRUCT_LATENCY_BUCKETS_MS` → the "finer in band" assertion red-fails.
+    #[test]
+    fn construct_ladder_is_finer_and_shared_ladder_untouched() {
+        // The shared ladder is UNCHANGED — its P3/P5 consumers (O11LatencyHistogram)
+        // depend on exactly this 11-bucket set.
+        assert_eq!(
+            O11_LATENCY_BUCKETS_MS,
+            [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000],
+            "#obs-tuning follow-up 2: the SHARED O11_LATENCY_BUCKETS_MS must stay \
+             untouched (P3 ByteStream + P5 EvictingMap histograms depend on it); \
+             the finer band belongs on the SEPARATE construct ladder only"
+        );
+        // The construct ladder is sorted ascending.
+        let ladder = CONSTRUCT_LATENCY_BUCKETS_MS;
+        assert!(
+            ladder.windows(2).all(|w| w[0] < w[1]),
+            "#obs-tuning follow-up 2: CONSTRUCT_LATENCY_BUCKETS_MS must be strictly \
+             ascending (the conservative-p95 walk assumes monotone boundaries), \
+             got {ladder:?}"
+        );
+        // It has at least one boundary the shared ladder lacks in (100,250) — the
+        // exact gap that snapped the measured band to 250.
+        let shared_in_gap: Vec<u64> = O11_LATENCY_BUCKETS_MS
+            .iter()
+            .copied()
+            .filter(|&b| b > 100 && b < 250)
+            .collect();
+        let construct_in_gap: Vec<u64> = ladder
+            .iter()
+            .copied()
+            .filter(|&b| b > 100 && b < 250)
+            .collect();
+        assert!(
+            shared_in_gap.is_empty() && !construct_in_gap.is_empty(),
+            "#obs-tuning follow-up 2: the construct ladder must add >=1 boundary in \
+             (100,250) that the shared ladder lacks (shared_in_gap={shared_in_gap:?}, \
+             construct_in_gap={construct_in_gap:?}) — otherwise the measured 34–229ms \
+             band still snaps to 250ms"
+        );
+    }
+
+    // =================================================================
+    // #obs-tuning follow-up 3: COLD-CONSTRUCT RATE is measurable.
+    //
+    // The decay window assumes "few cold constructs/min" — an operator
+    // estimate with no counter. A monotone count of record_construct_fetch_ms
+    // calls makes the rate observable (rate = Δcount / Δt on the 15s log or a
+    // /metrics scrape), so the decay-window assumption can be validated.
+    // =================================================================
+
+    /// (#obs-tuning follow-up 3) Every `record_construct_fetch_ms` call bumps a
+    /// monotone cold-construct counter, so the cold RATE (Δcount / Δt) is
+    /// observable and the "~few/min" decay-window assumption is verifiable
+    /// instead of estimated. Guards against the counter being dropped from the
+    /// record path.
+    ///
+    /// Mutation: comment out `self.construct_fetch_count.fetch_add(1, ..)` in
+    /// `record_construct_fetch_ms` → the count stays 0 while sum/count/p95 still
+    /// update; this test red-fails on the count assertion.
+    #[test]
+    fn record_construct_fetch_ms_increments_cold_rate_counter() {
+        let c = DirCacheCounters::new();
+        assert_eq!(
+            c.construct_fetch_count.load(Ordering::Relaxed),
+            0,
+            "cold-construct rate counter must start at 0"
+        );
+        for _ in 0..7 {
+            c.record_construct_fetch_ms(120);
+        }
+        assert_eq!(
+            c.construct_fetch_count.load(Ordering::Relaxed),
+            7,
+            "#obs-tuning follow-up 3: record_construct_fetch_ms must bump the \
+             cold-construct rate counter once per call (7 calls → 7), got {} — \
+             the cold RATE is unmeasured, so the decay-window (~few/min) \
+             assumption cannot be validated",
+            c.construct_fetch_count.load(Ordering::Relaxed)
+        );
+    }
+
+    /// (#obs-tuning follow-up 3) The cold-construct rate counter renders on the
+    /// REAL `/metrics` path (same MetricsRegistry + render_prometheus walk the
+    /// worker uses), under the `dir_cache` prefix, as
+    /// `dir_cache_construct_fetch_count_total_counter`. Absence = the rate is
+    /// DARK on /metrics (the dark-counter trap: 0 indistinguishable from unwired).
+    ///
+    /// Mutation: drop the `construct_fetch_count` emit in
+    /// `DirCacheCounters::publish` (or rename its key) → the exact line is absent
+    /// and this test red-fails with its bespoke "cold-rate counter dark" message.
+    #[test]
+    fn dir_cache_render_exposes_cold_construct_rate_counter() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // Drive a distinct sentinel count so we catch a publish of the wrong field.
+        dir_cache_counters()
+            .construct_fetch_count
+            .store(4242, Ordering::Relaxed);
+
+        let registry = MetricsRegistry::new();
+        registry.register("dir_cache", dir_cache_counters_arc());
+        let body = render_prometheus(&registry);
+
+        let needle = "dir_cache_construct_fetch_count_total_counter 4242";
+        assert!(
+            body.contains(needle),
+            "#obs-tuning follow-up 3: cold-construct rate counter DARK on /metrics \
+             — expected line `{needle}` from the render_prometheus walk, but it is \
+             ABSENT. Without it on /metrics the cold RATE cannot be scraped to \
+             validate the decay window. body=\n{body}"
+        );
+        // Guard the #86 doubled-prefix trap.
+        assert!(
+            !body.contains("dir_cache_dir_cache"),
+            "#obs-tuning follow-up 3: doubled-prefix trap — construct rate counter \
+             emitted a `dir_cache_dir_cache_*` name. body=\n{body}"
         );
     }
 
