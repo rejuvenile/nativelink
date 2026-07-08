@@ -3290,8 +3290,9 @@ mod tests {
     /// (#obs-tuning-construct-latency-conditioning) EMPIRICAL GROUNDING — the p95
     /// biases toward the pessimistic cold-construct tail `T_SETUP` must not
     /// under-price, where the replaced `sum/count` mean landed in the cheap
-    /// middle. Feeds the exact per-worker cold-construct population MEASURED live
-    /// on the fleet under a forced cold-input cascade (2026-07-07): 34, 61, 69,
+    /// middle. Feeds the per-worker cold-construct population from a FORCED synthetic
+    /// cold-input cascade (2026-07-07; NOT a steady-state scrape — live steady-state
+    /// p95 is ~0, cold constructs are rare): 34, 61, 69,
     /// 75, 92, 141, 149, 210, 225, 229 ms. Their arithmetic mean is 128.5 ms (the
     /// old signal's value). On the finer [`CONSTRUCT_LATENCY_BUCKETS_MS`] ladder
     /// the top three samples (210, 225, 229) land in the `<=250` bucket, so the

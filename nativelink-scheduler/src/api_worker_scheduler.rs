@@ -1090,7 +1090,7 @@ struct ApiWorkerSchedulerImpl {
     assume_core_count: u32,
     /// (#sched M1 rebalance) When true, the cache-affinity tiers apply the
     /// dispatch-count P-headroom overflow gate (see
-    /// `SimpleSpec::p_headroom_gate_enabled`). Default OFF: the matcher
+    /// `SimpleSpec::p_headroom_gate_enabled`). Default ON (serde default flipped to `true` in `69f34eee`; live config omits the field → inherits ON): the matcher
     /// behaves byte-identically to the pre-gate path until an operator flips
     /// the config flag. Read once per dispatch under the same write lock.
     p_headroom_gate_enabled: bool,
@@ -1170,7 +1170,7 @@ struct ApiWorkerSchedulerImpl {
     prefetch_coalesce_guard: LruCache<OperationId, WorkerId>,
 
     /// (#specprefetch-rebind Stage B) Master gate for the temporal hold-vs-rebind
-    /// decision (`SimpleSpec::enable_speculative_hold`). Default OFF: the matcher
+    /// decision (`SimpleSpec::enable_speculative_hold`). Default ON (serde default flipped to `true` in `69f34eee`; live config omits the field → inherits ON): the matcher
     /// NEVER holds — `inner_find_and_reserve_worker` assigns the best available
     /// worker byte-identically to the pre-Stage-B path. Read once per reserve under
     /// the same write lock. Independent of `enable_speculative_prefetch` (Stage A).
@@ -2625,7 +2625,7 @@ impl ApiWorkerSchedulerImpl {
         //
         // v3: the hold is the TEMPORAL exception to pcore-first's SPATIAL route-away
         // (design §2.3-v3.2). HOLD iff:
-        //  * `enable_speculative_hold` (default-OFF master gate), AND
+        //  * `enable_speculative_hold` (default-ON master gate since `69f34eee`), AND
         //  * `p_gate_active` (design §2.3-v3.7-#1, distsys BLOCK-2): the pcore-first
         //    gate is ON *and* some viable worker has P-headroom → a P-saturated
         //    holder W is genuinely being routed-away-from. On a FULLY-P-saturated
@@ -4054,7 +4054,7 @@ impl ApiWorkerScheduler {
             // (code-reviewer note; previously hardcoded `512 * 1024, 8`).
             nativelink_config::schedulers::default_load_byte_cost(),
             nativelink_config::schedulers::default_assume_core_count(),
-            // (#sched M1 rebalance) P-headroom gate defaults OFF.
+            // (#sched M1 rebalance) P-headroom gate defaults ON (`69f34eee`).
             false,
             // (#sched M1 rebalance v2) override tunables: threshold 0 =
             // override OFF (exact v1), factor 2 (from the config default fn).
