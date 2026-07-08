@@ -1108,6 +1108,119 @@ async fn fix_b_update_oneshot_in_flight_byte_cap_emits_typed_signal() -> Result<
     Ok(())
 }
 
+/// **#sibling-hunt I2 — concurrent same-digest accounting.** Two
+/// concurrent LEGACY writes (`update_oneshot`) for the SAME digest each
+/// `fetch_add` into `in_flight_slow_writes_bytes`, but the map is keyed by
+/// digest so it holds ONE entry (the second insert overwrites the first).
+/// When the two background slow-writes finish, the FIRST `remove()` returns
+/// `Some` (→ `fetch_sub`) and the SECOND returns `None` (→ no `fetch_sub`),
+/// so the counter leaks exactly one payload's bytes PERMANENTLY. Over time
+/// this drifts `in_flight_slow_writes_bytes` up until
+/// `check_slow_writes_capacity_gate` spuriously rejects every admission
+/// with `SlowWritesAtCapacity` even though no bytes are actually in flight.
+///
+/// Reachability (settling check, verified against the live buildcache chain):
+/// concurrent same-digest legacy writes ARE reachable via BatchUpdateBlobs
+/// (cas_server has NO cross-request digest dedup; ByteStream's
+/// `in_flight_writes` dedup does not cover the batch path) for any >16 KiB
+/// blob — SizePartitioning(16 KiB) routes >16 KiB to `cas_FAST_SLOW_STORE`,
+/// and `update_oneshot` has no chunked branch, so every such write takes the
+/// legacy `in_flight_slow_writes` path. `slow_writes_in_flight_max_bytes` is
+/// 12 GiB live, so the leaked skew feeds a real admission gate.
+///
+/// The fix makes the byte counter track the MAP's actual content (a
+/// same-digest overwrite adjusts the counter by the byte DELTA under the
+/// map lock), so two concurrent same-digest writes count ONE payload while
+/// in flight and drain to ZERO.
+///
+/// Mutation step: revert the insert-site accounting to the unconditional
+/// `fetch_add(bytes)` (drop the delta/prior-entry adjustment). The test
+/// MUST red-fail with the bespoke "counter leaked on concurrent same-digest
+/// legacy write" message.
+#[nativelink_test]
+async fn i2_concurrent_same_digest_legacy_write_does_not_leak_byte_counter()
+-> Result<(), Error> {
+    let cap_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB — above what we use
+    let (fss, store, release, in_flight, _dropped) = make_fast_slow_with_gated_slow(cap_bytes);
+
+    const PAYLOAD_LEN: u64 = 2048;
+    let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN)?;
+
+    // Fire TWO concurrent same-digest update_oneshot writes. Each writes the
+    // fast tier, passes the cap gate, inserts into the (digest-keyed) map,
+    // and spawns a background slow-write that blocks on the GatedSlowStore.
+    let store2 = store.clone();
+    let w1 = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest, Bytes::from(vec![0u8; PAYLOAD_LEN as usize])),
+    );
+    let w2 = tokio::time::timeout(
+        Duration::from_secs(5),
+        store2.update_oneshot(digest, Bytes::from(vec![0u8; PAYLOAD_LEN as usize])),
+    );
+    let (r1, r2) = tokio::join!(w1, w2);
+    r1.expect("first concurrent update_oneshot must not deadlock")?;
+    r2.expect("second concurrent update_oneshot must not deadlock")?;
+
+    // Both background slow-writes must be pinned in the GatedSlowStore
+    // (in_flight=2) — proves both legacy spawns are live and both did a
+    // fetch_add.
+    wait_until("both same-digest slow-writes pinned (in_flight=2)", || {
+        in_flight.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    // The map holds exactly ONE entry (same digest), so the counter must
+    // reflect ONE payload — not two. Under the bug this reads 2*PAYLOAD_LEN
+    // because both writes did an unconditional fetch_add.
+    assert_eq!(
+        fss.in_flight_slow_write_count(),
+        1,
+        "the digest-keyed in-flight map must hold exactly one entry for two \
+         same-digest writes"
+    );
+    assert_eq!(
+        fss.in_flight_slow_write_bytes(),
+        PAYLOAD_LEN,
+        "in-flight byte counter must equal ONE payload while two same-digest \
+         legacy writes are in flight (the map holds a single entry); a value \
+         of {} (== 2*{}) means the insert site did an unconditional fetch_add \
+         per write instead of tracking the map's actual byte content",
+        2 * PAYLOAD_LEN,
+        PAYLOAD_LEN,
+    );
+
+    // Release the gate; both background slow-writes complete. The FIRST
+    // remove() returns Some (fetch_sub); the SECOND returns None. The
+    // counter MUST drain to ZERO — under the bug it stays stuck at
+    // PAYLOAD_LEN forever (the leaked add), which is the admission-gate
+    // corruption.
+    release.notify_waiters();
+    release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fss.in_flight_slow_write_bytes() == 0 && fss.in_flight_slow_write_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "counter leaked on concurrent same-digest legacy write — \
+             in_flight_slow_write_bytes stuck at {} (map count {}) after both \
+             slow-writes drained; the admission gate \
+             (check_slow_writes_capacity_gate) will accumulate this skew and \
+             eventually reject every write with a spurious SlowWritesAtCapacity",
+            fss.in_flight_slow_write_bytes(),
+            fss.in_flight_slow_write_count(),
+        )
+    });
+
+    Ok(())
+}
+
 /// **Fix B — recovery contract.** When a streaming `update` is rejected
 /// by the slow-write byte cap, the rejecting code path MUST also:
 ///   1. Insert the digest into `failed_slow_writes` so the server-side

@@ -1018,30 +1018,31 @@ pub struct FastSlowStore {
     /// atomic so the cap-check on the hot insert path doesn't have to
     /// walk the map.
     ///
-    /// **Synchronization model (eventually-consistent, NOT
-    /// strongly-consistent w.r.t. the map):**
-    /// - Insert side: takes the `in_flight_slow_writes` mutex,
-    ///   inserts, releases the mutex, THEN does `fetch_add` (the
-    ///   mutex is dropped at end of the `lock().insert(...)`
-    ///   statement before the counter is bumped).
-    /// - Remove side: takes the same mutex, calls `remove`, THEN
-    ///   does `fetch_sub` while still holding the mutex.
-    /// - Cap-check (`check_slow_writes_capacity_gate`) reads this
-    ///   counter as a snapshot, with no map lock held.
+    /// **Synchronization model (the counter tracks the map's actual byte
+    /// content — invariant: `counter == Σ len(entry.chunks)`):**
+    /// - Insert side: takes the `in_flight_slow_writes` mutex, inserts,
+    ///   and — STILL HOLDING the mutex — adjusts the counter by the byte
+    ///   DELTA against the entry it replaced (`+new − prior`). Because the
+    ///   map is keyed by digest, a concurrent same-digest legacy write
+    ///   overwrites one slot; the delta keeps the counter from
+    ///   double-counting that slot (#sibling-hunt I2 — an unconditional
+    ///   per-write `fetch_add` leaked one payload when the losing bg-task's
+    ///   `remove()` returned `None`).
+    /// - Remove side: takes the same mutex, calls `remove`, THEN does
+    ///   `fetch_sub(removed_bytes)` while still holding the mutex.
+    /// - Cap-check (`check_slow_writes_capacity_gate`) reads this counter
+    ///   as a lock-free snapshot (no map lock held).
     ///
-    /// Consequence: a concurrent reader can observe a stale-low
-    /// counter for the brief window between insert (lock-released)
-    /// and `fetch_add`. The cap thus admits at most one in-flight
-    /// insert's worth of overshoot per concurrent admission — i.e.
-    /// `concurrent_admissions × max_admission_bytes` worst case.
-    /// At the 8 GiB default cap this is comfortably below OOM
-    /// territory and the cap remains an effective backpressure
-    /// signal. Counter monotonicity (no underflow) relies on
-    /// `tokio::spawn` parent-task ordering: the parent task's
-    /// `fetch_add` runs to completion before the spawned task's
-    /// `fetch_sub` can be polled. If a future change replaces
-    /// `tokio::spawn` with a synchronously-detached path, the
-    /// counter could underflow.
+    /// Both mutating sides now hold the map mutex across their counter
+    /// mutation, so the (map, counter) pair is consistent under concurrent
+    /// same-digest writes and no longer drifts. The cap-check snapshot may
+    /// still be momentarily stale relative to an in-progress insert/remove
+    /// on another thread, which is fine for a backpressure signal (the cap
+    /// STOPS a hot loop; it is not a hard accounting fence). Counter
+    /// monotonicity (no unsigned underflow) is preserved by the add/sub
+    /// branch on the insert side plus the invariant that every `fetch_sub`
+    /// subtracts exactly the bytes a prior insert added for that same map
+    /// slot.
     ///
     /// Wrapped in `Arc` so the spawned background task can hold a
     /// clone for the post-write decrement (mirrors
@@ -6094,26 +6095,38 @@ impl StoreDriver for FastSlowStore {
         // in one of the three sets, so any acked-not-durable write path MUST
         // register here (or in one of the sibling sets) before its ack.
         let owned_key = key.borrow().into_owned();
-        self.in_flight_slow_writes
-            .lock()
-            .insert(owned_key.clone(), data.clone());
-        // #334 Fix B: increment the byte counter after the insert
-        // lands. The `fetch_add` runs OUTSIDE the
-        // `in_flight_slow_writes` mutex (the lock was dropped at end
-        // of the `lock().insert(...)` statement above), so a
-        // concurrent reader of the counter may observe a stale-low
-        // value for the brief window before this `fetch_add`
-        // completes. The counter and the map are eventually
-        // consistent — see the struct field doc on
-        // `in_flight_slow_writes_bytes` for the full synchronization
-        // model and the worst-case overshoot analysis. The remove
-        // path (in the spawned task below) calls `remove()` THEN
-        // `fetch_sub` while holding the same mutex, so the order is
-        // not symmetric — counter monotonicity (no underflow) relies
-        // on `tokio::spawn` parent-task ordering: this `fetch_add`
-        // runs to completion before the spawned future is polled.
-        self.in_flight_slow_writes_bytes
-            .fetch_add(bytes_sent, Ordering::Relaxed);
+        // #334 Fix B + #sibling-hunt I2: adjust the byte counter by the
+        // DELTA against any prior same-digest entry, atomically UNDER the
+        // map lock. The map is keyed by digest, so a concurrent same-digest
+        // legacy write OVERWRITES the prior entry (one map slot); an
+        // unconditional `fetch_add(bytes_sent)` per write therefore
+        // double-counted while the single `remove()` on the losing bg-task
+        // only `fetch_sub`'d once → a permanent positive skew that corrupts
+        // `check_slow_writes_capacity_gate`. Subtracting the replaced
+        // payload's bytes keeps the counter equal to the map's actual byte
+        // content: two same-digest writes count ONE payload, and each
+        // bg-task's `remove()` + `fetch_sub` (below) then drains it to zero.
+        // Done under the lock so the delta is consistent with the map slot
+        // it replaced (symmetric with the remove path, which holds the same
+        // mutex across `remove()` + `fetch_sub`).
+        {
+            let mut guard = self.in_flight_slow_writes.lock();
+            let prior_bytes: u64 = guard
+                .insert(owned_key.clone(), data.clone())
+                .map_or(0, |prev| prev.iter().map(|b| b.len() as u64).sum());
+            // net = bytes_sent (new) - prior_bytes (replaced). For
+            // content-addressed CAS the sizes are equal so the net is 0 on a
+            // same-digest overwrite; the add/sub branch keeps the counter
+            // monotone (no unsigned underflow) if a future non-CAS caller
+            // ever overwrites with a different-sized payload.
+            if bytes_sent >= prior_bytes {
+                self.in_flight_slow_writes_bytes
+                    .fetch_add(bytes_sent - prior_bytes, Ordering::Relaxed);
+            } else {
+                self.in_flight_slow_writes_bytes
+                    .fetch_sub(prior_bytes - bytes_sent, Ordering::Relaxed);
+            }
+        }
 
         let in_flight = self.in_flight_slow_writes.clone();
         let in_flight_bytes = self.in_flight_slow_writes_bytes.clone();
@@ -6479,12 +6492,27 @@ impl StoreDriver for FastSlowStore {
 
         // Spawn background slow store write.
         let owned_key = key.borrow().into_owned();
-        self.in_flight_slow_writes
-            .lock()
-            .insert(owned_key.clone(), vec![data.clone()]);
-        // #334 Fix B: increment after successful insert.
-        self.in_flight_slow_writes_bytes
-            .fetch_add(data_bytes, Ordering::Relaxed);
+        // #334 Fix B + #sibling-hunt I2: delta-accounting against any prior
+        // same-digest entry, under the map lock — see the streaming-`update`
+        // insert site for the full rationale (concurrent same-digest legacy
+        // writes overwrite one digest-keyed slot; an unconditional
+        // `fetch_add` per write leaked one payload on the losing bg-task's
+        // no-op `remove()`). BatchUpdateBlobs has no cross-request digest
+        // dedup, so two same-digest `update_oneshot` calls for a >16 KiB blob
+        // reach this site concurrently in production.
+        {
+            let mut guard = self.in_flight_slow_writes.lock();
+            let prior_bytes: u64 = guard
+                .insert(owned_key.clone(), vec![data.clone()])
+                .map_or(0, |prev| prev.iter().map(|b| b.len() as u64).sum());
+            if data_bytes >= prior_bytes {
+                self.in_flight_slow_writes_bytes
+                    .fetch_add(data_bytes - prior_bytes, Ordering::Relaxed);
+            } else {
+                self.in_flight_slow_writes_bytes
+                    .fetch_sub(prior_bytes - data_bytes, Ordering::Relaxed);
+            }
+        }
 
         let in_flight = self.in_flight_slow_writes.clone();
         let in_flight_bytes = self.in_flight_slow_writes_bytes.clone();
