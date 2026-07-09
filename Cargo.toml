@@ -21,6 +21,13 @@ version = "1.0.0"
 [profile.release]
 lto = "thin"
 codegen-units = 16
+# (#buildcache-sigabrt-crash-2026-07-08) Keep line-table debug info + symbols so a prod
+# core dump / RUST_BACKTRACE yields a readable backtrace (the 2026-07-08 SIGABRT core
+# was unsymbolizable: `#0 n/a`). `line-tables-only` = file:line per frame at minimal
+# size; adds ~tens of MB to the binary (server + the worker scp'd to 10 Macs) — an
+# accepted trade for prod diagnosability. This is NOT [profile.smol] (which strips).
+debug = "line-tables-only"
+strip = false
 
 # Prefer this profile in CI, for instance via `cargo test --all --profile=smol`.
 # It reduces the size of the `target` directory from ~12GB to ~1GB.
