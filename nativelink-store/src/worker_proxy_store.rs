@@ -1159,6 +1159,35 @@ fn should_evict_locality_on_peer_error(e: &Error) -> bool {
     matches!(e.code, Code::NotFound | Code::DataLoss)
 }
 
+/// #logstorm-mirror-confirm-info-demote: sample period for the per-blob
+/// mirror-confirm `info!` lines. Under a routine ~20k-blob upload burst
+/// the two "blob confirmed on worker (≥2 replicas)" lines were 64% of a
+/// 31,775-line log storm (~20,394 lines in ~4 min, peak 1,223/s). The
+/// exact aggregate is already carried by the `mirror_total_succeeded`
+/// atomic/metric, so the human-readable per-blob line only needs to be a
+/// SAMPLE that preserves which-digest/which-endpoint detail at ~0.4%
+/// volume. Demoting to `debug!` would DELETE it from prod entirely
+/// (`release_max_level_info` compiles `debug!`/`trace!` out), so we
+/// sample the `info!` instead. Same 256 precedent as
+/// `FALLBACK_LOG_SAMPLE_PERIOD` in `nativelink-util/src/task.rs`.
+const MIRROR_CONFIRM_LOG_SAMPLE_PERIOD: u64 = 256;
+
+/// Returns `true` if the per-blob mirror-confirm `info!` should be emitted
+/// for the mirror-success counter value `n`. `n` is the PRIOR value returned
+/// by `mirror_total_succeeded.fetch_add(1, ..)` — a SHARED counter bumped by
+/// every mirror-success path (both "blob confirmed" sites plus any other
+/// mirror-success increment), so a given confirm call sees a SUB-SEQUENCE of
+/// the global counter, NOT a private `0,1,2,…`. We log when that shared value
+/// is a multiple of the period, i.e. ~1/256 of mirror successes overall; the
+/// `n == 0` first-success anchor fires only if the first-ever increment is a
+/// confirm call (best-effort). The exact aggregate lives in the
+/// counter/metric — this line is a lossy per-blob breadcrumb. Pure and
+/// deterministic (`n -> bool`) so the cadence is unit-testable without
+/// capturing tracing output.
+const fn should_log_mirror_confirm(n: u64) -> bool {
+    n % MIRROR_CONFIRM_LOG_SAMPLE_PERIOD == 0
+}
+
 /// Bytes a peer OWES for a Read RPC against a blob of `blob_size`,
 /// starting at `offset`, with optional `length` (None = unbounded
 /// tail). Used by the WPS Ok+0-bytes guard on both
@@ -4554,13 +4583,20 @@ impl WorkerProxyStore {
             match result {
                 Ok(()) => {
                     self.record_mirror_success(&endpoint);
-                    self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        %digest,
-                        size_bytes,
-                        endpoint = endpoint.as_ref(),
-                        "mirror_and_confirm: blob confirmed on worker (≥2 replicas)"
-                    );
+                    // #logstorm-mirror-confirm-info-demote: sample the per-blob
+                    // confirm line 1-in-256 off this same increment; the exact
+                    // aggregate stays in the `mirror_total_succeeded` metric.
+                    let prior_succeeded =
+                        self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
+                    if should_log_mirror_confirm(prior_succeeded) {
+                        info!(
+                            %digest,
+                            size_bytes,
+                            endpoint = endpoint.as_ref(),
+                            total_succeeded = prior_succeeded + 1,
+                            "mirror_and_confirm: blob confirmed on worker (≥2 replicas)"
+                        );
+                    }
                     return MirrorConfirmOutcome::Confirmed;
                 }
                 Err(e) => {
@@ -4938,13 +4974,20 @@ impl WorkerProxyStore {
         match result {
             Ok(()) => {
                 self.record_mirror_success(&endpoint);
-                self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
-                info!(
-                    %digest,
-                    size_bytes,
-                    endpoint = endpoint.as_ref(),
-                    "mirror_via_stream_and_confirm: blob confirmed on worker (≥2 replicas)"
-                );
+                // #logstorm-mirror-confirm-info-demote: sample the per-blob
+                // confirm line 1-in-256 off this same increment; the exact
+                // aggregate stays in the `mirror_total_succeeded` metric.
+                let prior_succeeded =
+                    self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
+                if should_log_mirror_confirm(prior_succeeded) {
+                    info!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        total_succeeded = prior_succeeded + 1,
+                        "mirror_via_stream_and_confirm: blob confirmed on worker (≥2 replicas)"
+                    );
+                }
                 MirrorConfirmOutcome::Confirmed
             }
             Err(e) => {
@@ -5542,6 +5585,42 @@ mod tests {
             !should_evict_locality_on_peer_error(&e),
             "FailedPrecondition is transient — does not prove the peer \
              lost the blob"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // #logstorm-mirror-confirm-info-demote: per-blob mirror-confirm INFO
+    // is sampled 1-in-N off the SAME atomic increment that feeds the
+    // `mirror_total_succeeded` metric. `fetch_add` returns the PRIOR
+    // value, so the predicate is fed n = 0, 1, 2, ... — the first
+    // success (n=0) and every MIRROR_CONFIRM_LOG_SAMPLE_PERIOD-th
+    // thereafter (n=256, 512, ...) must log; all others suppress. The
+    // exact aggregate stays in the counter/metric, so cutting the log
+    // volume loses no signal.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_should_log_mirror_confirm_cadence() {
+        assert!(
+            should_log_mirror_confirm(0),
+            "first mirror success (n=0, the prior fetch_add value) must \
+             log so the sample always has an occurrence-1 anchor"
+        );
+        assert!(
+            !should_log_mirror_confirm(1),
+            "n=1 is between samples — must suppress"
+        );
+        assert!(
+            !should_log_mirror_confirm(255),
+            "n=255 is the last value before the first period boundary — \
+             must suppress"
+        );
+        assert!(
+            should_log_mirror_confirm(256),
+            "n=256 is exactly one MIRROR_CONFIRM_LOG_SAMPLE_PERIOD — must log"
+        );
+        assert!(
+            should_log_mirror_confirm(512),
+            "n=512 is two periods — must log"
         );
     }
 
