@@ -500,6 +500,353 @@ fn classify_stall(
     }
 }
 
+/// A single parsed frame from the passive KERNEL call chain read out of
+/// `/proc/self/task/<tid>/stack`.
+///
+/// The kernel exposes each frame on its own line in the form
+/// `[<0>] symbol+0xOFFSET/0xSIZE` (the leading `[<0>]` is the frame
+/// address, zeroed by `kptr_restrict` on hardened kernels). This is the
+/// **D-state-proof** signal: a `TASK_UNINTERRUPTIBLE` thread cannot run
+/// a userspace signal handler (so the cooperative SIGRTMIN+1 path can
+/// never obtain its userspace backtrace), but the kernel call chain that
+/// PUT it into D-state — `folio_wait_bit_common ← ... ← __x64_sys_*` —
+/// is always readable from `/proc`. That chain names the actual syscall
+/// the thread is wedged in (write vs page-fault vs mmap vs ZFS), which
+/// is exactly the diagnostic the `0/N cooperative` dump could not give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KernelFrame {
+    /// Kernel symbol name, e.g. `folio_wait_bit_common`. If a line cannot
+    /// be parsed into the expected shape it is preserved verbatim here so
+    /// no information is dropped.
+    pub symbol: String,
+    /// Byte offset into the function, parsed from `+0xNN`. `None` when the
+    /// line does not carry an offset (e.g. a raw/unparseable line).
+    pub offset: Option<u64>,
+    /// Function size, parsed from `/0xMM`. `None` when absent.
+    pub size: Option<u64>,
+}
+
+/// Result of attempting to read a thread's passive kernel call chain.
+///
+/// The distinction between `PermissionDenied` and `Empty` is
+/// load-bearing for graceful degradation: `PermissionDenied` means the
+/// process lacks `CAP_SYS_ADMIN` (the cap `/proc/<tid>/stack` requires)
+/// and the operator must grant it via the systemd unit; `Empty` means
+/// the read succeeded but the kernel returned nothing (a running thread
+/// with no blocked call chain, or a thread that exited between
+/// enumeration and read). Only `PermissionDenied` should drive the
+/// once-per-dump "missing capability" warning.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KernelStackResult {
+    /// One or more frames parsed from the kernel call chain.
+    Frames(Vec<KernelFrame>),
+    /// The read failed with `EPERM`/`EACCES` — the process lacks
+    /// `CAP_SYS_ADMIN`. Degrade to wchan-only for this thread and warn
+    /// once per dump.
+    PermissionDenied,
+    /// The read produced no usable frames (empty file, only `0`, the
+    /// thread vanished, or the target was ON-CPU when read). Not a
+    /// capability problem and NOT a degradation: the kernel has no saved
+    /// call chain for a thread that is currently running (a cross-CPU read
+    /// of a running thread returns ENOENT → `Empty`). D-state / off-CPU
+    /// threads — the diagnostic target — always have a chain, so an `Empty`
+    /// here means "nothing to show for THIS thread," never "the read path
+    /// is broken." (A broken path would be `Empty` for a blocked own-thread
+    /// too; that is exactly what `read_kernel_stack_live_own_thread_never_empty`
+    /// guards against.)
+    Empty,
+}
+
+/// Parse the passive kernel call chain text from `/proc/<tid>/stack`.
+///
+/// Pure function — no I/O — so the exact line grammar the formatter
+/// depends on is unit-testable against captured `/proc` samples without
+/// needing a D-state thread or `CAP_SYS_ADMIN`. Given input like:
+///
+/// ```text
+/// [<0>] folio_wait_bit_common+0x1b4/0x420
+/// [<0>] __x64_sys_pwrite64+0x91/0xc0
+/// [<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+/// ```
+///
+/// it returns one [`KernelFrame`] per non-blank line. Blank lines and a
+/// bare `0` (the wchan-style "no chain" sentinel some kernels emit for a
+/// running thread) are skipped. A line that does not match the
+/// `[<addr>] sym+off/size` shape is preserved verbatim as a frame with
+/// `symbol` = the trimmed line and `offset`/`size` = `None`, so an
+/// unexpected kernel format degrades to "show the raw line" rather than
+/// silently dropping a frame.
+pub(crate) fn parse_kernel_stack(raw: &str) -> Vec<KernelFrame> {
+    let mut frames = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line == "0" {
+            continue;
+        }
+        // Strip an optional leading address token `[<...>]` (may be
+        // `[<0>]` under kptr_restrict, or a real hex address otherwise).
+        let rest = if let Some(stripped) = line.strip_prefix("[<") {
+            stripped
+                .split_once(">]")
+                .map_or(line, |(_addr, tail)| tail.trim())
+        } else {
+            line
+        };
+        if rest.is_empty() {
+            // Line was only an address token with no symbol — preserve
+            // the original line verbatim so nothing is dropped.
+            frames.push(KernelFrame {
+                symbol: line.to_string(),
+                offset: None,
+                size: None,
+            });
+            continue;
+        }
+        // `rest` is now `symbol+0xOFF/0xSIZE`, `symbol+0xOFF`, or bare
+        // `symbol`. Split the symbol from the `+offset[/size]` suffix.
+        let (symbol, offset, size) = match rest.split_once('+') {
+            None => (rest.to_string(), None, None),
+            Some((sym, suffix)) => {
+                let (off_str, size_str) = match suffix.split_once('/') {
+                    Some((o, s)) => (o, Some(s)),
+                    None => (suffix, None),
+                };
+                let offset = parse_hex_or_dec(off_str.trim());
+                let size = size_str.and_then(|s| parse_hex_or_dec(s.trim()));
+                (sym.to_string(), offset, size)
+            }
+        };
+        frames.push(KernelFrame {
+            symbol,
+            offset,
+            size,
+        });
+    }
+    frames
+}
+
+/// Parse a `0x`-prefixed hex or plain-decimal integer token, returning
+/// `None` on any parse failure (so a malformed offset degrades to
+/// "offset unknown" rather than dropping the whole frame).
+fn parse_hex_or_dec(token: &str) -> Option<u64> {
+    token.strip_prefix("0x").map_or_else(
+        || token.parse::<u64>().ok(),
+        |hex| u64::from_str_radix(hex, 16).ok(),
+    )
+}
+
+/// Classify the outcome of a `std::fs::read_to_string` on
+/// `/proc/<tid>/stack` into a [`KernelStackResult`].
+///
+/// Pure mapping from `io::Result<String>` so the EPERM-vs-empty
+/// graceful-degradation branch is unit-testable without a real `/proc`
+/// read. `EPERM`/`EACCES` ⇒ `PermissionDenied` (drives the once-per-dump
+/// missing-`CAP_SYS_ADMIN` warning); a successful read that parses to
+/// zero frames ⇒ `Empty`; any other I/O error (e.g. `ESRCH` — the thread
+/// exited) ⇒ `Empty` (benign, not a capability problem).
+pub(crate) fn classify_kernel_stack_read(
+    read: std::io::Result<String>,
+) -> KernelStackResult {
+    match read {
+        Ok(raw) => {
+            let frames = parse_kernel_stack(&raw);
+            if frames.is_empty() {
+                KernelStackResult::Empty
+            } else {
+                KernelStackResult::Frames(frames)
+            }
+        }
+        Err(err) => match err.raw_os_error() {
+            Some(libc::EPERM) | Some(libc::EACCES) => KernelStackResult::PermissionDenied,
+            // ENOENT/ESRCH (thread exited) or any other error is benign
+            // for our purposes — there is simply no kernel chain to show.
+            _ => KernelStackResult::Empty,
+        },
+    }
+}
+
+/// Read and classify a single thread's passive kernel call chain.
+///
+/// Thin wrapper pairing [`std::fs::read_to_string`] with
+/// [`classify_kernel_stack_read`]. Isolated so the formatter path is a
+/// single call and the (pure) classification is separately testable.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_kernel_stack(tid: u32) -> KernelStackResult {
+    let path = format!("/proc/self/task/{tid}/stack");
+    classify_kernel_stack_read(std::fs::read_to_string(path))
+}
+
+/// Outcome of running an external diagnostic subprocess under a HARD
+/// wall-clock deadline.
+///
+/// The eu-stack no-timeout hang (a `std::process::Command` child that
+/// never returns wedging the dumper indefinitely) is a real prior
+/// incident; every subprocess on the dump path MUST be bounded. This
+/// enum makes the three outcomes explicit so the caller can annotate the
+/// dump output (frames captured / timed out and killed / spawn failed)
+/// rather than silently hanging or silently dropping.
+#[derive(Debug)]
+pub(crate) enum CommandOutcome {
+    /// The child exited on its own before the deadline. `stdout` is the
+    /// captured standard output (the backtrace text for eu-stack).
+    Completed { stdout: String },
+    /// The child did not exit before the deadline and was killed. The
+    /// dumper continues; it does NOT hang.
+    TimedOut,
+    /// The child could not be spawned or waited on (binary missing,
+    /// EAGAIN, etc.), OR the watchdog thread that enforces the deadline
+    /// could not be spawned — in which case the child is killed rather
+    /// than run unbounded. Non-fatal — the dump proceeds without this source.
+    SpawnFailed { error: String },
+}
+
+/// Run `command` to completion under a HARD `timeout`, killing the child
+/// if it overruns. Returns a [`CommandOutcome`]; never blocks longer than
+/// `timeout` plus a bounded reap window.
+///
+/// **Why a watchdog thread and not `wait_timeout` / `tokio::process`.**
+/// The dumper runs on a plain OS thread (see [`spawn_dump_thread`]) so it
+/// works when the tokio runtime is wedged — it must not depend on a
+/// tokio reactor. `std::process::Child` has no std timed-wait, so we
+/// spawn a short-lived watchdog thread that `kill`s the child once the
+/// deadline passes; the main thread then `wait`s (which now returns
+/// promptly because the child was signalled). This is the plain-OS-thread
+/// analog of a kill-on-timeout wrapper.
+///
+/// The child is spawned in its own process group (`setsid`) and the
+/// watchdog sends `SIGKILL` to the whole group, so a child that itself
+/// forked helpers cannot outlive the deadline.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_command_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> CommandOutcome {
+    use std::os::unix::process::CommandExt as _;
+    use std::sync::atomic::AtomicBool;
+
+    // Put the child in its own session/process-group so the watchdog can
+    // kill the whole group (eu-stack does not fork, but this is
+    // defense-in-depth against any diagnostic tool that does).
+    //
+    // SAFETY: `setsid()` is async-signal-safe and valid to call in the
+    // pre-exec hook; it takes no arguments and only affects the child.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    command.stdin(std::process::Stdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            return CommandOutcome::SpawnFailed {
+                error: err.to_string(),
+            };
+        }
+    };
+    let pid = child.id() as libc::pid_t;
+
+    // Take stdout BEFORE the watchdog can kill the child so we can read
+    // whatever it produced up to the deadline.
+    let mut stdout_pipe = child.stdout.take();
+
+    // Watchdog: after `timeout`, SIGKILL the child's process group.
+    // `killed` lets the watchdog record that it fired so the caller can
+    // distinguish a natural exit from a killed one. The watchdog polls a
+    // "done" flag so it exits promptly when the child finishes early
+    // (rather than always sleeping the full timeout).
+    let done = Arc::new(AtomicBool::new(false));
+    let killed = Arc::new(AtomicBool::new(false));
+    let done_wd = done.clone();
+    let killed_wd = killed.clone();
+    let watchdog = std::thread::Builder::new()
+        .name("eu-stack-watchdog".to_string())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + timeout;
+            // Poll in small slices so an early-finishing child lets the
+            // watchdog return quickly (bounded ~50ms after `done`).
+            let poll = Duration::from_millis(50);
+            while std::time::Instant::now() < deadline {
+                if done_wd.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(poll);
+            }
+            if done_wd.load(Ordering::Acquire) {
+                return;
+            }
+            // Deadline passed and the child is still running: SIGKILL the
+            // whole process group (negative pid targets the group).
+            killed_wd.store(true, Ordering::Release);
+            // SAFETY: `kill` with a negative pid signals the process
+            // group led by `pid`. SIGKILL cannot be caught/ignored, so
+            // the child cannot escape the deadline.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        });
+
+    // If the watchdog thread could not be spawned (EAGAIN/ENOMEM under
+    // pressure), there is NOTHING to enforce the deadline: a subsequent
+    // blocking `read_to_string` + `wait()` on an overrunning child would
+    // hang forever — the exact eu-stack no-timeout hang this primitive
+    // exists to prevent. So rather than proceed unbounded, kill the child
+    // we just spawned and report SpawnFailed (the dump then notes it and
+    // continues, no hang). Disabling the timeout is never acceptable.
+    let watchdog = match watchdog {
+        Ok(handle) => handle,
+        Err(err) => {
+            // SAFETY: `kill` with a negative pid signals the child's own
+            // process group (it is in its own session via `setsid`); the
+            // child is freshly spawned and not yet reaped.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return CommandOutcome::SpawnFailed {
+                error: format!("watchdog thread spawn failed: {err}"),
+            };
+        }
+    };
+
+    // Read the child's stdout to EOF. If the watchdog kills the child,
+    // the pipe closes and the read returns what was buffered.
+    // UNBOUNDED-OK: not a network path. The producer is a trusted local
+    // diagnostic tool (eu-stack) whose output is bounded by the process's
+    // thread count × frames-per-thread (a few hundred KB), and it is
+    // hard-killed by the watchdog at the deadline — the read cannot grow
+    // without bound because the child cannot run past the deadline.
+    let mut stdout = String::new();
+    if let Some(pipe) = stdout_pipe.as_mut() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+
+    // Signal the watchdog to stand down BEFORE reaping the child. Setting
+    // `done` here (the child's stdout has closed → it has exited or been
+    // killed) closes the PID/PGID-recycle window: once the watchdog
+    // observes `done` it will not fire, so the post-loop `kill(-pid)`
+    // cannot land on a recycled process group after `child.wait()` frees
+    // the pid. An overrunning child is unaffected — for it `read_to_string`
+    // only returns AFTER the watchdog's SIGKILL closes the pipe, so the
+    // kill still happens.
+    done.store(true, Ordering::Release);
+    // Reap the child (returns promptly: it has either exited naturally or
+    // been SIGKILLed by the watchdog).
+    let _ = child.wait();
+    let _ = watchdog.join();
+
+    if killed.load(Ordering::Acquire) {
+        CommandOutcome::TimedOut
+    } else {
+        CommandOutcome::Completed { stdout }
+    }
+}
+
 /// Dump all thread stacks to `/tmp/nativelink-stall-<timestamp>.txt`.
 ///
 /// On Linux, reads `/proc/self/task/` to enumerate threads, collects
@@ -1550,6 +1897,66 @@ fn dump_thread_stacks_linux(label: &str) {
     let bt_map: std::collections::HashMap<u32, &signal_dumper::ThreadBacktrace> =
         backtraces.iter().map(|bt| (bt.tid, bt)).collect();
 
+    // Phase 2b: Passive KERNEL call-chain capture from /proc/<tid>/stack.
+    //
+    // This is the passive primary that survives BOTH failure modes the
+    // cooperative path suffers, because it never sends a signal and never
+    // touches DUMP_IN_PROGRESS:
+    //   (1) COLLISION (operative cause of the 2026-07-08 `0/240`): a second
+    //       concurrent dump makes `capture_all_backtraces` early-return
+    //       `Vec::new()` (the DUMP_IN_PROGRESS swap-guard below), so the
+    //       cooperative count is 0 even though most threads were RUNNABLE.
+    //       The 2026-07-08 dump was this: 168/240 threads were R/S (would
+    //       have answered SIGRTMIN+1 in ms) and capture took 35ms — far
+    //       below the 5s cooperative wait — i.e. no signal was sent at all.
+    //   (2) D-STATE (real but SECONDARY, applies to the 61 blocked threads):
+    //       a `TASK_UNINTERRUPTIBLE` thread (e.g. wedged in `folio_wait`)
+    //       can never run the SIGRTMIN+1 handler, so it is dark to the
+    //       cooperative path even absent a collision.
+    // This passive read runs on the FULL tid list regardless of a collision
+    // (dump_thread_stacks_linux is not itself DUMP_IN_PROGRESS-guarded) and
+    // is readable for a D-state thread, so it captures frames in both cases.
+    // The kernel call chain that put the thread into D-state is always
+    // readable from /proc (given CAP_SYS_ADMIN) and names the actual syscall
+    // (write / page-fault / mmap / ZFS).
+    //
+    // Reading /proc/<tid>/stack requires CAP_SYS_ADMIN. If the process
+    // lacks it every read returns EPERM/EACCES (empirically EACCES for an
+    // owner-self-read on the deploy kernel); we degrade to wchan-only and
+    // warn ONCE (not once-per-thread) so the operator knows to grant the
+    // cap via the systemd unit. Missing frames never fail the dump.
+    // CAPPED AT tids.len() (≤ live thread count, ~240 in prod): one entry
+    // per enumerated thread, each holding that thread's parsed kernel
+    // frames. Not a network path — this is a bounded, one-shot diagnostic
+    // buffer built once per dump and dropped when the dump is written.
+    let mut kernel_stacks: std::collections::HashMap<u32, Vec<KernelFrame>> =
+        std::collections::HashMap::with_capacity(tids.len());
+    let mut kernel_perm_denied = false;
+    for &tid in &tids {
+        match read_kernel_stack(tid) {
+            KernelStackResult::Frames(frames) => {
+                kernel_stacks.insert(tid, frames);
+            }
+            KernelStackResult::PermissionDenied => {
+                kernel_perm_denied = true;
+            }
+            KernelStackResult::Empty => {}
+        }
+    }
+    let kernel_stack_count = kernel_stacks.len();
+    if kernel_perm_denied {
+        // One structured warning per dump (not per thread). CAP_SYS_ADMIN
+        // is the cap /proc/<tid>/stack needs; CAP_SYS_PTRACE (which we
+        // already hold) is NOT sufficient for it.
+        tracing::warn!(
+            target: "nativelink_util::stall_detector",
+            "kernel-stack capture degraded: /proc/<tid>/stack returned EPERM/EACCES — \
+             process lacks CAP_SYS_ADMIN. D-state threads will show wchan only, \
+             no kernel call chain. Grant AmbientCapabilities=CAP_SYS_ADMIN in the \
+             systemd unit (see deployment-examples/rhel/nativelink-cap-sys-admin.conf)."
+        );
+    }
+
     // Phase 3: Format combined output (kernel info + userspace backtrace).
     for &tid in &tids {
         let tid_str = tid.to_string();
@@ -1579,13 +1986,25 @@ fn dump_thread_stacks_linux(label: &str) {
                 }
             }
         }
-        // Kernel stack
-        if let Ok(stack) = std::fs::read_to_string(format!("{base}/stack")) {
-            let trimmed = stack.trim();
-            if !trimmed.is_empty() {
-                let _ = writeln!(output, "  kernel stack:");
-                for line in trimmed.lines() {
-                    let _ = writeln!(output, "    {line}");
+        // Kernel call chain (D-state-proof). Parsed into structured
+        // frames so the syscall path is legible; `+off/size` preserved.
+        if let Some(frames) = kernel_stacks.get(&tid) {
+            let _ = writeln!(output, "  kernel stack:");
+            for (i, frame) in frames.iter().enumerate() {
+                match (frame.offset, frame.size) {
+                    (Some(off), Some(size)) => {
+                        let _ = writeln!(
+                            output,
+                            "    #{i:>3} {}+{off:#x}/{size:#x}",
+                            frame.symbol
+                        );
+                    }
+                    (Some(off), None) => {
+                        let _ = writeln!(output, "    #{i:>3} {}+{off:#x}", frame.symbol);
+                    }
+                    _ => {
+                        let _ = writeln!(output, "    #{i:>3} {}", frame.symbol);
+                    }
                 }
             }
         }
@@ -1624,23 +2043,133 @@ fn dump_thread_stacks_linux(label: &str) {
         let _ = writeln!(output);
     }
 
+    // Phase 4 (opt-in): external ptrace-based userspace unwind via
+    // eu-stack for threads the cooperative path could not reach.
+    //
+    // eu-stack is ptrace-based, so it works on D-state threads and needs
+    // only CAP_SYS_PTRACE (which we already hold) — NOT CAP_SYS_ADMIN.
+    // It is DEFAULT-OFF (gated on `NL_DUMP_EU_STACK=1`) because it
+    // ptrace-STOPs every thread in the process for the duration of the
+    // unwind; that whole-process suspend is the same hazard that got the
+    // macOS `sample(1)` path removed (commit f6779f3a). The kernel call
+    // chain above is the always-on primary that already identifies the
+    // wedged syscall; eu-stack is an operator escalation for when the
+    // userspace frames of a D-state thread are also needed. When enabled
+    // it runs under a HARD timeout (the eu-stack no-timeout hang is a
+    // prior incident) and its output is appended verbatim.
+    //
+    // NOTE — the HARD timeout does NOT defend the eu-stack SELF-SUSPEND
+    // variant. eu-stack `-p <pid>` ptrace-STOPs EVERY thread of this
+    // process, INCLUDING the watchdog thread that is supposed to enforce
+    // the deadline. If the watchdog is itself stopped, it cannot fire
+    // `kill(-pid)` at the deadline — the exact whole-process-suspend
+    // feedback shape that got macOS `sample(1)` removed in f6779f3a. The
+    // watchdog guards a passively-hung child (run_command_with_timeout);
+    // it CANNOT guard against eu-stack freezing its own watchdog. The real
+    // guard for that variant is this DEFAULT-OFF gate: the hazard exists
+    // only on explicit operator opt-in, and the always-on kernel-stack
+    // primary already delivers the D-state syscall diagnostic without it.
+    if std::env::var_os("NL_DUMP_EU_STACK").is_some_and(|v| v == "1") {
+        append_eu_stack_section(&mut output);
+    }
+
     let total_elapsed = start.elapsed();
     let responded = backtraces.iter().filter(|bt| !bt.symbols.is_empty()).count();
+    // Report cooperative-userspace AND kernel-stack coverage separately.
+    // The old summary counted only cooperative responses, so a wedge that
+    // captured every thread's kernel chain but zero userspace frames
+    // (D-state fleet) read as a total-failure `0/N` — the exact 2026-07-08
+    // dump. Kernel coverage makes the successful passive capture visible.
     let _ = writeln!(
         output,
-        "=== Dump complete: {responded}/{} threads responded, capture: {capture_elapsed:.1?}, total: {total_elapsed:.1?} ===",
-        tids.len()
+        "=== Dump complete: {responded}/{} threads userspace-responded, \
+         {kernel_stack_count}/{} kernel-stacks captured, capture: {capture_elapsed:.1?}, \
+         total: {total_elapsed:.1?} ===",
+        tids.len(),
+        tids.len(),
     );
 
     match write_dump_owner_only(&path, &output) {
         Ok(()) => eprintln!(
-            "Thread dump written to {path} ({responded}/{} threads, {total_elapsed:.1?})",
-            tids.len()
+            "Thread dump written to {path} ({responded}/{} userspace, \
+             {kernel_stack_count}/{} kernel, {total_elapsed:.1?})",
+            tids.len(),
+            tids.len(),
         ),
         Err(err) => eprintln!("Failed to write thread dump to {path}: {err}"),
     }
 
     cleanup_old_stall_dumps();
+}
+
+/// Append an eu-stack (ptrace-based) userspace unwind of the whole
+/// process to `output`, under a HARD timeout.
+///
+/// Split out of [`dump_thread_stacks_linux`] so the timeout-bounded
+/// subprocess invocation is a single, reviewable unit. eu-stack dumps
+/// EVERY thread of the target PID in one call (`-p <pid>`), so a single
+/// invocation covers all threads the cooperative path missed. The child
+/// is bounded by [`run_command_with_timeout`]; on timeout it is killed
+/// and the dump notes the timeout rather than hanging.
+#[cfg(target_os = "linux")]
+fn append_eu_stack_section(output: &mut String) {
+    use std::fmt::Write as _;
+
+    // Hard wall-clock budget for the external unwind. eu-stack on a
+    // few-hundred-thread process typically completes in a few seconds; a
+    // wedge can make it slower, so we cap it. This is the fix for the
+    // known "eu-stack no-timeout subprocess hang" incident.
+    const EU_STACK_TIMEOUT: Duration = Duration::from_secs(20);
+    const EU_STACK_BIN: &str = "/usr/bin/eu-stack";
+
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "=== eu-stack external unwind (NL_DUMP_EU_STACK=1) ==="
+    );
+
+    if !std::path::Path::new(EU_STACK_BIN).exists() {
+        let _ = writeln!(
+            output,
+            "  {EU_STACK_BIN} not present — skipping external unwind"
+        );
+        return;
+    }
+
+    let pid = std::process::id();
+    let mut cmd = std::process::Command::new(EU_STACK_BIN);
+    // `-p PID` dumps all threads; `-i` adds inlined frames + demangling
+    // best-effort. Keep it simple: raw eu-stack output appended verbatim.
+    cmd.arg("-p").arg(pid.to_string());
+
+    let start = std::time::Instant::now();
+    match run_command_with_timeout(cmd, EU_STACK_TIMEOUT) {
+        CommandOutcome::Completed { stdout } => {
+            let _ = writeln!(
+                output,
+                "  eu-stack completed in {:.1?}",
+                start.elapsed()
+            );
+            for line in stdout.lines() {
+                let _ = writeln!(output, "  {line}");
+            }
+        }
+        CommandOutcome::TimedOut => {
+            let _ = writeln!(
+                output,
+                "  eu-stack exceeded {EU_STACK_TIMEOUT:?} hard timeout — killed \
+                 (dump continued; no hang)"
+            );
+            tracing::warn!(
+                target: "nativelink_util::stall_detector",
+                timeout_secs = EU_STACK_TIMEOUT.as_secs(),
+                "eu-stack external unwind exceeded hard timeout and was killed"
+            );
+        }
+        CommandOutcome::SpawnFailed { error } => {
+            let _ = writeln!(output, "  eu-stack could not be spawned: {error}");
+        }
+    }
 }
 
 /// Dump thread info on macOS using Mach APIs, `pthread_kill(SIGUSR2)`, and
@@ -2101,12 +2630,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        DEFAULT_STALL_THRESHOLD, LAST_DUMP_EPOCH, LAST_FORCE_DUMP_EPOCH,
-        MIN_DUMP_INTERVAL_SECS, MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict,
-        TEST_DUMPS_FIRED, TEST_RATE_LIMITED_HITS, bump_progress_handle, classify_stall,
-        force_dump_should_proceed, force_dump_thread_stacks, rearm_loop_dump_should_proceed,
+        DEFAULT_STALL_THRESHOLD, KernelFrame, KernelStackResult, LAST_DUMP_EPOCH,
+        LAST_FORCE_DUMP_EPOCH, MIN_DUMP_INTERVAL_SECS, MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard,
+        StallVerdict, TEST_DUMPS_FIRED, TEST_RATE_LIMITED_HITS, bump_progress_handle,
+        classify_kernel_stack_read, classify_stall, force_dump_should_proceed,
+        force_dump_thread_stacks, parse_kernel_stack, rearm_loop_dump_should_proceed,
         spawn_dump_thread,
     };
+    #[cfg(target_os = "linux")]
+    use super::read_kernel_stack;
 
     /// Serialize tests that read or assert on the process-global
     /// `TEST_DUMPS_FIRED` / `TEST_RATE_LIMITED_HITS` / `LAST_DUMP_EPOCH`
@@ -3339,6 +3871,376 @@ mod tests {
             "spawn_dump_thread must not increase tokio blocking thread count — \
              std::thread::Builder::spawn must be used, not spawn_blocking; \
              before={blocking_before} during={blocking_during}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Kernel-stack capture (D-state-proof primary).
+    //
+    // Spec under test (2026-07-08 `0/240 responded` no-diagnostic dump):
+    // a `TASK_UNINTERRUPTIBLE` thread cannot run the cooperative
+    // SIGRTMIN+1 handler, so the ONLY signal that names its wedged
+    // syscall is the passive kernel call chain in /proc/<tid>/stack.
+    // These tests pin the parser (feed captured /proc samples → frames)
+    // and the EPERM-vs-empty graceful-degradation classifier, neither of
+    // which needs a real D-state thread or CAP_SYS_ADMIN to exercise.
+    // -------------------------------------------------------------
+
+    /// Real captured sample from a live worker's main thread
+    /// (`/proc/<pid>/task/<tid>/stack`, futex path). Format is
+    /// `[<0>] symbol+0xOFFSET/0xSIZE` per frame.
+    const KERNEL_STACK_FUTEX_SAMPLE: &str = "\
+[<0>] futex_do_wait+0x4e/0x80
+[<0>] __futex_wait+0xc0/0x120
+[<0>] futex_wait+0xbc/0x160
+[<0>] do_futex+0xc5/0x190
+[<0>] __x64_sys_futex+0x12a/0x220
+[<0>] do_syscall_64+0x83/0x820
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+";
+
+    /// A synthesized D-state (folio_wait / page writeback) sample — the
+    /// exact regime the cooperative dumper cannot reach. This is what the
+    /// kernel chain looks like for a thread blocked in ZFS/page-fault
+    /// write-back; the whole point of the fix is to surface THIS.
+    const KERNEL_STACK_FOLIO_WAIT_SAMPLE: &str = "\
+[<0>] folio_wait_bit_common+0x1b4/0x420
+[<0>] folio_wait_writeback+0x28/0x80
+[<0>] __x64_sys_pwrite64+0x91/0xc0
+[<0>] do_syscall_64+0x83/0x820
+[<0>] entry_SYSCALL_64_after_hwframe+0x76/0x7e
+";
+
+    /// Spec: the parser splits each `[<addr>] sym+0xOFF/0xSIZE` line into
+    /// a structured [`KernelFrame`] carrying the symbol, byte offset, and
+    /// function size. This is the frame grammar the dump formatter relies
+    /// on; a regression here would silently corrupt the one signal a
+    /// D-state thread can give.
+    ///
+    /// Mutation: make `parse_kernel_stack` return `Vec::new()` (drop all
+    /// frames). Test red-fails with the bespoke
+    /// "kernel-stack parser dropped frames — D-state diagnostic lost" message.
+    #[test]
+    fn parse_kernel_stack_extracts_symbol_offset_size() {
+        let frames = parse_kernel_stack(KERNEL_STACK_FUTEX_SAMPLE);
+        assert_eq!(
+            frames.len(),
+            7,
+            "kernel-stack parser dropped frames — D-state diagnostic lost. \
+             Expected 7 frames from the futex sample, got {}: {frames:?}",
+            frames.len(),
+        );
+        assert_eq!(
+            frames[0],
+            KernelFrame {
+                symbol: "futex_do_wait".to_string(),
+                offset: Some(0x4e),
+                size: Some(0x80),
+            },
+            "first frame must parse symbol/offset/size from \
+             `[<0>] futex_do_wait+0x4e/0x80`",
+        );
+        // The syscall entry frame is the load-bearing one: it names the
+        // syscall the thread is wedged in.
+        assert_eq!(frames[4].symbol, "__x64_sys_futex");
+        assert_eq!(frames[4].offset, Some(0x12a));
+        assert_eq!(frames[4].size, Some(0x220));
+        assert_eq!(frames[6].symbol, "entry_SYSCALL_64_after_hwframe");
+    }
+
+    /// Spec: the folio_wait (D-state write-back) chain — the regime the
+    /// cooperative path can never capture — parses to a chain whose
+    /// syscall frame identifies the operation (`pwrite64`). This is the
+    /// concrete "identify write vs page-fault vs mmap vs ZFS" goal.
+    #[test]
+    fn parse_kernel_stack_identifies_dstate_syscall() {
+        let frames = parse_kernel_stack(KERNEL_STACK_FOLIO_WAIT_SAMPLE);
+        assert_eq!(frames.len(), 5, "expected 5 frames, got {}", frames.len());
+        assert_eq!(
+            frames[0].symbol, "folio_wait_bit_common",
+            "top frame must be the folio-wait the thread is blocked in",
+        );
+        assert!(
+            frames.iter().any(|f| f.symbol == "__x64_sys_pwrite64"),
+            "the D-state chain MUST surface the wedged syscall \
+             (__x64_sys_pwrite64) so a write-vs-mmap-vs-fault wedge is \
+             distinguishable — this is exactly what the 0/240 dump lacked. \
+             Frames: {frames:?}",
+        );
+    }
+
+    /// Spec: robustness — blank lines and the bare `0` sentinel (emitted
+    /// for a running thread with no blocked chain) are skipped, and a
+    /// line that does not match the `sym+off/size` shape is preserved
+    /// verbatim rather than dropped (so an unexpected kernel format
+    /// degrades to "show the raw line").
+    #[test]
+    fn parse_kernel_stack_handles_edge_shapes() {
+        assert!(
+            parse_kernel_stack("").is_empty(),
+            "empty input → no frames",
+        );
+        assert!(
+            parse_kernel_stack("0\n").is_empty(),
+            "bare `0` sentinel (running thread) → no frames",
+        );
+        // Offset without size.
+        let f = parse_kernel_stack("[<0>] some_fn+0x10\n");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].symbol, "some_fn");
+        assert_eq!(f[0].offset, Some(0x10));
+        assert_eq!(f[0].size, None);
+        // Symbol with no offset at all.
+        let f = parse_kernel_stack("[<0>] bare_symbol\n");
+        assert_eq!(f[0].symbol, "bare_symbol");
+        assert_eq!(f[0].offset, None);
+        // A line with no recognizable address token is kept verbatim.
+        let f = parse_kernel_stack("totally unexpected line\n");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].symbol, "totally unexpected line");
+    }
+
+    /// Spec (graceful degradation): a successful read that parses to
+    /// frames ⇒ `Frames`; an `EPERM` (missing CAP_SYS_ADMIN) ⇒
+    /// `PermissionDenied` (the branch that drives the once-per-dump
+    /// warning + wchan-only fallback); a successful-but-empty read or a
+    /// benign `ESRCH`/`ENOENT` (thread exited) ⇒ `Empty`. The dump MUST
+    /// NEVER panic or fail on a missing cap.
+    ///
+    /// Mutation: collapse the `EPERM => PermissionDenied` arm into the
+    /// catch-all `_ => Empty`. Test red-fails with the bespoke
+    /// "EPERM must map to PermissionDenied — missing-cap warning would
+    /// never fire" message, because the operator would then get no signal
+    /// that CAP_SYS_ADMIN is absent.
+    #[test]
+    fn classify_kernel_stack_read_maps_eperm_to_permission_denied() {
+        // Success with frames.
+        let ok = Ok(KERNEL_STACK_FUTEX_SAMPLE.to_string());
+        match classify_kernel_stack_read(ok) {
+            KernelStackResult::Frames(frames) => {
+                assert_eq!(frames.len(), 7);
+            }
+            other => panic!("expected Frames for a valid read, got {other:?}"),
+        }
+
+        // EPERM → PermissionDenied (the load-bearing degradation branch).
+        let eperm = Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        assert_eq!(
+            classify_kernel_stack_read(eperm),
+            KernelStackResult::PermissionDenied,
+            "EPERM must map to PermissionDenied — missing-cap warning would \
+             never fire, and the operator would never learn CAP_SYS_ADMIN is \
+             absent (the exact condition that produced the 0/240 dump).",
+        );
+
+        // EACCES also → PermissionDenied (some kernels return EACCES).
+        let eacces = Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert_eq!(
+            classify_kernel_stack_read(eacces),
+            KernelStackResult::PermissionDenied,
+        );
+
+        // Successful-but-empty read → Empty (running thread, no chain).
+        assert_eq!(
+            classify_kernel_stack_read(Ok(String::new())),
+            KernelStackResult::Empty,
+            "empty read must be Empty, not PermissionDenied",
+        );
+        // ESRCH (thread exited between enumeration and read) → Empty,
+        // NOT PermissionDenied — this is benign and must not raise the
+        // missing-cap alarm.
+        let esrch = Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        assert_eq!(
+            classify_kernel_stack_read(esrch),
+            KernelStackResult::Empty,
+            "ESRCH (thread exited) must be Empty, not PermissionDenied",
+        );
+    }
+
+    /// Spec (live-read path-format GUARD): `read_kernel_stack` is the only
+    /// piece the pure-parser/pure-classifier tests do NOT cover — its sole
+    /// remaining logic is the `format!("/proc/self/task/{tid}/stack")` path
+    /// string. A typo there makes EVERY read miss the real pseudo-file and
+    /// return ENOENT, which `classify_kernel_stack_read` maps to `Empty` —
+    /// silently degrading the dumper to the exact `0/N` no-diagnostic state
+    /// this commit fixes, now MASKED as "no frames captured" with no warning.
+    ///
+    /// So this test reads a REAL live thread's OWN kernel stack and asserts
+    /// the result is `Frames` OR `PermissionDenied` but NEVER `Empty`:
+    ///   * Correct path + CAP_SYS_ADMIN (deploy box)  → `Frames` (real chain).
+    ///   * Correct path WITHOUT the cap (CI / dev box) → `PermissionDenied`:
+    ///     the kernel's proc_pid_stack CAP_SYS_ADMIN gate returns EACCES, and
+    ///     that gate fires FIRST — before the "no saved stack" ENOENT branch —
+    ///     so a correct path yields EACCES regardless of the target's run
+    ///     state (verified empirically on the deploy kernel 6.18: own-thread
+    ///     self-read with zero caps → EACCES=13). PermissionDenied itself
+    ///     PROVES the kernel FOUND the pseudo-file and applied the cap gate ⇒
+    ///     the path format is correct.
+    ///   * WRONG path (typo)                           → ENOENT → `Empty`
+    ///     (verified: a `/proc/self/task/<tid>/stackXYZ` open → ENOENT=2),
+    ///     which this assertion forbids — so a path-string regression is caught
+    ///     on ANY box, capability or not.
+    ///
+    /// The target thread is deliberately PARKED (blocked off-CPU on a channel
+    /// recv → futex) before the read: on a with-cap box a *running* thread read
+    /// cross-CPU can legitimately return ENOENT/`Empty` (no saved stack), so we
+    /// read a blocked thread whose kernel chain is always present. We poll the
+    /// read until it is non-`Empty` under a hard wall-clock deadline (this is a
+    /// liveness-bounded retry on the actual kernel-observable, NOT
+    /// sleep-as-synchronization — it fails loudly if the blocked chain never
+    /// materializes) to absorb the microscopic window between the thread
+    /// publishing its TID and the scheduler moving it off-CPU into the wait.
+    ///
+    /// Mutation: typo the path string in `read_kernel_stack` (e.g.
+    /// `/proc/self/task/{tid}/stackX`). Every read then returns ENOENT →
+    /// `Empty`; this test red-fails with the bespoke "read_kernel_stack
+    /// returned Empty for a live parked own-thread — path-format string is
+    /// wrong (the exact 0/N this commit fixes)".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_kernel_stack_live_own_thread_never_empty() {
+        use std::sync::mpsc;
+
+        // Channel 1: parked thread publishes its OS TID. Channel 2: main
+        // releases it after the read (its `recv` is the off-CPU park point).
+        let (tid_tx, tid_rx) = mpsc::channel::<u32>();
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+
+        let handle = std::thread::Builder::new()
+            .name("kstack-guard-parked".to_string())
+            .spawn(move || {
+                // SAFETY: SYS_gettid always succeeds and returns this
+                // thread's OS TID (matches the production dumper at
+                // stall_detector.rs:1102-1103).
+                let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                tid_tx.send(my_tid).expect("publish parked TID to main");
+                // Block off-CPU in a futex until the test releases us.
+                let _ = wake_rx.recv();
+            })
+            .expect("spawn parked guard thread");
+
+        let parked_tid = tid_rx
+            .recv()
+            .expect("parked thread must publish its TID");
+
+        // Poll the live read until it reflects a settled (non-Empty) state,
+        // bounded by a hard deadline. On a no-cap box the first read is
+        // already PermissionDenied (cap gate is run-state-independent); on a
+        // with-cap box we wait for the thread to be off-CPU so its blocked
+        // chain is present. A path typo makes this ALWAYS Empty, so the loop
+        // exhausts the deadline and the bespoke panic fires.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut result = read_kernel_stack(parked_tid);
+        while matches!(result, KernelStackResult::Empty)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+            result = read_kernel_stack(parked_tid);
+        }
+
+        // Release the parked thread BEFORE asserting so a failed assertion
+        // still joins cleanly (no leaked blocked thread).
+        let _ = wake_tx.send(());
+        handle.join().expect("join parked guard thread");
+
+        assert!(
+            matches!(
+                result,
+                KernelStackResult::Frames(_) | KernelStackResult::PermissionDenied
+            ),
+            "read_kernel_stack returned Empty for a live parked own-thread — \
+             path-format string is wrong (the exact 0/N this commit fixes). A \
+             correct /proc/self/task/<tid>/stack read of a blocked own-thread \
+             is Frames (with CAP_SYS_ADMIN) or PermissionDenied (without it, \
+             because the kernel's cap gate returns EACCES before checking for a \
+             saved stack); only a mistyped path returns ENOENT → Empty. \
+             Got: {result:?}",
+        );
+    }
+
+    // -------------------------------------------------------------
+    // eu-stack subprocess HARD-timeout wrapper.
+    //
+    // Spec (the "eu-stack no-timeout subprocess hang" incident): any
+    // external unwind child MUST be bounded — a child that runs past the
+    // deadline is killed, and the dumper continues rather than hanging.
+    // The dumper runs on a plain OS thread (no tokio), so the wrapper
+    // uses a watchdog thread + SIGKILL, not tokio::process.
+    // -------------------------------------------------------------
+
+    /// Spec: a child that finishes WELL WITHIN the timeout is reported as
+    /// `Completed` with its stdout captured verbatim. Baseline that the
+    /// happy path works before we test the kill path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_command_with_timeout_captures_fast_child_stdout() {
+        let mut cmd = std::process::Command::new("/bin/echo");
+        cmd.arg("hello-from-child");
+        let outcome = super::run_command_with_timeout(cmd, Duration::from_secs(5));
+        match outcome {
+            super::CommandOutcome::Completed { stdout } => {
+                assert!(
+                    stdout.contains("hello-from-child"),
+                    "fast child stdout must be captured verbatim; got {stdout:?}",
+                );
+            }
+            other => panic!("expected Completed for a fast child, got {other:?}"),
+        }
+    }
+
+    /// Spec: a child that SLEEPS PAST the hard timeout MUST be killed and
+    /// reported as `TimedOut`, and the wrapper MUST return within a
+    /// bounded window (timeout + reap slack) — it MUST NOT hang for the
+    /// child's full sleep. This is the direct regression test for the
+    /// eu-stack no-timeout hang.
+    ///
+    /// We spawn `/bin/sleep 30` with a 1s timeout and assert (a) the
+    /// outcome is `TimedOut` and (b) wall-clock stayed under ~5s (far
+    /// below the child's 30s sleep). If the kill path were removed the
+    /// wrapper would block ~30s and this test would exceed its own
+    /// `timeout` and fail.
+    ///
+    /// Mutation: delete the watchdog's `libc::kill(-pid, SIGKILL)` call.
+    /// Test red-fails: the `child.wait()` blocks for the full 30s sleep,
+    /// the outcome is `Completed` (not `TimedOut`), and the elapsed
+    /// assertion fires with "hard timeout did not kill the overrunning
+    /// child — eu-stack no-timeout hang regression".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_command_with_timeout_kills_overrunning_child() {
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let outcome = super::run_command_with_timeout(cmd, Duration::from_secs(1));
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(outcome, super::CommandOutcome::TimedOut),
+            "hard timeout did not kill the overrunning child — eu-stack \
+             no-timeout hang regression. A `/bin/sleep 30` under a 1s \
+             timeout MUST be killed and reported TimedOut, got {outcome:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "wrapper hung on the overrunning child ({elapsed:?}) — the \
+             watchdog must SIGKILL past the 1s deadline so the dumper never \
+             blocks for the child's full 30s sleep (eu-stack no-timeout \
+             hang regression).",
+        );
+    }
+
+    /// Spec: a missing binary is reported as `SpawnFailed`, not a panic
+    /// or a hang. eu-stack absence must degrade gracefully.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_command_with_timeout_reports_spawn_failure() {
+        let cmd = std::process::Command::new(
+            "/nonexistent/definitely-not-a-real-binary-xyz",
+        );
+        let outcome = super::run_command_with_timeout(cmd, Duration::from_secs(5));
+        assert!(
+            matches!(outcome, super::CommandOutcome::SpawnFailed { .. }),
+            "a missing binary must be SpawnFailed, got {outcome:?}",
         );
     }
 }
