@@ -340,6 +340,15 @@ pub fn warn_if_quic_udp_buffer_capped(buffers: QuicUdpBuffers, label: &str) {
     );
 }
 
+/// The concrete quinn-backed H3 channel a single pool member drives.
+#[cfg(feature = "quic")]
+type H3ChannelConcrete = tonic_h3::H3Channel<tonic_h3::quinn::H3QuinnConnector>;
+
+/// The response type every H3 pool member yields (`H3IncomingClient` body).
+#[cfg(feature = "quic")]
+type H3ChannelResponse =
+    hyper::Response<h3_util::client_body::H3IncomingClient<h3_quinn::RecvStream, bytes::Bytes>>;
+
 /// Clone-able QUIC/HTTP3 channel for gRPC clients.
 ///
 /// `tonic_h3::H3Channel` wraps a `BoxService` internally and doesn't
@@ -348,18 +357,23 @@ pub fn warn_if_quic_udp_buffer_capped(buffers: QuicUdpBuffers, label: &str) {
 /// `poll_ready`/`call` pairs through a background worker task,
 /// properly routing wakers so concurrent callers don't deadlock.
 ///
-/// Type alias for the inner buffered H3 service.
+/// The buffered service wraps a `tower::reconnect::Reconnect<H3ChannelMaker>`
+/// (not a bare `H3Channel`) so a transient quinn timeout self-heals instead
+/// of permanently poisoning the `Buffer`. `Reconnect::poll_ready` never
+/// returns `Err` — a Connected inner `poll_ready` error transparently re-makes
+/// the channel, and a make error is stashed as a per-request error, not a
+/// permanent latch — so the `Buffer` worker only ever sees `Ready(Ok)` from
+/// `poll_ready` and can never poison (FL #6951).
+///
+/// Type alias for the inner buffered H3 service. Its second parameter is the
+/// wrapped service's `Future` — here `Reconnect`'s `ResponseFuture`, which
+/// erases the maker-error side into the request path.
 #[cfg(feature = "quic")]
 type H3BufferedService = tower::buffer::Buffer<
     hyper::Request<tonic::body::Body>,
-    futures::future::BoxFuture<
-        'static,
-        Result<
-            hyper::Response<
-                h3_util::client_body::H3IncomingClient<h3_quinn::RecvStream, bytes::Bytes>,
-            >,
-            tonic_h3::Error,
-        >,
+    tower::reconnect::ResponseFuture<
+        futures::future::BoxFuture<'static, Result<H3ChannelResponse, tonic_h3::Error>>,
+        tower::BoxError,
     >,
 >;
 
@@ -419,6 +433,114 @@ impl tower::Service<hyper::Request<tonic::body::Body>> for QuicChannel {
         // Reset so next poll_ready picks a new channel.
         self.selected = usize::MAX;
         tower::Service::call(&mut self.channels[idx], req)
+    }
+}
+
+/// Build ONE fresh quinn-backed H3 channel: bind a new UDP socket, tune its
+/// send/recv buffers, create the quinn `Endpoint`, and wrap it in an
+/// `H3Channel`. Returns the channel plus the effective UDP buffer sizes so a
+/// pool builder can emit a single cap warning.
+///
+/// This is the exact per-member construction the pool loop used inline; it is
+/// factored out so [`H3ChannelMaker`] (the `tower::reconnect::Reconnect`
+/// factory) can rebuild an identical member after a transient QUIC failure.
+/// Every input is owned/cloned, so the returned channel shares nothing mutable
+/// with its siblings or with prior generations of the same member.
+#[cfg(feature = "quic")]
+fn build_h3_channel_member(
+    client_config: &quinn::ClientConfig,
+    uri: &Uri,
+    server_name: &str,
+    label: &str,
+) -> Result<(H3ChannelConcrete, QuicUdpBuffers), Error> {
+    let udp_socket = std::net::UdpSocket::bind("[::]:0")
+        .map_err(|e| make_err!(Code::Internal, "QUIC client UDP bind ({label}): {e:?}"))?;
+    let bufs = tune_quic_udp_buffers(socket2::SockRef::from(&udp_socket), label);
+
+    let mut client_endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        udp_socket,
+        quinn::default_runtime()
+            .ok_or_else(|| make_err!(Code::Internal, "No async runtime for QUIC client"))?,
+    )
+    .map_err(|e| make_err!(Code::Internal, "Failed to create QUIC client endpoint ({label}): {e:?}"))?;
+    client_endpoint.set_default_client_config(client_config.clone());
+
+    let connector =
+        tonic_h3::quinn::H3QuinnConnector::new(uri.clone(), server_name.to_string(), client_endpoint);
+
+    let h3_channel = tonic_h3::H3Channel::new(connector, uri.clone());
+    Ok((h3_channel, bufs))
+}
+
+/// `tower::Service<()>` factory that builds a fresh [`H3ChannelConcrete`] on
+/// each `call()`, used as the `MakeService` for `tower::reconnect::Reconnect`.
+///
+/// `Reconnect` invokes this maker to (re)establish a pool member's QUIC
+/// connection: on the initial connect it is bypassed (we seed the member via
+/// `Reconnect::with_connection`), and on a transient inner `poll_ready`
+/// failure `Reconnect` drives it to build a NEW connection transparently.
+/// Construction is fully synchronous, so `call()` returns a ready future.
+///
+/// A build failure (e.g. UDP bind failure under fd exhaustion) is surfaced as
+/// the maker's `Error` and becomes a PER-REQUEST error on the next `call()` of
+/// the buffered member — never a permanent poison. The next request re-drives
+/// the maker and retries a fresh build.
+#[cfg(feature = "quic")]
+struct H3ChannelMaker {
+    client_config: quinn::ClientConfig,
+    uri: Uri,
+    server_name: String,
+    /// Distinguishes reconnect generations of ONE member in logs.
+    label: String,
+    /// Monotonic reconnect generation for this member (0 = initial seed is
+    /// external; the first make here is generation 1).
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "quic")]
+impl tower::Service<()> for H3ChannelMaker {
+    type Response = H3ChannelConcrete;
+    type Error = tower::BoxError;
+    type Future = core::future::Ready<Result<H3ChannelConcrete, tower::BoxError>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        // The factory itself is always ready — building is synchronous.
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _target: ()) -> Self::Future {
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let gen_label = format!("{}#reconnect{generation}", self.label);
+        info!(
+            member = %self.label,
+            generation,
+            "tls_utils: rebuilding QUIC pool member after transport failure",
+        );
+        match build_h3_channel_member(&self.client_config, &self.uri, &self.server_name, &gen_label)
+        {
+            Ok((channel, _bufs)) => core::future::ready(Ok(channel)),
+            Err(e) => {
+                warn!(
+                    member = %self.label,
+                    generation,
+                    ?e,
+                    "tls_utils: QUIC pool member rebuild failed; will retry on next request",
+                );
+                // Convert the internal error into a BoxError for the
+                // Reconnect per-request error path (never a poison).
+                core::future::ready(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    e.to_string(),
+                )))
+            }
+        }
     }
 }
 
@@ -554,8 +676,12 @@ pub fn h3_channel(endpoint_config: &GrpcEndpoint, connections: usize) -> Result<
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     // Send QUIC keepalives every 2s to detect dead connections quickly
     // after server restart. Combined with 15s idle timeout, a dead
-    // connection is detected within ~4-6s, triggering H3Connection's
-    // built-in reconnection before the RPC timeout (120s) expires.
+    // connection surfaces a readiness error within ~4-6s. `H3Channel`
+    // itself has NO reconnection — the `tower::reconnect::Reconnect` layer
+    // wrapped around each pool member (see `h3_channel` / `H3ChannelMaker`)
+    // is what transparently rebuilds the connection on that error, well
+    // before the RPC timeout (120s) expires, and prevents the surrounding
+    // `Buffer` from permanently poisoning (FL #6951).
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     // Enable QUIC MTU discovery for jumbo frames. Probe up to 8952
     // bytes (9000 jumbo MTU minus 40 IPv6 + 8 UDP headers). Reduces
@@ -573,35 +699,36 @@ pub fn h3_channel(endpoint_config: &GrpcEndpoint, connections: usize) -> Result<
     let mut pool_buffers: Option<QuicUdpBuffers> = None;
 
     for i in 0..connections {
-        let udp_socket = std::net::UdpSocket::bind("[::]:0")
-            .map_err(|e| make_err!(Code::Internal, "QUIC client UDP bind [{i}]: {e:?}"))?;
         let label = format!("client[{i}]");
-        let bufs = tune_quic_udp_buffers(socket2::SockRef::from(&udp_socket), &label);
+        // Build the INITIAL member eagerly (identical to the prior inline
+        // construction) so the eager UDP-buffer tuning + one-warn-per-pool
+        // diagnostic below is preserved. Only RECONNECTS are lazy.
+        let (initial_channel, bufs) =
+            build_h3_channel_member(&client_config, &uri, &server_name, &label)?;
         if pool_buffers.is_none() {
             pool_buffers = Some(bufs);
         }
 
-        let mut client_endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            udp_socket,
-            quinn::default_runtime()
-                .ok_or_else(|| make_err!(Code::Internal, "No async runtime for QUIC client"))?,
-        )
-        .map_err(|e| make_err!(Code::Internal, "Failed to create QUIC client endpoint [{i}]: {e:?}"))?;
-        client_endpoint.set_default_client_config(client_config.clone());
-
-        let connector = tonic_h3::quinn::H3QuinnConnector::new(
-            uri.clone(),
-            server_name.clone(),
-            client_endpoint,
-        );
-
-        let h3_channel = tonic_h3::H3Channel::new(connector, uri.clone());
+        // Factory that rebuilds THIS member's connection on transient QUIC
+        // failure. Shares the (cheap-to-clone) config/uri/server_name; each
+        // make binds a fresh UDP socket + quinn Endpoint.
+        let maker = H3ChannelMaker {
+            client_config: client_config.clone(),
+            uri: uri.clone(),
+            server_name: server_name.clone(),
+            label,
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        // `Reconnect::with_connection` seeds the member with the eagerly-built
+        // channel and never returns `Err` from `poll_ready`, so the `Buffer`
+        // wrapping it can NEVER poison on a transient inner readiness error
+        // (FL #6951). A Connected inner error re-makes transparently; a make
+        // error becomes a per-request error, not a latch.
+        let reconnect = tower::reconnect::Reconnect::with_connection(initial_channel, maker, ());
         // 1024 slots per connection. With N connections, total capacity
         // is N×1024 (e.g., 32×1024 = 32768), sufficient for burst peaks
         // while providing backpressure under transport degradation.
-        let buffered = tower::buffer::Buffer::new(h3_channel, 1024);
+        let buffered = tower::buffer::Buffer::new(reconnect, 1024);
         channels.push(buffered);
     }
 
@@ -673,5 +800,216 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerification {
         self.0
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Layering-seam tests for the never-poison invariant on the QUIC pool.
+///
+/// INVARIANT (the property under test, verbatim): "a transient slow-store
+/// (QUIC) readiness failure must not permanently latch the transport — a
+/// subsequent read must succeed — so it cannot cause unnecessary duplicate
+/// action execution or truncated streamed data."
+///
+/// Background (FL benchmark #6951 CAS latched-pool cascade): each QUIC pool
+/// member is a `tower::buffer::Buffer` wrapping an inner H3 service. A
+/// `Buffer` PERMANENTLY poisons on the FIRST inner `poll_ready` error —
+/// its worker task stores a `ServiceError` and exits, so every subsequent
+/// `poll_ready`/`call` on any clone returns `"buffered service failed: …"`
+/// forever. The inner error is a quinn idle/connection timeout; ~42 genuine
+/// timeouts latched all 32 members and instant-failed 35,682 reads for hours.
+///
+/// The fix wraps each member's inner service in `tower::reconnect::Reconnect`
+/// INSIDE the `Buffer`. `Reconnect::poll_ready` never returns `Err`: a
+/// Connected inner `poll_ready` error transitions to `Idle` and transparently
+/// re-makes the service, so the `Buffer` never observes an inner `poll_ready`
+/// `Err` and can never poison.
+///
+/// These tests exercise the SEAM (Buffer-alone vs Buffer+Reconnect) with fake
+/// tower services so they are deterministic and require no real transport —
+/// the real-transport self-heal is covered by the `nativelink-store`
+/// integration test.
+#[cfg(all(test, feature = "quic"))]
+mod reconnect_seam_tests {
+    use core::future::{Ready, ready};
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::task::{Context, Poll};
+    use std::sync::Arc;
+
+    use tower::{BoxError, Service};
+
+    /// Fake inner service that fails its FIRST `poll_ready` (across all
+    /// instances that share `already_poisoned`), then is healthy forever.
+    ///
+    /// This models exactly one transient connection death: the first
+    /// connection's first readiness check times out; any connection made
+    /// afterwards is healthy from its first poll. A shared flag (rather than
+    /// a per-instance one) is deliberate — if EVERY freshly-made instance
+    /// errored on its first poll, `Reconnect` would spin its internal make
+    /// loop forever, which is not the production scenario (a reconnect gets a
+    /// fresh, healthy connection).
+    struct PoisonOnce {
+        already_poisoned: Arc<AtomicBool>,
+    }
+
+    impl Service<()> for PoisonOnce {
+        type Response = &'static str;
+        type Error = BoxError;
+        type Future = Ready<Result<&'static str, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            // `swap(true)` returns the PREVIOUS value: the very first caller
+            // sees `false` → errors once; everyone after sees `true` → Ok.
+            if !self.already_poisoned.swap(true, Ordering::SeqCst) {
+                return Poll::Ready(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "simulated transient quinn idle timeout",
+                )));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: ()) -> Self::Future {
+            ready(Ok("served"))
+        }
+    }
+
+    /// Fake `MakeService` (`Service<()>`) producing a fresh `PoisonOnce` per
+    /// make, all sharing the same one-shot `already_poisoned` flag, and
+    /// counting makes so the test can assert a reconnect actually happened.
+    struct FakeMaker {
+        already_poisoned: Arc<AtomicBool>,
+        makes: Arc<AtomicUsize>,
+    }
+
+    impl Service<()> for FakeMaker {
+        type Response = PoisonOnce;
+        type Error = BoxError;
+        type Future = Ready<Result<PoisonOnce, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            // The maker itself is always ready — mirrors `H3ChannelMaker`,
+            // whose construction is synchronous and infallible-to-poll.
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _target: ()) -> Self::Future {
+            self.makes.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(PoisonOnce {
+                already_poisoned: Arc::clone(&self.already_poisoned),
+            }))
+        }
+    }
+
+    /// Drive a `tower::Service<()>` to readiness and issue one call, with a
+    /// deadline so an infinite internal make-loop cannot hang the test.
+    async fn ready_and_call<S>(svc: &mut S) -> Result<&'static str, BoxError>
+    where
+        S: Service<(), Response = &'static str, Error = BoxError>,
+    {
+        core::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
+        svc.call(()).await
+    }
+
+    /// (a) Documents the BUG: a plain `Buffer` permanently latches after one
+    /// transient inner `poll_ready` error — every subsequent call fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_buffer_permanently_latches_on_transient_error() {
+        let mut buffered = tower::buffer::Buffer::new(
+            PoisonOnce {
+                already_poisoned: Arc::new(AtomicBool::new(false)),
+            },
+            4,
+        );
+
+        // First readiness check hits the transient error and poisons the
+        // Buffer worker. The exact error surfaced here is timing-dependent
+        // (the ServiceError may surface on this call or the next), so we do
+        // not assert on this one — only on the PERMANENCE below.
+        let _first = tokio::time::timeout(core::time::Duration::from_secs(5), ready_and_call(&mut buffered))
+            .await
+            .expect("plain-buffer first call must not hang");
+
+        // The latch is permanent: a subsequent call must fail with the tower
+        // ServiceError. This is the bug the fix removes.
+        let second = tokio::time::timeout(core::time::Duration::from_secs(5), ready_and_call(&mut buffered))
+            .await
+            .expect("plain-buffer second call must not hang");
+        let err = second.expect_err(
+            "plain Buffer must stay latched after a transient inner poll_ready error \
+             (documents the FL #6951 bug — remove this and the reproduce baseline is gone)",
+        );
+        assert!(
+            err.to_string().contains("buffered service failed"),
+            "expected tower ServiceError 'buffered service failed', got: {err}",
+        );
+    }
+
+    /// (b) Proves the FIX: `Buffer::new(Reconnect::new(maker, target), cap)`
+    /// self-heals after the same transient error — a subsequent call SUCCEEDS.
+    ///
+    /// MUTATION: replace the `Reconnect::new(...)` inner with a bare
+    /// `PoisonOnce` (drop `Reconnect`) and this test MUST fail with the
+    /// bespoke `.expect` message below.
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffer_with_reconnect_self_heals_after_transient_error() {
+        let already_poisoned = Arc::new(AtomicBool::new(false));
+        let makes = Arc::new(AtomicUsize::new(0));
+        let maker = FakeMaker {
+            already_poisoned: Arc::clone(&already_poisoned),
+            makes: Arc::clone(&makes),
+        };
+
+        let mut buffered =
+            tower::buffer::Buffer::new(tower::reconnect::Reconnect::new(maker, ()), 4);
+
+        // Issue calls until one succeeds. The FIRST inner `poll_ready` errors
+        // (transient); `Reconnect` swallows it, re-makes a healthy service,
+        // and a subsequent call must succeed — the Buffer never poisons.
+        // A generic `is_ok()` here would let a `tokio::time::Elapsed` (from a
+        // hung latch) masquerade as success, so we assert with a bespoke
+        // deadline message AND on the served payload.
+        let mut last_err: Option<BoxError> = None;
+        let mut served: Option<&'static str> = None;
+        for _ in 0..4 {
+            let outcome: Result<Result<&'static str, BoxError>, tokio::time::error::Elapsed> =
+                tokio::time::timeout(
+                    core::time::Duration::from_secs(5),
+                    ready_and_call(&mut buffered),
+                )
+                .await;
+            let call_result = outcome.expect(
+                "never-poison invariant violated: a transient poll_ready error \
+                 permanently latched the buffered QUIC member",
+            );
+            match call_result {
+                Ok(v) => {
+                    served = Some(v);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        let served = served.unwrap_or_else(|| {
+            panic!(
+                "never-poison invariant violated: a transient poll_ready error \
+                 permanently latched the buffered QUIC member (last error: {:?})",
+                last_err.map(|e| e.to_string()),
+            )
+        });
+        assert_eq!(
+            served, "served",
+            "reconnected member must serve the request payload",
+        );
+        assert!(
+            makes.load(Ordering::SeqCst) >= 2,
+            "Reconnect must have re-made the inner service at least once after the \
+             transient error (makes={})",
+            makes.load(Ordering::SeqCst),
+        );
+
+        // Silence unused-Pin import lint if the trait path shifts; keep the
+        // deadline type explicit above to prove Elapsed cannot pass as Ok.
+        let _ = core::marker::PhantomData::<Pin<Box<()>>>;
     }
 }
