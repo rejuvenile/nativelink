@@ -798,6 +798,20 @@ async fn inner_main(
         nativelink_util::o11_probes::ecs_hit_counters_arc(),
     );
 
+    // (FL-681 NAK boundary fix): register the worker admission-NAK counter
+    // singleton so the pin-cap-saturation NAK signal appears on /metrics as the
+    // BARE `worker_admission_nak_pin_saturated_total` (no `_counter` suffix —
+    // empirically pinned by the render test in local_worker.rs). Previously this
+    // signal had no home on the per-instance LocalWorker.metrics tree (never
+    // registered — the worker-metrics-exposure trap; same class as #37
+    // memory_gate). Registered unconditionally; the producer (worker
+    // create_and_add_action) is WORKER-ONLY so the counter reads 0 on
+    // server-only processes.
+    metrics_registry.register(
+        "worker_admission",
+        nativelink_util::o11_probes::worker_admission_nak_counters_arc(),
+    );
+
     // Periodically log tokio runtime metrics to detect thread pool exhaustion.
     // Requires tokio_unstable cfg for blocking thread metrics.
     #[cfg(tokio_unstable)]

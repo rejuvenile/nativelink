@@ -8359,6 +8359,14 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 if self.deferred_output_uploads_enabled
                     && self.filesystem_store.indefinite_pin_saturated()
                 {
+                    // (FL-681 NAK boundary fix) Count the NAK on the process
+                    // singleton so `/metrics` shows the gate is actually firing
+                    // (a dead gate reads 0 here, indistinguishable from a healthy
+                    // pin budget only by cross-referencing the pinned_bytes/pin_cap
+                    // gauges — the FL-681 incident's missing signal). Registered
+                    // in nativelink.rs under prefix "worker_admission".
+                    nativelink_util::o11_probes::worker_admission_nak_counters()
+                        .record_nak_pin_saturated();
                     return Err(make_err!(
                         Code::ResourceExhausted,
                         "worker indefinite-pin cap saturated (pending-BIS durability backlog); \

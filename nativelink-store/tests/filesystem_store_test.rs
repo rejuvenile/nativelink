@@ -2354,6 +2354,7 @@ async fn v3c_reconcile_pin_survives_runtime_insert() -> Result<(), Error> {
             evict_bytes: 0,
             max_seconds: 0,
             max_count: 0,
+            pin_cap_bytes: 0,
         }),
         block_size: 1,
         // pending_bis_pin_max_bytes = 0 falls back to pin_cap = 1280 >= 1024.
@@ -2632,6 +2633,7 @@ async fn v3c_block2_boot_drain_suppressed_when_gate_armed_at_construction() -> R
                 evict_bytes: 0,
                 max_seconds: 0,
                 max_count: 0,
+                pin_cap_bytes: 0,
             }),
             block_size: 1,
             startup_reconcile_gate: true, // BLOCK-2 fix: suppress boot drain

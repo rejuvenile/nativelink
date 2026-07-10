@@ -120,6 +120,7 @@ fn build_map_with_tracker(boot_epoch: u64) -> (Arc<TestMap>, Arc<BlobChangeTrack
         evict_bytes: 0,
         max_seconds: 0,
         max_count: 0,
+        pin_cap_bytes: 0,
     };
     let map = Arc::new(TestMap::with_anchor_and_boot_epoch(
         &policy,
@@ -426,6 +427,7 @@ async fn scenario4_filesystem_store_eviction_carries_nonzero_stamp() {
                 max_count: 2,
                 max_seconds: 0,
                 evict_bytes: 0,
+                pin_cap_bytes: 0,
             }),
             ..Default::default()
         })

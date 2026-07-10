@@ -40,6 +40,14 @@ use crate::metrics_utils::{Counter, CounterWithTime};
 
 /// Maximum fraction of max_bytes that can be pinned (25%).
 const PIN_CAP_FRACTION: f64 = 0.25;
+/// FL-681 NAK boundary fix: `indefinite_pin_saturated` fires within
+/// `pin_cap / PIN_SATURATION_HEADROOM_DIVISOR` of `pin_cap` — i.e. once
+/// `real_pinned` is within 5% of the total pin budget. The band exists so the
+/// admission gate NAKs a new action just BEFORE the total pin-cap refusal at
+/// `pin_key_with_mode` starts rejecting variable-sized outputs, rather than only
+/// at the exact-full boundary that a refused pin (which adds no bytes) can sit
+/// just below forever. Divisor 20 = fire within 5% of `pin_cap`.
+const PIN_SATURATION_HEADROOM_DIVISOR: u64 = 20; // fire within 5% of pin_cap
 /// #speculative-prefetch P0: fraction of max_bytes reserved for SPECULATIVE
 /// pins (5% — a fifth of the 25% total `pin_cap`). Speculative pins draw from
 /// this small, DISJOINT sub-budget so they can never consume the headroom a
@@ -700,7 +708,15 @@ where
         });
 
         let cache = builder.build();
-        let pin_cap = (max_bytes as f64 * PIN_CAP_FRACTION) as u64;
+        // FL-681 NAK boundary fix: honor the operator-configured `pin_cap_bytes`
+        // when non-zero; otherwise derive the historical 25%-of-max_bytes cap so
+        // existing configs are unchanged. This is the ceiling the admission NAK
+        // gate (`indefinite_pin_saturated`) and the total pin refusal measure against.
+        let pin_cap = if config.pin_cap_bytes == 0 {
+            (max_bytes as f64 * PIN_CAP_FRACTION) as u64
+        } else {
+            config.pin_cap_bytes
+        };
         // #speculative-prefetch P0: the disjoint speculative sub-budget
         // (5% of max_bytes, a fifth of the 25% pin_cap). Speculative pins draw
         // only from this; the real-pin check excludes speculative bytes.
@@ -1842,28 +1858,47 @@ where
         self.indefinite_pinned_bytes.load(Ordering::Relaxed)
     }
 
-    /// FL-681 Follow-up A (MAJOR-1b close-out): snapshot predicate for the
-    /// worker's admission-side gate. Returns `true` when the indefinite-pin
-    /// cap has NO headroom left for even a zero-byte blob — i.e. the next
-    /// fresh F2 output's `pin_key_indefinite` would be REFUSED. The worker's
+    /// FL-681 NAK boundary fix: snapshot predicate for the worker's
+    /// admission-side gate. Returns `true` when the TOTAL real-pin budget has
+    /// almost no headroom left — specifically when
+    /// `real_pinned >= pin_cap − pin_cap / PIN_SATURATION_HEADROOM_DIVISOR`
+    /// (within 5% of `pin_cap`), where
+    /// `real_pinned = pinned_bytes − speculative_pinned_bytes`. The worker's
     /// action-acceptance path reads this and NAKs the new action with
     /// `Code::ResourceExhausted` so the scheduler re-queues it (true producer
-    /// backpressure) instead of admitting an action whose output cannot be
+    /// backpressure) instead of admitting an action whose F2 output cannot be
     /// pinned-until-durable.
+    ///
+    /// Gating on `real_pinned` vs `pin_cap` — the SAME quantity and ceiling the
+    /// total pin refusal in `pin_key_with_mode` uses — makes this predicate
+    /// PREDICT that refusal: it fires just before the cap starts rejecting
+    /// variable-sized outputs, not one blob after `pinned_bytes` reaches the
+    /// exact cap. (The prior gate `indefinite_pinned_bytes >= indefinite_pin_cap`
+    /// was silently dead: a refused pin adds no bytes, so `indefinite_pinned_bytes`
+    /// stuck below the cap and `>= cap` ~never tripped with variable sizes.)
+    /// Disk is fungible across cache/pinned/inputs, so a full pin budget from
+    /// ANY source is legitimate backpressure. NOTE: post-fix
+    /// `pending_bis_pin_max_bytes` (the `indefinite_pin_cap`) NO LONGER
+    /// influences the NAK — the gate changed both the numerator (indefinite →
+    /// real) and the cap (`indefinite_pin_cap` → `pin_cap`).
     ///
     /// Same eventually-consistent snapshot shape as `indefinite_cap_admits`
     /// (the cap STOPS an over-capacity hot loop; the scheduler's natural
     /// re-queue closes the residual race). `max_bytes == 0` (no byte budget
-    /// configured) never gates — an uncapped store has no indefinite-pin cap
-    /// to saturate. "Saturated" means `indefinite_pinned_bytes >= cap`: at the
-    /// exact-full boundary the next real (>0-byte) F2 output's indefinite pin
-    /// is already refused, so the gate must fire there, not one blob later.
+    /// configured) never gates — an uncapped store has no pin cap to saturate.
     #[must_use]
     pub fn indefinite_pin_saturated(&self) -> bool {
         if self.max_bytes == 0 {
             return false;
         }
-        self.indefinite_pinned_bytes.load(Ordering::Relaxed) >= self.indefinite_pin_cap
+        // Integer headroom band: `pin_cap / DIVISOR <= pin_cap` so the
+        // subtraction cannot underflow; do NOT write `pin_cap * 19 / 20` (u64
+        // overflow for large caps).
+        let real_pinned = self
+            .pinned_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.speculative_pinned_bytes.load(Ordering::Relaxed));
+        real_pinned >= self.pin_cap - self.pin_cap / PIN_SATURATION_HEADROOM_DIVISOR
     }
 
     /// FL-681 Follow-up B (MAJOR-2 robust close-out): enumerate the keys of the
@@ -2482,6 +2517,9 @@ mod tests {
             evict_bytes: 0,
             max_seconds: 0,
             max_count,
+            // FL-681: leave pin_cap_bytes 0 so pin_cap stays DERIVED
+            // (max_bytes * PIN_CAP_FRACTION) — the boundary test relies on it.
+            pin_cap_bytes: 0,
         }
     }
 
@@ -3420,52 +3458,109 @@ mod tests {
         );
     }
 
-    // FL-681 Follow-up A (MAJOR-1b close-out): the admission-side gate reads
+    // FL-681 NAK boundary fix: the admission-side gate reads
     // `indefinite_pin_saturated()` to decide whether to NAK a new action with
-    // `ResourceExhausted`. The predicate is the snapshot mirror of
-    // `indefinite_cap_admits(0)`: TRUE when there is NO indefinite-cap headroom
-    // left for even a zero-byte blob, FALSE while any headroom remains.
+    // `ResourceExhausted`. Post-fix the predicate gates on the TOTAL real-pin
+    // budget (`real_pinned = pinned_bytes − speculative_pinned_bytes`) vs
+    // `pin_cap` MINUS a 5% headroom band, so it fires as soon as the total
+    // refusal at `pin_key_with_mode` (which also gates on `real_pinned` vs
+    // `pin_cap`) is imminent — NOT one blob after `pinned_bytes` reaches the
+    // exact cap. The OLD predicate (`indefinite_pinned_bytes >= indefinite_pin_cap`)
+    // never fired with variable-sized outputs because a refused pin adds no
+    // bytes, so `indefinite_pinned_bytes` stuck below the cap forever.
+    //
+    // `pin_cap` is DERIVED (`max_bytes * PIN_CAP_FRACTION = 0.25`), so choose
+    // `max_bytes = 16384` → `pin_cap = 4096`, headroom threshold
+    // `4096 − 4096/PIN_SATURATION_HEADROOM_DIVISOR = 4096 − 204 = 3892`. This
+    // uses the REAL total-pin budget (`pin_cap`) — NOT `indefinite_pin_cap`
+    // (the old, wrong field); `make_map_cb` leaves `indefinite_pin_cap`
+    // defaulted to `pin_cap` so it does not confound the boundary.
     #[tokio::test]
-    async fn indefinite_pin_saturated_tracks_cap_headroom() {
-        // Cap indefinite pins at 4096 bytes.
-        let cfg = policy(1024 * 1024, 0);
-        let map = Arc::new(make_map_cb_indefinite_cap(&cfg, 4096));
+    async fn real_pin_saturated_fires_before_hard_cap_with_variable_sizes() {
+        // max_bytes 16384 → derived pin_cap = 4096; headroom threshold = 3892.
+        let cfg = policy(16384, 0);
+        let map = Arc::new(make_map_cb(&cfg));
 
-        for k in 0..2u64 {
-            map.insert(k, BytesEntry(2048)).await;
-        }
-
-        // No indefinite pins yet → headroom exists → NOT saturated.
-        assert!(
-            !map.indefinite_pin_saturated(),
-            "empty indefinite-pin set must report headroom (not saturated)"
+        // (a) Pin a 3900-byte entry indefinitely → real_pinned = 3900. This is
+        // BELOW the hard cap (4096) but AT/ABOVE the 3892 headroom threshold.
+        map.insert(0u64, BytesEntry(3900)).await;
+        assert!(map.pin_key_indefinite(0), "first indefinite pin (3900 B) fits under pin_cap 4096");
+        assert_eq!(
+            map.pinned_bytes(),
+            3900,
+            "real pin should account 3900 bytes after the first indefinite pin"
         );
 
-        assert!(map.pin_key_indefinite(0), "first indefinite pin fits under cap");
-        // 2048 of 4096 used → still headroom → NOT saturated.
+        // (b) Attempt a second pin that OVERSHOOTS the cap: 3900 + 300 = 4200 > 4096
+        // → refused by the total pin-cap check. real_pinned STAYS 3900 (a refused
+        // pin adds no bytes) — this is exactly the window the old `>= cap` gate missed.
+        map.insert(1u64, BytesEntry(300)).await;
         assert!(
-            !map.indefinite_pin_saturated(),
-            "indefinite_pin_saturated must be FALSE while indefinite-cap headroom remains — \
-             the admission gate would wrongly NAK actions and churn the scheduler"
+            !map.pin_key_indefinite(1),
+            "second indefinite pin (300 B) must be REFUSED: 3900 + 300 = 4200 exceeds pin_cap 4096"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            3900,
+            "a refused pin must add no bytes — real_pinned stays 3900 (the boundary-gap window)"
         );
 
-        assert!(map.pin_key_indefinite(1), "second indefinite pin fills cap exactly");
-        // 4096 of 4096 used → no headroom → SATURATED.
+        // (c) The gate MUST fire at 3900: 3900 >= 3892 (pin_cap − 5%). This is the
+        // refuse-but-below-hard-cap window: further real pins are already being
+        // refused, so admission must NAK. The OLD gate (>= 4096) would report
+        // FALSE here (3900 >= 4096 is false) → boundary gap → NAK never fires.
         assert!(
             map.indefinite_pin_saturated(),
-            "indefinite_pin_saturated must be TRUE once the indefinite cap is full — \
-             without it the admission gate never fires and fresh F2 outputs are lost"
+            "boundary gap: saturated false while pins are being refused — the gate must fire \
+             at real_pinned 3900 >= pin_cap−5% (3892), the window where the total pin cap is \
+             already refusing new pins; the old `>= pin_cap` gate missed it and the NAK was dead"
         );
 
-        // BIS-ack release of one pin reclaims headroom → de-saturates.
+        // (d) A BIS-ack `unpin_key` frees headroom → de-saturates (transient
+        // backpressure, not a terminal stall).
         map.unpin_key(&0);
         assert!(
             !map.indefinite_pin_saturated(),
-            "indefinite_pin_saturated must clear once a BIS-ack frees cap headroom — \
-             the gate is transient backpressure, not a terminal stall"
+            "indefinite_pin_saturated must clear once a BIS-ack frees pin_cap headroom — \
+             real_pinned drops to 0 (< 3892), the gate is transient backpressure"
+        );
+    }
+
+    // FL-681 NAK boundary fix (§2 config knob): the per-store `pin_cap_bytes`
+    // config field must OVERRIDE the derived 25%-of-max_bytes `pin_cap` when
+    // non-zero, and fall back to the derived value when 0. This is what lets an
+    // operator raise the pin budget to 50% of max_bytes without touching max_bytes.
+    #[tokio::test]
+    async fn pin_cap_bytes_config_overrides_derived_pin_cap() {
+        // Derived-default path: pin_cap_bytes 0 → pin_cap = max_bytes * 25%.
+        let derived_cfg = policy(16384, 0);
+        let derived_map = Arc::new(make_map_cb(&derived_cfg));
+        assert_eq!(
+            derived_map.pin_cap,
+            4096,
+            "pin_cap_bytes=0 must derive pin_cap as max_bytes(16384) * PIN_CAP_FRACTION(0.25) = 4096"
         );
 
-        map.unpin_key(&1);
+        // Override path: a non-zero pin_cap_bytes must be used verbatim, even
+        // when it differs from the derived 25% (here 8192 = 50% of max_bytes).
+        let mut override_cfg = policy(16384, 0);
+        override_cfg.pin_cap_bytes = 8192;
+        let override_map = Arc::new(make_map_cb(&override_cfg));
+        assert_eq!(
+            override_map.pin_cap,
+            8192,
+            "a non-zero pin_cap_bytes(8192) must override the derived 25% cap(4096) — \
+             the operator-tuned total pin budget did not reach the eviction map"
+        );
+        // And the override cap is the ceiling the total pin refusal / NAK gate
+        // now measure against: a 5000-byte pin fits under 8192 but would have
+        // been refused under the derived 4096.
+        override_map.insert(0u64, BytesEntry(5000)).await;
+        assert!(
+            override_map.pin_key_indefinite(0),
+            "a 5000-byte pin must fit under the overridden 8192-byte pin_cap (it would \
+             exceed the derived 4096 cap) — proving pin_cap_bytes governs admission"
+        );
     }
 
     // FL-681 Follow-up B (MAJOR-2 robust close-out): the worker re-advertises

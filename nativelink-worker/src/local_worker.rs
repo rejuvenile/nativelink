@@ -8221,6 +8221,7 @@ mod tests {
                     max_seconds: 0,
                     max_bytes: 0,
                     evict_bytes: 0,
+                    pin_cap_bytes: 0,
                 },
                 SystemTime::now(),
             ));
@@ -9624,6 +9625,157 @@ mod tests {
              If publish() returned Component without emitting Counter, the derive \
              output is silently mis-routing the field.",
             metric.value
+        );
+    }
+
+    /// (FL-681 NAK boundary fix) The worker admission-NAK counter must render on
+    /// the process metric tree under the literal name
+    /// `worker_admission_nak_pin_saturated_total` — the signal that proves the
+    /// pin-cap-saturation NAK gate is actually firing (its absence was the
+    /// FL-681 incident's blind spot). Proves:
+    ///   1. `worker_admission_nak_counters()` returns the same singleton the NAK
+    ///      site in `running_actions_manager.rs::create_and_add_action` writes.
+    ///   2. `worker_admission_nak_counters_arc()` (which `nativelink.rs` passes to
+    ///      `MetricsRegistry::register`) publishes that literal field name.
+    ///   3. The published value reflects the increment done via the singleton.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): comment out
+    /// `publish!("nak_pin_saturated_total", ...)` in
+    /// `WorkerAdmissionNakCounters::publish` → the `unwrap_or_else` panic fires
+    /// with the bespoke "the pin-cap-saturation NAK signal is dark on /metrics"
+    /// message; or `record_nak_pin_saturated` → the delta assertion fails.
+    #[test]
+    fn worker_admission_nak_counter_visible_in_metric_tree() {
+        use std::sync::Mutex;
+
+        use nativelink_metric::{MetricFieldData, MetricKind, MetricsComponent};
+        use nativelink_util::o11_probes::{
+            worker_admission_nak_counters, worker_admission_nak_counters_arc,
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Debug, Default, Clone)]
+        struct CapturedMetric {
+            name: String,
+            value: String,
+        }
+
+        #[derive(Default)]
+        struct MetricCaptureLayer {
+            events: Arc<Mutex<Vec<CapturedMetric>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MetricCaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "nativelink_metric" {
+                    return;
+                }
+                struct Grabber {
+                    name: String,
+                    value: String,
+                }
+                impl tracing::field::Visit for Grabber {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn core::fmt::Debug,
+                    ) {
+                        let s = format!("{value:?}").trim_matches('"').to_string();
+                        match field.name() {
+                            "__name" => self.name = s,
+                            "__value" => self.value = s,
+                            _ => {}
+                        }
+                    }
+                }
+                let mut g = Grabber {
+                    name: String::new(),
+                    value: String::new(),
+                };
+                event.record(&mut g);
+                if g.name.is_empty() {
+                    return;
+                }
+                self.events.lock().unwrap().push(CapturedMetric {
+                    name: g.name,
+                    value: g.value,
+                });
+            }
+        }
+
+        // Baseline BEFORE increment — the singleton is process-wide, shared
+        // across all tests in the suite; a delta assertion avoids ordering
+        // sensitivity with any parallel test that also NAKs.
+        let before = worker_admission_nak_counters()
+            .nak_pin_saturated
+            .load(::core::sync::atomic::Ordering::Relaxed);
+
+        // Drive one NAK via the PRODUCTION singleton path (the same
+        // `record_nak_pin_saturated` the NAK site calls).
+        worker_admission_nak_counters().record_nak_pin_saturated();
+
+        let layer = MetricCaptureLayer::default();
+        let captured = layer.events.clone();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // `worker_admission_nak_counters_arc()` is what nativelink.rs passes to
+        // `MetricsRegistry::register` — publish via that handle.
+        MetricsComponent::publish(
+            worker_admission_nak_counters_arc().as_ref(),
+            MetricKind::Component,
+            MetricFieldData::default(),
+        )
+        .expect("publish must succeed for WorkerAdmissionNakCountersHandle");
+
+        drop(_guard);
+
+        let events = captured.lock().unwrap().clone();
+
+        // The rendered name is the BARE `nak_pin_saturated_total` at the metric
+        // event (the "worker_admission" prefix is applied by the registry key at
+        // render time; the doubled-prefix guard below pins that the name is not
+        // `worker_admission_worker_admission_*`).
+        let metric = events
+            .iter()
+            .find(|m| m.name == "nak_pin_saturated_total")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected metric `nak_pin_saturated_total` (rendered \
+                     worker_admission_nak_pin_saturated_total) to be published by \
+                     WorkerAdmissionNakCountersHandle — the pin-cap-saturation NAK signal is \
+                     dark on /metrics; the FL-681 dead-gate incident cannot be distinguished \
+                     from a healthy pin budget. Captured events: {events:#?}. Mutation target: \
+                     comment out publish!(\"nak_pin_saturated_total\", ...) in \
+                     WorkerAdmissionNakCounters::publish."
+                )
+            });
+        let published: u64 = metric
+            .value
+            .parse()
+            .expect("nak_pin_saturated_total value must be numeric");
+        assert_eq!(
+            published,
+            before + 1,
+            "nak_pin_saturated_total must equal baseline+1 after one record_nak_pin_saturated — \
+             got {published} (baseline was {before}). Singleton aliasing broken: \
+             worker_admission_nak_counters() and worker_admission_nak_counters_arc() are not \
+             observing the same AtomicU64."
+        );
+
+        // Doubled-prefix trap guard (as the memory_gate / dir_cache tests do):
+        // the field name at the event must NOT already carry the registry prefix.
+        assert!(
+            !metric.name.contains("worker_admission"),
+            "doubled metric name: the published field name `{}` already contains the registry \
+             prefix `worker_admission` — the rendered name would be \
+             worker_admission_worker_admission_nak_pin_saturated_total (do not group!() inside \
+             WorkerAdmissionNakCounters::publish; the registry key already scopes it).",
+            metric.name
         );
     }
 

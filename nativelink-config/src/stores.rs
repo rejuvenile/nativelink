@@ -1173,6 +1173,18 @@ pub struct EvictionPolicy {
     /// Default: 0. Zero means never evict based on count.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_count: u64,
+
+    /// FL-681 NAK boundary fix: explicit ceiling (in bytes) on the total data
+    /// that may be PINNED (held un-evictable) in this store's eviction map.
+    /// This is the ceiling the worker's admission NAK gate (`indefinite_pin_saturated`)
+    /// and the total pin refusal both measure against.
+    ///
+    /// 0 (the default) = derive the cap as `max_bytes * PIN_CAP_FRACTION` (25%),
+    /// preserving the historical behavior for every existing config. A non-zero
+    /// value overrides that derived cap directly, letting an operator raise the
+    /// pin budget (e.g. to 50% of `max_bytes`) without changing `max_bytes`.
+    #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
+    pub pin_cap_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

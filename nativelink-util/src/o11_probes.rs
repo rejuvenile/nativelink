@@ -2216,6 +2216,111 @@ fn sysctl_u64(name: &core::ffi::CStr) -> Option<u64> {
 }
 
 // =====================================================================
+// FL-681 worker admission-NAK counter (pin-cap saturation)
+// =====================================================================
+
+/// (FL-681 NAK boundary fix) Process-wide count of new actions the worker
+/// REFUSED at admission because its local CAS FilesystemStore pin budget was
+/// saturated (`indefinite_pin_saturated()` true), NAKing with
+/// `Code::ResourceExhausted` so the scheduler re-queues them.
+///
+/// This is the counter that proves the NAK gate is actually FIRING. It was the
+/// missing signal in the FL-681 incident: the gate was silently dead (pins
+/// pegged at cap, thousands of internal refusals, ~1 scheduler re-queue in
+/// 12 h) with no metric distinguishing "gate never fires" from "gate healthy,
+/// zero load." Backed by a `static` so `const fn new()` suffices; incremented
+/// DIRECTLY at the NAK site in `running_actions_manager.rs::create_and_add_action`.
+///
+/// Lives here (NOT on the per-instance `LocalWorker.metrics` tree, which is
+/// never registered with `MetricsRegistry` — the worker-metrics-exposure trap;
+/// same class as #37 memory_gate, #86 symlink_fix, #DC3 dir_cache) so it renders
+/// on `/metrics`. Registered under prefix `"worker_admission"` → rendered name:
+///   `worker_admission_nak_pin_saturated_total`
+#[derive(Debug)]
+pub struct WorkerAdmissionNakCounters {
+    /// Monotone count of new actions NAKed at admission because the worker's
+    /// local pin cap was saturated (F2 deferred-output mode).
+    pub nak_pin_saturated: AtomicU64,
+}
+
+impl WorkerAdmissionNakCounters {
+    const fn new() -> Self {
+        Self {
+            nak_pin_saturated: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one admission NAK due to pin-cap saturation.
+    pub fn record_nak_pin_saturated(&self) {
+        self.nak_pin_saturated.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl MetricsComponent for WorkerAdmissionNakCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        let v = self.nak_pin_saturated.load(Ordering::Relaxed);
+        publish!(
+            "nak_pin_saturated_total",
+            &v,
+            MetricKind::Counter,
+            "Count of new actions the worker REFUSED at admission because its local CAS \
+             pin budget was saturated (indefinite_pin_saturated true), NAKing with \
+             ResourceExhausted so the scheduler re-queues them (F2 deferred-output mode). \
+             Monotonic — alert on rate; a rising rate means sustained pending-BIS durability \
+             backpressure. Zero = gate never fired (healthy pin budget OR — the FL-681 bug \
+             — a dead gate); correlate with the pinned_bytes/pin_cap gauges to tell them apart."
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// (FL-681) Process-wide worker admission-NAK counter. Backed by a `static`
+/// so `const fn new()` suffices; incremented from the NAK site in
+/// `running_actions_manager.rs::create_and_add_action`.
+static WORKER_ADMISSION_NAK_COUNTERS: WorkerAdmissionNakCounters =
+    WorkerAdmissionNakCounters::new();
+/// (FL-681) Cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents
+/// double-registration; both calls return a clone of the same `Arc`.
+static WORKER_ADMISSION_NAK_COUNTERS_ARC: OnceLock<Arc<WorkerAdmissionNakCountersHandle>> =
+    OnceLock::new();
+
+/// (FL-681) Process-wide worker admission-NAK counter singleton. All calls
+/// within the process observe the same atomic state.
+#[must_use]
+pub fn worker_admission_nak_counters() -> &'static WorkerAdmissionNakCounters {
+    &WORKER_ADMISSION_NAK_COUNTERS
+}
+
+/// (FL-681) `Arc` wrapper for `MetricsRegistry::register`. The singleton lives
+/// in a `static`; the `Arc` carries a zero-sized handle that delegates
+/// `publish` to the static so scrapes always read live state. `OnceLock`-cached.
+#[must_use]
+pub fn worker_admission_nak_counters_arc() -> Arc<WorkerAdmissionNakCountersHandle> {
+    Arc::clone(
+        WORKER_ADMISSION_NAK_COUNTERS_ARC.get_or_init(|| Arc::new(WorkerAdmissionNakCountersHandle)),
+    )
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an
+/// `Arc<T: MetricsComponent>` for the `static`-backed FL-681 counter.
+#[derive(Debug)]
+pub struct WorkerAdmissionNakCountersHandle;
+
+impl MetricsComponent for WorkerAdmissionNakCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        WORKER_ADMISSION_NAK_COUNTERS.publish(kind, field_metadata)
+    }
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 

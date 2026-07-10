@@ -53,6 +53,8 @@ fn policy(
         evict_bytes,
         max_seconds,
         max_count,
+        // FL-681: default pin_cap_bytes 0 → pin_cap stays derived (25% max_bytes).
+        pin_cap_bytes: 0,
     }
 }
 

@@ -647,6 +647,7 @@ mod tests {
             evict_bytes: 0,
             max_seconds: 0,
             max_count: 0,
+            pin_cap_bytes: 0,
         };
         let map: MokaEvictingMap<u64, u64, Entry, SystemTime, NoopCallback> =
             MokaEvictingMap::with_anchor(&cfg, SystemTime::now());
@@ -742,6 +743,7 @@ mod tests {
             evict_bytes: 0,
             max_seconds: 0,
             max_count: 0,
+            pin_cap_bytes: 0,
         };
         let map: MokaEvictingMap<u64, u64, Entry, SystemTime, NoopCallback> =
             MokaEvictingMap::with_anchor(&cfg, SystemTime::now());
