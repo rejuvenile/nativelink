@@ -359,11 +359,16 @@ type H3ChannelResponse =
 ///
 /// The buffered service wraps a `tower::reconnect::Reconnect<H3ChannelMaker>`
 /// (not a bare `H3Channel`) so a transient quinn timeout self-heals instead
-/// of permanently poisoning the `Buffer`. `Reconnect::poll_ready` never
-/// returns `Err` — a Connected inner `poll_ready` error transparently re-makes
-/// the channel, and a make error is stashed as a per-request error, not a
-/// permanent latch — so the `Buffer` worker only ever sees `Ready(Ok)` from
-/// `poll_ready` and can never poison (FL #6951).
+/// of permanently poisoning the `Buffer`. `Reconnect::poll_ready` shields the
+/// `Buffer` from an inner (`H3Channel`) `poll_ready` `Err` — a Connected inner
+/// error transparently re-makes the channel, and a make error is stashed as a
+/// per-request error, not a permanent latch. This holds ONLY because the
+/// `H3ChannelMaker`'s own `poll_ready` is infallible: `Reconnect::poll_ready`
+/// propagates the maker's readiness with `mk_service.poll_ready(cx)?`
+/// (reconnect/mod.rs:90), so a fallible maker WOULD re-poison the `Buffer`.
+/// With the maker infallible the `Buffer` worker only ever sees `Ready(Ok)`
+/// from `poll_ready` and can never poison (FL #6951). See
+/// [`H3ChannelMaker::poll_ready`]'s INVARIANT and `wrap_reconnecting_member`.
 ///
 /// Type alias for the inner buffered H3 service. Its second parameter is the
 /// wrapped service's `Future` — here `Reconnect`'s `ResponseFuture`, which
@@ -495,8 +500,13 @@ struct H3ChannelMaker {
     /// Distinguishes reconnect generations of ONE member in logs.
     label: String,
     /// Monotonic reconnect generation for this member (0 = initial seed is
-    /// external; the first make here is generation 1).
-    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// external; the first make here is generation 1). A bare `AtomicU64`
+    /// (not `Arc`-wrapped): a maker is owned by exactly one `Reconnect` and
+    /// never shared, so no shared-ownership handle is needed. `Atomic` (not a
+    /// plain `u64`) only so `call` can bump it through `&mut self` without an
+    /// extra field-projection dance; `Relaxed` is fine (log-label counter, no
+    /// cross-thread ordering dependency).
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "quic")]
@@ -505,11 +515,23 @@ impl tower::Service<()> for H3ChannelMaker {
     type Error = tower::BoxError;
     type Future = core::future::Ready<Result<H3ChannelConcrete, tower::BoxError>>;
 
+    /// INVARIANT (load-bearing for the FL #6951 never-poison guarantee): this
+    /// MUST stay infallible — always `Ready(Ok(()))`, never `Err` and never
+    /// `Pending`. `tower::reconnect::Reconnect::poll_ready` propagates the
+    /// maker's readiness with `mk_service.poll_ready(cx)?` (tower-0.5.3
+    /// reconnect/mod.rs:90): if this ever returned `Err`, that `Err` would
+    /// escape `Reconnect::poll_ready` to the surrounding `Buffer`, whose
+    /// worker poisons permanently on the first inner `poll_ready` `Err` —
+    /// silently reintroducing the exact latched-pool cascade this fix removes.
+    /// Building a channel is synchronous and its failure is surfaced from
+    /// `call` (per-request, not a latch), so there is nothing to be
+    /// not-ready-for here. The `maker_poll_ready_err_repoisons_buffer` seam
+    /// test guards this: a fallible maker MUST make the `Buffer` poison.
     fn poll_ready(
         &mut self,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        // The factory itself is always ready — building is synchronous.
+        // MUST stay infallible — see the INVARIANT doc above.
         std::task::Poll::Ready(Ok(()))
     }
 
@@ -534,14 +556,55 @@ impl tower::Service<()> for H3ChannelMaker {
                     ?e,
                     "tls_utils: QUIC pool member rebuild failed; will retry on next request",
                 );
-                // Convert the internal error into a BoxError for the
-                // Reconnect per-request error path (never a poison).
-                core::future::ready(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                    e.to_string(),
-                )))
+                // Box the structured `nativelink_error::Error` directly (it is
+                // `Send + Sync + core::error::Error`) so the `Reconnect`
+                // per-request error path (never a poison) preserves its
+                // Display + source chain instead of flattening to a string.
+                core::future::ready(Err(Box::<dyn std::error::Error + Send + Sync>::from(e)))
             }
         }
     }
+}
+
+/// Wrap ONE already-connected pool member (`initial`) plus its reconnect
+/// factory (`maker`) as a never-poison buffered service:
+/// `Buffer::new(Reconnect::with_connection(initial, maker, ()), cap)`.
+///
+/// This is the SINGLE definition of the pool member's transport composition —
+/// the production [`h3_channel`] loop AND the `reconnect_seam_tests` fast unit
+/// test both call it, so a revert that removes the `Reconnect` layer here (the
+/// FL #6951 fix) red-fails the fast NON-ignored seam test rather than shipping
+/// green. Do not inline this back into either caller.
+///
+/// The FL #6951 never-poison guarantee holds because `Reconnect::poll_ready`
+/// (tower-0.5.3 reconnect/mod.rs:84-140) does not surface an inner `poll_ready`
+/// `Err` to the `Buffer` — CONDITIONAL on the `maker`'s own `poll_ready` being
+/// infallible (it does `mk_service.poll_ready(cx)?` at reconnect/mod.rs:90; see
+/// [`H3ChannelMaker::poll_ready`]'s INVARIANT). A Connected inner error re-makes
+/// transparently via `maker`; a make error is stashed as a per-request error.
+#[cfg(feature = "quic")]
+fn wrap_reconnecting_member<Req, S, M>(
+    initial: S,
+    maker: M,
+    cap: usize,
+) -> tower::buffer::Buffer<Req, <tower::reconnect::Reconnect<M, ()> as tower::Service<Req>>::Future>
+where
+    // `Reconnect<M, ()>` must be `Send + 'static` for `Buffer::new` to spawn
+    // its worker: it holds `M::Future` (in `State::Connecting`) and `M::Error`
+    // (in its `error` slot), so both must be `Send`, and `M::Future: Unpin`
+    // for `Reconnect` to poll it via `Pin::new`.
+    M: tower::Service<(), Response = S> + Send + 'static,
+    M::Future: core::marker::Unpin + Send + 'static,
+    M::Error: Send + 'static,
+    S: tower::Service<Req> + Send + 'static,
+    Req: Send + 'static,
+    tower::BoxError: From<M::Error> + From<S::Error>,
+    <tower::reconnect::Reconnect<M, ()> as tower::Service<Req>>::Future: Send + 'static,
+{
+    tower::buffer::Buffer::new(
+        tower::reconnect::Reconnect::with_connection(initial, maker, ()),
+        cap,
+    )
 }
 
 /// Create a pool of QUIC/HTTP3 channels for a gRPC endpoint.
@@ -717,18 +780,25 @@ pub fn h3_channel(endpoint_config: &GrpcEndpoint, connections: usize) -> Result<
             uri: uri.clone(),
             server_name: server_name.clone(),
             label,
-            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            generation: std::sync::atomic::AtomicU64::new(0),
         };
-        // `Reconnect::with_connection` seeds the member with the eagerly-built
-        // channel and never returns `Err` from `poll_ready`, so the `Buffer`
-        // wrapping it can NEVER poison on a transient inner readiness error
-        // (FL #6951). A Connected inner error re-makes transparently; a make
-        // error becomes a per-request error, not a latch.
-        let reconnect = tower::reconnect::Reconnect::with_connection(initial_channel, maker, ());
-        // 1024 slots per connection. With N connections, total capacity
-        // is N×1024 (e.g., 32×1024 = 32768), sufficient for burst peaks
-        // while providing backpressure under transport degradation.
-        let buffered = tower::buffer::Buffer::new(reconnect, 1024);
+        // Wrap the eagerly-built channel + its maker as the never-poison
+        // buffered member (FL #6951) via the SHARED helper (also used by the
+        // fast seam test, so a revert of the wrapping red-fails CI). 1024 slots
+        // per connection: with N connections, total capacity is N×1024 (e.g.
+        // 32×1024 = 32768), enough for burst peaks while providing
+        // backpressure under transport degradation.
+        //
+        // No-CPU-spin property depends on the inner `tonic_h3::RequestSender::
+        // poll_ready` returning `Pending` (not a synchronous `Ready(Err)`)
+        // while a dead connection is being re-dialed: `Reconnect::poll_ready`
+        // loops on a Connected `poll_ready` `Err` (reconnect/mod.rs:119-134),
+        // so an inner service that failed SYNCHRONOUSLY every poll would
+        // hot-spin that loop. `RequestSender` awaits its connect future
+        // (h3-util-0.0.5 client_conn.rs:148-160 returns `Pending`), so the
+        // loop parks — but a future h3 change to synchronous-fail readiness
+        // would need a backoff here.
+        let buffered = wrap_reconnecting_member(initial_channel, maker, 1024);
         channels.push(buffered);
     }
 
@@ -819,24 +889,28 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerification {
 /// timeouts latched all 32 members and instant-failed 35,682 reads for hours.
 ///
 /// The fix wraps each member's inner service in `tower::reconnect::Reconnect`
-/// INSIDE the `Buffer`. `Reconnect::poll_ready` never returns `Err`: a
-/// Connected inner `poll_ready` error transitions to `Idle` and transparently
-/// re-makes the service, so the `Buffer` never observes an inner `poll_ready`
-/// `Err` and can never poison.
+/// INSIDE the `Buffer` (via the production `wrap_reconnecting_member` helper,
+/// which these tests ALSO call so a revert of the wrapping red-fails a fast
+/// non-ignored test — see `production_helper_wraps_reconnect_and_self_heals`).
+/// `Reconnect::poll_ready` does not surface an inner `poll_ready` `Err` to the
+/// `Buffer` — a Connected inner error transitions to `Idle` and transparently
+/// re-makes the service — PROVIDED the maker's own `poll_ready` is infallible
+/// (`Reconnect::poll_ready` does `mk_service.poll_ready(cx)?`); the
+/// `maker_poll_ready_err_repoisons_buffer` test guards that dependency.
 ///
-/// These tests exercise the SEAM (Buffer-alone vs Buffer+Reconnect) with fake
-/// tower services so they are deterministic and require no real transport —
-/// the real-transport self-heal is covered by the `nativelink-store`
-/// integration test.
+/// These tests exercise the SEAM with fake tower services so they are
+/// deterministic and require no real transport — the real-transport self-heal
+/// is covered by the `tests/quic_reconnect_selfheal_test.rs` integration test.
 #[cfg(all(test, feature = "quic"))]
 mod reconnect_seam_tests {
     use core::future::{Ready, ready};
-    use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use core::task::{Context, Poll};
     use std::sync::Arc;
 
     use tower::{BoxError, Service};
+
+    use super::wrap_reconnecting_member;
 
     /// Fake inner service that fails its FIRST `poll_ready` (across all
     /// instances that share `already_poisoned`), then is healthy forever.
@@ -876,6 +950,7 @@ mod reconnect_seam_tests {
     /// Fake `MakeService` (`Service<()>`) producing a fresh `PoisonOnce` per
     /// make, all sharing the same one-shot `already_poisoned` flag, and
     /// counting makes so the test can assert a reconnect actually happened.
+    /// Its `poll_ready` is infallible — mirrors `H3ChannelMaker`.
     struct FakeMaker {
         already_poisoned: Arc<AtomicBool>,
         makes: Arc<AtomicUsize>,
@@ -896,6 +971,72 @@ mod reconnect_seam_tests {
             self.makes.fetch_add(1, Ordering::SeqCst);
             ready(Ok(PoisonOnce {
                 already_poisoned: Arc::clone(&self.already_poisoned),
+            }))
+        }
+    }
+
+    /// Inner service that is always `poll_ready`-Ok but whose `call` FUTURE
+    /// resolves to `Err`. Models a per-request RPC failure (not a readiness
+    /// failure). `Reconnect` must NOT rebuild on this (only on `poll_ready`
+    /// errors); the `makes` counter proves it.
+    struct CallAlwaysErrors;
+
+    impl Service<()> for CallAlwaysErrors {
+        type Response = &'static str;
+        type Error = BoxError;
+        type Future = Ready<Result<&'static str, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: ()) -> Self::Future {
+            ready(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "per-request RPC error (not a readiness failure)",
+            )))
+        }
+    }
+
+    /// Maker for `CallAlwaysErrors`, counting makes.
+    struct CallErrorMaker {
+        makes: Arc<AtomicUsize>,
+    }
+
+    impl Service<()> for CallErrorMaker {
+        type Response = CallAlwaysErrors;
+        type Error = BoxError;
+        type Future = Ready<Result<CallAlwaysErrors, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _target: ()) -> Self::Future {
+            self.makes.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(CallAlwaysErrors))
+        }
+    }
+
+    /// A FALLIBLE maker: its `poll_ready` returns `Err`. This violates the
+    /// `H3ChannelMaker::poll_ready` INVARIANT on purpose, to prove the
+    /// invariant is load-bearing (a fallible maker re-poisons the `Buffer`).
+    struct FallibleMaker;
+
+    impl Service<()> for FallibleMaker {
+        type Response = PoisonOnce;
+        type Error = BoxError;
+        type Future = Ready<Result<PoisonOnce, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "fallible maker readiness error",
+            )))
+        }
+
+        fn call(&mut self, _target: ()) -> Self::Future {
+            // Never reached — `poll_ready` fails first — but must type-check.
+            ready(Ok(PoisonOnce {
+                already_poisoned: Arc::new(AtomicBool::new(true)),
             }))
         }
     }
@@ -944,37 +1085,20 @@ mod reconnect_seam_tests {
         );
     }
 
-    /// (b) Proves the FIX: `Buffer::new(Reconnect::new(maker, target), cap)`
-    /// self-heals after the same transient error — a subsequent call SUCCEEDS.
-    ///
-    /// MUTATION: replace the `Reconnect::new(...)` inner with a bare
-    /// `PoisonOnce` (drop `Reconnect`) and this test MUST fail with the
-    /// bespoke `.expect` message below.
-    #[tokio::test(flavor = "current_thread")]
-    async fn buffer_with_reconnect_self_heals_after_transient_error() {
-        let already_poisoned = Arc::new(AtomicBool::new(false));
-        let makes = Arc::new(AtomicUsize::new(0));
-        let maker = FakeMaker {
-            already_poisoned: Arc::clone(&already_poisoned),
-            makes: Arc::clone(&makes),
-        };
-
-        let mut buffered =
-            tower::buffer::Buffer::new(tower::reconnect::Reconnect::new(maker, ()), 4);
-
-        // Issue calls until one succeeds. The FIRST inner `poll_ready` errors
-        // (transient); `Reconnect` swallows it, re-makes a healthy service,
-        // and a subsequent call must succeed — the Buffer never poisons.
-        // A generic `is_ok()` here would let a `tokio::time::Elapsed` (from a
-        // hung latch) masquerade as success, so we assert with a bespoke
-        // deadline message AND on the served payload.
+    /// Drive `buffered` until a call succeeds (or the retry budget is spent),
+    /// asserting with a bespoke deadline message so a hung latch's
+    /// `tokio::time::Elapsed` cannot masquerade as success.
+    async fn assert_self_heals<S>(buffered: &mut S)
+    where
+        S: Service<(), Response = &'static str, Error = BoxError>,
+    {
         let mut last_err: Option<BoxError> = None;
         let mut served: Option<&'static str> = None;
         for _ in 0..4 {
             let outcome: Result<Result<&'static str, BoxError>, tokio::time::error::Elapsed> =
                 tokio::time::timeout(
                     core::time::Duration::from_secs(5),
-                    ready_and_call(&mut buffered),
+                    ready_and_call(buffered),
                 )
                 .await;
             let call_result = outcome.expect(
@@ -989,7 +1113,6 @@ mod reconnect_seam_tests {
                 Err(e) => last_err = Some(e),
             }
         }
-
         let served = served.unwrap_or_else(|| {
             panic!(
                 "never-poison invariant violated: a transient poll_ready error \
@@ -1001,15 +1124,152 @@ mod reconnect_seam_tests {
             served, "served",
             "reconnected member must serve the request payload",
         );
+    }
+
+    /// (b, `Reconnect::new` topology) Proves the FIX: `Buffer(Reconnect::new(
+    /// maker))` self-heals after the transient error — a subsequent call
+    /// SUCCEEDS and the maker was driven at least twice (initial lazy make +
+    /// post-error re-make).
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffer_with_reconnect_self_heals_after_transient_error() {
+        let already_poisoned = Arc::new(AtomicBool::new(false));
+        let makes = Arc::new(AtomicUsize::new(0));
+        let maker = FakeMaker {
+            already_poisoned: Arc::clone(&already_poisoned),
+            makes: Arc::clone(&makes),
+        };
+
+        let mut buffered =
+            tower::buffer::Buffer::new(tower::reconnect::Reconnect::new(maker, ()), 4);
+
+        assert_self_heals(&mut buffered).await;
         assert!(
             makes.load(Ordering::SeqCst) >= 2,
-            "Reconnect must have re-made the inner service at least once after the \
-             transient error (makes={})",
+            "with Reconnect::new (lazy), the maker makes the initial service AND \
+             re-makes after the transient error (makes={})",
             makes.load(Ordering::SeqCst),
         );
+    }
 
-        // Silence unused-Pin import lint if the trait path shifts; keep the
-        // deadline type explicit above to prove Elapsed cannot pass as Ok.
-        let _ = core::marker::PhantomData::<Pin<Box<()>>>;
+    /// (item 6, `with_connection` topology — PRODUCTION shape, via the SHARED
+    /// production helper `wrap_reconnecting_member`) Proves the FIX self-heals
+    /// with a SEEDED initial member. Because the initial (poisoned) member is
+    /// supplied, the maker makes ≥1 time (the post-error re-make only), unlike
+    /// the lazy `Reconnect::new` variant.
+    ///
+    /// WIRING GUARD (item 3): this calls `wrap_reconnecting_member` — the SAME
+    /// helper the production `h3_channel` loop calls. A revert that drops the
+    /// `Reconnect` layer from that helper red-fails THIS fast non-ignored test.
+    ///
+    /// MUTATION: change `wrap_reconnecting_member`'s body to
+    /// `tower::buffer::Buffer::new(initial, cap)` (drop `Reconnect`) → this
+    /// test fails with the never-poison message in `assert_self_heals`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_helper_wraps_reconnect_and_self_heals() {
+        let already_poisoned = Arc::new(AtomicBool::new(false));
+        let makes = Arc::new(AtomicUsize::new(0));
+
+        // Seed: the initial member fires the transient poll_ready error once.
+        let initial = PoisonOnce {
+            already_poisoned: Arc::clone(&already_poisoned),
+        };
+        let maker = FakeMaker {
+            already_poisoned: Arc::clone(&already_poisoned),
+            makes: Arc::clone(&makes),
+        };
+
+        // Exact production composition via the shared helper.
+        let mut buffered = wrap_reconnecting_member::<(), _, _>(initial, maker, 4);
+
+        assert_self_heals(&mut buffered).await;
+        assert!(
+            makes.load(Ordering::SeqCst) >= 1,
+            "with_connection seeds the initial member, so the maker only needs to \
+             re-make once after the transient error (makes={})",
+            makes.load(Ordering::SeqCst),
+        );
+    }
+
+    /// (item 1c) Guard for the load-bearing `H3ChannelMaker::poll_ready`
+    /// infallibility INVARIANT. `Reconnect::poll_ready` propagates the maker's
+    /// readiness with `mk_service.poll_ready(cx)?`, so a FALLIBLE maker lets a
+    /// `poll_ready` `Err` escape to the `Buffer`, which then poisons. This
+    /// PROVES that the never-poison guarantee depends on the maker staying
+    /// infallible: a future edit making the real maker fallible would
+    /// reintroduce FL #6951, and this test documents/locks that dependency.
+    #[tokio::test(flavor = "current_thread")]
+    async fn maker_poll_ready_err_repoisons_buffer() {
+        // Start from `Idle` (Reconnect::new, no seed) so the very first
+        // `poll_ready` drives the fallible maker: `Reconnect::poll_ready` does
+        // `mk_service.poll_ready(cx)?`, so the maker's `Err` escapes to the
+        // Buffer and poisons it.
+        let mut buffered =
+            tower::buffer::Buffer::new(tower::reconnect::Reconnect::new(FallibleMaker, ()), 4);
+
+        // The fallible maker's poll_ready Err escapes Reconnect → poisons the
+        // Buffer. Every call must then fail with the tower ServiceError,
+        // permanently — the exact re-poison the invariant forbids in prod.
+        let mut latched = false;
+        for _ in 0..3 {
+            let outcome = tokio::time::timeout(
+                core::time::Duration::from_secs(5),
+                ready_and_call(&mut buffered),
+            )
+            .await
+            .expect("fallible-maker call must not hang");
+            if let Err(e) = outcome
+                && e.to_string().contains("buffered service failed")
+            {
+                latched = true;
+                break;
+            }
+        }
+        assert!(
+            latched,
+            "a FALLIBLE maker poll_ready MUST re-poison the Buffer — this proves \
+             H3ChannelMaker::poll_ready infallibility is load-bearing for the FL \
+             #6951 never-poison guarantee",
+        );
+    }
+
+    /// (item 5) Over-action guard: `Reconnect` rebuilds ONLY on a `poll_ready`
+    /// error, NOT on a per-request `call()`-future error. Repeated call-errors
+    /// must NOT churn the maker (no reconnect storm on honest RPC errors).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_does_not_rebuild_on_call_error() {
+        let makes = Arc::new(AtomicUsize::new(0));
+        let maker = CallErrorMaker {
+            makes: Arc::clone(&makes),
+        };
+        // Seed the initial (always-poll_ready-Ok, call-errors) member via the
+        // production helper so poll_ready NEVER errors — only calls do.
+        let mut buffered =
+            wrap_reconnecting_member::<(), _, _>(CallAlwaysErrors, maker, 4);
+
+        // Issue several requests; each `call` future resolves to Err, but
+        // poll_ready stays Ok, so Reconnect must not re-make.
+        for _ in 0..5 {
+            let outcome = tokio::time::timeout(
+                core::time::Duration::from_secs(5),
+                ready_and_call(&mut buffered),
+            )
+            .await
+            .expect("call-error request must not hang");
+            let err = outcome.expect_err("CallAlwaysErrors must surface a call error");
+            assert!(
+                !err.to_string().contains("buffered service failed"),
+                "a per-request call error must NOT poison the Buffer (got: {err})",
+            );
+        }
+
+        // `with_connection` seeds the member (0 makes) and a call-error must
+        // not trigger any re-make: the maker was never driven.
+        assert_eq!(
+            makes.load(Ordering::SeqCst),
+            0,
+            "Reconnect must NOT rebuild on per-request call() errors — the maker \
+             was driven {} time(s), indicating an unwanted reconnect storm",
+            makes.load(Ordering::SeqCst),
+        );
     }
 }

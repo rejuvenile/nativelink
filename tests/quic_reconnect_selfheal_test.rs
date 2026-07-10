@@ -52,11 +52,15 @@
 //! server appears.
 //!
 //! `#[ignore]` by default: the initial dead-port connect is bounded by quinn's
-//! handshake/idle timeout, so a run takes ~15-30s of real time. The seam-level
-//! guarantee is also pinned deterministically and fast by the
-//! `tls_utils::reconnect_seam_tests` unit tests (Buffer-alone poisons;
-//! Buffer+Reconnect recovers, with a mutation proving the discriminator). Run
-//! explicitly with `--ignored`.
+//! handshake/idle timeout, so a run takes ~15-30s of real time. The PRODUCTION
+//! wiring is also pinned deterministically and fast by the
+//! `tls_utils::reconnect_seam_tests` unit tests — in particular
+//! `production_helper_wraps_reconnect_and_self_heals`, which drives the SAME
+//! `wrap_reconnecting_member` helper the production `h3_channel` loop uses, so a
+//! revert of the `Reconnect` wrapping red-fails a fast NON-ignored test (it
+//! also fails to compile production). This integration test is the
+//! real-transport corroboration, not the sole guard. Run explicitly with
+//! `--ignored`.
 
 #![cfg(feature = "quic")]
 
@@ -415,4 +419,123 @@ async fn quic_read_self_heals_after_transient_transport_failure() {
     );
 
     server.kill().await;
+}
+
+/// Invariant clause (b) — NO SILENT TRUNCATION under a mid-stream reset.
+///
+/// The never-poison invariant forbids "truncated streamed data". A read of a
+/// blob LARGER than the server's `max_bytes_per_stream` (3 MiB) is delivered as
+/// multiple gRPC `ReadResponse` frames over ONE QUIC stream. If the connection
+/// is reset MID-BODY, `get_part_unchunked` MUST NOT return a short (truncated)
+/// buffer as `Ok` that a caller would mistake for the whole object. The ONLY
+/// forbidden outcome is `Ok(short_bytes)`. All other outcomes satisfy the
+/// invariant:
+///   - `Ok(full, bit-identical)`  — the reset landed after the last byte, or a
+///                                   transparent reconnect/retry completed it;
+///   - `Err(_)`                    — a clean surfaced failure;
+///   - `Elapsed` (bounded stall)  — the read did not TERMINATE, so it never
+///                                   handed a partial object to the caller (a
+///                                   stall is a liveness concern tracked
+///                                   elsewhere, not a silent truncation).
+///
+/// We reset the connection shortly after issuing the multi-frame read (server
+/// killed, then RESTARTED on the same port so the client's own transparent
+/// reconnect can drive the read to a definite Ok/Err rather than a permanent
+/// stall). Staggered delays across iterations bias the reset toward different
+/// points in the transfer. `#[ignore]` (real quinn; grouped with the other
+/// real-transport test).
+///
+/// MUTATION check for this guard: replacing the length+content assertion with a
+/// bare `is_ok()` would let a truncated `Ok(short_bytes)` pass — the explicit
+/// length + `assert_eq!(got, data)` is what makes truncation observable.
+#[ignore = "real-quinn mid-stream reset timing; grouped with the other real-transport test"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_multiframe_read_never_silently_truncates_on_reset() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let certs = generate_tls_certs();
+    let store_manager = make_store_manager();
+
+    // 6 MiB: above max_bytes_per_stream (3 MiB → ≥2 frames) but below the
+    // client's parallel_chunk_read_threshold (8 MiB) so it stays a single
+    // multi-frame QUIC stream rather than fanning into parallel chunk reads.
+    let (digest, data) = make_blob(6 * 1024 * 1024);
+    {
+        let store = store_manager
+            .get_store("main_cas")
+            .expect("main_cas not found");
+        store
+            .update_oneshot(digest, data.clone())
+            .await
+            .expect("failed to prepopulate large blob");
+    }
+
+    // Run several interleavings; each biases the reset toward mid-stream via a
+    // small, staggered delay after issuing the read.
+    for iteration in 0..6u64 {
+        let port = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve port");
+            s.local_addr().unwrap().port()
+        };
+        let server = QuicServer::start(&store_manager, &certs, port).await;
+        let client = make_quic_client(port).await;
+
+        // Prime the connection with a small successful read so the multi-frame
+        // read below starts on an established connection (isolating the effect
+        // to the mid-stream reset, not the initial connect).
+        let _ = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.get_part_unchunked(digest, 0, Some(4096)),
+        )
+        .await
+        .expect("prime read must not hang");
+
+        // Issue the full multi-frame read; concurrently reset the connection
+        // after a brief delay (server killed then RESTARTED on the same port so
+        // the client's transparent reconnect can reach a definite outcome).
+        let read_fut = client.get_part_unchunked(digest, 0, None);
+        let sm = Arc::clone(&store_manager);
+        let certs_clone = TlsCerts {
+            cert_pem: certs.cert_pem.clone(),
+            key_pem: certs.key_pem.clone(),
+        };
+        let killer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1 + iteration * 2)).await;
+            server.kill().await;
+            // Restart on the same port so a retry/reconnect has a live peer.
+            QuicServer::start(&sm, &certs_clone, port).await
+        });
+
+        // Bounded so a stall cannot hang the suite. A timeout is an ACCEPTABLE
+        // outcome (no partial object was handed back); only Ok(short) fails.
+        let result = tokio::time::timeout(Duration::from_secs(20), read_fut).await;
+        let server2 = killer.await.expect("killer task panicked");
+
+        match result {
+            Ok(Ok(got)) => {
+                assert_eq!(
+                    got.len(),
+                    data.len(),
+                    "iteration {iteration}: SILENT TRUNCATION — get_part_unchunked \
+                     returned Ok with {} bytes for a {}-byte blob after a mid-stream \
+                     reset; a truncated buffer must surface as Err, never Ok",
+                    got.len(),
+                    data.len(),
+                );
+                assert_eq!(
+                    got, data,
+                    "iteration {iteration}: full-length but CONTENT-CORRUPTED read \
+                     after mid-stream reset",
+                );
+            }
+            Ok(Err(_e)) => {
+                // Clean surfaced error — did not deliver a partial object.
+            }
+            Err(_elapsed) => {
+                // Bounded stall — the read never terminated, so it never handed
+                // back a truncated buffer. Acceptable for this invariant.
+            }
+        }
+
+        server2.kill().await;
+    }
 }
