@@ -561,25 +561,47 @@ pub struct GrpcStore {
         help = "Genuine-QUIC-leg read failures that are neither a genuine transport timeout nor an NL_REDIRECT (other transport/backpressure/application errors)"
     )]
     quic_read_other_fail: AtomicU64,
-    /// #6 QUIC transport-timeout RECOVERY counter: increments once per
-    /// genuine-timeout→success TRANSITION on a single-stream read operation —
-    /// an attempt recorded a genuine transport timeout on the QUIC leg, then a
-    /// LATER attempt of the SAME retrier sequence succeeded (`read_internal`
-    /// returned a stream), i.e. the FL #6951 `tls_utils.rs` `Reconnect` layer
-    /// rebuilt the pool member and the read healed. The per-operation
-    /// `saw_quic_transport_timeout` flag is CLEARED on each recovery, so a
-    /// second timeout→success cycle within one operation counts again (each is
-    /// a real heal). This is the observable signal for the fix's NEW failure
-    /// shape ("transient timeout → reconnect → heal").
+    /// #6 QUIC in-transport RECONNECT-recovery counter: increments once per
+    /// timeout→reconnect TRANSITION on a single-stream read operation — an
+    /// attempt recorded a genuine transport timeout on the QUIC leg, then a
+    /// LATER attempt of the SAME retrier sequence got a fresh Ok STREAM HANDLE
+    /// from `read_internal` (grpc_store.rs `read_internal` Ok arm ~:2680).
     ///
-    /// LOAD-BEARING regime-shift discriminator: pair this against
-    /// `quic_read_transport_timeout`. HEALED-reconnect (the fix working) =
-    /// both climb roughly in lockstep. PERMANENT-latch (the fix regressed /
-    /// was reverted) = `quic_read_transport_timeout` climbs while THIS stays
-    /// FLAT, because a poisoned member instant-fails every subsequent read
-    /// (`consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD` → abort →
-    /// the operation returns `Err` and NEVER reaches the success arm that
-    /// increments this). So `timeout climbing WITHOUT recovery = regression`.
+    /// PRECISE SEMANTICS — read before drawing any conclusion from this:
+    /// * "recovered" means the transport RECONNECTED (a later `read_internal`
+    ///   returned Ok), NOT that the read COMPLETED. The streaming frame loop
+    ///   runs AFTER this increment and can still mid-fail (`Some(Err(status))`).
+    /// * The per-operation `saw_quic_transport_timeout` flag is CLEARED on each
+    ///   recovery, so a second timeout→reconnect cycle in one op counts again.
+    /// * NOT a proof that the SAME timed-out pool member self-healed via the
+    ///   `Reconnect` layer: `QuicChannel::poll_ready` is ROUND-ROBIN
+    ///   (`tls_utils.rs:430`) and each read uses a fresh `quic.clone()`, so the
+    ///   later Ok is often a DIFFERENT already-healthy member answering (a
+    ///   "round-robin dodge"), not the poisoned member rebuilding. This counter
+    ///   conflates member-self-heal with round-robin-dodge; both mean "a QUIC
+    ///   read succeeded after a transport timeout", which is what it measures.
+    /// * NOT in lockstep with `quic_read_transport_timeout`:
+    ///   `quic_read_transport_timeout` counts per-ATTEMPT, this counts per-OP,
+    ///   so a healthy pool that times out on N attempts before succeeding once
+    ///   shows N:1, not 1:1.
+    ///
+    /// USE — a RECOVERY-RATE signal, NOT a standalone regression detector.
+    /// A climbing `quic_read_transport_timeout` with a FLAT
+    /// `quic_read_timeout_recovered` has MULTIPLE causes; "the FL #6951 fix
+    /// regressed" is only ONE hypothesis and must NOT be concluded from these
+    /// two counters alone. The SAME shape (timeout↑, recovery flat) occurs
+    /// while the fix is perfectly intact when:
+    ///   1. the SERVER is unreachable (outage) — every read times out, nothing
+    ///      recovers in-transport → flat. Reverting the Reconnect fix here would
+    ///      RE-INTRODUCE the permanent poison; check server reachability FIRST.
+    ///   2. a timeout heals ACROSS operation boundaries — FSS sets a terminal
+    ///      error and the reader falls back to slow-store / peer-fetch, or a
+    ///      fresh higher-layer `get_part` succeeds; the heal is real but lands
+    ///      in a DIFFERENT operation, so this per-op counter stays flat.
+    ///   3. a purely-slow timeout exhausts retries (see below) before any
+    ///      attempt succeeds within the same operation.
+    /// Before concluding a regression, CORRELATE with server-reachability and
+    /// the fallback / peer-fetch counters — do NOT act on this counter alone.
     ///
     /// Scoped to the single-stream path (`prefer_tcp = false` → always the
     /// QUIC leg under Dual/Quic, one operation = one `LocalState` so
@@ -591,7 +613,7 @@ pub struct GrpcStore {
     /// CAPPED AT 1: single monotonic u64.
     #[cfg(feature = "quic")]
     #[metric(
-        help = "Single-stream QUIC read operations that recovered (succeeded on a later attempt after a genuine transport timeout) — pair with quic_read_transport_timeout: timeout climbing without this climbing = the FL#6951 reconnect fix regressed"
+        help = "Single-stream QUIC read ops that reconnected after a transport timeout (a later read_internal returned a fresh Ok stream; reconnected, NOT necessarily read-completed, and possibly a round-robin dodge to a different member). A recovery-RATE signal: a climbing quic_read_transport_timeout with this FLAT does NOT by itself mean the FL#6951 fix regressed — the same shape occurs during a server outage, a fallback-layer heal, or round-robin member-dodge; correlate with server-reachability + fallback/peer-fetch counters before concluding a regression"
     )]
     quic_read_timeout_recovered: AtomicU64,
     /// #FU rate-limit gate for the diagnostic `warn!`: monotonic nanos
@@ -1144,11 +1166,26 @@ impl GrpcStore {
         Some(class)
     }
 
-    /// #6 record a successful single-stream QUIC read that ends a retrier
-    /// operation which had seen ≥1 genuine transport timeout on the QUIC leg:
-    /// the FL #6951 `Reconnect` layer rebuilt the pool member and the read
-    /// healed. Increments `quic_read_timeout_recovered` — the regime-shift
-    /// discriminator (see the field doc).
+    /// #6 record that a single-stream read operation which had seen ≥1 genuine
+    /// transport timeout on the QUIC leg then got a fresh Ok stream from a
+    /// LATER `read_internal` attempt of the SAME operation — the transport
+    /// RECONNECTED (not necessarily that the read COMPLETED: the frame loop
+    /// runs after and can still mid-fail). Increments
+    /// `quic_read_timeout_recovered`, a recovery-RATE signal (NOT a standalone
+    /// regression detector — see the field doc for the outage / fallback-heal /
+    /// round-robin-dodge confounders).
+    ///
+    /// Note the recovery signal is intrinsically CONDITIONAL on reaching this
+    /// success arm, and there are TWO ways a genuine-timeout operation never
+    /// does — so flat recovery is EXPECTED whenever the transport stays broken
+    /// within the operation, independent of any regression:
+    ///   * latch-abort: an INSTANT-fail latch (`elapsed <= 50ms`) trips
+    ///     `looks_like_latched_pool` → `consecutive_latched_fails >=
+    ///     LATCHED_POOL_ABORT_THRESHOLD` → early `RetryResult::Err`.
+    ///   * retry-EXHAUSTION: a purely-SLOW timeout (`elapsed > 50ms`, no latch)
+    ///     is NOT caught by the abort; it retries until the backoff sequence
+    ///     runs out and `Retrier::retry` returns `Err` (`retry.rs`
+    ///     `iter.next() == None` → `ok_or_else(...)?`).
     ///
     /// Called from the single-stream success arm ONLY (see the field doc for
     /// why the parallel path is deliberately excluded). `saw_transport_timeout`
@@ -2542,9 +2579,11 @@ impl GrpcStore {
             /// #6 set true when an attempt of THIS operation recorded a genuine
             /// transport timeout on the QUIC leg (`record_quic_read_fail`
             /// returned `TransportTimeout`). If a LATER attempt of the same
-            /// operation then succeeds, the `Reconnect` layer healed the pool
-            /// member → increment `quic_read_timeout_recovered`. `quic`-only:
-            /// the recovery signal only exists where a QUIC transport does.
+            /// operation then gets a fresh Ok stream (the transport
+            /// reconnected — possibly via the `Reconnect` layer rebuilding the
+            /// member, possibly a round-robin dodge to a healthy member) →
+            /// increment `quic_read_timeout_recovered`. `quic`-only: the
+            /// recovery signal only exists where a QUIC transport does.
             #[cfg(feature = "quic")]
             saw_quic_transport_timeout: bool,
         }
@@ -2671,10 +2710,12 @@ impl GrpcStore {
                 // A successful read_internal means the pool is not latched.
                 local_state.consecutive_latched_fails = 0;
                 // #6: if a prior attempt of THIS operation genuinely
-                // transport-timed-out on the QUIC leg and we now succeeded, the
-                // `Reconnect` layer healed the pool member — record the
-                // recovery and clear the flag (so a subsequent timeout→success
-                // cycle is counted again). No-op if no timeout was seen.
+                // transport-timed-out on the QUIC leg and we now got a fresh Ok
+                // stream (the transport reconnected — see
+                // `record_quic_read_timeout_recovery` for the reconnect-vs-
+                // member-heal nuance), record the recovery and clear the flag
+                // (so a subsequent timeout→reconnect cycle is counted again).
+                // No-op if no timeout was seen.
                 #[cfg(feature = "quic")]
                 {
                     self.record_quic_read_timeout_recovery(
@@ -4032,6 +4073,14 @@ mod tests {
         ReadTransportKind, quic_read_fail_bucket, quic_read_fail_class,
         quic_read_fail_should_emit, quic_read_leg,
     };
+    #[cfg(feature = "quic")]
+    use core::sync::atomic::Ordering;
+    #[cfg(feature = "quic")]
+    use super::{GrpcStore, Transport};
+    #[cfg(feature = "quic")]
+    use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
+    #[cfg(feature = "quic")]
+    use nativelink_macro::nativelink_test;
     use super::{
         ChunkAttemptOutcome, LATCHED_POOL_ABORT_THRESHOLD, LATCHED_POOL_INSTANT_FAIL_MS,
         classify_chunk_attempt, looks_like_dead_channel, looks_like_latched_pool,
@@ -4700,6 +4749,180 @@ mod tests {
             QuicReadFailClass::Other,
             "ResourceExhausted backpressure is neither a transport timeout nor a \
              redirect — must classify as Other"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #6 fix-up: class→counter WIRING test (convergent: assumption-auditor +
+    // testing-czar). The pure `quic_read_fail_class` tests above prove the
+    // classifier; this proves `record_quic_read_fail` increments the RIGHT
+    // counter for each class (a dark-counter gap: a swapped `fetch_add` arm
+    // compiles clean and the pure tests still pass) AND that the #6 recovery
+    // counter increments only on `saw_transport_timeout == true`.
+    //
+    // No-server construction: `GrpcStore::new` does no network I/O for a QUIC
+    // spec — `tls_utils::h3_channel` binds local UDP sockets and QUIC dials
+    // lazily on first request. A literal-IP address (`127.0.0.1`) skips DNS
+    // (`to_socket_addrs` parses the IP), so a real `Transport::Quic` store is
+    // built with NO server listening.
+    // -----------------------------------------------------------------------
+
+    /// A localhost-IP QUIC `GrpcSpec` — builds a real `Transport::Quic` store
+    /// (binds UDP sockets, never dials) so the private counters +
+    /// `record_quic_read_fail` can be exercised without a server. IP literal
+    /// (not a hostname) so `h3_channel`'s `to_socket_addrs` needs no DNS.
+    #[cfg(feature = "quic")]
+    fn quic_test_spec() -> GrpcSpec {
+        GrpcSpec {
+            instance_name: String::new(),
+            endpoints: vec![GrpcEndpoint {
+                address: "https://127.0.0.1:50071".into(),
+                tls_config: None,
+                concurrency_limit: None,
+                connect_timeout_s: 0,
+                tcp_keepalive_s: 0,
+                http2_keepalive_interval_s: 0,
+                http2_keepalive_timeout_s: 0,
+                tcp_nodelay: true,
+                use_http3: true,
+            }],
+            store_type: StoreType::Cas,
+            retry: Retry::default(),
+            max_concurrent_requests: 0,
+            connections_per_endpoint: 1,
+            rpc_timeout_s: 0,
+            batch_update_threshold_bytes: 0,
+            max_concurrent_batch_rpcs: 8,
+            parallel_chunk_read_threshold: 0,
+            parallel_chunk_count: 0,
+            dual_transport: false,
+            zstd_compression: false,
+            connection_acquire_timeout_ms: None,
+            chunked_writes_enabled: false,
+            chunked_v2_writes_enabled: false,
+        }
+    }
+
+    /// `record_quic_read_fail` on a `Transport::Quic` store (single-stream
+    /// leg, `prefer_tcp = false`) must increment EXACTLY the counter matching
+    /// the error's content class, and return that class — closing the
+    /// class→counter dark-counter gap. Also asserts `record_quic_read_timeout_recovery`
+    /// increments the #6 counter only when a timeout was seen.
+    ///
+    /// **Mutation step (over-action guard):** swap the `Redirect` and `Other`
+    /// `fetch_add` arms in `record_quic_read_fail` (Redirect increments
+    /// `quic_read_other_fail`, Other increments `quic_read_redirect`). This
+    /// compiles clean and the pure classifier tests still pass — ONLY this
+    /// wiring test catches it: the redirect assertion red-fails with
+    /// "a FailedPrecondition NL_REDIRECT must increment quic_read_redirect".
+    #[cfg(feature = "quic")]
+    #[nativelink_test]
+    async fn record_quic_read_fail_increments_matching_content_counter() {
+        let store = GrpcStore::new(&quic_test_spec())
+            .await
+            .expect("build Transport::Quic store with no server (UDP binds, dials lazily)");
+        // Sanity: we actually built the QUIC transport (else the leg-gate would
+        // early-return and count nothing, making the assertions vacuous).
+        assert!(
+            matches!(store.transport, Transport::Quic(_)),
+            "test spec must build Transport::Quic — otherwise record_quic_read_fail \
+             early-returns via the leg gate and the counter assertions are vacuous"
+        );
+
+        // (a) Genuine transport timeout → quic_read_transport_timeout only.
+        let timeout_err = make_err!(
+            Code::Unknown,
+            "Service was not ready: buffered service failed: timed out"
+        );
+        let class = store.record_quic_read_fail(&timeout_err, 500, false);
+        assert_eq!(
+            class,
+            Some(QuicReadFailClass::TransportTimeout),
+            "record_quic_read_fail must return the recorded content class so the \
+             single-stream caller can drive the #6 recovery flag"
+        );
+        assert_eq!(
+            store.quic_read_transport_timeout.load(Ordering::Relaxed),
+            1,
+            "a genuine transport timeout (Unknown + buffered-service/timed-out) must \
+             increment quic_read_transport_timeout — the honest timeout count"
+        );
+        assert_eq!(
+            store.quic_read_redirect.load(Ordering::Relaxed),
+            0,
+            "a genuine timeout must NOT increment quic_read_redirect"
+        );
+        assert_eq!(
+            store.quic_read_other_fail.load(Ordering::Relaxed),
+            0,
+            "a genuine timeout must NOT increment quic_read_other_fail"
+        );
+
+        // (b) NL_REDIRECT → quic_read_redirect only (timeout counter unchanged).
+        let redirect_err = make_err!(
+            Code::FailedPrecondition,
+            "NL_REDIRECT: 127.0.0.1:50072"
+        );
+        let class = store.record_quic_read_fail(&redirect_err, 500, false);
+        assert_eq!(class, Some(QuicReadFailClass::Redirect));
+        assert_eq!(
+            store.quic_read_redirect.load(Ordering::Relaxed),
+            1,
+            "a FailedPrecondition NL_REDIRECT must increment quic_read_redirect — NOT \
+             the timeout counter (the exact prod defect: redirects were read as \
+             timeouts). If this fails with quic_read_redirect == 0 the redirect and \
+             other fetch_add arms were swapped"
+        );
+        assert_eq!(
+            store.quic_read_transport_timeout.load(Ordering::Relaxed),
+            1,
+            "a redirect must NOT inflate the timeout count (still 1 from step a)"
+        );
+        assert_eq!(
+            store.quic_read_other_fail.load(Ordering::Relaxed),
+            0,
+            "a redirect must NOT increment quic_read_other_fail"
+        );
+
+        // (c) Other → quic_read_other_fail only.
+        let other_err = make_err!(Code::Unknown, "transport error: connection reset");
+        let class = store.record_quic_read_fail(&other_err, 500, false);
+        assert_eq!(class, Some(QuicReadFailClass::Other));
+        assert_eq!(
+            store.quic_read_other_fail.load(Ordering::Relaxed),
+            1,
+            "an unrelated Unknown transport error must increment quic_read_other_fail"
+        );
+        assert_eq!(
+            store.quic_read_transport_timeout.load(Ordering::Relaxed),
+            1,
+            "an 'other' failure must NOT inflate the timeout count (still 1)"
+        );
+        assert_eq!(
+            store.quic_read_redirect.load(Ordering::Relaxed),
+            1,
+            "an 'other' failure must NOT increment quic_read_redirect (still 1)"
+        );
+
+        // (d) #6 recovery: increments iff a timeout was seen this operation.
+        assert_eq!(
+            store.quic_read_timeout_recovered.load(Ordering::Relaxed),
+            0,
+            "recovery counter starts at 0"
+        );
+        store.record_quic_read_timeout_recovery(true);
+        assert_eq!(
+            store.quic_read_timeout_recovered.load(Ordering::Relaxed),
+            1,
+            "record_quic_read_timeout_recovery(true) — a reconnect after a genuine \
+             transport timeout — must increment quic_read_timeout_recovered"
+        );
+        store.record_quic_read_timeout_recovery(false);
+        assert_eq!(
+            store.quic_read_timeout_recovered.load(Ordering::Relaxed),
+            1,
+            "record_quic_read_timeout_recovery(false) — no timeout was seen — must \
+             NOT increment (still 1): recovery is conditional on a prior timeout"
         );
     }
 }
