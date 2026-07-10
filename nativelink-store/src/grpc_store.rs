@@ -53,6 +53,8 @@ use nativelink_util::proto_stream_utils::{
 };
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::retry::{Retrier, RetryResult};
+#[cfg(feature = "quic")]
+use nativelink_util::store_trait::REDIRECT_PREFIX;
 use nativelink_util::store_trait::{
     IS_AC_PEER_FETCH, IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, DurableDelegation, MarkStableDelegation,
     PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
@@ -263,6 +265,71 @@ fn quic_read_fail_bucket(elapsed_ms: u64) -> QuicReadFailBucket {
     }
 }
 
+/// #3 QUIC read-failure CONTENT class: WHAT a failed QUIC read actually was,
+/// classified by error content (code + message) rather than by elapsed time.
+///
+/// This is the honest disambiguation the elapsed-only `instant`/`slow` split
+/// could not provide. In prod the `slow` bucket (elapsed > 50 ms) was
+/// DOMINATED by `FailedPrecondition` NL_REDIRECT signals — a normal P2P
+/// handoff (`bytestream_server.rs`, `Code::FailedPrecondition` +
+/// `REDIRECT_PREFIX`), NOT a genuine transport timeout — so `slow_fail_total`
+/// could not answer "how many genuine QUIC timeouts happened". Splitting on
+/// content makes the timeout count honest: `rate(quic_read_transport_timeout)`
+/// isolates real timeouts, `quic_read_redirect` accounts for the P2P-handoff
+/// noise, and `quic_read_other_fail` catches everything else.
+///
+/// Gated on `quic`: there is no QUIC transport in the no-quic build.
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicReadFailClass {
+    /// Genuine transport timeout: the tower-Buffer/quinn-idle-timeout
+    /// signature — `Code::Unknown` with a `"buffered service failed"` or
+    /// `"timed out"` message. This is the SAME message signature
+    /// `looks_like_latched_pool` matches, MINUS the 50 ms gate: a quinn
+    /// idle-timeout surfaced through the tower `Buffer` is SLOW (>50 ms), so
+    /// gating on elapsed would miss it. The ONLY class that answers "how many
+    /// genuine QUIC timeouts happened".
+    TransportTimeout,
+    /// `Code::FailedPrecondition` carrying `REDIRECT_PREFIX` — a normal P2P
+    /// handoff (the server redirecting the read to a worker peer), NOT a
+    /// transport failure. Broken out so it never inflates the timeout count.
+    Redirect,
+    /// Any other QUIC read failure (unrelated transport reset, backpressure,
+    /// application-level code, …). Not a genuine transport timeout — must not
+    /// inflate the timeout count.
+    Other,
+}
+
+/// Classify a failed QUIC read by error CONTENT (code + message). Pure — no
+/// elapsed input — so it is unit-testable without a transport and so a genuine
+/// (slow) idle-timeout is never dropped by an elapsed gate.
+///
+/// * `TransportTimeout` iff `code == Code::Unknown` AND any message contains
+///   `"buffered service"` OR `"timed out"` (either alone suffices — the
+///   tower-`Buffer` idle-timeout typically reads
+///   `"buffered service failed: timed out"`, but matching either substring is
+///   robust to upstream tonic/tower/quinn message composition changes).
+/// * `Redirect` iff `code == Code::FailedPrecondition` AND any message
+///   contains `REDIRECT_PREFIX` (`"NL_REDIRECT:"`).
+/// * `Other` otherwise.
+#[cfg(feature = "quic")]
+fn quic_read_fail_class(err: &Error) -> QuicReadFailClass {
+    if err.code == Code::Unknown
+        && err
+            .messages
+            .iter()
+            .any(|m| m.contains("buffered service") || m.contains("timed out"))
+    {
+        return QuicReadFailClass::TransportTimeout;
+    }
+    if err.code == Code::FailedPrecondition
+        && err.messages.iter().any(|m| m.contains(REDIRECT_PREFIX))
+    {
+        return QuicReadFailClass::Redirect;
+    }
+    QuicReadFailClass::Other
+}
+
 /// Transport-variant discriminant for the QUIC read-failure diagnostic's
 /// leg-gating predicate. Mirrors the three `Transport` variants but is a
 /// plain `Copy` enum so `quic_read_leg` is unit-testable without standing
@@ -458,6 +525,75 @@ pub struct GrpcStore {
         help = "Genuine-QUIC-leg read RPC failures with elapsed > 50ms (slow / backpressure-shaped)"
     )]
     quic_read_slow_fail: AtomicU64,
+    /// #3 CONTENT-classified QUIC read failures (orthogonal to the
+    /// `instant`/`slow` ELAPSED split above): WHAT the failure was, not how
+    /// long it took. Each genuine-QUIC-leg read failure increments EXACTLY ONE
+    /// of the three below (via `quic_read_fail_class`), so a scrape answers
+    /// "how many genuine QUIC timeouts happened" — the question the elapsed
+    /// split could not, because in prod the `slow` bucket was dominated by
+    /// `FailedPrecondition` NL_REDIRECT signals (normal P2P handoff), NOT
+    /// timeouts. Cumulative Prometheus counters (correct semantics — isolate
+    /// an incident with `rate()`/`increase()`, NOT a reset which would break
+    /// `rate()`). CAPPED AT 1: single monotonic u64 each; no bounding needed.
+    ///
+    /// GENUINE transport timeouts only: `Code::Unknown` + the tower-Buffer/
+    /// quinn-idle-timeout message signature (see `quic_read_fail_class`).
+    /// `rate(quic_read_transport_timeout)` is the honest "timeouts happening
+    /// now" signal. This is the counter to alert on.
+    #[cfg(feature = "quic")]
+    #[metric(
+        help = "Genuine-QUIC-leg read failures that are genuine transport timeouts (Code::Unknown + tower-Buffer/quinn-idle-timeout signature); NOT redirects — the honest timeout count"
+    )]
+    quic_read_transport_timeout: AtomicU64,
+    /// `Code::FailedPrecondition` + `NL_REDIRECT:` — a NORMAL P2P handoff, NOT
+    /// a transport failure. Broken out so it never inflates the timeout count;
+    /// high volume here is expected/benign. See `quic_read_transport_timeout`.
+    #[cfg(feature = "quic")]
+    #[metric(
+        help = "Genuine-QUIC-leg read failures that are NL_REDIRECT P2P handoffs (Code::FailedPrecondition + NL_REDIRECT prefix); normal protocol behavior, NOT a transport failure"
+    )]
+    quic_read_redirect: AtomicU64,
+    /// Any other genuine-QUIC-leg read failure (unrelated transport reset,
+    /// backpressure, application code). NOT a timeout. See
+    /// `quic_read_transport_timeout`.
+    #[cfg(feature = "quic")]
+    #[metric(
+        help = "Genuine-QUIC-leg read failures that are neither a genuine transport timeout nor an NL_REDIRECT (other transport/backpressure/application errors)"
+    )]
+    quic_read_other_fail: AtomicU64,
+    /// #6 QUIC transport-timeout RECOVERY counter: increments once per
+    /// genuine-timeout→success TRANSITION on a single-stream read operation —
+    /// an attempt recorded a genuine transport timeout on the QUIC leg, then a
+    /// LATER attempt of the SAME retrier sequence succeeded (`read_internal`
+    /// returned a stream), i.e. the FL #6951 `tls_utils.rs` `Reconnect` layer
+    /// rebuilt the pool member and the read healed. The per-operation
+    /// `saw_quic_transport_timeout` flag is CLEARED on each recovery, so a
+    /// second timeout→success cycle within one operation counts again (each is
+    /// a real heal). This is the observable signal for the fix's NEW failure
+    /// shape ("transient timeout → reconnect → heal").
+    ///
+    /// LOAD-BEARING regime-shift discriminator: pair this against
+    /// `quic_read_transport_timeout`. HEALED-reconnect (the fix working) =
+    /// both climb roughly in lockstep. PERMANENT-latch (the fix regressed /
+    /// was reverted) = `quic_read_transport_timeout` climbs while THIS stays
+    /// FLAT, because a poisoned member instant-fails every subsequent read
+    /// (`consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD` → abort →
+    /// the operation returns `Err` and NEVER reaches the success arm that
+    /// increments this). So `timeout climbing WITHOUT recovery = regression`.
+    ///
+    /// Scoped to the single-stream path (`prefer_tcp = false` → always the
+    /// QUIC leg under Dual/Quic, one operation = one `LocalState` so
+    /// attribution is exact and never double-counted). The parallel path
+    /// under `Dual` routes over TCP (not a QUIC read) and under Quic-only
+    /// shares a cross-chunk atomic where a single logical recovery could be
+    /// over-counted, so it is deliberately NOT wired here — over-counting
+    /// would make "recovered" dishonest, which is worse than scoping it.
+    /// CAPPED AT 1: single monotonic u64.
+    #[cfg(feature = "quic")]
+    #[metric(
+        help = "Single-stream QUIC read operations that recovered (succeeded on a later attempt after a genuine transport timeout) — pair with quic_read_transport_timeout: timeout climbing without this climbing = the FL#6951 reconnect fix regressed"
+    )]
+    quic_read_timeout_recovered: AtomicU64,
     /// #FU rate-limit gate for the diagnostic `warn!`: monotonic nanos
     /// (since `QUIC_DIAG_EPOCH`) of the last emit. NOT a metric — internal
     /// gate state. Zero = never emitted. CAPPED AT 1: single u64.
@@ -649,6 +785,14 @@ impl GrpcStore {
             quic_read_instant_fail: AtomicU64::new(0),
             #[cfg(feature = "quic")]
             quic_read_slow_fail: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_transport_timeout: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_redirect: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_other_fail: AtomicU64::new(0),
+            #[cfg(feature = "quic")]
+            quic_read_timeout_recovered: AtomicU64::new(0),
             #[cfg(feature = "quic")]
             quic_read_fail_log_last_emit_nanos: AtomicU64::new(0),
             #[cfg(feature = "quic")]
@@ -888,8 +1032,20 @@ impl GrpcStore {
     #[cfg(not(feature = "quic"))]
     fn record_quic_read_fail(&self, _err: &Error, _elapsed_ms: u64, _prefer_tcp: bool) {}
 
+    /// Returns `Some(class)` iff this read actually traversed the QUIC leg and
+    /// was therefore counted — the CONTENT class recorded (`TransportTimeout`
+    /// / `Redirect` / `Other`) — else `None` (TCP-leg read: not observed).
+    /// The returned class lets the single-stream call site drive the #6
+    /// recovery counter (via `record_quic_read_timeout_recovery`): a
+    /// `TransportTimeout` here that is later followed by a success on the SAME
+    /// retrier operation is a healed reconnect.
     #[cfg(feature = "quic")]
-    fn record_quic_read_fail(&self, err: &Error, elapsed_ms: u64, prefer_tcp: bool) {
+    fn record_quic_read_fail(
+        &self,
+        err: &Error,
+        elapsed_ms: u64,
+        prefer_tcp: bool,
+    ) -> Option<QuicReadFailClass> {
         let kind = match &self.transport {
             Transport::Tcp(_) => ReadTransportKind::Tcp,
             Transport::Quic(_) => ReadTransportKind::Quic,
@@ -898,10 +1054,9 @@ impl GrpcStore {
         // Count + log ONLY if this read actually went over the QUIC leg.
         // TCP-leg failures (TCP transport, or Dual + prefer_tcp) are simply
         // not observed by this probe. The tag is the precise leg.
-        let Some(transport_kind) = quic_read_leg(kind, prefer_tcp) else {
-            return;
-        };
+        let transport_kind = quic_read_leg(kind, prefer_tcp)?;
 
+        // #FU ELAPSED split (instant-latch vs slow-backpressure shape).
         match quic_read_fail_bucket(elapsed_ms) {
             QuicReadFailBucket::Instant => {
                 self.quic_read_instant_fail.fetch_add(1, Ordering::Relaxed);
@@ -911,13 +1066,30 @@ impl GrpcStore {
             }
         }
 
+        // #3 CONTENT split (WHAT the failure was). Increment exactly one so a
+        // scrape can distinguish genuine transport timeout vs NL_REDIRECT vs
+        // other — the elapsed split alone conflated all three in the `slow`
+        // bucket.
+        let class = quic_read_fail_class(err);
+        match class {
+            QuicReadFailClass::TransportTimeout => {
+                self.quic_read_transport_timeout.fetch_add(1, Ordering::Relaxed);
+            }
+            QuicReadFailClass::Redirect => {
+                self.quic_read_redirect.fetch_add(1, Ordering::Relaxed);
+            }
+            QuicReadFailClass::Other => {
+                self.quic_read_other_fail.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         // Rate-limit the warn! (monotonic-nanos gate). Suppressed events
         // still count so the emitted line carries true volume.
         let now_nanos = quic_diag_now_nanos();
         let last_emit = self.quic_read_fail_log_last_emit_nanos.load(Ordering::Relaxed);
         if !quic_read_fail_should_emit(now_nanos, last_emit, QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS) {
             self.quic_read_fail_log_suppressed.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Some(class);
         }
         // Single-flight the emit: only the winner of the CAS publishes its
         // timestamp and prints; concurrent callers fall back to suppressed.
@@ -927,7 +1099,7 @@ impl GrpcStore {
             .is_err()
         {
             self.quic_read_fail_log_suppressed.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Some(class);
         }
         let suppressed_since_last = self.quic_read_fail_log_suppressed.swap(0, Ordering::Relaxed);
 
@@ -940,20 +1112,55 @@ impl GrpcStore {
             .unwrap_or("<no_message>");
         let msg_head_short: String = msg_head.chars().take(80).collect();
         let latch_classified = looks_like_latched_pool(err, elapsed_ms);
+        // `fail_class` is the HONEST label: the elapsed-only diagnostic below
+        // must not imply a `slow` event was a timeout — the CONTENT class says
+        // what it actually was.
+        let fail_class = match class {
+            QuicReadFailClass::TransportTimeout => "transport_timeout",
+            QuicReadFailClass::Redirect => "nl_redirect",
+            QuicReadFailClass::Other => "other",
+        };
         warn!(
             elapsed_ms,
             transport_kind,
+            fail_class,
             latch_classified,
             code = ?err.code,
             %msg_head_short,
             suppressed_since_last,
             instant_fail_total = self.quic_read_instant_fail.load(Ordering::Relaxed),
             slow_fail_total = self.quic_read_slow_fail.load(Ordering::Relaxed),
-            "GrpcStore QUIC read-failure diagnostic (#FU latch-vs-backpressure): \
-             tight elapsed cluster <=5ms confirms genuine instant latch; \
-             spread near the timeout bound confirms live backpressure the \
+            transport_timeout_total = self.quic_read_transport_timeout.load(Ordering::Relaxed),
+            redirect_total = self.quic_read_redirect.load(Ordering::Relaxed),
+            other_fail_total = self.quic_read_other_fail.load(Ordering::Relaxed),
+            "GrpcStore QUIC read-failure diagnostic (#FU latch-vs-backpressure + #3 \
+             content class): the `fail_class` field disambiguates a genuine \
+             `transport_timeout` from a normal `nl_redirect` P2P handoff (the \
+             `slow` elapsed bucket was dominated by redirects in prod, NOT \
+             timeouts); tight elapsed cluster <=5ms confirms genuine instant \
+             latch; spread near the timeout bound confirms live backpressure the \
              50ms latch gate is mis-classifying",
         );
+        Some(class)
+    }
+
+    /// #6 record a successful single-stream QUIC read that ends a retrier
+    /// operation which had seen ≥1 genuine transport timeout on the QUIC leg:
+    /// the FL #6951 `Reconnect` layer rebuilt the pool member and the read
+    /// healed. Increments `quic_read_timeout_recovered` — the regime-shift
+    /// discriminator (see the field doc).
+    ///
+    /// Called from the single-stream success arm ONLY (see the field doc for
+    /// why the parallel path is deliberately excluded). `saw_transport_timeout`
+    /// is the per-operation flag the caller set when `record_quic_read_fail`
+    /// returned `TransportTimeout`. The caller is itself `quic`-gated, so there
+    /// is no no-quic variant of this method (there is no QUIC transport, and so
+    /// no reconnect-recovery signal, without the `quic` feature).
+    #[cfg(feature = "quic")]
+    fn record_quic_read_timeout_recovery(&self, saw_transport_timeout: bool) {
+        if saw_transport_timeout {
+            self.quic_read_timeout_recovered.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Creates a CAS client with zstd compression configured if enabled.
@@ -2332,6 +2539,14 @@ impl GrpcStore {
             /// readers fall back (slow-store / peer-fetch) within seconds
             /// instead of burning the full 30s notify timeout.
             consecutive_latched_fails: u32,
+            /// #6 set true when an attempt of THIS operation recorded a genuine
+            /// transport timeout on the QUIC leg (`record_quic_read_fail`
+            /// returned `TransportTimeout`). If a LATER attempt of the same
+            /// operation then succeeds, the `Reconnect` layer healed the pool
+            /// member → increment `quic_read_timeout_recovered`. `quic`-only:
+            /// the recovery signal only exists where a QUIC transport does.
+            #[cfg(feature = "quic")]
+            saw_quic_transport_timeout: bool,
         }
 
         let local_state = LocalState {
@@ -2344,6 +2559,8 @@ impl GrpcStore {
             last_frame_at: std::time::Instant::now(),
             attempt: 0,
             consecutive_latched_fails: 0,
+            #[cfg(feature = "quic")]
+            saw_quic_transport_timeout: false,
         };
 
         let result = self.retrier
@@ -2406,10 +2623,23 @@ impl GrpcStore {
                             self.evict_pool_on_transport_err(&err);
                         }
                         // #FU QUIC read-failure diagnostic (observability-only):
-                        // record the latch-vs-backpressure split. `prefer_tcp =
-                        // false` here (single-stream), so under Dual this read
-                        // went over QUIC; counted only on the genuine QUIC leg.
-                        // No control-flow effect — reuses `attempt_elapsed_ms`.
+                        // record the latch-vs-backpressure split + #3 content
+                        // class. `prefer_tcp = false` here (single-stream), so
+                        // under Dual this read went over QUIC; counted only on
+                        // the genuine QUIC leg. No control-flow effect — reuses
+                        // `attempt_elapsed_ms`.
+                        #[cfg(feature = "quic")]
+                        {
+                            // #6: remember a genuine transport timeout on THIS
+                            // operation so a later successful attempt is counted
+                            // as a healed reconnect (recovery signal).
+                            if self.record_quic_read_fail(&err, attempt_elapsed_ms, false)
+                                == Some(QuicReadFailClass::TransportTimeout)
+                            {
+                                local_state.saw_quic_transport_timeout = true;
+                            }
+                        }
+                        #[cfg(not(feature = "quic"))]
                         self.record_quic_read_fail(&err, attempt_elapsed_ms, false);
                         // #2 Fix-C: if every attempt is an instant-fail
                         // latched-pool hit, abort retries early so FSS
@@ -2440,6 +2670,18 @@ impl GrpcStore {
                 };
                 // A successful read_internal means the pool is not latched.
                 local_state.consecutive_latched_fails = 0;
+                // #6: if a prior attempt of THIS operation genuinely
+                // transport-timed-out on the QUIC leg and we now succeeded, the
+                // `Reconnect` layer healed the pool member — record the
+                // recovery and clear the flag (so a subsequent timeout→success
+                // cycle is counted again). No-op if no timeout was seen.
+                #[cfg(feature = "quic")]
+                {
+                    self.record_quic_read_timeout_recovery(
+                        local_state.saw_quic_transport_timeout,
+                    );
+                    local_state.saw_quic_transport_timeout = false;
+                }
 
                 // Reset per-stream counter so we detect empty responses even
                 // when retrying at a non-zero read_offset.
@@ -2867,8 +3109,13 @@ impl GrpcStore {
                                                     // TCP and is NOT counted as a QUIC
                                                     // read; under Quic-only it IS counted.
                                                     // No control-flow effect — reuses
-                                                    // `attempt_elapsed_ms`.
-                                                    self.record_quic_read_fail(&err, attempt_elapsed_ms, true);
+                                                    // `attempt_elapsed_ms`. The returned
+                                                    // content class is deliberately
+                                                    // discarded: the #6 recovery counter is
+                                                    // scoped to the single-stream path only
+                                                    // (see `quic_read_timeout_recovered`).
+                                                    let _fail_class =
+                                                        self.record_quic_read_fail(&err, attempt_elapsed_ms, true);
                                                     if looks_like_latched_pool(&err, attempt_elapsed_ms) {
                                                         // Atomic add; another chunk racing here may
                                                         // also increment — first one to reach the
@@ -3781,8 +4028,9 @@ mod tests {
 
     #[cfg(feature = "quic")]
     use super::{
-        QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS, QuicReadFailBucket, ReadTransportKind,
-        quic_read_fail_bucket, quic_read_fail_should_emit, quic_read_leg,
+        QUIC_READ_FAIL_LOG_MIN_INTERVAL_NANOS, QuicReadFailBucket, QuicReadFailClass,
+        ReadTransportKind, quic_read_fail_bucket, quic_read_fail_class,
+        quic_read_fail_should_emit, quic_read_leg,
     };
     use super::{
         ChunkAttemptOutcome, LATCHED_POOL_ABORT_THRESHOLD, LATCHED_POOL_INSTANT_FAIL_MS,
@@ -4318,6 +4566,140 @@ mod tests {
             quic_read_leg(ReadTransportKind::Tcp, true),
             None,
             "Tcp-only + prefer_tcp=true must NOT count — there is no QUIC leg"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #3 QUIC read-failure CONTENT classifier: genuine-transport-timeout vs
+    // NL_REDIRECT vs other. The pre-fix diagnostic split QUIC read failures
+    // only on elapsed (instant/slow); in prod the `slow` bucket was dominated
+    // by `FailedPrecondition` NL_REDIRECT signals (normal P2P handoff), NOT
+    // genuine transport timeouts — so `slow_fail_total` could NOT answer "how
+    // many genuine QUIC timeouts happened". This classifier disambiguates by
+    // ERROR CONTENT so a scrape distinguishes the three classes. Pure so it is
+    // unit-testable without a transport.
+    // -----------------------------------------------------------------------
+
+    /// A genuine transport timeout (the tower-Buffer/quinn-idle-timeout
+    /// signature: `Code::Unknown` + a "buffered service failed"/"timed out"
+    /// message — the SAME signature `looks_like_latched_pool` matches, minus
+    /// the 50ms gate because a quinn idle-timeout is SLOW, not instant) must
+    /// classify as `TransportTimeout` — and a `FailedPrecondition` NL_REDIRECT
+    /// must NOT (it is `Redirect`), and vice-versa.
+    ///
+    /// **Mutation step:** swap the `TransportTimeout` and `Redirect` arms in
+    /// `quic_read_fail_class` (classify the Unknown+timeout as `Redirect` and
+    /// the FailedPrecondition+NL_REDIRECT as `TransportTimeout`). Each direction
+    /// red-fails with its bespoke message below — proving the classifier does
+    /// not conflate a normal P2P redirect with a genuine transport timeout (the
+    /// exact defect: `slow_fail_total` counted redirects as if they were
+    /// timeouts).
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_read_fail_class_separates_timeout_from_redirect() {
+        // The production tower-Buffer/quinn-idle-timeout error: tonic wraps
+        // the tower BoxError as Code::Unknown; the message is the stable
+        // `ServiceError` Display "buffered service failed: timed out".
+        let timeout = make_err!(
+            Code::Unknown,
+            "Service was not ready: buffered service failed: timed out"
+        );
+        assert_eq!(
+            quic_read_fail_class(&timeout),
+            QuicReadFailClass::TransportTimeout,
+            "genuine transport timeout (Code::Unknown + buffered-service/timed-out \
+             signature) must classify as TransportTimeout — this is the ONLY class \
+             that answers 'how many genuine QUIC timeouts happened'; if it were \
+             classified otherwise the timeout counter would stay dark during a real \
+             quinn idle-timeout incident"
+        );
+
+        // The production NL_REDIRECT: bytestream_server.rs:2427 emits
+        // `Code::FailedPrecondition` + a message containing REDIRECT_PREFIX
+        // ("NL_REDIRECT:") for a normal P2P handoff. This is NOT a transport
+        // failure and MUST NOT inflate the timeout count.
+        let redirect = make_err!(
+            Code::FailedPrecondition,
+            "NL_REDIRECT: 192.168.100.5:50071,192.168.100.6:50071"
+        );
+        assert_eq!(
+            quic_read_fail_class(&redirect),
+            QuicReadFailClass::Redirect,
+            "FailedPrecondition NL_REDIRECT is a normal P2P handoff, NOT a transport \
+             timeout — it must classify as Redirect. In prod the `slow` bucket was \
+             DOMINATED by these; counting them as timeouts is the exact defect this \
+             classifier fixes"
+        );
+    }
+
+    /// A genuine timeout classified as `TransportTimeout` regardless of elapsed:
+    /// the quinn idle-timeout is a SLOW (>50ms) failure, so a classifier that
+    /// (like `looks_like_latched_pool`) gated on `elapsed <= 50ms` would MISS
+    /// every real idle-timeout. `quic_read_fail_class` takes no elapsed input —
+    /// it matches the message signature alone.
+    ///
+    /// **Mutation step:** narrow the `TransportTimeout` message match in
+    /// `quic_read_fail_class` to require BOTH substrings (`&&` instead of `||`)
+    /// or drop the "timed out" alternative; a real idle-timeout that carries
+    /// only "buffered service failed" (no "timed out") then falls to `Other`
+    /// and this test red-fails.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_read_fail_class_timeout_matches_either_substring() {
+        // Buffered-service latch without the literal "timed out" text.
+        let buffered_only = make_err!(Code::Unknown, "buffered service failed: worker gone");
+        assert_eq!(
+            quic_read_fail_class(&buffered_only),
+            QuicReadFailClass::TransportTimeout,
+            "Unknown + 'buffered service failed' (no literal 'timed out') is still a \
+             transport-latch/timeout signature and must classify as TransportTimeout"
+        );
+        // Raw "timed out" text without the buffered-service framing.
+        let timed_out_only = make_err!(Code::Unknown, "transport error: connection timed out");
+        assert_eq!(
+            quic_read_fail_class(&timed_out_only),
+            QuicReadFailClass::TransportTimeout,
+            "Unknown + 'timed out' (no 'buffered service' framing) is still a genuine \
+             transport timeout and must classify as TransportTimeout"
+        );
+    }
+
+    /// Everything that is neither a genuine transport timeout nor an NL_REDIRECT
+    /// classifies as `Other` — so the timeout counter is NOT inflated by
+    /// unrelated backpressure/application errors. Covers: an Unknown error whose
+    /// message is unrelated (not a latch/timeout); a FailedPrecondition that is
+    /// NOT a redirect; and a plain application code.
+    ///
+    /// **Mutation step:** change the `Other` fallthrough in `quic_read_fail_class`
+    /// to `TransportTimeout`. The first assertion red-fails — an unrelated
+    /// Unknown transport reset would then be miscounted as a timeout.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_read_fail_class_other_is_not_timeout_or_redirect() {
+        // Unknown but NOT a latch/timeout signature.
+        let unknown_other = make_err!(Code::Unknown, "transport error: connection reset");
+        assert_eq!(
+            quic_read_fail_class(&unknown_other),
+            QuicReadFailClass::Other,
+            "Unknown WITHOUT the buffered-service/timed-out signature must classify as \
+             Other — it is not a genuine transport timeout and must not inflate the \
+             timeout counter"
+        );
+        // FailedPrecondition but NOT an NL_REDIRECT.
+        let fp_other = make_err!(Code::FailedPrecondition, "digest verification failed");
+        assert_eq!(
+            quic_read_fail_class(&fp_other),
+            QuicReadFailClass::Other,
+            "FailedPrecondition WITHOUT the NL_REDIRECT prefix is not a P2P handoff — \
+             must classify as Other, not Redirect"
+        );
+        // Plain application-level backpressure code.
+        let exhausted = make_err!(Code::ResourceExhausted, "server memory store at capacity");
+        assert_eq!(
+            quic_read_fail_class(&exhausted),
+            QuicReadFailClass::Other,
+            "ResourceExhausted backpressure is neither a transport timeout nor a \
+             redirect — must classify as Other"
         );
     }
 }
