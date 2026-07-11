@@ -3667,6 +3667,30 @@ mod tests {
     // config field must OVERRIDE the derived 25%-of-max_bytes `pin_cap` when
     // non-zero, and fall back to the derived value when 0. This is what lets an
     // operator raise the pin budget to 50% of max_bytes without touching max_bytes.
+    // FL-681 prod-incident probe (2026-07-11): the deployed config's
+    // `pin_cap_bytes: 20000000000` did NOT take effect (enforced pin_cap stayed
+    // at the 25% derived 10GB). The override test below sets the field DIRECTLY,
+    // so it cannot catch a DESERIALIZATION gap. This parses the EXACT deployed
+    // JSON to test the full config→pin_cap path.
+    #[tokio::test]
+    async fn pin_cap_bytes_deserializes_from_config_json_and_reaches_pin_cap() {
+        let json = r#"{"max_bytes": 40000000000, "pin_cap_bytes": 20000000000}"#;
+        let cfg: EvictionPolicy =
+            serde_json::from_str(json).expect("eviction_policy must deserialize");
+        assert_eq!(cfg.max_bytes, 40_000_000_000, "max_bytes control (known-working)");
+        assert_eq!(
+            cfg.pin_cap_bytes, 20_000_000_000,
+            "DESERIALIZATION dropped pin_cap_bytes (got {}) — would explain prod pin_cap=10GB",
+            cfg.pin_cap_bytes
+        );
+        let map = Arc::new(make_map_cb(&cfg));
+        assert_eq!(
+            map.pin_cap, 20_000_000_000,
+            "deserialized pin_cap_bytes must reach the eviction map's pin_cap (got {})",
+            map.pin_cap
+        );
+    }
+
     #[tokio::test]
     async fn pin_cap_bytes_config_overrides_derived_pin_cap() {
         // Derived-default path: pin_cap_bytes 0 → pin_cap = max_bytes * 25%.
