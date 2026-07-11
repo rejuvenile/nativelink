@@ -2490,7 +2490,7 @@ mod tests {
 
     use nativelink_config::stores::EvictionPolicy;
 
-    use super::{MokaEvictingMap, PinnedEntry, PIN_TIMEOUT_SECS};
+    use super::{MokaEvictingMap, PinnedEntry, PIN_SATURATION_HEADROOM_DIVISOR, PIN_TIMEOUT_SECS};
     use crate::evicting_map::{ItemCallback, LenEntry};
 
     // ---------------------------------------------------------------
@@ -3523,6 +3523,143 @@ mod tests {
             !map.indefinite_pin_saturated(),
             "indefinite_pin_saturated must clear once a BIS-ack frees pin_cap headroom — \
              real_pinned drops to 0 (< 3892), the gate is transient backpressure"
+        );
+    }
+
+    // FL-681 NAK boundary fix (de-confound MINOR-a): the predicate's NUMERATOR
+    // is `real_pinned = pinned_bytes − speculative_pinned_bytes`, NOT
+    // `pinned_bytes` and NOT `indefinite_pinned_bytes`. The original boundary
+    // test pinned a single indefinite blob, collapsing all three to the same
+    // value — so a numerator mutation to `pinned_bytes` or `indefinite_pinned_bytes`
+    // wrongly PASSED. This test holds a SPECULATIVE pin (so pinned_bytes >
+    // real_pinned) AND a TIME-BOUNDED real pin (so real_pinned >
+    // indefinite_pinned_bytes), then checks two boundary points that only
+    // `real_pinned` gets right.
+    #[tokio::test]
+    async fn real_pin_saturated_numerator_excludes_speculative_and_isnt_indefinite_only() {
+        // max_bytes 16384 → pin_cap = 4096, threshold = 3892,
+        // speculative_pin_cap = 16384 * 0.05 = 819.
+        let cfg = policy(16384, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // Speculative pin of 800 B (fits the 819 speculative sub-budget). It
+        // adds to pinned_bytes AND speculative_pinned_bytes, so it is EXCLUDED
+        // from real_pinned.
+        map.insert(10u64, BytesEntry(800)).await;
+        assert!(map.pin_key_speculative(10), "speculative pin (800 B) fits the 819 sub-budget");
+        assert_eq!(map.speculative_pinned_bytes(), 800, "speculative gauge must read 800");
+
+        // Indefinite pin of 3800 B → real_pinned = 3800 (indefinite counts as
+        // real), pinned_bytes = 4600, indefinite_pinned_bytes = 3800.
+        map.insert(11u64, BytesEntry(3800)).await;
+        assert!(map.pin_key_indefinite(11), "indefinite pin (3800 B) fits: real 0+3800 <= 4096");
+        assert_eq!(map.pinned_bytes(), 4600, "pinned_bytes = 800 spec + 3800 indefinite");
+        assert_eq!(map.indefinite_pinned_bytes(), 3800, "indefinite subset = 3800");
+
+        // CHECKPOINT 1 — real_pinned = 4600 − 800 = 3800 (< 3892) → NOT saturated.
+        // A `pinned_bytes` numerator (4600 >= 3892) would WRONGLY report saturated
+        // here → this assertion RED-fails under numerator → pinned_bytes.
+        assert!(
+            !map.indefinite_pin_saturated(),
+            "numerator must EXCLUDE speculative: real_pinned = pinned_bytes(4600) − \
+             speculative(800) = 3800 < threshold 3892 → NOT saturated. A pinned_bytes numerator \
+             (4600 >= 3892) would wrongly gate a worker whose real pin budget still has headroom"
+        );
+
+        // Add a TIME-BOUNDED (non-indefinite, non-speculative) real pin of 200 B
+        // → real_pinned = 4000 (>= 3892), but indefinite_pinned_bytes stays 3800
+        // (< 3892). Total refusal: real 3800 + 200 = 4000 <= 4096 → admitted.
+        map.insert(12u64, BytesEntry(200)).await;
+        assert!(map.pin_key(12), "time-bounded pin (200 B) fits: real 3800+200 = 4000 <= 4096");
+        assert_eq!(map.pinned_bytes(), 4800, "pinned_bytes = 800 + 3800 + 200");
+        assert_eq!(map.indefinite_pinned_bytes(), 3800, "indefinite subset UNCHANGED at 3800");
+
+        // CHECKPOINT 2 — real_pinned = 4800 − 800 = 4000 (>= 3892) → SATURATED.
+        // An `indefinite_pinned_bytes` numerator (3800 < 3892) would WRONGLY report
+        // NOT saturated here → this assertion RED-fails under numerator →
+        // indefinite_pinned_bytes.
+        assert!(
+            map.indefinite_pin_saturated(),
+            "numerator must be real_pinned, NOT indefinite_pinned_bytes: real_pinned = 4000 \
+             (indefinite 3800 + time-bounded 200) >= threshold 3892 → SATURATED. An \
+             indefinite_pinned_bytes numerator (3800 < 3892) would leave the gate dead while \
+             the total pin budget is full of time-bounded + indefinite real pins"
+        );
+    }
+
+    // FL-681 NAK boundary fix (de-confound MINOR-b): the predicate's CEILING is
+    // `pin_cap` (total pin budget), NOT `indefinite_pin_cap`. The original test's
+    // helper left `indefinite_pin_cap == pin_cap`, masking the choice. Here
+    // `indefinite_pin_cap` is set FAR above `pin_cap` so that gating on the wrong
+    // ceiling would never fire.
+    #[tokio::test]
+    async fn real_pin_saturated_ceiling_is_pin_cap_not_indefinite_cap() {
+        // max_bytes 16384 → derived pin_cap = 4096, threshold = 3892.
+        // indefinite_pin_cap set to 100_000 (>> pin_cap) via the indefinite-cap
+        // helper — a deliberately distinguishable ceiling.
+        let cfg = policy(16384, 0);
+        let map = Arc::new(make_map_cb_indefinite_cap(&cfg, 100_000));
+
+        // Indefinite pin of 3900 B → real_pinned = 3900 (>= 3892). It fits the
+        // total pin cap (0 + 3900 <= 4096) AND the large indefinite cap.
+        map.insert(20u64, BytesEntry(3900)).await;
+        assert!(map.pin_key_indefinite(20), "indefinite pin (3900 B) fits both caps");
+        assert_eq!(map.pinned_bytes(), 3900, "real_pinned = 3900");
+
+        // real_pinned 3900 >= pin_cap−5% (3892) → SATURATED against pin_cap.
+        // Against indefinite_pin_cap the threshold would be 100_000 − 5_000 =
+        // 95_000, so 3900 >= 95_000 is FALSE → an indefinite_pin_cap ceiling
+        // would report NOT saturated → this assertion RED-fails under ceiling →
+        // indefinite_pin_cap.
+        assert!(
+            map.indefinite_pin_saturated(),
+            "ceiling must be pin_cap (4096), NOT indefinite_pin_cap (100_000): real_pinned 3900 \
+             >= pin_cap−5% (3892) → SATURATED. An indefinite_pin_cap ceiling would need \
+             real_pinned >= 95_000 and never fire — the gate would be dead exactly as before"
+        );
+    }
+
+    // FL-681 NAK boundary fix (de-confound MINOR-c): pin the 5% band WIDTH and
+    // POSITION. Asserts the constant is 20 (declaration-site value) AND that a
+    // real_pinned BELOW the threshold does NOT saturate — a divisor mutation
+    // (e.g. 20→2, which widens the band to 50%) would fire early and RED-fail
+    // the below-threshold assertion.
+    #[tokio::test]
+    async fn real_pin_saturated_band_is_five_percent_at_divisor_twenty() {
+        assert_eq!(
+            PIN_SATURATION_HEADROOM_DIVISOR, 20,
+            "the saturation headroom band is pin_cap/PIN_SATURATION_HEADROOM_DIVISOR; the \
+             boundary tests assume divisor 20 (5%). If this changed, re-derive the thresholds."
+        );
+
+        // max_bytes 16384 → pin_cap = 4096; divisor 20 → threshold = 4096 − 204 = 3892.
+        let cfg = policy(16384, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // Pin 3800 B indefinitely → real_pinned = 3800, which is BELOW the
+        // divisor-20 threshold (3892) but ABOVE a divisor-2 threshold (2048).
+        map.insert(30u64, BytesEntry(3800)).await;
+        assert!(map.pin_key_indefinite(30), "indefinite pin (3800 B) fits under pin_cap 4096");
+        assert_eq!(map.pinned_bytes(), 3800, "real_pinned = 3800");
+
+        // 3800 < 3892 → NOT saturated at divisor 20. A divisor of 2 would put the
+        // threshold at 2048, so 3800 >= 2048 → wrongly SATURATED → this assertion
+        // RED-fails under divisor 20→2 (band too wide, gate fires too early).
+        assert!(
+            !map.indefinite_pin_saturated(),
+            "band position: real_pinned 3800 is BELOW the divisor-20 threshold (3892) so the gate \
+             must NOT fire. A wider band (e.g. divisor 2 → threshold 2048) would saturate here and \
+             NAK a worker with real headroom — over-eager backpressure churns the scheduler"
+        );
+
+        // Sanity: crossing to 3900 (>= 3892) DOES saturate — the band's near edge.
+        map.unpin_key(&30);
+        map.insert(31u64, BytesEntry(3900)).await;
+        assert!(map.pin_key_indefinite(31), "indefinite pin (3900 B) fits under pin_cap 4096");
+        assert!(
+            map.indefinite_pin_saturated(),
+            "band near-edge: real_pinned 3900 >= threshold 3892 → SATURATED (confirms the band \
+             fires at 5% below pin_cap, not lower)"
         );
     }
 

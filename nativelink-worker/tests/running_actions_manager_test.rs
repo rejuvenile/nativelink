@@ -143,14 +143,21 @@ mod tests {
     /// FL-681 Follow-up A: worker id used by the admission-gate tests.
     const ADMISSION_GATE_WORKER_ID: &str = "fl681_admission_gate_worker";
 
-    /// FL-681 Follow-up A: build a CAS `FastSlowStore` whose fast tier is a
-    /// `FilesystemStore` with an explicit indefinite-pin byte cap
-    /// (`pending_bis_pin_max_bytes`) and a non-zero eviction `max_bytes` (so
-    /// the saturation gate is governed — `max_bytes == 0` never gates). Returns
-    /// the concrete `FilesystemStore` handle alongside so the test can drive
-    /// the indefinite-pin set directly to saturate the cap.
+    /// FL-681 NAK boundary fix: build a CAS `FastSlowStore` whose fast tier is a
+    /// `FilesystemStore` with an explicit TOTAL pin cap (`pin_cap_bytes`, the
+    /// ceiling the post-fix `indefinite_pin_saturated` gate measures against)
+    /// and a non-zero eviction `max_bytes` (so the saturation gate is governed —
+    /// `max_bytes == 0` never gates). Sets `pending_bis_pin_max_bytes` to the
+    /// same value so indefinite pins remain bounded but never refuse before the
+    /// total cap. Returns the concrete `FilesystemStore` handle alongside so the
+    /// test can drive the pin set directly to saturate the cap.
+    ///
+    /// `max_bytes` is intentionally set LARGE relative to `pin_cap_bytes`: the
+    /// derived pin_cap would be `max_bytes * 0.25`, but the explicit
+    /// `pin_cap_bytes` overrides it to the small value, so a single blob can
+    /// saturate the gate deterministically without allocating a 262 KiB payload.
     async fn setup_capped_stores(
-        indefinite_pin_cap_bytes: u64,
+        pin_cap_bytes: u64,
         max_bytes: usize,
     ) -> Result<(Arc<FilesystemStore>, Arc<FastSlowStore>, Arc<MemoryStore>), Error> {
         let fast_config = FilesystemSpec {
@@ -158,9 +165,10 @@ mod tests {
             temp_path: make_temp_path("temp_path"),
             eviction_policy: Some(EvictionPolicy {
                 max_bytes,
+                pin_cap_bytes,
                 ..Default::default()
             }),
-            pending_bis_pin_max_bytes: indefinite_pin_cap_bytes,
+            pending_bis_pin_max_bytes: pin_cap_bytes,
             ..Default::default()
         };
         let slow_config = MemorySpec::default();
@@ -274,10 +282,12 @@ mod tests {
         })
     }
 
-    /// FL-681 Follow-up A (MAJOR-1b true close-out): drive the fast store's
-    /// indefinite-pin set to exactly its `pending_bis_pin_max_bytes` cap so
-    /// `indefinite_pin_saturated()` reports `true`. Inserts a `cap`-byte blob
-    /// and pins it indefinitely. Returns the saturating digest.
+    /// FL-681 NAK boundary fix: drive the fast store's TOTAL real-pin budget to
+    /// the saturation threshold so `indefinite_pin_saturated()` reports `true`.
+    /// Post-fix the gate fires at `real_pinned >= pin_cap - pin_cap/20`; inserting
+    /// a `cap`-byte blob and pinning it indefinitely puts `real_pinned = cap`,
+    /// which is >= the threshold when `pin_cap_bytes == cap` (as `setup_capped_stores`
+    /// configures). Returns the saturating digest.
     async fn saturate_indefinite_pin_cap(
         fast_store: &Arc<FilesystemStore>,
         cap_bytes: u64,
@@ -293,11 +303,14 @@ mod tests {
             .await?;
         assert!(
             fast_store.pin_digest_indefinite_with_result(&digest),
-            "saturating indefinite pin must succeed (the blob fills the cap exactly)"
+            "saturating indefinite pin must succeed (the blob fills the pin cap exactly: \
+             real_pinned + cap == pin_cap, admitted at the boundary)"
         );
         assert!(
             fast_store.indefinite_pin_saturated(),
-            "test precondition: indefinite-pin cap must read saturated after filling it"
+            "test precondition: total pin cap must read saturated after filling it — \
+             real_pinned ({}) must be >= pin_cap - 5%",
+            fast_store.pinned_bytes(),
         );
         Ok(digest)
     }
@@ -318,7 +331,10 @@ mod tests {
     #[nativelink_test]
     async fn f2_admission_gate_naks_when_indefinite_pin_saturated()
     -> Result<(), Box<dyn core::error::Error>> {
-        const CAP: u64 = 4096;
+        // Total pin cap chosen well above the ~4 KiB of incidental pins the
+        // action-proto CAS writes create, so only a deliberate saturating pin
+        // trips the gate (threshold = pin_cap - 5% = 249_037).
+        const CAP: u64 = 262_144;
         let (fast_store, cas_store, ac_store) = setup_capped_stores(CAP, 1024 * 1024).await?;
         let running_actions_manager =
             build_running_actions_manager(cas_store.clone(), ac_store, true).await?;
@@ -326,6 +342,18 @@ mod tests {
         saturate_indefinite_pin_cap(&fast_store, CAP).await?;
 
         let start_execute = make_start_execute(&cas_store).await?;
+
+        // (FL-681 NAK boundary fix) Capture the process-singleton NAK counter
+        // baseline IMMEDIATELY before the call — it is shared across the whole
+        // test binary, so a delta assertion (not an absolute) is the only
+        // ordering-safe check. This is the ONLY test that exercises the real
+        // production increment at `running_actions_manager.rs` create_and_add_action
+        // (the o11_probes/local_worker render test drives the singleton directly
+        // and never runs create_and_add_action).
+        let nak_before = nativelink_util::o11_probes::worker_admission_nak_counters()
+            .nak_pin_saturated
+            .load(core::sync::atomic::Ordering::Relaxed);
+
         let result = running_actions_manager
             .create_and_add_action(ADMISSION_GATE_WORKER_ID.to_string(), start_execute)
             .await;
@@ -340,6 +368,24 @@ mod tests {
             "the admission NAK MUST carry Code::ResourceExhausted so the scheduler re-queues it as \
              backpressure (any other code fails the action and churns instead of throttling): {err:?}"
         );
+
+        // (b) The production NAK site MUST have incremented the observability
+        // counter by exactly 1 — this is the signal that proves the gate fired
+        // on /metrics (the FL-681 dead-gate incident's missing evidence). This
+        // asserts the increment at the ACTUAL create_and_add_action call above,
+        // not a direct singleton poke.
+        let nak_after = nativelink_util::o11_probes::worker_admission_nak_counters()
+            .nak_pin_saturated
+            .load(core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            nak_after,
+            nak_before + 1,
+            "worker_admission_nak_pin_saturated_total must increment by exactly 1 when \
+             create_and_add_action NAKs a saturated worker — got delta {} (before {nak_before}, \
+             after {nak_after}). Without this increment the NAK gate fires but is DARK on /metrics: \
+             a live dead-gate is indistinguishable from a healthy pin budget (the FL-681 incident).",
+            nak_after.wrapping_sub(nak_before),
+        );
         Ok(())
     }
 
@@ -349,7 +395,10 @@ mod tests {
     #[nativelink_test]
     async fn f2_admission_gate_admits_when_indefinite_pin_has_headroom()
     -> Result<(), Box<dyn core::error::Error>> {
-        const CAP: u64 = 4096;
+        // Total pin cap chosen well above the ~4 KiB of incidental pins the
+        // action-proto CAS writes create, so only a deliberate saturating pin
+        // trips the gate (threshold = pin_cap - 5% = 249_037).
+        const CAP: u64 = 262_144;
         let (fast_store, cas_store, ac_store) = setup_capped_stores(CAP, 1024 * 1024).await?;
         let running_actions_manager =
             build_running_actions_manager(cas_store.clone(), ac_store, true).await?;
@@ -360,6 +409,15 @@ mod tests {
         );
 
         let start_execute = make_start_execute(&cas_store).await?;
+        // Sanity: the incidental pins from the action-proto CAS writes (~4 KiB)
+        // must be far below the saturation threshold (pin_cap - 5%), so a store
+        // with no deliberate saturating pin genuinely has headroom.
+        assert!(
+            !fast_store.indefinite_pin_saturated(),
+            "test precondition: after uploading action protos (incidental ~4 KiB of pins) a store \
+             with pin_cap {CAP} must still have headroom (real_pinned {} < pin_cap - 5%)",
+            fast_store.pinned_bytes(),
+        );
         running_actions_manager
             .create_and_add_action(ADMISSION_GATE_WORKER_ID.to_string(), start_execute)
             .await
@@ -378,7 +436,10 @@ mod tests {
     #[nativelink_test]
     async fn f2_admission_gate_inert_when_deferred_uploads_disabled()
     -> Result<(), Box<dyn core::error::Error>> {
-        const CAP: u64 = 4096;
+        // Total pin cap chosen well above the ~4 KiB of incidental pins the
+        // action-proto CAS writes create, so only a deliberate saturating pin
+        // trips the gate (threshold = pin_cap - 5% = 249_037).
+        const CAP: u64 = 262_144;
         let (fast_store, cas_store, ac_store) = setup_capped_stores(CAP, 1024 * 1024).await?;
         let running_actions_manager =
             build_running_actions_manager(cas_store.clone(), ac_store, false).await?;
