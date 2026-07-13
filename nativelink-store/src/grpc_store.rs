@@ -33,8 +33,9 @@ use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_s
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
     BatchUpdateBlobsResponse, FindMissingBlobsRequest, FindMissingBlobsResponse,
-    GetActionResultRequest, GetTreeRequest, GetTreeResponse, UpdateActionResultRequest,
-    batch_update_blobs_request, compressor,
+    GetActionResultRequest, GetTreeRequest, GetTreeResponse, SpliceBlobRequest, SpliceBlobResponse,
+    SplitBlobRequest, SplitBlobResponse, UpdateActionResultRequest, batch_update_blobs_request,
+    compressor,
 };
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::{
@@ -1724,6 +1725,100 @@ impl GrpcStore {
             "GrpcStore::get_tree call completed (#479)",
         );
         result
+    }
+
+    /// Forwards a `SplitBlob` RPC (REAPI content-defined chunking, #2497)
+    /// verbatim to the grpc backend, rewriting the instance name and reusing
+    /// the store's connection/retry handling — the backend owns chunking and
+    /// the chunk-layout index. Follows the `find_missing_blobs` forwarding
+    /// pattern.
+    pub async fn split_blob(
+        &self,
+        grpc_request: Request<SplitBlobRequest>,
+    ) -> Result<Response<SplitBlobResponse>, Error> {
+        error_if!(
+            matches!(self.store_type, nativelink_config::stores::StoreType::Ac),
+            "CAS operation on AC store"
+        );
+
+        let mut request = grpc_request.into_inner();
+        request.instance_name.clone_from(&self.instance_name);
+        self.perform_request(request, |request| async move {
+            match &self.transport {
+                Transport::Tcp(cm) => {
+                    let channel = cm
+                        .connection("split_blob".into())
+                        .await
+                        .err_tip(|| "in split_blob")?;
+                    self.cas_client(channel)
+                        .split_blob(Request::new(request))
+                        .await
+                        .err_tip(|| "in GrpcStore::split_blob")
+                }
+                #[cfg(feature = "quic")]
+                Transport::Quic(ch) => self
+                    .cas_client(ch.clone())
+                    .split_blob(Request::new(request))
+                    .await
+                    .err_tip(|| "in GrpcStore::split_blob (quic)"),
+                #[cfg(feature = "quic")]
+                Transport::Dual { quic, .. } => {
+                    // Small/metadata RPC: prefer QUIC
+                    self.cas_client(quic.clone())
+                        .split_blob(Request::new(request))
+                        .await
+                        .err_tip(|| "in GrpcStore::split_blob (dual/quic)")
+                }
+            }
+        })
+        .await
+    }
+
+    /// Forwards a `SpliceBlob` RPC (REAPI content-defined chunking, #2497)
+    /// verbatim to the grpc backend, rewriting the instance name and reusing
+    /// the store's connection/retry handling — the backend owns chunking and
+    /// the chunk-layout index. Follows the `find_missing_blobs` forwarding
+    /// pattern.
+    pub async fn splice_blob(
+        &self,
+        grpc_request: Request<SpliceBlobRequest>,
+    ) -> Result<Response<SpliceBlobResponse>, Error> {
+        error_if!(
+            matches!(self.store_type, nativelink_config::stores::StoreType::Ac),
+            "CAS operation on AC store"
+        );
+
+        let mut request = grpc_request.into_inner();
+        request.instance_name.clone_from(&self.instance_name);
+        self.perform_request(request, |request| async move {
+            match &self.transport {
+                Transport::Tcp(cm) => {
+                    let channel = cm
+                        .connection("splice_blob".into())
+                        .await
+                        .err_tip(|| "in splice_blob")?;
+                    self.cas_client(channel)
+                        .splice_blob(Request::new(request))
+                        .await
+                        .err_tip(|| "in GrpcStore::splice_blob")
+                }
+                #[cfg(feature = "quic")]
+                Transport::Quic(ch) => self
+                    .cas_client(ch.clone())
+                    .splice_blob(Request::new(request))
+                    .await
+                    .err_tip(|| "in GrpcStore::splice_blob (quic)"),
+                #[cfg(feature = "quic")]
+                Transport::Dual { quic, .. } => {
+                    // Small/metadata RPC: prefer QUIC
+                    self.cas_client(quic.clone())
+                        .splice_blob(Request::new(request))
+                        .await
+                        .err_tip(|| "in GrpcStore::splice_blob (dual/quic)")
+                }
+            }
+        })
+        .await
     }
 
     fn get_read_request(&self, mut request: ReadRequest) -> Result<ReadRequest, Error> {

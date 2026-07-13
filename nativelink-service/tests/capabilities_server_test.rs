@@ -17,12 +17,13 @@ use std::sync::Arc;
 
 use futures::join;
 use nativelink_config::cas_server::{
-    CapabilitiesConfig, CapabilitiesRemoteExecutionConfig, WithInstanceName,
+    CapabilitiesConfig, CapabilitiesRemoteExecutionConfig, CasChunkingConfig, CasStoreConfig,
+    WithInstanceName,
 };
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::capabilities_server::Capabilities;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    GetCapabilitiesRequest, ServerCapabilities, compressor,
+    FastCdc2020Params, GetCapabilitiesRequest, ServerCapabilities, compressor,
 };
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::mock_scheduler::MockActionScheduler;
@@ -149,6 +150,110 @@ async fn remote_execution_instance_advertises_execution_capabilities_and_node_pr
     assert_eq!(
         execution_capabilities.supported_node_properties,
         expected_properties
+    );
+    Ok(())
+}
+
+const CHUNKING_INSTANCE: &str = "chunking";
+
+fn cas_config_with_chunking(
+    instance_name: &str,
+    experimental_chunking: Option<CasChunkingConfig>,
+) -> WithInstanceName<CasStoreConfig> {
+    WithInstanceName {
+        instance_name: instance_name.to_string(),
+        config: CasStoreConfig {
+            cas_store: "main_cas".to_string(),
+            experimental_chunking,
+        },
+    }
+}
+
+// #2497: with no experimental_chunking config for the instance, the
+// capabilities service MUST advertise split/splice as unsupported and omit
+// FastCDC params (behavior is unchanged when the feature is not opted in).
+#[nativelink_test]
+async fn chunking_disabled_instance_does_not_advertise_split_splice()
+-> Result<(), Box<dyn core::error::Error>> {
+    let configs = [capabilities_config(CHUNKING_INSTANCE, false, false)];
+    let remote_cache_compression_instances =
+        RemoteCacheCompressionInstances::from_capabilities_configs(&configs);
+    // A CAS instance exists but does not opt into chunking.
+    let cas_configs = [cas_config_with_chunking(CHUNKING_INSTANCE, None)];
+    let server = CapabilitiesServer::new(
+        &configs,
+        &HashMap::new(),
+        &remote_cache_compression_instances,
+        &cas_configs,
+    )
+    .await?;
+
+    let response = get_capabilities(&server, CHUNKING_INSTANCE).await?;
+    let cache_capabilities = response
+        .cache_capabilities
+        .expect("cache capabilities should be set");
+
+    assert!(
+        !cache_capabilities.split_blob_support,
+        "split_blob_support must be false when experimental_chunking is unset"
+    );
+    assert!(
+        !cache_capabilities.splice_blob_support,
+        "splice_blob_support must be false when experimental_chunking is unset"
+    );
+    assert_eq!(
+        cache_capabilities.fast_cdc_2020_params, None,
+        "fast_cdc_2020_params must be None when experimental_chunking is unset"
+    );
+    Ok(())
+}
+
+// #2497: with experimental_chunking configured, the capabilities service MUST
+// advertise split/splice support and the FastCDC 2020 params derived from the
+// configured average chunk size — gated on the config, not hardcoded false.
+#[nativelink_test]
+async fn chunking_enabled_instance_advertises_split_splice_and_fastcdc_params()
+-> Result<(), Box<dyn core::error::Error>> {
+    const AVG_CHUNK_SIZE: u64 = 1024;
+    let configs = [capabilities_config(CHUNKING_INSTANCE, false, false)];
+    let remote_cache_compression_instances =
+        RemoteCacheCompressionInstances::from_capabilities_configs(&configs);
+    let cas_configs = [cas_config_with_chunking(
+        CHUNKING_INSTANCE,
+        Some(CasChunkingConfig {
+            index_store: Some("chunk_index".to_string()),
+            avg_chunk_size_bytes: AVG_CHUNK_SIZE,
+            max_chunk_count: 0,
+        }),
+    )];
+    let server = CapabilitiesServer::new(
+        &configs,
+        &HashMap::new(),
+        &remote_cache_compression_instances,
+        &cas_configs,
+    )
+    .await?;
+
+    let response = get_capabilities(&server, CHUNKING_INSTANCE).await?;
+    let cache_capabilities = response
+        .cache_capabilities
+        .expect("cache capabilities should be set");
+
+    assert!(
+        cache_capabilities.split_blob_support,
+        "split_blob_support must be true when experimental_chunking is set"
+    );
+    assert!(
+        cache_capabilities.splice_blob_support,
+        "splice_blob_support must be true when experimental_chunking is set"
+    );
+    assert_eq!(
+        cache_capabilities.fast_cdc_2020_params,
+        Some(FastCdc2020Params {
+            avg_chunk_size_bytes: AVG_CHUNK_SIZE,
+            seed: 0,
+        }),
+        "fast_cdc_2020_params must reflect the configured average chunk size"
     );
     Ok(())
 }

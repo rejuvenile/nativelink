@@ -188,14 +188,15 @@ impl Capabilities for CapabilitiesServer {
                 supported_compressors: supported_compressors.clone(),
                 supported_batch_update_compressors: supported_compressors,
                 max_cas_blob_size_bytes: 0,
-                // Hardcoded false until the #2497 SplitBlob/SpliceBlob handler
-                // pass lands: the cas_server SplitBlob/SpliceBlob handlers return
-                // `Status::unimplemented`, so advertising support off the
-                // `experimental_chunking` config knob would be a half-wire. The
-                // `chunking_params` computation is left intact (harmless) so the
-                // advertisement can be flipped back on with the handlers.
-                split_blob_support: false,
-                splice_blob_support: false,
+                // Config-gated (#2497): advertise SplitBlob/SpliceBlob support
+                // only for CAS instances that opted in via
+                // `experimental_chunking` (which is exactly when
+                // `chunking_params` is populated for this instance). Instances
+                // without the config advertise `false` and the cas_server
+                // handlers return `Unimplemented`, so conformant REAPI clients
+                // never call the RPCs there — zero behavior change when unset.
+                split_blob_support: chunking_params.is_some(),
+                splice_blob_support: chunking_params.is_some(),
                 fast_cdc_2020_params: chunking_params.copied(),
                 rep_max_cdc_params: None,
             }),
