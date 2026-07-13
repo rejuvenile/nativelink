@@ -32,9 +32,12 @@ use nativelink_metric::{
     RootMetricsComponent, group,
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory, Tree};
+use nativelink_proto::com::github::trace_machina::nativelink::events::{
+    Event, OriginEvent, ResponseEvent, event, response_event,
+};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    AcPinResyncRequest, BlobsInStableStorage, KillOperationRequest, MissingBlobPeers, PeerHint,
-    PrefetchInputs, StartExecute, UpdateForWorker, update_for_worker,
+    AcPinResyncRequest, ActionResourceUsage, BlobsInStableStorage, KillOperationRequest,
+    MissingBlobPeers, PeerHint, PrefetchInputs, StartExecute, UpdateForWorker, update_for_worker,
 };
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -50,15 +53,17 @@ use nativelink_util::digest_hasher::{
 };
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
+use nativelink_util::origin_event::get_node_id;
 use nativelink_util::platform_properties::PlatformProperties;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::{Store, StoreDriver, StoreKey, StoreLike};
 use parking_lot::Mutex as ParkingMutex;
 use prost::Message;
-use tokio::sync::{Notify, Semaphore};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tonic::async_trait;
 use tracing::{debug, error, info, trace, warn};
+use uuid::Uuid;
 
 /// Metrics for tracking scheduler performance.
 ///
@@ -3450,6 +3455,10 @@ pub struct ApiWorkerScheduler {
     /// silently coexist with a buggy worker that omitted the field;
     /// regenerate until non-zero).
     server_instance_token: u64,
+
+    /// Channel for publishing origin events such as worker-observed action
+    /// resource usage. `None` when origin events are disabled.
+    maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
 }
 
 /// Probe a CAS store chain to find the SizePartitioningStore threshold.
@@ -4139,6 +4148,7 @@ impl ApiWorkerScheduler {
         worker_change_notify: Arc<Notify>,
         worker_timeout_s: u64,
         worker_registry: SharedWorkerRegistry,
+        maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
     ) -> Arc<Self> {
         Self::new_with_locality_map(
             worker_state_manager,
@@ -4168,6 +4178,7 @@ impl ApiWorkerScheduler {
             // (#specprefetch-rebind Stage B) temporal hold gate OFF on the
             // no-config constructor path — byte-identical to today.
             false,
+            maybe_origin_event_tx,
         )
     }
 
@@ -4189,6 +4200,7 @@ impl ApiWorkerScheduler {
         p_headroom_override_factor: u32,
         enable_p2p_input_prefetch: bool,
         enable_speculative_hold: bool,
+        maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
     ) -> Arc<Self> {
         let memory_store_threshold = cas_store
             .as_ref()
@@ -4322,6 +4334,7 @@ impl ApiWorkerScheduler {
                 );
                 token
             },
+            maybe_origin_event_tx,
         })
     }
 
@@ -4499,6 +4512,44 @@ impl ApiWorkerScheduler {
         }
 
         Ok(())
+    }
+
+    pub async fn running_action_info(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+    ) -> Option<ActionInfoWithProps> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .peek(worker_id)
+            .and_then(|worker| worker.running_action_infos.get(operation_id))
+            .map(|pending_action_info| pending_action_info.action_info.clone())
+    }
+
+    /// (merge v1.6.1) Post-reserve linkage for the scheduler start-execute origin
+    /// event. Our concurrent-reserve matching path records the
+    /// `ActionInfoWithProps` into `running_action_infos` inside
+    /// `find_and_reserve_worker` — BEFORE the assigned worker_id (and hence the
+    /// derived event id) is known — so `SimpleScheduler::match_action_to_worker_cached`
+    /// stamps the event id back onto the reserved running action here.
+    /// `record_action_resource_usage` later reads it as the resource-usage
+    /// event's `parent_event_id`. Only invoked when origin events are enabled
+    /// (a publisher channel is present), so it never runs on the production path
+    /// where origin events are disabled. A missing worker/operation (removed
+    /// during the lock-free window) is a benign no-op.
+    pub async fn set_scheduler_start_execute_event_id(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        event_id: String,
+    ) {
+        let mut inner = self.inner.write().await;
+        if let Some(worker) = inner.workers.get_mut(worker_id) {
+            if let Some(pending) = worker.running_action_infos.get_mut(operation_id) {
+                pending.action_info.scheduler_start_execute_event_id = Some(event_id);
+            }
+        }
     }
 
     /// Returns the scheduler metrics for observability.
@@ -7522,6 +7573,12 @@ async fn create_worker_cas_connection(
         // this connection, so the chunked-write kill-switch is N/A.
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
+        // merge v1.6.1: new upstream GrpcSpec fields — worker CAS prefetch
+        // connections use the modern resource-name format and inject no
+        // static/forwarded headers.
+        use_legacy_resource_names: false,
+        headers: HashMap::new(),
+        forward_headers: Vec::new(),
     };
     let store = GrpcStore::new(&spec)
         .await
@@ -8150,6 +8207,8 @@ impl ApiWorkerScheduler {
                     }),
                 }),
                 platform_properties: PlatformProperties::default(),
+                origin_metadata: Default::default(),
+                scheduler_start_execute_event_id: None,
             };
             worker.running_action_infos.insert(
                 OperationId::default(),
@@ -8215,6 +8274,59 @@ impl ApiWorkerScheduler {
 impl WorkerScheduler for ApiWorkerScheduler {
     fn get_platform_property_manager(&self) -> &PlatformPropertyManager {
         self.platform_property_manager.as_ref()
+    }
+
+    async fn record_action_resource_usage(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        mut resource_usage: ActionResourceUsage,
+    ) -> Result<(), Error> {
+        // The worker API talks to this `ApiWorkerScheduler` (it is the
+        // `WorkerScheduler` returned by `SimpleScheduler::new`), so the
+        // resource-usage origin event must be published here. Previously the
+        // only override lived on `SimpleScheduler`, which this path never
+        // reaches, so the event was silently dropped by the trait's no-op
+        // default and `observed_worker_peak_memory_mib` was never recorded.
+        let Some(origin_event_tx) = self.maybe_origin_event_tx.as_ref() else {
+            return Ok(());
+        };
+        let Some(action_info) = self.running_action_info(worker_id, operation_id).await else {
+            return Ok(());
+        };
+
+        if resource_usage.operation_id.is_empty() {
+            resource_usage.operation_id = operation_id.to_string();
+        }
+        if resource_usage.worker_id.is_empty() {
+            resource_usage.worker_id = worker_id.to_string();
+        }
+
+        let event = Event {
+            event: Some(event::Event::Response(ResponseEvent {
+                event: Some(response_event::Event::ActionResourceUsage(resource_usage)),
+            })),
+        };
+        let origin_event = OriginEvent {
+            version: 0,
+            event_id: Uuid::now_v6(&get_node_id(Some(&event)))
+                .hyphenated()
+                .to_string(),
+            parent_event_id: action_info
+                .scheduler_start_execute_event_id
+                .clone()
+                .unwrap_or_default(),
+            bazel_request_metadata: action_info.origin_metadata.bazel_metadata.clone(),
+            identity: action_info.origin_metadata.identity,
+            event: Some(event),
+        };
+        // Awaited send (not try_send): apply backpressure when the publisher
+        // queue is full instead of silently dropping the resource-usage event,
+        // which is what drives action-level resource sizing in the UI.
+        if let Err(err) = origin_event_tx.send(origin_event).await {
+            warn!(?err, "Failed to publish action resource usage origin event");
+        }
+        Ok(())
     }
 
     async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
@@ -9064,6 +9176,8 @@ mod tests {
                     }),
                 }),
                 platform_properties: PlatformProperties::default(),
+                origin_metadata: Default::default(),
+                scheduler_start_execute_event_id: None,
             };
             w.running_action_infos.insert(
                 op,
@@ -10800,6 +10914,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         );
 
         // First call: cache miss, inline resolution succeeds and caches.
@@ -10980,6 +11095,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         );
 
         // Precondition: both counters start at zero.
@@ -11292,6 +11408,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         );
         (scheduler, dir_digest)
     }
@@ -11400,6 +11517,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         );
         (scheduler, r1_digest, r2_digest, c_digest)
     }
@@ -11840,6 +11958,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         )
     }
 
@@ -12470,6 +12589,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         );
 
         // First, verify guard wiring against the real shared map. Pre-insert
@@ -12607,6 +12727,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         )
     }
 
@@ -13763,6 +13884,7 @@ mod tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         );
 
         let registry = MetricsRegistry::new();
@@ -13936,6 +14058,8 @@ mod b1_lock_decouple_tests {
                 }),
             }),
             platform_properties: props_named(name),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
         }
     }
 
@@ -13969,6 +14093,7 @@ mod b1_lock_decouple_tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         )
     }
 
@@ -13999,6 +14124,7 @@ mod b1_lock_decouple_tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         )
     }
 
@@ -14519,6 +14645,8 @@ mod b1_lock_decouple_tests {
                     }),
                 }),
                 platform_properties: props_pool(),
+                origin_metadata: Default::default(),
+                scheduler_start_execute_event_id: None,
             }
         }
 
@@ -14646,6 +14774,7 @@ mod b1_lock_decouple_tests {
                 false,
                 // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
                 false,
+                None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
             )
         }
 
@@ -14671,6 +14800,7 @@ mod b1_lock_decouple_tests {
                 2,    // p_headroom_override_factor
                 false, // P2P prefetch OFF
                 true, // temporal hold gate ON
+                None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
             )
         }
 
@@ -15337,6 +15467,7 @@ mod b1_lock_decouple_tests {
                 false,
                 // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
                 false,
+                None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
             );
             // X_ROOT: Tier-1 root match (cached_directory_digests ∋ input_root),
             // moderately loaded.
@@ -17289,6 +17420,7 @@ mod deferred_proto_clone_tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         )
     }
 
@@ -17312,6 +17444,7 @@ mod deferred_proto_clone_tests {
             false,
             // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
             false,
+            None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
         )
     }
 
@@ -17342,6 +17475,8 @@ mod deferred_proto_clone_tests {
                 }),
             }),
             platform_properties: props_exact(name),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
         }
     }
 

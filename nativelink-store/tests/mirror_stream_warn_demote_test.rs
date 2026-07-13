@@ -116,6 +116,9 @@ default_health_status_indicator!(DrainingWorkerStore);
 
 #[async_trait]
 impl StoreDriver for DrainingWorkerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -129,11 +132,11 @@ impl StoreDriver for DrainingWorkerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         loop {
             let chunk = reader.recv().await?;
             if chunk.is_empty() {
-                return Ok(());
+                return Ok(0);
             }
         }
     }

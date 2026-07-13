@@ -171,7 +171,7 @@ fn make_bytestream_server(
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: CAS_STORE_NAME.to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 256 * 1024,
             ..Default::default()
         },
@@ -186,6 +186,7 @@ fn make_cas_server(
     let config = vec![WithInstanceName {
         instance_name: INSTANCE_NAME.to_string(),
         config: CasStoreConfig {
+            experimental_chunking: None,
             cas_store: CAS_STORE_NAME.to_string(),
         },
     }];

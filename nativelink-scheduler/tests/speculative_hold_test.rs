@@ -267,6 +267,8 @@ async fn add_p_saturated_holder(
             ActionInfoWithProps {
                 inner: ai,
                 platform_properties: props.clone(),
+                origin_metadata: Default::default(),
+                scheduler_start_execute_event_id: None,
             }
         };
         let (assigned, _, _) = scheduler
@@ -303,6 +305,8 @@ fn action_with_root(input_root: DigestInfo, action_hash: u8) -> ActionInfoWithPr
     ActionInfoWithProps {
         inner,
         platform_properties: PlatformProperties::default(),
+        origin_metadata: Default::default(),
+        scheduler_start_execute_event_id: None,
     }
 }
 
@@ -666,7 +670,7 @@ async fn deep_backlog_declines() -> Result<(), Error> {
         let filler_op = OperationId::default();
         let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0xD0 + i as u8; 32], 7));
         Arc::make_mut(&mut ai).input_root_digest = filler_root;
-        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None };
         let (assigned, _, _) = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &filler_op, &filler_ai, false)
             .await
@@ -681,7 +685,7 @@ async fn deep_backlog_declines() -> Result<(), Error> {
         let filler_op = OperationId::default();
         let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0xD0 + i as u8; 32], 7));
         Arc::make_mut(&mut ai).input_root_digest = filler_root;
-        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None };
         let (assigned, _, _) = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &filler_op, &filler_ai, false)
             .await
@@ -775,7 +779,7 @@ async fn perf_deep_backlog_skipped_without_select() -> Result<(), Error> {
         let filler_root = unique_filler_root(&w, i);
         let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0x10 + i as u8; 32], 7));
         Arc::make_mut(&mut ai).input_root_digest = filler_root;
-        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None };
         let (assigned, _, _) = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &OperationId::default(), &filler_ai, false)
             .await
@@ -862,7 +866,7 @@ async fn k_th_completion_frees_one_p_slot() -> Result<(), Error> {
         let filler_root = unique_filler_root(&w, i);
         let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0xC0 + i as u8; 32], 7));
         Arc::make_mut(&mut ai).input_root_digest = filler_root;
-        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None };
         let (assigned, _, _) = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &OperationId::default(), &filler_ai, false)
             .await
@@ -875,7 +879,7 @@ async fn k_th_completion_frees_one_p_slot() -> Result<(), Error> {
         let filler_root = unique_filler_root(&w, i);
         let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0xC0 + i as u8; 32], 7));
         Arc::make_mut(&mut ai).input_root_digest = filler_root;
-        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None };
         let (assigned, _, _) = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &OperationId::default(), &filler_ai, false)
             .await
@@ -1576,7 +1580,7 @@ async fn p_core_count_zero_no_candidate() -> Result<(), Error> {
         let filler_root = unique_filler_root(&w, i);
         let mut ai = make_base_action_info(make_system_time(1), DigestInfo::new([0xA0 + i as u8; 32], 7));
         Arc::make_mut(&mut ai).input_root_digest = filler_root;
-        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default() };
+        let filler_ai = ActionInfoWithProps { inner: ai, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None };
         let (assigned, _, _) = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &OperationId::default(), &filler_ai, false)
             .await

@@ -16,6 +16,7 @@ pub mod ac_proxy_store;
 pub mod ac_utils;
 pub mod azure_blob_store;
 pub mod batch_read_coalescer;
+pub mod cache_metrics_store;
 pub mod callback_utils;
 pub mod cas_utils;
 // `chunked` is `pub` (gated) so the `nativelink-service` crate's
@@ -40,8 +41,10 @@ pub mod grpc_store;
 pub mod memory_store;
 pub mod mongo_store;
 pub mod noop_store;
+pub mod oci_store;
 pub mod ontap_s3_existence_cache_store;
 pub mod ontap_s3_store;
+pub mod r2_store;
 pub mod redis_store;
 mod redis_utils;
 pub mod ref_store;

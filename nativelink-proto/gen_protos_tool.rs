@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Command};
-use prost_build::Config;
+use tonic_prost_build::Config;
 
 fn main() -> std::io::Result<()> {
     let matches = Command::new("Rust gRPC Codegen")

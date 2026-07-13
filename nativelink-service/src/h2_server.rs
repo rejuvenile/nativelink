@@ -97,7 +97,7 @@ pub fn build_h2_server_builder(
     if let Some(value) = config.experimental_http2_max_concurrent_streams {
         http.http2().max_concurrent_streams(value);
     }
-    if let Some(value) = config.experimental_http2_keep_alive_timeout {
+    if let Some(value) = config.experimental_http2_keep_alive_timeout_s {
         http.http2()
             .keep_alive_timeout(Duration::from_secs(u64::from(value)));
     }
@@ -252,7 +252,7 @@ mod tests {
             ),
             (
                 ".keep_alive_timeout(",
-                "experimental_http2_keep_alive_timeout",
+                "experimental_http2_keep_alive_timeout_s",
             ),
             (
                 ".max_send_buf_size(",
@@ -301,7 +301,7 @@ mod tests {
             experimental_http2_adaptive_window: Some(true),
             experimental_http2_max_frame_size: Some(2 * 1024 * 1024),
             experimental_http2_max_concurrent_streams: Some(256),
-            experimental_http2_keep_alive_timeout: Some(60),
+            experimental_http2_keep_alive_timeout_s: Some(60),
             experimental_http2_max_send_buf_size: Some(1024 * 1024),
             experimental_http2_enable_connect_protocol: Some(true),
             experimental_http2_max_header_list_size: Some(64 * 1024),

@@ -80,6 +80,7 @@ fn build_fss(slow: Store) -> (Arc<FastSlowStore>, Store) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast.clone(),
         slow,
@@ -105,10 +106,10 @@ struct ControllableSlowProbe {
 default_health_status_indicator!(ControllableSlowProbe);
 
 impl ControllableSlowProbe {
-    async fn run_write<F, Fut>(self: Pin<&Self>, f: F) -> Result<(), Error>
+    async fn run_write<F, Fut, T>(self: Pin<&Self>, f: F) -> Result<T, Error>
     where
         F: FnOnce() -> Fut,
-        Fut: core::future::Future<Output = Result<(), Error>>,
+        Fut: core::future::Future<Output = Result<T, Error>>,
     {
         if self.block_forever {
             // Park forever (until the never-fired gate). Models a wedged slow
@@ -118,14 +119,17 @@ impl ControllableSlowProbe {
         } else if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
-        f().await?;
+        let value = f().await?;
         self.landed.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(value)
     }
 }
 
 #[async_trait]
 impl StoreDriver for ControllableSlowProbe {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -139,7 +143,7 @@ impl StoreDriver for ControllableSlowProbe {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let inner = self.inner.clone();
         let key = key.into_owned();
         self.run_write(move || async move { inner.update(key, reader, upload_size).await })

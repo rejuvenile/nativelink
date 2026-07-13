@@ -132,6 +132,9 @@ fn make_grpc_spec(addr: String) -> nativelink_config::stores::GrpcSpec {
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
+        use_legacy_resource_names: false,
+        headers: Default::default(),
+        forward_headers: Vec::new(),
     }
 }
 
@@ -168,7 +171,7 @@ async fn spawn_g1_server_with_locality_seeded(
             instance_name: INSTANCE_NAME.to_string(),
             config: ByteStreamConfig {
                 cas_store: CAS_STORE_NAME.to_string(),
-                persist_stream_on_disconnect_timeout: 0,
+                persist_stream_on_disconnect_timeout_s: 0,
                 max_bytes_per_stream: 4 * 1024 * 1024, // 4 MiB
                 ..Default::default()
             },
@@ -214,6 +217,7 @@ async fn build_manager_with_server(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store.clone()),
         Store::new(proxy),

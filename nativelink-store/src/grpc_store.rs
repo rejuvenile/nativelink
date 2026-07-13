@@ -482,6 +482,13 @@ pub struct GrpcStore {
     parallel_chunk_count: u64,
     /// Enable zstd compression at the tonic transport level.
     zstd_compression: bool,
+    /// #2285: emit legacy `ByteStream` resource names omitting the
+    /// digest-function component (`{instance}/blobs/{hash}/{size}` rather
+    /// than `{instance}/blobs/{digest_function}/{hash}/{size}`). Needed for
+    /// older upstream backends (e.g. Buildbarn pre-v0.3) that reject the
+    /// modern format with `InvalidArgument: Unsupported digest function`.
+    /// See [`nativelink_config::stores::GrpcSpec::use_legacy_resource_names`].
+    use_legacy_resource_names: bool,
     /// Cap on `cm.connection()` for write-side RPCs. None = wait
     /// indefinitely (current behavior); used by WorkerProxyStore at 3s
     /// to fast-fail mirror writes to dead workers.
@@ -800,6 +807,7 @@ impl GrpcStore {
             parallel_chunk_read_threshold: spec.parallel_chunk_read_threshold,
             parallel_chunk_count: spec.parallel_chunk_count.max(1),
             zstd_compression: spec.zstd_compression,
+            use_legacy_resource_names: spec.use_legacy_resource_names,
             connection_acquire_timeout_ms: spec.connection_acquire_timeout_ms,
             parallel_chunk_retries_succeeded: AtomicU64::new(0),
             parallel_chunk_retries_failed: AtomicU64::new(0),
@@ -3664,6 +3672,10 @@ impl GrpcStore {
 
 #[async_trait]
 impl StoreDriver for GrpcStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     // NOTE: This function can only be safely used on CAS stores. AC stores may return a size that
     // is incorrect.
     async fn has_with_results(
@@ -3736,7 +3748,7 @@ impl StoreDriver for GrpcStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         struct LocalState {
             resource_name: String,
             reader: DropCloserReadHalf,
@@ -3745,8 +3757,10 @@ impl StoreDriver for GrpcStore {
         }
 
         let digest = key.into_digest();
+        let digest_size = digest.size_bytes();
         if matches!(self.store_type, nativelink_config::stores::StoreType::Ac) {
-            return self.update_action_result_from_bytes(digest, reader).await;
+            self.update_action_result_from_bytes(digest, reader).await?;
+            return Ok(digest_size);
         }
 
         // #212 Phase 2.4 dispatch: when (a) the `chunked_fast_slow`
@@ -3776,25 +3790,36 @@ impl StoreDriver for GrpcStore {
             && digest.size_bytes() >= crate::chunked::CHUNK_SIZE as u64
             && digest.size_bytes() <= crate::chunked::MAX_CHUNKED_BLOB_SIZE
         {
-            return self.update_via_chunked_inner(digest, reader).await;
+            self.update_via_chunked_inner(digest, reader).await?;
+            return Ok(digest_size);
         }
 
-        let digest_function = Context::current()
-            .get::<DigestHasherFunc>()
-            .map_or_else(default_digest_hasher_func, |v| *v)
-            .proto_digest_func()
-            .as_str_name()
-            .to_ascii_lowercase();
-
         let mut buf = Uuid::encode_buffer();
-        let resource_name = format!(
-            "{}/uploads/{}/blobs/{}/{}/{}",
-            &self.instance_name,
-            Uuid::new_v4().hyphenated().encode_lower(&mut buf),
-            digest_function,
-            digest.packed_hash(),
-            digest.size_bytes(),
-        );
+        // #2285: legacy backends omit the digest-function path component.
+        let resource_name = if self.use_legacy_resource_names {
+            format!(
+                "{}/uploads/{}/blobs/{}/{}",
+                &self.instance_name,
+                Uuid::new_v4().hyphenated().encode_lower(&mut buf),
+                digest.packed_hash(),
+                digest.size_bytes(),
+            )
+        } else {
+            let digest_function = Context::current()
+                .get::<DigestHasherFunc>()
+                .map_or_else(default_digest_hasher_func, |v| *v)
+                .proto_digest_func()
+                .as_str_name()
+                .to_ascii_lowercase();
+            format!(
+                "{}/uploads/{}/blobs/{}/{}/{}",
+                &self.instance_name,
+                Uuid::new_v4().hyphenated().encode_lower(&mut buf),
+                digest_function,
+                digest.packed_hash(),
+                digest.size_bytes(),
+            )
+        };
         trace!(
             resource_name = %resource_name,
             digest_hash = %digest.packed_hash(),
@@ -3856,7 +3881,7 @@ impl StoreDriver for GrpcStore {
         .await
         .err_tip(|| "in GrpcStore::update()")?;
 
-        Ok(())
+        Ok(digest_size)
     }
 
     async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
@@ -3946,20 +3971,29 @@ impl StoreDriver for GrpcStore {
             return writer.send_eof();
         }
 
-        let digest_function = Context::current()
-            .get::<DigestHasherFunc>()
-            .map_or_else(default_digest_hasher_func, |v| *v)
-            .proto_digest_func()
-            .as_str_name()
-            .to_ascii_lowercase();
-
-        let resource_name = format!(
-            "{}/blobs/{}/{}/{}",
-            &self.instance_name,
-            digest_function,
-            digest.packed_hash(),
-            digest.size_bytes(),
-        );
+        // #2285: legacy backends omit the digest-function path component.
+        let resource_name = if self.use_legacy_resource_names {
+            format!(
+                "{}/blobs/{}/{}",
+                &self.instance_name,
+                digest.packed_hash(),
+                digest.size_bytes(),
+            )
+        } else {
+            let digest_function = Context::current()
+                .get::<DigestHasherFunc>()
+                .map_or_else(default_digest_hasher_func, |v| *v)
+                .proto_digest_func()
+                .as_str_name()
+                .to_ascii_lowercase();
+            format!(
+                "{}/blobs/{}/{}/{}",
+                &self.instance_name,
+                digest_function,
+                digest.packed_hash(),
+                digest.size_bytes(),
+            )
+        };
 
         // Determine the effective read length for parallel chunking.
         // Bug B (audit 2026-04-25): production callers occasionally
@@ -4800,6 +4834,9 @@ mod tests {
             connection_acquire_timeout_ms: None,
             chunked_writes_enabled: false,
             chunked_v2_writes_enabled: false,
+            use_legacy_resource_names: false,
+            headers: Default::default(),
+            forward_headers: Vec::new(),
         }
     }
 

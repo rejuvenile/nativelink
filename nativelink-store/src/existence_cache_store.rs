@@ -539,6 +539,11 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
 
 #[async_trait]
 impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        self.inner_store.clone().into_inner().post_init().await?;
+        Ok(())
+    }
+
     /// Remove the entry: clear the moka existence cache then delegate to
     /// the inner store (#40 §2 delete-on-detection). Clearing the moka
     /// entry first prevents a brief window where `has_with_results` would
@@ -581,7 +586,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let digest = key.into_digest();
         // Check the inner store directly, bypassing the existence cache.
         // The existence cache may have a stale positive for a blob that was
@@ -607,7 +612,10 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             inner_has_start.elapsed().as_micros() as u64;
         if let Some(durable_size) = durable {
             // Blob is already DURABLY present in the inner store — safe to skip.
-            reader
+            // Drain the reader (consume the client's upload) to avoid the writer
+            // complaining that we dropped the connection prematurely; the drained
+            // byte count is the bytes-processed value returned to the caller.
+            let size = reader
                 .drain()
                 .await
                 .err_tip(|| "In ExistenceCacheStore::update")?;
@@ -619,7 +627,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 .existence_cache
                 .insert(digest, ExistenceItem(durable_size))
                 .await;
-            return Ok(());
+            return Ok(size);
         }
         // If the existence cache had a stale entry, remove it now.
         if debug_digest_match(&digest) {

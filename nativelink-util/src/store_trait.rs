@@ -20,6 +20,7 @@ use core::hash::{Hash, Hasher};
 use core::ops::{Bound, RangeBounds};
 use core::pin::Pin;
 use core::ptr::addr_eq;
+use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher as StdHasher;
 use std::ffi::OsString;
@@ -103,7 +104,17 @@ pub fn set_default_digest_size_health_check(size: usize) -> Result<(), Error> {
     })
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    Serialize,
+    Deserialize,
+    wincode::SchemaWrite,
+    wincode::SchemaRead,
+)]
 pub enum UploadSizeInfo {
     /// When the data transfer amount is known to be exact size, this enum should be used.
     /// The receiver store can use this to better optimize the way the data is sent or stored.
@@ -933,7 +944,7 @@ pub trait StoreLike: Send + Sync + Sized + Unpin + 'static {
         digest: impl Into<StoreKey<'a>>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+    ) -> impl Future<Output = Result<u64, Error>> + Send + 'a {
         self.as_store_driver_pin()
             .update(digest.into(), reader, upload_size)
     }
@@ -1063,6 +1074,10 @@ pub trait StoreLike: Send + Sync + Sized + Unpin + 'static {
 pub trait StoreDriver:
     Sync + Send + Unpin + MetricsComponent + HealthStatusIndicator + 'static
 {
+    // Do "all the stores are setup" init e.g. if we need access to the store manager
+    // for ref stores
+    async fn post_init(self: Arc<Self>) -> Result<(), Error>;
+
     /// See: [`StoreLike::has`] for details.
     #[inline]
     async fn has(self: Pin<&Self>, key: StoreKey<'_>) -> Result<Option<u64>, Error> {
@@ -1192,7 +1207,7 @@ pub trait StoreDriver:
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error>;
+    ) -> Result<u64, Error>;
 
     /// See: [`StoreLike::optimized_for`] for details.
     fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
@@ -2021,7 +2036,11 @@ pub trait SchedulerStore: Send + Sync + 'static {
     /// the version in the passed in data.
     /// No guarantees are made about when `Version` is `FalseValue`.
     /// Indexes are guaranteed to be updated atomically with the data.
-    fn update_data<T>(&self, data: T) -> impl Future<Output = Result<Option<i64>, Error>> + Send
+    fn update_data<T>(
+        &self,
+        data: T,
+        expiry: Option<Duration>,
+    ) -> impl Future<Output = Result<Option<i64>, Error>> + Send
     where
         T: SchedulerStoreDataProvider
             + SchedulerStoreKeyProvider
@@ -2039,7 +2058,8 @@ pub trait SchedulerStore: Send + Sync + 'static {
         >,
     > + Send
     where
-        K: SchedulerIndexProvider + SchedulerStoreDecodeTo + Send;
+        K: SchedulerIndexProvider + SchedulerStoreDecodeTo + Send,
+        <K as SchedulerStoreDecodeTo>::DecodeOutput: Send;
 
     /// Returns data for the provided key with the given version if
     /// `StoreKeyProvider::Versioned` is `TrueValue`.

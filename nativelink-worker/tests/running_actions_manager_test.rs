@@ -133,6 +133,7 @@ mod tests {
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(fast_store.clone()),
             Store::new(slow_store.clone()),
@@ -183,6 +184,7 @@ mod tests {
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(fast_store.clone()),
             Store::new(slow_store.clone()),
@@ -5939,6 +5941,7 @@ exit 1
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(ac_fast),
             Store::new(ac_slow),
@@ -6372,6 +6375,10 @@ exit 1
 
     #[async_trait]
     impl StoreDriver for BlockingFakeSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
+
         async fn has_with_results(
             self: Pin<&Self>,
             keys: &[StoreKey<'_>],
@@ -6387,7 +6394,7 @@ exit 1
             key: StoreKey<'_>,
             reader: DropCloserReadHalf,
             size_info: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             self.update_attempts.fetch_add(1, Ordering::SeqCst);
             if self.block_updates.load(Ordering::SeqCst) {
                 // Signal the test that we have been entered and are about
@@ -6488,6 +6495,7 @@ exit 1
                 // BlockingFakeSlowStore.requires_in_flight_buffer_cap() == false
                 // (default), so 0 is valid here.
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(fast_store.clone()),
             Store::new(slow_store.clone()),
@@ -7369,6 +7377,10 @@ exit 1
 
     #[async_trait]
     impl StoreDriver for HasCountingStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
+
         async fn has_with_results(
             self: Pin<&Self>,
             keys: &[StoreKey<'_>],
@@ -7390,7 +7402,7 @@ exit 1
             key: StoreKey<'_>,
             reader: DropCloserReadHalf,
             size_info: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(key, reader, size_info)
                 .await
@@ -7476,6 +7488,7 @@ exit 1
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(fast_store.clone()),
             Store::new(slow_store.clone()),
@@ -8074,6 +8087,10 @@ exit 1
 
     #[async_trait]
     impl StoreDriver for CountingFsStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
+
         async fn has_with_results(
             self: Pin<&Self>,
             keys: &[StoreKey<'_>],
@@ -8095,7 +8112,7 @@ exit 1
             key: StoreKey<'_>,
             reader: DropCloserReadHalf,
             size_info: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(key, reader, size_info)
                 .await
@@ -8192,6 +8209,7 @@ exit 1
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(counting_fast_store.clone()),
             Store::new(slow_store.clone()),
@@ -8617,6 +8635,7 @@ exit 1
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             Store::new(counting_fast_store.clone()),
             Store::new(slow_store.clone()),

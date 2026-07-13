@@ -231,6 +231,7 @@ async fn setup_with_ac_registry(cas_endpoint: &str) -> Result<AcRegistryContext,
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let locality_map = new_shared_blob_locality_map();
@@ -672,6 +673,7 @@ async fn setup_multi_connect_ac() -> Result<AcMultiConnectContext, Error> {
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let locality_map = new_shared_blob_locality_map();

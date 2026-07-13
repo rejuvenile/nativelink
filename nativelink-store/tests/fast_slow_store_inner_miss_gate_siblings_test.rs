@@ -84,6 +84,9 @@ default_health_status_indicator!(DelayedPeerStore);
 
 #[async_trait]
 impl StoreDriver for DelayedPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -97,7 +100,7 @@ impl StoreDriver for DelayedPeerStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
 
@@ -217,6 +220,7 @@ async fn mirror_blobs_size_mismatch_does_not_terminate_outer_writer_when_gate_se
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

@@ -35,6 +35,7 @@ use rand::Rng;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 
+use crate::common_s3_utils::install_default_rustls_crypto_provider;
 use crate::gcs_client::types::{
     CHUNK_SIZE, DEFAULT_CONCURRENT_UPLOADS, DEFAULT_CONTENT_TYPE, GcsObject,
     INITIAL_UPLOAD_RETRY_DELAY_MS, MAX_UPLOAD_RETRIES, MAX_UPLOAD_RETRY_DELAY_MS, ObjectPath,
@@ -109,6 +110,8 @@ pub struct GcsClient {
 
 impl GcsClient {
     fn create_client_config(spec: &ExperimentalGcsSpec) -> Result<ClientConfig, Error> {
+        install_default_rustls_crypto_provider();
+
         let mut client_config = ClientConfig::default();
         let connect_timeout = if spec.connection_timeout_s > 0 {
             Duration::from_secs(spec.connection_timeout_s)
@@ -124,7 +127,9 @@ impl GcsClient {
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
             .build()
-            .map_err(|e| make_err!(Code::Internal, "Unable to create GCS client: {e:?}"))?;
+            .map_err(|e| {
+                Error::from_std_err(Code::Internal, &e).append("Unable to create GCS client")
+            })?;
         let mid_client = reqwest_middleware::ClientBuilder::new(client).build();
         client_config.http = Some(mid_client);
         Ok(client_config)
@@ -145,10 +150,8 @@ impl GcsClient {
             Err(_) => Self::create_client_config(spec)?.with_auth().await,
         }
         .map_err(|e| {
-            make_err!(
-                Code::Internal,
-                "Failed to create client config with credentials: {e:?}"
-            )
+            Error::from_std_err(Code::Internal, &e)
+                .append("Failed to create client config with credentials")
         });
 
         // If authentication is required then error, otherwise use anonymous.
@@ -201,10 +204,9 @@ impl GcsClient {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<T, Error>> + Send,
     {
-        let permit =
-            self.semaphore.acquire().await.map_err(|e| {
-                make_err!(Code::Internal, "Failed to acquire connection permit: {}", e)
-            })?;
+        let permit = self.semaphore.acquire().await.map_err(|e| {
+            Error::from_std_err(Code::Internal, &e).append("Failed to acquire connection permit")
+        })?;
 
         let result = operation().await;
         drop(permit);
@@ -253,7 +255,7 @@ impl GcsClient {
             _ => Code::Internal,
         };
 
-        make_err!(code, "GCS operation failed: {}", err)
+        Error::from_std_err(code, &err).append("GCS operation failed")
     }
 
     /// Reading data from reader and upload in a single operation
@@ -402,10 +404,10 @@ impl GcsOperations for GcsClient {
             match self.client.get_object(&request).await {
                 Ok(obj) => Ok(Some(self.convert_to_gcs_object(obj))),
                 Err(err) => {
-                    if let GcsError::Response(resp) = &err {
-                        if resp.code == 404 {
-                            return Ok(None);
-                        }
+                    if let GcsError::Response(resp) = &err
+                        && resp.code == 404
+                    {
+                        return Ok(None);
                     }
                     Err(Self::handle_gcs_error(&err))
                 }
@@ -454,10 +456,9 @@ impl GcsOperations for GcsClient {
             }
         }
 
-        let permit =
-            self.semaphore.clone().acquire_owned().await.map_err(|e| {
-                make_err!(Code::Internal, "Failed to acquire connection permit: {}", e)
-            })?;
+        let permit = self.semaphore.clone().acquire_owned().await.map_err(|e| {
+            Error::from_std_err(Code::Internal, &e).append("Failed to acquire connection permit")
+        })?;
         let request = GetObjectRequest {
             bucket: object_path.bucket.clone(),
             object: object_path.path.clone(),

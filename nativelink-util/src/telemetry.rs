@@ -14,11 +14,13 @@
 
 use core::default::Default;
 use core::time::Duration;
+use std::collections::HashMap;
 use std::env;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
+use ginepro::LoadBalancedChannel;
 use hyper::http::Response;
 use nativelink_error::{Code, ResultExt, make_err};
 use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
@@ -27,7 +29,9 @@ use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_http::HeaderExtractor;
-use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -44,6 +48,8 @@ use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, registry};
 use uuid::Uuid;
+
+use crate::origin_event::{BAZEL_METADATA_KEY, request_metadata_to_baggage};
 
 /// The OTLP "service.name" field for all nativelink services.
 const NATIVELINK_SERVICE_NAME: &str = "nativelink";
@@ -207,7 +213,10 @@ fn spawn_appender_drop_reporter() {
 ///
 /// Returns `Err` if logging was already initialized or if the exporters can't
 /// be initialized.
-pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nativelink_error::Error> {
+pub async fn init_tracing(
+    disable_otlp: bool,
+    nonblocking_log: bool,
+) -> Result<(), nativelink_error::Error> {
     static INITIALIZED: OnceLock<()> = OnceLock::new();
 
     if INITIALIZED.get().is_some() {
@@ -255,13 +264,18 @@ pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nat
     ]);
     global::set_text_map_propagator(propagator);
 
+    let maybe_channel = maybe_load_balanced_channel().await;
+
     // Logs
+    let mut log_exporter_builder = LogExporter::builder().with_tonic();
+    if let Some(channel) = maybe_channel.clone() {
+        log_exporter_builder = log_exporter_builder.with_channel(channel.into());
+    }
     let otlp_log_layer = OpenTelemetryTracingBridge::new(
         &SdkLoggerProvider::builder()
             .with_resource(resource.clone())
             .with_batch_exporter(
-                LogExporter::builder()
-                    .with_tonic()
+                log_exporter_builder
                     .with_protocol(Protocol::Grpc)
                     .build()
                     .map_err(|e| make_err!(Code::Internal, "{e}"))
@@ -272,13 +286,16 @@ pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nat
     .with_filter(otlp_filter());
 
     // Traces
+    let mut span_exporter_builder = SpanExporter::builder().with_tonic();
+    if let Some(channel) = maybe_channel.clone() {
+        span_exporter_builder = span_exporter_builder.with_channel(channel.into());
+    }
     let otlp_trace_layer = layer()
         .with_tracer(
             SdkTracerProvider::builder()
                 .with_resource(resource.clone())
                 .with_batch_exporter(
-                    SpanExporter::builder()
-                        .with_tonic()
+                    span_exporter_builder
                         .with_protocol(Protocol::Grpc)
                         .build()
                         .map_err(|e| make_err!(Code::Internal, "{e}"))
@@ -290,11 +307,14 @@ pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nat
         .with_filter(otlp_filter());
 
     // Metrics
+    let mut metric_exporter_builder = MetricExporter::builder().with_tonic();
+    if let Some(channel) = maybe_channel {
+        metric_exporter_builder = metric_exporter_builder.with_channel(channel.into());
+    }
     let meter_provider = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_periodic_exporter(
-            MetricExporter::builder()
-                .with_tonic()
+            metric_exporter_builder
                 .with_protocol(Protocol::Grpc)
                 .build()
                 .map_err(|e| make_err!(Code::Internal, "{e}"))
@@ -322,9 +342,43 @@ pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nat
     Ok(())
 }
 
-/// Custom metadata key field for Bazel metadata.
-const BAZEL_METADATA_KEY: &str = "bazel.metadata";
+/// Environment variable pointing OTLP exporters at a load-balanced endpoint.
+pub const NL_OTEL_ENDPOINT: &str = "NL_OTEL_ENDPOINT";
 
+/// Creates a load-balanced gRPC channel for the endpoint configured via
+/// [`NL_OTEL_ENDPOINT`], or returns `None` if the variable isn't set.
+///
+/// Public so that integration tests can verify that exporters behave the
+/// same with and without the load-balanced channel.
+pub async fn maybe_load_balanced_channel() -> Option<LoadBalancedChannel> {
+    match env::var(NL_OTEL_ENDPOINT) {
+        Ok(endpoint) => {
+            let url = Url::parse(endpoint.as_str())
+                .map_err(|e| {
+                    make_err!(Code::Internal, "Unable to parse endpoint {endpoint}: {e:?}")
+                })
+                .unwrap();
+
+            let host = url
+                .host()
+                .err_tip(|| format!("Unable to get host from endpoint {endpoint}"))
+                .unwrap();
+            let port = url
+                .port()
+                .err_tip(|| format!("Unable to get port from endpoint {endpoint}"))
+                .unwrap();
+
+            Some(
+                LoadBalancedChannel::builder((host.to_string(), port))
+                    .channel()
+                    .await
+                    .map_err(|e| make_err!(Code::Internal, "Invalid hostname '{endpoint}': {e}"))
+                    .unwrap(),
+            )
+        }
+        Err(_) => None,
+    }
+}
 /// This is the header that bazel sends when using the `--remote_header` flag.
 /// TODO(palfrey): There are various other headers that bazel supports.
 ///                    Optimize their usage.
@@ -332,6 +386,13 @@ const BAZEL_REQUESTMETADATA_HEADER: &str = "build.bazel.remote.execution.v2.requ
 
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::context::FutureExt;
+use url::Url;
+
+/// ASCII headers from an inbound client request, stored in the task context
+/// so that outgoing upstream calls can forward them (e.g. JWT auth tokens).
+// CAPPED: bounded by HTTP/2 max-header-list-size; per-request, not accumulated.
+#[derive(Clone, Debug, Default)]
+pub struct ClientHeaders(pub Arc<HashMap<String, String>>);
 
 #[derive(Debug, Clone)]
 pub struct OtlpMiddleware<S> {
@@ -375,6 +436,20 @@ where
         let clone = self.inner.clone();
         let mut inner = core::mem::replace(&mut self.inner, clone);
 
+        // Capture all ASCII-valued request headers before req is consumed, so
+        // they can be forwarded to upstream services (e.g. JWT auth tokens).
+        let client_headers = ClientHeaders(Arc::new(
+            req.headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect(),
+        ));
+
         let parent_cx = global::get_text_map_propagator(|propagator| {
             propagator.extract(&HeaderExtractor(req.headers()))
         });
@@ -412,19 +487,19 @@ NativeLink instance configured to require this OpenTelemetry Baggage header:
 
         let mut cx = parent_cx.with_span(span);
 
-        if let Some(bazel_header) = req.headers().get(BAZEL_REQUESTMETADATA_HEADER) {
-            if let Ok(decoded) = BASE64_STANDARD_NO_PAD.decode(bazel_header.as_bytes()) {
-                if let Ok(metadata) = RequestMetadata::decode(decoded.as_slice()) {
-                    let metadata_str = format!("{metadata:?}");
-                    debug!("Baggage Bazel request metadata: {metadata_str}");
-                    cx = cx.with_baggage(vec![
-                        KeyValue::new(BAZEL_METADATA_KEY, metadata_str),
-                        KeyValue::new(ENDUSER_ID, identity),
-                    ]);
-                }
-            }
+        if let Some(bazel_header) = req.headers().get(BAZEL_REQUESTMETADATA_HEADER)
+            && let Ok(decoded) = BASE64_STANDARD_NO_PAD.decode(bazel_header.as_bytes())
+            && let Ok(metadata) = RequestMetadata::decode(decoded.as_slice())
+        {
+            let metadata_str = format!("{metadata:?}");
+            debug!("Baggage Bazel request metadata: {metadata_str}");
+            cx = cx.with_baggage(vec![
+                KeyValue::new(BAZEL_METADATA_KEY, request_metadata_to_baggage(&metadata)),
+                KeyValue::new(ENDUSER_ID, identity),
+            ]);
         }
 
+        let cx = cx.with_value(client_headers);
         Box::pin(async move { inner.call(req).with_context(cx).await })
     }
 }
@@ -445,5 +520,58 @@ impl<S> tower::Layer<S> for OtlpLayer {
 
     fn layer(&self, service: S) -> Self::Service {
         OtlpMiddleware::new(service, self.identity_required)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nativelink_macro::nativelink_test;
+    use serial_test::serial;
+
+    use super::*;
+
+    // ginepro's default resolver (hickory-dns) reads /etc/resolv.conf, which
+    // doesn't exist in sandboxed environments (e.g. Nix builds).
+    #[cfg(unix)]
+    fn dns_configured() -> bool {
+        std::path::Path::new("/etc/resolv.conf").exists()
+    }
+    #[cfg(not(unix))]
+    const fn dns_configured() -> bool {
+        true
+    }
+
+    // Env vars are process-global, so concurrent writes would be a data race
+    // on Unix.  `#[serial(env)]` serializes all env-mutating tests.
+    #[serial(env)]
+    #[nativelink_test("crate")]
+    async fn channel_absent_when_env_not_set() {
+        // SAFETY: `#[serial(env)]` serializes all env-var writes across tests.
+        unsafe { env::remove_var(NL_OTEL_ENDPOINT) };
+        assert!(
+            maybe_load_balanced_channel().await.is_none(),
+            "Expected None when {NL_OTEL_ENDPOINT} is unset"
+        );
+    }
+
+    #[serial(env)]
+    #[nativelink_test("crate")]
+    async fn channel_present_when_valid_endpoint_set() {
+        if !dns_configured() {
+            eprintln!(
+                "Skipping channel_present_when_valid_endpoint_set: no DNS configuration \
+                 available (e.g. sandboxed Nix build)"
+            );
+            return;
+        }
+        // SAFETY: `#[serial(env)]` serializes all env-var writes across tests.
+        unsafe { env::set_var(NL_OTEL_ENDPOINT, "http://localhost:4317") };
+        let result = maybe_load_balanced_channel().await;
+        // SAFETY: `#[serial(env)]` serializes all env-var writes across tests.
+        unsafe { env::remove_var(NL_OTEL_ENDPOINT) };
+        assert!(
+            result.is_some(),
+            "Expected Some(channel) when {NL_OTEL_ENDPOINT} points to a valid URL"
+        );
     }
 }

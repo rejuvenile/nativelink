@@ -94,6 +94,7 @@ async fn make_fast_slow() -> (Arc<FilesystemStore<FileEntryImpl>>, Arc<FastSlowS
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),

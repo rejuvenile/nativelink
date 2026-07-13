@@ -274,6 +274,12 @@ impl AcProxyStore {
             connection_acquire_timeout_ms: Some(3000),
             chunked_writes_enabled: false,
             chunked_v2_writes_enabled: false,
+            // Upstream #2288 header-forwarding (not consumed by this fork's
+            // GrpcStore; internal peer connections forward routing headers via
+            // per-call metadata injection instead). Defaults are no-op.
+            use_legacy_resource_names: false,
+            headers: Default::default(),
+            forward_headers: Vec::new(),
         };
         let store = GrpcStore::new(&spec)
             .await
@@ -448,6 +454,11 @@ impl AcProxyStore {
 
 #[async_trait]
 impl StoreDriver for AcProxyStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        // Transparent wrapper: forward to the inner AC store.
+        self.inner.clone().into_inner().post_init().await
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -463,7 +474,7 @@ impl StoreDriver for AcProxyStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Pass through. Writes never short-circuit against AC pins.
         self.inner.update(key, reader, upload_size).await
     }

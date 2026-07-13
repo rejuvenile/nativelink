@@ -166,6 +166,7 @@ async fn make_e2e_fast_slow_with_sink(chunk_size: usize) -> Arc<FastSlowStore> {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -615,6 +616,7 @@ async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -769,6 +771,7 @@ async fn chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1107,6 +1110,10 @@ struct PinCountingFastStore {
 
 #[async_trait]
 impl StoreDriver for PinCountingFastStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -1122,7 +1129,7 @@ impl StoreDriver for PinCountingFastStore {
         digest: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Pin::new(self.inner.as_ref())
             .update(digest, reader, size_info)
             .await
@@ -1209,6 +1216,7 @@ async fn make_e2e_fast_slow_with_sink_and_pin_counter(
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1393,6 +1401,7 @@ async fn chunked_synchronous_commit_failure_inserts_failed_writes_and_repins() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1601,6 +1610,7 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -2057,6 +2067,7 @@ async fn chunked_async_commit_watchdog_unlinks_partial() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -2247,6 +2258,7 @@ async fn chunked_synchronous_commit_watchdog_fires_on_stalled_completion() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),

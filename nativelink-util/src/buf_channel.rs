@@ -195,6 +195,30 @@ impl DropCloserWriteHalf {
         self.send_get_bytes_on_error(buf).map_err(|err| err.0)
     }
 
+    /// Sends data over the channel to the receiver from a blocking thread.
+    pub fn blocking_send(&mut self, buf: Bytes) -> Result<(), Error> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| make_err!(Code::Internal, "Tried to send while stream is closed"))?;
+        let buf_len = u64::try_from(buf.len()).err_tip(|| "Could not convert usize to u64")?;
+        if buf_len == 0 {
+            return Err(make_input_err!(
+                "Cannot send EOF in blocking_send(). Instead use send_eof()"
+            ));
+        }
+        if let Err(err) = tx.blocking_send(buf) {
+            self.tx = None;
+            return Err(make_err!(
+                Code::Internal,
+                "Failed to write to data, receiver disconnected: {} bytes",
+                err.0.len()
+            ));
+        }
+        self.bytes_written += buf_len;
+        Ok(())
+    }
+
     /// Sends data over the channel to the receiver.
     #[inline]
     async fn send_get_bytes_on_error(&mut self, buf: Bytes) -> Result<(), (Error, Bytes)> {
@@ -745,6 +769,17 @@ impl DropCloserReadHalf {
         }
     }
 
+    /// Receive a chunk of data from a blocking thread.
+    pub fn blocking_recv(&mut self) -> Result<Bytes, Error> {
+        if let Some(result) = self.try_recv() {
+            result
+        } else {
+            // `None` here indicates EOF, which we represent as Zero data
+            let data = self.rx.blocking_recv().unwrap_or(ZERO_DATA);
+            self.recv_inner(data)
+        }
+    }
+
     fn maybe_populate_recent_data(&mut self, chunk: &Bytes) {
         if self.max_recent_data_size == 0 {
             return; // Fast path.
@@ -793,18 +828,19 @@ impl DropCloserReadHalf {
     }
 
     /// Drains the reader until an EOF is received, but sends data to the void.
-    pub async fn drain(&mut self) -> Result<(), Error> {
+    pub async fn drain(&mut self) -> Result<u64, Error> {
+        let mut total_bytes: u64 = 0;
         loop {
-            if self
+            let bytes = self
                 .recv()
                 .await
-                .err_tip(|| "Failed to drain in buf_channel::drain")?
-                .is_empty()
-            {
+                .err_tip(|| "Failed to drain in buf_channel::drain")?;
+            if bytes.is_empty() {
                 break; // EOF.
             }
+            total_bytes += bytes.len().try_into().unwrap_or(0);
         }
-        Ok(())
+        Ok(total_bytes)
     }
 
     /// Peek the next set of bytes in the stream without consuming them.

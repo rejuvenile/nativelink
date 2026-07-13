@@ -118,6 +118,7 @@ fn build_server(
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();

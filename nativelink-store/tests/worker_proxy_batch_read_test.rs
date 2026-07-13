@@ -416,6 +416,9 @@ struct DelayedPeerStore {
 
 #[async_trait]
 impl StoreDriver for DelayedPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -429,7 +432,7 @@ impl StoreDriver for DelayedPeerStore {
         key: StoreKey<'_>,
         rx: nativelink_util::buf_channel::DropCloserReadHalf,
         size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, rx, size).await
     }
 

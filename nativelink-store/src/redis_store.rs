@@ -1905,6 +1905,10 @@ where
     C: ConnectionLike + Clone + Send + Sync + Unpin + 'static,
     M: RedisManager<C> + Unpin + Send + Sync + 'static,
 {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -2161,7 +2165,7 @@ where
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let final_key = self.encode_key(&key);
 
         // While the name generation function can be supplied by the user, we need to have the curly
@@ -2189,7 +2193,7 @@ where
                     .await
                     .err_tip(|| "Failed to drain in RedisStore::update")?;
                 // Zero-digest keys are special -- we don't need to do anything with it.
-                return Ok(());
+                return Ok(0);
             }
         }
 
@@ -2438,7 +2442,8 @@ where
             } else if elapsed.as_secs() >= 1 {
                 warn!(cmd = "RENAME+PUBLISH", key = %final_key, elapsed_ms = elapsed.as_millis() as u64, size_bytes = blob_len, "redis pipeline slow (>1s)");
             }
-            return Ok(result.1);
+            let _ = result;
+            return Ok(u64::try_from(blob_len).unwrap_or(0));
         }
 
         // No pub_sub — just RENAME.
@@ -2475,7 +2480,7 @@ where
             warn!(cmd = "RENAME", key = %final_key, elapsed_ms = elapsed.as_millis() as u64, size_bytes = blob_len, "redis command slow (>1s)");
         }
 
-        Ok(())
+        Ok(u64::try_from(blob_len).unwrap_or(0))
     }
 
     // LINT: writer-termination contract for `get_part`.
@@ -3223,22 +3228,30 @@ impl Drop for RedisSubscription {
             return; // Already dropped, nothing to do.
         };
         let key = receiver.borrow().clone();
-        // IMPORTANT: This must be dropped before receiver_count() is called.
-        drop(receiver);
         let Some(subscribed_keys) = self.weak_subscribed_keys.upgrade() else {
-            return; // Already dropped, nothing to do.
+            return; // Parent dropped — nothing to do.
         };
+        // #2353: acquire the write lock BEFORE dropping our receiver so the
+        // count check and the map removal are atomic wrt concurrent
+        // subscribe/drop for this key. The prior code dropped the receiver
+        // first and then checked `receiver_count() == 0` after acquiring the
+        // lock, opening a TOCTOU window in which the count no longer matched
+        // the map state.
         let mut subscribed_keys = subscribed_keys.write();
         let Some(value) = subscribed_keys.get(&key) else {
-            error!(
-                "Key {key} was not found in subscribed keys when checking if it should be removed."
+            warn!(
+                %key,
+                "RedisSubscription::drop: key absent from subscribed_keys under write lock — \
+                 indicates an unexpected removal path",
             );
             return;
         };
-        // If we have no receivers, cleanup the entry from our map.
-        if value.receiver_count() == 0 {
+        // The count still includes our own (not-yet-dropped) receiver. If we
+        // are the sole subscriber, remove the publisher entry.
+        if value.receiver_count() == 1 {
             subscribed_keys.remove(key);
         }
+        drop(receiver);
     }
 }
 
@@ -3427,6 +3440,29 @@ impl SchedulerSubscriptionManager for RedisSubscriptionManager {
     }
 }
 
+/// Best-effort TTL application for a just-written scheduler key (#2315
+/// completed-action expiry). A `None` expiry is a no-op; a failed `EXPIRE`
+/// propagates as an `Error`, and an `EXPIRE` that reports the key absent
+/// (`!= 1`) is logged rather than silently ignored.
+async fn apply_redis_key_expiry<C: ConnectionLike + Send + Sync>(
+    connection_manager: &mut C,
+    redis_key: &str,
+    expiry: Option<Duration>,
+) -> Result<(), Error> {
+    let Some(expiry) = expiry else {
+        return Ok(());
+    };
+    let seconds: i64 = expiry.as_secs().try_into().unwrap_or(i64::MAX);
+    let expiry_result: u8 = connection_manager
+        .expire(redis_key, seconds)
+        .await
+        .err_tip(|| format!("In RedisStore::update_data (expiry) for {redis_key}"))?;
+    if expiry_result != 1 {
+        warn!(%redis_key, seconds, "Wasn't able to set expiry for Redis key");
+    }
+    Ok(())
+}
+
 impl<C, M> SchedulerStore for RedisStore<C, M>
 where
     C: Clone + ConnectionLike + Sync + Send + 'static,
@@ -3454,7 +3490,7 @@ where
             .map(Clone::clone)
     }
 
-    async fn update_data<T>(&self, data: T) -> Result<Option<i64>, Error>
+    async fn update_data<T>(&self, data: T, expiry: Option<Duration>) -> Result<Option<i64>, Error>
     where
         T: SchedulerStoreDataProvider
             + SchedulerStoreKeyProvider
@@ -3541,6 +3577,7 @@ where
                 %new_version,
                 "Updated redis key to new version"
             );
+            apply_redis_key_expiry(&mut client.connection_manager, &redis_key, expiry).await?;
             // If we have a publish channel configured, send a notice that the key has been set.
             if let Some(pub_sub_channel) = &self.pub_sub_channel {
                 return Ok(client
@@ -3594,6 +3631,7 @@ where
                     return Err(error);
                 }
             }
+            apply_redis_key_expiry(&mut client.connection_manager, &redis_key, expiry).await?;
             // If we have a publish channel configured, send a notice that the key has been set.
             if let Some(pub_sub_channel) = &self.pub_sub_channel {
                 return Ok(client

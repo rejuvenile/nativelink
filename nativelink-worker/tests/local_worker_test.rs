@@ -830,6 +830,7 @@ async fn new_local_worker_creates_work_directory_test() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(
             <FilesystemStore>::new(&FilesystemSpec {
@@ -874,6 +875,7 @@ async fn new_local_worker_removes_work_directory_before_start_test() -> Result<(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(
             <FilesystemStore>::new(&FilesystemSpec {
@@ -2531,6 +2533,7 @@ async fn deferred_uploads_without_cas_server_port_is_rejected() -> Result<(), Er
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(
             <FilesystemStore>::new(&FilesystemSpec {
@@ -2590,6 +2593,7 @@ async fn deferred_uploads_with_cas_server_port_passes_guard() -> Result<(), Erro
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(
             <FilesystemStore>::new(&FilesystemSpec {

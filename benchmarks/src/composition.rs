@@ -320,6 +320,9 @@ fn rewrite_filesystem_paths(spec: &mut StoreSpec, content_path: &str, temp_path:
         StoreSpec::Compression(c_spec) => {
             rewrite_filesystem_paths(&mut c_spec.backend, content_path, temp_path);
         }
+        StoreSpec::CacheMetrics(cm_spec) => {
+            rewrite_filesystem_paths(&mut cm_spec.backend, content_path, temp_path);
+        }
         StoreSpec::Dedup(d_spec) => {
             rewrite_filesystem_paths(&mut d_spec.index_store, content_path, temp_path);
             rewrite_filesystem_paths(&mut d_spec.content_store, content_path, temp_path);

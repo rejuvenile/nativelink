@@ -4,7 +4,7 @@ lints.workspace = true
 [package]
 edition = "2024"
 name = "nativelink-util"
-version = "1.0.0"
+version = "1.6.1"
 
 [features]
 io-uring = ["dep:tokio-epoll-uring", "dep:io-uring"]
@@ -52,29 +52,29 @@ dashmap = { version = "6", default-features = false }
 libc = { version = "0.2.177", default-features = false }
 moka = { version = "0.12", features = ["sync"], default-features = false }
 mock_instant = { version = "0.5.3", default-features = false }
-opentelemetry = { version = "0.31.0", default-features = false }
-opentelemetry-appender-tracing = { version = "0.31.1", default-features = false }
-opentelemetry-http = { version = "0.31.0", default-features = false }
-opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
+opentelemetry = { version = "0.32.0", default-features = false }
+opentelemetry-appender-tracing = { version = "0.32.0", default-features = false }
+opentelemetry-http = { version = "0.32.0", default-features = false }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
   "grpc-tonic",
   "logs",
   "metrics",
   "trace",
   "zstd-tonic",
 ] }
-opentelemetry-semantic-conventions = { version = "0.31.0", default-features = false, features = [
+opentelemetry-semantic-conventions = { version = "0.32.0", default-features = false, features = [
   "default",
   "semconv_experimental",
 ] }
-opentelemetry_sdk = { version = "0.31.0", default-features = false }
+opentelemetry_sdk = { version = "0.32.1", default-features = false }
 parking_lot = { version = "0.12.3", features = [
   "arc_lock",
   "send_guard",
 ], default-features = false }
 pin-project = { version = "1.1.10", default-features = false }
 pin-project-lite = { version = "0.2.16", default-features = false }
-prost = { version = "0.14.3", default-features = false }
-prost-types = { version = "0.14.3", default-features = false, features = [
+prost = { version = "0.14.4", default-features = false }
+prost-types = { version = "0.14.4", default-features = false, features = [
   "std",
 ] }
 rand = { version = "0.9.0", default-features = false, features = [
@@ -86,7 +86,7 @@ serde = { version = "1.0.219", default-features = false }
 sha2 = { version = "0.10.8", default-features = false, features = ["asm"] }
 smallvec = { version = "1.13", default-features = false, features = ["const_generics", "union"] }
 tempfile = { version = "3.20.0", default-features = false }
-tokio = { version = "1.44.1", features = [
+tokio = { version = "1.52.2", features = [
   "fs",
   "io-util",
   "rt-multi-thread",
@@ -105,7 +105,7 @@ tonic = { version = "0.14.5", features = [
 tower = { version = "0.5.2", default-features = false, features = ["buffer", "reconnect"] }
 tracing = { version = "0.1.41", default-features = false }
 tracing-appender = { version = "0.2", default-features = false }
-tracing-opentelemetry = { version = "0.32.1", default-features = false, features = [
+tracing-opentelemetry = { version = "0.33.0", default-features = false, features = [
   "metrics",
 ] }
 tracing-subscriber = { version = "0.3.19", features = [
@@ -115,7 +115,9 @@ tracing-subscriber = { version = "0.3.19", features = [
   "registry",
 ], default-features = false }
 tracing-test = { version = "0.2.5", default-features = false, features = [] }
-
+# FIXME: Replace with version once https://github.com/TrueLayer/ginepro/pull/77 is fixed
+ginepro = { git = "https://github.com/mstyura/ginepro", rev = "d08cdeff6300edfb46204b3b9fbde3f3355db35f", default-features = false }
+url = { version = "2.5.7", default-features = false }
 uuid = { version = "1.16.0", default-features = false, features = [
   "serde",
   "v4",
@@ -131,11 +133,17 @@ socket2 = { version = "0.5", default-features = false, optional = true }
 axum = { version = "0.8.3", default-features = false, features = ["http1", "query", "tokio"], optional = true }
 pprof = { version = "0.15.0", default-features = false, features = ["flamegraph", "prost-codec"], optional = true }
 serde_json = { version = "1.0.140", default-features = false, features = ["alloc"], optional = true }
+wincode = { version = "0.5.4", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
+anyhow = { version = "1.0.100", default-features = false }
 nativelink-macro = { path = "../nativelink-macro" }
 fail = { version = "0.5", features = ["failpoints"] }
-tokio = { version = "1.44.1", features = ["macros", "test-util"], default-features = false }
+tokio = { version = "1.52.2", features = ["macros", "test-util"], default-features = false }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
+  "gen-tonic",
+  "metrics",
+] }
 
 axum = { version = "0.8.3", default-features = false }
 criterion = { version = "0.5", default-features = false, features = ["async_tokio"] }
@@ -151,6 +159,7 @@ serde_json5 = { version = "0.2.1", default-features = false }
 serial_test = { version = "3.2.0", default-features = false, features = [
   "async",
 ] }
+tonic-prost = { version = "0.14.6", default-features = false }
 tracing-test = { version = "0.2.5", default-features = false, features = [
   "no-env-filter",
 ] }

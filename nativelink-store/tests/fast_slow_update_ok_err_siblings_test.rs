@@ -175,6 +175,9 @@ impl DropImmediatelyOkSlowStore {
 
 #[async_trait]
 impl StoreDriver for DropImmediatelyOkSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -193,12 +196,12 @@ impl StoreDriver for DropImmediatelyOkSlowStore {
         _digest: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Drop `_reader` immediately (rx dropped) and return Ok.
         // Simulates GrpcStore receiving AlreadyExists from the server
         // and returning Ok without draining the stream body.
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(
@@ -285,6 +288,7 @@ fn build_fast_slow(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,

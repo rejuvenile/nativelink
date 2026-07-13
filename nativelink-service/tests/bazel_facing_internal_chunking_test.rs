@@ -134,6 +134,7 @@ async fn make_fast_slow_with_dispatcher(
     let slow_store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1036,6 +1037,7 @@ async fn fast_tier_ok_dispatch_err_records_failed_slow_write() {
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),

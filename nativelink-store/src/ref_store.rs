@@ -82,13 +82,6 @@ impl RefStore {
         })
     }
 
-    // This will get the store or populate it if needed. It is designed to be quite fast on the
-    // common path, but slow on the uncommon path. It does use some unsafe functions because we
-    // wanted it to be fast. It is technically possible on some platforms for this function to
-    // create a data race here is the reason I do not believe it is an issue:
-    // 1. It would only happen on the very first call of the function (after first call we are safe)
-    // 2. It should only happen on platforms that are < 64 bit address space
-    // 3. It is likely that the internals of how Option work protect us anyway.
     #[inline]
     fn get_store(&self) -> Result<&Store, Error> {
         let ref_store = self.inner.cell.0.get();
@@ -158,6 +151,13 @@ impl RefStore {
 
 #[async_trait]
 impl StoreDriver for RefStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        // RefStore resolves its inner store lazily on first access via
+        // `get_store()` (AlignedStoreCell + queued-callback replay); there is
+        // no eager binding to do at post-init time.
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -181,7 +181,7 @@ impl StoreDriver for RefStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.get_store()?.update(key, reader, size_info).await
     }
 
@@ -217,7 +217,7 @@ impl StoreDriver for RefStore {
         match self.get_store() {
             Ok(store) => store.inner_store(key),
             Err(err) => {
-                error!(?key, ?err, "Failed to get store for key",);
+                error!(?key, ?err, "Failed to get store for key");
                 self
             }
         }

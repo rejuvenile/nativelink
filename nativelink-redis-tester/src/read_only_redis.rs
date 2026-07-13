@@ -22,11 +22,12 @@ use redis::Value;
 use redis_protocol::resp2::decode::decode;
 use redis_protocol::resp2::types::OwnedFrame;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot::{self, Sender};
 use tracing::info;
 
 use crate::fake_redis::{arg_as_string, fake_redis_internal};
 
-const FAKE_SCRIPT_SHA: &str = "b22b9926cbce9dd9ba97fa7ba3626f89feea1ed5";
+const FAKE_SCRIPT_SHA: &str = "5148c724ce419ea27d1971dcb61c111dbbc6b63e";
 
 #[derive(Clone, Debug)]
 pub struct ReadOnlyRedis {
@@ -47,7 +48,7 @@ impl ReadOnlyRedis {
         }
     }
 
-    async fn dynamic_fake_redis(self, listener: TcpListener) {
+    async fn dynamic_fake_redis(self, listener: TcpListener, listener_ready_tx: Sender<()>) {
         let readonly_err_str = "READONLY You can't write against a read only replica.";
         let readonly_err = format!("!{}\r\n{readonly_err_str}\r\n", readonly_err_str.len());
 
@@ -119,6 +120,16 @@ impl ReadOnlyRedis {
                         }
                     }
                     "EVALSHA" => Either::Left(Value::Array(vec![Value::Int(1), Value::Int(0)])),
+                    "EXPIRE" => {
+                        assert_eq!(args[1], OwnedFrame::BulkString(b"60".to_vec()));
+                        let value = self.readonly_triggered.load(Ordering::Relaxed);
+                        if value {
+                            Either::Left(Value::Int(1))
+                        } else {
+                            self.readonly_triggered.store(true, Ordering::Relaxed);
+                            Either::Right(readonly_err.clone())
+                        }
+                    }
                     actual => {
                         panic!("Mock command not implemented! {actual:?}");
                     }
@@ -139,7 +150,7 @@ impl ReadOnlyRedis {
             }
             output
         };
-        fake_redis_internal(listener, vec![inner]).await;
+        fake_redis_internal(listener, listener_ready_tx, vec![inner]).await;
     }
 
     pub async fn run(self) -> u16 {
@@ -147,9 +158,15 @@ impl ReadOnlyRedis {
         let port = listener.local_addr().unwrap().port();
         info!("Using port {port}");
 
+        let (listener_ready_tx, listener_ready_rx) = oneshot::channel::<()>();
+
         background_spawn!("listener", async move {
-            self.dynamic_fake_redis(listener).await;
+            self.dynamic_fake_redis(listener, listener_ready_tx).await;
         });
+
+        listener_ready_rx
+            .await
+            .expect("Expected successful listener boot");
 
         port
     }

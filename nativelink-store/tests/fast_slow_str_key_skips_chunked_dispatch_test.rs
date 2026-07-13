@@ -116,6 +116,7 @@ fn make_fast_slow() -> (Arc<FastSlowStore>, Store, Store) {
             slow_direction: nativelink_config::stores::StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast.clone(),
         slow.clone(),

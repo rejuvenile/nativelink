@@ -95,6 +95,7 @@ fn build_fss(slow: Store) -> Arc<FastSlowStore> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -113,6 +114,9 @@ default_health_status_indicator!(NoHasProbe);
 
 #[async_trait]
 impl StoreDriver for NoHasProbe {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -129,7 +133,7 @@ impl StoreDriver for NoHasProbe {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
     async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
@@ -201,6 +205,9 @@ impl NoUpdateExpected {
 
 #[async_trait]
 impl StoreDriver for NoUpdateExpected {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -213,7 +220,7 @@ impl StoreDriver for NoUpdateExpected {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.forbid(&key);
         self.inner.update(key, reader, upload_size).await
     }

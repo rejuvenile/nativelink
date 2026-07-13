@@ -131,6 +131,7 @@ fn build_fast_slow_with_memory_slow() -> (Store, Arc<FastSlowStore>) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,

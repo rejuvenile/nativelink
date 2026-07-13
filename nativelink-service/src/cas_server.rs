@@ -32,8 +32,8 @@ use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_s
 use nativelink_proto::build::bazel::remote::execution::v2::{
     BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
     BatchUpdateBlobsResponse, Directory, FindMissingBlobsRequest, FindMissingBlobsResponse,
-    GetTreeRequest, GetTreeResponse, batch_read_blobs_response, batch_update_blobs_response,
-    compressor,
+    GetTreeRequest, GetTreeResponse, SpliceBlobRequest, SpliceBlobResponse, SplitBlobRequest,
+    SplitBlobResponse, batch_read_blobs_response, batch_update_blobs_response, compressor,
 };
 use nativelink_proto::google::rpc::Status as GrpcStatus;
 use nativelink_store::ac_utils::batch_get_and_decode_digest;
@@ -1287,6 +1287,32 @@ impl ContentAddressableStorage for CasServer {
             debug!(return = "Ok(<stream>)");
         }
         resp
+    }
+
+    // REAPI content-defined chunking (SplitBlob/SpliceBlob, upstream #2497)
+    // is not implemented in this fork yet. The generated
+    // `ContentAddressableStorage` trait requires these methods, so we
+    // provide `UNIMPLEMENTED` stubs. This server does not advertise
+    // `split_blob_support`/`splice_blob_support` in its capabilities, so
+    // conformant REAPI clients will not call these RPCs. A later feature
+    // pass replaces these stubs with the real handlers (store/util/config
+    // touches land together).
+    async fn split_blob(
+        &self,
+        _grpc_request: Request<SplitBlobRequest>,
+    ) -> Result<Response<SplitBlobResponse>, Status> {
+        Err(Status::unimplemented(
+            "SplitBlob (REAPI content-defined chunking) is not supported by this server",
+        ))
+    }
+
+    async fn splice_blob(
+        &self,
+        _grpc_request: Request<SpliceBlobRequest>,
+    ) -> Result<Response<SpliceBlobResponse>, Status> {
+        Err(Status::unimplemented(
+            "SpliceBlob (REAPI content-defined chunking) is not supported by this server",
+        ))
     }
 }
 

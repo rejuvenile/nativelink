@@ -571,6 +571,8 @@ async fn t4_coalesce_guard_reaped_on_worker_evict() -> Result<(), Error> {
         ActionInfoWithProps {
             inner: ai,
             platform_properties: PlatformProperties::default(),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
         }
     };
     let reserved = ws
@@ -670,6 +672,8 @@ async fn d2_coalesce_guard_reaped_on_unreserve_reroute() -> Result<(), Error> {
         ActionInfoWithProps {
             inner: ai,
             platform_properties: PlatformProperties::default(),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
         }
     };
     let reserved = ws
@@ -932,6 +936,8 @@ async fn add_busy_healthy_worker(
         ActionInfoWithProps {
             inner: ai,
             platform_properties: props.clone(),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
         }
     };
     let reserved = scheduler
@@ -1255,6 +1261,8 @@ async fn prefetch_selector_is_peek_only_assignment_unchanged() -> Result<(), Err
         ActionInfoWithProps {
             inner: ai,
             platform_properties: PlatformProperties::default(),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
         }
     };
     let reserved = ws
@@ -1556,7 +1564,7 @@ async fn prefetch_hit_vs_miss() -> Result<(), Error> {
         let ai = {
             let mut inner = make_base_action_info(make_system_time(1), DigestInfo::new([0x31; 32], 1));
             Arc::make_mut(&mut inner).input_root_digest = input_root;
-            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default() }
+            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None }
         };
         let reserved = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &op_p, &ai, false)
@@ -1622,7 +1630,7 @@ async fn prefetch_hit_vs_miss() -> Result<(), Error> {
         let ai = {
             let mut inner = make_base_action_info(make_system_time(1), DigestInfo::new([0x32; 32], 2));
             Arc::make_mut(&mut inner).input_root_digest = input_root;
-            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default() }
+            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None }
         };
         let reserved = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &op_m, &ai, false)
@@ -1655,7 +1663,7 @@ async fn prefetch_hit_vs_miss() -> Result<(), Error> {
         let control_ai = {
             let mut inner = make_base_action_info(make_system_time(1), DigestInfo::new([0x33; 32], 3));
             Arc::make_mut(&mut inner).input_root_digest = input_root;
-            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default() }
+            ActionInfoWithProps { inner, platform_properties: PlatformProperties::default(), origin_metadata: Default::default(), scheduler_start_execute_event_id: None }
         };
         let control = ws
             .find_and_reserve_worker(&PlatformProperties::default(), &op_control, &control_ai, false)

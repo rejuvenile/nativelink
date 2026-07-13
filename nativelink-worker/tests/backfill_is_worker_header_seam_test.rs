@@ -279,6 +279,9 @@ fn make_grpc_spec(addr: String) -> nativelink_config::stores::GrpcSpec {
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
+        use_legacy_resource_names: false,
+        headers: Default::default(),
+        forward_headers: Vec::new(),
     }
 }
 
@@ -317,6 +320,7 @@ async fn make_fss_over_grpc(addr: String, digest: DigestInfo, payload: Bytes) ->
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,

@@ -661,6 +661,9 @@ default_health_status_indicator!(PartialFailStore);
 
 #[async_trait]
 impl StoreDriver for PartialFailStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -674,7 +677,7 @@ impl StoreDriver for PartialFailStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
 
@@ -936,6 +939,9 @@ default_health_status_indicator!(StructuredFailStore);
 
 #[async_trait]
 impl StoreDriver for StructuredFailStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -949,7 +955,7 @@ impl StoreDriver for StructuredFailStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
 
@@ -1455,6 +1461,9 @@ default_health_status_indicator!(EmptyEofStore);
 
 #[async_trait]
 impl StoreDriver for EmptyEofStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -1471,7 +1480,7 @@ impl StoreDriver for EmptyEofStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "EmptyEofStore does not support update"
@@ -1561,6 +1570,9 @@ default_health_status_indicator!(PartialWriteThenErrorStore);
 
 #[async_trait]
 impl StoreDriver for PartialWriteThenErrorStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -1577,7 +1589,7 @@ impl StoreDriver for PartialWriteThenErrorStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "PartialWriteThenErrorStore: update not supported"
@@ -1941,6 +1953,7 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -1983,6 +1996,9 @@ default_health_status_indicator!(DelayedPeerStore);
 
 #[async_trait]
 impl StoreDriver for DelayedPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -1996,7 +2012,7 @@ impl StoreDriver for DelayedPeerStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
 
@@ -2108,6 +2124,7 @@ async fn inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_writer_termin
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -2249,6 +2266,7 @@ async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -2424,6 +2442,7 @@ async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         recording_store,
@@ -2511,6 +2530,9 @@ default_health_status_indicator!(RecordingInnerStore);
 
 #[async_trait]
 impl StoreDriver for RecordingInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -2527,11 +2549,11 @@ impl StoreDriver for RecordingInnerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_calls
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         let _drained = reader.drain().await;
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(
@@ -2627,6 +2649,7 @@ async fn cdn_cache_failure_does_not_fail_read() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         failing_fast,
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -2752,6 +2775,7 @@ async fn cdn_cache_failure_on_peer_mid_stream_err_does_not_deadlock() -> Result<
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         failing_fast,
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -2867,6 +2891,9 @@ default_health_status_indicator!(FailingUpdateStore);
 
 #[async_trait]
 impl StoreDriver for FailingUpdateStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -2883,7 +2910,7 @@ impl StoreDriver for FailingUpdateStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Drain the reader so the producer doesn't hang on a full channel
         // before we surface the configured failure.
         let _drained = reader.drain().await;

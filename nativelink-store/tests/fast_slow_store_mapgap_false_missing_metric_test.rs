@@ -77,6 +77,7 @@ fn build_fss() -> (Arc<FastSlowStore>, Arc<MemoryStore>) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_inner.clone()),
         Store::new(slow_inner),

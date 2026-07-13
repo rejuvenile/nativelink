@@ -84,7 +84,7 @@ fn make_bytestream_server(
             instance_name: "foo_instance_name".to_string(),
             config: ByteStreamConfig {
                 cas_store: "main_cas".to_string(),
-                persist_stream_on_disconnect_timeout: 0,
+                persist_stream_on_disconnect_timeout_s: 0,
                 max_bytes_per_stream: 1024,
                 ..Default::default()
             },
@@ -1227,7 +1227,7 @@ pub async fn memory_pressure_evicts_oldest_idle_streams() -> Result<(), Box<dyn 
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 2,
+            persist_stream_on_disconnect_timeout_s: 2,
             max_bytes_per_stream: 1024,
             max_partial_write_bytes: 16,
             ..Default::default()
@@ -1345,7 +1345,7 @@ fn make_streaming_config() -> Vec<WithInstanceName<ByteStreamConfig>> {
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 1024,
             streaming_read_while_write: true,
             max_streaming_blob_buffer_bytes: 64 * 1024 * 1024,
@@ -1650,7 +1650,7 @@ pub async fn memory_pressure_does_not_trigger_under_budget()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 2,
+            persist_stream_on_disconnect_timeout_s: 2,
             max_bytes_per_stream: 1024,
             // Budget of 100 bytes: 5 streams of 10 bytes = 50 bytes, under budget.
             max_partial_write_bytes: 100,
@@ -1724,7 +1724,7 @@ pub async fn memory_pressure_evicts_oldest_idle_stream()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 10,
+            persist_stream_on_disconnect_timeout_s: 10,
             max_bytes_per_stream: 1024,
             max_partial_write_bytes: 20,
             ..Default::default()
@@ -1941,7 +1941,7 @@ pub async fn resumable_write_reconnect_same_uuid()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 5,
+            persist_stream_on_disconnect_timeout_s: 5,
             max_bytes_per_stream: 1024,
             ..Default::default()
         },
@@ -2056,7 +2056,7 @@ pub async fn streaming_read_of_large_blob_not_truncated()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: CHUNK_SIZE,
             streaming_read_while_write: true,
             max_streaming_blob_buffer_bytes: 64 * 1024, // 64 KB — triggers sliding window
@@ -2196,7 +2196,7 @@ pub async fn streaming_read_large_chunk_exceeds_max_bytes_per_stream()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: MAX_BYTES,
             streaming_read_while_write: true,
             // Buffer large enough to hold the whole blob.
@@ -2324,7 +2324,7 @@ pub async fn streaming_read_with_offset_past_eviction_falls_through_to_store()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: CHUNK_SIZE,
             streaming_read_while_write: true,
             max_streaming_blob_buffer_bytes: 64 * 1024, // 64 KB sliding window
@@ -2436,7 +2436,7 @@ pub async fn concurrent_read_during_active_upload()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 1024,
             streaming_read_while_write: true,
             max_streaming_blob_buffer_bytes: 64 * 1024,
@@ -2731,7 +2731,7 @@ fn make_locality_test_server(store_manager: &StoreManager) -> Arc<ByteStreamServ
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             // Larger than our 100 KiB blob so reads (not exercised
             // here, but defensive) wouldn't fragment unnecessarily.
             max_bytes_per_stream: 256 * 1024,
@@ -2923,6 +2923,10 @@ impl nativelink_metric::MetricsComponent for LyingHasStore {
 
 #[async_trait::async_trait]
 impl StoreDriver for LyingHasStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -2939,9 +2943,11 @@ impl StoreDriver for LyingHasStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        reader.drain().await.err_tip(|| "In LyingHasStore::update")?;
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(reader
+            .drain()
+            .await
+            .err_tip(|| "In LyingHasStore::update")?)
     }
 
     async fn get_part(
@@ -3316,6 +3322,10 @@ impl nativelink_metric::MetricsComponent for FailAfterNBytesStore {
 
 #[async_trait::async_trait]
 impl StoreDriver for FailAfterNBytesStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -3336,7 +3346,7 @@ impl StoreDriver for FailAfterNBytesStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Drain up to `fail_after` bytes, then return Err. This mirrors
         // the production path where `FastSlowStore::update`'s chunked
         // driver returns `Code::ResourceExhausted` mid-stream: the body
@@ -3436,7 +3446,7 @@ pub async fn cancelled_chunked_write_replaced_not_recycled_on_retry()
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 10,
+            persist_stream_on_disconnect_timeout_s: 10,
             max_bytes_per_stream: 1024,
             ..Default::default()
         },
@@ -3709,6 +3719,7 @@ pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flig
     let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -3842,6 +3853,7 @@ pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_fl
     let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -4050,6 +4062,10 @@ default_health_status_indicator!(PartialErrThenDropStore);
 
 #[async_trait]
 impl StoreDriver for PartialErrThenDropStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -4069,7 +4085,7 @@ impl StoreDriver for PartialErrThenDropStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "PartialErrThenDropStore: update not supported"
@@ -4443,6 +4459,10 @@ default_health_status_indicator!(SendEofThenOkStore);
 
 #[async_trait]
 impl StoreDriver for SendEofThenOkStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -4464,7 +4484,7 @@ impl StoreDriver for SendEofThenOkStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "SendEofThenOkStore: update not supported"

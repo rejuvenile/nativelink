@@ -1473,6 +1473,7 @@ async fn cdn_tee_fss_nc_abandonment_does_not_emit_error_log() -> Result<(), Erro
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         slow_fast,
         fss_slow,
@@ -1648,6 +1649,7 @@ async fn cdn_tee_fss_chunked_abandonment_does_not_emit_error_log() -> Result<(),
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         slow_fast,
         fss_slow,
@@ -1773,6 +1775,7 @@ async fn fss_genuine_update_failure_still_logs_error_level() -> Result<(), Error
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -1838,6 +1841,9 @@ default_health_status_indicator!(SlowUpdateInnerStore);
 
 #[async_trait]
 impl StoreDriver for SlowUpdateInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -1854,13 +1860,13 @@ impl StoreDriver for SlowUpdateInnerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_calls.fetch_add(1, AOrdering::SeqCst);
         // Sleep BEFORE we drain — this is what causes cache_tx to back
         // up and abandon-on-full to fire.
         tokio::time::sleep(self.sleep).await;
         let _drained = reader.drain().await;
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(
@@ -1925,6 +1931,9 @@ default_health_status_indicator!(ThrottledFirstChunkInnerStore);
 
 #[async_trait]
 impl StoreDriver for ThrottledFirstChunkInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -1938,7 +1947,7 @@ impl StoreDriver for ThrottledFirstChunkInnerStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.triggered.store(1, AOrdering::SeqCst);
         tokio::time::sleep(self.sleep).await;
         self.delegate.update(key, reader, upload_size).await
@@ -2003,6 +2012,9 @@ default_health_status_indicator!(FailingUpdateInnerStore);
 
 #[async_trait]
 impl StoreDriver for FailingUpdateInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -2019,7 +2031,7 @@ impl StoreDriver for FailingUpdateInnerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Drain the reader so the producer doesn't wedge, then fail.
         let _ = reader.drain().await;
         Err(make_err!(self.err_code, "{}", self.err_msg))
@@ -2090,6 +2102,9 @@ default_health_status_indicator!(DelayedReadInnerStore);
 
 #[async_trait]
 impl StoreDriver for DelayedReadInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -2106,7 +2121,7 @@ impl StoreDriver for DelayedReadInnerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Sleep before reading, giving the forward loop time to fill
         // the 16-slot mpsc and trigger the Full-abandon + send_error path.
         tokio::time::sleep(self.sleep).await;
@@ -2186,6 +2201,9 @@ default_health_status_indicator!(ChunkedPeerStore);
 
 #[async_trait]
 impl StoreDriver for ChunkedPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -2202,9 +2220,9 @@ impl StoreDriver for ChunkedPeerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let _drained = reader.drain().await;
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(

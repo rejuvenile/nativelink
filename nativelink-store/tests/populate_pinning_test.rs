@@ -87,6 +87,7 @@ async fn make_fss(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),

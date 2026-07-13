@@ -76,6 +76,9 @@ struct HangingSlowStore {
 
 #[async_trait]
 impl StoreDriver for HangingSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -91,7 +94,7 @@ impl StoreDriver for HangingSlowStore {
         digest: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Drop the reader so the upstream sender doesn't block
         // forever (FastSlowStore's send_fut would otherwise wedge on
         // the buf_channel).
@@ -220,6 +223,7 @@ async fn make_harness() -> Result<Harness, Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -543,6 +547,7 @@ async fn pin_expire_listener_registration_is_idempotent() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store_handle.clone(),
         Store::new(hanging_a),
@@ -555,6 +560,7 @@ async fn pin_expire_listener_registration_is_idempotent() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store_handle.clone(),
         Store::new(inner_slow_b),

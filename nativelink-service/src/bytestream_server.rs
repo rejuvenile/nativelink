@@ -1257,10 +1257,10 @@ impl ByteStreamServer {
     ) -> Result<Self, Error> {
         let mut instance_infos: HashMap<String, InstanceInfo> = HashMap::new();
         for config in configs {
-            let idle_stream_timeout = if config.persist_stream_on_disconnect_timeout == 0 {
+            let idle_stream_timeout = if config.persist_stream_on_disconnect_timeout_s == 0 {
                 DEFAULT_PERSIST_STREAM_ON_DISCONNECT_TIMEOUT
             } else {
-                Duration::from_secs(config.persist_stream_on_disconnect_timeout as u64)
+                Duration::from_secs(config.persist_stream_on_disconnect_timeout_s as u64)
             };
             let _old_value = instance_infos.insert(
                 config.instance_name.clone(),
@@ -1887,7 +1887,11 @@ impl ByteStreamServer {
             if result.is_err() {
                 store_errored_for_fut.store(true, Ordering::Release);
             }
-            result
+            // v1.6.1 trait cascade: `StoreDriver::update` now returns the
+            // bytes-written count (`Result<u64>`); this path only cares
+            // about success/failure, so discard the count to match
+            // `StoreUpdateFuture`'s `Result<()>` output.
+            result.map(|_| ())
         });
         ActiveStreamGuard {
             stream_state: Some(StreamState {

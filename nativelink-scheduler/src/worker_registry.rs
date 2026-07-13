@@ -126,7 +126,7 @@ impl WorkerRegistry {
     pub async fn update_worker_heartbeat(&self, worker_id: &WorkerId, now: SystemTime) {
         let mut workers = self.workers.write().await;
         workers.insert(worker_id.clone(), now);
-        trace!(?worker_id, "FLOW: Worker heartbeat updated in registry");
+        trace!(?worker_id, now = %humantime::format_rfc3339(now), "FLOW: Worker heartbeat updated in registry");
     }
 
     pub async fn register_worker(&self, worker_id: &WorkerId, now: SystemTime) {
@@ -180,18 +180,18 @@ impl WorkerRegistry {
     ) -> bool {
         let workers = self.workers.read().await;
 
-        if let Some(last_seen) = workers.get(worker_id) {
-            if let Some(deadline) = last_seen.checked_add(timeout) {
-                let is_alive = deadline > now;
-                trace!(
-                    ?worker_id,
-                    ?last_seen,
-                    ?timeout,
-                    is_alive,
-                    "FLOW: Worker liveness check"
-                );
-                return is_alive;
-            }
+        if let Some(last_seen) = workers.get(worker_id)
+            && let Some(deadline) = last_seen.checked_add(timeout)
+        {
+            let is_alive = deadline > now;
+            trace!(
+                ?worker_id,
+                last_seen = %humantime::format_rfc3339(*last_seen),
+                ?timeout,
+                is_alive,
+                "FLOW: Worker liveness check"
+            );
+            return is_alive;
         }
 
         trace!(?worker_id, "FLOW: Worker not found or timed out");

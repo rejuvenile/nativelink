@@ -78,6 +78,9 @@ default_health_status_indicator!(StructuredNotFoundSlowStore);
 
 #[async_trait]
 impl StoreDriver for StructuredNotFoundSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -94,8 +97,8 @@ impl StoreDriver for StructuredNotFoundSlowStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(0)
     }
 
     async fn get_part(
@@ -193,6 +196,7 @@ async fn non_wps_slow_store_fallback_err_terminates_writer_with_structured_error
         slow_direction: StoreDirection::Both,
         chunked_reads_enabled: false,
         slow_writes_in_flight_max_bytes: 0,
+        bypass_dedup_threshold_bytes: 0,
     };
     let fast_slow = FastSlowStore::new(&spec, fast, slow);
 

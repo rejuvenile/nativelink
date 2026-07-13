@@ -89,6 +89,7 @@ async fn setup_stores() -> Result<
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store.clone()),
         Store::new(slow_store.clone()),

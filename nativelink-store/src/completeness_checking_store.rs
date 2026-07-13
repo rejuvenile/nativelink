@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use futures::{FutureExt, TryFutureExt, select};
+use futures::{FutureExt, TryFutureExt, select, try_join};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -802,6 +802,14 @@ impl CompletenessCheckingStore {
 
 #[async_trait]
 impl StoreDriver for CompletenessCheckingStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        try_join!(
+            self.cas_store.clone().into_inner().post_init(),
+            self.ac_store.clone().into_inner().post_init()
+        )?;
+        Ok(())
+    }
+
     /// Delegate remove to the AC store (#40 §2). CCS itself holds no state
     /// for the AC key — the state lives in the AC chain (ECS + FSS).
     async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
@@ -827,7 +835,7 @@ impl StoreDriver for CompletenessCheckingStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.ac_store.update(key, reader, size_info).await
     }
 

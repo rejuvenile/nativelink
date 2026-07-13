@@ -521,9 +521,10 @@ impl WorkerApiServer {
             config,
             schedulers,
             Box::new(move || {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| make_err!(Code::Internal, "System time is now behind unix epoch"))
+                SystemTime::now().duration_since(UNIX_EPOCH).map_err(|err| {
+                    Error::from_std_err(Code::Internal, &err)
+                        .append("System time is now behind unix epoch")
+                })
             }),
             node_id,
             locality_map,
@@ -2503,7 +2504,16 @@ impl WorkerConnection {
     }
 
     async fn inner_execution_response(&self, execute_result: ExecuteResult) -> Result<(), Error> {
-        let operation_id = OperationId::from(execute_result.operation_id);
+        let operation_id = OperationId::from(execute_result.operation_id.clone());
+
+        if let Some(resource_usage) = execute_result.resource_usage {
+            self.scheduler
+                .record_action_resource_usage(&self.worker_id, &operation_id, resource_usage)
+                .await
+                .err_tip(|| {
+                    format!("Failed to record resource usage for operation {operation_id}")
+                })?;
+        }
 
         match execute_result
             .result

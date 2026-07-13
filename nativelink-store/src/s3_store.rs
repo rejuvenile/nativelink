@@ -58,6 +58,10 @@ use tracing::{error, info};
 use crate::cas_utils::is_zero_digest;
 use crate::common_s3_utils::{BodyWrapper, TlsClient};
 
+// S3 object cannot be larger than this number. See:
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+const MAX_UPLOAD_SIZE: u64 = 48 * 1024 * 1024 * 1024 * 1024; // 48TiB (technically should be 48.8 TiB, but close enough)
+
 // S3 parts cannot be smaller than this number. See:
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024; // 5MB.
@@ -68,7 +72,8 @@ const MAX_MULTIPART_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5GB.
 
 // S3 parts cannot be more than this number. See:
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-const MAX_UPLOAD_PARTS: usize = 10_000;
+// Note: Type 'u64' chosen to simplify calculations
+const MAX_UPLOAD_PARTS: u64 = 10_000;
 
 // Default max buffer size for retrying upload requests.
 // Note: If you change this, adjust the docs in the config.
@@ -152,7 +157,7 @@ where
         Ok(Arc::new(Self {
             s3_client: Arc::new(s3_client),
             now_fn,
-            bucket: spec.bucket.to_string(),
+            bucket: spec.bucket.clone(),
             key_prefix: spec
                 .common
                 .key_prefix
@@ -179,7 +184,7 @@ where
     }
 
     fn make_s3_path(&self, key: &StoreKey<'_>) -> String {
-        format!("{}{}", self.key_prefix, key.as_str(),)
+        format!("{}{}", self.key_prefix, key.as_str())
     }
 
     async fn has(self: Pin<&Self>, digest: StoreKey<'_>) -> Result<Option<u64>, Error> {
@@ -235,10 +240,10 @@ where
                         Err(sdk_error) => match sdk_error.into_service_error() {
                             HeadObjectError::NotFound(_) => Some((RetryResult::Ok(None), state)),
                             other => Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Unavailable,
-                                    "Unhandled HeadObjectError in S3: {other:?}"
-                                )),
+                                RetryResult::Retry(
+                                    Error::from_std_err(Code::Unavailable, &other)
+                                        .append("Unhandled HeadObjectError in S3"),
+                                ),
                                 state,
                             )),
                         },
@@ -255,6 +260,10 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -285,12 +294,20 @@ where
         digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let s3_path = &self.make_s3_path(&digest);
 
         let max_size = match upload_size {
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
         };
+
+        // Sanity check S3 maximum upload size.
+        if max_size > MAX_UPLOAD_SIZE {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "File size exceeds max of {MAX_UPLOAD_SIZE}"
+            ));
+        }
 
         // Note(aaronmondal) It might be more optimal to use a different
         // heuristic here, but for simplicity we use a hard coded value.
@@ -329,13 +346,15 @@ where
                                     size: sz,
                                 }))
                                 .send()
-                                .map_ok_or_else(|e| Err(make_err!(Code::Aborted, "{e:?}")), |_| Ok(())),
+                                .map_ok_or_else(|e| Err(Error::from_std_err(Code::Aborted, &e)), |_| Ok(sz)),
                             // Stream all data from the reader channel to the writer channel.
                             tx.bind_buffered(reader_ref)
                         );
-                        upload_res
-                            .merge(bind_res)
-                            .err_tip(|| "Failed to upload file to s3 in single chunk")
+                        match (upload_res, bind_res) {
+                            (Ok(size), Ok(())) => Ok(size),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                        .err_tip(|| "Failed to upload file to s3 in single chunk")
                     };
 
                     // If we failed to upload the file, check to see if we can retry.
@@ -360,7 +379,7 @@ where
                             "Retryable S3 error"
                         );
                         RetryResult::Retry(err)
-                    }, |()| RetryResult::Ok(()));
+                    }, RetryResult::Ok);
                     Some((retry_result, reader))
                 }))
                 .await;
@@ -378,10 +397,10 @@ where
                     .await
                     .map_or_else(
                         |e| {
-                            RetryResult::Retry(make_err!(
-                                Code::Aborted,
-                                "Failed to create multipart upload to s3: {e:?}"
-                            ))
+                            RetryResult::Retry(
+                                Error::from_std_err(Code::Aborted, &e)
+                                    .append("Failed to create multipart upload to s3"),
+                            )
                         },
                         |CreateMultipartUploadOutput { upload_id, .. }| {
                             upload_id.map_or_else(
@@ -400,9 +419,24 @@ where
             .await?;
 
         // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
-        // 5mb (except last part) and can have up to 10,000 parts.
+        // 5MB (except last part) and can have up to 10,000 parts.
+
+        // Calculate of number of chunks if we upload in 5MB chucks (min chunk size), clamping to
+        // 10,000 parts and correcting for lossy integer division. This provides the
+        let chunk_count = (max_size / MIN_MULTIPART_SIZE).clamp(0, MAX_UPLOAD_PARTS - 1) + 1;
+
+        // Using clamped first approximation of number of chunks, calculate byte count of each
+        // chunk, excluding last chunk, clamping to min/max upload size 5MB, 5GB.
         let bytes_per_upload_part =
-            (max_size / (MIN_MULTIPART_SIZE - 1)).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
+            (max_size / chunk_count).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
+
+        // Sanity check before continuing.
+        if !(MIN_MULTIPART_SIZE..MAX_MULTIPART_SIZE).contains(&bytes_per_upload_part) {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "Failed to calculate file chuck size (min, max, calc): {MIN_MULTIPART_SIZE}, {MAX_MULTIPART_SIZE}, {bytes_per_upload_part}",
+            ));
+        }
 
         let upload_parts = move || async move {
             // This will ensure we only have `multipart_max_concurrent_uploads` * `bytes_per_upload_part`
@@ -411,6 +445,7 @@ where
 
             let read_stream_fut = async move {
                 let retrier = &Pin::get_ref(self).retrier;
+                let mut total_uploaded = 0;
                 // Note: Our break condition is when we reach EOF.
                 for part_number in 1..i32::MAX {
                     let write_buf = reader
@@ -422,6 +457,8 @@ where
                     if write_buf.is_empty() {
                         break; // Reached EOF.
                     }
+
+                    total_uploaded += write_buf.len() as u64;
 
                     tx.send(retrier.retry(unfold(write_buf, move |write_buf| {
                         async move {
@@ -437,10 +474,11 @@ where
                                 .await
                                 .map_or_else(
                                     |e| {
-                                        RetryResult::Retry(make_err!(
-                                            Code::Aborted,
-                                            "Failed to upload part {part_number} in S3 store: {e:?}"
-                                        ))
+                                        RetryResult::Retry(
+                                            Error::from_std_err(Code::Aborted, &e).append(format!(
+                                                "Failed to upload part {part_number} in S3 store"
+                                            )),
+                                        )
                                     },
                                     |mut response| {
                                         RetryResult::Ok(
@@ -458,22 +496,21 @@ where
                         }
                     })))
                     .await
-                    .map_err(|_| {
-                        make_err!(Code::Internal, "Failed to send part to channel in s3_store")
+                    .map_err(|err| {
+                        Error::from_std_err(Code::Internal, &err)
+                            .append("Failed to send part to channel in s3_store")
                     })?;
                 }
-                Result::<_, Error>::Ok(())
+                Result::<_, Error>::Ok(total_uploaded)
             }
             .fuse();
 
             let mut upload_futures = FuturesUnordered::new();
+            let mut total_uploaded = 0;
 
             let mut completed_parts = Vec::with_capacity(
-                usize::try_from(cmp::min(
-                    MAX_UPLOAD_PARTS as u64,
-                    (max_size / bytes_per_upload_part) + 1,
-                ))
-                .err_tip(|| "Could not convert u64 to usize")?,
+                usize::try_from(cmp::min(MAX_UPLOAD_PARTS, chunk_count))
+                    .err_tip(|| "Could not convert u64 to usize")?,
             );
             tokio::pin!(read_stream_fut);
             loop {
@@ -481,7 +518,9 @@ where
                     break; // No more data to process.
                 }
                 tokio::select! {
-                    result = &mut read_stream_fut => result?, // Return error or wait for other futures.
+                    result = &mut read_stream_fut => {
+                        total_uploaded = result?;
+                    }, // Return error or wait for other futures.
                     Some(upload_result) = upload_futures.next() => completed_parts.push(upload_result?),
                     Some(fut) = rx.recv() => upload_futures.push(fut),
                 }
@@ -508,12 +547,13 @@ where
                             .await
                             .map_or_else(
                                 |e| {
-                                    RetryResult::Retry(make_err!(
-                                        Code::Aborted,
-                                        "Failed to complete multipart upload in S3 store: {e:?}"
-                                    ))
+                                    RetryResult::Retry(
+                                        Error::from_std_err(Code::Aborted, &e).append(
+                                            "Failed to complete multipart upload in S3 store",
+                                        ),
+                                    )
                                 },
-                                |_| RetryResult::Ok(()),
+                                |_| RetryResult::Ok(total_uploaded),
                             ),
                         completed_parts,
                     ))
@@ -523,28 +563,22 @@ where
         // Upload our parts and complete the multipart upload.
         // If we fail attempt to abort the multipart upload (cleanup).
         upload_parts()
-            .or_else(move |e| async move {
-                Result::<(), _>::Err(e).merge(
-                    // Note: We don't retry here because this is just a best attempt.
-                    self.s3_client
-                        .abort_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(s3_path)
-                        .upload_id(upload_id)
-                        .send()
-                        .await
-                        .map_or_else(
-                            |e| {
-                                let err = make_err!(
-                                    Code::Aborted,
-                                    "Failed to abort multipart upload in S3 store : {e:?}"
-                                );
-                                info!(?err, "Multipart upload error");
-                                Err(err)
-                            },
-                            |_| Ok(()),
-                        ),
-                )
+            .or_else(move |mut e| async move {
+                let abort_res = self
+                    .s3_client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(s3_path)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+                if let Err(abort_err) = abort_res {
+                    let err = Error::from_std_err(Code::Aborted, &abort_err)
+                        .append("Failed to abort multipart upload in S3 store");
+                    info!(?err, "Multipart upload error");
+                    e = e.merge(err);
+                }
+                Err(e)
             })
             .await
     }
@@ -588,19 +622,19 @@ where
                     Err(sdk_error) => match sdk_error.into_service_error() {
                         GetObjectError::NoSuchKey(e) => {
                             return Some((
-                                RetryResult::Err(make_err!(
-                                    Code::NotFound,
-                                    "No such key in S3: {e}"
-                                )),
+                                RetryResult::Err(
+                                    Error::from_std_err(Code::NotFound, &e)
+                                        .append("No such key in S3"),
+                                ),
                                 writer,
                             ));
                         }
                         other => {
                             return Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Unavailable,
-                                    "Unhandled GetObjectError in S3: {other:?}",
-                                )),
+                                RetryResult::Retry(
+                                    Error::from_std_err(Code::Unavailable, &other)
+                                        .append("Unhandled GetObjectError in S3"),
+                                ),
                                 writer,
                             ));
                         }
@@ -618,20 +652,20 @@ where
                             }
                             if let Err(e) = writer.send(bytes).await {
                                 return Some((
-                                    RetryResult::Err(make_err!(
-                                        Code::Aborted,
-                                        "Error sending bytes to consumer in S3: {e}"
-                                    )),
+                                    RetryResult::Err(
+                                        Error::from_std_err(Code::Aborted, &e)
+                                            .append("Error sending bytes to consumer in S3"),
+                                    ),
                                     writer,
                                 ));
                             }
                         }
                         Err(e) => {
                             return Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Aborted,
-                                    "Bad bytestream element in S3: {e}"
-                                )),
+                                RetryResult::Retry(
+                                    Error::from_std_err(Code::Aborted, &e)
+                                        .append("Bad bytestream element in S3"),
+                                ),
                                 writer,
                             ));
                         }
@@ -639,10 +673,10 @@ where
                 }
                 if let Err(e) = writer.send_eof() {
                     return Some((
-                        RetryResult::Err(make_err!(
-                            Code::Aborted,
-                            "Failed to send EOF to consumer in S3: {e}"
-                        )),
+                        RetryResult::Err(
+                            Error::from_std_err(Code::Aborted, &e)
+                                .append("Failed to send EOF to consumer in S3"),
+                        ),
                         writer,
                     ));
                 }

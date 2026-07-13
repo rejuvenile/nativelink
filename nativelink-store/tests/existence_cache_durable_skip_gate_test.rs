@@ -99,6 +99,9 @@ default_health_status_indicator!(CountingSlowStore);
 
 #[async_trait]
 impl StoreDriver for CountingSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -112,7 +115,7 @@ impl StoreDriver for CountingSlowStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         self.inner.update(key, reader, upload_size).await
     }
@@ -185,6 +188,7 @@ fn build_chain(slow_store: Store) -> (Store, Arc<FastSlowStore>) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         slow_store,

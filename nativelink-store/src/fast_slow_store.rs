@@ -1001,6 +1001,15 @@ pub struct FastSlowStore {
     #[metric(group = "slow_store")]
     slow_store: Store,
     slow_direction: StoreDirection,
+    /// #2415: opt-in huge-blob dedup bypass. Reads of blobs at or above
+    /// this size skip the streaming-populate dedup and stream straight from
+    /// the slow store WITHOUT teeing into the fast tier — this avoids
+    /// evicting many smaller, more-useful entries when populating the fast
+    /// tier with a huge blob. `0` (the default) disables the bypass, so every
+    /// read goes through the `spawn_populate_producer_with_role` dedup path,
+    /// byte-identical to prior behavior. See
+    /// [`nativelink_config::stores::FastSlowSpec::bypass_dedup_threshold_bytes`].
+    bypass_dedup_threshold_bytes: u64,
     weak_self: Weak<Self>,
     #[metric]
     metrics: FastSlowStoreMetrics,
@@ -1534,6 +1543,8 @@ impl FastSlowStore {
             fast_direction: spec.fast_direction,
             slow_store,
             slow_direction: spec.slow_direction,
+            // #2415: 0 (default) disables the huge-blob dedup bypass.
+            bypass_dedup_threshold_bytes: spec.bypass_dedup_threshold_bytes,
             weak_self: weak_self.clone(),
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
@@ -1572,6 +1583,24 @@ impl FastSlowStore {
             store.enable_chunked_reads();
         }
         store
+    }
+
+    /// Digest size in bytes, or `None` for non-digest (AC string) keys.
+    /// Used by [`Self::should_bypass_dedup`] (#2415).
+    fn digest_size_bytes(key: &StoreKey<'_>) -> Option<u64> {
+        match key {
+            StoreKey::Digest(d) => Some(d.size_bytes()),
+            StoreKey::Str(_) => None,
+        }
+    }
+
+    /// Whether a read should skip the streaming-populate dedup and stream
+    /// straight from the slow store (#2415). A threshold of `0` disables the
+    /// bypass so every read goes through dedup.
+    fn should_bypass_dedup(&self, key: &StoreKey<'_>) -> bool {
+        self.bypass_dedup_threshold_bytes != 0
+            && Self::digest_size_bytes(key)
+                .is_some_and(|size| size >= self.bypass_dedup_threshold_bytes)
     }
 
     /// Path C (cascade-bundle, 2026-05-09) startup-time check: validates
@@ -3504,6 +3533,8 @@ impl FastSlowStore {
             fast_direction: spec.fast_direction,
             slow_store,
             slow_direction: spec.slow_direction,
+            // #2415: 0 (default) disables the huge-blob dedup bypass.
+            bypass_dedup_threshold_bytes: spec.bypass_dedup_threshold_bytes,
             weak_self: weak_self.clone(),
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
@@ -4520,7 +4551,7 @@ impl FastSlowStore {
                     .await;
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 match &res {
-                    Ok(()) => debug!(
+                    Ok(_) => debug!(
                         key = %key_for_fast,
                         elapsed_ms,
                         "populate fast_store.update branch Ok",
@@ -5300,7 +5331,7 @@ impl FastSlowStore {
         // after the consumer's legitimate Ok.
         let entry_to_join_completion_ms = t_entry.elapsed().as_millis() as u64;
         match (write_res, forward_res) {
-            (Ok(()), Ok(())) => {
+            (Ok(_), Ok(())) => {
                 debug!(
                     ?key,
                     entry_to_join_completion_ms,
@@ -5319,7 +5350,7 @@ impl FastSlowStore {
                 );
                 Err(write_err)
             }
-            (Ok(()), Err(forward_err)) => {
+            (Ok(_), Err(forward_err)) => {
                 // #56/#62 fix: consumer Ok is the authoritative commit
                 // signal — the blob is durable (or already present) in
                 // the store. The producer's error is a benign symptom of
@@ -5382,6 +5413,10 @@ impl FastSlowStore {
 
 #[async_trait]
 impl StoreDriver for FastSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Remove the entry from BOTH fast and slow tiers (#40 §2 delete-on-detection).
     ///
     /// Returns `Ok(())` if the entry is guaranteed absent from the fast tier
@@ -5670,7 +5705,7 @@ impl StoreDriver for FastSlowStore {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Mirror writes: hold blob data in memory only, skip both disk and
         // server. The server already has this blob persisted and is pushing
         // a copy to us for read locality. Data is cleaned up when
@@ -5690,10 +5725,11 @@ impl StoreDriver for FastSlowStore {
                 chunks.extend_from_slice(&chunk);
             }
             let data = chunks.freeze();
+            let data_len = data.len() as u64;
             // Propagate cap-exceeded back to the mirror writer so it can
             // record a per-peer failure (see `insert_mirror_blob`).
             self.insert_mirror_blob(digest, data)?;
-            return Ok(());
+            return Ok(data_len);
         }
 
         // If either one of our stores is a noop store, bypass the multiplexing
@@ -5713,11 +5749,11 @@ impl StoreDriver for FastSlowStore {
         if ignore_slow && ignore_fast {
             // We need to drain the reader to avoid the writer complaining that we dropped
             // the connection prematurely.
-            reader
+            let drained = reader
                 .drain()
                 .await
                 .err_tip(|| "In FastFlowStore::update")?;
-            return Ok(());
+            return Ok(drained);
         }
         if ignore_slow {
             let result = self
@@ -5797,16 +5833,16 @@ impl StoreDriver for FastSlowStore {
                 {
                     if let Some(dispatcher) = self.bazel_chunked_dispatcher() {
                         let digest = *digest;
-                        return self
-                            .update_via_chunked_dispatcher(
-                                key,
-                                reader,
-                                size_info,
-                                digest,
-                                dispatcher,
-                                update_start,
-                            )
-                            .await;
+                        self.update_via_chunked_dispatcher(
+                            key,
+                            reader,
+                            size_info,
+                            digest,
+                            dispatcher,
+                            update_start,
+                        )
+                        .await?;
+                        return Ok(digest.size_bytes());
                     }
                 }
             }
@@ -6033,9 +6069,9 @@ impl StoreDriver for FastSlowStore {
             // server already had the blob. Consumer Ok is authoritative;
             // the producer error is swallowed and logged at info level.
             return match (write_result, send_result) {
-                (Ok(()), Ok(())) => Ok(()),
+                (Ok(_), Ok(())) => Ok(bytes_sent),
                 (Err(write_err), Ok(())) => Err(write_err),
-                (Ok(()), Err(send_err)) => {
+                (Ok(_), Err(send_err)) => {
                     info!(
                         ?key,
                         ?send_err,
@@ -6043,7 +6079,7 @@ impl StoreDriver for FastSlowStore {
                         "#56/#62 FastSlowStore::update shutdown-flush: consumer Ok \
                          — producer Err swallowed (blob already committed)",
                     );
-                    Ok(())
+                    Ok(bytes_sent)
                 }
                 (Err(write_err), Err(send_err)) => Err(write_err.append(format!(
                     "FastSlowStore::update shutdown-flush: consumer error \
@@ -6264,9 +6300,9 @@ impl StoreDriver for FastSlowStore {
             // Consumer Ok is authoritative; the producer error is swallowed
             // and logged at info level so it remains observable.
             let mut result = match (write_result, send_result) {
-                (Ok(()), Ok(())) => Ok(()),
+                (Ok(_), Ok(())) => Ok(()),
                 (Err(write_err), Ok(())) => Err(write_err),
-                (Ok(()), Err(send_err)) => {
+                (Ok(_), Err(send_err)) => {
                     info!(
                         key = ?key_for_bg,
                         ?send_err,
@@ -6391,7 +6427,7 @@ impl StoreDriver for FastSlowStore {
             }
         });
 
-        Ok(())
+        Ok(bytes_sent)
     }
 
     async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
@@ -7512,6 +7548,43 @@ impl StoreDriver for FastSlowStore {
             return Ok(());
         }
 
+        // #2415: opt-in huge-blob dedup bypass. For blobs >= the configured
+        // threshold, skip the spawn-detach populate (which would tee the
+        // whole blob into the fast tier, evicting many smaller, more-useful
+        // entries) and stream straight from the slow store. Reached only
+        // AFTER every local-serve path (mirror / fast-store-direct /
+        // in-flight / chunked-cascade) missed, so an already-cached huge
+        // blob is still served locally; only the populate is bypassed. Also
+        // reached only AFTER the `local_only_reads` early-return above, so a
+        // worker public-CAS variant NEVER hits the slow tier here. Honors
+        // `INNER_MISS_NO_TERMINATE` via `commit_with_inner_miss_gate`, exactly
+        // like the noop/readonly/update block above. `0` (default) disables
+        // the bypass, so this block is inert and behavior is byte-identical.
+        if self.should_bypass_dedup(&key) {
+            self.metrics
+                .huge_blob_dedup_bypasses
+                .fetch_add(1, Ordering::Acquire);
+            self.metrics
+                .slow_store_hit_count
+                .fetch_add(1, Ordering::Acquire);
+            debug!(
+                ?key,
+                threshold_bytes = self.bypass_dedup_threshold_bytes,
+                "bypassing dedup for huge blob; reading slow store directly"
+            );
+            let bytes_before = guard.get_bytes_written();
+            let res = self
+                .slow_store
+                .get_part(key.borrow(), &mut *guard, offset, length)
+                .await;
+            commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
+            res?;
+            self.metrics
+                .slow_store_downloaded_bytes
+                .fetch_add(guard.get_bytes_written() - bytes_before, Ordering::Acquire);
+            return Ok(());
+        }
+
         // Spawn the producer if we're the first caller for this key
         // (no-op otherwise). Capture `is_populator_caller` to preserve
         // the pre-fix asymmetry on errors: the populator's caller
@@ -8212,6 +8285,10 @@ struct FastSlowStoreMetrics {
     slow_store_hit_count: AtomicU64,
     #[metric(help = "Downloaded bytes from the slow store")]
     slow_store_downloaded_bytes: AtomicU64,
+    /// #2415: get_part reads that bypassed the streaming-populate dedup
+    /// because the blob was >= `bypass_dedup_threshold_bytes`.
+    #[metric(help = "get_part reads that bypassed the populate dedup for huge blobs")]
+    huge_blob_dedup_bypasses: AtomicU64,
     /// Counts every `tokio::spawn` issued by the populate machinery in
     /// `spawn_populate_producer_with_role`. The inline-fast-path in
     /// `copy_slow_to_fast` keeps this counter unchanged for single-

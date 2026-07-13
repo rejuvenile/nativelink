@@ -97,6 +97,9 @@ default_health_status_indicator!(HoldableSlowStore);
 
 #[async_trait]
 impl StoreDriver for HoldableSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -109,7 +112,7 @@ impl StoreDriver for HoldableSlowStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.wait_if_held().await;
         self.inner.update(key, reader, upload_size).await
     }
@@ -170,6 +173,7 @@ fn build_chain() -> (Store, Arc<HoldableSlowStore>) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         upper_fast,
         upper_slow,
@@ -185,6 +189,7 @@ fn build_chain() -> (Store, Arc<HoldableSlowStore>) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         lower_fast,
         lower_slow,

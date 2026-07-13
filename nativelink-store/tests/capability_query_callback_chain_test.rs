@@ -84,6 +84,9 @@ impl NoCallbackStore {
 
 #[async_trait]
 impl StoreDriver for NoCallbackStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _keys: &[StoreKey<'_>],
@@ -100,8 +103,8 @@ impl StoreDriver for NoCallbackStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(0)
     }
 
     async fn get_part(
@@ -196,6 +199,9 @@ impl RejectCallbackStore {
 
 #[async_trait]
 impl StoreDriver for RejectCallbackStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _keys: &[StoreKey<'_>],
@@ -213,8 +219,8 @@ impl StoreDriver for RejectCallbackStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(0)
     }
 
     async fn get_part(
@@ -347,6 +353,7 @@ async fn fast_slow_new_ref_wrapped_slow_registers_bis_listener() -> Result<(), E
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_mem.clone(),
         slow_ref,
@@ -449,6 +456,7 @@ async fn fast_slow_supports_callbacks_false_when_slow_does_not() -> Result<(), E
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -482,6 +490,7 @@ async fn fast_slow_supports_callbacks_true_when_both_tiers_support() -> Result<(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -523,6 +532,7 @@ async fn fast_slow_supports_callbacks_true_when_slow_ref_resolves_to_memory() ->
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow_ref,
@@ -579,6 +589,7 @@ async fn ecs_over_fss_no_callback_slow_enters_vulnerable_mode() -> Result<(), Er
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -636,6 +647,7 @@ async fn fss_supports_callbacks_false_when_fast_does_not_and_rule() -> Result<()
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -787,6 +799,7 @@ async fn ecs_over_ref_fast_slow_slow_tier_eviction_clears_cache() -> Result<(), 
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_mem.clone(),
         slow_mem.clone(),

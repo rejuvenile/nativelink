@@ -984,7 +984,7 @@ async fn test_sentinel_connect_and_update_data_unversioned_readonly() {
         content: "Test scheduler data #1".to_string(),
         version: 0,
     };
-    store.update_data(data).await.expect("working update");
+    store.update_data(data, None).await.expect("working update");
 }
 
 #[nativelink_test]
@@ -1011,7 +1011,7 @@ async fn test_sentinel_connect_and_update_data_versioned_readonly() {
         content: "Test scheduler data #1".to_string(),
         version: 0,
     };
-    store.update_data(data).await.expect("working update");
+    store.update_data(data, None).await.expect("working update");
 }
 
 #[nativelink_test]
@@ -2885,7 +2885,7 @@ async fn reconnect_fired_after_update_data_versioned_timeout() -> Result<(), Err
 
     let result = timeout(
         Duration::from_secs(5),
-        store.update_data(data),
+        store.update_data(data, None),
     )
     .await
     .expect("update_data must not deadlock");
@@ -2968,7 +2968,7 @@ async fn reconnect_fired_after_update_data_noversion_timeout() -> Result<(), Err
 
     let result = timeout(
         Duration::from_secs(5),
-        store.update_data(data),
+        store.update_data(data, None),
     )
     .await
     .expect("update_data must not deadlock");

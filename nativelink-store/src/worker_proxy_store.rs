@@ -1729,6 +1729,12 @@ impl WorkerProxyStore {
             // to server, not the reverse direction. Leave OFF.
             chunked_writes_enabled: false,
             chunked_v2_writes_enabled: false,
+            // Upstream #2288 header-forwarding (not consumed by this fork's
+            // GrpcStore; server→worker mirror connections forward routing
+            // headers via per-call metadata injection instead). No-op defaults.
+            use_legacy_resource_names: false,
+            headers: Default::default(),
+            forward_headers: Vec::new(),
         };
         let store = GrpcStore::new(&spec)
             .await
@@ -2997,7 +3003,7 @@ impl WorkerProxyStore {
             )
             .await
             {
-                Ok(Ok(())) => {
+                Ok(Ok(_)) => {
                     completed_counter.fetch_add(1, Ordering::Relaxed);
                     info!(
                         %digest,
@@ -4415,6 +4421,7 @@ impl WorkerProxyStore {
                     store
                         .update(key, rx, UploadSizeInfo::ExactSize(size_bytes as u64))
                         .await
+                        .map(|_| ())
                 } else {
                     // Small blob: single-message oneshot is more efficient.
                     store.update_oneshot(digest, data_clone).await
@@ -4574,6 +4581,7 @@ impl WorkerProxyStore {
                         store
                             .update(key, rx, UploadSizeInfo::ExactSize(size_bytes as u64))
                             .await
+                            .map(|_| ())
                     } else {
                         store.update_oneshot(digest, data_clone).await
                     }
@@ -4850,7 +4858,7 @@ impl WorkerProxyStore {
             .await;
 
         match &result {
-            Ok(()) => {
+            Ok(_) => {
                 self.record_mirror_success(&endpoint);
                 self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
                 debug!(
@@ -4972,7 +4980,7 @@ impl WorkerProxyStore {
             .await;
 
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 self.record_mirror_success(&endpoint);
                 // #logstorm-mirror-confirm-info-demote: sample the per-blob
                 // confirm line 1-in-256 off this same increment; the exact
@@ -5019,6 +5027,11 @@ impl WorkerProxyStore {
 
 #[async_trait]
 impl StoreDriver for WorkerProxyStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        // Transparent outermost wrapper: forward to the inner CAS store.
+        self.inner.clone().into_inner().post_init().await
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -5080,7 +5093,7 @@ impl StoreDriver for WorkerProxyStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Pass through to inner store.
         self.inner.update(key, reader, upload_size).await
     }
@@ -7628,6 +7641,9 @@ mod tests {
 
     #[async_trait]
     impl StoreDriver for PartialThenErrorPeer {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _keys: &[StoreKey<'_>],
@@ -7641,7 +7657,7 @@ mod tests {
             _key: StoreKey<'_>,
             _rx: DropCloserReadHalf,
             _size: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Err(make_err!(Code::Unimplemented, "test fixture: no update"))
         }
 
@@ -7924,6 +7940,9 @@ mod tests {
 
     #[async_trait]
     impl StoreDriver for AlwaysFailPeer {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _keys: &[StoreKey<'_>],
@@ -7936,7 +7955,7 @@ mod tests {
             _key: StoreKey<'_>,
             mut rx: DropCloserReadHalf,
             _size: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             // Drain so the producer's send/EOF doesn't wedge, then fail.
             let _ = rx.drain().await;
             Err(make_err!(
@@ -8007,6 +8026,9 @@ mod tests {
 
     #[async_trait]
     impl StoreDriver for SlowOkPeer {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             keys: &[StoreKey<'_>],
@@ -8019,7 +8041,7 @@ mod tests {
             key: StoreKey<'_>,
             rx: DropCloserReadHalf,
             size: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             tokio::time::sleep(self.delay).await;
             self.backing.as_store_driver_pin().update(key, rx, size).await
         }

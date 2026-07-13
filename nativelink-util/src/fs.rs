@@ -14,7 +14,9 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::fs::{Metadata, Permissions};
-use std::io::{Read, Seek, Write};
+use std::io::{self, Read, Seek, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::sync::OnceLock;
@@ -120,7 +122,6 @@ impl FileSlot {
     /// Only available on Linux;
     #[cfg(target_os = "linux")]
     pub fn advise_dontneed(&self) {
-        use std::os::unix::io::AsRawFd;
         let fd = self.inner.as_raw_fd();
         let ret = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
         if ret != 0 {
@@ -141,7 +142,6 @@ impl FileSlot {
     /// enabling more aggressive readahead (typically 2-4x default).
     #[cfg(target_os = "linux")]
     pub fn advise_sequential(&self) {
-        use std::os::unix::io::AsRawFd;
         let fd = self.inner.as_raw_fd();
         let ret = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
         if ret != 0 {
@@ -167,7 +167,6 @@ impl FileSlot {
     /// Best-effort: errors are silently ignored.
     #[cfg(target_os = "linux")]
     pub fn advise_willneed(&self, offset: u64, len: usize) {
-        use std::os::unix::io::AsRawFd;
         let fd = self.inner.as_raw_fd();
         unsafe {
             libc::posix_fadvise(fd, offset as i64, len as i64, libc::POSIX_FADV_WILLNEED);
@@ -195,6 +194,35 @@ impl FileSlot {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub const fn advise_willneed(&self, _offset: u64, _len: usize) {}
+}
+
+/// Enable [`IP_FREEBIND`](`libc::IP_FREEBIND`) before binding a socket.
+#[cfg(target_os = "linux")]
+pub fn set_freebind<F: AsRawFd>(socket: &F) -> Result<(), io::Error> {
+    let enable = 1;
+    let optlen = libc::socklen_t::try_from(size_of::<libc::c_int>())
+        .expect("size of c_int always fits in socklen_t");
+
+    // SAFETY: we pass in a valid fd, initialized optval, and matching optlen.
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_FREEBIND,
+            core::ptr::addr_of!(enable).cast(),
+            optlen,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub const fn set_freebind<F>(_socket: &F) -> Result<(), io::Error> {
+    Ok(())
 }
 
 // Note: If the default changes make sure you update the documentation in
@@ -225,7 +253,9 @@ where
     let permit = get_permit().await?;
     spawn_blocking!("fs_call_with_permit", move || f(permit))
         .await
-        .unwrap_or_else(|e| Err(make_err!(Code::Internal, "background task failed: {e:?}")))
+        .unwrap_or_else(|e| {
+            Err(Error::from_std_err(Code::Internal, &e).append("background task failed"))
+        })
 }
 
 /// Sets the soft nofile limit to `desired_open_file_limit` and adjusts
@@ -1483,6 +1513,13 @@ async fn remove_file_std(path: impl AsRef<Path>) -> Result<(), Error> {
     call_with_permit(move |_| std::fs::remove_file(path).map_err(Into::<Error>::into)).await
 }
 
+/// Removes an empty directory. Errors if the directory is not empty; use
+/// [`remove_dir_all`] when the contents should be removed too.
+pub async fn remove_dir(path: impl AsRef<Path>) -> Result<(), Error> {
+    let path = path.as_ref().to_owned();
+    call_with_permit(move |_| std::fs::remove_dir(path).map_err(Into::<Error>::into)).await
+}
+
 pub async fn canonicalize(path: impl AsRef<Path>) -> Result<PathBuf, Error> {
     let path = path.as_ref().to_owned();
     call_with_permit(move |_| std::fs::canonicalize(path).map_err(Into::<Error>::into)).await
@@ -1517,7 +1554,7 @@ fn internal_remove_dir_all(path: impl AsRef<Path>) -> Result<(), Error> {
 
     for entry in WalkDir::new(&path) {
         let Ok(entry) = &entry else {
-            debug!("Can't get into {entry:?}, assuming already deleted");
+            debug!(?entry, "Can't get entry, assuming already deleted");
             continue;
         };
         let metadata = entry.metadata()?;

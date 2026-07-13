@@ -205,6 +205,9 @@ async fn chunked_v2_flag_selects_v2_rpc_end_to_end() -> Result<(), Error> {
         connection_acquire_timeout_ms: Some(2000),
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
+        use_legacy_resource_names: false,
+        headers: Default::default(),
+        forward_headers: Vec::new(),
     };
     let store = GrpcStore::new(&spec).await?;
     store.enable_chunked_writes();

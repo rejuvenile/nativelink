@@ -3735,7 +3735,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         if write_res.is_ok() {
                             Ok(())
                         } else {
-                            read_res.merge(write_res)
+                            // `StoreLike::update` now yields the byte count
+                            // (`Result<u64>`); this backfill path only cares
+                            // about success/failure, so discard it to keep the
+                            // combined result `Result<()>`.
+                            read_res.merge(write_res.map(|_| ()))
                         }
                     };
                     match result {
@@ -5442,6 +5446,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // count as an attempt (simple_scheduler_state_manager.rs:817).
                                             // Code::Unavailable WOULD burn the retry budget.
                                             result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker startup reconcile in progress").into())),
+                                            resource_usage: None,
                                         }
                                     ).await?;
                                 }
@@ -5456,6 +5461,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             instance_name,
                                             operation_id: start_execute.operation_id,
                                             result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker shutting down").into())),
+                                            resource_usage: None,
                                         }
                                     ).await?;
                                 }
@@ -5520,6 +5526,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                 instance_name,
                                                 operation_id: start_execute.operation_id,
                                                 result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker under memory pressure").into())),
+                                                resource_usage: None,
                                             }
                                         ).await?;
                                     }
@@ -5623,6 +5630,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                 instance_name,
                                                 operation_id: start_execute.operation_id,
                                                 result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker under disk pressure").into())),
+                                                resource_usage: None,
                                             }
                                         ).await?;
                                     }
@@ -6004,6 +6012,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::ExecuteResponse(action_stage.into())),
+                                                    resource_usage: None,
                                                 }
                                             )
                                             .await
@@ -6190,12 +6199,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::ExecuteResponse(action_stage.into())),
+                                                    resource_usage: None,
                                                 }).await.err_tip(|| "Error calling execution_response with missing inputs")?;
                                             } else {
                                                 grpc_client.execution_response(ExecuteResult{
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::InternalError(e.into())),
+                                                    resource_usage: None,
                                                 }).await.err_tip(|| "Error calling execution_response with error")?;
                                             }
                                         },
@@ -6571,15 +6582,15 @@ pub async fn new_local_worker(
     } else {
         Some(config.entrypoint.clone())
     };
-    let max_action_timeout = if config.max_action_timeout == 0 {
+    let max_action_timeout = if config.max_action_timeout_s == 0 {
         DEFAULT_MAX_ACTION_TIMEOUT
     } else {
-        Duration::from_secs(config.max_action_timeout as u64)
+        Duration::from_secs(config.max_action_timeout_s as u64)
     };
-    let max_upload_timeout = if config.max_upload_timeout == 0 {
+    let max_upload_timeout = if config.max_upload_timeout_s == 0 {
         DEFAULT_MAX_UPLOAD_TIMEOUT
     } else {
-        Duration::from_secs(config.max_upload_timeout as u64)
+        Duration::from_secs(config.max_upload_timeout_s as u64)
     };
 
     // Whether the worker CAS server uses TLS (determines grpc:// vs grpcs:// in
@@ -6642,6 +6653,9 @@ pub async fn new_local_worker(
             // default but kept explicit so removing the default later
             // wouldn't silently re-introduce a cap on workers.
             slow_writes_in_flight_max_bytes: 0,
+            // Upstream #2415 opt-in leader/follower dedup bypass for huge
+            // blobs; 0 = disabled (default), preserving prior behavior.
+            bypass_dedup_threshold_bytes: 0,
         };
         let new_fss = FastSlowStore::new(&fss_spec, fast_store, proxy_store);
         info!("Peer blob sharing enabled: wrapping slow store with WorkerProxyStore");
@@ -6759,6 +6773,9 @@ pub async fn new_local_worker(
             // cap (no slow-tier write is admitted at all). Set 0 to
             // match the wrapper FSS above for consistency.
             slow_writes_in_flight_max_bytes: 0,
+            // Upstream #2415 opt-in leader/follower dedup bypass for huge
+            // blobs; 0 = disabled (default), preserving prior behavior.
+            bypass_dedup_threshold_bytes: 0,
         };
         FastSlowStore::new_with_shared_failed_writes(
             &fss_spec,
@@ -7010,6 +7027,9 @@ pub async fn new_local_worker(
             instance_name: String::new(),
             config: nativelink_config::cas_server::CasStoreConfig {
                 cas_store: "worker_cas".to_string(),
+                // Upstream CAS chunking config; None = disabled (default),
+                // chunking RPCs rejected — identical to pre-existence.
+                experimental_chunking: None,
             },
         }];
         let bytestream_configs = vec![nativelink_config::cas_server::WithInstanceName {

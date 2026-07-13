@@ -116,6 +116,7 @@ fn make_server(
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let locality_map = new_shared_blob_locality_map();
@@ -528,6 +529,7 @@ async fn post_pull_flush_makes_pulled_blob_durable_on_slow_tier()
     let slow_probe = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),

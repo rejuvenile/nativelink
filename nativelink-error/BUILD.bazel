@@ -16,6 +16,7 @@ rust_library(
     deps = [
         "//nativelink-metric",
         "//nativelink-proto",
+        "@crates//:base64",
         "@crates//:mongodb",
         "@crates//:prost",
         "@crates//:prost-types",
@@ -38,9 +39,17 @@ rust_test_suite(
     timeout = "short",
     srcs = [
         "tests/error_tests.rs",
+        "tests/lib_tests.rs",
     ],
     deps = [
         "//nativelink-error",
+        "//nativelink-metric",
+        "//nativelink-proto",
+        "@crates//:prost",
+        "@crates//:redis",
+        "@crates//:tokio",
+        "@crates//:tonic",
+        "@crates//:tracing",
         "@crates//:walkdir",
     ],
 )

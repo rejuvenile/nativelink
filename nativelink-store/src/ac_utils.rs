@@ -69,23 +69,23 @@ pub async fn get_size_and_decode_digest<T: Message + Default + 'static>(
         code = ?store_data_resp.as_ref().err().map(|e| e.code),
         "get_size_and_decode_digest: get_part_unchunked returned"
     );
-    if let Err(err) = &mut store_data_resp {
-        if err.code == Code::NotFound {
-            // Trim the error code. Not Found is quite common and we don't want to send a large
-            // error (debug) message for something that is common. We resize to just the last
-            // message as it will be the most relevant.
-            err.messages.resize_with(1, String::new);
-        }
+    if let Err(err) = &mut store_data_resp
+        && err.code == Code::NotFound
+    {
+        // Trim the error code. Not Found is quite common and we don't want to send a large
+        // error (debug) message for something that is common. We resize to just the last
+        // message as it will be the most relevant.
+        err.messages.resize_with(1, String::new);
     }
     let store_data = store_data_resp?;
     let store_data_len =
         u64::try_from(store_data.len()).err_tip(|| "Could not convert store_data.len() to u64")?;
 
     T::decode(store_data)
-        .err_tip_with_code(|e| {
+        .err_tip_with_code(|_e| {
             (
                 Code::NotFound,
-                format!("Stored value appears to be corrupt: {e} - {key:?}"),
+                format!("Stored value appears to be corrupt for {key:?}"),
             )
         })
         .map(|v| (v, store_data_len))

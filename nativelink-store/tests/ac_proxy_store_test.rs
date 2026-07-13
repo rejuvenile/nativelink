@@ -66,6 +66,9 @@ impl core::fmt::Debug for AlwaysErrorPeer {
 
 #[async_trait]
 impl StoreDriver for AlwaysErrorPeer {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -79,7 +82,7 @@ impl StoreDriver for AlwaysErrorPeer {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(self.code, "AlwaysErrorPeer: simulated transient"))
     }
 

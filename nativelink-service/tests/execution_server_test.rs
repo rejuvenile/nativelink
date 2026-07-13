@@ -30,6 +30,7 @@ use nativelink_proto::google::longrunning::{
     CancelOperationRequest, DeleteOperationRequest, GetOperationRequest, ListOperationsRequest,
     WaitOperationRequest,
 };
+use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::mock_scheduler::MockActionScheduler;
 use nativelink_service::execution_server::ExecutionServer;
 use nativelink_store::default_store_factory::store_factory;
@@ -38,9 +39,7 @@ use nativelink_util::action_messages::{
     ActionInfo, ActionResult, ActionStage, ActionState, OperationId,
 };
 use nativelink_util::common::DigestInfo;
-use nativelink_util::operation_state_manager::{
-    ActionStateResult, ActionStateResultStream, ClientStateManager,
-};
+use nativelink_util::operation_state_manager::{ActionStateResult, ActionStateResultStream};
 use nativelink_util::origin_event::OriginMetadata;
 use tonic::Request;
 
@@ -64,7 +63,8 @@ fn make_execution_server(
     store_manager: &StoreManager,
 ) -> Result<(ExecutionServer, Arc<MockActionScheduler>), Error> {
     let mock_scheduler = Arc::new(MockActionScheduler::new());
-    let mut action_schedulers: HashMap<String, Arc<dyn ClientStateManager>> = HashMap::new();
+    let mut action_schedulers: HashMap<String, Arc<dyn KnownPlatformPropertyProvider>> =
+        HashMap::new();
     action_schedulers.insert("main_scheduler".to_string(), mock_scheduler.clone());
     let server = ExecutionServer::new(
         &[WithInstanceName {

@@ -58,7 +58,7 @@ fn make_streaming_config() -> Vec<WithInstanceName<ByteStreamConfig>> {
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 1024,
             streaming_read_while_write: true,
             max_streaming_blob_buffer_bytes: 64 * 1024 * 1024,

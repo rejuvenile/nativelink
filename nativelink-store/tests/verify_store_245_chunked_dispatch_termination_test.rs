@@ -165,6 +165,9 @@ impl ReaderObservingInnerStore {
 
 #[async_trait]
 impl StoreDriver for ReaderObservingInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -178,7 +181,7 @@ impl StoreDriver for ReaderObservingInnerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_was_called.store(true, Ordering::Release);
         // Drain rx until EOF or Err — record what we saw. This is the
         // production analog of FastSlowStore::update_via_chunked_dispatcher's
@@ -200,7 +203,7 @@ impl StoreDriver for ReaderObservingInnerStore {
         *self.last_observed.lock() = Some(observed.clone());
         // Mirror what the inner store does: bubble up the err it saw
         // so VerifyStore's tokio::join! merges both halves consistently.
-        observed
+        observed.map(|()| 0)
     }
 
     async fn get_part(
@@ -298,7 +301,7 @@ async fn drive_verify_update(
     // contains both halves' errs). The send_res Err on a closed pipe
     // is expected on the early-Err branches; surface its err only if
     // update_res was Ok (defensive — should never happen on these tests).
-    update_res.or_else(|update_err| {
+    update_res.map(|_| ()).or_else(|update_err| {
         if let Err(send_err) = send_res {
             Err(update_err.merge(send_err))
         } else {
@@ -700,7 +703,7 @@ async fn drive_verify_update_inject_recv_err(
             .await
     };
     let (send_res, update_res) = tokio::join!(send_fut, update_fut);
-    update_res.or_else(|update_err| {
+    update_res.map(|_| ()).or_else(|update_err| {
         if let Err(send_err) = send_res {
             Err(update_err.merge(send_err))
         } else {

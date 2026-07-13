@@ -162,6 +162,7 @@ fn make_production_cas_store() -> (Store, Arc<StoreManager>, Store, Store) {
     let upper_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
     let upper_fast_slow = Store::new(FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -180,6 +181,7 @@ fn make_production_cas_store() -> (Store, Arc<StoreManager>, Store, Store) {
     let lower_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
     let lower_fast_slow = Store::new(FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -295,6 +297,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let locality_map = new_shared_blob_locality_map();
@@ -762,6 +765,7 @@ async fn v3c_block1_reconcile_complete_follows_upload_missing_blobs()
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
     let locality_map = new_shared_blob_locality_map();
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
@@ -948,6 +952,7 @@ async fn v3c_reconcile_complete_exactly_once_fall_through_path()
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
     let locality_map = new_shared_blob_locality_map();
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
@@ -1116,6 +1121,7 @@ async fn v3c_gap1a_no_locality_map_sends_reconcile_complete()
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
     schedulers.insert("GAP1A_SCHEDULER".to_string(), scheduler);
@@ -1319,6 +1325,7 @@ async fn v3c_gap1b_empty_endpoint_sends_reconcile_complete()
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
     let locality_map = new_shared_blob_locality_map();
     let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();

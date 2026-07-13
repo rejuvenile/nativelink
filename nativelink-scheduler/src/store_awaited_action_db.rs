@@ -22,7 +22,7 @@ use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use futures::{Stream, TryStreamExt};
-use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::action_messages::{
     ActionInfo, ActionStage, ActionUniqueQualifier, OperationId,
@@ -69,6 +69,17 @@ pub struct OperationSubscriber<S: SchedulerStore, I: InstantWrapper, NowFn: Fn()
     // when the state is set to subscribed.  When set it causes the state to be polled
     // as well as listening for the publishing.
     maybe_last_stage: Option<Discriminant<ActionStage>>,
+    // merge v1.6.1: retained from upstream's completed-action TTL plumbing but
+    // dormant — the per-update expiry is threaded as `None` at every `update_data`
+    // site so our `default_scheduler_factory` `max_seconds` eviction stays
+    // authoritative (avoids double-TTL + the `retain_completed_for_s=0` →
+    // immediate-expiry footgun). Kept (not removed) to avoid rippling the
+    // constructor chain; strip when upstream's per-update TTL is adopted or retired.
+    #[expect(
+        dead_code,
+        reason = "dormant: per-update completed-action expiry declined in favor of max_seconds eviction"
+    )]
+    retain_completed_for: Duration,
 }
 
 impl<S: SchedulerStore, I: InstantWrapper, NowFn: Fn() -> I + core::fmt::Debug> core::fmt::Debug
@@ -100,6 +111,7 @@ where
         subscription_key: OperationIdToAwaitedAction<'static>,
         weak_store: Weak<S>,
         now_fn: NowFn,
+        retain_completed_for: Duration,
     ) -> Self {
         Self {
             maybe_client_operation_id,
@@ -109,6 +121,7 @@ where
             state: OperationSubscriberState::Unsubscribed,
             now_fn,
             maybe_last_stage: None,
+            retain_completed_for,
         }
     }
 
@@ -134,9 +147,7 @@ where
 
         // Helper to convert SystemTime to unix timestamp
         let to_unix_ts = |t: std::time::SystemTime| -> u64 {
-            t.duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
+            t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
         };
 
         // Check the separate keepalive key for the most recent timestamp.
@@ -232,18 +243,18 @@ where
             let last_known_keepalive_ts = self.last_known_keepalive_ts.load(Ordering::Acquire);
             if I::from_secs(last_known_keepalive_ts).elapsed() > CLIENT_KEEPALIVE_DURATION {
                 let now = (self.now_fn)().now();
-                let now_ts = now
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now_ts = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
 
                 if USE_SEPARATE_CLIENT_KEEPALIVE_KEY {
                     let operation_id = self.subscription_key.0.as_ref();
                     let update_result = store
-                        .update_data(UpdateClientKeepalive {
-                            operation_id,
-                            timestamp: now_ts,
-                        })
+                        .update_data(
+                            UpdateClientKeepalive {
+                                operation_id,
+                                timestamp: now_ts,
+                            },
+                            None,
+                        )
                         .await;
 
                     if let Err(e) = update_result {
@@ -302,7 +313,11 @@ where
                                     != core::mem::discriminant(&awaited_action.state().stage)
                             })
                             .then(|| awaited_action.clone());
-                        match inner_update_awaited_action(store.as_ref(), awaited_action).await {
+                        // merge: keep our max_seconds retain; upstream per-update expiry declined (would double-apply)
+                        let expiry: Option<Duration> = None;
+                        match inner_update_awaited_action(store.as_ref(), awaited_action, expiry)
+                            .await
+                        {
                             Ok(()) => break,
                             err if attempt == MAX_RETRIES_FOR_CLIENT_KEEPALIVE => {
                                 err.err_tip_with_code(|_| {
@@ -363,14 +378,19 @@ where
 }
 
 fn awaited_action_decode(version: i64, data: &Bytes) -> Result<AwaitedAction, Error> {
-    let mut awaited_action: AwaitedAction = serde_json::from_slice(data)
-        .map_err(|e| make_input_err!("In AwaitedAction::decode - {e:?}"))?;
+    let mut awaited_action: AwaitedAction = serde_json::from_slice(data).map_err(|e| {
+        Error::from_std_err(Code::InvalidArgument, &e).append("In AwaitedAction::decode")
+    })?;
     awaited_action.set_version(version);
     Ok(awaited_action)
 }
 
 const OPERATION_ID_TO_AWAITED_ACTION_KEY_PREFIX: &str = "aa_";
 const CLIENT_ID_TO_OPERATION_ID_KEY_PREFIX: &str = "cid_";
+/// TTL bounding the cid_* mapping's lifetime so it cannot outlive its
+/// aa_* key and accumulate as a permanent orphan (24h safely exceeds
+/// any real action lifetime).
+const CLIENT_ID_MAPPING_TTL: Duration = Duration::from_hours(24);
 /// Phase 2: Separate key prefix for client keepalives (non-versioned).
 const CLIENT_KEEPALIVE_KEY_PREFIX: &str = "ck_";
 
@@ -411,10 +431,9 @@ impl SchedulerStoreDecodeTo for ClientIdToOperationId<'_> {
     type DecodeOutput = OperationId;
     fn decode(_version: i64, data: Bytes) -> Result<Self::DecodeOutput, Error> {
         serde_json::from_slice(&data).map_err(|e| {
-            make_input_err!(
-                "In ClientIdToOperationId::decode - {e:?} (data: {:02x?})",
-                data
-            )
+            Error::from_std_err(Code::InvalidArgument, &e).append(format!(
+                "In ClientIdToOperationId::decode (data: {data:02x?})",
+            ))
         })
     }
 }
@@ -432,10 +451,14 @@ impl SchedulerStoreKeyProvider for ClientKeepaliveKey<'_> {
 impl SchedulerStoreDecodeTo for ClientKeepaliveKey<'_> {
     type DecodeOutput = u64;
     fn decode(_version: i64, data: Bytes) -> Result<Self::DecodeOutput, Error> {
-        let s = core::str::from_utf8(&data)
-            .map_err(|e| make_input_err!("In ClientKeepaliveKey::decode utf8 - {e:?}"))?;
-        s.parse::<u64>()
-            .map_err(|e| make_input_err!("In ClientKeepaliveKey::decode parse - {e:?}"))
+        let s = core::str::from_utf8(&data).map_err(|e| {
+            Error::from_std_err(Code::InvalidArgument, &e)
+                .append("In ClientKeepaliveKey::decode utf8")
+        })?;
+        s.parse::<u64>().map_err(|e| {
+            Error::from_std_err(Code::InvalidArgument, &e)
+                .append("In ClientKeepaliveKey::decode parse")
+        })
     }
 }
 
@@ -499,7 +522,8 @@ const fn get_state_prefix(state: SortedAwaitedActionState) -> &'static str {
     }
 }
 
-struct UpdateOperationIdToAwaitedAction(AwaitedAction);
+#[derive(Debug)]
+pub struct UpdateOperationIdToAwaitedAction(AwaitedAction);
 impl SchedulerCurrentVersionProvider for UpdateOperationIdToAwaitedAction {
     fn current_version(&self) -> i64 {
         self.0.version()
@@ -515,7 +539,10 @@ impl SchedulerStoreDataProvider for UpdateOperationIdToAwaitedAction {
     fn try_into_bytes(self) -> Result<Bytes, Error> {
         serde_json::to_string(&self.0)
             .map(Bytes::from)
-            .map_err(|e| make_input_err!("Could not convert AwaitedAction to json - {e:?}"))
+            .map_err(|e| {
+                Error::from_std_err(Code::InvalidArgument, &e)
+                    .append("Could not convert AwaitedAction to json")
+            })
     }
     fn get_indexes(&self) -> Result<Vec<(&'static str, Bytes)>, Error> {
         let unique_qualifier = &self.0.action_info().unique_qualifier;
@@ -559,13 +586,17 @@ impl SchedulerStoreDataProvider for UpdateClientIdToOperationId {
     fn try_into_bytes(self) -> Result<Bytes, Error> {
         serde_json::to_string(&self.operation_id)
             .map(Bytes::from)
-            .map_err(|e| make_input_err!("Could not convert OperationId to json - {e:?}"))
+            .map_err(|e| {
+                Error::from_std_err(Code::InvalidArgument, &e)
+                    .append("Could not convert OperationId to json")
+            })
     }
 }
 
-async fn inner_update_awaited_action(
+pub async fn inner_update_awaited_action(
     store: &impl SchedulerStore,
     mut new_awaited_action: AwaitedAction,
+    expiry: Option<Duration>,
 ) -> Result<(), Error> {
     let operation_id = new_awaited_action.operation_id().clone();
     if new_awaited_action.state().client_operation_id != operation_id {
@@ -575,7 +606,7 @@ async fn inner_update_awaited_action(
     let _is_finished = new_awaited_action.state().stage.is_finished();
 
     let maybe_version = store
-        .update_data(UpdateOperationIdToAwaitedAction(new_awaited_action))
+        .update_data(UpdateOperationIdToAwaitedAction(new_awaited_action), expiry)
         .await
         .err_tip(|| "In RedisAwaitedActionDb::update_awaited_action")?;
 
@@ -605,6 +636,7 @@ where
     now_fn: NowFn,
     operation_id_creator: F,
     _pull_task_change_subscriber_spawn: JoinHandleDropGuard<()>,
+    retain_completed_for: Duration,
 }
 
 impl<S, F, I, NowFn> StoreAwaitedActionDb<S, F, I, NowFn>
@@ -619,6 +651,7 @@ where
         task_change_publisher: Arc<Notify>,
         now_fn: NowFn,
         operation_id_creator: F,
+        retain_completed_for_s: u32,
     ) -> Result<Self, Error> {
         let mut subscription = store
             .subscription_manager()
@@ -654,11 +687,14 @@ where
             now_fn,
             operation_id_creator,
             _pull_task_change_subscriber_spawn: pull_task_change_subscriber,
+            retain_completed_for: Duration::from_secs(retain_completed_for_s.into()),
         })
     }
 
+    // `pub` so integration tests in `tests/` can drive this directly;
+    // matches the precedent of `inner_update_awaited_action` below.
     #[expect(clippy::future_not_send)] // TODO(jhpratt) remove this
-    async fn try_subscribe(
+    pub async fn try_subscribe(
         &self,
         client_operation_id: &ClientOperationId,
         unique_qualifier: &ActionUniqueQualifier,
@@ -668,20 +704,33 @@ where
         // we should add priority upgrades back in.
         _priority: i32,
     ) -> Result<Option<AwaitedAction>, Error> {
+        // Retry once on miss: closes the RediSearch index-visibility
+        // window where two concurrent `add_action` calls can both see
+        // empty and create duplicate scheduler operations.
+        const SUBSCRIBE_RACE_RETRY_DELAY: Duration = Duration::from_millis(20);
         match unique_qualifier {
             ActionUniqueQualifier::Cacheable(_) => {}
             ActionUniqueQualifier::Uncacheable(_) => return Ok(None),
         }
-        let stream = self
-            .store
-            .search_by_index_prefix(SearchUniqueQualifierToAwaitedAction(unique_qualifier))
-            .await
-            .err_tip(|| "In RedisAwaitedActionDb::try_subscribe")?;
-        tokio::pin!(stream);
-        let maybe_awaited_action = stream
-            .try_next()
-            .await
-            .err_tip(|| "In RedisAwaitedActionDb::try_subscribe")?;
+        let mut maybe_awaited_action: Option<AwaitedAction> = None;
+        for attempt in 0..2_u32 {
+            if attempt > 0 {
+                tokio::time::sleep(SUBSCRIBE_RACE_RETRY_DELAY).await;
+            }
+            let stream = self
+                .store
+                .search_by_index_prefix(SearchUniqueQualifierToAwaitedAction(unique_qualifier))
+                .await
+                .err_tip(|| "In RedisAwaitedActionDb::try_subscribe")?;
+            tokio::pin!(stream);
+            maybe_awaited_action = stream
+                .try_next()
+                .await
+                .err_tip(|| "In RedisAwaitedActionDb::try_subscribe")?;
+            if maybe_awaited_action.is_some() {
+                break;
+            }
+        }
         match maybe_awaited_action {
             Some(awaited_action) => {
                 // TODO(palfrey) We don't support joining completed jobs because we
@@ -781,6 +830,7 @@ where
             OperationIdToAwaitedAction(Cow::Owned(operation_id)),
             Arc::downgrade(&self.store),
             self.now_fn.clone(),
+            self.retain_completed_for,
         )))
     }
 }
@@ -811,11 +861,14 @@ where
             OperationIdToAwaitedAction(Cow::Owned(operation_id.clone())),
             Arc::downgrade(&self.store),
             self.now_fn.clone(),
+            self.retain_completed_for,
         )))
     }
 
     async fn update_awaited_action(&self, new_awaited_action: AwaitedAction) -> Result<(), Error> {
-        inner_update_awaited_action(self.store.as_ref(), new_awaited_action).await
+        // merge: keep our max_seconds retain; upstream per-update expiry declined (would double-apply)
+        let expiry: Option<Duration> = None;
+        inner_update_awaited_action(self.store.as_ref(), new_awaited_action, expiry).await
     }
 
     async fn add_action(
@@ -861,9 +914,11 @@ where
             awaited_action.update_client_keep_alive((self.now_fn)().now());
 
             let version = awaited_action.version();
+            // merge: keep our max_seconds retain; upstream per-update expiry declined (would double-apply)
+            let expiry: Option<Duration> = None;
             if self
                 .store
-                .update_data(UpdateOperationIdToAwaitedAction(awaited_action))
+                .update_data(UpdateOperationIdToAwaitedAction(awaited_action), expiry)
                 .await
                 .err_tip(|| "In RedisAwaitedActionDb::add_action")?
                 .is_none()
@@ -876,12 +931,15 @@ where
                 continue;
             }
 
-            // Add the client_operation_id to operation_id mapping
+            // Bound the cid_* mapping's lifetime (see CLIENT_ID_MAPPING_TTL).
             self.store
-                .update_data(UpdateClientIdToOperationId {
-                    client_operation_id: client_operation_id.clone(),
-                    operation_id: operation_id.clone(),
-                })
+                .update_data(
+                    UpdateClientIdToOperationId {
+                        client_operation_id: client_operation_id.clone(),
+                        operation_id: operation_id.clone(),
+                    },
+                    Some(CLIENT_ID_MAPPING_TTL),
+                )
                 .await
                 .err_tip(|| "In RedisAwaitedActionDb::add_action while adding client mapping")?;
 
@@ -890,6 +948,7 @@ where
                 OperationIdToAwaitedAction(Cow::Owned(operation_id)),
                 Arc::downgrade(&self.store),
                 self.now_fn.clone(),
+                self.retain_completed_for,
             ));
         }
     }
@@ -932,6 +991,7 @@ where
                     OperationIdToAwaitedAction(Cow::Owned(awaited_action.operation_id().clone())),
                     Arc::downgrade(&self.store),
                     self.now_fn.clone(),
+                    self.retain_completed_for,
                 )
             }))
     }
@@ -950,6 +1010,7 @@ where
                     OperationIdToAwaitedAction(Cow::Owned(awaited_action.operation_id().clone())),
                     Arc::downgrade(&self.store),
                     self.now_fn.clone(),
+                    self.retain_completed_for,
                 )
             }))
     }

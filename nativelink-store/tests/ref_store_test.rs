@@ -40,7 +40,7 @@ use tokio::sync::Notify;
 
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 
-fn setup_stores() -> (Arc<StoreManager>, Store, Store) {
+async fn setup_stores() -> (Arc<StoreManager>, Store, Store) {
     let store_manager = Arc::new(StoreManager::new());
 
     let memory_store = Store::new(MemoryStore::new(&MemorySpec::default()));
@@ -60,7 +60,7 @@ fn setup_stores() -> (Arc<StoreManager>, Store, Store) {
 async fn has_test() -> Result<(), Error> {
     const VALUE1: &str = "13";
 
-    let (_store_manager, memory_store, ref_store) = setup_stores();
+    let (_store_manager, memory_store, ref_store) = setup_stores().await;
 
     {
         // Insert data into memory store.
@@ -90,7 +90,7 @@ async fn has_test() -> Result<(), Error> {
 async fn get_test() -> Result<(), Error> {
     const VALUE1: &str = "13";
 
-    let (_store_manager, memory_store, ref_store) = setup_stores();
+    let (_store_manager, memory_store, ref_store) = setup_stores().await;
 
     {
         // Insert data into memory store.
@@ -121,7 +121,7 @@ async fn get_test() -> Result<(), Error> {
 async fn update_test() -> Result<(), Error> {
     const VALUE1: &str = "13";
 
-    let (_store_manager, memory_store, ref_store) = setup_stores();
+    let (_store_manager, memory_store, ref_store) = setup_stores().await;
 
     {
         // Insert data into ref_store.
@@ -256,6 +256,10 @@ impl ProbeStore {
 
 #[async_trait]
 impl StoreDriver for ProbeStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         _keys: &[StoreKey<'_>],
@@ -272,8 +276,8 @@ impl StoreDriver for ProbeStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(0)
     }
 
     async fn get_part(
@@ -451,6 +455,7 @@ async fn mark_stable_delegates_to_resolved_target_test() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

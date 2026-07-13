@@ -123,6 +123,9 @@ default_health_status_indicator!(ErroringSlowStore);
 
 #[async_trait]
 impl StoreDriver for ErroringSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -135,7 +138,7 @@ impl StoreDriver for ErroringSlowStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.write_attempts.fetch_add(1, Ordering::SeqCst);
         Err(make_err!(
             Code::DeadlineExceeded,
@@ -201,6 +204,9 @@ default_health_status_indicator!(EnospcFastStore);
 
 #[async_trait]
 impl StoreDriver for EnospcFastStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -213,7 +219,7 @@ impl StoreDriver for EnospcFastStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::ResourceExhausted,
             "EnospcFastStore: No space left on device (os error 28)"
@@ -310,6 +316,7 @@ async fn make_disk_harness() -> Result<DiskHarness, Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow,
@@ -523,6 +530,7 @@ async fn spill_enospc_is_tolerated_per_entry() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         enospc_fast,
         slow,

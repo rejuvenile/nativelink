@@ -138,6 +138,7 @@ fn make_fss() -> Arc<FastSlowStore> {
     let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
     FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -614,6 +615,10 @@ impl MetricsComponent for GatedSlowStore {
 
 #[async_trait]
 impl StoreDriver for GatedSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -631,7 +636,7 @@ impl StoreDriver for GatedSlowStore {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         if self.fail_updates.load(Ordering::SeqCst) {
             // Drain the reader so writers don't observe a "Sender
             // dropped before EOF" error (writer-termination contract
@@ -715,6 +720,7 @@ fn make_fss_with_gated_slow() -> (
     let slow = Store::new(slow_arc.clone());
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1102,6 +1108,7 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
         let slow = Store::new(slow_arc.clone());
         let fss = FastSlowStore::new(
             &FastSlowSpec {
+                bypass_dedup_threshold_bytes: 0,
                 fast: StoreSpec::Memory(MemorySpec::default()),
                 slow: StoreSpec::Memory(MemorySpec::default()),
                 fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1132,6 +1139,7 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
             Store::new(MemoryStore::new(&MemorySpec::default()));
         let lower_fss = FastSlowStore::new(
             &FastSlowSpec {
+                bypass_dedup_threshold_bytes: 0,
                 fast: StoreSpec::Memory(MemorySpec::default()),
                 slow: StoreSpec::Memory(MemorySpec::default()),
                 fast_direction: nativelink_config::stores::StoreDirection::default(),
@@ -1367,6 +1375,10 @@ impl MetricsComponent for BlockingSlowStore {
 
 #[async_trait]
 impl StoreDriver for BlockingSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -1382,7 +1394,7 @@ impl StoreDriver for BlockingSlowStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Streaming `update` path isn't on the V3 self-retry hot
         // path (FSS uses `update_oneshot` there); just delegate.
         Pin::new(self.inner.as_ref())
@@ -1474,6 +1486,7 @@ fn make_fss_with_blocking_slow() -> (
     let slow = Store::new(slow_arc.clone());
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),

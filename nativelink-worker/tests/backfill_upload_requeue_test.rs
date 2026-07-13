@@ -112,6 +112,10 @@ impl RejectingSlowStore {
 
 #[async_trait]
 impl StoreDriver for RejectingSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -128,7 +132,7 @@ impl StoreDriver for RejectingSlowStore {
         _digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Drain so the streaming-upload producer half does not deadlock on
         // a full channel before we return the Err.
@@ -208,6 +212,7 @@ fn make_fss_with_rejecting_slow() -> Arc<FastSlowStore> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -381,6 +386,7 @@ fn make_fss_with_accepting_slow() -> Arc<FastSlowStore> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,

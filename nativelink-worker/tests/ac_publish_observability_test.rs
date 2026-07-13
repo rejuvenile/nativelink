@@ -74,6 +74,7 @@ fn build_ac_fss() -> Arc<FastSlowStore> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow),
@@ -113,6 +114,7 @@ async fn build_cas_fss() -> Arc<FastSlowStore> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow),
@@ -384,6 +386,10 @@ default_health_status_indicator!(FailingSlowStore);
 
 #[async_trait]
 impl StoreDriver for FailingSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -400,7 +406,7 @@ impl StoreDriver for FailingSlowStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(Code::Unavailable, "T3-fake: slow tier update failed"))
     }
 
@@ -476,6 +482,10 @@ default_health_status_indicator!(LatentSlowStore);
 
 #[async_trait]
 impl StoreDriver for LatentSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -492,12 +502,12 @@ impl StoreDriver for LatentSlowStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Exercising the SUT-defined latency: the slow tier really
         // is slow. NOT test synchronization — the slow-publish
         // threshold is the prod behavior under test.
         tokio::time::sleep(self.latency).await;
-        Ok(())
+        Ok(0)
     }
 
     async fn update_oneshot(
@@ -573,6 +583,7 @@ fn build_ac_fss_with_slow(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow_driver),
@@ -773,6 +784,7 @@ async fn t4_slow_publish_warn_fires() -> Result<(), Box<dyn core::error::Error>>
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(latent_fast),
         Store::new(slow),

@@ -1,6 +1,9 @@
 ---
 name: Prepare Nix
 description: "Common setup for all runs using Nix."
+inputs:
+  nativelink_attic_token:
+    required: true
 runs:
   using: "composite"
   steps:
@@ -8,18 +11,42 @@ runs:
       uses: ./.github/actions/free-disk
 
     - name: Install Nix
-      uses: >- # https://github.com/DeterminateSystems/nix-installer-action/releases/tag/v20
-        DeterminateSystems/nix-installer-action@786fff0690178f1234e4e1fe9b536e94f5433196
+      uses: >- # https://github.com/DeterminateSystems/nix-installer-action/releases/tag/v22
+        DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
       with:
         source-tag: v3.13.0
+        extra-conf: |
+          fallback = true # So we always work even if the cache is down
+          log-lines = 100 # Necessary in CI to get enough failure context
+          keep-outputs = true # Don't delete non-root outputs, because might be needed for other builds
 
-    # FIXME(palfrey): Replace with better cache. Workers are currently taking minutes to upload data
-    # all the time, probably because we're at ~500GB of 10GB in the cache storage and it's breaking.
-    # We've tried Flakehub, but it doesn't work for us because it assumes "branches on an org repo"
-    # not our "fork and branch on your own repo" setup for it's auth so we can't currently use that.
+    - name: Setup attic cache
+      uses: >- # v4
+        nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60
+      with:
+        timeout_minutes: 30
+        max_attempts: 3
+        retry_wait_seconds: 30 # if we're failing, we want to wait a reasonable amount of time
+        command: |
+          set -euo pipefail
+          date
+          cd /tmp
+          nix build nixpkgs#attic-client
+          # Note NATIVELINK_ATTIC_TOKEN is blank for PR builds as they don't have secret access
+          ./result/bin/attic login uc1-dev https://attic.uc1.scdev.nativelink.net/ ${{ inputs.nativelink_attic_token }}
+          ./result/bin/attic use nativelink
 
-    # - name: Add Nix magic cache
-    #   uses: >- # https://github.com/DeterminateSystems/magic-nix-cache-action/releases/tag/v13
-    #     DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39
-    #   with:
-    #     source-tag: v0.1.6
+          if [ -n "${{ inputs.nativelink_attic_token }}" ]; then
+            # If we don't have a token, we can't push!
+
+            # Replace with more reliable attic for working around
+            # * https://github.com/zhaofengli/attic/issues/226
+            # * https://github.com/zhaofengli/attic/pull/317
+            # We use the original one first to get caching of this
+            nix build github:TraceMachina/attic
+            RUST_BACKTRACE=full RUST_LOG=debug,hyper_util=info,rustls=info ./result/bin/attic watch-store nativelink &> attic-push.log &
+
+            # For the cases where we don't have a cache of it, push it
+            ./result/bin/attic push nativelink $(nix eval --raw github:TraceMachina/attic)
+          fi
+        shell: bash

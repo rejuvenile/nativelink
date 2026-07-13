@@ -34,7 +34,6 @@ pub mod fs_util;
 pub mod health_utils;
 pub mod log_utils;
 pub mod instant_wrapper;
-pub mod known_platform_property_provider;
 pub mod metrics;
 pub mod metrics_publisher;
 pub mod metrics_utils;
@@ -58,7 +57,6 @@ pub mod streaming_blob;
 pub mod task;
 pub mod telemetry;
 pub mod tls_utils;
-pub mod write_counter;
 pub mod buf_list;
 pub mod zero_copy_codec;
 

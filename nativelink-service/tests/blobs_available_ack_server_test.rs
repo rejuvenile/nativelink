@@ -129,6 +129,7 @@ async fn setup() -> Result<AckTestContext, Error> {
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let locality_map = new_shared_blob_locality_map();

@@ -61,7 +61,7 @@ use tokio::time::sleep;
 use tracing::{Level, event, warn};
 
 use crate::cas_utils::is_zero_digest;
-use crate::common_s3_utils::TlsClient;
+use crate::common_s3_utils::{TlsClient, install_default_rustls_crypto_provider};
 
 // S3 parts cannot be smaller than this number
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024; // 5MB
@@ -123,10 +123,8 @@ pub fn load_custom_certs(cert_path: &str) -> Result<Arc<ClientConfig>, Error> {
     // Add each certificate to the root store
     for cert in certs {
         root_store.add(cert).map_err(|e| {
-            make_err!(
-                Code::Internal,
-                "Failed to add certificate to root store: {e:?}"
-            )
+            Error::from_std_err(Code::Internal, &e)
+                .append("Failed to add certificate to root store")
         })?;
     }
 
@@ -144,6 +142,8 @@ where
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
     pub async fn new(spec: &ExperimentalOntapS3Spec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+        install_default_rustls_crypto_provider();
+
         // Load custom CA config
         let ca_config = if let Some(cert_path) = &spec.root_certificates {
             load_custom_certs(cert_path)?
@@ -184,7 +184,7 @@ where
             .timeout_config(
                 aws_config::timeout::TimeoutConfig::builder()
                     .connect_timeout(Duration::from_secs(30))
-                    .operation_timeout(Duration::from_secs(120))
+                    .operation_timeout(Duration::from_mins(2))
                     .build(),
             )
             .build();
@@ -313,6 +313,10 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -359,7 +363,7 @@ where
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let s3_path = &self.make_s3_path(&key);
 
         let max_size = match size_info {
@@ -381,7 +385,7 @@ where
 
                     let result = {
                         let reader_ref = &mut reader;
-                        let (upload_res, bind_res): (Result<(), Error>, Result<(), Error>) = tokio::join!(async move {
+                        let (upload_res, bind_res): (Result<u64, Error>, Result<(), Error>) = tokio::join!(async move {
                             let raw_body_bytes = {
                                 let mut raw_body_chunks = BytesMut::new();
                                 loop {
@@ -401,6 +405,7 @@ where
                             let internal_res = match raw_body_bytes {
                                 Ok(body_bytes) => {
                                     let hash = Sha256::digest(&body_bytes);
+                                    let body_len: u64 = body_bytes.len().try_into().unwrap_or(0);
                                     let send_res = self.s3_client
                                         .put_object()
                                         .bucket(&self.bucket)
@@ -414,10 +419,11 @@ where
                                         .customize()
                                         .mutate_request(|req| {req.headers_mut().insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD");})
                                         .send();
-                                    Either::Left(send_res.map_ok_or_else(|e| Err(make_err!(Code::Aborted, "{e:?}")), |_| Ok(())))
+                                    Either::Left(send_res.map_ok_or_else(|e| Err(
+                                        Error::from_std_err(Code::Aborted, &e)), move |_| Ok(body_len)))
                                     }
                                 Err(collect_err) => {
-                                    async fn make_collect_err(collect_err: Error) -> Result<(), Error> {
+                                    async fn make_collect_err(collect_err: Error) -> Result<u64, Error> {
                                         Err(collect_err)
                                     }
 
@@ -432,9 +438,11 @@ where
                         },
                             tx.bind_buffered(reader_ref)
                         );
-                        upload_res
-                            .merge(bind_res)
-                            .err_tip(|| "Failed to upload file to ONTAP S3 in single chunk")
+                        match (upload_res, bind_res) {
+                            (Ok(size), Ok(())) => Ok(size),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                        .err_tip(|| "Failed to upload file to ONTAP S3 in single chunk")
                     };
 
                     let retry_result = result.map_or_else(
@@ -466,7 +474,7 @@ where
                             event!(Level::INFO, ?err, ?bytes_received, "Retryable ONTAP S3 error");
                             RetryResult::Retry(err)
                         },
-                        |()| RetryResult::Ok(())
+                        RetryResult::Ok
                     );
                     Some((retry_result, reader))
                 })
@@ -486,10 +494,10 @@ where
                     .await
                     .map_or_else(
                         |e| {
-                            RetryResult::Retry(make_err!(
-                                Code::Aborted,
-                                "Failed to create multipart upload to ONTAP S3: {e:?}"
-                            ))
+                            RetryResult::Retry(
+                                Error::from_std_err(Code::Aborted, &e)
+                                    .append("Failed to create multipart upload to ONTAP S3"),
+                            )
                         },
                         |CreateMultipartUploadOutput { upload_id, .. }| {
                             upload_id.map_or_else(
@@ -516,6 +524,7 @@ where
             let read_stream_fut = (
                 async move {
                     let retrier = &Pin::get_ref(self).retrier;
+                    let mut total_uploaded = 0;
                     for part_number in 1..i32::MAX {
                         let write_buf = reader
                             .consume(
@@ -532,6 +541,8 @@ where
                             break;
                         }
 
+                        total_uploaded += write_buf.len() as u64;
+
                         tx
                             .send(
                                 retrier.retry(
@@ -547,9 +558,9 @@ where
                                             .map_or_else(
                                                 |e| {
                                                     RetryResult::Retry(
-                                                        make_err!(
-                                                            Code::Aborted,
-                                                            "Failed to upload part {part_number} in ONTAP S3 store: {e:?}"
+                                                        Error::from_std_err(
+                                                            Code::Aborted,&e).append(
+                                                            "Failed to upload part {part_number} in ONTAP S3 store"
                                                         )
                                                     )
                                                 },
@@ -566,18 +577,16 @@ where
                                     })
                                 )
                             ).await
-                            .map_err(|_| {
-                                make_err!(
-                                    Code::Internal,
-                                    "Failed to send part to channel in ontap_s3_store"
-                                )
+                            .map_err(|err| {
+                                Error::from_std_err(Code::Internal, &err).append("Failed to send part to channel in ontap_s3_store")
                             })?;
                     }
-                    Result::<_, Error>::Ok(())
+                    Result::<_, Error>::Ok(total_uploaded)
                 }
             ).fuse();
 
             let mut upload_futures = FuturesUnordered::new();
+            let mut total_uploaded = 0;
             let mut completed_parts = Vec::with_capacity(
                 usize::try_from(cmp::min(
                     MAX_UPLOAD_PARTS as u64,
@@ -592,7 +601,9 @@ where
                     break;
                 }
                 tokio::select! {
-                    result = &mut read_stream_fut => result?,
+                    result = &mut read_stream_fut => {
+                        total_uploaded = result?;
+                    },
                     Some(upload_result) = upload_futures.next() => completed_parts.push(upload_result?),
                     Some(fut) = rx.recv() => upload_futures.push(fut),
                 }
@@ -600,8 +611,8 @@ where
 
             completed_parts.sort_unstable_by_key(|part| part.part_number);
 
-            self.retrier.retry(
-                unfold(completed_parts, move |completed_parts| async move {
+            self.retrier
+                .retry(unfold(completed_parts, move |completed_parts| async move {
                     Some((
                         self.s3_client
                             .complete_multipart_upload()
@@ -610,49 +621,44 @@ where
                             .multipart_upload(
                                 CompletedMultipartUploadBuilder::default()
                                     .set_parts(Some(completed_parts.clone()))
-                                    .build()
+                                    .build(),
                             )
                             .upload_id(upload_id)
-                            .send().await
+                            .send()
+                            .await
                             .map_or_else(
                                 |e| {
                                     RetryResult::Retry(
-                                        make_err!(
-                                            Code::Aborted,
-                                            "Failed to complete multipart upload in ONTAP S3 store: {e:?}"
-                                        )
+                                        Error::from_std_err(Code::Aborted, &e).append(
+                                            "Failed to complete multipart upload in ONTAP S3 store",
+                                        ),
                                     )
                                 },
-                                |_| RetryResult::Ok(())
+                                |_| RetryResult::Ok(total_uploaded),
                             ),
                         completed_parts,
                     ))
-                })
-            ).await
+                }))
+                .await
         };
 
         upload_parts()
-            .or_else(move |e| async move {
-                Result::<(), _>::Err(e).merge(
-                    self.s3_client
-                        .abort_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(s3_path)
-                        .upload_id(upload_id)
-                        .send()
-                        .await
-                        .map_or_else(
-                            |e| {
-                                let err = make_err!(
-                                    Code::Aborted,
-                                    "Failed to abort multipart upload in ONTAP S3 store : {e:?}"
-                                );
-                                event!(Level::INFO, ?err, "Multipart upload error");
-                                Err(err)
-                            },
-                            |_| Ok(()),
-                        ),
-                )
+            .or_else(move |mut e| async move {
+                let abort_res = self
+                    .s3_client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(s3_path)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+                if let Err(abort_err) = abort_res {
+                    let err = Error::from_std_err(Code::Aborted, &abort_err)
+                        .append("Failed to abort multipart upload in ONTAP S3 store");
+                    event!(Level::INFO, ?err, "Multipart upload error");
+                    e = e.merge(err);
+                }
+                Err(e)
             })
             .await
     }
@@ -678,7 +684,8 @@ where
 
         self.retrier
             .retry(unfold(writer, move |writer| async move {
-                let result = self.s3_client
+                let result = self
+                    .s3_client
                     .get_object()
                     .bucket(&self.bucket)
                     .key(s3_path)
@@ -712,9 +719,9 @@ where
                                         }
                                         Err(e) => {
                                             return Some((
-                                                RetryResult::Err(make_err!(
-                                                    Code::Aborted,
-                                                    "Error sending bytes to consumer in ONTAP S3: {e}"
+                                                RetryResult::Err(Error::from_std_err(
+                                                    Code::Aborted,&e).append(
+                                                    "Error sending bytes to consumer in ONTAP S3"
                                                 )),
                                                 writer,
                                             ));
@@ -723,10 +730,10 @@ where
                                 }
                                 Err(e) => {
                                     return Some((
-                                        RetryResult::Retry(make_err!(
-                                            Code::Aborted,
-                                            "Bad bytestream element in ONTAP S3: {e}"
-                                        )),
+                                        RetryResult::Retry(
+                                            Error::from_std_err(Code::Aborted, &e)
+                                                .append("Bad bytestream element in ONTAP S3"),
+                                        ),
                                         writer,
                                     ));
                                 }
@@ -736,37 +743,31 @@ where
                         // EOF handling
                         if let Err(e) = writer.send_eof() {
                             return Some((
-                                RetryResult::Err(make_err!(
-                                    Code::Aborted,
-                                    "Failed to send EOF to consumer in ONTAP S3: {e}"
-                                )),
+                                RetryResult::Err(
+                                    Error::from_std_err(Code::Aborted, &e)
+                                        .append("Failed to send EOF to consumer in ONTAP S3"),
+                                ),
                                 writer,
                             ));
                         }
 
                         Some((RetryResult::Ok(()), writer))
                     }
-                    Err(sdk_error) => {
-                        // Clone sdk_error before moving
-                        let error_description = format!("{sdk_error:?}");
-                        match sdk_error.into_service_error() {
-                            GetObjectError::NoSuchKey(e) => {
-                                Some((
-                                    RetryResult::Err(make_err!(
-                                        Code::NotFound,
-                                        "No such key in ONTAP S3: {e}"
-                                    )),
-                                    writer,
-                                ))
-                            }
-                            _ => Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::Unavailable,
-                                    "Unhandled GetObjectError in ONTAP S3: {error_description}"
-                                )),
-                                writer,
-                            )),
-                        }
+                    Err(sdk_error) => match sdk_error.into_service_error() {
+                        GetObjectError::NoSuchKey(e) => Some((
+                            RetryResult::Err(
+                                Error::from_std_err(Code::NotFound, &e)
+                                    .append("No such key in ONTAP S3"),
+                            ),
+                            writer,
+                        )),
+                        other => Some((
+                            RetryResult::Retry(
+                                Error::from_std_err(Code::Unavailable, &other)
+                                    .append("Unhandled GetObjectError in ONTAP S3"),
+                            ),
+                            writer,
+                        )),
                     },
                 }
             }))

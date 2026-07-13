@@ -160,7 +160,7 @@ fn make_bytestream_server(store_manager: &StoreManager) -> Result<ByteStreamServ
             cas_store: "main_cas".to_string(),
             // Short idle_stream_timeout so the zombie threshold (2 × this) is
             // 4s of virtual time, keeping the test fast.
-            persist_stream_on_disconnect_timeout: IDLE_TIMEOUT_SECS,
+            persist_stream_on_disconnect_timeout_s: IDLE_TIMEOUT_SECS,
             max_bytes_per_stream: 1024,
             ..Default::default()
         },

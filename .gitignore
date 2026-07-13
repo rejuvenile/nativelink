@@ -1,5 +1,6 @@
 bazel-*
 target/
+nativelink-test/fuzz/target/
 .vscode/
 .idea/
 .zed
@@ -14,14 +15,14 @@ __pycache__
 .DS_Store
 .pre-commit-config.yaml
 result
-MODULE.bazel.lock
 trivy-results.sarif
 Pulumi.dev.yaml
+rust-project.json
 lre.bazelrc
 nixos.bazelrc
-rust-project.json
 darwin.bazelrc
 nativelink.bazelrc
+user.bazelrc
 *.log
 buck-out/
 nativelink_config.schema.json
@@ -35,3 +36,5 @@ nativelink_config.schema.json
 specs/*_TTrace_*.tla
 specs/*_TTrace_*.bin
 specs/states/
+.gstack/
+.worktrees/

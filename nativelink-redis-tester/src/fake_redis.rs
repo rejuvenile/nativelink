@@ -22,6 +22,7 @@ use redis::Value;
 use redis_test::IntoRedisValue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot::{self, Sender};
 use tracing::{error, info, warn};
 
 fn cmd_as_string(cmd: &redis::Cmd) -> String {
@@ -64,6 +65,14 @@ pub(crate) fn arg_as_string(output: &mut String, arg: Value) {
         }
         Value::Nil => {
             write!(output, "_\r\n").unwrap();
+        }
+        Value::Boolean(value) => {
+            if value {
+                write!(output, "#t\r\n")
+            } else {
+                write!(output, "#f\r\n")
+            }
+            .unwrap();
         }
         _ => {
             panic!("No support for {arg:?}")
@@ -191,16 +200,22 @@ pub fn fake_redis_sentinel_stream(master_name: &str, redis_port: u16) -> HashMap
     response
 }
 
-pub(crate) async fn fake_redis_internal<H>(listener: TcpListener, handlers: Vec<H>)
-where
+pub(crate) async fn fake_redis_internal<H>(
+    listener: TcpListener,
+    listener_ready_tx: Sender<()>,
+    handlers: Vec<H>,
+) where
     H: Fn(&[u8]) -> String + Send + Clone + 'static + Sync,
 {
     let mut handler_iter = handlers.iter().cloned().cycle();
+    info!(
+        "Waiting for connection on {}",
+        listener.local_addr().unwrap()
+    );
+    listener_ready_tx
+        .send(())
+        .expect("Expected successful send");
     loop {
-        info!(
-            "Waiting for connection on {}",
-            listener.local_addr().unwrap()
-        );
         let Ok((mut stream, _)) = listener.accept().await else {
             error!("accept error");
             panic!("error");
@@ -222,8 +237,11 @@ where
     }
 }
 
-async fn fake_redis<B>(listener: TcpListener, all_responses: Vec<HashMap<String, String, B>>)
-where
+async fn fake_redis<B>(
+    listener: TcpListener,
+    listener_ready_tx: Sender<()>,
+    all_responses: Vec<HashMap<String, String, B>>,
+) where
     B: BuildHasher + Clone + Send + 'static + Sync,
 {
     let funcs = all_responses
@@ -247,21 +265,25 @@ where
             }
         })
         .collect();
-    fake_redis_internal(listener, funcs).await;
+    fake_redis_internal(listener, listener_ready_tx, funcs).await;
 }
 
-pub async fn make_fake_redis_with_multiple_responses<
-    B: BuildHasher + Clone + Send + 'static + Sync,
->(
+async fn make_fake_redis_with_multiple_responses<B: BuildHasher + Clone + Send + 'static + Sync>(
     responses: Vec<HashMap<String, String, B>>,
 ) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    info!("Using port {port}");
+
+    let (listener_ready_tx, listener_ready_rx) = oneshot::channel::<()>();
 
     background_spawn!("listener", async move {
-        fake_redis(listener, responses).await;
+        fake_redis(listener, listener_ready_tx, responses).await;
     });
+
+    listener_ready_rx
+        .await
+        .expect("Expected successful listener boot");
+    info!(port, "Fake redis booted");
 
     port
 }

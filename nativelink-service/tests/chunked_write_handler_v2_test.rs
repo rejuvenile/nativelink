@@ -1926,6 +1926,7 @@ async fn fss_is_chunked_in_flight_returns_true_after_register_h2() {
     let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -2174,6 +2175,7 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
     let slow_store = Store::new(Arc::clone(&slow_store_inner) as Arc<dyn nativelink_util::store_trait::StoreDriver>);
     let fss = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),

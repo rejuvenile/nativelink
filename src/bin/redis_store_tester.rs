@@ -244,7 +244,7 @@ async fn run<S: StoreDriver + SchedulerStore>(
                                 version: 0,
                             };
 
-                            store_clone.update_data(data).await?;
+                            store_clone.update_data(data, None).await?;
                         }
                         let search_results: Vec<_> = store_clone
                             .search_by_index_prefix(search_provider)
@@ -265,7 +265,9 @@ async fn run<S: StoreDriver + SchedulerStore>(
                             data.version = existing_data.version + 1;
                         }
 
-                        store_clone.update_data(data).await?;
+                        store_clone
+                            .update_data(data, Some(Duration::from_mins(1)))
+                            .await?;
                     }
                 }
                 Ok(())
@@ -305,7 +307,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .unwrap()
         .block_on(async {
             // The OTLP exporters need to run in a Tokio context.
-            spawn!("init tracing", async { init_tracing(true, true) })
+            spawn!("init tracing", async { init_tracing(true, true).await })
                 .await?
                 .expect("Init tracing should work");
 

@@ -18,7 +18,6 @@ use core::str::from_utf8;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use bincode::serde::decode_from_slice;
 use bytes::Bytes;
 use nativelink_config::stores::{
     CompressionSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
@@ -27,7 +26,7 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::compression_store::{
     CURRENT_STREAM_FORMAT_VERSION, CompressionStore, DEFAULT_BLOCK_SIZE, FOOTER_FRAME_TYPE, Footer,
-    Lz4Config, SliceIndex,
+    Lz4Config, SliceIndex, WincodeConfig,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
@@ -62,7 +61,7 @@ fn extract_footer(data: &[u8]) -> Result<Footer, Error> {
         "Expected frame_type to be footer"
     );
 
-    let (footer, _) = decode_from_slice::<Footer, _>(&data[pos..], bincode::config::legacy())
+    let footer = wincode::config::deserialize::<Footer, _>(&data[pos..], WincodeConfig::new())
         .map_err(|e| make_err!(Code::Internal, "Failed to deserialize header : {:?}", e))?;
     Ok(footer)
 }
@@ -418,7 +417,7 @@ async fn check_footer_test() -> Result<(), Error> {
         }
     }
     {
-        // `bincode` adds the size again as a u64 before our index vector so check it too.
+        // `wincode` adds the size again as a u64 before our index vector so check it too.
         let bincode_index_count =
             u64::from_le_bytes(compressed_data[pos - 8..pos].try_into().unwrap());
         pos -= 8;
@@ -665,6 +664,7 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

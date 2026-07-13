@@ -30,8 +30,8 @@ use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
-    CasConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, SchedulerConfig,
-    ServerConfig, WorkerConfig,
+    CasConfig, CasStoreConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig,
+    SchedulerConfig, ServerConfig, WithInstanceName, WorkerConfig,
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -46,6 +46,7 @@ use nativelink_service::execution_server::ExecutionServer;
 use nativelink_service::fetch_server::FetchServer;
 use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
+use nativelink_service::wire_compression::RemoteCacheCompressionInstances;
 use nativelink_service::worker_api_server::{
     LOCALITY_PERSIST_RECONNECT_GRACE_SECS, WorkerApiServer,
 };
@@ -1883,10 +1884,36 @@ async fn inner_main(
     // Move into an Option so the per-entry loop can `.take()` it exactly once.
     let mut pre_built_worker_api_holder = pre_built_worker_api_holder;
 
+    // The capabilities service advertises chunking support for CAS instances
+    // that may be served from a different server block (e.g. behind an L7
+    // router), so collect the CAS configs across all blocks before the loop
+    // consumes `server_cfgs`. (#2497 wiring — the split/splice handlers stay
+    // stubbed; this only feeds the capabilities advertisement, which is gated
+    // on a CAS instance setting `experimental_chunking`, default None.)
+    let all_cas_configs: Vec<WithInstanceName<CasStoreConfig>> = server_cfgs
+        .iter()
+        .filter_map(|server_cfg| server_cfg.services.as_ref())
+        .filter_map(|services| services.cas.as_deref())
+        .flatten()
+        .cloned()
+        .collect();
+
     for server_cfg in server_cfgs {
         let services = server_cfg
             .services
             .err_tip(|| "'services' must be configured")?;
+
+        // (#2527 wiring — compression config-gated OFF by default) Build the
+        // set of instances that advertise remote-cache compression from the
+        // capabilities configs. `from_capabilities_configs` only includes an
+        // instance when its `remote_cache_compression` flag is set, so with no
+        // config this is empty → capabilities advertises no compressors and
+        // there is no half-wire. This feeds ONLY the capabilities
+        // advertisement; CAS/ByteStream serving is untouched (still uses the
+        // WorkerProxyStore small-blob dispatcher path).
+        let capabilities_configs = services.capabilities.as_deref().unwrap_or_default();
+        let remote_cache_compression_instances =
+            RemoteCacheCompressionInstances::from_capabilities_configs(capabilities_configs);
 
         // Extract message size limits from the listener config.
         // Both HTTP and HTTP3 listeners support these; HTTP also has compression.
@@ -2126,7 +2153,12 @@ async fn inner_main(
                     services
                         .capabilities
                         .as_ref()
-                        .map(|cfg| CapabilitiesServer::new(cfg, &action_schedulers)),
+                        .map(|cfg| CapabilitiesServer::new(
+                            cfg,
+                            &action_schedulers,
+                            &remote_cache_compression_instances,
+                            &all_cas_configs,
+                        )),
                 )
                 .await
                 .map_or(Ok::<Option<CapabilitiesServer>, Error>(None), |server| {
@@ -3371,7 +3403,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     let disable_otlp = global_cfg.disable_otlp;
     let nonblocking_log = global_cfg.nonblocking_log;
     #[expect(clippy::disallowed_methods, reason = "tracing init on main runtime")]
-    runtime.block_on(async { tokio::spawn(async move { init_tracing(disable_otlp, nonblocking_log) }).await? })?;
+    runtime.block_on(async { tokio::spawn(async move { init_tracing(disable_otlp, nonblocking_log).await }).await? })?;
     set_open_file_limit(global_cfg.max_open_files);
     set_default_digest_hasher_func(DigestHasherFunc::from(
         global_cfg

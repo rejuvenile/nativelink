@@ -112,6 +112,7 @@ fn make_scheduler() -> Arc<ApiWorkerScheduler> {
         false,
         // (#specprefetch-rebind Stage B) temporal hold gate OFF (test default)
         false,
+        None, // merge v1.6.1: maybe_origin_event_tx (origin events off in tests)
     )
 }
 

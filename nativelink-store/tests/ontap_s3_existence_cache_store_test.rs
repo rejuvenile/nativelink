@@ -16,7 +16,7 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use aws_sdk_s3::config::{BehaviorVersion, Builder, Region};
-use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http::status::StatusCode;
@@ -64,7 +64,7 @@ async fn create_test_store(mock_client: StaticReplayClient) -> Result<Store, Err
         .to_string();
 
     let _test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -270,7 +270,7 @@ async fn test_cache_population() -> Result<(), Error> {
         .to_string();
 
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client.clone())
         .build();
@@ -441,7 +441,7 @@ async fn test_cache_sync_multiple_objects() -> Result<(), Error> {
         .to_string();
 
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client.clone())
         .build();
@@ -746,6 +746,7 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

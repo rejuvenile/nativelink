@@ -495,6 +495,13 @@ where
     pub fn is_first_msg_complete(&self) -> bool {
         self.first_msg.as_ref().is_some_and(|msg| msg.finish_write)
     }
+
+    fn enforce_wire_size_matches_digest_size(&self) -> bool {
+        matches!(
+            self.resource_info.compressor.as_deref(),
+            None | Some("identity")
+        )
+    }
 }
 
 impl<T, E> Stream for WriteRequestStreamWrapper<T>
@@ -508,12 +515,14 @@ where
         // If the stream said that the previous message was the last one, then
         // return a stream EOF (i.e. None).
         if self.write_finished {
-            error_if!(
-                self.bytes_received != self.resource_info.expected_size,
-                "Did not send enough data. Expected {}, but so far received {}",
-                self.resource_info.expected_size,
-                self.bytes_received
-            );
+            if self.enforce_wire_size_matches_digest_size() {
+                error_if!(
+                    self.bytes_received != self.resource_info.expected_size,
+                    "Did not send enough data. Expected {}, but so far received {}",
+                    self.resource_info.expected_size,
+                    self.bytes_received
+                );
+            }
             return Poll::Ready(None);
         }
 
@@ -564,7 +573,9 @@ where
             self.bytes_received = self.bytes_received.max(chunk_end);
 
             // Check that we haven't read past the expected end.
-            if self.bytes_received > self.resource_info.expected_size {
+            if self.enforce_wire_size_matches_digest_size()
+                && self.bytes_received > self.resource_info.expected_size
+            {
                 Err(make_input_err!(
                     "sent too much data: expected={}, write_offset={}, chunk_len={}, bytes_received={}",
                     self.resource_info.expected_size,

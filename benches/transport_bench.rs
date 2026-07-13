@@ -100,6 +100,7 @@ fn make_services(
             instance_name: INSTANCE_NAME.to_string(),
             config: CasStoreConfig {
                 cas_store: "main_cas".to_string(),
+                experimental_chunking: None,
             },
         }],
         store_manager,
@@ -230,6 +231,9 @@ async fn make_tcp_client(port: u16, certs: &TlsCerts) -> Arc<GrpcStore> {
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
+        use_legacy_resource_names: false,
+        headers: std::collections::HashMap::new(),
+        forward_headers: Vec::new(),
     };
     GrpcStore::new(&spec)
         .await
@@ -376,6 +380,9 @@ async fn make_quic_client(port: u16) -> Arc<GrpcStore> {
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
+        use_legacy_resource_names: false,
+        headers: std::collections::HashMap::new(),
+        forward_headers: Vec::new(),
     };
     GrpcStore::new(&spec)
         .await

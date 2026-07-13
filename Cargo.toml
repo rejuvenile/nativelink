@@ -8,6 +8,7 @@
 members = ["benchmarks"]
 exclude = [
   "nativelink-config/generate-stores-config",
+  "nativelink-test/fuzz",
   "tools/generate-bazel-rc",
 ]
 resolver = "2"
@@ -15,8 +16,8 @@ resolver = "2"
 [package]
 edition = "2024"
 name = "nativelink"
-rust-version = "1.87.0"
-version = "1.0.0"
+rust-version = "1.93.1"
+version = "1.6.1"
 
 [profile.release]
 lto = "thin"
@@ -81,7 +82,7 @@ hyper-util = { version = "0.1.11", default-features = false, features = [
   "server-graceful",
   "tracing",
 ] }
-mimalloc = { version = "0.1.44", default-features = false, features = ["override", "v3"] }
+mimalloc = { version = "0.1.48", default-features = false, features = ["override", "v3"] }
 rand = { version = "0.9.0", default-features = false, features = [
   "thread_rng",
 ] }
@@ -90,7 +91,7 @@ rustls-pki-types = { version = "1.13.1", features = [
 ], default-features = false }
 sha2 = { version = "0.10.8", default-features = false }
 socket2 = { version = "0.5.10", features = ["all"] }
-tokio = { version = "1.44.1", features = [
+tokio = { version = "1.52.2", features = [
   "fs",
   "io-util",
   "parking_lot",
@@ -121,8 +122,8 @@ nativelink-proto = { path = "nativelink-proto" }
 nativelink-service = { path = "nativelink-service" }
 nativelink-store = { path = "nativelink-store" }
 nativelink-util = { path = "nativelink-util" }
-prost = { version = "0.14.3", default-features = false }
-prost-types = { version = "0.14.3", default-features = false }
+prost = { version = "0.14.4", default-features = false }
+prost-types = { version = "0.14.4", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
@@ -188,7 +189,6 @@ missing-abi = "warn"
 missing-copy-implementations = "warn"
 missing-debug-implementations = "warn"
 noop-method-call = "warn"
-single-use-lifetimes = "warn"
 trivial-casts = "warn"
 trivial-numeric-casts = "warn"
 unreachable-pub = "warn"
@@ -201,9 +201,9 @@ variant-size-differences = "warn"
 [workspace.lints.clippy]
 
 # Global configuration
-all = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+all = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 
 # Restriction Denies with default priority
 alloc-instead-of-core = "deny"
@@ -216,33 +216,38 @@ doc-markdown = "deny"
 elidable-lifetime-names = "deny"
 explicit-into-iter-loop = "deny"
 future-not-send = "deny"
+ignored-unit-patterns = "deny"
 implicit-clone = "deny"
 implicit-hasher = "deny"
+items-after-statements = "deny"
 manual-is-variant-and = "deny"
 map-unwrap-or = "deny"
+new-ret-no-self = "deny"
 or-fun-call = "deny"
+print-stdout = "deny"
 ptr-arg = "deny"
+redundant-closure = "deny"
 redundant-closure-for-method-calls = "deny"
 semicolon-if-nothing-returned = "deny"
+similar-names = "deny"
 single-char-pattern = "deny"
+single-match-else = "deny"
 std-instead-of-core = "deny"
 string-lit-as-bytes = "deny"
 todo = "deny"
-unchecked-duration-subtraction = "deny"
+unchecked-time-subtraction = "deny"
 unnecessary-semicolon = "deny"
+use-debug = "deny"
 used-underscore-binding = "deny"
 useless-format = "deny"
 
 # Restriction Warnings with default priority
 dbg-macro = "warn"
-decimal-literal-representation = "warn"
 get-unwrap = "allow"                    # TODO(jhpratt) Flip
 missing-docs-in-private-items = "allow" # TODO(jhpratt) Flip
-print-stdout = "warn"
 unimplemented = "warn"
 unwrap-in-result = "allow"              # TODO(jhpratt) Flip
 unwrap-used = "allow"                   # TODO(jhpratt) Flip
-use-debug = "warn"
 
 # Nursery denies we want once they get out of Nursery
 missing-const-for-fn = "deny"

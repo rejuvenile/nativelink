@@ -34,6 +34,20 @@ common --@rules_python//python/config_settings:py_linux_libc=musl
 # Don't leak PATH and LD_LIBRARY_PATH into the build.
 build --incompatible_strict_action_env
 
+# hermetic-llvm <-> rules_rs interop. These are harmless when LRE-CC is the
+# active CC toolchain (Nix path) and required when hermetic-llvm provides it
+# (non-Nix path):
+#   - Rust passes -lgcc_s when linking, so libgcc_s must be stubbed.
+#   - cc-rs doesn't honor $AR/$ARFLAGS, so disable llvm-libtool-darwin as the
+#     default macOS archiver.
+# Musl + PIE harmonization (Rust forces -no-pie; hermetic-llvm defaults to
+# -static-pie) is a follow-up: it requires adding @llvm//constraints/pie:off
+# to the lre-rs musl platforms, which are @generated and need a generator-side
+# change.
+build --@llvm//config:experimental_stub_libgcc_s=True
+build --@rules_cc//cc/toolchains/args/archiver_flags:use_libtool_on_macos=False
+build --@rules_rust//cargo/settings:experimental_symlink_execroot
+
 # Don't use legacy repository rules.
 build --incompatible_disable_native_repo_rules
 
@@ -82,7 +96,6 @@ build --@rules_rust//:extra_rustc_flag=-Wmissing_debug_implementations
 build --@rules_rust//:extra_rustc_flag=-Wnoop_method_call
 build --@rules_rust//:extra_rustc_flag=-Dopaque_hidden_inferred_bound
 build --@rules_rust//:extra_rustc_flag=-Doverlapping_range_endpoints
-build --@rules_rust//:extra_rustc_flag=-Wsingle_use_lifetimes
 build --@rules_rust//:extra_rustc_flag=-Dsuspicious_double_ref_op
 build --@rules_rust//:extra_rustc_flag=-Wtrivial_casts
 build --@rules_rust//:extra_rustc_flag=-Wtrivial_numeric_casts
@@ -99,44 +112,49 @@ build --@rules_rust//:extra_rustc_flag=-Wunused_lifetimes
 build --@rules_rust//:extra_rustc_flag=-Wunused_qualifications
 build --@rules_rust//:extra_rustc_flag=-Wvariant_size_differences
 
-build --@rules_rust//:clippy_flag=-Wclippy::all
-build --@rules_rust//:clippy_flag=-Wclippy::nursery
-build --@rules_rust//:clippy_flag=-Wclippy::pedantic
+build --@rules_rust//:clippy_flag=-Dclippy::all
+build --@rules_rust//:clippy_flag=-Dclippy::nursery
+build --@rules_rust//:clippy_flag=-Dclippy::pedantic
 build --@rules_rust//:clippy_flag=-Dclippy::alloc_instead_of_core
 build --@rules_rust//:clippy_flag=-Dclippy::as_underscore
 build --@rules_rust//:clippy_flag=-Dclippy::await_holding_lock
 build --@rules_rust//:clippy_flag=-Dclippy::bind_instead_of_map
 build --@rules_rust//:clippy_flag=-Dclippy::collapsible_if
 build --@rules_rust//:clippy_flag=-Wclippy::dbg_macro
-build --@rules_rust//:clippy_flag=-Wclippy::decimal_literal_representation
 build --@rules_rust//:clippy_flag=-Dclippy::disallowed_methods
 build --@rules_rust//:clippy_flag=-Dclippy::doc_markdown
 build --@rules_rust//:clippy_flag=-Dclippy::elidable_lifetime_names
 build --@rules_rust//:clippy_flag=-Dclippy::explicit_into_iter_loop
 build --@rules_rust//:clippy_flag=-Dclippy::future_not_send
 build --@rules_rust//:clippy_flag=-Aclippy::get_unwrap
+build --@rules_rust//:clippy_flag=-Dclippy::ignored_unit_patterns
 build --@rules_rust//:clippy_flag=-Dclippy::implicit_clone
 build --@rules_rust//:clippy_flag=-Dclippy::implicit_hasher
+build --@rules_rust//:clippy_flag=-Dclippy::items_after_statements
 build --@rules_rust//:clippy_flag=-Dclippy::manual_is_variant_and
 build --@rules_rust//:clippy_flag=-Dclippy::map_unwrap_or
 build --@rules_rust//:clippy_flag=-Dclippy::missing_const_for_fn
 build --@rules_rust//:clippy_flag=-Aclippy::missing_docs_in_private_items
+build --@rules_rust//:clippy_flag=-Dclippy::new_ret_no_self
 build --@rules_rust//:clippy_flag=-Dclippy::or_fun_call
-build --@rules_rust//:clippy_flag=-Wclippy::print_stdout
+build --@rules_rust//:clippy_flag=-Dclippy::print_stdout
 build --@rules_rust//:clippy_flag=-Dclippy::ptr_arg
+build --@rules_rust//:clippy_flag=-Dclippy::redundant_closure
 build --@rules_rust//:clippy_flag=-Dclippy::redundant_closure_for_method_calls
 build --@rules_rust//:clippy_flag=-Dclippy::semicolon_if_nothing_returned
+build --@rules_rust//:clippy_flag=-Dclippy::similar_names
 build --@rules_rust//:clippy_flag=-Dclippy::single_char_pattern
+build --@rules_rust//:clippy_flag=-Dclippy::single_match_else
 build --@rules_rust//:clippy_flag=-Dclippy::std_instead_of_core
 build --@rules_rust//:clippy_flag=-Dclippy::string_lit_as_bytes
 build --@rules_rust//:clippy_flag=-Dclippy::todo
 build --@rules_rust//:clippy_flag=-Aclippy::too_long_first_doc_paragraph
-build --@rules_rust//:clippy_flag=-Dclippy::unchecked_duration_subtraction
+build --@rules_rust//:clippy_flag=-Dclippy::unchecked_time_subtraction
 build --@rules_rust//:clippy_flag=-Wclippy::unimplemented
 build --@rules_rust//:clippy_flag=-Dclippy::unnecessary_semicolon
 build --@rules_rust//:clippy_flag=-Aclippy::unwrap_in_result
 build --@rules_rust//:clippy_flag=-Aclippy::unwrap_used
-build --@rules_rust//:clippy_flag=-Wclippy::use_debug
+build --@rules_rust//:clippy_flag=-Dclippy::use_debug
 build --@rules_rust//:clippy_flag=-Dclippy::used_underscore_binding
 build --@rules_rust//:clippy_flag=-Dclippy::useless_format
 build --@rules_rust//:clippy_flag=-Dclippy::cast_possible_truncation
@@ -194,6 +212,9 @@ startup --windows_enable_symlinks
 build:windows --cxxopt=/std:c++14 --host_cxxopt=/std:c++14
 build:windows --enable_runfiles
 build:windows --extra_toolchains=@rust_toolchains//:all  # Doesn't support LRE.
+
+# Configuration options for MacOS builds
+build --macos_sdk_version=10.12 # For clock_gettime in mimalloc
 
 # rustfmt
 # TODO(palfrey): compatibility workaround for https://github.com/bazelbuild/rules_rust/issues/3493

@@ -22,6 +22,7 @@ use redis::Value;
 use redis_protocol::resp2::decode::decode;
 use redis_protocol::resp2::types::{OwnedFrame, Resp2Frame};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot::{self, Sender};
 use tracing::{debug, info, trace};
 
 use crate::fake_redis::{arg_as_string, fake_redis_internal};
@@ -34,6 +35,9 @@ pub trait SubscriptionManagerNotify {
 pub struct FakeRedisBackend<S: SubscriptionManagerNotify> {
     /// Contains a list of all of the Redis keys -> fields.
     pub table: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
+    /// TTL (seconds) attached to each key via `EXPIRE`, so tests can
+    /// assert a key was given a bounded lifetime.
+    pub expiries: Arc<Mutex<HashMap<String, i64>>>,
     subscription_manager: Arc<Mutex<Option<Arc<S>>>>,
 }
 
@@ -49,12 +53,13 @@ impl<S: SubscriptionManagerNotify> fmt::Debug for FakeRedisBackend<S> {
     }
 }
 
-const FAKE_SCRIPT_SHA: &str = "b22b9926cbce9dd9ba97fa7ba3626f89feea1ed5";
+const FAKE_SCRIPT_SHA: &str = "5148c724ce419ea27d1971dcb61c111dbbc6b63e";
 
 impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
     pub fn new() -> Self {
         Self {
             table: Arc::new(Mutex::new(HashMap::new())),
+            expiries: Arc::new(Mutex::new(HashMap::new())),
             subscription_manager: Arc::new(Mutex::new(None)),
         }
     }
@@ -66,7 +71,7 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
             .replace(subscription_manager);
     }
 
-    async fn dynamic_fake_redis(self, listener: TcpListener) {
+    async fn dynamic_fake_redis(self, listener: TcpListener, listener_ready_tx: Sender<()>) {
         let inner = move |buf: &[u8]| -> String {
             let mut output = String::new();
             let mut buf_index = 0;
@@ -137,9 +142,21 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                             panic!("Aggregate query should be a string: {args:?}");
                         };
                         let query = str::from_utf8(raw_query).unwrap();
+                        // The real ft_aggregate caller now passes an explicit
+                        // `TIMEOUT <ms>` clause before `LOAD`. Tolerate both
+                        // shapes here so this fake doesn't break older callers
+                        // and the LOAD-args check still validates the bit we
+                        // actually care about.
+                        let load_offset = if matches!(args.get(2), Some(OwnedFrame::BulkString(b)) if b == b"TIMEOUT")
+                        {
+                            // Skip "TIMEOUT" and its millisecond argument.
+                            4
+                        } else {
+                            2
+                        };
                         // Lazy implementation making assumptions.
                         assert_eq!(
-                            args[2..6],
+                            args[load_offset..load_offset + 4],
                             vec![
                                 OwnedFrame::BulkString(b"LOAD".to_vec()),
                                 OwnedFrame::BulkString(b"2".to_vec()),
@@ -175,18 +192,15 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                                 .and_then(|s| s.strip_suffix(" }"))
                                 .unwrap_or(value);
                             for fields in self.table.lock().unwrap().values() {
-                                if let Some(key_value) = fields.get(field) {
-                                    if *key_value == Value::BulkString(value.as_bytes().to_vec()) {
-                                        results.push(Value::Array(vec![
-                                            Value::BulkString(b"data".to_vec()),
-                                            fields.get("data").expect("No data field").clone(),
-                                            Value::BulkString(b"version".to_vec()),
-                                            fields
-                                                .get("version")
-                                                .expect("No version field")
-                                                .clone(),
-                                        ]));
-                                    }
+                                if let Some(key_value) = fields.get(field)
+                                    && *key_value == Value::BulkString(value.as_bytes().to_vec())
+                                {
+                                    results.push(Value::Array(vec![
+                                        Value::BulkString(b"data".to_vec()),
+                                        fields.get("data").expect("No data field").clone(),
+                                        Value::BulkString(b"version".to_vec()),
+                                        fields.get("version").expect("No version field").clone(),
+                                    ]));
                                 }
                             }
                         }
@@ -208,9 +222,9 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                         let mut value: HashMap<_, Value> = HashMap::new();
                         value.insert(
                             "data".into(),
-                            Value::BulkString(args[4].as_bytes().unwrap().to_vec()),
+                            Value::BulkString(args[5].as_bytes().unwrap().to_vec()),
                         );
-                        for pair in args[5..].chunks(2) {
+                        for pair in args[6..].chunks(2) {
                             value.insert(
                                 str::from_utf8(pair[0].as_bytes().expect("Field name not bytes"))
                                     .expect("Unable to parse field name as string")
@@ -228,7 +242,17 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                                 .unwrap()
                                 .parse()
                                 .expect("Unable to parse existing version field");
-                        trace!(%key, %expected_existing_version, ?value, "Want to insert with EVALSHA");
+                        let expiry: i64 = str::from_utf8(args[4].as_bytes().unwrap())
+                            .unwrap()
+                            .parse()
+                            .expect("Unable to parse expiry field");
+                        trace!(
+                            key,
+                            expected_existing_version,
+                            expiry,
+                            ?value,
+                            "Want to insert with EVALSHA"
+                        );
                         let version = match self.table.lock().unwrap().entry(key.clone()) {
                             Entry::Occupied(mut occupied_entry) => {
                                 let version = occupied_entry
@@ -315,6 +339,28 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
                         Value::Okay
                     }
 
+                    "EXPIRE" => {
+                        // `EXPIRE key seconds`: record the TTL; return 1
+                        // if the key existed, else 0 (as real Redis does).
+                        let key_name =
+                            str::from_utf8(args[0].as_bytes().expect("Key argument is not bytes"))
+                                .expect("Unable to parse key name")
+                                .to_string();
+                        let seconds = str::from_utf8(
+                            args[1].as_bytes().expect("EXPIRE seconds is not bytes"),
+                        )
+                        .expect("EXPIRE seconds is not utf8")
+                        .parse::<i64>()
+                        .expect("EXPIRE seconds is not an integer");
+                        let exists = self.table.lock().unwrap().contains_key(&key_name);
+                        if exists {
+                            self.expiries.lock().unwrap().insert(key_name, seconds);
+                            Value::Int(1)
+                        } else {
+                            Value::Int(0)
+                        }
+                    }
+
                     "HMGET" => {
                         let key_name =
                             str::from_utf8(args[0].as_bytes().expect("Key argument is not bytes"))
@@ -354,7 +400,7 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
             }
             output
         };
-        fake_redis_internal(listener, vec![inner]).await;
+        fake_redis_internal(listener, listener_ready_tx, vec![inner]).await;
     }
 
     pub async fn run(self) -> u16 {
@@ -362,9 +408,15 @@ impl<S: SubscriptionManagerNotify + Send + 'static + Sync> FakeRedisBackend<S> {
         let port = listener.local_addr().unwrap().port();
         info!("Using port {port}");
 
+        let (listener_ready_tx, listener_ready_rx) = oneshot::channel::<()>();
+
         background_spawn!("listener", async move {
-            self.dynamic_fake_redis(listener).await;
+            self.dynamic_fake_redis(listener, listener_ready_tx).await;
         });
+
+        listener_ready_rx
+            .await
+            .expect("Expected successful listener boot");
 
         port
     }

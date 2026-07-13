@@ -15,6 +15,7 @@
 use core::cmp;
 use core::ops::Bound;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};
@@ -40,9 +41,9 @@ use nativelink_util::store_trait::{
 use nativelink_util::task::JoinHandleDropGuard;
 use parking_lot::{Mutex, RwLock};
 use patricia_tree::StringPatriciaMap;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, SemaphorePermit, watch};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::cas_utils::is_zero_digest;
 
@@ -63,9 +64,6 @@ const DEFAULT_CONNECTION_TIMEOUT_MS: u64 = 3000;
 
 /// The default command timeout in milliseconds if not specified.
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
-
-/// The default maximum number of concurrent uploads.
-const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 10;
 
 /// The name of the field in `MongoDB` documents that stores the key.
 const KEY_FIELD: &str = "_id";
@@ -103,16 +101,18 @@ pub struct ExperimentalMongoStore {
     #[metric(help = "The amount of data to read from MongoDB at a time")]
     read_chunk_size: usize,
 
-    /// The maximum number of concurrent uploads.
-    #[metric(help = "The maximum number of concurrent uploads")]
-    max_concurrent_uploads: usize,
-
     /// Enable change streams for real-time updates.
     #[metric(help = "Whether change streams are enabled")]
     enable_change_streams: bool,
 
     /// A manager for subscriptions to keys in `MongoDB`.
     subscription_manager: Mutex<Option<Arc<ExperimentalMongoSubscriptionManager>>>,
+
+    /// Limits the number of requests at any one time
+    request_permits: Arc<Semaphore>,
+
+    /// Keep track of the `request_permits` queue size
+    waiting_permits: Arc<AtomicUsize>,
 }
 
 impl ExperimentalMongoStore {
@@ -150,8 +150,19 @@ impl ExperimentalMongoStore {
             spec.command_timeout_ms = DEFAULT_COMMAND_TIMEOUT_MS;
         }
 
-        if spec.max_concurrent_uploads == 0 {
-            spec.max_concurrent_uploads = DEFAULT_MAX_CONCURRENT_UPLOADS;
+        if spec.max_concurrent_uploads != 0 {
+            warn!(
+                "max_concurrent_uploads was set for Mongo, and it's a deprecated value we don't use anymore"
+            );
+        }
+
+        if let Some(max_permits) = spec.max_requests
+            && max_permits == 0
+        {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "max_request_permits was set to zero, which will block mongo_store from working at all"
+            ));
         }
 
         // Configure client options
@@ -225,9 +236,12 @@ impl ExperimentalMongoStore {
             scheduler_collection,
             key_prefix: spec.key_prefix.clone().unwrap_or_default(),
             read_chunk_size: spec.read_chunk_size,
-            max_concurrent_uploads: spec.max_concurrent_uploads,
             enable_change_streams: spec.enable_change_streams,
             subscription_manager: Mutex::new(None),
+            request_permits: Arc::new(Semaphore::new(
+                spec.max_requests.unwrap_or(Semaphore::MAX_PERMITS),
+            )),
+            waiting_permits: Arc::new(AtomicUsize::new(0)),
         };
 
         Ok(Arc::new(store))
@@ -283,10 +297,27 @@ impl ExperimentalMongoStore {
             key.strip_prefix(&self.key_prefix).map(ToString::to_string)
         }
     }
+
+    async fn acquire_permit(&self) -> Result<SemaphorePermit<'_>, Error> {
+        let waiting = self.waiting_permits.fetch_add(1, Ordering::Relaxed);
+
+        if waiting > 0 && waiting.is_multiple_of(100) {
+            info!(waiting, "Number of waiting permits for Mongo");
+        } else {
+            trace!(waiting, "Number of waiting permits for Mongo");
+        }
+        let permit = self.request_permits.acquire().await;
+        self.waiting_permits.fetch_sub(1, Ordering::Relaxed);
+        Ok(permit?)
+    }
 }
 
 #[async_trait]
 impl StoreDriver for ExperimentalMongoStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -302,6 +333,11 @@ impl StoreDriver for ExperimentalMongoStore {
             let encoded_key = self.encode_key(key);
             let filter = doc! { KEY_FIELD: encoded_key.as_ref() };
 
+            // We could do this with acquire_many, but that's unsafe if the number of keys is greater
+            // than the number of permits, as it'll block forever. Doing this one at a time is guaranteed
+            // not to block provided no-one sets permits to 0, and we check for that case at startup.
+            let semaphore = self.acquire_permit().await?;
+
             match self.cas_collection.find_one(filter).await {
                 Ok(Some(doc)) => {
                     *result = doc.get_i64(SIZE_FIELD).ok().map(|v| v as u64);
@@ -316,7 +352,9 @@ impl StoreDriver for ExperimentalMongoStore {
                     ));
                 }
             }
+            drop(semaphore);
         }
+
         Ok(())
     }
 
@@ -371,6 +409,8 @@ impl StoreDriver for ExperimentalMongoStore {
             }
         }
 
+        let semaphore = self.acquire_permit().await?;
+
         let mut cursor = self
             .cas_collection
             .find(filter)
@@ -384,16 +424,18 @@ impl StoreDriver for ExperimentalMongoStore {
             .await
             .map_err(|e| make_err!(Code::Internal, "Failed to get next document in list: {e}"))?
         {
-            if let Ok(key) = doc.get_str(KEY_FIELD) {
-                if let Some(decoded_key) = self.decode_key(key) {
-                    let store_key = StoreKey::new_str(&decoded_key);
-                    count += 1;
-                    if !handler(&store_key) {
-                        break;
-                    }
+            if let Ok(key) = doc.get_str(KEY_FIELD)
+                && let Some(decoded_key) = self.decode_key(key)
+            {
+                let store_key = StoreKey::new_str(&decoded_key);
+                count += 1;
+                if !handler(&store_key) {
+                    break;
                 }
             }
         }
+
+        drop(semaphore);
 
         Ok(count)
     }
@@ -403,7 +445,7 @@ impl StoreDriver for ExperimentalMongoStore {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let encoded_key = self.encode_key(&key);
 
         // Handle zero digest
@@ -421,7 +463,7 @@ impl StoreDriver for ExperimentalMongoStore {
                         "Failed to drain in ExperimentalMongoStore::update: {e}"
                     )
                 })?;
-                return Ok(());
+                return Ok(0);
             }
         }
 
@@ -464,6 +506,8 @@ impl StoreDriver for ExperimentalMongoStore {
             SIZE_FIELD: size,
         };
 
+        let semaphore = self.acquire_permit().await?;
+
         // Upsert the document
         self.cas_collection
             .update_one(
@@ -474,7 +518,9 @@ impl StoreDriver for ExperimentalMongoStore {
             .await
             .map_err(|e| make_err!(Code::Internal, "Failed to update document in MongoDB: {e}"))?;
 
-        Ok(())
+        drop(semaphore);
+
+        Ok(size.try_into().unwrap_or(0))
     }
 
     async fn get_part(
@@ -496,6 +542,8 @@ impl StoreDriver for ExperimentalMongoStore {
 
         let encoded_key = self.encode_key(&key);
         let filter = doc! { KEY_FIELD: encoded_key.as_ref() };
+
+        let semaphore = self.acquire_permit().await?;
 
         let doc = self
             .cas_collection
@@ -553,6 +601,8 @@ impl StoreDriver for ExperimentalMongoStore {
                 })?;
             }
         }
+
+        drop(semaphore);
 
         writer.send_eof().map_err(|e| {
             make_err!(
@@ -623,6 +673,8 @@ impl HealthStatusIndicator for ExperimentalMongoStore {
     }
 
     async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
+        // Note we do not acquire a request_permit here, as the health check needs to always go through
+        // even if everything else is fully loaded
         match self.database.run_command(doc! { "ping": 1 }).await {
             Ok(_) => HealthStatus::new_ok(self, "Connection healthy".into()),
             Err(e) => HealthStatus::new_failed(
@@ -653,11 +705,9 @@ impl SchedulerSubscription for ExperimentalMongoSubscription {
                 "In ExperimentalMongoSubscription::changed::as_mut"
             )
         })?;
-        receiver.changed().await.map_err(|_| {
-            make_err!(
-                Code::Internal,
-                "In ExperimentalMongoSubscription::changed::changed"
-            )
+        receiver.changed().await.map_err(|err| {
+            Error::from_std_err(Code::Internal, &err)
+                .append("In ExperimentalMongoSubscription::changed::changed")
         })
     }
 }
@@ -763,31 +813,30 @@ impl ExperimentalMongoSubscriptionManager {
                                             | OperationType::Update
                                             | OperationType::Replace
                                             | OperationType::Delete => {
-                                                if let Some(doc_key) = event.document_key {
-                                                    if let Ok(key) = doc_key.get_str(KEY_FIELD) {
-                                                        // Remove prefix if present
-                                                        let key = if key_prefix.is_empty() {
-                                                            key
-                                                        } else {
-                                                            key.strip_prefix(&key_prefix)
-                                                                .unwrap_or(key)
-                                                        };
+                                                if let Some(doc_key) = event.document_key
+                                                    && let Ok(key) = doc_key.get_str(KEY_FIELD)
+                                                {
+                                                    // Remove prefix if present
+                                                    let key = if key_prefix.is_empty() {
+                                                        key
+                                                    } else {
+                                                        key.strip_prefix(&key_prefix).unwrap_or(key)
+                                                    };
 
-                                                        let Some(subscribed_keys) =
-                                                            subscribed_keys_weak.upgrade()
-                                                        else {
-                                                            warn!(
-                                                                "Parent dropped, exiting ExperimentalMongoSubscriptionManager"
-                                                            );
-                                                            return;
-                                                        };
+                                                    let Some(subscribed_keys) =
+                                                        subscribed_keys_weak.upgrade()
+                                                    else {
+                                                        warn!(
+                                                            "Parent dropped, exiting ExperimentalMongoSubscriptionManager"
+                                                        );
+                                                        return;
+                                                    };
 
-                                                        let subscribed_keys_mux =
-                                                            subscribed_keys.read();
-                                                        subscribed_keys_mux
+                                                    let subscribed_keys_mux =
+                                                        subscribed_keys.read();
+                                                    subscribed_keys_mux
                                                                 .common_prefix_values(key)
                                                                 .for_each(ExperimentalMongoSubscriptionPublisher::notify);
-                                                    }
                                                 }
                                             }
                                             _ => {}
@@ -895,13 +944,19 @@ impl SchedulerStore for ExperimentalMongoStore {
         }
     }
 
-    async fn update_data<T>(&self, data: T) -> Result<Option<i64>, Error>
+    async fn update_data<T>(&self, data: T, expiry: Option<Duration>) -> Result<Option<i64>, Error>
     where
         T: SchedulerStoreDataProvider
             + SchedulerStoreKeyProvider
             + SchedulerCurrentVersionProvider
             + Send,
     {
+        if expiry.is_some() {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "Mongo store doesn't support expiry!"
+            ));
+        }
         let key = data.get_key();
         let encoded_key = self.encode_key(&key);
         let maybe_index = data.get_indexes().map_err(|e| {
@@ -948,7 +1003,9 @@ impl SchedulerStore for ExperimentalMongoStore {
                 VERSION_FIELD: current_version,
             };
 
-            match self
+            let semaphore = self.acquire_permit().await?;
+
+            let result = match self
                 .scheduler_collection
                 .find_one_and_update(filter, update_doc)
                 .upsert(true)
@@ -961,7 +1018,9 @@ impl SchedulerStore for ExperimentalMongoStore {
                     Code::Internal,
                     "MongoDB error in update_data: {e}"
                 )),
-            }
+            };
+            drop(semaphore);
+            result
         } else {
             let data_bytes = data.try_into_bytes().map_err(|e| {
                 make_err!(
@@ -989,6 +1048,8 @@ impl SchedulerStore for ExperimentalMongoStore {
                 );
             }
 
+            let semaphore = self.acquire_permit().await?;
+
             self.scheduler_collection
                 .update_one(
                     doc! { KEY_FIELD: encoded_key.as_ref() },
@@ -999,6 +1060,8 @@ impl SchedulerStore for ExperimentalMongoStore {
                 .map_err(|e| {
                     make_err!(Code::Internal, "Failed to update scheduler document: {e}")
                 })?;
+
+            drop(semaphore);
 
             Ok(Some(0))
         }

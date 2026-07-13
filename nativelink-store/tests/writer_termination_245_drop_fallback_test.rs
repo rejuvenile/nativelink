@@ -131,6 +131,9 @@ impl ReaderObservingInnerStore {
 
 #[async_trait]
 impl StoreDriver for ReaderObservingInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -144,7 +147,7 @@ impl StoreDriver for ReaderObservingInnerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_was_called.store(true, Ordering::Release);
         let observed: Result<(), Error> = async {
             loop {
@@ -160,7 +163,7 @@ impl StoreDriver for ReaderObservingInnerStore {
         .await;
 
         *self.last_observed.lock() = Some(observed.clone());
-        observed
+        observed.map(|()| 0)
     }
 
     async fn get_part(
@@ -377,6 +380,9 @@ default_health_status_indicator!(RecordingFastStore);
 #[cfg(feature = "chunked_fast_slow")]
 #[async_trait]
 impl StoreDriver for RecordingFastStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -394,7 +400,7 @@ impl StoreDriver for RecordingFastStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let observed: Result<(), Error> = async {
             loop {
                 let buf = reader.recv().await?;
@@ -405,7 +411,7 @@ impl StoreDriver for RecordingFastStore {
         }
         .await;
         *self.last_observed.lock() = Some(observed.clone());
-        observed
+        observed.map(|()| 0)
     }
 
     async fn get_part(
@@ -506,6 +512,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
             slow_direction: nativelink_config::stores::StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store_typed,
         slow,

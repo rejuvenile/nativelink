@@ -151,6 +151,7 @@ async fn ac_read_via_fast_slow_store_with_size_mismatch_does_not_trip_silent_sho
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,

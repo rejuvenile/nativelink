@@ -52,6 +52,7 @@ fn make_stores_direction(
             slow_direction,
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -319,6 +320,9 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
 
     #[async_trait]
     impl StoreDriver for DropCheckStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -339,7 +343,7 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
             _digest: StoreKey<'_>,
             mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             // Gets called in the fast store and we don't need to do
             // anything.  Should only complete when drain has finished.
             reader.drain().await?;
@@ -352,7 +356,7 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
             if let Some(rx) = read_rx {
                 rx.await.map_err(|e| make_err!(Code::Internal, "{:?}", e))?;
             }
-            Ok(())
+            Ok(0)
         }
 
         async fn get_part(
@@ -448,6 +452,7 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -458,7 +463,7 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
         async move {
             // Drop get_part as soon as rx.drain() completes
             tokio::select!(
-                res = rx.drain() => res,
+                res = rx.drain() => res.map(|_| ()),
                 res = fast_slow_store.get_part(digest, tx, 0, Some(digest.size_bytes())) => res,
             )
         },
@@ -493,6 +498,7 @@ async fn ignore_value_in_fast_store() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store,
@@ -520,6 +526,7 @@ async fn has_checks_fast_store_when_noop() -> Result<(), Error> {
         slow_direction: StoreDirection::default(),
         chunked_reads_enabled: false,
         slow_writes_in_flight_max_bytes: 0,
+        bypass_dedup_threshold_bytes: 0,
     };
     let fast_slow_store = Arc::new(FastSlowStore::new(
         &fast_slow_store_config,
@@ -681,6 +688,9 @@ fn make_stores_with_lazy_slow() -> (Store, Store, Store) {
 
     #[async_trait]
     impl StoreDriver for LazyStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -696,7 +706,7 @@ fn make_stores_with_lazy_slow() -> (Store, Store, Store) {
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -773,6 +783,7 @@ fn make_stores_with_lazy_slow() -> (Store, Store, Store) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -843,6 +854,7 @@ async fn partial_slow_store_read_does_not_poison_fast_store() -> Result<(), Erro
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -905,6 +917,9 @@ async fn update_with_whole_file_writes_to_both_stores() -> Result<(), Error> {
 
     #[async_trait]
     impl StoreDriver for FileUpdateStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -920,7 +935,7 @@ async fn update_with_whole_file_writes_to_both_stores() -> Result<(), Error> {
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -1012,6 +1027,7 @@ async fn update_with_whole_file_writes_to_both_stores() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -1077,6 +1093,7 @@ async fn streaming_populate_fallback_on_buffer_eviction() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -1151,6 +1168,7 @@ async fn streaming_populate_fallback_arithmetic() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -1430,6 +1448,9 @@ async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Erro
 
     #[async_trait]
     impl StoreDriver for GatedHasStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -1449,7 +1470,7 @@ async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Erro
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -1520,6 +1541,7 @@ async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Erro
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -1641,6 +1663,9 @@ async fn populate_survives_caller_cancellation() -> Result<(), Error> {
 
     #[async_trait]
     impl StoreDriver for StallSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -1656,7 +1681,7 @@ async fn populate_survives_caller_cancellation() -> Result<(), Error> {
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -1741,6 +1766,7 @@ async fn populate_survives_caller_cancellation() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -1851,6 +1877,9 @@ async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
 
     #[async_trait]
     impl StoreDriver for GatedErrorSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -1866,7 +1895,7 @@ async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -1957,6 +1986,7 @@ async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -2045,6 +2075,7 @@ async fn populate_inline_does_not_spawn() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store.clone(),
@@ -2264,6 +2295,7 @@ async fn flush_slow_writes_no_lost_wakeup() -> Result<(), Error> {
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
                 slow_writes_in_flight_max_bytes: 0,
+                bypass_dedup_threshold_bytes: 0,
             },
             fast,
             slow,
@@ -2403,6 +2435,9 @@ struct CountingNotFoundSlowStore {
 
 #[async_trait]
 impl StoreDriver for CountingNotFoundSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -2420,8 +2455,8 @@ impl StoreDriver for CountingNotFoundSlowStore {
         _digest: StoreKey<'_>,
         _reader: nativelink_util::buf_channel::DropCloserReadHalf,
         _size_info: nativelink_util::store_trait::UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(0)
     }
 
     async fn get_part(
@@ -2520,6 +2555,7 @@ async fn failed_populate_does_not_reissue_slow_store_probe() -> Result<(), Error
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -2643,6 +2679,7 @@ async fn terminal_internal_err_falls_back_to_slow_store() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -2732,6 +2769,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_populator_notfound()
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -2828,6 +2866,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_mirror_blobs_size_mi
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -2915,6 +2954,9 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_fast_store_truncatio
 
     #[async_trait]
     impl StoreDriver for TruncatingFastStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -2934,8 +2976,8 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_fast_store_truncatio
             _digest: StoreKey<'_>,
             _reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
-            Ok(())
+        ) -> Result<u64, Error> {
+            Ok(0)
         }
 
         async fn get_part(
@@ -3011,6 +3053,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_fast_store_truncatio
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -3072,6 +3115,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_in_flight_size_misma
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -3141,6 +3185,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_local_only_reads() -
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -3237,6 +3282,9 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
 
     #[async_trait]
     impl StoreDriver for LyingHasSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _digests: &[StoreKey<'_>],
@@ -3253,8 +3301,8 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
             _digest: StoreKey<'_>,
             _reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
-            Ok(())
+        ) -> Result<u64, Error> {
+            Ok(0)
         }
 
         async fn get_part(
@@ -3317,6 +3365,7 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -3373,6 +3422,9 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock() -> Resul
 
     #[async_trait]
     impl StoreDriver for ForgetfulStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -3388,8 +3440,8 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock() -> Resul
             _: StoreKey<'_>,
             _: nativelink_util::buf_channel::DropCloserReadHalf,
             _: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
-            Ok(())
+        ) -> Result<u64, Error> {
+            Ok(0)
         }
         async fn get_part(
             self: Pin<&Self>,
@@ -3502,6 +3554,7 @@ async fn dispatched_mirror_pin_snapshot_is_sorted_by_store_id() -> Result<(), Er
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -3596,6 +3649,7 @@ fn make_fss_for_ac_pin() -> Arc<FastSlowStore> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),
@@ -4110,6 +4164,9 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream() -> 
 
     #[async_trait]
     impl StoreDriver for AlwaysAtCapFastStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _digests: &[StoreKey<'_>],
@@ -4126,7 +4183,7 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream() -> 
             _digest: StoreKey<'_>,
             mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             // Pull at least one chunk to ensure the producer's
             // `fast_tx.send` round-trips first (so cache_tee_disabled
             // gets set on the SECOND send after we error). Then
@@ -4221,6 +4278,9 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream() -> 
 
     #[async_trait]
     impl StoreDriver for GatedSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -4236,7 +4296,7 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream() -> 
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -4360,6 +4420,7 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream() -> 
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store_arc.clone()),
         Store::new(gated_slow),
@@ -4510,6 +4571,7 @@ async fn populate_at_capacity_pre_stream_returns_clean_error() -> Result<(), Err
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store_arc.clone()),
         Store::new(slow_store_arc.clone()),
@@ -4600,6 +4662,9 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream()
 
     #[async_trait]
     impl StoreDriver for AlwaysAtCapFastStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _digests: &[StoreKey<'_>],
@@ -4616,7 +4681,7 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream()
             _digest: StoreKey<'_>,
             mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             let _ = reader.recv().await;
             let detail = encode_backpressure_signal_any(
                 backpressure_signal::Reason::MemoryStoreAtCapacity,
@@ -4687,6 +4752,9 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream()
 
     #[async_trait]
     impl StoreDriver for MidStreamErrSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -4707,7 +4775,7 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream()
             _digest: StoreKey<'_>,
             _reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Err(make_err!(
                 Code::Unimplemented,
                 "MidStreamErrSlowStore::update unused"
@@ -4843,6 +4911,7 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream()
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store_arc),
         Store::new(slow_store_arc),
@@ -4926,6 +4995,9 @@ async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Err
 
     #[async_trait]
     impl StoreDriver for InternalErrFastStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _digests: &[StoreKey<'_>],
@@ -4942,7 +5014,7 @@ async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Err
             _digest: StoreKey<'_>,
             mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             // Pull at least one chunk so the producer's first send
             // round-trips, then error. The error is `Code::Internal`
             // — NOT `ResourceExhausted`, so the predicate's
@@ -5017,6 +5089,9 @@ async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Err
 
     #[async_trait]
     impl StoreDriver for TwoChunkSlowStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -5032,7 +5107,7 @@ async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Err
             digest: StoreKey<'_>,
             reader: nativelink_util::buf_channel::DropCloserReadHalf,
             size_info: nativelink_util::store_trait::UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             Pin::new(self.inner.as_ref())
                 .update(digest, reader, size_info)
                 .await
@@ -5130,6 +5205,7 @@ async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Err
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store_arc),
         Store::new(slow_store_arc),
@@ -5208,6 +5284,7 @@ async fn ac_failure_prune_drops_dispatched_pin() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow),
@@ -5262,6 +5339,7 @@ async fn ac_failure_prune_is_scoped_to_store_id_and_digest() -> Result<(), Error
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow),
@@ -5369,6 +5447,7 @@ async fn stable_digests_invalidated_on_slow_tier_eviction() -> Result<(), Error>
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow),
@@ -5519,6 +5598,7 @@ async fn evict_never_stable_digest_does_not_queue_failed_slow_writes() -> Result
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast),
         Store::new(slow),
@@ -5645,6 +5725,7 @@ async fn stable_digests_invalidated_on_filesystemstore_eviction() -> Result<(), 
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_mem),
         slow_store,
@@ -5768,6 +5849,7 @@ mod path_c_startup_validation {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: cap,
+            bypass_dedup_threshold_bytes: 0,
         }
     }
 
@@ -5946,6 +6028,9 @@ mod path_c_startup_validation {
 
     #[async_trait]
     impl StoreDriver for RemoteDiskBackedStub {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _keys: &[nativelink_util::store_trait::StoreKey<'_>],
@@ -5962,9 +6047,9 @@ mod path_c_startup_validation {
             _key: nativelink_util::store_trait::StoreKey<'_>,
             mut reader: DropCloserReadHalf,
             _size: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             reader.drain().await?;
-            Ok(())
+            Ok(0)
         }
 
         async fn get_part(

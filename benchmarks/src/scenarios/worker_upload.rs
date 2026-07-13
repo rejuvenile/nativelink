@@ -251,6 +251,11 @@ impl HealthStatusIndicator for LatencyInjectingStore {
 
 #[async_trait::async_trait]
 impl StoreDriver for LatencyInjectingStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        // Forward init to the inner MemoryStore (a no-op for MemoryStore).
+        self.inner.clone().post_init().await
+    }
+
     async fn has_with_results(
         self: core::pin::Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -272,7 +277,7 @@ impl StoreDriver for LatencyInjectingStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Inject latency BEFORE delegating.
         if !self.rpc_latency.is_zero() {
             tokio::time::sleep(self.rpc_latency).await;
@@ -498,6 +503,7 @@ async fn build_bench_stores(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(fast_store),
         Store::new(slow_store),

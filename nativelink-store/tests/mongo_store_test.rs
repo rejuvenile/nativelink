@@ -72,6 +72,7 @@ fn create_test_spec_with_key_prefix(
         write_concern_w: Some("majority".to_string()),
         write_concern_j: Some(true),
         write_concern_timeout_ms: Some(10000), // Longer timeout for remote DB
+        max_requests: None,
     }
 }
 
@@ -619,12 +620,12 @@ async fn create_ten_cas_entries() -> Result<(), Error> {
         .await
         .map_err(|e| make_err!(Code::Internal, "Failed to get next document: {e}"))?
     {
-        if doc_count < 3 {
-            if let Ok(key) = doc.get_str("_id") {
-                eprintln!("  - Key: {key}");
-                if let Ok(size) = doc.get_i64("size") {
-                    eprintln!("    Size: {size} bytes");
-                }
+        if doc_count < 3
+            && let Ok(key) = doc.get_str("_id")
+        {
+            eprintln!("  - Key: {key}");
+            if let Ok(size) = doc.get_i64("size") {
+                eprintln!("    Size: {size} bytes");
             }
         }
         doc_count += 1;
@@ -758,7 +759,7 @@ impl SchedulerStoreDecodeTo for TestSchedulerKey {
 // FIXME(palfrey): Test doesn't work on local Mongo. https://github.com/TraceMachina/nativelink/pull/1843 covers
 // expanding Mongo to be usable as a scheduler backend, and should correct this problem there
 #[nativelink_test]
-#[ignore]
+#[ignore = "Broken with local mongo, only needed when we use this for a scheduler backend"]
 async fn test_scheduler_store_operations() -> Result<(), Error> {
     // Create test helper
     let helper = TestMongoHelper::new(None).await?;
@@ -780,7 +781,7 @@ async fn test_scheduler_store_operations() -> Result<(), Error> {
         // Update data in the scheduler store
         let version = helper
             .store
-            .update_data(data.clone())
+            .update_data(data.clone(), None)
             .await
             .err_tip(|| "Failed to update scheduler data")?
             .ok_or_else(|| make_err!(Code::Internal, "Expected version from update"))?;
@@ -812,7 +813,7 @@ async fn test_scheduler_store_operations() -> Result<(), Error> {
         // First update
         let version1 = helper
             .store
-            .update_data(data.clone())
+            .update_data(data.clone(), None)
             .await?
             .ok_or_else(|| make_err!(Code::Internal, "Expected version"))?;
 
@@ -821,7 +822,7 @@ async fn test_scheduler_store_operations() -> Result<(), Error> {
         data.version = version1;
         let version2 = helper
             .store
-            .update_data(data.clone())
+            .update_data(data.clone(), None)
             .await?
             .ok_or_else(|| make_err!(Code::Internal, "Expected version"))?;
 
@@ -831,7 +832,7 @@ async fn test_scheduler_store_operations() -> Result<(), Error> {
         // Try update with wrong version (should fail)
         data.content = "This should fail".to_string();
         data.version = version1; // Using old version
-        let result = helper.store.update_data(data.clone()).await;
+        let result = helper.store.update_data(data.clone(), None).await;
 
         assert!(result.is_err(), "Update with old version should fail");
         eprintln!("Correctly rejected update with stale version");
@@ -878,7 +879,7 @@ async fn test_scheduler_store_operations() -> Result<(), Error> {
                 version: 0,
             };
 
-            let version = helper.store.update_data(data).await?;
+            let version = helper.store.update_data(data, None).await?;
             assert_eq!(Some(1), version);
         }
 
@@ -969,25 +970,55 @@ async fn test_scheduler_store_operations() -> Result<(), Error> {
 
 #[nativelink_test]
 async fn test_non_w_config() -> Result<(), Error> {
+    let (mut spec, mongo_process) = TestMongoHelper::new_spec(None).await?;
+    spec.write_concern_w = None;
+    spec.write_concern_j = Some(true);
+    spec.write_concern_timeout_ms = Some(1);
+
     assert_eq!(
         Error::new(Code::InvalidArgument, "write_concern_w not set, but j and/or timeout set. Please set 'write_concern_w' to a non-default value. See https://www.mongodb.com/docs/manual/reference/write-concern/#w-option for options.".to_string()),
-        ExperimentalMongoStore::new(ExperimentalMongoSpec {
-            connection_string: "mongodb://dummy".to_string(),
-            database: "dummy".to_string(),
-            cas_collection: "test_cas".to_string(),
-            scheduler_collection: "test_scheduler".to_string(),
-            key_prefix: None,
-            read_chunk_size: 1024,
-            max_concurrent_uploads: 10,
-            connection_timeout_ms: 10000,
-            command_timeout_ms: 15000,
-            enable_change_streams: false,
-            write_concern_w: None,
-            write_concern_j: Some(true),
-            write_concern_timeout_ms: Some(1),
-        })
-        .await
+        TestMongoHelper::new_with_spec_and_process(spec, mongo_process).await
         .unwrap_err()
     );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn empty_request_permit() -> Result<(), Error> {
+    let (mut spec, mongo_process) = TestMongoHelper::new_spec(None).await?;
+    spec.max_requests = Some(0);
+
+    assert_eq!(
+        Error::new(
+            Code::InvalidArgument,
+            "max_request_permits was set to zero, which will block mongo_store from working at all"
+                .to_string()
+        ),
+        TestMongoHelper::new_with_spec_and_process(spec, mongo_process)
+            .await
+            .unwrap_err()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn single_request_permit() -> Result<(), Error> {
+    let (mut spec, mongo_process) = TestMongoHelper::new_spec(None).await?;
+    spec.max_requests = Some(1);
+    let helper = TestMongoHelper::new_with_spec_and_process(spec, mongo_process).await?;
+
+    let data = Bytes::from_static(b"14");
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+    helper.store.update_oneshot(digest, data.clone()).await?;
+    let result = helper.store.has(digest).await?;
+    assert!(
+        result.is_some(),
+        "Expected mongo store to have hash: {VALID_HASH1}",
+    );
+
+    assert!(logs_contain(
+        "Number of waiting permits for Mongo waiting=0"
+    ));
+
     Ok(())
 }

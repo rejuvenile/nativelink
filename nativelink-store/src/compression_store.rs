@@ -17,7 +17,6 @@ use core::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bincode::serde::{decode_from_slice, encode_to_vec};
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::future::FutureExt;
@@ -36,6 +35,7 @@ use nativelink_util::store_trait::{
     UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
+use wincode::{SchemaRead, SchemaWrite};
 
 use crate::cas_utils::is_zero_digest;
 
@@ -118,24 +118,28 @@ pub const FOOTER_FRAME_TYPE: u8 = 1;
 /// This is a partial mirror of `nativelink_config::stores::Lz4Config`.
 /// We cannot use that natively here because it could cause our
 /// serialized format to change if we added more configs.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Copy, Clone)]
+#[derive(
+    Serialize, Deserialize, PartialEq, Eq, Debug, Default, Copy, Clone, SchemaWrite, SchemaRead,
+)]
 pub struct Lz4Config {
     pub block_size: u32,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy, SchemaWrite, SchemaRead)]
 pub struct Header {
     pub version: u8,
     pub config: Lz4Config,
     pub upload_size: UploadSizeInfo,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone, Copy)]
+#[derive(
+    Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone, Copy, SchemaWrite, SchemaRead,
+)]
 pub struct SliceIndex {
     pub position_from_prev_index: u32,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, SchemaWrite, SchemaRead)]
 pub struct Footer {
     pub indexes: Vec<SliceIndex>,
     pub index_count: u32,
@@ -151,19 +155,18 @@ const fn lz4_compress_bound(input_size: u64) -> u64 {
     input_size + (input_size / 255) + 16
 }
 
-fn serialized_size<C>(value: &impl Serialize, config: C) -> Result<u64, Error>
+fn serialized_size<C, V>(value: &V, config: C) -> Result<u64, Error>
 where
-    C: bincode::config::Config,
+    C: wincode::config::Config,
+    V: SchemaWrite<C, Src = V>,
 {
-    let mut size_writer = bincode::enc::write::SizeWriter { bytes_written: 0 };
-    bincode::serde::encode_into_writer(value, &mut size_writer, config).map_err(|e| {
+    wincode::config::serialized_size(value, config).map_err(|e| {
         make_err!(
             Code::Internal,
             "Failed to calculate serialized size: {:?}",
             e
         )
-    })?;
-    Ok(size_writer.bytes_written as u64)
+    })
 }
 
 struct UploadState {
@@ -208,9 +211,9 @@ impl UploadState {
         let max_block_size = lz4_compress_bound(u64::from(store.config.block_size)) + U32_SZ + 1;
 
         let max_output_size = {
-            let header_size = serialized_size(&header, store.bincode_config)?;
+            let header_size = serialized_size(&header, store.wincode_config)?;
             let max_content_size = max_block_size * max_index_count;
-            let max_footer_size = U32_SZ + 1 + serialized_size(&footer, store.bincode_config)?;
+            let max_footer_size = U32_SZ + 1 + serialized_size(&footer, store.wincode_config)?;
             header_size + max_content_size + max_footer_size
         };
 
@@ -223,11 +226,14 @@ impl UploadState {
     }
 }
 
-// TODO(jaroeichler): Use the default `standard` config.
-type LegacyBincodeConfig = bincode::config::Configuration<
-    bincode::config::LittleEndian,
-    bincode::config::Fixint,
-    bincode::config::NoLimit,
+// Based off of an older Bincode config
+pub type WincodeConfig = wincode::config::Configuration<
+    true,
+    { wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED },
+    wincode::len::BincodeLen,
+    wincode::int_encoding::LittleEndian,
+    wincode::int_encoding::FixInt,
+    u32,
 >;
 
 /// This store will compress data before sending it on to the inner store.
@@ -239,7 +245,7 @@ pub struct CompressionStore {
     #[metric(group = "inner_store")]
     inner_store: Store,
     config: nativelink_config::stores::Lz4Config,
-    bincode_config: LegacyBincodeConfig,
+    wincode_config: WincodeConfig,
 }
 
 impl core::fmt::Debug for CompressionStore {
@@ -267,13 +273,18 @@ impl CompressionStore {
         Ok(Arc::new(Self {
             inner_store,
             config: lz4_config,
-            bincode_config: bincode::config::legacy(),
+            wincode_config: WincodeConfig::new(),
         }))
     }
 }
 
 #[async_trait]
 impl StoreDriver for CompressionStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        self.inner_store.clone().into_inner().post_init().await?;
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -287,7 +298,7 @@ impl StoreDriver for CompressionStore {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let mut output_state = UploadState::new(&self, upload_size)?;
 
         let (mut tx, rx) = make_buf_channel_pair();
@@ -342,10 +353,10 @@ impl StoreDriver for CompressionStore {
             let mut tx_guard = WriteHalfGuard::new(&mut tx);
             {
                 // Write Header.
-                let serialized_header = encode_to_vec(output_state.header, self.bincode_config)
-                    .map_err(|e| {
-                        make_err!(Code::Internal, "Failed to serialize header : {:?}", e)
-                    })?;
+                let serialized_header =
+                    wincode::config::serialize(&output_state.header, self.wincode_config).map_err(
+                        |e| make_err!(Code::Internal, "Failed to serialize header : {:?}", e),
+                    )?;
                 (*tx_guard)
                     .send(serialized_header.into())
                     .await
@@ -424,10 +435,10 @@ impl StoreDriver for CompressionStore {
             output_state.footer.uncompressed_data_size = received_amt;
             {
                 // Write Footer.
-                let serialized_footer = encode_to_vec(output_state.footer, self.bincode_config)
-                    .map_err(|e| {
-                        make_err!(Code::Internal, "Failed to serialize header : {:?}", e)
-                    })?;
+                let serialized_footer =
+                    wincode::config::serialize(&output_state.footer, self.wincode_config).map_err(
+                        |e| make_err!(Code::Internal, "Failed to serialize header : {:?}", e),
+                    )?;
 
                 let mut footer = BytesMut::with_capacity(1 + 4 + serialized_footer.len());
                 footer.put_u8(FOOTER_FRAME_TYPE);
@@ -443,10 +454,13 @@ impl StoreDriver for CompressionStore {
                     .err_tip(|| "Failed writing EOF in compression store update")?;
             }
 
-            Result::<(), Error>::Ok(())
+            Result::<u64, Error>::Ok(received_amt)
         };
         let (write_result, update_result) = tokio::join!(write_fut, update_fut);
-        write_result.merge(update_result)
+        match (write_result, update_result) {
+            (Ok(size), Ok(_)) => Ok(size),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }
     }
 
     // LINT: writer-termination policy for `get_part` (#336 P1 fix).
@@ -512,7 +526,7 @@ impl StoreDriver for CompressionStore {
                     config: Lz4Config { block_size: 0 },
                     upload_size: UploadSizeInfo::ExactSize(0),
                 };
-                let header_size = serialized_size(&EMPTY_HEADER, self.bincode_config)?;
+                let header_size = serialized_size(&EMPTY_HEADER, self.wincode_config)?;
                 let chunk = rx
                     .consume(Some(usize::try_from(header_size).unwrap_or(usize::MAX)))
                     .await
@@ -524,11 +538,11 @@ impl StoreDriver for CompressionStore {
                     header_size,
                 );
 
-                let (header, _) = decode_from_slice::<Header, _>(&chunk, self.bincode_config)
-                    .map_err(|e| {
-                        make_err!(Code::Internal, "Failed to deserialize header : {:?}", e)
-                    })?;
-                header
+                wincode::config::deserialize::<Header, WincodeConfig>(
+                    &chunk,
+                    self.wincode_config,
+                )
+                .map_err(|e| make_err!(Code::Internal, "Failed to deserialize header : {:?}", e))?
             };
 
             error_if!(
@@ -644,10 +658,11 @@ impl StoreDriver for CompressionStore {
                     "Unexpected EOF when reading footer in compression store get_part"
                 );
 
-                let (footer, _) = decode_from_slice::<Footer, _>(&chunk, self.bincode_config)
-                    .map_err(|e| {
-                        make_err!(Code::Internal, "Failed to deserialize footer : {:?}", e)
-                    })?;
+                let footer = wincode::config::deserialize::<Footer, WincodeConfig>(
+                    &chunk,
+                    self.wincode_config,
+                )
+                .map_err(|e| make_err!(Code::Internal, "Failed to deserialize footer : {:?}", e))?;
 
                 error_if!(
                     header.version != footer.version,

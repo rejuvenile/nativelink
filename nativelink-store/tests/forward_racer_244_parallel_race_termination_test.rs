@@ -170,6 +170,9 @@ default_health_status_indicator!(ChunkedPeerStore);
 
 #[async_trait]
 impl StoreDriver for ChunkedPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -186,9 +189,9 @@ impl StoreDriver for ChunkedPeerStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let _drained = reader.drain().await;
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(

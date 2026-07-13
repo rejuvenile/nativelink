@@ -103,6 +103,9 @@ struct InstantLatchedErrorSlowStore {
 
 #[async_trait]
 impl StoreDriver for InstantLatchedErrorSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -139,7 +142,7 @@ impl StoreDriver for InstantLatchedErrorSlowStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(Code::Unimplemented, "update not supported"))
     }
 
@@ -193,6 +196,9 @@ struct SlowSuccessSlowStore {
 
 #[async_trait]
 impl StoreDriver for SlowSuccessSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -230,7 +236,7 @@ impl StoreDriver for SlowSuccessSlowStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(Code::Unimplemented, "update not supported"))
     }
 
@@ -285,6 +291,7 @@ fn build_fss<D: StoreDriver>(slow_driver: Arc<D>) -> Store {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,

@@ -143,6 +143,10 @@ default_health_status_indicator!(HoldableSlowStore);
 
 #[async_trait]
 impl StoreDriver for HoldableSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -156,7 +160,7 @@ impl StoreDriver for HoldableSlowStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.wait_if_held().await;
         self.inner.update(key, reader, upload_size).await
     }
@@ -234,6 +238,7 @@ fn make_cas_store_with_holdable_slow() -> (Store, Arc<StoreManager>, Arc<Holdabl
     let upper_slow = Store::new(holdable.clone());
     let upper_fast_slow = Store::new(FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -251,6 +256,7 @@ fn make_cas_store_with_holdable_slow() -> (Store, Arc<StoreManager>, Arc<Holdabl
     let lower_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
     let lower_fast_slow = Store::new(FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -354,6 +360,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
         tasks_or_worker_change_notify,
         BASE_WORKER_TIMEOUT_S,
         worker_registry,
+    None,
     );
 
     let locality_map = new_shared_blob_locality_map();

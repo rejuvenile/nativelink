@@ -112,6 +112,9 @@ default_health_status_indicator!(OkEmptyPeerStore);
 
 #[async_trait]
 impl StoreDriver for OkEmptyPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -132,7 +135,7 @@ impl StoreDriver for OkEmptyPeerStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "OkEmptyPeerStore does not support update"
@@ -202,6 +205,9 @@ default_health_status_indicator!(RedirectInnerStore);
 
 #[async_trait]
 impl StoreDriver for RedirectInnerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -220,7 +226,7 @@ impl StoreDriver for RedirectInnerStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "RedirectInnerStore does not support update"
@@ -528,6 +534,9 @@ default_health_status_indicator!(PartialThenUnavailablePeerStore);
 
 #[async_trait]
 impl StoreDriver for PartialThenUnavailablePeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -546,7 +555,7 @@ impl StoreDriver for PartialThenUnavailablePeerStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Err(make_err!(
             Code::Unimplemented,
             "PartialThenUnavailablePeerStore does not support update"

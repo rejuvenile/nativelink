@@ -66,6 +66,7 @@ fn make_cas_server(store_manager: &StoreManager) -> Result<CasServer, Error> {
         &[WithInstanceName {
             instance_name: "foo_instance_name".to_string(),
             config: nativelink_config::cas_server::CasStoreConfig {
+                experimental_chunking: None,
                 cas_store: "main_cas".to_string(),
             },
         }],

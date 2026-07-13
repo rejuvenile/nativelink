@@ -4,7 +4,7 @@ lints.workspace = true
 [package]
 edition = "2024"
 name = "nativelink-service"
-version = "1.0.0"
+version = "1.6.1"
 
 [dependencies]
 nativelink-config = { path = "../nativelink-config" }
@@ -19,6 +19,7 @@ fail = { version = "0.5", optional = true }
 
 axum = { version = "0.8.3", default-features = false }
 bytes = { version = "1.10.1", default-features = false }
+fastcdc = { version = "3.2.1", default-features = false, features = ["tokio"] }
 futures = { version = "0.3.31", default-features = false }
 # h2 = direct dependency so #355 terminal-frame inspector can downcast
 # `tonic::Status::source()` to `h2::Error` and pull `h2::Reason` (CANCEL,
@@ -39,14 +40,14 @@ hyper-util = { version = "0.1.11", default-features = false, features = [
   "server-auto",
   "tokio",
 ] }
-opentelemetry = { version = "0.31.0", default-features = false }
-opentelemetry-semantic-conventions = { version = "0.31.0", default-features = false, features = [
+opentelemetry = { version = "0.32.0", default-features = false }
+opentelemetry-semantic-conventions = { version = "0.32.0", default-features = false, features = [
   "default",
   "semconv_experimental",
 ] }
 parking_lot = { version = "0.12.3", default-features = false }
-prost = { version = "0.14.3", default-features = false }
-prost-types = { version = "0.14.3", default-features = false, features = [
+prost = { version = "0.14.4", default-features = false }
+prost-types = { version = "0.14.4", default-features = false, features = [
   "std",
 ] }
 # `sha2` is `optional` because it is only consumed by the
@@ -65,7 +66,7 @@ rand = { version = "0.9.0", default-features = false, features = [
   "thread_rng",
 ] }
 serde_json5 = { version = "0.2.1", default-features = false }
-tokio = { version = "1.44.1", features = [
+tokio = { version = "1.52.2", features = [
   "fs",
   "io-util",
   "rt-multi-thread",
@@ -74,6 +75,7 @@ tokio = { version = "1.44.1", features = [
 tokio-stream = { version = "0.1.17", features = [
   "fs",
 ], default-features = false }
+tokio-util = { version = "0.7.14", features = ["io"], default-features = false }
 tonic = { version = "0.14.5", features = [
   "gzip",
   "router",
@@ -87,6 +89,7 @@ uuid = { version = "1.16.0", default-features = false, features = [
   "serde",
   "v4",
 ] }
+zstd = { version = "0.13.3", default-features = false }
 
 [features]
 failpoints = ["fail/failpoints"]
@@ -139,8 +142,8 @@ hyper = { version = "1.6.0", default-features = false }
 pretty_assertions = { version = "1.4.1", features = [
   "std",
 ], default-features = false }
-prost-types = { version = "0.14.3", default-features = false }
-tonic-prost = { version = "0.14.5", default-features = false }
+prost-types = { version = "0.14.4", default-features = false }
+tonic-prost = { version = "0.14.6", default-features = false }
 serde_json = { version = "1.0.140", default-features = false, features = [
   "std",
 ] }

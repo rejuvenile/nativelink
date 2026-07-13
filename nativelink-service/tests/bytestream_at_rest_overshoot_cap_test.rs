@@ -101,6 +101,10 @@ impl nativelink_metric::MetricsComponent for OverdeliveringStore {
 
 #[async_trait::async_trait]
 impl StoreDriver for OverdeliveringStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -117,9 +121,8 @@ impl StoreDriver for OverdeliveringStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        reader.drain().await?;
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(reader.drain().await?)
     }
 
     async fn get_part(
@@ -193,7 +196,7 @@ fn make_at_rest_config() -> Vec<WithInstanceName<ByteStreamConfig>> {
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 1024,
             // streaming_read_while_write=false forces inner_read to
             // skip the in_flight_blobs lookup and fall through to the

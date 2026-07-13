@@ -538,13 +538,44 @@ impl LenEntry for FileEntryImpl {
         let to_path = to_full_path_from_key(&encoded_file_path.shared_context.temp_path, &new_key);
 
         if let Err(err) = fs::rename(&from_path, &to_path).await {
-            warn!(
-                key = ?encoded_file_path.key,
-                ?from_path,
-                ?to_path,
-                ?err,
-                "Failed to rename file",
-            );
+            // #2424: ENOENT from rename is ambiguous — the source may be
+            // genuinely gone (another eviction beat us, or the entry never
+            // got its file on disk), OR a destination directory component
+            // (the temp dir) may be missing. Confirm the source is actually
+            // gone with a metadata probe before treating it as benign;
+            // otherwise a removed temp dir would flip an intact content file
+            // to Temp and orphan it on disk.
+            let source_gone = err.code == Code::NotFound
+                && matches!(
+                    fs::metadata(&from_path).await,
+                    Err(meta_err) if meta_err.code == Code::NotFound
+                );
+            if source_gone {
+                // Benign: the file is already gone. This case dominates log
+                // volume under heavy write+evict concurrency, so keep it at
+                // debug rather than warn. Mark the entry Temp (as a
+                // successful rename would) so a repeat unref hits the
+                // early-return above and Drop stops claiming the content
+                // path.
+                debug!(
+                    key = ?encoded_file_path.key,
+                    ?from_path,
+                    "unref: file already gone, treating as benign",
+                );
+                encoded_file_path.path_type = PathType::Temp;
+                encoded_file_path.key = new_key;
+            } else {
+                // Either a non-ENOENT failure (EACCES, EXDEV, EBUSY, …) or
+                // ENOENT with the source still present (missing temp dir).
+                // The content file is intact; leave the entry as Content.
+                warn!(
+                    key = ?encoded_file_path.key,
+                    ?from_path,
+                    ?to_path,
+                    ?err,
+                    "Failed to rename file",
+                );
+            }
         } else {
             debug!(
                 key = ?encoded_file_path.key,
@@ -2292,6 +2323,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
 #[async_trait]
 impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -2355,11 +2390,16 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         if is_zero_digest(key.borrow()) {
             // don't need to add, because zero length files are just assumed to exist
-            return Ok(());
+            return Ok(0);
         }
+
+        // FilesystemStore is a CAS store: keys are digests, so the digest's
+        // declared size is the authoritative bytes-written count for the
+        // `StoreDriver::update` u64 contract.
+        let digest_size = key.borrow().into_digest().size_bytes();
 
         // CAS dedup: skip write if blob already exists (same digest = same content).
         // sizes_for_keys with peek=false promotes the key in the LRU, updating
@@ -2375,7 +2415,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                     .drain()
                     .await
                     .err_tip(|| "Failed to drain reader for existing blob")?;
-                return Ok(());
+                return Ok(digest_size);
             }
         }
 
@@ -2421,7 +2461,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                 "update slow write (>100ms)"
             );
         }
-        result
+        result.map(|()| digest_size)
     }
 
     fn optimized_for(&self, optimization: StoreOptimizations) -> bool {

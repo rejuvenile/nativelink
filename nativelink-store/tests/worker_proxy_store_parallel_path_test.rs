@@ -90,6 +90,9 @@ default_health_status_indicator!(DelayedPeerStore);
 
 #[async_trait]
 impl StoreDriver for DelayedPeerStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -103,7 +106,7 @@ impl StoreDriver for DelayedPeerStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
 
@@ -169,6 +172,9 @@ default_health_status_indicator!(SlowNotFoundStore);
 
 #[async_trait]
 impl StoreDriver for SlowNotFoundStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -186,8 +192,8 @@ impl StoreDriver for SlowNotFoundStore {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
+    ) -> Result<u64, Error> {
+        Ok(0)
     }
 
     async fn get_part(
@@ -316,6 +322,7 @@ async fn waiter_path_inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_d
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(Arc::new(SlowNotFoundStore {

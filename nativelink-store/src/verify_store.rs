@@ -27,7 +27,9 @@ use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
 use nativelink_util::common::PackedHash;
-use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
+use nativelink_util::digest_hasher::{
+    DigestHasher, DigestHasherFunc, default_digest_hasher_func, digest_hasher_func_from_context,
+};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
@@ -314,6 +316,11 @@ impl VerifyStore {
 
 #[async_trait]
 impl StoreDriver for VerifyStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        self.inner_store.clone().into_inner().post_init().await?;
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -327,31 +334,27 @@ impl StoreDriver for VerifyStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let StoreKey::Digest(digest) = key else {
             return Err(make_input_err!(
                 "Only digests are supported in VerifyStore. Got {key:?}"
             ));
         };
         let digest_size = digest.size_bytes();
-        if let UploadSizeInfo::ExactSize(expected_size) = size_info {
-            if self.verify_size && expected_size != digest_size {
-                self.size_verification_failures.inc();
-                return Err(make_input_err!(
-                    "Expected size to match. Got {} but digest says {} on update",
-                    expected_size,
-                    digest_size
-                ));
-            }
+        if let UploadSizeInfo::ExactSize(expected_size) = size_info
+            && self.verify_size
+            && expected_size != digest_size
+        {
+            self.size_verification_failures.inc();
+            return Err(make_input_err!(
+                "Expected size to match. Got {} but digest says {} on update",
+                expected_size,
+                digest_size
+            ));
         }
 
         let mut hasher = if self.verify_hash {
-            Some(
-                Context::current()
-                    .get::<DigestHasherFunc>()
-                    .map_or_else(default_digest_hasher_func, |v| *v)
-                    .hasher(),
-            )
+            Some(digest_hasher_func_from_context().hasher())
         } else {
             None
         };
@@ -374,7 +377,11 @@ impl StoreDriver for VerifyStore {
 
         let (update_res, check_res) = tokio::join!(update_fut, check_fut);
 
-        update_res.merge(check_res)
+        match (update_res, check_res) {
+            // Prioritize the check future's error, as it's more specific.
+            (_, Err(e)) | (Err(e), Ok(_)) => Err(e),
+            (Ok(size), Ok(_)) => Ok(size),
+        }
     }
 
     async fn get_part(

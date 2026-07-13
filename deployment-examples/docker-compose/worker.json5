@@ -89,6 +89,8 @@
             ],
           },
         },
+        use_namespaces: true,
+        use_mount_namespace: true,
       },
     },
   ],

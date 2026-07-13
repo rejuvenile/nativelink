@@ -27,7 +27,6 @@ use nativelink_util::action_messages::{
     OperationId, WorkerId,
 };
 use nativelink_util::instant_wrapper::InstantWrapper;
-use nativelink_util::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_util::metrics::{
     EXECUTION_METRICS, EXECUTION_RESULT, EXECUTION_STAGE, ExecutionResult, ExecutionStage,
 };
@@ -354,6 +353,20 @@ where
 
         let now = (self.now_fn)().now();
 
+        // Honor the per-action `Action.timeout` from the RBE protocol as a
+        // backend wall-clock deadline. Without this, the only enforcement is
+        // the Bazel client's --test_timeout, which surfaces as TIMEOUT/NO
+        // STATUS instead of a backend signal pointing at the worker.
+        let action_timeout = awaited_action.action_info().timeout;
+        if action_timeout > Duration::ZERO {
+            let executing_started_at = awaited_action.state().last_transition_timestamp;
+            if let Ok(elapsed) = now.duration_since(executing_started_at)
+                && elapsed > action_timeout
+            {
+                return true;
+            }
+        }
+
         let registry_alive = if let Some(ref worker_registry) = self.worker_registry {
             if let Some(worker_id) = awaited_action.worker_id() {
                 worker_registry
@@ -401,6 +414,7 @@ where
             let mut timed_out = true;
             if !awaited_action.state().stage.is_finished() {
                 let mut state = awaited_action.state().as_ref().clone();
+                warn!(operation_id = ?awaited_action.operation_id(), timeout_secs = self.client_action_timeout.as_secs_f32(), "Operation timed out having no more clients listening");
                 state.stage = ActionStage::Completed(ActionResult {
                     error: Some(make_err!(
                         Code::DeadlineExceeded,
@@ -471,10 +485,10 @@ where
             .as_ref()
             .unwrap_or(awaited_action);
 
-        if let Some(operation_id) = &filter.operation_id {
-            if operation_id != awaited_action.operation_id() {
-                return false;
-            }
+        if let Some(operation_id) = &filter.operation_id
+            && operation_id != awaited_action.operation_id()
+        {
+            return false;
         }
 
         if filter.worker_id.is_some() && filter.worker_id.as_ref() != awaited_action.worker_id() {
@@ -494,26 +508,25 @@ where
                     }
                 }
             }
-            if let Some(action_digest) = filter.action_digest {
-                if action_digest != awaited_action.action_info().digest() {
-                    return false;
-                }
+            if let Some(action_digest) = filter.action_digest
+                && action_digest != awaited_action.action_info().digest()
+            {
+                return false;
             }
         }
 
         {
             let last_worker_update_timestamp = awaited_action.last_worker_updated_timestamp();
-            if let Some(worker_update_before) = filter.worker_update_before {
-                if worker_update_before < last_worker_update_timestamp {
-                    return false;
-                }
+            if let Some(worker_update_before) = filter.worker_update_before
+                && worker_update_before < last_worker_update_timestamp
+            {
+                return false;
             }
-            if let Some(completed_before) = filter.completed_before {
-                if awaited_action.state().stage.is_finished()
-                    && completed_before < last_worker_update_timestamp
-                {
-                    return false;
-                }
+            if let Some(completed_before) = filter.completed_before
+                && awaited_action.state().stage.is_finished()
+                && completed_before < last_worker_update_timestamp
+            {
+                return false;
             }
             if filter.stages != OperationStageFlags::Any {
                 let stage_flag = match awaited_action.state().stage {
@@ -597,7 +610,7 @@ where
             return Ok(());
         }
 
-        debug!(
+        warn!(
             %operation_id,
             worker_id = ?awaited_action.worker_id(),
             registry_alive,
@@ -652,8 +665,9 @@ where
                 let base_delay = BASE_RETRY_DELAY_MS * (1 << (retry_count - 2).min(4));
                 let jitter = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| u64::try_from(d.as_nanos()).expect("u64 error") % MAX_RETRY_JITTER_MS)
-                    .unwrap_or(0);
+                    .map_or(0, |d| {
+                        u64::try_from(d.as_nanos()).expect("u64 error") % MAX_RETRY_JITTER_MS
+                    });
                 let delay = Duration::from_millis(base_delay + jitter);
 
                 warn!(
@@ -859,7 +873,37 @@ where
                         ActionStage::Queued
                     }
                 }
-                UpdateOperationType::UpdateWithDisconnect => ActionStage::Queued,
+                UpdateOperationType::UpdateWithDisconnect => {
+                    // A worker disconnect (e.g. OOMKill, pod eviction, network
+                    // drop) used to requeue without counting as an attempt,
+                    // which let an action that always crashes its worker loop
+                    // forever until the Bazel client's --test_timeout fired.
+                    // Count disconnects as attempts so max_job_retries caps the
+                    // loop and the client sees a backend-attributable error.
+                    awaited_action.attempts += 1;
+
+                    if awaited_action.attempts > self.max_job_retries {
+                        ActionStage::Completed(ActionResult {
+                            execution_metadata: ExecutionMetadata {
+                                worker: maybe_worker_id
+                                    .map_or_else(String::default, ToString::to_string),
+                                ..ExecutionMetadata::default()
+                            },
+                            error: Some(make_err!(
+                                Code::Internal,
+                                "Worker disconnected repeatedly while executing this action ({} > {} attempts); the runner likely OOMKilled or the pod was evicted. {}",
+                                awaited_action.attempts,
+                                self.max_job_retries,
+                                format!(
+                                    "for operation_id: {operation_id}, maybe_worker_id: {maybe_worker_id:?}"
+                                ),
+                            )),
+                            ..ActionResult::default()
+                        })
+                    } else {
+                        ActionStage::Queued
+                    }
+                }
                 // We shouldn't get here, but we just ignore it if we do.
                 UpdateOperationType::ExecutionComplete => {
                     warn!("inner_update_operation got an ExecutionComplete, that's unexpected.");
@@ -1092,6 +1136,8 @@ where
                 .try_collect()
                 .await
                 .err_tip(|| "In SimpleSchedulerStateManager::filter_operations")?;
+
+            #[allow(clippy::unnecessary_sort_by)]
             match filter.order_by_priority_direction {
                 Some(OrderDirection::Asc) => all_items.sort_unstable_by(|(_, a), (_, b)| a.cmp(b)),
                 Some(OrderDirection::Desc) => all_items.sort_unstable_by(|(_, a), (_, b)| b.cmp(a)),
@@ -1227,10 +1273,6 @@ where
             "In SimpleSchedulerStateManager::client_operation_id_to_operation_id"
         })?;
         Ok(Some(awaited_action.operation_id().clone()))
-    }
-
-    fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
-        None
     }
 }
 

@@ -108,6 +108,7 @@ async fn make_e2e_fast_slow(
     let slow_store: Store = Store::new(fs_store.clone());
     let fast_slow = FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),

@@ -361,6 +361,10 @@ impl MemoryStore {
 
 #[async_trait]
 impl StoreDriver for MemoryStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
         let removed = self.remove_entry(key).await;
         if removed {
@@ -414,7 +418,7 @@ impl StoreDriver for MemoryStore {
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let update_start = std::time::Instant::now();
         debug!(key = ?key, "MemoryStore::update: start");
 
@@ -510,7 +514,7 @@ impl StoreDriver for MemoryStore {
             elapsed_ms = update_start.elapsed().as_millis() as u64,
             "MemoryStore::update: complete",
         );
-        Ok(())
+        Ok(total_bytes)
     }
 
     fn optimized_for(&self, optimization: StoreOptimizations) -> bool {

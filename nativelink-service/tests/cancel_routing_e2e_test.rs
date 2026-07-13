@@ -55,6 +55,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     UpdateForWorker, update_for_worker,
 };
 use nativelink_scheduler::default_scheduler_factory::memory_awaited_action_db_factory;
+use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::simple_scheduler::SimpleScheduler;
 use nativelink_scheduler::worker::Worker;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
@@ -65,7 +66,6 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::instant_wrapper::MockInstantWrapped;
-use nativelink_util::operation_state_manager::ClientStateManager;
 use nativelink_util::platform_properties::PlatformProperties;
 use nativelink_util::store_trait::StoreLike;
 use tokio::sync::{Notify, mpsc};
@@ -146,7 +146,7 @@ async fn stream_drop_routes_kill_to_assigned_worker_via_real_apiworkerscheduler(
         None,
         None,
     );
-    let scheduler_dyn: Arc<dyn ClientStateManager> = scheduler.clone();
+    let scheduler_dyn: Arc<dyn KnownPlatformPropertyProvider> = scheduler.clone();
 
     // ---------------------------------------------------------------
     // 3. Real Worker whose tx is captured by the test. The worker's
@@ -172,7 +172,7 @@ async fn stream_drop_routes_kill_to_assigned_worker_via_real_apiworkerscheduler(
     // ---------------------------------------------------------------
     // 4. Build ExecutionServer over the real scheduler + real cas_store.
     // ---------------------------------------------------------------
-    let mut scheduler_map: HashMap<String, Arc<dyn ClientStateManager>> = HashMap::new();
+    let mut scheduler_map: HashMap<String, Arc<dyn KnownPlatformPropertyProvider>> = HashMap::new();
     scheduler_map.insert("main_scheduler".to_string(), scheduler_dyn);
     let execution_server = ExecutionServer::new(
         &[WithInstanceName {

@@ -48,6 +48,10 @@ impl NoopStore {
 
 #[async_trait]
 impl StoreDriver for NoopStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         _keys: &[StoreKey<'_>],
@@ -64,11 +68,11 @@ impl StoreDriver for NoopStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // We need to drain the reader to avoid the writer complaining that we dropped
         // the connection prematurely.
-        reader.drain().await.err_tip(|| "In NoopStore::update")?;
-        Ok(())
+        let size = reader.drain().await.err_tip(|| "In NoopStore::update")?;
+        Ok(size)
     }
 
     fn optimized_for(&self, optimization: StoreOptimizations) -> bool {

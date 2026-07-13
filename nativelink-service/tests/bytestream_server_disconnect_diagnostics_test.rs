@@ -113,7 +113,7 @@ fn make_bytestream_server(store_manager: &StoreManager) -> Result<ByteStreamServ
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 1024,
             ..Default::default()
         },

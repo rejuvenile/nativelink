@@ -23,16 +23,18 @@ use nativelink_config::schedulers::SimpleSpec;
 use nativelink_config::stores::ClientTlsConfig;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
-use nativelink_proto::com::github::trace_machina::nativelink::events::OriginEvent;
+use nativelink_proto::com::github::trace_machina::nativelink::events::{
+    Event, OriginEvent, RequestEvent, event, request_event,
+};
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::StartExecute;
 use nativelink_util::action_messages::{ActionInfo, ActionState, OperationId, WorkerId};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::instant_wrapper::InstantWrapper;
-use nativelink_util::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_util::operation_state_manager::{
     ActionStateResult, ActionStateResultStream, ClientStateManager, MatchingEngineStateManager,
     OperationFilter, OperationStageFlags, OrderDirection, UpdateOperationType,
 };
-use nativelink_util::origin_event::OriginMetadata;
+use nativelink_util::origin_event::{OriginMetadata, get_node_id};
 use nativelink_util::platform_properties::PlatformProperties;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::spawn;
@@ -45,12 +47,14 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tracing::{debug, error, info, info_span, warn};
+use uuid::Uuid;
 
 use crate::api_worker_scheduler::{
     ApiWorkerScheduler, HOLD_COUNTERS_LOG_INTERVAL_S, compute_dedup_cached_score,
     emit_speculative_hold_counters_log,
 };
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
+use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::simple_scheduler_state_manager::SimpleSchedulerStateManager;
 use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp};
@@ -1590,6 +1594,65 @@ impl core::fmt::Debug for SimpleScheduler {
 }
 
 impl SimpleScheduler {
+    fn origin_event_id(event: &Event) -> String {
+        Uuid::now_v6(&get_node_id(Some(event)))
+            .hyphenated()
+            .to_string()
+    }
+
+    fn scheduler_start_execute_event(
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        action_info: &ActionInfoWithProps,
+    ) -> Event {
+        let start_execute = StartExecute {
+            execute_request: Some(action_info.inner.as_ref().into()),
+            operation_id: operation_id.to_string(),
+            queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
+            platform: Some((&action_info.platform_properties).into()),
+            worker_id: worker_id.to_string(),
+            // merge v1.6.1: our StartExecute proto carries extra fork fields
+            // (resolved_directories, missing_digests, missing_digest_peers, ...);
+            // the scheduler-start-execute telemetry event does not populate them.
+            ..Default::default()
+        };
+        Event {
+            event: Some(event::Event::Request(RequestEvent {
+                event: Some(request_event::Event::SchedulerStartExecute(start_execute)),
+            })),
+        }
+    }
+
+    async fn publish_scheduler_start_execute(
+        maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
+        origin_metadata: &OriginMetadata,
+        event_id: String,
+        event: Event,
+    ) {
+        let Some(origin_event_tx) = maybe_origin_event_tx else {
+            return;
+        };
+
+        let origin_event = OriginEvent {
+            version: 0,
+            event_id,
+            parent_event_id: String::new(),
+            bazel_request_metadata: origin_metadata.bazel_metadata.clone(),
+            identity: origin_metadata.identity.clone(),
+            event: Some(event),
+        };
+
+        // Awaited send (not try_send): backpressure rather than drop, so the
+        // start-execute event that later resource-usage events reference as
+        // their parent isn't silently lost when the queue is full.
+        if let Err(err) = origin_event_tx.send(origin_event).await {
+            warn!(
+                ?err,
+                "Failed to publish scheduler start execute origin event"
+            );
+        }
+    }
+
     /// Attempts to find a worker to execute an action and begins executing it.
     /// If an action is already running that is cacheable it may merge this
     /// action with the results and state changes of the already running
@@ -1687,7 +1750,7 @@ impl SimpleScheduler {
     /// without arranging the hard-to-force backlog-more-than-idle-workers race
     /// (which made the prior emission tests vacuous — testing-czar C1/C2).
     #[must_use]
-    pub fn worker_scheduler_for_test(&self) -> &Arc<crate::api_worker_scheduler::ApiWorkerScheduler> {
+    pub fn worker_scheduler_for_test(&self) -> &Arc<ApiWorkerScheduler> {
         &self.worker_scheduler
     }
 
@@ -1786,6 +1849,7 @@ impl SimpleScheduler {
                 &props_cache,
                 &per_client_matches,
                 max_per_client,
+                self.maybe_origin_event_tx.as_ref(),
                 full_worker_logging,
             )));
         }
@@ -1803,6 +1867,7 @@ impl SimpleScheduler {
                     &props_cache,
                     &per_client_matches,
                     max_per_client,
+                    self.maybe_origin_event_tx.as_ref(),
                     full_worker_logging,
                 )));
             }
@@ -2100,6 +2165,7 @@ impl SimpleScheduler {
         >,
         per_client_matches: &std::sync::Mutex<HashMap<String, usize>>,
         max_per_client: usize,
+        maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
         full_worker_logging: bool,
     ) -> Result<(), Error> {
         let (action_info, maybe_origin_metadata) = action_state_result
@@ -2265,6 +2331,15 @@ impl SimpleScheduler {
         let action_info_with_props = ActionInfoWithProps {
             inner: action_info,
             platform_properties: (*platform_properties).clone(),
+            // merge v1.6.1: populate origin_metadata so the resource-usage origin
+            // event (ApiWorkerScheduler::record_action_resource_usage, which reads
+            // this back from running_action_infos) carries the action's identity.
+            // scheduler_start_execute_event_id stays None on this concurrent-reserve
+            // matching path — the start-execute origin event is not emitted here
+            // (worker_id is only known post-reserve, but the recorded copy would
+            // need the event_id pre-reserve). See deferred_tasks.md.
+            origin_metadata: maybe_origin_metadata.clone().unwrap_or_default(),
+            scheduler_start_execute_event_id: None,
         };
 
         // Extract the operation_id from the action_state BEFORE finding a
@@ -2342,10 +2417,46 @@ impl SimpleScheduler {
                 })
         };
 
-        info_span!("do_try_match")
+        let notify_result = info_span!("do_try_match")
             .in_scope(|| notify_fut)
             .with_context(ctx)
-            .await
+            .await;
+
+        // merge v1.6.1: publish the scheduler start-execute origin event for this
+        // assignment (upstream #2398/#2413) once the worker has been notified, and
+        // stamp its event id back onto the reserved running action so a later
+        // resource-usage origin event links to it as `parent_event_id`. On our
+        // concurrent-reserve matching path the worker_id (hence the event id) is
+        // only known AFTER `find_and_reserve_worker` already recorded the
+        // action_info, so `set_scheduler_start_execute_event_id` performs the
+        // post-reserve linkage that upstream's inline matcher did inline.
+        // Inert when origin events are disabled (production default → `None`).
+        if notify_result.is_ok() {
+            if let Some(origin_event_tx) = maybe_origin_event_tx {
+                let event = Self::scheduler_start_execute_event(
+                    &worker_id,
+                    &operation_id,
+                    &action_info_with_props,
+                );
+                let event_id = Self::origin_event_id(&event);
+                workers
+                    .set_scheduler_start_execute_event_id(
+                        &worker_id,
+                        &operation_id,
+                        event_id.clone(),
+                    )
+                    .await;
+                Self::publish_scheduler_start_execute(
+                    Some(origin_event_tx),
+                    &action_info_with_props.origin_metadata,
+                    event_id,
+                    event,
+                )
+                .await;
+            }
+        }
+
+        notify_result
     }
 }
 
@@ -2511,6 +2622,7 @@ impl SimpleScheduler {
             // default OFF (byte-identical assignment until an operator enables
             // it — the hold has a p99-regression risk Stage A does not).
             spec.enable_speculative_hold,
+            maybe_origin_event_tx.clone(),
         );
 
         // (#specprefetch-rebind Stage C) Wire the SAME `now_fn`-derived clock the
@@ -2915,10 +3027,6 @@ impl ClientStateManager for SimpleScheduler {
         self.worker_scheduler
             .cancel_operation_internal(&target)
             .await
-    }
-
-    fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
-        Some(self)
     }
 }
 

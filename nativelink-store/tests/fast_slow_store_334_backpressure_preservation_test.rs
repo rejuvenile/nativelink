@@ -382,6 +382,9 @@ impl Drop for GatedSlowStore {
 
 #[async_trait]
 impl StoreDriver for GatedSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -395,7 +398,7 @@ impl StoreDriver for GatedSlowStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Drain bytes immediately so the producer doesn't backpressure on
         // the buf_channel (the test wants the spawn-task to be alive +
         // pinning bytes, not stuck on send).
@@ -410,7 +413,7 @@ impl StoreDriver for GatedSlowStore {
                 "GatedSlowStore: fail_after_release was set"
             ));
         }
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(
@@ -486,6 +489,7 @@ fn make_fast_slow_with_gated_slow(
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: cap_bytes,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast.clone(),
         slow.clone(),
@@ -659,6 +663,7 @@ async fn fix_a_and_b_compose_to_typed_signal_only() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: cap_bytes,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast.clone(),
         slow.clone(),
@@ -740,6 +745,9 @@ struct BareResourceExhaustedFastStore {}
 
 #[async_trait]
 impl StoreDriver for BareResourceExhaustedFastStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -753,7 +761,7 @@ impl StoreDriver for BareResourceExhaustedFastStore {
         _key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Drain so the producer doesn't deadlock on send before we
         // return our error.
         let _ = reader.drain().await;
@@ -848,6 +856,7 @@ async fn fix_a_does_not_over_match_bare_resource_exhausted() -> Result<(), Error
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,
@@ -946,6 +955,7 @@ async fn fix_b_counter_decrements_on_slow_write_failure() -> Result<(), Error> {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: cap_bytes,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast,
         slow,

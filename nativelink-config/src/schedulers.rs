@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::serde_utils::{
     convert_duration_with_shellexpand, convert_duration_with_shellexpand_and_negative,
-    convert_numeric_with_shellexpand,
+    convert_numeric_with_shellexpand, convert_string_with_shellexpand,
 };
 use crate::stores::{GrpcEndpoint, Retry, StoreRefName};
 
@@ -32,6 +32,7 @@ pub enum SchedulerSpec {
     Grpc(GrpcSpec),
     CacheLookup(CacheLookupSpec),
     PropertyModifier(PropertyModifierSpec),
+    HistoricalResource(HistoricalResourceSpec),
 }
 
 /// When the scheduler matches tasks to workers that are capable of running
@@ -113,21 +114,21 @@ pub struct SimpleSpec {
     /// config.
     pub supported_platform_properties: Option<HashMap<String, PropertyType>>,
 
-    /// The amount of time to retain completed actions in memory for in case
+    /// The amount of time to retain completed actions for in case
     /// a `WaitExecution` is called after the action has completed.
-    /// Default: 60 (seconds)
+    /// Default: 60 seconds
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub retain_completed_for_s: u32,
 
     /// Mark operations as completed with error if no client has updated them
     /// within this duration.
-    /// Default: 60 (seconds)
+    /// Default: 60 seconds
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub client_action_timeout_s: u64,
 
     /// Remove workers from pool once the worker has not responded in this
     /// amount of time in seconds.
-    /// Default: 5 (seconds)
+    /// Default: 5 seconds
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub worker_timeout_s: u64,
 
@@ -580,11 +581,13 @@ pub struct GrpcSpec {
     /// Limit the number of simultaneous upstream requests to this many.  A
     /// value of zero is treated as unlimited.  If the limit is reached the
     /// request is queued.
+    /// Default: unlimited
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_concurrent_requests: usize,
 
     /// The number of connections to make to each specified endpoint to balance
-    /// the load over multiple TCP connections.  Default 1.
+    /// the load over multiple TCP connections.
+    /// Default: 1.
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub connections_per_endpoint: usize,
 }
@@ -652,5 +655,65 @@ pub struct PropertyModifierSpec {
     pub modifications: Vec<PropertyModification>,
 
     /// The nested scheduler to use after modifying the properties.
+    pub scheduler: Box<SchedulerSpec>,
+}
+
+const fn default_historical_resource_refresh_interval_s() -> u64 {
+    30
+}
+
+fn default_historical_resource_cpu_property_name() -> String {
+    "cpu_count".to_string()
+}
+
+fn default_historical_resource_memory_property_name() -> String {
+    "memory_kb".to_string()
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct HistoricalResourceSpec {
+    /// JSON file containing historical resource hints keyed by Bazel
+    /// `RequestMetadata` `target_id` and/or `action_mnemonic`.
+    ///
+    /// Supported file shapes:
+    /// ```json
+    /// [
+    ///   { "target_id": "//pkg:test", "action_mnemonic": "TestRunner", "cpu_count": 2, "memory_kb": 12582912 }
+    /// ]
+    /// ```
+    /// or:
+    /// ```json
+    /// { "hints": [ ... ] }
+    /// ```
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub hints_file: String,
+
+    /// Reload interval for `hints_file`. Set to 0 to load once.
+    /// Default: 30 seconds
+    #[serde(
+        default = "default_historical_resource_refresh_interval_s",
+        deserialize_with = "convert_duration_with_shellexpand"
+    )]
+    pub refresh_interval_s: u64,
+
+    /// Platform property name used for CPU minimums.
+    /// Default: `cpu_count`
+    #[serde(
+        default = "default_historical_resource_cpu_property_name",
+        deserialize_with = "convert_string_with_shellexpand"
+    )]
+    pub cpu_property_name: String,
+
+    /// Platform property name used for memory minimums, expressed in KiB.
+    /// Default: `memory_kb`
+    #[serde(
+        default = "default_historical_resource_memory_property_name",
+        deserialize_with = "convert_string_with_shellexpand"
+    )]
+    pub memory_property_name: String,
+
+    /// The nested scheduler to use after applying resource hints.
     pub scheduler: Box<SchedulerSpec>,
 }

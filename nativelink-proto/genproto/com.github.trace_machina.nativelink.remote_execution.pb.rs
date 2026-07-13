@@ -298,11 +298,18 @@ pub struct BlobsAvailableNotification {
     #[prost(message, repeated, tag = "17")]
     pub pinned_ac_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
     /// / (FL-681 re-saturation gate) True when the worker's local CAS
-    /// / FilesystemStore indefinite-pin cap is saturated
-    /// / (`indefinite_pinned_bytes >= indefinite_pin_cap`) — i.e. its
-    /// / pending-BIS durability backlog has filled the cap and a new F2
-    /// / action's output would be refused by the worker-side admission
-    /// / gate (`running_actions_manager.rs` `create_and_add_action`).
+    /// / FilesystemStore total pin budget is (nearly) saturated —
+    /// / specifically `real_pinned >= pin_cap - pin_cap/20` (within 5% of
+    /// / `pin_cap`), where `real_pinned = pinned_bytes - speculative_pinned_bytes`.
+    /// / This is the SAME quantity and ceiling the total pin refusal measures
+    /// / against, so the flag predicts that a new F2 action's output would be
+    /// / refused by the worker-side admission gate
+    /// / (`running_actions_manager.rs` `create_and_add_action`).
+    /// / NOTE: post-FL-681-NAK-fix `pending_bis_pin_max_bytes` (the indefinite-pin
+    /// / cap) NO LONGER influences this flag — the gate changed both the numerator
+    /// / (indefinite -> real pinned) and the cap (indefinite_pin_cap -> pin_cap),
+    /// / because a refused pin adds no bytes so the old `indefinite_pinned_bytes >=
+    /// / indefinite_pin_cap` never tripped with variable-sized outputs.
     /// /
     /// / The scheduler stores this on the `Worker` and SKIPS the worker in
     /// / `inner_find_and_reserve_worker` while true, so a saturated-but-idle
@@ -908,6 +915,9 @@ pub struct ExecuteResult {
     /// / The operation ID that was executed.
     #[prost(string, tag = "2")]
     pub operation_id: ::prost::alloc::string::String,
+    /// / Worker-observed resource usage for this action execution.
+    #[prost(message, optional, tag = "5")]
+    pub resource_usage: ::core::option::Option<ActionResourceUsage>,
     /// / The actual response data.
     #[prost(oneof = "execute_result::Result", tags = "3, 4")]
     pub result: ::core::option::Option<execute_result::Result>,
@@ -948,6 +958,22 @@ pub struct ExecuteComplete {
     /// / 0 means unknown. 100 when no E-cores exist (P-core-only CPU).
     #[prost(uint32, tag = "4")]
     pub e_core_load_pct: u32,
+}
+/// / Resource usage observed by the worker while running one action.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ActionResourceUsage {
+    /// / Peak resident memory observed for the action process tree.
+    #[prost(uint64, tag = "1")]
+    pub peak_memory_kb: u64,
+    /// / Whether this value came from worker-side sampling.
+    #[prost(bool, tag = "2")]
+    pub sampled: bool,
+    /// / The operation ID that was sampled.
+    #[prost(string, tag = "3")]
+    pub operation_id: ::prost::alloc::string::String,
+    /// / The worker ID that observed the resource usage.
+    #[prost(string, tag = "4")]
+    pub worker_id: ::prost::alloc::string::String,
 }
 /// / Result sent back from the server when a node connects.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

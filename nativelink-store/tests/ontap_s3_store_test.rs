@@ -16,7 +16,7 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use aws_sdk_s3::config::{BehaviorVersion, Builder, Region};
-use aws_smithy_runtime::client::http::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::join;
@@ -51,7 +51,7 @@ async fn simple_has_object_not_found() -> Result<(), Error> {
             .unwrap(),
     )]);
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -111,7 +111,7 @@ async fn simple_has_retries() -> Result<(), Error> {
         ),
     ]);
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -168,7 +168,7 @@ async fn has_with_expired_result() -> Result<(), Error> {
         ),
     ]);
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -192,7 +192,7 @@ async fn has_with_expired_result() -> Result<(), Error> {
     // Time starts at 1970-01-01 00:00:00.
     let digest = DigestInfo::try_new(VALID_HASH1, CAS_ENTRY_SIZE).unwrap();
     {
-        MockClock::advance(Duration::from_secs(24 * 60 * 60)); // 1 day.
+        MockClock::advance(Duration::from_hours(24)); // 1 day.
         // Date is now 1970-01-02 00:00:00.
         let mut results = vec![None];
         store
@@ -202,7 +202,7 @@ async fn has_with_expired_result() -> Result<(), Error> {
         assert_eq!(results, vec![Some(512)]);
     }
     {
-        MockClock::advance(Duration::from_secs(24 * 60 * 60)); // 1 day.
+        MockClock::advance(Duration::from_hours(24)); // 1 day.
         // Date is now 1970-01-03 00:00:00.
         let mut results = vec![None];
         store
@@ -228,18 +228,17 @@ async fn simple_update_ac() -> Result<(), Error> {
     }
     let send_data = send_data.freeze();
 
-    let (mock_client, request_receiver) =
-        aws_smithy_runtime::client::http::test_util::capture_request(Some(
-            aws_smithy_runtime_api::http::Response::new(
-                StatusCode::OK.into(),
-                SdkBody::empty(), // This is an upload, so server does not send a body.
-            )
-            .try_into_http02x()
-            .unwrap(),
-        ));
+    let (mock_client, request_receiver) = aws_smithy_http_client::test_util::capture_request(Some(
+        aws_smithy_runtime_api::http::Response::new(
+            StatusCode::OK.into(),
+            SdkBody::empty(), // This is an upload, so server does not send a body.
+        )
+        .try_into_http1x()
+        .unwrap(),
+    ));
 
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -352,7 +351,7 @@ async fn simple_get_ac() -> Result<(), Error> {
     )]);
 
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -409,7 +408,7 @@ async fn smoke_test_get_part() -> Result<(), Error> {
     );
 
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client.clone())
         .build();
@@ -445,7 +444,7 @@ async fn get_part_is_zero_digest() -> Result<(), Error> {
     let digest = DigestInfo::new(Sha256::new().finalize().into(), 0);
     let mock_client = StaticReplayClient::new(vec![]);
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -504,7 +503,7 @@ async fn ensure_empty_string_in_stream_works_test() -> Result<(), Error> {
         ]
     );
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client.clone())
         .build();
@@ -555,7 +554,7 @@ async fn has_with_results_on_zero_digests() -> Result<(), Error> {
 
     let mock_client = StaticReplayClient::new(vec![]);
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client)
         .build();
@@ -709,7 +708,7 @@ async fn multipart_update_large_cas() -> Result<(), Error> {
     );
 
     let test_config = Builder::new()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::from_static(VSERVER_NAME))
         .http_client(mock_client.clone())
         .build();

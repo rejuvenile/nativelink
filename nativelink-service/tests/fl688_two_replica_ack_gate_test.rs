@@ -117,6 +117,7 @@ fn make_manager_fast_slow(slow: Store) -> (Arc<StoreManager>, Arc<WorkerProxySto
     let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = Store::new(FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -134,6 +135,7 @@ fn make_cas_server(manager: &StoreManager) -> Result<Arc<CasServer>, Error> {
     let config = vec![WithInstanceName {
         instance_name: INSTANCE_NAME.to_string(),
         config: CasStoreConfig {
+            experimental_chunking: None,
             cas_store: CAS_STORE_NAME.to_string(),
         },
     }];
@@ -145,7 +147,7 @@ fn make_bytestream_server(manager: &StoreManager) -> Result<Arc<ByteStreamServer
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: CAS_STORE_NAME.to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 256 * 1024,
             ..Default::default()
         },
@@ -236,6 +238,10 @@ struct AlwaysFailPeer {
 
 #[async_trait]
 impl StoreDriver for AlwaysFailPeer {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: core::pin::Pin<&Self>,
         _keys: &[StoreKey<'_>],
@@ -248,7 +254,7 @@ impl StoreDriver for AlwaysFailPeer {
         _key: StoreKey<'_>,
         mut rx: DropCloserReadHalf,
         _size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let _drain_result = rx.drain().await;
         Err(make_err!(Code::Internal, "AlwaysFailPeer: simulated worker mirror failure"))
     }
@@ -315,6 +321,10 @@ struct DelayedSlowStore {
 
 #[async_trait]
 impl StoreDriver for DelayedSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: core::pin::Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -327,7 +337,7 @@ impl StoreDriver for DelayedSlowStore {
         key: StoreKey<'_>,
         rx: DropCloserReadHalf,
         size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         tokio::time::sleep(self.delay).await;
         self.backing.as_store_driver_pin().update(key, rx, size).await
     }
@@ -433,6 +443,10 @@ impl GatedMirrorStore {
 
 #[async_trait]
 impl StoreDriver for GatedMirrorStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn has_with_results(
         self: core::pin::Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -445,7 +459,7 @@ impl StoreDriver for GatedMirrorStore {
         key: StoreKey<'_>,
         rx: DropCloserReadHalf,
         size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Signal gate-reached (latching) BEFORE blocking, so the test's
         // `wait_for(entered)` resolves even if it registers after this line.
         let _ = self.entered_tx.send_replace(true);

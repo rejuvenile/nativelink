@@ -1091,6 +1091,7 @@ async fn update_with_zero_digest() -> Result<(), Error> {
         store
             .update(digest, reader, UploadSizeInfo::ExactSize(0))
             .await
+            .map(|_| ())
     })
     .await
 }

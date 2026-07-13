@@ -58,6 +58,7 @@ async fn fast_slow_store_new_honors_chunked_reads_enabled_true() -> Result<(), E
         slow_direction: StoreDirection::default(),
         chunked_reads_enabled: true,
         slow_writes_in_flight_max_bytes: 0,
+        bypass_dedup_threshold_bytes: 0,
     };
     let fss = FastSlowStore::new(&spec, fast, slow);
     assert!(
@@ -79,6 +80,7 @@ async fn fast_slow_store_new_honors_chunked_reads_enabled_false() -> Result<(), 
         slow_direction: StoreDirection::default(),
         chunked_reads_enabled: false,
         slow_writes_in_flight_max_bytes: 0,
+        bypass_dedup_threshold_bytes: 0,
     };
     let fss = FastSlowStore::new(&spec, fast, slow);
     assert!(

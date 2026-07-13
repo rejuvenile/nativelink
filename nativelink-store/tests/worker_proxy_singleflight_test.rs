@@ -933,6 +933,9 @@ mod wps_wireup {
 
     #[async_trait]
     impl StoreDriver for CountingPeerStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -946,7 +949,7 @@ mod wps_wireup {
             key: StoreKey<'_>,
             reader: DropCloserReadHalf,
             upload_size: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             self.inner.update(key, reader, upload_size).await
         }
 
@@ -1431,6 +1434,9 @@ mod wps_wireup {
 
     #[async_trait]
     impl StoreDriver for SlowUpdateInnerStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             digests: &[StoreKey<'_>],
@@ -1444,7 +1450,7 @@ mod wps_wireup {
             key: StoreKey<'_>,
             reader: DropCloserReadHalf,
             upload_size: UploadSizeInfo,
-        ) -> Result<(), Error> {
+        ) -> Result<u64, Error> {
             self.update_calls.fetch_add(1, AOrdering::SeqCst);
             // Delay BEFORE the actual write so by the time the cache
             // task lands the bytes, waiters have already raced past

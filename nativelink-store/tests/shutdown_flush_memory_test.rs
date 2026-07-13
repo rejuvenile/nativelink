@@ -106,6 +106,7 @@ fn build_fast_slow_with_slow_probe(slow: Store) -> (Arc<FastSlowStore>, Store) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast.clone(),
         slow.clone(),
@@ -216,6 +217,7 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         upper_fast.clone(),
         upper_slow.clone(),
@@ -231,6 +233,7 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         lower_fast.clone(),
         lower_slow.clone(),
@@ -503,6 +506,9 @@ default_health_status_indicator!(SlowSlowProbe);
 
 #[async_trait]
 impl StoreDriver for SlowSlowProbe {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -516,7 +522,7 @@ impl StoreDriver for SlowSlowProbe {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         tokio::time::sleep(self.per_update_delay).await;
         self.update_count.fetch_add(1, Ordering::SeqCst);
         self.inner.update(key, reader, upload_size).await
@@ -647,6 +653,9 @@ default_health_status_indicator!(EveryOtherFailsProbe);
 
 #[async_trait]
 impl StoreDriver for EveryOtherFailsProbe {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -660,7 +669,7 @@ impl StoreDriver for EveryOtherFailsProbe {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         if n % 2 == 0 {
             return Err(make_err!(
@@ -789,6 +798,7 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
             // 0 = uncapped (test default); MemoryStore slow tier is
             // exempt from Path C's required-cap check.
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         upper_fast.clone(),
         upper_slow.clone(),
@@ -811,6 +821,7 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
             // 0 = uncapped (test default); MemoryStore slow tier is
             // exempt from Path C's required-cap check.
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         lower_fast,
         lower_slow,
@@ -1058,6 +1069,9 @@ default_health_status_indicator!(BlockingUpdateProbe);
 
 #[async_trait]
 impl StoreDriver for BlockingUpdateProbe {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -1071,7 +1085,7 @@ impl StoreDriver for BlockingUpdateProbe {
         _key: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         // Announce entry, then park until the test releases us. We do NOT
         // consume the reader or write to `inner`: the test only needs the
         // digest to stay registered in `in_flight_slow_writes` (which the FSS
@@ -1079,7 +1093,7 @@ impl StoreDriver for BlockingUpdateProbe {
         // flush itself lands the bytes via `update_oneshot`.
         self.update_entered.notify_waiters();
         self.release.notified().await;
-        Ok(())
+        Ok(0)
     }
 
     async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {

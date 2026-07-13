@@ -397,6 +397,23 @@ impl From<prost::DecodeError> for Error {
     }
 }
 
+// Re-added on the v1.6.1 merge: upstream code merged into this fork
+// (`origin_event::request_metadata_from_baggage` base64-decodes, and
+// `running_actions_manager` `CString::new(...).err_tip()?` on `NulError`)
+// relies on these additive conversions. They are orthogonal to this fork's
+// `details`-based error model, so keeping them costs nothing.
+impl From<base64::DecodeError> for Error {
+    fn from(err: base64::DecodeError) -> Self {
+        Self::from_std_err(Code::Internal, &err)
+    }
+}
+
+impl From<std::ffi::NulError> for Error {
+    fn from(err: std::ffi::NulError) -> Self {
+        Self::from_std_err(Code::Internal, &err)
+    }
+}
+
 impl From<prost::EncodeError> for Error {
     fn from(err: prost::EncodeError) -> Self {
         Self::from_std_err(Code::Internal, &err)

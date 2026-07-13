@@ -88,7 +88,7 @@ fn make_verify_backed_server() -> ByteStreamServer {
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             // Large enough that no per-stream cap interferes with the
             // small-blob payloads (max 16 KiB here).
             max_bytes_per_stream: 64 * 1024 * 1024,
@@ -476,6 +476,7 @@ fn make_production_chain_server() -> ByteStreamServer {
     let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = Store::new(FastSlowStore::new(
         &FastSlowSpec {
+            bypass_dedup_threshold_bytes: 0,
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
@@ -520,7 +521,7 @@ fn make_production_chain_server() -> ByteStreamServer {
         instance_name: INSTANCE_NAME.to_string(),
         config: ByteStreamConfig {
             cas_store: "main_cas".to_string(),
-            persist_stream_on_disconnect_timeout: 0,
+            persist_stream_on_disconnect_timeout_s: 0,
             max_bytes_per_stream: 64 * 1024 * 1024,
             ..Default::default()
         },

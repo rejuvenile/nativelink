@@ -80,17 +80,22 @@ pub fn nativelink_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #crate_ident::common::reseed_rng_for_test().unwrap();
                     let res = #fn_block;
                     logs_assert(|lines: &[&str]| {
-                        // Catch unredacted Bytes payloads emitted by OUR
-                        // tracing calls. Our structured-field convention is
-                        // `data=b"..."` (the Debug formatter for Bytes
-                        // produces `b"..."`). Free-form messages from
-                        // third-party crates (e.g. aws-runtime's
-                        // `tracing::trace!("remaining chunk data: {:#?}",
-                        // chunk)`) emit `data: b"..."` with a colon, NOT
-                        // `data=b"..."` — those are out-of-scope and would
-                        // trigger an unfixable false positive here.
+                        // Catch unredacted Bytes payloads in captured logs. Two
+                        // render formats can leak them, so check BOTH: our
+                        // structured-field convention emits `data=b"..."` (the
+                        // Debug formatter for Bytes produces `b"..."`), while the
+                        // debug-struct format emits `data: b"..."` with a colon.
+                        // Free-form third-party traces (e.g. aws-runtime's
+                        // `tracing::trace!("remaining chunk data: {:#?}", chunk)`)
+                        // emit the colon form as a false positive, so exclude that
+                        // module path from the colon-form check only.
                         for line in lines {
-                            if line.contains(" data=b\"") {
+                            if line.contains(" data=b\"")
+                                || (line.contains(" data: b")
+                                    && !line.contains(
+                                        "aws_runtime::content_encoding::body::http_body_1_x",
+                                    ))
+                            {
                                 return Err(format!("Non-redacted data in \"{line}\""));
                             }
                         }

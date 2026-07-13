@@ -115,6 +115,7 @@ fn make_fast_slow_arc() -> (Arc<FastSlowStore>, Store, Store) {
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -427,6 +428,7 @@ async fn d1_verify_store_around_fast_slow_survives_fallback_with_correct_hash() 
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),
@@ -600,6 +602,9 @@ default_health_status_indicator!(GatedSlowStore);
 
 #[async_trait]
 impl StoreDriver for GatedSlowStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -615,7 +620,7 @@ impl StoreDriver for GatedSlowStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Pin::new(&*self.inner)
             .update(key, reader, upload_size)
             .await
@@ -721,6 +726,7 @@ async fn d1_waiter_path_falls_back_on_sliding_window_eviction() -> Result<(), Er
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store.clone(),
         slow_store.clone(),

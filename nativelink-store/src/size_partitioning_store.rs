@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::try_join;
 use nativelink_config::stores::SizePartitioningSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
@@ -84,6 +85,14 @@ impl SizePartitioningStore {
 
 #[async_trait]
 impl StoreDriver for SizePartitioningStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        try_join!(
+            self.upper_store.clone().into_inner().post_init(),
+            self.lower_store.clone().into_inner().post_init(),
+        )?;
+        Ok(())
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],
@@ -191,7 +200,7 @@ impl StoreDriver for SizePartitioningStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let digest = match key {
             StoreKey::Digest(digest) => digest,
             other @ StoreKey::Str(_) => {

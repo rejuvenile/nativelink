@@ -146,6 +146,9 @@ struct FileUpdateStore {
 
 #[async_trait]
 impl StoreDriver for FileUpdateStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -161,7 +164,7 @@ impl StoreDriver for FileUpdateStore {
         digest: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Pin::new(self.inner.as_ref())
             .update(digest, reader, size_info)
             .await
@@ -258,6 +261,9 @@ impl DropImmediatelyOkStore {
 
 #[async_trait]
 impl StoreDriver for DropImmediatelyOkStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -271,13 +277,13 @@ impl StoreDriver for DropImmediatelyOkStore {
         _digest: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Drop `_reader` immediately (rx dropped here) and return Ok.
         // This simulates GrpcStore receiving AlreadyExists from the server
         // and returning Ok without draining the stream, which leaves the
         // producer's in-flight tx.send to return "receiver disconnected".
-        Ok(())
+        Ok(0)
     }
 
     async fn get_part(
@@ -349,6 +355,9 @@ impl DropImmediatelyErrStore {
 
 #[async_trait]
 impl StoreDriver for DropImmediatelyErrStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -362,7 +371,7 @@ impl StoreDriver for DropImmediatelyErrStore {
         _digest: StoreKey<'_>,
         _reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Drop `_reader` immediately (rx dropped) and return Err.
         // With a 256-chunk feeder, the producer also errors — dual-err.
@@ -438,6 +447,7 @@ where
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,

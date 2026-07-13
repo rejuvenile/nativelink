@@ -100,8 +100,8 @@ where
                     config: ByteStreamConfig {
                         cas_store: cas_store.clone(),
                         max_bytes_per_stream: old_config.max_bytes_per_stream,
-                        persist_stream_on_disconnect_timeout: old_config
-                            .persist_stream_on_disconnect_timeout,
+                        persist_stream_on_disconnect_timeout_s: old_config
+                            .persist_stream_on_disconnect_timeout_s,
                         streaming_read_while_write: old_config.streaming_read_while_write,
                         max_streaming_blob_buffer_bytes: old_config.max_streaming_blob_buffer_bytes,
                         ..Default::default()

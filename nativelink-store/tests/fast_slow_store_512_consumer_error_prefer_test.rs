@@ -172,6 +172,9 @@ impl AbortAfterOneChunkStore {
 
 #[async_trait]
 impl StoreDriver for AbortAfterOneChunkStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -191,7 +194,7 @@ impl StoreDriver for AbortAfterOneChunkStore {
         _digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Consume one chunk so the producer's chunk loop has fully
         // started (and the producer has filled the channel + is blocked
@@ -270,6 +273,7 @@ fn build_fast_slow(abort_slow: Arc<AbortAfterOneChunkStore>) -> (Store, Arc<Fast
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,

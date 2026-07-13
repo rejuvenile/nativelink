@@ -177,6 +177,9 @@ struct FileUpdateStore {
 
 #[async_trait]
 impl StoreDriver for FileUpdateStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -192,7 +195,7 @@ impl StoreDriver for FileUpdateStore {
         digest: StoreKey<'_>,
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Pin::new(self.inner.as_ref())
             .update(digest, reader, size_info)
             .await
@@ -292,6 +295,9 @@ impl AbortAfterOneChunkStore {
 
 #[async_trait]
 impl StoreDriver for AbortAfterOneChunkStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -305,7 +311,7 @@ impl StoreDriver for AbortAfterOneChunkStore {
         _digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Consume one chunk so the producer is fully engaged before
         // we drop. With a 256-chunk feeder vs a 128-slot buf_channel,
@@ -393,6 +399,9 @@ impl PropagateRecvErrorStore {
 
 #[async_trait]
 impl StoreDriver for PropagateRecvErrorStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -406,12 +415,12 @@ impl StoreDriver for PropagateRecvErrorStore {
         _digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Loop until we see EOF (clean) or an error.
         loop {
             match reader.recv().await {
-                Ok(chunk) if chunk.is_empty() => return Ok(()),
+                Ok(chunk) if chunk.is_empty() => return Ok(0),
                 Ok(_) => continue,
                 Err(e) => {
                     // Record the error string for diagnostic-time
@@ -506,6 +515,9 @@ impl AcceptAllThenAbortOnEofStore {
 
 #[async_trait]
 impl StoreDriver for AcceptAllThenAbortOnEofStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         _digests: &[StoreKey<'_>],
@@ -519,7 +531,7 @@ impl StoreDriver for AcceptAllThenAbortOnEofStore {
         _digest: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
         _size_info: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
         // Drain every chunk; EOF is signalled by `Ok(empty)` from
         // recv (see `buf_channel.rs:607,632`). Any propagated err
@@ -619,6 +631,7 @@ where
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
         },
         fast_store,
         slow_store,

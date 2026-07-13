@@ -592,6 +592,9 @@ mod unterminating_store {
 
     #[async_trait]
     impl StoreDriver for UnterminatingStore {
+        async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+            Ok(())
+        }
         async fn has_with_results(
             self: Pin<&Self>,
             _keys: &[StoreKey<'_>],
@@ -608,8 +611,8 @@ mod unterminating_store {
             _key: StoreKey<'_>,
             _reader: DropCloserReadHalf,
             _size_info: UploadSizeInfo,
-        ) -> Result<(), Error> {
-            Ok(())
+        ) -> Result<u64, Error> {
+            Ok(0)
         }
 
         /// CONTRACT VIOLATION (intentional): returns Err WITHOUT calling

@@ -100,6 +100,9 @@ default_health_status_indicator!(ErrCodeOnGetStore);
 
 #[async_trait]
 impl StoreDriver for ErrCodeOnGetStore {
+    async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+        Ok(())
+    }
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -124,7 +127,7 @@ impl StoreDriver for ErrCodeOnGetStore {
         key: StoreKey<'_>,
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.inner.update(key, reader, upload_size).await
     }
 
