@@ -498,8 +498,6 @@ async fn worker_cas_listener_recursion_defense_test() {
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
-        headers: Default::default(),
-        forward_headers: Vec::new(),
     })
     .await
     .expect("loopback GrpcStore");

@@ -5446,6 +5446,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // count as an attempt (simple_scheduler_state_manager.rs:817).
                                             // Code::Unavailable WOULD burn the retry budget.
                                             result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker startup reconcile in progress").into())),
+                                            // resource_usage is intentionally None at every
+                                            // ExecuteResult site: worker-side resource
+                                            // telemetry was declined in the v1.6.1 merge. When
+                                            // origin events are enabled they yield start-execute
+                                            // events but never resource-usage events (no producer
+                                            // populates this field on this fork's worker path).
                                             resource_usage: None,
                                         }
                                     ).await?;

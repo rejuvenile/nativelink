@@ -1113,8 +1113,19 @@ async fn get_file_entry_for_zero_digest() -> Result<(), Error> {
     )
     .await?;
 
-    let file_entry = store.get_file_entry_for_digest(&digest).await?;
-    assert!(file_entry.is_empty());
+    // #2346: a zero-digest has no backing FileEntry, so the singular accessor
+    // returns NotFound (matching `get_file_entries_batch`, which returns None)
+    // instead of a synthetic entry pointing at a nonexistent path. Every caller
+    // special-cases zero digests before calling.
+    let err = store
+        .get_file_entry_for_digest(&digest)
+        .await
+        .expect_err("zero-digest must not return a synthetic file entry");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "zero-digest file entry lookup must surface NotFound"
+    );
     Ok(())
 }
 
@@ -2801,6 +2812,58 @@ async fn speculative_pins_never_refuse_a_real_pin() -> Result<(), Error> {
         "composite invariant violated (2026-07-05): real-only pinned total is 9900 ≤ \
          10_000 pin_cap; only the shared-budget bug (adding 2000 speculative bytes → \
          11_900 > 10_000) can refuse this second real pin"
+    );
+
+    Ok(())
+}
+
+/// #2424 (ported): `rename` ENOENT is ambiguous — a missing temp directory must
+/// not be mistaken for a vanished source. With the content file still present,
+/// `unref` must warn ("Failed to rename file") and leave the content file intact
+/// rather than take the benign vanished-source path (which would flip the entry
+/// to `Temp` and orphan the content file on disk). Guards the `source_gone`
+/// `fs::metadata` disambiguation at `filesystem_store.rs` unref.
+#[nativelink_test]
+async fn unref_does_not_orphan_content_file_when_temp_dir_missing() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+    let store = Box::pin(
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: None,
+            ..Default::default()
+        })
+        .await?,
+    );
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let file_entry = store.get_file_entry_for_digest(&digest).await?;
+
+    // Remove the temp dir so `unref`'s rename destination parent is gone
+    // (ENOENT) while the source content file is perfectly intact. Removing the
+    // whole DIGEST_FOLDER (with its shard subdirs) guarantees the rename
+    // destination's parent shard directory is missing.
+    fs::remove_dir_all(format!("{temp_path}/{DIGEST_FOLDER}")).await?;
+
+    file_entry.unref().await;
+
+    assert!(
+        logs_contain("Failed to rename file"),
+        "missing temp dir (source present) must warn, not be treated as benign"
+    );
+    assert!(
+        !logs_contain("treating as benign"),
+        "an intact content file must not take the benign vanished-source path"
+    );
+
+    // The content file must still exist — not orphaned by a wrong Temp flip.
+    let content_file = digest_content_path(&content_path, &digest);
+    let data = read_file_contents(&content_file).await?;
+    assert_eq!(
+        &data[..],
+        VALUE1.as_bytes(),
+        "content file must remain intact after a failed unref rename"
     );
 
     Ok(())

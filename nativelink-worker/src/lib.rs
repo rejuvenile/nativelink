@@ -14,6 +14,12 @@
 
 pub mod directory_cache;
 pub mod local_worker;
+// The following three modules are upstream worker subsystems that this fork
+// keeps declared but INTENTIONALLY UNWIRED: nothing outside these files (and
+// this lib) references them. They are retained inert to minimize future-merge
+// divergence against upstream and are not part of our macOS worker execution
+// path. `namespace_utils` is Linux-only sandboxing; `persistent_worker` is the
+// Bazel persistent-worker protocol; `qos` is CPU/IO QoS scheduling.
 #[cfg(target_os = "linux")]
 pub mod namespace_utils;
 pub mod persistent_worker;

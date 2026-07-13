@@ -274,12 +274,7 @@ impl AcProxyStore {
             connection_acquire_timeout_ms: Some(3000),
             chunked_writes_enabled: false,
             chunked_v2_writes_enabled: false,
-            // Upstream #2288 header-forwarding (not consumed by this fork's
-            // GrpcStore; internal peer connections forward routing headers via
-            // per-call metadata injection instead). Defaults are no-op.
             use_legacy_resource_names: false,
-            headers: Default::default(),
-            forward_headers: Vec::new(),
         };
         let store = GrpcStore::new(&spec)
             .await

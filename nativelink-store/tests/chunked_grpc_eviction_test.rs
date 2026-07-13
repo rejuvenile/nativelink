@@ -168,8 +168,6 @@ async fn chunked_path_evicts_pool_on_transport_err() -> Result<(), Error> {
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
-        headers: Default::default(),
-        forward_headers: Vec::new(),
     };
     let store = GrpcStore::new(&spec).await?;
     store.enable_chunked_writes();

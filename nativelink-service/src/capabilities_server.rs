@@ -27,13 +27,13 @@ use nativelink_proto::build::bazel::remote::execution::v2::priority_capabilities
 use nativelink_proto::build::bazel::remote::execution::v2::symlink_absolute_path_strategy::Value as SymlinkAbsolutePathStrategy;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionCacheUpdateCapabilities, CacheCapabilities, ExecutionCapabilities, FastCdc2020Params,
-    GetCapabilitiesRequest, PriorityCapabilities, ServerCapabilities, compressor,
+    GetCapabilitiesRequest, PriorityCapabilities, ServerCapabilities,
 };
 use nativelink_proto::build::bazel::semver::SemVer;
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_util::digest_hasher::default_digest_hasher_func;
 use tonic::{Request, Response, Status};
-use tracing::{Level, instrument};
+use tracing::{Level, instrument, warn};
 
 use crate::wire_compression::RemoteCacheCompressionInstances;
 
@@ -152,14 +152,25 @@ impl Capabilities for CapabilitiesServer {
                 ],
             });
 
-        let supported_compressors = if self
+        // Compression advertisement is forced OFF post-merge: the zstd
+        // batch/stream compressor handlers are not wired (#2527 wire-compression
+        // kept but gated pending a real handler pass), so advertising
+        // `supported_compressors` off the config knob would be a half-wire.
+        // The `remote_cache_compression_instances` gate is still honored: if an
+        // operator enabled it we surface a warning, but the advertised list MUST
+        // stay empty until handlers land.
+        if self
             .remote_cache_compression_instances
             .enabled_for(&instance_name)
         {
-            vec![compressor::Value::Zstd.into()]
-        } else {
-            Vec::new()
-        };
+            warn!(
+                %instance_name,
+                "remote_cache_compression is enabled in config but compressor \
+                 handlers are not wired post-merge; advertising no supported \
+                 compressors"
+            );
+        }
+        let supported_compressors: Vec<i32> = Vec::new();
 
         let chunking_params = self.chunking_params_for_instance.get(&instance_name);
         let resp = ServerCapabilities {
@@ -177,8 +188,14 @@ impl Capabilities for CapabilitiesServer {
                 supported_compressors: supported_compressors.clone(),
                 supported_batch_update_compressors: supported_compressors,
                 max_cas_blob_size_bytes: 0,
-                split_blob_support: chunking_params.is_some(),
-                splice_blob_support: chunking_params.is_some(),
+                // Hardcoded false until the #2497 SplitBlob/SpliceBlob handler
+                // pass lands: the cas_server SplitBlob/SpliceBlob handlers return
+                // `Status::unimplemented`, so advertising support off the
+                // `experimental_chunking` config knob would be a half-wire. The
+                // `chunking_params` computation is left intact (harmless) so the
+                // advertisement can be flipped back on with the handlers.
+                split_blob_support: false,
+                splice_blob_support: false,
                 fast_cdc_2020_params: chunking_params.copied(),
                 rep_max_cdc_params: None,
             }),

@@ -296,8 +296,6 @@ async fn make_quic_client(port: u16) -> Arc<GrpcStore> {
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
-        headers: std::collections::HashMap::new(),
-        forward_headers: Vec::new(),
     };
     GrpcStore::new(&spec)
         .await

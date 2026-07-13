@@ -3458,6 +3458,9 @@ pub struct ApiWorkerScheduler {
 
     /// Channel for publishing origin events such as worker-observed action
     /// resource usage. `None` when origin events are disabled.
+    // CAPPED: bounded mpsc::channel(max_event_queue_size) at construction
+    // (`src/bin/nativelink.rs` origin-event wiring); None in prod
+    // (experimental_origin_events unset), so no unbounded growth on this path.
     maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
 }
 
@@ -7573,12 +7576,9 @@ async fn create_worker_cas_connection(
         // this connection, so the chunked-write kill-switch is N/A.
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
-        // merge v1.6.1: new upstream GrpcSpec fields — worker CAS prefetch
-        // connections use the modern resource-name format and inject no
-        // static/forwarded headers.
+        // merge v1.6.1: worker CAS prefetch connections use the modern
+        // resource-name format.
         use_legacy_resource_names: false,
-        headers: HashMap::new(),
-        forward_headers: Vec::new(),
     };
     let store = GrpcStore::new(&spec)
         .await

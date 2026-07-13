@@ -1292,8 +1292,9 @@ impl ContentAddressableStorage for CasServer {
     // REAPI content-defined chunking (SplitBlob/SpliceBlob, upstream #2497)
     // is not implemented in this fork yet. The generated
     // `ContentAddressableStorage` trait requires these methods, so we
-    // provide `UNIMPLEMENTED` stubs. This server does not advertise
-    // `split_blob_support`/`splice_blob_support` in its capabilities, so
+    // provide `UNIMPLEMENTED` stubs. The capabilities server hardcodes
+    // `split_blob_support`/`splice_blob_support = false` (see
+    // `capabilities_server.rs`) until the #2497 handler pass lands, so
     // conformant REAPI clients will not call these RPCs. A later feature
     // pass replaces these stubs with the real handlers (store/util/config
     // touches land together).

@@ -1729,12 +1729,7 @@ impl WorkerProxyStore {
             // to server, not the reverse direction. Leave OFF.
             chunked_writes_enabled: false,
             chunked_v2_writes_enabled: false,
-            // Upstream #2288 header-forwarding (not consumed by this fork's
-            // GrpcStore; server→worker mirror connections forward routing
-            // headers via per-call metadata injection instead). No-op defaults.
             use_legacy_resource_names: false,
-            headers: Default::default(),
-            forward_headers: Vec::new(),
         };
         let store = GrpcStore::new(&spec)
             .await

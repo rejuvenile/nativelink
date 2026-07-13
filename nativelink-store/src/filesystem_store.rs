@@ -1424,15 +1424,18 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
         if is_zero_digest(digest) {
-            return Ok(Arc::new(Fe::create(
-                0,
-                0,
-                RwLock::new(EncodedFilePath {
-                    shared_context: self.shared_context.clone(),
-                    path_type: PathType::Content,
-                    key: digest.into(),
-                }),
-            )));
+            // #2346: zero-digest files have no backing file on disk, so there is
+            // no real `FileEntry` to hand back. Match `get_file_entries_batch`
+            // (which returns `None` for zero digests) by surfacing `NotFound`
+            // instead of a synthetic `Content` entry pointing at a nonexistent
+            // path. Every caller either special-cases zero digests before
+            // calling (writing the empty file directly) or ignores the error, so
+            // `NotFound` is safe and avoids returning a phantom entry whose Drop
+            // would try to delete a file that never existed.
+            return Err(make_err!(
+                Code::NotFound,
+                "{digest} is a zero-digest with no backing file entry in the filesystem store"
+            ));
         }
         self.evicting_map
             .get(&digest.into())

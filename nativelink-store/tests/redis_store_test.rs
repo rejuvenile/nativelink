@@ -23,9 +23,10 @@ use nativelink_config::stores::{RedisMode, RedisSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
-    ReadOnlyRedis, add_lua_script, add_to_response_raw, fake_redis_sentinel_master_stream,
-    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_counting_connections,
-    make_fake_redis_counting_with_multiple_responses, make_fake_redis_with_responses,
+    ReadOnlyRedis, SubscriptionManagerNotify, add_lua_script, add_to_response_raw,
+    fake_redis_sentinel_master_stream, fake_redis_sentinel_stream, fake_redis_stream,
+    make_fake_redis_counting_connections, make_fake_redis_counting_with_multiple_responses,
+    make_fake_redis_with_responses,
 };
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
@@ -38,8 +39,9 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::HealthStatus;
 use nativelink_util::store_trait::{
     FalseValue, SchedulerCurrentVersionProvider, SchedulerIndexProvider, SchedulerStore,
-    SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider, StoreKey,
-    StoreLike, TrueValue, UploadSizeInfo,
+    SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider,
+    SchedulerSubscription, SchedulerSubscriptionManager, StoreKey, StoreLike, TrueValue,
+    UploadSizeInfo,
 };
 use pretty_assertions::assert_eq;
 use redis::{PushInfo, RedisError, Value};
@@ -3016,5 +3018,94 @@ async fn remove_absent_key_returns_not_found() -> Result<(), Error> {
         "remove of absent key must return Code::NotFound; got: {err:?}"
     );
 
+    Ok(())
+}
+
+/// Test key provider that just wraps a string. Reused across the #2353
+/// subscription regression tests below.
+#[derive(Clone)]
+struct TestSubKey(String);
+
+impl SchedulerStoreKeyProvider for TestSubKey {
+    type Versioned = FalseValue;
+    fn get_key(&self) -> StoreKey<'static> {
+        StoreKey::Str(std::borrow::Cow::Owned(self.0.clone()))
+    }
+}
+
+/// #2353 (ported): `RedisSubscription::drop` must acquire the `subscribed_keys`
+/// write lock BEFORE dropping its receiver, so `receiver_count()` still counts
+/// the dropping subscriber. Subscribe twice on one key, drop one — the publisher
+/// entry must survive so the second subscriber still resolves on notify. The
+/// pre-fix "drop receiver, then take the lock" sequence saw `receiver_count()==1`
+/// and removed the still-referenced publisher, orphaning the survivor.
+#[nativelink_test]
+async fn redis_subscription_drop_one_of_two_keeps_publisher() -> Result<(), Error> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = RedisSubscriptionManager::new(rx);
+
+    let key = "shared-key";
+    let sub_a = manager.subscribe(TestSubKey(key.to_string()))?;
+    let mut sub_b = manager.subscribe(TestSubKey(key.to_string()))?;
+
+    // Drop the first; the second's subscription must still resolve when we
+    // notify on the same key (the publisher entry must not be removed).
+    drop(sub_a);
+
+    manager.notify_for_test(key.to_string());
+    timeout(Duration::from_secs(2), sub_b.changed())
+        .await
+        .expect("sub_b.changed() did not fire — publisher entry was dropped prematurely")?;
+
+    // A live publisher can notify REPEATEDLY. If the single drop above wrongly
+    // removed the entry, the survivor's watch sender is gone: the first
+    // `changed()` can still resolve once by observing the channel closing, so a
+    // SECOND notify+changed cycle is what actually proves the publisher entry is
+    // still registered and forwarding (a dead sender's receiver has no new value
+    // to report and errors out here).
+    manager.notify_for_test(key.to_string());
+    timeout(Duration::from_secs(2), sub_b.changed())
+        .await
+        .expect("second sub_b.changed() did not fire — publisher entry was removed on single drop")?;
+
+    assert!(
+        !logs_contain("key absent from subscribed_keys under write lock"),
+        "absence warning fired during single drop with another receiver alive",
+    );
+    drop(sub_b);
+    drop(manager);
+    Ok(())
+}
+
+/// #2353 (ported): after the last subscriber drops, the publisher entry must be
+/// cleaned so a re-subscribe builds a fresh, working publisher. With the pre-fix
+/// Drop ordering the first drop already removed the entry, so the second drop
+/// hit the absence path and warned.
+#[nativelink_test]
+async fn redis_subscription_resubscribe_after_drop_creates_fresh_publisher() -> Result<(), Error> {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager = RedisSubscriptionManager::new(rx);
+
+    let key = "cycle-key";
+    let sub_a = manager.subscribe(TestSubKey(key.to_string()))?;
+    let sub_b = manager.subscribe(TestSubKey(key.to_string()))?;
+    drop(sub_a);
+    drop(sub_b);
+
+    // Re-subscribe to the same key. If the previous drops left the map in an
+    // inconsistent state (stale publisher kept, or the entry removed too early
+    // so the last drop hit the absence path), this either reuses a dead
+    // publisher (changed() never fires) or logs the absence warning.
+    let mut sub_c = manager.subscribe(TestSubKey(key.to_string()))?;
+    manager.notify_for_test(key.to_string());
+    timeout(Duration::from_secs(2), sub_c.changed())
+        .await
+        .expect("re-subscribe after drops produced a dead publisher")?;
+
+    assert!(!logs_contain(
+        "key absent from subscribed_keys under write lock"
+    ));
+    drop(sub_c);
+    drop(manager);
     Ok(())
 }

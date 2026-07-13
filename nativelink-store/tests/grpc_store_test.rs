@@ -36,8 +36,6 @@ use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
 use nativelink_util::store_trait::{IS_WORKER_REQUEST, StoreKey, StoreLike, UploadSizeInfo};
-use nativelink_util::telemetry::ClientHeaders;
-use opentelemetry::Context;
 use regex::Regex;
 use tokio::time::timeout;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -83,8 +81,6 @@ fn make_test_spec() -> GrpcSpec {
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
-        headers: HashMap::new(),
-        forward_headers: vec![],
     }
 }
 
@@ -117,8 +113,6 @@ fn test_spec<T: Into<String>>(endpoint: T, use_legacy_resource_names: bool) -> G
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
         use_legacy_resource_names,
-        headers: HashMap::new(),
-        forward_headers: vec![],
     }
 }
 
@@ -2477,41 +2471,5 @@ async fn read_works_with_legacy_resource_names() -> Result<(), Error> {
     read_works_core(true, upload_pattern, core::convert::identity)
         .await
         .unwrap();
-    Ok(())
-}
-
-#[nativelink_test]
-async fn read_works_with_headers() -> Result<(), Error> {
-    fn set_spec(mut spec: GrpcSpec) -> GrpcSpec {
-        spec.headers.insert("foo".into(), "bar".into());
-        // Testing with mixed case, as it gets lowercased internally
-        spec.forward_headers.push("SomeTHING".into());
-        spec
-    }
-
-    let upload_pattern =
-        "/blobs/sha256/0123456789abcdef000000000000000000010000000000000123456789abcdef/3";
-
-    let client_headers = {
-        let mut headers: HashMap<String, String> = HashMap::new();
-        // We're inserting a lowercase one here as the telemetry insertion uses a lowercase one
-        headers.insert("something".to_string(), "From outside".to_string());
-        ClientHeaders(Arc::new(headers))
-    };
-
-    let cx_guard = Context::map_current(|cx| cx.with_value(client_headers)).attach();
-
-    let read_request = read_works_core(false, upload_pattern, set_spec)
-        .await
-        .unwrap();
-    assert_eq!(read_request.metadata.get("foo"), Some(&"bar".to_string()));
-    assert_eq!(
-        read_request.metadata.get("something"),
-        Some(&"From outside".to_string()),
-        "{:#?}",
-        read_request.metadata
-    );
-    drop(cx_guard);
-
     Ok(())
 }

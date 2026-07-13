@@ -133,8 +133,6 @@ fn make_grpc_spec(addr: String) -> nativelink_config::stores::GrpcSpec {
         chunked_writes_enabled: false,
         chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
-        headers: Default::default(),
-        forward_headers: Vec::new(),
     }
 }
 

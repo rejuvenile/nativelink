@@ -1489,6 +1489,9 @@ pub struct SimpleScheduler {
     worker_scheduler: Arc<ApiWorkerScheduler>,
 
     /// The sender to send origin events to the origin events.
+    // CAPPED: bounded mpsc::channel(max_event_queue_size) at construction
+    // (`src/bin/nativelink.rs` origin-event wiring); None in prod
+    // (experimental_origin_events unset), so no unbounded growth on this path.
     maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
 
     /// Background task that tries to match actions to workers. If this struct

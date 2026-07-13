@@ -71,10 +71,15 @@ pub struct OperationSubscriber<S: SchedulerStore, I: InstantWrapper, NowFn: Fn()
     maybe_last_stage: Option<Discriminant<ActionStage>>,
     // merge v1.6.1: retained from upstream's completed-action TTL plumbing but
     // dormant — the per-update expiry is threaded as `None` at every `update_data`
-    // site so our `default_scheduler_factory` `max_seconds` eviction stays
-    // authoritative (avoids double-TTL + the `retain_completed_for_s=0` →
-    // immediate-expiry footgun). Kept (not removed) to avoid rippling the
-    // constructor chain; strip when upstream's per-update TTL is adopted or retired.
+    // site (upstream's per-update completed-action expiry was declined). As a
+    // result the STORE-backed (redis / `experimental_backend`) path has NO
+    // completed-action TTL post-merge: nothing expires completed actions there.
+    // Production runs the MEMORY backend (`MemoryAwaitedActionDb`), whose
+    // `default_scheduler_factory` `max_seconds` eviction bounds completed-action
+    // retention — that eviction lives in the memory backend and does NOT apply to
+    // this store-backed path. Kept (not removed) to avoid rippling the constructor
+    // chain; restore `Some(retain_completed_for)` (or add store-side eviction)
+    // before adopting the Redis backend. See deferred_tasks.md.
     #[expect(
         dead_code,
         reason = "dormant: per-update completed-action expiry declined in favor of max_seconds eviction"

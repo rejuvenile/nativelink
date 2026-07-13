@@ -728,5 +728,14 @@ pub async fn build_store_manager(
         store_manager.add_store(name, store);
     }
 
+    // NOTE (v1.6.1 merge): there is intentionally NO post_init / run_post_init
+    // pass here. Upstream drives an eager `run_post_init` loop over every store
+    // after construction; this fork deliberately does NOT adopt it. Our stores
+    // self-initialize inside their own constructor (`store_factory` above), and
+    // the lazy `RefStore` architecture resolves cross-store references on first
+    // use against the in-progress `StoreManager` — so there is no second,
+    // root-driven initialization phase to run. Do not reintroduce an eager
+    // post_init loop without re-checking that lazy `RefStore` resolution still
+    // covers every cross-store dependency.
     Ok(store_manager)
 }
