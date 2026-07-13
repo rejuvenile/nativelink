@@ -23,7 +23,7 @@ use nativelink_config::cas_server::{
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::capabilities_server::Capabilities;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    FastCdc2020Params, GetCapabilitiesRequest, ServerCapabilities, compressor,
+    FastCdc2020Params, GetCapabilitiesRequest, ServerCapabilities,
 };
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::mock_scheduler::MockActionScheduler;
@@ -65,8 +65,14 @@ async fn get_capabilities(
 }
 
 #[nativelink_test]
-async fn compression_only_instance_advertises_zstd_cache_capabilities()
+async fn compression_advertisement_is_forced_off_until_handlers_land()
 -> Result<(), Box<dyn core::error::Error>> {
+    // v1.6.1 merge (#2527 wire-compression): the CAS server does NOT serve
+    // compressed uploads (our FL-688 bytestream path has no compressed-upload
+    // handling), so `CapabilitiesServer` intentionally advertises NO
+    // compressors regardless of the `remote_cache_compression` config knob,
+    // to avoid advertising a capability the server can't honor. When the
+    // #2527 handler pass lands, restore the Zstd advertisement + this test.
     let configs = [capabilities_config(COMPRESSION_INSTANCE, true, false)];
     let remote_cache_compression_instances =
         RemoteCacheCompressionInstances::from_capabilities_configs(&configs);
@@ -83,13 +89,15 @@ async fn compression_only_instance_advertises_zstd_cache_capabilities()
         .cache_capabilities
         .expect("cache capabilities should be set");
 
-    assert_eq!(
-        cache_capabilities.supported_compressors,
-        vec![compressor::Value::Zstd as i32]
+    assert!(
+        cache_capabilities.supported_compressors.is_empty(),
+        "compression advertisement must stay forced-off until #2527 handlers land"
     );
-    assert_eq!(
-        cache_capabilities.supported_batch_update_compressors,
-        vec![compressor::Value::Zstd as i32]
+    assert!(
+        cache_capabilities
+            .supported_batch_update_compressors
+            .is_empty(),
+        "batch-update compression advertisement must stay forced-off until #2527 handlers land"
     );
     Ok(())
 }
