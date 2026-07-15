@@ -240,18 +240,12 @@ mod cpu_impl {
                 return None;
             }
 
-            // On Intel Macs, perflevel sysctl doesn't exist → p_count == 0.
-            // Also guard against future chips where the counts don't add up
-            // (e.g. a third core type) — fall back to treating all as P-cores.
-            let is_heterogeneous = p_count > 0 && (p_count + e_count == cpu_count);
-
-            let mut agg_busy = 0u64;
-            let mut agg_total = 0u64;
-            let mut p_busy = 0u64;
-            let mut p_total = 0u64;
-            let mut e_busy = 0u64;
-            let mut e_total = 0u64;
-
+            // Materialize each logical CPU's busy/total from the kernel buffer,
+            // then hand off to the pure, unit-tested `split_pe_ticks` for the
+            // P/E bucketing. `per_cpu` is a local per-tick scratch buffer, not
+            // network-reachable, bounded by `cpu_count` (logical CPU count,
+            // ~10 on M4).
+            let mut per_cpu = Vec::with_capacity(cpu_count as usize);
             for i in 0..cpu_count {
                 let base = (i as usize) * CPU_STATE_MAX;
                 let user = *info_array.add(base + CPU_STATE_USER) as u64;
@@ -259,22 +253,10 @@ mod cpu_impl {
                 let idle = *info_array.add(base + CPU_STATE_IDLE) as u64;
                 let nice = *info_array.add(base + CPU_STATE_NICE) as u64;
                 let busy = user + system + nice;
-                let total = busy + idle;
-                agg_busy += busy;
-                agg_total += total;
-                if is_heterogeneous && i < p_count {
-                    p_busy += busy;
-                    p_total += total;
-                } else if is_heterogeneous {
-                    e_busy += busy;
-                    e_total += total;
-                }
-            }
-
-            // If not heterogeneous, all cores are P-cores.
-            if !is_heterogeneous {
-                p_busy = agg_busy;
-                p_total = agg_total;
+                per_cpu.push(super::CpuTicks {
+                    busy,
+                    total: busy + idle,
+                });
             }
 
             let kr = vm_deallocate(
@@ -284,18 +266,20 @@ mod cpu_impl {
             );
             debug_assert_eq!(kr, 0, "vm_deallocate failed: {kr}");
 
+            let split = super::split_pe_ticks(cpu_count, p_count, e_count, &per_cpu);
+
             Some(PerTypeCpuTimes {
                 aggregate: CpuTimes {
-                    busy: agg_busy,
-                    total: agg_total,
+                    busy: split.aggregate.busy,
+                    total: split.aggregate.total,
                 },
                 p_core: CpuTimes {
-                    busy: p_busy,
-                    total: p_total,
+                    busy: split.p_core.busy,
+                    total: split.p_core.total,
                 },
                 e_core: CpuTimes {
-                    busy: e_busy,
-                    total: e_total,
+                    busy: split.e_core.busy,
+                    total: split.e_core.total,
                 },
                 has_e_cores: e_count > 0,
             })
@@ -322,6 +306,91 @@ mod cpu_impl {
     /// the scheduler uses its `assume_core_count` fallback.
     pub(super) const fn core_counts() -> (u32, u32) {
         (0, 0)
+    }
+}
+
+/// One logical CPU's cumulative busy/total ticks — the per-CPU input element
+/// to [`split_pe_ticks`]. Defined at module level (not inside the macOS
+/// `cpu_impl` block) so the P/E split is unit-tested on ALL platforms, the
+/// same reason [`compute_available_bytes`] lives here.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(super) struct CpuTicks {
+    pub(super) busy: u64,
+    pub(super) total: u64,
+}
+
+/// Aggregate + P-core + E-core cumulative tick buckets produced by
+/// [`split_pe_ticks`]. Named fields (not a positional tuple) so the caller
+/// can never transpose the P and E buckets — the exact class of bug this
+/// function fixes.
+pub(super) struct SplitCpuTicks {
+    pub(super) aggregate: CpuTicks,
+    pub(super) p_core: CpuTicks,
+    pub(super) e_core: CpuTicks,
+}
+
+/// Split per-logical-CPU tick data into aggregate, P-core, and E-core buckets.
+///
+/// APPLE SILICON ENUMERATION (the load-bearing fact): `host_processor_info`
+/// lists the E-cores FIRST — logical CPUs `0..e_count` — and the P-cores LAST
+/// — `e_count..cpu_count` — on M-series chips. So the P bucket is the HIGH
+/// indices `i >= e_count`, NOT the low indices `i < p_count`. The old
+/// `i < p_count` predicate charged the first `p_count` E-cores into the P
+/// bucket, SWAPPING `p_core_load_pct` and `e_core_load_pct`. Empirically
+/// confirmed on M4 (P=4, E=6) by
+/// `~/fl/bld/infra/nativelink/synthetic-core-metric-validate.sh`: pinning load
+/// to the 4 P-cores read `p_core_load=0%, e_core_load=66%`, and pinning to the
+/// 6 E-cores read `p_core_load=100%, e_core_load=34%` — exactly the index math
+/// for E-first enumeration under the old buggy predicate.
+///
+/// Heterogeneous (a real P/E split) only when `p_count > 0` AND the P and E
+/// counts partition every logical CPU (`p_count + e_count == cpu_count`). On
+/// Intel Macs / Linux `p_count == 0`; a hypothetical third core class would
+/// fail the sum. Either way the function folds all CPUs into the P bucket (the
+/// aggregate) and leaves the E bucket zero — the scheduler's `has_e_cores`
+/// policy is applied by the caller, not here.
+///
+/// Extracted as a pure function so unit tests exercise THIS production path
+/// (not an inline replica), giving the mutation guard real coverage.
+pub(super) fn split_pe_ticks(
+    cpu_count: u32,
+    p_count: u32,
+    e_count: u32,
+    per_cpu: &[CpuTicks],
+) -> SplitCpuTicks {
+    let is_heterogeneous = p_count > 0 && (p_count + e_count == cpu_count);
+
+    let mut aggregate = CpuTicks::default();
+    let mut p_core = CpuTicks::default();
+    let mut e_core = CpuTicks::default();
+
+    for (i, cpu) in per_cpu.iter().enumerate() {
+        aggregate.busy += cpu.busy;
+        aggregate.total += cpu.total;
+        if !is_heterogeneous {
+            continue;
+        }
+        // P-cores are the HIGH indices on Apple Silicon (E-cores enumerate
+        // first); see the function-level doc comment for the empirical proof.
+        if i as u32 >= e_count {
+            p_core.busy += cpu.busy;
+            p_core.total += cpu.total;
+        } else {
+            e_core.busy += cpu.busy;
+            e_core.total += cpu.total;
+        }
+    }
+
+    if !is_heterogeneous {
+        // Linux / Intel / unknown-chip fallback: treat every core as a P-core
+        // (identical to today's non-heterogeneous behavior).
+        p_core = aggregate;
+    }
+
+    SplitCpuTicks {
+        aggregate,
+        p_core,
+        e_core,
     }
 }
 
@@ -9035,6 +9104,201 @@ mod tests {
             wrong_available,
             "formula must exclude speculative_count — if this fires, the production \
              helper or the fixture both have speculative_count, masking the mutation"
+        );
+    }
+
+    /// (#sched: fix swapped P/E core-load metric) THE regression guard.
+    /// Apple Silicon `host_processor_info` enumerates E-cores FIRST (logical
+    /// CPUs `0..e_count`) and P-cores LAST (`e_count..cpu_count`). The old
+    /// `i < p_count` bucket test therefore charged the first `p_count`
+    /// E-cores into the P bucket — SWAPPING `p_core_load_pct` /
+    /// `e_core_load_pct`. Empirically confirmed on M4 by
+    /// `~/fl/bld/infra/nativelink/synthetic-core-metric-validate.sh`.
+    ///
+    /// This test pins THE invariant that was wrong: on the real M4 layout
+    /// (p_count=4, e_count=6, cpu_count=10), the P bucket must collect the
+    /// HIGH indices `6..10` (the 4 P-cores), NOT the low indices. The fixture
+    /// loads the P-cores heavily and the E-cores lightly with DISTINCT per-CPU
+    /// busy values so an off-by-one on either bucket edge changes the sum.
+    ///
+    /// The test calls `split_pe_ticks` — the SAME pure helper that
+    /// `read_per_type_cpu_times` calls on the macOS production path — so any
+    /// mutation to its bucket predicate red-fails here (mutation guard is on
+    /// production code, not an inline replica).
+    ///
+    /// Mutation (CLAUDE.md TDD #5): revert the bucket test from `i >= e_count`
+    /// to `i < p_count`. The P bucket then collects the low E-core indices
+    /// (busy 1 each ⇒ 4) and the E bucket collects the busy P-cores
+    /// (⇒ 402) — both bespoke asserts below fire naming the P/E-index
+    /// inversion.
+    #[test]
+    fn split_pe_ticks_p_cores_are_the_high_indices_m4_layout() {
+        // Real M4: 6 E-cores enumerated first (idx 0..6), 4 P-cores last
+        // (idx 6..10). E-cores lightly loaded (busy 1), P-cores heavily
+        // loaded (busy 100). total=1000 each so per-bucket totals are
+        // 6000 (E) and 4000 (P).
+        let p_count = 4u32;
+        let e_count = 6u32;
+        let cpu_count = 10u32;
+        let mut per_cpu = Vec::new();
+        for i in 0..cpu_count {
+            let busy = if i >= e_count { 100 } else { 1 };
+            per_cpu.push(CpuTicks { busy, total: 1000 });
+        }
+
+        let split = split_pe_ticks(cpu_count, p_count, e_count, &per_cpu);
+
+        // P bucket = the 4 HIGH indices (6..10): busy 4*100 = 400.
+        assert_eq!(
+            split.p_core.busy, 400,
+            "P bucket must collect the HIGH logical-CPU indices (i >= e_count) \
+             on Apple Silicon (E-cores enumerate FIRST). Got busy={} (expected \
+             400 = 4 P-cores x 100). A value of 4 means the P/E indices are \
+             INVERTED (bucketing the first e-cores as P — the swapped-metric \
+             bug); revert of `i >= e_count` to `i < p_count` produces exactly \
+             this.",
+            split.p_core.busy
+        );
+        assert_eq!(
+            split.p_core.total, 4000,
+            "P bucket total must be the 4 P-cores' total (4*1000); got {}",
+            split.p_core.total
+        );
+        // E bucket = the 6 LOW indices (0..6): busy 6*1 = 6.
+        assert_eq!(
+            split.e_core.busy, 6,
+            "E bucket must collect the LOW logical-CPU indices (i < e_count) on \
+             Apple Silicon. Got busy={} (expected 6 = 6 E-cores x 1). A value \
+             of 402 means the P/E indices are INVERTED (the busy P-cores were \
+             charged to E — the swapped-metric bug).",
+            split.e_core.busy
+        );
+        assert_eq!(
+            split.e_core.total, 6000,
+            "E bucket total must be the 6 E-cores' total (6*1000); got {}",
+            split.e_core.total
+        );
+        // Aggregate is bucket-independent: all 10 CPUs.
+        assert_eq!(split.aggregate.busy, 406, "aggregate busy = 4*100 + 6*1");
+        assert_eq!(split.aggregate.total, 10_000, "aggregate total = 10*1000");
+    }
+
+    /// (#sched: fix swapped P/E core-load metric) Reverse-load counterpart to
+    /// the M4-layout test: load the LOW indices (the E-cores) and idle the
+    /// HIGH indices (the P-cores). Proves the split is directional — the E
+    /// bucket must equal the sum of the low `0..e_count` CPUs and the P bucket
+    /// must be ~0 when only the E-cores are busy.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): revert to `i < p_count` → the busy low
+    /// E-cores land in the P bucket, flipping both asserts.
+    #[test]
+    fn split_pe_ticks_reverse_load_low_indices_are_e_cores() {
+        let p_count = 4u32;
+        let e_count = 6u32;
+        let cpu_count = 10u32;
+        let mut per_cpu = Vec::new();
+        for i in 0..cpu_count {
+            // E-cores (low indices) busy, P-cores (high indices) idle.
+            let busy = if i < e_count { 100 } else { 0 };
+            per_cpu.push(CpuTicks { busy, total: 1000 });
+        }
+
+        let split = split_pe_ticks(cpu_count, p_count, e_count, &per_cpu);
+
+        assert_eq!(
+            split.e_core.busy, 600,
+            "with only the LOW indices busy, the E bucket must equal their sum \
+             (6*100=600); got {}. A value of ~0/400 means low indices were \
+             mis-bucketed as P (P/E inversion).",
+            split.e_core.busy
+        );
+        assert_eq!(
+            split.p_core.busy, 0,
+            "with the HIGH-index P-cores idle, the P bucket busy must be 0; got \
+             {} (P/E inversion charged busy E-cores to P).",
+            split.p_core.busy
+        );
+    }
+
+    /// (#sched: fix swapped P/E core-load metric) Non-heterogeneous fallback:
+    /// on Intel Macs / Linux `p_count == 0`, so `is_heterogeneous` is false
+    /// and every CPU folds into the P bucket (= the aggregate), with the E
+    /// bucket left at zero. The caller's `has_e_cores` (from `e_count > 0`)
+    /// handles the "no E-cores → report saturated" policy separately; the
+    /// split itself must not invent an E bucket.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): delete the `if !is_heterogeneous { p_core =
+    /// aggregate; }` fallback → the P bucket stays zero on Intel/Linux and the
+    /// first assert fires ("all CPUs must fold into the P bucket").
+    #[test]
+    fn split_pe_ticks_non_heterogeneous_folds_all_into_p() {
+        let p_count = 0u32; // Intel Mac / Linux: perflevel sysctl absent
+        let e_count = 0u32;
+        let cpu_count = 8u32;
+        let mut per_cpu = Vec::new();
+        for i in 0..cpu_count {
+            per_cpu.push(CpuTicks {
+                busy: 10 * u64::from(i + 1),
+                total: 1000,
+            });
+        }
+        let expected_busy: u64 = (1..=cpu_count).map(|i| 10 * u64::from(i)).sum();
+
+        let split = split_pe_ticks(cpu_count, p_count, e_count, &per_cpu);
+
+        assert_eq!(
+            split.p_core, split.aggregate,
+            "non-heterogeneous (p_count==0): all CPUs must fold into the P \
+             bucket (== aggregate). p_core={:?} aggregate={:?}",
+            split.p_core, split.aggregate
+        );
+        assert_eq!(
+            split.p_core.busy, expected_busy,
+            "P bucket busy must equal the sum of all CPUs on the fallback path"
+        );
+        assert_eq!(
+            split.e_core,
+            CpuTicks::default(),
+            "non-heterogeneous: the E bucket must stay zero (no P/E split); got \
+             {:?}",
+            split.e_core
+        );
+    }
+
+    /// (#sched: fix swapped P/E core-load metric) Count-mismatch guard: a
+    /// future chip could report a non-zero `p_count` whose P+E counts do NOT
+    /// partition every logical CPU (e.g. a third core class). The
+    /// `p_count + e_count == cpu_count` half of the heterogeneity predicate
+    /// must reject that and fall back to all-P rather than mis-attribute the
+    /// unaccounted CPUs.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): drop the `&& p_count + e_count == cpu_count`
+    /// clause → the function treats the mismatched layout as heterogeneous and
+    /// splits with a wrong `e_count`, so `p_core != aggregate` and this assert
+    /// fires.
+    #[test]
+    fn split_pe_ticks_count_mismatch_falls_back_to_all_p() {
+        let p_count = 4u32;
+        let e_count = 4u32; // 4 + 4 != 10 → not a clean partition
+        let cpu_count = 10u32;
+        let per_cpu: Vec<CpuTicks> = (0..cpu_count)
+            .map(|_| CpuTicks { busy: 50, total: 100 })
+            .collect();
+
+        let split = split_pe_ticks(cpu_count, p_count, e_count, &per_cpu);
+
+        assert_eq!(
+            split.p_core, split.aggregate,
+            "when p_count + e_count != cpu_count the layout is not a clean P/E \
+             partition — must fall back to all-P (p_core == aggregate); got \
+             p_core={:?} aggregate={:?}",
+            split.p_core, split.aggregate
+        );
+        assert_eq!(
+            split.e_core,
+            CpuTicks::default(),
+            "count-mismatch fallback must leave the E bucket zero; got {:?}",
+            split.e_core
         );
     }
 
