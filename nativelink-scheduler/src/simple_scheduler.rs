@@ -2652,6 +2652,13 @@ impl SimpleScheduler {
         // wall clock, which is correct in prod but not mockable in tests.
         worker_scheduler.set_exec_clock(affinity_clock.clone());
 
+        // (#sched-decision-trace) Wire the diagnostic dispatch-decision-trace
+        // switch from config (default false). Observability-only: an operator
+        // turns it ON briefly to see, per candidate worker, which predicate is
+        // holding queued actions off idle-looking workers, then OFF. Mirrors the
+        // `set_exec_clock` one-shot wiring above.
+        worker_scheduler.set_decision_trace_enabled(spec.scheduler_decision_trace_enabled);
+
         let worker_scheduler_clone = worker_scheduler.clone();
 
         let action_scheduler = Arc::new_cyclic(move |weak_self| -> Self {

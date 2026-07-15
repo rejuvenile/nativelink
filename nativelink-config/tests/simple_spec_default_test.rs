@@ -149,6 +149,12 @@ fn simple_spec_default_matches_deserialize_empty() {
         "enable_speculative_hold default drift (both should be true — ENABLED \
          by default, drift-proof, per user 2026-07-07; config `false` is the kill-switch)"
     );
+    assert_eq!(
+        derived.scheduler_decision_trace_enabled, deserialized.scheduler_decision_trace_enabled,
+        "scheduler_decision_trace_enabled default drift (both should be false — the \
+         dispatch-decision diagnostic dump is OFF by default; an operator turns it ON \
+         briefly via config to diagnose a placement question, then OFF)"
+    );
 }
 
 /// Direct assertions on the concrete default values, so the intent is legible
@@ -202,5 +208,11 @@ fn simple_spec_default_concrete_values() {
          (default_pending_affinity_probe_enabled) — the quadratic observability probe \
          is OPT-IN (user decision 2026-07-06); the deployed prod config leaves the \
          flag absent → probe OFF → the 20-27s do_try_match collapse cannot occur"
+    );
+    assert!(
+        !spec.scheduler_decision_trace_enabled,
+        "scheduler_decision_trace_enabled default must be FALSE — the dispatch-decision \
+         diagnostic dump is a short-lived operator tool, OFF unless explicitly enabled \
+         in config; a default-ON would emit the trace on every fleet with no operator ask"
     );
 }

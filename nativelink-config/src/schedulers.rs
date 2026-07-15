@@ -395,6 +395,35 @@ pub struct SimpleSpec {
     /// MUST NOT be derived from `worker_timeout_s` (default 0 = disabled).
     #[serde(default = "default_speculative_prefetch_ttl_s")]
     pub speculative_prefetch_ttl_s: u64,
+
+    /// (#sched-decision-trace) DIAGNOSTIC master switch for the scheduler
+    /// dispatch-decision trace. When `true`, the worker matcher emits an
+    /// INFO-level `tag = "sched_decision_trace"` dump at the dispatch decision
+    /// point (`inner_find_and_reserve_worker`) showing, per capability-matched
+    /// candidate worker, WHICH predicate held it back from taking a queued
+    /// action: viability/pressure gate (quarantine, paused, indefinite-pin
+    /// saturation, swap, disk), the `is_satisfied_by` Minimum-resource
+    /// reservation (`memory_kb` / `cpu_count` / `disk_*`, decremented by
+    /// `reduce_platform_properties` as jobs land), or the dispatch-count
+    /// p-headroom gate. It is the ground-truth answer to "queued actions aren't
+    /// placing on workers that look idle — which predicate is the limiter?".
+    ///
+    /// Rate-limited to at most one dump per second (a wall-clock token on the
+    /// worker registry) and emitted only while a candidate set exists, so it
+    /// cannot flood the log or dominate the match-cycle hot loop (the 2026-07-06
+    /// hot-loop-fold trap): the flag is checked FIRST, before any formatting or
+    /// clock read, so a flag-OFF dispatch pays only a bool load.
+    ///
+    /// MUST be INFO (not debug/trace): the release build pins
+    /// `release_max_level_info`, so debug/trace are compiled out in prod and the
+    /// dump would be dark — the same reason the sibling `p_headroom_gate_exclusion`
+    /// probe is INFO.
+    ///
+    /// Default: false (OFF). This is a short-lived DIAGNOSTIC an operator turns
+    /// ON via config to settle a live placement question, then OFF. It is
+    /// OBSERVABILITY-ONLY: no dispatch decision changes when it is on.
+    #[serde(default)]
+    pub scheduler_decision_trace_enabled: bool,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -469,6 +498,10 @@ impl Default for SimpleSpec {
                 default_speculative_prefetch_backlog_threshold(),
             // #[serde(default = "default_speculative_prefetch_ttl_s")] → 60.
             speculative_prefetch_ttl_s: default_speculative_prefetch_ttl_s(),
+            // #[serde(default)] → bool default (false) = decision-trace diagnostic
+            // OFF (observability-only; an operator turns it ON briefly to diagnose
+            // a placement question, then OFF).
+            scheduler_decision_trace_enabled: false,
         }
     }
 }

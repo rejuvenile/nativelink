@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::fmt::Write as _;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -54,7 +55,7 @@ use nativelink_util::digest_hasher::{
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::operation_state_manager::{UpdateOperationType, WorkerStateManager};
 use nativelink_util::origin_event::get_node_id;
-use nativelink_util::platform_properties::PlatformProperties;
+use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::{Store, StoreDriver, StoreKey, StoreLike};
 use parking_lot::Mutex as ParkingMutex;
@@ -1055,6 +1056,42 @@ fn worker_has_p_headroom(w: &Worker, idle_threshold_pct: u32, override_factor: u
             && running < u64::from(w.p_core_count) * u64::from(override_factor))
 }
 
+/// (#sched-decision-trace) Minimum wall-clock spacing between two full
+/// `sched_decision_trace` dumps. The trace runs inside `do_try_match`'s per-
+/// action dispatch under the worker write lock; without this cap a deep backlog
+/// (100+ queued × 32 match concurrency) would emit one dump per matched action
+/// and both flood the log and add formatting cost to the hot loop. One dump per
+/// second is enough to read the stuck-predicate state while staying negligible.
+const DECISION_TRACE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// (#sched-decision-trace) Formats the `Minimum`-valued platform properties of a
+/// property set into a compact, sorted `key=value` string for the decision
+/// trace. The `Minimum` values are exactly the numeric resource reservations
+/// (`memory_kb` / `cpu_count` / `disk_*`) that `reduce_platform_properties`
+/// decrements as jobs land, so a worker's set here is its REMAINING capacity and
+/// an action's set is its REQUIREMENT — logging both lets the reader see an
+/// `is_satisfied_by` shortfall directly. Built ONLY inside the flag-on,
+/// rate-limited emit path, so it costs nothing when the trace is off.
+fn decision_trace_min_props(props: &PlatformProperties) -> String {
+    let mut mins: Vec<(&str, f64)> = props
+        .properties
+        .iter()
+        .filter_map(|(k, v)| match v {
+            PlatformPropertyValue::Minimum(n) => Some((k.as_str(), *n)),
+            _ => None,
+        })
+        .collect();
+    mins.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut out = String::new();
+    for (i, (k, n)) in mins.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{k}={n}");
+    }
+    out
+}
+
 /// (#sched M1 rebalance v2, §12.1) Ranking preference for the cache-tier and
 /// fallback winner selectors — the "magnet fix". SMALLER = preferred. The load
 /// term stays the SECONDARY key; this is PRIMARY, so a worker with a genuine
@@ -1190,6 +1227,21 @@ struct ApiWorkerSchedulerImpl {
     /// actions (design §3, I5_Bounded). Config
     /// (`SimpleSpec::p_headroom_override_factor`). Default 2.
     p_headroom_override_factor: u32,
+    /// (#sched-decision-trace) DIAGNOSTIC master switch (config
+    /// `SimpleSpec::scheduler_decision_trace_enabled`, default false). When true,
+    /// `inner_find_and_reserve_worker` emits the INFO `sched_decision_trace` dump
+    /// (per-candidate predicate breakdown) at the dispatch decision point. Checked
+    /// FIRST in `emit_decision_trace`, before any formatting or the `Instant`
+    /// read, so a flag-OFF dispatch pays only a bool load. Wired
+    /// post-construction via `set_decision_trace_enabled` (mirrors
+    /// `set_exec_clock`), so no constructor call site changes. Observability-only.
+    decision_trace_enabled: bool,
+    /// (#sched-decision-trace) Rate-limit state for the decision trace: wall-clock
+    /// instant of the last emitted dump. Read+written only under the worker write
+    /// lock (dispatch is serialized on it), so a plain field is race-free — no
+    /// atomic needed. `None` until the first dump, then throttles to at most one
+    /// dump per `DECISION_TRACE_MIN_INTERVAL`.
+    last_decision_trace_at: Option<Instant>,
     /// A channel to notify the matching engine that the worker pool has changed.
     worker_change_notify: Arc<Notify>,
     /// Worker registry for tracking worker liveness.
@@ -2858,8 +2910,31 @@ impl ApiWorkerSchedulerImpl {
             wid
         } else {
             // ── Fallback: existing LRU/MRU strategy ──
-            let wid = self.inner_find_worker_for_action(platform_properties, full_worker_logging)?;
-            wid
+            match self.inner_find_worker_for_action(platform_properties, full_worker_logging) {
+                Some(wid) => wid,
+                None => {
+                    // (#sched-decision-trace) No worker selected on the LRU/MRU
+                    // fallback either — the action stays queued. Emit the decision
+                    // dump with a None outcome so the per-candidate
+                    // first-failing-predicate breakdown explains why a
+                    // capability-matched candidate set left the action queued (the
+                    // `is_satisfied_by` memory_kb / p-headroom / pressure question).
+                    self.emit_decision_trace(
+                        platform_properties,
+                        operation_id,
+                        &input_root_digest,
+                        &candidates,
+                        p_gate_active,
+                        p_idle_threshold_pct,
+                        p_headroom_override_factor,
+                        viable_count,
+                        any_viable_has_p_headroom,
+                        saturation_fall_through,
+                        None,
+                    );
+                    return None;
+                }
+            }
         };
 
         // Atomically reserve the worker by mutating its state under the same lock.
@@ -2867,7 +2942,162 @@ impl ApiWorkerSchedulerImpl {
         // drops — `resolved_directories` is injected post-lock by the caller.
         let (tx, msg) = self.prepare_worker_run_action(&worker_id, operation_id, action_info)?;
 
+        // (#sched-decision-trace) Decision reached a worker — emit the dump with
+        // the selected worker so the per-candidate breakdown shows the winning
+        // predicate alongside the also-rans. Flag-gated + rate-limited inside the
+        // helper (near-zero cost when off).
+        self.emit_decision_trace(
+            platform_properties,
+            operation_id,
+            &input_root_digest,
+            &candidates,
+            p_gate_active,
+            p_idle_threshold_pct,
+            p_headroom_override_factor,
+            viable_count,
+            any_viable_has_p_headroom,
+            saturation_fall_through,
+            Some(&worker_id),
+        );
+
         Some((worker_id, tx, msg))
+    }
+
+    /// (#sched-decision-trace) DIAGNOSTIC dump at the dispatch decision point.
+    /// Flag-gated (`decision_trace_enabled`) and rate-limited to at most one dump
+    /// per `DECISION_TRACE_MIN_INTERVAL`; the flag check precedes ALL formatting
+    /// and the `Instant` read, so a flag-OFF dispatch pays only a bool load
+    /// (the 2026-07-06 hot-loop-fold trap avoidance). Called from the two
+    /// dispatch exits — the reserved-worker success path (`selected = Some`) and
+    /// the LRU/MRU fallback no-worker path (`selected = None`) — so ONE dump per
+    /// invocation with the true outcome.
+    ///
+    /// Emits INFO (`tag = "sched_decision_trace"`) — MUST be INFO, not
+    /// debug/trace, because the release build pins `release_max_level_info` and
+    /// would compile a lower level out (same as the `p_headroom_gate_exclusion`
+    /// probe). One summary line plus one line per capability-matched candidate,
+    /// carrying its full viability/pressure/`is_satisfied_by`/p-headroom state and
+    /// the FIRST predicate that would exclude it — so one dump answers "which
+    /// predicate is holding a worker back". OBSERVABILITY-ONLY: mutates only the
+    /// rate-limit field, never a dispatch decision.
+    #[expect(clippy::too_many_arguments)]
+    fn emit_decision_trace(
+        &mut self,
+        platform_properties: &PlatformProperties,
+        operation_id: &OperationId,
+        input_root_digest: &DigestInfo,
+        candidates: &HashSet<WorkerId>,
+        p_gate_active: bool,
+        p_idle_threshold_pct: u32,
+        p_headroom_override_factor: u32,
+        viable_count: usize,
+        any_viable_has_p_headroom: bool,
+        saturation_fall_through: bool,
+        selected: Option<&WorkerId>,
+    ) {
+        // OFF-path early-out: the flag check precedes ALL formatting and the
+        // Instant read.
+        if !self.decision_trace_enabled {
+            return;
+        }
+        // Rate-limit: at most one full dump per DECISION_TRACE_MIN_INTERVAL. Runs
+        // under the worker write lock (dispatch is serialized on it), so a plain
+        // field read-modify-write is race-free.
+        let now = Instant::now();
+        let due = self
+            .last_decision_trace_at
+            .is_none_or(|t| now.duration_since(t) >= DECISION_TRACE_MIN_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_decision_trace_at = Some(now);
+
+        // Action-side required Minimum resource hints (the reservation the leading
+        // hypothesis blames): `memory_kb` / `cpu_count` / `disk_*`.
+        let action_min_props = decision_trace_min_props(platform_properties);
+        let outcome = if selected.is_some() {
+            "selected"
+        } else {
+            "left_queued"
+        };
+        let selected_worker = selected.map_or_else(|| "none".to_string(), |w| w.0.to_string());
+
+        info!(
+            tag = "sched_decision_trace",
+            %operation_id,
+            %input_root_digest,
+            candidate_count = candidates.len(),
+            viable_count,
+            any_viable_has_p_headroom,
+            p_gate_active,
+            saturation_fall_through,
+            %action_min_props,
+            %selected_worker,
+            outcome,
+            "scheduler dispatch decision summary (per-candidate breakdown follows)"
+        );
+
+        for wid in candidates {
+            let Some(w) = self.workers.0.peek(wid) else {
+                continue;
+            };
+            let running = w.running_action_infos.len();
+            let is_satisfied_by = platform_properties.is_satisfied_by(&w.platform_properties, false);
+            let has_headroom =
+                worker_has_p_headroom(w, p_idle_threshold_pct, p_headroom_override_factor);
+            let pref = p_headroom_pref(
+                w,
+                p_gate_active,
+                p_idle_threshold_pct,
+                p_headroom_override_factor,
+            );
+            let can_accept_work = w.can_accept_work();
+            let worker_min_props = decision_trace_min_props(&w.platform_properties);
+            // FIRST failing predicate, in the exact order `worker_is_viable`
+            // applies them, followed by the p-headroom gate the cache tiers add.
+            // `eligible` = this worker could take the action (subject to tier
+            // ranking).
+            let first_failing_predicate = if w.quarantined_at.is_some() {
+                "quarantined"
+            } else if !can_accept_work {
+                "cannot_accept_work (paused/draining/max_inflight)"
+            } else if w.indefinite_pin_saturated {
+                "indefinite_pin_saturated"
+            } else if w.swap_pressured {
+                "swap_pressured"
+            } else if w.disk_pressured {
+                "disk_pressured"
+            } else if !is_satisfied_by {
+                "unsatisfied_platform_property (is_satisfied_by=false; compare action_min_props vs worker_min_props)"
+            } else if p_gate_active && !has_headroom {
+                "p_headroom_gated"
+            } else {
+                "eligible"
+            };
+            info!(
+                tag = "sched_decision_trace",
+                %operation_id,
+                worker_id = %wid.0,
+                running,
+                p_core_count = w.p_core_count,
+                e_core_count = w.e_core_count,
+                p_core_load_pct = w.p_core_load_pct,
+                e_core_load_pct = w.e_core_load_pct,
+                has_p_headroom = has_headroom,
+                p_headroom_pref = pref,
+                is_paused = w.is_paused,
+                can_accept_work,
+                swap_pressured = w.swap_pressured,
+                disk_pressured = w.disk_pressured,
+                indefinite_pin_saturated = w.indefinite_pin_saturated,
+                quarantined = w.quarantined_at.is_some(),
+                max_inflight_tasks = w.max_inflight_tasks,
+                %worker_min_props,
+                is_satisfied_by,
+                first_failing_predicate,
+                "sched_decision_trace candidate"
+            );
+        }
     }
 
     /// Undoes a reservation made by `inner_find_and_reserve_worker`.
@@ -4277,6 +4507,12 @@ impl ApiWorkerScheduler {
                 p_headroom_gate_enabled,
                 p_idle_threshold_pct,
                 p_headroom_override_factor,
+                // (#sched-decision-trace) Diagnostic decision-trace OFF until the
+                // operator enables it via config (wired post-construction by
+                // `set_decision_trace_enabled`, mirroring `set_exec_clock`);
+                // rate-limit state starts empty.
+                decision_trace_enabled: false,
+                last_decision_trace_at: None,
                 worker_change_notify,
                 worker_registry: worker_registry.clone(),
                 shutting_down: false,
@@ -4390,6 +4626,22 @@ impl ApiWorkerScheduler {
                  task holds the inner lock",
             )
             .exec_clock = clock;
+    }
+
+    /// (#sched-decision-trace) Enable/disable the INFO `sched_decision_trace`
+    /// diagnostic dump. Wired ONCE by `SimpleScheduler::new` right after
+    /// construction from `SimpleSpec::scheduler_decision_trace_enabled`, mirroring
+    /// `set_exec_clock`. SYNCHRONOUS one-shot wiring on the freshly-returned
+    /// `Arc<Self>` before any task can hold `inner`, so `try_write()` is
+    /// uncontended. Tests call it to flip the flag ON before driving a dispatch.
+    pub fn set_decision_trace_enabled(&self, enabled: bool) {
+        self.inner
+            .try_write()
+            .expect(
+                "set_decision_trace_enabled must be called during one-shot wiring, \
+                 before any task holds the inner lock",
+            )
+            .decision_trace_enabled = enabled;
     }
 
     /// (#specprefetch-rebind Stage B/C v3) `T_wait_W`: the worker's expected time to
@@ -18048,6 +18300,77 @@ mod deferred_proto_clone_tests {
              (got {ratio:.1}×) — if this fires, the premise for deferring to_proto_vecs() \
              is invalidated and the optimization should be reconsidered; \
              size_check={size_check_ns}ns clone={clone_ns}ns"
+        );
+    }
+
+    /// (#sched-decision-trace) The dispatch-decision diagnostic dump fires ONLY
+    /// when the `scheduler_decision_trace_enabled` flag is on. This pins the two
+    /// load-bearing contracts an operator relies on: (1) OFF by default → the
+    /// trace is silent (no dump armed) on a fleet that never opted in, and (2)
+    /// ON via config → a real dispatch arms the trace (the flag plumbs through
+    /// `set_decision_trace_enabled` into `emit_decision_trace`, past its
+    /// flag-first early-out and its rate-limit gate). Observed via the rate-limit
+    /// field `last_decision_trace_at`, which `emit_decision_trace` sets to `Some`
+    /// exactly when it emits — `None` means it never got past the flag/rate gate,
+    /// `Some` means it dumped.
+    ///
+    /// Mutation A (flag early-out): delete `if !self.decision_trace_enabled {
+    /// return; }` → the OFF scheduler dumps → `last_decision_trace_at` becomes
+    /// `Some` → the OFF assertion red-fails with its bespoke message.
+    /// Mutation B (emit reached): comment out `self.last_decision_trace_at =
+    /// Some(now);` (or either `emit_decision_trace` call site) → the ON scheduler
+    /// never arms → the ON assertion red-fails with its bespoke message.
+    #[nativelink_test]
+    async fn decision_trace_fires_only_when_flag_enabled() {
+        let digest = DigestInfo::new([0xD7u8; 32], 1);
+
+        // (1) Flag OFF (default): a successful dispatch must NOT arm the trace.
+        let sched_off = build_scheduler_no_cas();
+        let mut rx_off = add_worker(&sched_off, "W").await;
+        let op_off = OperationId::default();
+        let action_off = make_action("W", digest);
+        let res_off = tokio::time::timeout(
+            Duration::from_secs(2),
+            sched_off.find_and_reserve_worker(&props_exact("W"), &op_off, &action_off, false),
+        )
+        .await
+        .expect("find_and_reserve_worker must not hang (flag-off)");
+        assert!(
+            res_off.is_some(),
+            "worker W is idle and matches props_exact(\"W\") → dispatch must select it"
+        );
+        let _ = rx_off.try_recv();
+        assert!(
+            sched_off.inner.read().await.last_decision_trace_at.is_none(),
+            "#sched-decision-trace: with the flag OFF (default), emit_decision_trace \
+             must early-out on the flag check and NEVER arm the trace — \
+             last_decision_trace_at stayed None. A Some here means the flag guard was \
+             removed and the diagnostic would dump on every fleet, unasked."
+        );
+
+        // (2) Flag ON: the same successful dispatch MUST arm the trace exactly once.
+        let sched_on = build_scheduler_no_cas();
+        sched_on.set_decision_trace_enabled(true);
+        let mut rx_on = add_worker(&sched_on, "W").await;
+        let op_on = OperationId::default();
+        let action_on = make_action("W", digest);
+        let res_on = tokio::time::timeout(
+            Duration::from_secs(2),
+            sched_on.find_and_reserve_worker(&props_exact("W"), &op_on, &action_on, false),
+        )
+        .await
+        .expect("find_and_reserve_worker must not hang (flag-on)");
+        assert!(
+            res_on.is_some(),
+            "worker W is idle and matches → dispatch must select it (flag-on)"
+        );
+        let _ = rx_on.try_recv();
+        assert!(
+            sched_on.inner.read().await.last_decision_trace_at.is_some(),
+            "#sched-decision-trace: with the flag ON, the successful-dispatch exit must \
+             call emit_decision_trace, which (flag on + first call ⇒ rate-limit due) \
+             emits the dump and sets last_decision_trace_at = Some. None here means the \
+             flag did not plumb through set_decision_trace_enabled or the emit was skipped."
         );
     }
 }
