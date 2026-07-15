@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! v1 WriteChunked removed: `update_via_chunked_inner` now dispatches the
-//! V2 wire shape UNCONDITIONALLY (the `chunked_v2_writes_enabled` flag is
-//! vestigial). This test proves the worker upload path is always V2.
+//! V2 wire shape UNCONDITIONALLY (there is no write-path selector). This
+//! test proves the worker upload path is always V2.
 //!
 //! Test geometry:
 //! - Bind an in-process `CasExtensions` server whose `write_chunked` records
@@ -171,8 +171,8 @@ async fn chunked_worker_upload_always_uses_v2_rpc_end_to_end() -> Result<(), Err
             .await;
     });
 
-    // Build GrpcStore with chunked_writes_enabled=false (default) and
-    // chunked_v2_writes_enabled=false (default).
+    // Build GrpcStore with chunked_writes_enabled=false (default); the
+    // worker upload path is unconditionally V2.
     let spec = GrpcSpec {
         instance_name: String::new(),
         endpoints: vec![GrpcEndpoint {
@@ -204,7 +204,6 @@ async fn chunked_worker_upload_always_uses_v2_rpc_end_to_end() -> Result<(), Err
         zstd_compression: false,
         connection_acquire_timeout_ms: Some(2000),
         chunked_writes_enabled: false,
-        chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
     };
     let store = GrpcStore::new(&spec).await?;

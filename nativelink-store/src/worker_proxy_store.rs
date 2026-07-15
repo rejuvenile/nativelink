@@ -1728,7 +1728,6 @@ impl WorkerProxyStore {
             // chunked-write path; the chunked-write path is from worker
             // to server, not the reverse direction. Leave OFF.
             chunked_writes_enabled: false,
-            chunked_v2_writes_enabled: false,
             use_legacy_resource_names: false,
         };
         let store = GrpcStore::new(&spec)

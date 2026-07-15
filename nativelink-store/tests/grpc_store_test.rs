@@ -79,7 +79,6 @@ fn make_test_spec() -> GrpcSpec {
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
-        chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
     }
 }
@@ -111,7 +110,6 @@ fn test_spec<T: Into<String>>(endpoint: T, use_legacy_resource_names: bool) -> G
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
-        chunked_v2_writes_enabled: false,
         use_legacy_resource_names,
     }
 }

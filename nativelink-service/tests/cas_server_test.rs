@@ -1831,7 +1831,6 @@ async fn chunking_on_grpc_store_forbids_index_store() -> Result<(), Box<dyn core
                 zstd_compression: false,
                 connection_acquire_timeout_ms: None,
                 chunked_writes_enabled: false,
-                chunked_v2_writes_enabled: false,
                 use_legacy_resource_names: false,
             }),
             &store_manager,

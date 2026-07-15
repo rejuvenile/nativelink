@@ -273,7 +273,6 @@ impl AcProxyStore {
             zstd_compression: false,
             connection_acquire_timeout_ms: Some(3000),
             chunked_writes_enabled: false,
-            chunked_v2_writes_enabled: false,
             use_legacy_resource_names: false,
         };
         let store = GrpcStore::new(&spec)

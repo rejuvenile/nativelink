@@ -1828,24 +1828,6 @@ pub struct GrpcSpec {
     #[serde(default)]
     pub chunked_writes_enabled: bool,
 
-    /// DEPRECATED / VESTIGIAL (v1 WriteChunked removed): the worker upload
-    /// path is now ALWAYS the V2 wire shape (`WorkerApi/WriteChunkedV2`
-    /// bidi RPC with per-chunk acks). This field is retained ONLY so the
-    /// deployed config — which still carries `chunked_v2_writes_enabled:
-    /// true` — continues to deserialize: `GrpcSpec` is
-    /// `#[serde(deny_unknown_fields)]`, so DROPPING this field would make
-    /// the live config fail to parse. The value is parsed and IGNORED;
-    /// `GrpcStore::update_via_chunked_inner` no longer branches on it.
-    ///
-    /// (Historically — #550 Phase 3 — this selected V1 (unary
-    /// `WorkerApi/WriteChunked`) vs V2 (bidi). The V1 dispatcher and its
-    /// server handler were deleted once workers ran V2 fleet-wide, leaving
-    /// V2 as the sole worker upload path; there is nothing left to select.)
-    ///
-    /// Default: false (no effect — V2 is unconditional)
-    #[serde(default)]
-    pub chunked_v2_writes_enabled: bool,
-
     /// Use legacy `ByteStream` resource name format, omitting the digest
     /// function component from the path.
     ///
@@ -2354,10 +2336,12 @@ mod tests {
         );
     }
 
-    /// #550 Phase 3: verify `chunked_v2_writes_enabled` defaults to false
-    /// when absent from JSON5, and can be explicitly set to true/false.
+    /// #chunked-v1-removal: the `chunked_v2_writes_enabled` field was deleted
+    /// once the v1 `WriteChunked` worker-upload path was removed (workers now
+    /// always use v2). Post-removal contract (a): a `GrpcSpec` WITHOUT the key
+    /// still deserializes cleanly — nothing selects it anymore.
     #[test]
-    fn grpc_spec_chunked_v2_writes_enabled_defaults_false() {
+    fn grpc_spec_parses_without_chunked_v2_writes_enabled_key() {
         let spec: GrpcSpec = serde_json5::from_str(
             r#"{
                 "instance_name": "",
@@ -2365,45 +2349,41 @@ mod tests {
                 "store_type": "cas",
             }"#,
         )
-        .expect("GrpcSpec must deserialize from minimal JSON5");
+        .expect(
+            "GrpcSpec MUST deserialize when chunked_v2_writes_enabled is absent — \
+             the field was removed with the v1 WriteChunked path",
+        );
+        // The sibling chunked flag (kept) still defaults false.
         assert!(
-            !spec.chunked_v2_writes_enabled,
-            "chunked_v2_writes_enabled MUST default to false — #550 Phase 3 \
-             opt-in rollout requires V1 behavior as the default"
+            !spec.chunked_writes_enabled,
+            "chunked_writes_enabled MUST still default to false"
         );
     }
 
+    /// Post-removal contract (b): because `GrpcSpec` is
+    /// `#[serde(deny_unknown_fields)]`, a config that STILL carries the removed
+    /// `chunked_v2_writes_enabled` key is now a HARD parse error. This is why
+    /// the deployed config MUST be stripped of the key BEFORE this build ships
+    /// — the parent owns that config migration and deploy ordering.
     #[test]
-    fn grpc_spec_chunked_v2_writes_enabled_explicit_true() {
-        let spec: GrpcSpec = serde_json5::from_str(
+    fn grpc_spec_rejects_removed_chunked_v2_writes_enabled_key() {
+        let result: Result<GrpcSpec, _> = serde_json5::from_str(
             r#"{
                 "instance_name": "",
                 "endpoints": [{"address": "http://localhost:50051"}],
                 "store_type": "cas",
                 "chunked_v2_writes_enabled": true,
             }"#,
-        )
-        .expect("GrpcSpec must deserialize with explicit chunked_v2_writes_enabled");
-        assert!(
-            spec.chunked_v2_writes_enabled,
-            "chunked_v2_writes_enabled MUST honor explicit true"
         );
-    }
-
-    #[test]
-    fn grpc_spec_chunked_v2_writes_enabled_explicit_false() {
-        let spec: GrpcSpec = serde_json5::from_str(
-            r#"{
-                "instance_name": "",
-                "endpoints": [{"address": "http://localhost:50051"}],
-                "store_type": "cas",
-                "chunked_v2_writes_enabled": false,
-            }"#,
-        )
-        .expect("GrpcSpec must deserialize with explicit chunked_v2_writes_enabled=false");
+        let err = result.expect_err(
+            "GrpcSpec MUST reject the removed chunked_v2_writes_enabled key — \
+             deny_unknown_fields turns a lingering config key into a hard parse \
+             error, which is why deployed configs must be stripped of it first",
+        );
+        let msg = err.to_string();
         assert!(
-            !spec.chunked_v2_writes_enabled,
-            "chunked_v2_writes_enabled MUST honor explicit false"
+            msg.contains("chunked_v2_writes_enabled"),
+            "reject error MUST name the unknown field chunked_v2_writes_enabled, got: {msg}"
         );
     }
 }

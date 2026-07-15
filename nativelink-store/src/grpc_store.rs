@@ -848,10 +848,9 @@ impl GrpcStore {
             store.enable_chunked_writes();
         }
 
-        // v1 WriteChunked removed: `spec.chunked_v2_writes_enabled` is now
-        // vestigial (parsed + ignored — see the `GrpcSpec` field doc).
-        // `update_via_chunked_inner` dispatches V2 unconditionally, so
-        // there is no runtime flag to honor here.
+        // v1 WriteChunked removed: workers always use the V2 wire shape, so
+        // `update_via_chunked_inner` dispatches V2 unconditionally. There is
+        // no runtime write-path selector to honor here.
 
         Ok(store)
     }
@@ -3560,8 +3559,8 @@ impl GrpcStore {
                 // factory closure can be `'static`. ConnectionManager
                 // is internally Arc-wrapped, so cloning is cheap.
                 // v1 WriteChunked removed: dispatch V2 unconditionally
-                // (workers run V2 fleet-wide). No `chunked_v2_writes_enabled`
-                // branch — there is no other worker upload path to select.
+                // (workers run V2 fleet-wide). There is no other worker
+                // upload path to select.
                 let cm_clone = cm.clone();
                 let acquire_timeout_ms = self.connection_acquire_timeout_ms;
                 let dispatcher: Box<dyn WriteChunkedDispatcher> =
@@ -4847,7 +4846,6 @@ mod tests {
             zstd_compression: false,
             connection_acquire_timeout_ms: None,
             chunked_writes_enabled: false,
-            chunked_v2_writes_enabled: false,
             use_legacy_resource_names: false,
         }
     }

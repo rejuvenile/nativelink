@@ -131,7 +131,6 @@ fn make_grpc_spec(addr: String) -> nativelink_config::stores::GrpcSpec {
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
-        chunked_v2_writes_enabled: false,
         use_legacy_resource_names: false,
     }
 }

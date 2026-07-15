@@ -1171,7 +1171,7 @@ mod tests {
     }
 
     /// **#550 Phase 3 (red-team version-skew finding):** a worker that
-    /// has opted into V2 (`chunked_v2_writes_enabled = true`) but talks
+    /// uses V2 (the sole worker upload path) but talks
     /// to a server without the `WriteChunkedV2` handler receives
     /// `Code::Unimplemented`. That error carries no `BackpressureSignal`
     /// and is not watchdog-tagged, so it MUST classify as `Abort`: the
