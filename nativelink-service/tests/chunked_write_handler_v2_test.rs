@@ -571,55 +571,6 @@ async fn v2_cancel_mid_blob_handoff_to_second_writer_completes() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// Test 4: old-client fallback (v1 unary RPC continues to work)
-// -----------------------------------------------------------------------------
-
-/// A client that still uses the v1 unary `write_chunked` RPC keeps
-/// working — backwards compatibility is preserved by keeping the v1
-/// trait method on the same adapter.
-#[nativelink_test]
-async fn v2_adapter_still_serves_v1_write_chunked() {
-    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
-        .map(|i| (i as u8).wrapping_mul(17))
-        .collect();
-    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
-
-    let (store, content_path) = make_store().await;
-    let budget = make_test_budget();
-    let handler = make_handler(Arc::clone(&store), budget);
-    let (mut client, _server_handle) = start_v2_server(handler).await;
-
-    let chunks = build_chunks(digest, &payload);
-    let stream = tokio_stream::iter(chunks);
-    let response = tokio::time::timeout(
-        Duration::from_secs(15),
-        client.write_chunked(stream),
-    )
-    .await
-    .expect("must not deadlock — v1 RPC under 15s")
-    .expect("v1 write_chunked must return Ok on the v2 adapter (backwards-compat)")
-    .into_inner();
-    assert_eq!(
-        response.committed_size,
-        payload.len() as u64,
-        "v1 committed_size must match"
-    );
-    let final_path = format!(
-        "{}/d/{:02x}/{}",
-        content_path,
-        digest.packed_hash()[0],
-        digest
-    );
-    let on_disk = tokio::fs::read(&final_path)
-        .await
-        .expect("v1 path must produce canonical file");
-    assert_eq!(
-        sha256(&on_disk),
-        sha256(&payload),
-        "v1 canonical file must match declared content"
-    );
-}
 
 // -----------------------------------------------------------------------------
 // Test 5: corruption regression — bit-identical canonical post-race
@@ -2551,20 +2502,6 @@ async fn major_k_chunked_v2_disabled_returns_unimplemented_for_v2_rpcs() {
             );
         }
     }
-
-    // Sanity: v1 write_chunked MUST still work even with v2 disabled
-    // (the gate is v2-specific; rollback to v1 is the whole point).
-    let chunks_v1 = build_chunks(digest, &payload);
-    let v1_stream = tokio_stream::iter(chunks_v1);
-    let v1_result = tokio::time::timeout(Duration::from_secs(15), client.write_chunked(v1_stream))
-        .await
-        .expect("must not deadlock — v1 RPC under v2_enabled=false must still work")
-        .expect("v1 write_chunked must succeed even when v2 is disabled");
-    assert_eq!(
-        v1_result.into_inner().committed_size,
-        payload.len() as u64,
-        "MAJOR-K (sanity): v1 backwards-compat path must work with v2_enabled=false"
-    );
 }
 
 // =============================================================================

@@ -643,12 +643,6 @@ pub struct GrpcStore {
     /// `enable_locality_in_has` on `WorkerProxyStore`.
     #[cfg(feature = "chunked_fast_slow")]
     chunked_writes_enabled: AtomicBool,
-    /// #550 Phase 3: selects V1 (unary) vs V2 (bidi-per-chunk-ack)
-    /// dispatcher inside `update_via_chunked_inner`. Default OFF —
-    /// preserves V1 behavior. Flip ON for opt-in rollout of the V2
-    /// wire shape.
-    #[cfg(feature = "chunked_fast_slow")]
-    chunked_v2_writes_enabled: AtomicBool,
     /// #212 Phase 2.4 metrics for the chunked-write path. Counters
     /// are populated via `chunked_client::write_chunked_stream` and
     /// readable through the `chunked_metrics()` accessor. Folding into
@@ -831,8 +825,6 @@ impl GrpcStore {
             #[cfg(feature = "chunked_fast_slow")]
             chunked_writes_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
-            chunked_v2_writes_enabled: AtomicBool::new(false),
-            #[cfg(feature = "chunked_fast_slow")]
             chunked_metrics: crate::chunked::chunked_client::ChunkedClientMetrics::new(),
         });
 
@@ -856,12 +848,10 @@ impl GrpcStore {
             store.enable_chunked_writes();
         }
 
-        // #550 Phase 3: honor the V2 dispatcher config knob. Same
-        // compile-ship/flip-later pattern as V1.
-        #[cfg(feature = "chunked_fast_slow")]
-        if spec.chunked_v2_writes_enabled {
-            store.enable_chunked_v2_writes();
-        }
+        // v1 WriteChunked removed: `spec.chunked_v2_writes_enabled` is now
+        // vestigial (parsed + ignored — see the `GrpcSpec` field doc).
+        // `update_via_chunked_inner` dispatches V2 unconditionally, so
+        // there is no runtime flag to honor here.
 
         Ok(store)
     }
@@ -903,37 +893,6 @@ impl GrpcStore {
     #[must_use]
     pub fn chunked_writes_enabled(&self) -> bool {
         self.chunked_writes_enabled.load(Ordering::Relaxed)
-    }
-
-    /// #550 Phase 3 runtime kill-switch: enable the V2 dispatcher
-    /// (`WorkerApiWriteChunkedV2Dispatcher`) inside
-    /// `update_via_chunked_inner()`. Default OFF — preserves V1
-    /// behavior. Flip ON for opt-in rollout.
-    #[cfg(feature = "chunked_fast_slow")]
-    pub fn enable_chunked_v2_writes(&self) {
-        self.chunked_v2_writes_enabled.store(true, Ordering::Relaxed);
-        tracing::info!(
-            instance_name = %self.instance_name,
-            "GrpcStore: chunked V2 writes enabled (WorkerApi/WriteChunkedV2 path active for blobs >= CHUNK_SIZE)",
-        );
-    }
-
-    /// Operator kill-switch: disable the V2 dispatcher. Falls back to
-    /// the V1 (`WorkerApiWriteChunkedDispatcher`) path.
-    #[cfg(feature = "chunked_fast_slow")]
-    pub fn disable_chunked_v2_writes(&self) {
-        self.chunked_v2_writes_enabled.store(false, Ordering::Relaxed);
-        tracing::info!(
-            instance_name = %self.instance_name,
-            "GrpcStore: chunked V2 writes disabled (V1 path)",
-        );
-    }
-
-    /// Inspector for the V2 dispatcher kill-switch.
-    #[cfg(feature = "chunked_fast_slow")]
-    #[must_use]
-    pub fn chunked_v2_writes_enabled(&self) -> bool {
-        self.chunked_v2_writes_enabled.load(Ordering::Relaxed)
     }
 
     /// Read-only accessor for the chunked-write metrics. Used by
@@ -3574,8 +3533,8 @@ impl GrpcStore {
         reader: DropCloserReadHalf,
     ) -> Result<(), Error> {
         use crate::chunked::chunked_client::{
-            ChunkedClientOptions, WorkerApiWriteChunkedDispatcher,
-            WorkerApiWriteChunkedV2Dispatcher, WriteChunkedDispatcher, write_chunked_stream,
+            ChunkedClientOptions, WorkerApiWriteChunkedV2Dispatcher, WriteChunkedDispatcher,
+            write_chunked_stream,
         };
 
         let options: ChunkedClientOptions = grpc_store_chunked_client_options();
@@ -3600,10 +3559,12 @@ impl GrpcStore {
                 // Fresh-Arc-per-call: clone the manager handle so the
                 // factory closure can be `'static`. ConnectionManager
                 // is internally Arc-wrapped, so cloning is cheap.
+                // v1 WriteChunked removed: dispatch V2 unconditionally
+                // (workers run V2 fleet-wide). No `chunked_v2_writes_enabled`
+                // branch — there is no other worker upload path to select.
                 let cm_clone = cm.clone();
                 let acquire_timeout_ms = self.connection_acquire_timeout_ms;
-                let v2 = self.chunked_v2_writes_enabled.load(Ordering::Relaxed);
-                let dispatcher: Box<dyn WriteChunkedDispatcher> = if v2 {
+                let dispatcher: Box<dyn WriteChunkedDispatcher> =
                     Box::new(WorkerApiWriteChunkedV2Dispatcher::with_factory(move || {
                         let cm = cm_clone.clone();
                         Box::pin(async move {
@@ -3619,50 +3580,26 @@ impl GrpcStore {
                             }
                             .err_tip(|| "in GrpcStore::update_via_chunked_inner (tcp)")
                         })
-                    }))
-                } else {
-                    Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
-                        let cm = cm_clone.clone();
-                        Box::pin(async move {
-                            match acquire_timeout_ms {
-                                Some(ms) => {
-                                    cm.connection_with_timeout(
-                                        "worker_api_write_chunked".to_string(),
-                                        Duration::from_millis(ms),
-                                    )
-                                    .await
-                                }
-                                None => cm.connection("worker_api_write_chunked".to_string()).await,
-                            }
-                            .err_tip(|| "in GrpcStore::update_via_chunked_inner (tcp)")
-                        })
-                    }))
-                };
+                    }));
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
             #[cfg(feature = "quic")]
             Transport::Quic(ch) => {
+                // v1 WriteChunked removed: dispatch V2 unconditionally.
                 let ch = ch.clone();
-                let v2 = self.chunked_v2_writes_enabled.load(Ordering::Relaxed);
-                let dispatcher: Box<dyn WriteChunkedDispatcher> = if v2 {
+                let dispatcher: Box<dyn WriteChunkedDispatcher> =
                     Box::new(WorkerApiWriteChunkedV2Dispatcher::with_factory(move || {
                         let ch = ch.clone();
                         Box::pin(async move { Ok(ch) })
-                    }))
-                } else {
-                    Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
-                        let ch = ch.clone();
-                        Box::pin(async move { Ok(ch) })
-                    }))
-                };
+                    }));
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
             #[cfg(feature = "quic")]
             Transport::Dual { tcp, .. } => {
+                // v1 WriteChunked removed: dispatch V2 unconditionally.
                 let cm_clone = tcp.clone();
                 let acquire_timeout_ms = self.connection_acquire_timeout_ms;
-                let v2 = self.chunked_v2_writes_enabled.load(Ordering::Relaxed);
-                let dispatcher: Box<dyn WriteChunkedDispatcher> = if v2 {
+                let dispatcher: Box<dyn WriteChunkedDispatcher> =
                     Box::new(WorkerApiWriteChunkedV2Dispatcher::with_factory(move || {
                         let cm = cm_clone.clone();
                         Box::pin(async move {
@@ -3678,25 +3615,7 @@ impl GrpcStore {
                             }
                             .err_tip(|| "in GrpcStore::update_via_chunked_inner (dual/tcp)")
                         })
-                    }))
-                } else {
-                    Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
-                        let cm = cm_clone.clone();
-                        Box::pin(async move {
-                            match acquire_timeout_ms {
-                                Some(ms) => {
-                                    cm.connection_with_timeout(
-                                        "worker_api_write_chunked".to_string(),
-                                        Duration::from_millis(ms),
-                                    )
-                                    .await
-                                }
-                                None => cm.connection("worker_api_write_chunked".to_string()).await,
-                            }
-                            .err_tip(|| "in GrpcStore::update_via_chunked_inner (dual/tcp)")
-                        })
-                    }))
-                };
+                    }));
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
         };

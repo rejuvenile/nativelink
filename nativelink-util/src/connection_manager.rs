@@ -93,7 +93,7 @@ impl ReconnectBackoff {
 /// "share this multi-producer endpoint" pattern.
 ///
 /// Cloning is required by the #212 Phase 2.4 chunked-write
-/// dispatcher (`chunked::chunked_client::WorkerApiWriteChunkedDispatcher`),
+/// dispatcher (`chunked::chunked_client::WorkerApiWriteChunkedV2Dispatcher`),
 /// whose per-attempt `acquire_channel` factory must be `'static`
 /// so the boxed future can outlive the borrow on `&GrpcStore`.
 #[derive(Debug, Clone)]

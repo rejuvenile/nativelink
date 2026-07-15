@@ -1828,19 +1828,21 @@ pub struct GrpcSpec {
     #[serde(default)]
     pub chunked_writes_enabled: bool,
 
-    /// #550 Phase 3 (part of #546 multi-phase pin-lifetime relaxation):
-    /// worker-side WriteChunkedV2 client kill-switch. Default OFF for
-    /// opt-in rollout — set true to route blobs >= `CHUNK_SIZE` through
-    /// the V2 wire shape (`WorkerApi/WriteChunkedV2` bidi RPC with
-    /// per-chunk acks) instead of the V1 unary `WorkerApi/WriteChunked`.
+    /// DEPRECATED / VESTIGIAL (v1 WriteChunked removed): the worker upload
+    /// path is now ALWAYS the V2 wire shape (`WorkerApi/WriteChunkedV2`
+    /// bidi RPC with per-chunk acks). This field is retained ONLY so the
+    /// deployed config — which still carries `chunked_v2_writes_enabled:
+    /// true` — continues to deserialize: `GrpcSpec` is
+    /// `#[serde(deny_unknown_fields)]`, so DROPPING this field would make
+    /// the live config fail to parse. The value is parsed and IGNORED;
+    /// `GrpcStore::update_via_chunked_inner` no longer branches on it.
     ///
-    /// Requires `chunked_writes_enabled=true` AND the
-    /// `chunked_fast_slow` feature compiled in. When true, the
-    /// `update_via_chunked_inner()` path constructs a
-    /// `WorkerApiWriteChunkedV2Dispatcher` instead of the V1 dispatcher;
-    /// the retry loop (`write_chunked_stream`) is identical for both.
+    /// (Historically — #550 Phase 3 — this selected V1 (unary
+    /// `WorkerApi/WriteChunked`) vs V2 (bidi). The V1 dispatcher and its
+    /// server handler were deleted once workers ran V2 fleet-wide, leaving
+    /// V2 as the sole worker upload path; there is nothing left to select.)
     ///
-    /// Default: false (V1 path, pre-#550 behavior)
+    /// Default: false (no effect — V2 is unconditional)
     #[serde(default)]
     pub chunked_v2_writes_enabled: bool,
 

@@ -218,16 +218,6 @@ required-features = ["chunked_fast_slow", "test-utils"]
 name = "chunked_stable_digests_push_test"
 required-features = ["chunked_fast_slow", "test-utils"]
 
-# #212 v4.5 — end-to-end wire-routing test for `WriteChunked` on the
-# `CasExtensions` service. Spins up a real `tonic::transport::Server`
-# registering ONLY `CasExtensions` (not `WorkerApi`) and a real client
-# `CasExtensionsClient`; proves the URI dispatch reaches the
-# `ChunkedWriteHandler`. This was the regression-test gap that let
-# the WorkerApi-routed WriteChunked ship to production unreachable.
-[[test]]
-name = "cas_extensions_routing_test"
-required-features = ["chunked_fast_slow", "test-utils"]
-
 # #494-v3 Phase 2 bidi `WriteChunkedV2` multi-writer race-state tests.
 # Uses `_for_test` constructors / counter accessors gated behind
 # `test-utils` and v2-feature behaviour gated behind `chunked_fast_slow`.

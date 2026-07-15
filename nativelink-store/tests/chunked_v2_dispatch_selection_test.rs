@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! #550 Phase 3: end-to-end test that the `chunked_v2_writes_enabled` flag
-//! selects the correct dispatcher in `update_via_chunked_inner`.
+//! v1 WriteChunked removed: `update_via_chunked_inner` now dispatches the
+//! V2 wire shape UNCONDITIONALLY (the `chunked_v2_writes_enabled` flag is
+//! vestigial). This test proves the worker upload path is always V2.
 //!
 //! Test geometry:
 //! - Bind an in-process `CasExtensions` server whose `write_chunked` records
 //!   "v1" and whose `write_chunked_v2` records "v2".
 //! - Build a `GrpcStore` pointed at the server, enable chunked writes.
-//! - Drive a CHUNK_SIZE blob with V2 flag OFF: must call V1 RPC.
-//! - Enable V2 flag, drive a second blob: must call V2 RPC.
+//! - Drive two CHUNK_SIZE blobs: BOTH must reach the server via the V2 RPC
+//!   (`write_chunked_v2`); the server must NEVER see the v1 `write_chunked`.
 //!
-//! Mutation hint: in `grpc_store.rs` the `if v2 {` branch in
-//! `update_via_chunked_inner` — flipping to `if !v2 {` must cause this test
-//! to fail on the V2 assertion.
+//! Mutation hint: in `grpc_store.rs::update_via_chunked_inner`, swapping the
+//! `WorkerApiWriteChunkedV2Dispatcher` construction back to the (removed)
+//! v1 `WorkerApiWriteChunkedDispatcher` would make the server record "v1"
+//! and this test fails on `assert_eq!(log, &["v2", "v2"])`.
 //!
 //! Transport scope: this test drives the Tcp arm only (`dual_transport:
-//! false`, `use_http3: false` — the production config). The Quic
-//! (`:2588`) and Dual (`:2606`) arms select the dispatcher with the
-//! identical `if v2 { .. } else { .. }` expression; exercising them would
+//! false`, `use_http3: false` — the production config). The Quic and Dual
+//! arms construct the identical V2 dispatcher; exercising them would
 //! require binding a QUIC server for zero additional branch coverage.
 
 #![cfg(feature = "chunked_fast_slow")]
@@ -139,18 +140,17 @@ impl CasExtensions for RecordingServer {
     }
 }
 
-/// #550 Phase 3: end-to-end test verifying that the `chunked_v2_writes_enabled`
-/// flag selects the correct dispatcher (V1 vs V2 RPC) in
-/// `update_via_chunked_inner`.
+/// End-to-end test verifying that `update_via_chunked_inner` dispatches the
+/// V2 RPC UNCONDITIONALLY now that the v1 WriteChunked path is removed.
 ///
 /// This is NOT a tautology — it drives actual writes through the store and
 /// observes which RPC the server receives.
 ///
-/// Mutation verification: flipping `if v2 {` to `if !v2 {` in
-/// `grpc_store.rs::update_via_chunked_inner` must cause the V2 assertion to
-/// fail.
+/// Mutation verification: reverting the V2 dispatcher construction in
+/// `grpc_store.rs::update_via_chunked_inner` to a v1 dispatcher would make
+/// the server record "v1" and the `["v2", "v2"]` assertion fires.
 #[nativelink_test]
-async fn chunked_v2_flag_selects_v2_rpc_end_to_end() -> Result<(), Error> {
+async fn chunked_worker_upload_always_uses_v2_rpc_end_to_end() -> Result<(), Error> {
     let rpc_log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Bind an in-process CasExtensions server on an ephemeral port.
@@ -210,12 +210,13 @@ async fn chunked_v2_flag_selects_v2_rpc_end_to_end() -> Result<(), Error> {
     let store = GrpcStore::new(&spec).await?;
     store.enable_chunked_writes();
 
-    // Write #1: V2 flag is OFF (default). Must select V1 dispatcher → WriteChunked RPC.
-    let blob_v1 = vec![0xa5_u8; CHUNK_SIZE];
-    let digest_v1 = DigestInfo::new(sha256(&blob_v1), CHUNK_SIZE as u64);
+    // Write #1: no flag toggling. v1 removed → MUST select the V2
+    // dispatcher → WriteChunkedV2 RPC.
+    let blob_a = vec![0xa5_u8; CHUNK_SIZE];
+    let digest_a = DigestInfo::new(sha256(&blob_a), CHUNK_SIZE as u64);
     let (mut tx, rx) = make_buf_channel_pair();
     let send_task = tokio::spawn(async move {
-        drop(tx.send(Bytes::from(blob_v1)).await);
+        drop(tx.send(Bytes::from(blob_a)).await);
         drop(tx.send_eof());
     });
 
@@ -223,44 +224,7 @@ async fn chunked_v2_flag_selects_v2_rpc_end_to_end() -> Result<(), Error> {
         Duration::from_secs(10),
         StoreLike::update(
             &*store,
-            StoreKey::from(digest_v1),
-            rx,
-            UploadSizeInfo::ExactSize(CHUNK_SIZE as u64),
-        ),
-    )
-    .await
-    .expect("must not deadlock — V1 dispatch must complete or fail promptly");
-    send_task.abort();
-    result.expect("V1 write must succeed against the recording server");
-
-    {
-        let log = rpc_log.lock().unwrap();
-        assert_eq!(
-            log.as_slice(),
-            &["v1"],
-            "#550 Phase 3: flag=false MUST select the V1 dispatcher (WriteChunked RPC), \
-             but got {:?}. The if/else branch in update_via_chunked_inner is not gating \
-             on the correct flag value.",
-            *log
-        );
-    }
-
-    // Enable V2 flag, write #2. Must select V2 dispatcher → WriteChunkedV2 RPC.
-    store.enable_chunked_v2_writes();
-
-    let blob_v2 = vec![0xb3_u8; CHUNK_SIZE];
-    let digest_v2 = DigestInfo::new(sha256(&blob_v2), CHUNK_SIZE as u64);
-    let (mut tx, rx) = make_buf_channel_pair();
-    let send_task = tokio::spawn(async move {
-        drop(tx.send(Bytes::from(blob_v2)).await);
-        drop(tx.send_eof());
-    });
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        StoreLike::update(
-            &*store,
-            StoreKey::from(digest_v2),
+            StoreKey::from(digest_a),
             rx,
             UploadSizeInfo::ExactSize(CHUNK_SIZE as u64),
         ),
@@ -268,17 +232,52 @@ async fn chunked_v2_flag_selects_v2_rpc_end_to_end() -> Result<(), Error> {
     .await
     .expect("must not deadlock — V2 dispatch must complete or fail promptly");
     send_task.abort();
-    result.expect("V2 write must succeed against the recording server");
+    result.expect("write #1 must succeed against the recording server");
 
     {
         let log = rpc_log.lock().unwrap();
         assert_eq!(
             log.as_slice(),
-            &["v1", "v2"],
-            "#550 Phase 3: after enable_chunked_v2_writes(), the V2 dispatcher \
-             (WriteChunkedV2 RPC) MUST be selected. Got {:?}. \
-             This proves the if/else branch in update_via_chunked_inner gates \
-             on the correct flag value.",
+            &["v2"],
+            "v1 WriteChunked removed: the FIRST worker upload MUST select the V2 \
+             dispatcher (WriteChunkedV2 RPC), but got {:?}. update_via_chunked_inner \
+             must construct WorkerApiWriteChunkedV2Dispatcher unconditionally.",
+            *log
+        );
+    }
+
+    // Write #2 (no toggling): also MUST select V2.
+    let blob_b = vec![0xb3_u8; CHUNK_SIZE];
+    let digest_b = DigestInfo::new(sha256(&blob_b), CHUNK_SIZE as u64);
+    let (mut tx, rx) = make_buf_channel_pair();
+    let send_task = tokio::spawn(async move {
+        drop(tx.send(Bytes::from(blob_b)).await);
+        drop(tx.send_eof());
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        StoreLike::update(
+            &*store,
+            StoreKey::from(digest_b),
+            rx,
+            UploadSizeInfo::ExactSize(CHUNK_SIZE as u64),
+        ),
+    )
+    .await
+    .expect("must not deadlock — V2 dispatch must complete or fail promptly");
+    send_task.abort();
+    result.expect("write #2 must succeed against the recording server");
+
+    {
+        let log = rpc_log.lock().unwrap();
+        assert_eq!(
+            log.as_slice(),
+            &["v2", "v2"],
+            "v1 WriteChunked removed: EVERY worker upload MUST select the V2 \
+             dispatcher (WriteChunkedV2 RPC); the server must NEVER receive the v1 \
+             write_chunked RPC. Got {:?}. If a \"v1\" appears, update_via_chunked_inner \
+             is still constructing the removed V1 dispatcher.",
             *log
         );
     }
