@@ -1005,9 +1005,8 @@ fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32, has_repor
     }
 }
 
-/// (#sched M1 rebalance v2) Dispatch-count P-headroom predicate with a BOUNDED
-/// `p_load` override (design §2). A worker has P-headroom when ANY of three
-/// clauses (precedence order) holds:
+/// (#sched-work-conservation) Dispatch-count P-headroom predicate. A worker has
+/// P-headroom when ANY of these clauses (precedence order) holds:
 ///
 /// 1. **A5** (`p_core_count == 0`, legacy / Linux / Intel-Mac / pre-populated)
 ///    — UNGATED (always has headroom) so it degrades to current behavior rather
@@ -1017,28 +1016,41 @@ fn effective_load_score(p_load: u32, e_load: u32, aggregate_load: u32, has_repor
 ///    in-flight count (`running_action_infos`, updated under the write lock on
 ///    assign + completion — never stale, closes red-team R3 / invariant I5).
 ///    Unchanged from v1.
-/// 3. **NEW bounded override** — admits a worker at/over its P-slot count IFF
-///    its reported `p_core_load_pct` says the P cores are actually idle
+/// 3. **Total-core term (work conservation)** — admits a worker whose P-slots
+///    are full while ANY logical core (P **or** E) is still idle, i.e. while
+///    `running < p_core_count + e_core_count`. This is the fix for the stranded
+///    E-cores: a CPU-bound worker at `running == p_core_count` used to lose all
+///    cache-tier eligibility and be soft-deprioritized DESPITE idle E-cores;
+///    macOS QoS spills the extra actions onto the E-cores (empirically
+///    confirmed). UNCONDITIONAL of `p_load` — it is a capacity term, not a load
+///    override. The RAM backstop is the live memory-pressure gate (worker sets
+///    `swap_pressured`/`disk_pressured`; scheduler hard-skips such workers),
+///    NOT this predicate. This is the load-bearing bound for I5_Bounded on the
+///    CPU-bound path: `running` is finite and monotone, so the gate shuts at the
+///    p+e equilibrium.
+/// 4. **Bounded idle-P override** — admits a worker past `p_core_count` IFF its
+///    reported `p_core_load_pct` says the P cores are actually idle
 ///    (`< idle_threshold_pct`; I/O-bound actions leave P idle) AND it is still
-///    under a FRESH-count ceiling `p_core_count * override_factor`. The ceiling
-///    is the load-bearing bound (design §3, invariant I5_Bounded): however
-///    stale-low `p_load` is, the override admits to at most
-///    `p_core_count * override_factor` in-flight actions — past that the fresh
-///    count shuts the gate, so a fully-adversarial stale reading yields bounded
-///    over-concentration, NOT the runaway R3 pileup.
+///    under a FRESH-count ceiling `p_core_count * override_factor`. Unchanged
+///    from v1. For an I/O-bound worker the effective cap is thus
+///    `max(p_core_count + e_core_count, p_core_count * override_factor)` — with
+///    the prod config (p=4, e=6, factor=4) that is `max(10, 16) = 16`, so the
+///    I/O-bound ceiling is UNCHANGED (no regression); the total-core term only
+///    lifts the CPU-bound path (which the override never rescued).
 ///
-/// `idle_threshold_pct == 0` (the default) makes clause 3 `p_load < 0` = never,
-/// so v2 collapses to EXACT v1. Consts are THREADED as params (this is a free
-/// `fn(&Worker)`, no `self`); both call sites — the cache-tier gate
-/// (`inner_find_and_reserve_worker`) and the fallback's soft tier
-/// (`inner_find_worker_for_action`) — pass the scheduler's configured values.
-/// All comparisons are `u64` to match `running_action_infos.len(): usize`
-/// against `p_core_count: u32` without truncation, and `u64::from(p_core_count)
-/// * u64::from(override_factor)` cannot overflow (u32*u32 fits in u64).
+/// Consts are THREADED as params (this is a free `fn(&Worker)`, no `self`); both
+/// call sites — the cache-tier gate (`inner_find_and_reserve_worker`) and the
+/// fallback's soft tier (`inner_find_worker_for_action`) — pass the scheduler's
+/// configured values. `e_core_count` rides on the `Worker` (set via
+/// `set_core_counts`) and is read directly, so no signature change. All
+/// comparisons are `u64` to match `running_action_infos.len(): usize` against
+/// `u32` core counts without truncation; `u64::from(p) + u64::from(e)` and
+/// `u64::from(p) * u64::from(factor)` cannot overflow (u32 op u32 fits in u64).
 fn worker_has_p_headroom(w: &Worker, idle_threshold_pct: u32, override_factor: u32) -> bool {
     let running = w.running_action_infos.len() as u64;
     w.p_core_count == 0
         || running < u64::from(w.p_core_count)
+        || running < u64::from(w.p_core_count) + u64::from(w.e_core_count)
         || (w.p_core_load_pct < idle_threshold_pct
             && running < u64::from(w.p_core_count) * u64::from(override_factor))
 }
@@ -1060,20 +1072,26 @@ fn worker_has_p_headroom(w: &Worker, idle_threshold_pct: u32, override_factor: u
 ///   ungated) → `0` — BEST. (A5 is not in the §12.1 pseudocode but §5 I4 /
 ///   §12.3 require an ungated worker to rank byte-identically to v1, i.e. by
 ///   load alone; giving it pref 0 keeps it in the top tier where v1 left it.)
-/// - override-admit (clause 3 fired: `p_load < threshold && running <
-///   p_core_count * factor`) → `1 + (running - p_core_count)` — the
-///   `+ (running - p_core_count)` is the FRESH over-subscription (never stale),
-///   so a more-oversubscribed override worker ranks strictly WORSE. This decays
-///   the override worker's preference as it fills toward the ceiling (closing
-///   red-team's "duration-of-preference" gap: a stale-low `p_load` can no
-///   longer hold it at the top of the ranking as it accumulates work), and is
-///   the LOAD-BEARING term for `PrefMonotone` (§13 R1: KEEP it).
+/// - E-spill / override-admit (eligible by the total-core term
+///   `running < p_core_count + e_core_count`, OR the bounded idle-P override
+///   `p_load < threshold && running < p_core_count * factor`) →
+///   `1 + (running - p_core_count)` — the `+ (running - p_core_count)` is the
+///   FRESH over-subscription (never stale), so a more-oversubscribed worker
+///   ranks strictly WORSE (`PrefMonotone`). A genuine free-P-slot worker (pref
+///   0) therefore ALWAYS out-ranks an E-spill/override worker (pref >= 1) — I6
+///   holds and the lift stays SOFT (this is a ranking penalty, never a hard
+///   filter — Phase2NoLift). The E-spill zone reuses the SAME decay formula as
+///   the idle-P override so a CPU-bound worker spilling to E-cores decays out of
+///   preference exactly as an I/O-bound override worker does.
 /// - no headroom → `u64::MAX` — only reachable on the soft fallback path (the
 ///   cache tiers already excluded such workers via `worker_is_viable_gated`).
+///   pref-finite ⟺ `worker_has_p_headroom` admits, so the ranker and the gate
+///   agree on eligibility.
 ///
 /// Overflow-safe: `1 + (running - p_core_count)` is computed in `u64` and the
-/// subtraction is guarded by the branch order (`running >= p_core_count` on the
-/// override arm), so it never underflows.
+/// subtraction is guarded by the branch order (the free-slot/A5 arm already
+/// returned for `running < p_core_count` and `p_core_count == 0`, so
+/// `running >= p_core_count` here), so it never underflows.
 fn p_headroom_pref(
     w: &Worker,
     p_gate_active: bool,
@@ -1088,11 +1106,13 @@ fn p_headroom_pref(
     if w.p_core_count == 0 || running < u64::from(w.p_core_count) {
         return 0;
     }
-    // Override-admit (clause 3): eligible up to the fresh-count ceiling,
-    // fresh-count-penalized so preference decays toward the ceiling.
-    if w.p_core_load_pct < idle_threshold_pct
-        && running < u64::from(w.p_core_count) * u64::from(override_factor)
-    {
+    // Eligible by the total-core term (E-spill onto idle E-cores) OR the bounded
+    // idle-P override: ranked strictly below a free P slot, fresh-count-penalized
+    // so preference decays toward the equilibrium/ceiling.
+    let has_e_spill = running < u64::from(w.p_core_count) + u64::from(w.e_core_count);
+    let has_io_override = w.p_core_load_pct < idle_threshold_pct
+        && running < u64::from(w.p_core_count) * u64::from(override_factor);
+    if has_e_spill || has_io_override {
         return 1 + (running - u64::from(w.p_core_count));
     }
     // No headroom (only reachable on the soft, never-filtering fallback path).
@@ -5580,6 +5600,9 @@ impl ApiWorkerScheduler {
                     // driver the gate keys on. Do NOT zero it.
                     running: w.running_action_infos.len() as u64,
                     p_core_count: w.p_core_count,
+                    // (#sched-work-conservation) SEED the real E-core count so the
+                    // gauge's total-core term matches the dispatch gate.
+                    e_core_count: w.e_core_count,
                     p_core_load_pct: w.p_core_load_pct,
                     load_penalty: cap.load_penalty,
                 });
@@ -9396,6 +9419,58 @@ mod tests {
         );
     }
 
+    /// (#sched-work-conservation, I6 + PrefMonotone for the E-spill zone) The
+    /// total-core term makes a CPU-bound worker eligible in the E-spill band
+    /// `[p_core_count, p+e)`, but its ranking must stay SOFT and P-first: a
+    /// genuine free-P-slot worker (pref 0) still out-ranks any E-spill worker
+    /// (pref >= 1), and a more-oversubscribed E-spill worker ranks strictly worse
+    /// (the `1 + (running - p_core_count)` fresh-count decay). CPU-bound (p_load
+    /// 98 >= threshold 50) kills the idle-P override, so the E-spill term is the
+    /// ONLY thing granting these workers a finite pref — isolating the new zone.
+    ///
+    /// MUTATION: replace the E-spill pref `1 + (running - p_core_count)` with a
+    /// CONSTANT → `pref_lo == pref_hi`, so `pref_lo < pref_hi` RED-fails (P-first
+    /// decay broken); the `assert_eq!` on the exact pref values also RED-fails.
+    #[test]
+    fn test_p_headroom_pref_e_spill_zone_ranks_below_free_and_monotone() {
+        // p=4, e=6 (total 10), CPU-bound so only the E-spill term admits.
+        let mut free = worker_with_running("FREE", 4, 98, 3); // free P slot
+        free.set_core_counts(4, 6);
+        let mut spill_lo = worker_with_running("SPILL_LO", 4, 98, 5); // E-spill
+        spill_lo.set_core_counts(4, 6);
+        let mut spill_hi = worker_with_running("SPILL_HI", 4, 98, 8); // E-spill, more sub
+        spill_hi.set_core_counts(4, 6);
+
+        let pref_free = p_headroom_pref(&free, true, 50, 4);
+        let pref_lo = p_headroom_pref(&spill_lo, true, 50, 4);
+        let pref_hi = p_headroom_pref(&spill_hi, true, 50, 4);
+
+        assert_eq!(
+            pref_free, 0,
+            "free P slot (running 3 < p_count 4) → pref 0 (BEST), even with 6 \
+             E-cores and a CPU-bound p_load"
+        );
+        assert_eq!(
+            pref_lo, 2,
+            "E-spill pref = 1 + (running(5) - p_count(4)) = 2 (the total-core \
+             term reuses the fresh-count decay formula)"
+        );
+        assert_eq!(
+            pref_hi, 5,
+            "E-spill pref = 1 + (running(8) - p_count(4)) = 5"
+        );
+        assert!(
+            pref_free < pref_lo,
+            "I6: a genuine free-P-slot worker (pref 0) must rank ABOVE any \
+             E-spill worker (pref >= 1) — the E-spill lift stays SOFT and P-first"
+        );
+        assert!(
+            pref_lo < pref_hi,
+            "PrefMonotone: the more-oversubscribed E-spill worker ranks strictly \
+             worse — the `1 + (running - p_core_count)` decay is load-bearing"
+        );
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // #sched: p_headroom dispatch-gate regime pins (TESTS ONLY, no behavior
     // change). These isolate the pure predicate `worker_has_p_headroom` and
@@ -9406,17 +9481,21 @@ mod tests {
     // ════════════════════════════════════════════════════════════════════
 
     /// Pure helper: the LARGEST `running` for which `worker_has_p_headroom`
-    /// still admits a worker at `(p_count, p_load)` under `(threshold, factor)`.
-    /// Loops `running` upward from 0, capped at 64 to stay bounded, and asserts
-    /// it found a cap strictly below the ceiling (a runaway gate would return
-    /// 64 and trip the assert). The gate is monotone non-increasing in `running`
-    /// (both live clauses `running < p_count` and `running < p_count*factor` can
-    /// only go false as `running` grows), so the largest admitting `running` is
-    /// the last one before the gate shuts; `+ 1` is the per-worker in-flight cap.
-    fn max_admit_running(p_count: u32, p_load: u32, threshold: u32, factor: u32) -> u64 {
+    /// still admits a worker at `(p_count, e_count, p_load)` under
+    /// `(threshold, factor)`. Loops `running` upward from 0, capped at 64 to
+    /// stay bounded, and asserts it found a cap strictly below the ceiling (a
+    /// runaway gate would return 64 and trip the assert). The gate is monotone
+    /// non-increasing in `running` (every live clause — `running < p_count`,
+    /// `running < p_count + e_count`, `running < p_count*factor` — can only go
+    /// false as `running` grows), so the largest admitting `running` is the last
+    /// one before the gate shuts; `+ 1` is the per-worker in-flight cap. Sets a
+    /// REAL `e_count` (the fixture defaults it to 0) so the total-core term is
+    /// exercised.
+    fn max_admit_running(p_count: u32, e_count: u32, p_load: u32, threshold: u32, factor: u32) -> u64 {
         let mut best: Option<u64> = None;
         for running in 0..=64usize {
-            let w = worker_with_running("cap", p_count, p_load, running);
+            let mut w = worker_with_running("cap", p_count, p_load, running);
+            w.set_core_counts(p_count, e_count);
             if worker_has_p_headroom(&w, threshold, factor) {
                 best = Some(running as u64);
             }
@@ -9426,137 +9505,150 @@ mod tests {
         assert!(
             best < 64,
             "max_admit_running must terminate strictly below the loop ceiling \
-             (64) for p_count={p_count} p_load={p_load} threshold={threshold} \
-             factor={factor}; got {best} (a runaway cap would hit the ceiling)"
+             (64) for p_count={p_count} e_count={e_count} p_load={p_load} \
+             threshold={threshold} factor={factor}; got {best} (a runaway cap \
+             would hit the ceiling)"
         );
         best
     }
 
-    /// (#sched regime 1) The EXACT live regime: P cores genuinely CPU-bound on a
-    /// compile backlog (`p_load` pinned 90-100%), P-slots full. Proves the
-    /// idle-P override cannot rescue it in EITHER config — the load-bearing fact
-    /// that the io_bound override is the WRONG lever for a CPU-saturated build.
+    /// (#sched-work-conservation regime 1) The EXACT live regime: P cores
+    /// genuinely CPU-bound on a compile backlog (`p_load` pinned 90-100%),
+    /// P-slots full. The work-conservation fix adds an UNCONDITIONAL total-core
+    /// term (`running < p_core_count + e_core_count`), so a CPU-bound worker with
+    /// 6 idle E-cores now KEEPS headroom for those E-core slots (running 4..9)
+    /// and only LOSES it at the p+e = 10 equilibrium — macOS QoS spills the extra
+    /// actions onto the E-cores. The idle-P override (threshold 50, factor 4 —
+    /// the PROD config) is dead for a CPU-bound worker (`p_load >= 50`), so the
+    /// total-core term is the ONLY thing granting the E-core headroom here.
     #[test]
     fn test_worker_has_p_headroom_live_compile_backlog_regime() {
         for p_load in [90u32, 95, 98, 100] {
-            // 4 P-cores, `running == p_core_count` (P-slots full), P CPU-bound.
-            let w = worker_with_running("BACKLOG", 4, p_load, 4);
+            // CPU-bound worker: 4 P-cores + 6 E-cores = 10 total. The fixture
+            // defaults e_core_count to 0, so set the REAL 6 E-cores explicitly —
+            // this is what the total-core term reads.
+            for running in 4..=9 {
+                let mut w = worker_with_running("BACKLOG", 4, p_load, running);
+                w.set_core_counts(4, 6);
+                // Prod config: threshold 50, factor 4. The idle-P override is dead
+                // (p_load >= 90 >= 50), so headroom here comes ONLY from the
+                // total-core term `running < p+e = 10` → work is spilled to the
+                // 6 idle E-cores instead of stranding the queue.
+                assert!(
+                    worker_has_p_headroom(&w, 50, 4),
+                    "live regime p_load={p_load}: a CPU-bound worker with 6 idle \
+                     E-cores KEEPS headroom at running={running} (< p+e = 10) — the \
+                     total-core term spills the extra actions to E-cores rather \
+                     than stranding them behind the queue (work conservation)"
+                );
+            }
 
-            // threshold 0 (the PROD default `p_idle_threshold_pct`): the override
-            // clause `p_load < 0` is never true → v2 collapses to EXACT v1 →
-            // `running(4)` NOT `< p_count(4)` → DENIED. This is the ~4/worker cap
-            // that pinned the live fleet at ~40 in-flight behind a 100-deep queue.
+            // Equilibrium: `running == p+e = 10` (P AND E slots full). The
+            // total-core term shuts (`10 < 10` false) and the idle-P override is
+            // dead (p_load >= 50) → DENIED. This is the new ~10/worker cap, up from
+            // the old ~4/worker that pinned the live fleet at ~40 in-flight.
+            let mut w_full = worker_with_running("BACKLOG_FULL", 4, p_load, 10);
+            w_full.set_core_counts(4, 6);
             assert!(
-                !worker_has_p_headroom(&w, 0, 2),
-                "live regime p_load={p_load}: at threshold 0 (prod default) the \
-                 idle-P override is dead (`p_load < 0` never) → v1 collapse → a \
-                 full-P worker (running==p_core_count) is DENIED"
-            );
-
-            // Even with the idle-P override "enabled" (threshold 50), a CPU-bound
-            // worker (p_load >= 90 >= 50) is STILL denied: `p_load < threshold` is
-            // false, so clause 3's idle-P precondition can never hold. Enabling
-            // the io_bound override does NOT relax a CPU-bound compile backlog —
-            // it is the WRONG lever for CPU-saturated builds (E-core spill needs a
-            // code change, per the 2026-07-15 E-core spill-gate design).
-            assert!(
-                !worker_has_p_headroom(&w, 50, 2),
-                "live regime p_load={p_load}: enabling the idle-P override \
-                 (threshold 50) does NOT relax a CPU-bound worker — p_load({p_load}) \
-                 >= threshold(50) makes clause 3's idle-P precondition false → \
-                 DENIED. The idle-P override is the WRONG lever for CPU-saturated \
-                 compile backlogs"
+                !worker_has_p_headroom(&w_full, 50, 4),
+                "live regime p_load={p_load}: at running == p+e(10) both P and E \
+                 slots are full and the idle-P override is dead (p_load({p_load}) \
+                 >= threshold(50)) → DENIED — the total-core term is the resource \
+                 bound (I5_Bounded), the memory-pressure gate the RAM backstop"
             );
         }
     }
 
-    /// (#sched regime 2) The gate is BLIND to E-core capacity: it reads only
-    /// `running`, `p_core_count`, `p_core_load_pct` — never `e_core_count`. So
-    /// "spill CPU-bound work onto idle E-cores" is NOT achievable by config; it
-    /// needs a code change. Uses a REAL `e_core_count = 6` (4 P + 6 E = 10 total
-    /// cores) and shows the 6 idle E-cores do not lift the 4-slot cap.
+    /// (#sched-work-conservation regime 2) The gate now CONSULTS E-core
+    /// capacity: a CPU-bound worker whose P-slots are full still has headroom for
+    /// the idle E-core slots via the total-core term (`running < p_core_count +
+    /// e_core_count`). This is the work-conservation fix — idle E-cores are no
+    /// longer stranded behind a deep queue. (This test's PREMISE inverts the
+    /// pre-fix `_ignores_e_cores`, which asserted the gate was E-core-blind.)
     ///
     /// MUTATION NOTE: commenting the `w.set_core_counts(4, 6)` line (reverting
-    /// e_core_count to 0) leaves this test GREEN — the deny is identical either
-    /// way, proving it is the GATE's blindness, not the fixture, that strands the
-    /// E capacity. No assertion below depends on `e_core_count` being 6.
+    /// e_core_count to 0) makes `total_cores` collapse to `p_core_count(4)`, so a
+    /// full-P worker (running >= 4) is DENIED and the admit assertions below
+    /// RED-fail — proving it is the E-core term reading a REAL `e_core_count`
+    /// that lifts the cap, not the fixture.
     #[test]
-    fn test_worker_has_p_headroom_ignores_e_cores() {
-        // Live worker: 4 P-cores, p_load 98 (CPU-bound), P-slots full (running 4).
-        let mut w = worker_with_running("ECORE", 4, 98, 4);
-        // Give it 6 REAL E-cores → 4 P + 6 E = 10 total cores, 6 of them idle.
-        w.set_core_counts(4, 6);
-
-        // The 6 idle E-cores cannot admit the worker at the prod default
-        // (threshold 0) — the gate never consults `e_core_count`.
+    fn test_worker_has_p_headroom_spills_to_e_cores() {
+        // CPU-bound worker (p_load 98 >= threshold 50 → idle-P override DEAD),
+        // 4 P + 6 E = 10 total cores. The total-core term is the ONLY thing
+        // granting headroom in the E-spill band [p_core_count, p+e).
+        for running in 4..=9 {
+            let mut w = worker_with_running("ECORE", 4, 98, running);
+            w.set_core_counts(4, 6);
+            assert!(
+                worker_has_p_headroom(&w, 50, 4),
+                "E-spill: a CPU-bound worker with 6 idle E-cores HAS headroom at \
+                 running={running} (< p+e = 10) even though its 4 P-slots are full \
+                 and p_load(98) >= threshold(50) kills the idle-P override"
+            );
+        }
+        // Equilibrium: `running == p+e = 10` → E-cores full too → DENIED.
+        let mut w_full = worker_with_running("ECORE_FULL", 4, 98, 10);
+        w_full.set_core_counts(4, 6);
         assert!(
-            !worker_has_p_headroom(&w, 0, 2),
-            "gate is blind to E-cores: 6 idle E-cores do NOT admit a worker whose \
-             4 P-slots are full at threshold 0 (v1 collapse) — stranded capacity"
-        );
-        // Nor with the idle-P override enabled (threshold 50): p_load(98) >= 50
-        // keeps it denied. The 6 idle E-cores are unreachable by config alone.
-        assert!(
-            !worker_has_p_headroom(&w, 50, 2),
-            "gate is blind to E-cores: even with the idle-P override enabled \
-             (threshold 50), p_load(98) >= 50 keeps a 10-core worker denied — the \
-             6 idle E-cores are unreachable capacity without a code change"
+            !worker_has_p_headroom(&w_full, 50, 4),
+            "E-spill equilibrium: at running == p+e(10) both P and E slots are \
+             full and the CPU-bound override is dead (p_load 98 >= 50) → DENIED"
         );
 
-        // Quantify the stranded capacity: the per-worker eligibility cap is
-        // p_core_count (4), NOT the 10 total cores. `max_admit_running` builds
-        // e_core_count=0 workers, which is exactly the point — it returns the
-        // SAME cap (3 → 4) because the gate never reads `e_core_count`. So a
-        // 10-core worker admits no more actions than a 4-core one.
-        let per_worker_cap = max_admit_running(4, 98, 0, 2) + 1;
+        // Quantify the reclaimed capacity: the per-worker eligibility cap is now
+        // the 10 total cores (4 P + 6 E), NOT p_core_count(4). `max_admit_running`
+        // now seeds the real e_count, so it exercises the total-core term.
+        let per_worker_cap = max_admit_running(4, 6, 98, 50, 4) + 1;
         assert_eq!(
-            per_worker_cap, 4,
-            "per-worker eligibility cap is p_core_count(4) even though the worker \
-             has 10 total cores (4 P + 6 E) — the 6 E-cores are stranded"
+            per_worker_cap, 10,
+            "per-worker eligibility cap is p+e = 10 (4 P + 6 E) — the 6 E-cores \
+             are no longer stranded (work conservation)"
         );
     }
 
-    /// (#sched regime 3) Turn "why only 4/worker → 40 fleet-wide" into an
-    /// assertion. Ties the per-worker predicate cap to the observed live
-    /// `run=40` across 10 workers, and contrasts with the idle-P override raising
-    /// the ceiling to 8/worker ONLY when P is reported idle.
+    /// (#sched-work-conservation regime 3) Turn the new per-worker → fleet cap
+    /// into an assertion. The work-conservation fix raises the CPU-bound
+    /// per-worker cap from ~4 (p_core_count) to 10 (p+e), so the fleet cap rises
+    /// from 40 to 100 (10 workers × 10). Contrasts with the idle-P override,
+    /// which still lifts the ceiling to `p_count*factor = 16` for genuinely
+    /// idle-P workers.
     #[test]
     fn test_p_headroom_per_worker_and_fleet_cap() {
-        // CPU-bound live regime at the prod default (threshold 0): the last
-        // admitting `running` is 3 → the gate stops dispatching once `running`
-        // reaches p_core_count(4).
-        let last_admit_cpu = max_admit_running(4, 98, 0, 2);
+        // CPU-bound live regime at the prod config (threshold 50, factor 4):
+        // the idle-P override is dead (p_load 98 >= 50), so the total-core term
+        // `running < p+e = 10` is the bound → the last admitting `running` is 9.
+        let last_admit_cpu = max_admit_running(4, 6, 98, 50, 4);
         assert_eq!(
-            last_admit_cpu, 3,
-            "threshold 0, CPU-bound (p_load 98): last admitting running is 3 → \
-             dispatch stops when running reaches p_core_count(4)"
+            last_admit_cpu, 9,
+            "prod config (threshold 50, factor 4), CPU-bound (p_load 98): last \
+             admitting running is 9 → dispatch stops when running reaches p+e(10)"
         );
         let per_worker_cap = last_admit_cpu + 1;
         assert_eq!(
-            per_worker_cap, 4,
-            "per-worker in-flight cap = last-admit(3) + 1 = 4 (== p_core_count) — \
-             the ~4/worker the live heavy build showed"
+            per_worker_cap, 10,
+            "per-worker in-flight cap = last-admit(9) + 1 = 10 (== p+e = 4 P + 6 E) \
+             — up from the old ~4/worker (p_core_count) that stranded E-cores"
         );
 
-        // Fleet-wide: 10 workers × 4/worker = 40 in-flight, exactly the live
-        // `run=40` observed while a 100-deep queue waited behind it.
+        // Fleet-wide: 10 workers × 10/worker = 100 in-flight, up from the old
+        // ~40 that pinned the fleet behind a 100-deep queue.
         assert_eq!(
             per_worker_cap * 10,
-            40,
-            "fleet cap = per-worker cap(4) × 10 workers = 40 in-flight — ties the \
-             predicate cap to the observed live run=40 (100-deep queue behind it)"
+            100,
+            "fleet cap = per-worker cap(10) × 10 workers = 100 in-flight — the \
+             work-conservation lift from the old 40 (E-cores now recruited)"
         );
 
-        // Contrast: ONLY when P is reported IDLE (p_load 10 < threshold 50) does
-        // the override lift the ceiling to p_count*factor = 8, so the last
-        // admitting `running` is 7 (deny at 8). The ceiling rises to 8/worker
-        // only for genuinely idle-P workers, NEVER under a CPU-bound backlog.
-        let last_admit_idle = max_admit_running(4, 10, 50, 2);
+        // Contrast: an I/O-bound worker (p_load 10 < threshold 50) is admitted
+        // even PAST p+e via the idle-P override up to `p_count*factor = 16`, so
+        // the last admitting `running` is 15 (deny at 16) — the override ceiling
+        // is UNCHANGED by the total-core term (max(p+e=10, override=16) = 16).
+        let last_admit_idle = max_admit_running(4, 6, 10, 50, 4);
         assert_eq!(
-            last_admit_idle, 7,
-            "idle-P override (p_load 10 < threshold 50): ceiling 4*2=8 → last \
-             admitting running is 7 (deny at 8) — the ceiling only rises to \
-             8/worker when P is reported idle, not under a CPU-bound backlog"
+            last_admit_idle, 15,
+            "idle-P override (p_load 10 < threshold 50): ceiling 4*4=16 → last \
+             admitting running is 15 (deny at 16) — the I/O-bound ceiling is \
+             UNCHANGED (no regression); the total-core term only lifts CPU-bound"
         );
     }
 
@@ -11697,16 +11789,17 @@ mod tests {
     /// slot budget).
     ///
     /// Gate-driven gain scenario (`sampled_roots = [r1, r2, r2]`, all containing
-    /// shared dir `c`; M4 shape p_core=4; gate ON, threshold 0):
-    ///   - W0: caches `c`, seeded `running=3` (< 4 → p_headroom, ONE slot before
-    ///     it crosses the gate boundary), low p_load.
-    ///   - W1: cold, seeded `running=2` (< 4 → p_headroom, two slots), low p_load.
+    /// shared dir `c`; M4 shape p_core=4, e_core=6 → total-core boundary p+e=10;
+    /// gate ON, threshold 0):
+    ///   - W0: caches `c`, seeded `running=9` (< 10 → p_headroom, ONE slot before
+    ///     it crosses the E-spill gate boundary), low p_load.
+    ///   - W1: cold, seeded `running=8` (< 10 → p_headroom, two slots), low p_load.
     /// GREEDY (priority order): A1(r1) argmax over eligible {W0 (c-match
-    ///   s=205000), W1 (0)} → W0; W0 `running` 3→4 → LOSES p_headroom. A2(r2): W0
+    ///   s=205000), W1 (0)} → W0; W0 `running` 9→10 → LOSES p_headroom. A2(r2): W0
     ///   gate-excluded, gate still active (W1 has headroom) → only W1 eligible →
-    ///   cold (0), W1 3. A3(r2): W1 still has headroom → cold (0). Greedy models NO
+    ///   cold (0), W1 9. A3(r2): W1 still has headroom → cold (0). Greedy models NO
     ///   warming → G = 205000 + 0 + 0 = 205000.
-    /// BATCH (global + warming, gated): r1→W0 (205000; W0 →running 4, loses
+    /// BATCH (global + warming, gated): r1→W0 (205000; W0 →running 10, loses
     ///   headroom); r2→W1 cold (0) WARMS W1 with {r2,c}; the SECOND r2→W1 now
     ///   scores BOTH its own r2 direct AND the warmed c → s = (900+PER_FILE_WEIGHT)
     ///   + (200 + 2·PER_FILE_WEIGHT) = 103300 + 205000 = 308300. B = 205000 + 0 +
@@ -11760,8 +11853,8 @@ mod tests {
             .add_worker(Worker::new(WorkerId("W1".to_string()), PlatformProperties::default(), tx1, 1, 100))
             .await
             .expect("add W1");
-        // M4 P-core shape (4 P-cores) so the fresh-count gate boundary is at
-        // running==4.
+        // M4 P-core shape (4 P + 6 E) so the fresh-count gate boundary is the
+        // total-core term p+e == 10 (work-conservation E-spill).
         scheduler
             .set_worker_core_counts(&WorkerId("W0".to_string()), 4, 6)
             .await
@@ -11781,14 +11874,19 @@ mod tests {
             .update_worker_load(&WorkerId("W1".to_string()), 10, 10, 10)
             .await
             .expect("load W1");
-        // Seed fresh in-flight counts ACROSS the gate boundary: W0 at 3 (one slot
-        // of p_headroom → loses it after ONE assignment), W1 at 2 (two slots).
+        // Seed fresh in-flight counts ACROSS the gate boundary. With the
+        // work-conservation total-core term the boundary is now p+e = 4+6 = 10
+        // (not p_core_count = 4), so seed relative to 10: W0 at 9 (one slot of
+        // p_headroom → loses it after ONE assignment at running==10), W1 at 8
+        // (two slots). This reproduces the SAME gate-contention scenario (W0
+        // spills after r1) at the new E-spill boundary — greedy/batch/overlap
+        // values are unchanged.
         scheduler
-            .set_worker_running_count(&WorkerId("W0".to_string()), 3)
+            .set_worker_running_count(&WorkerId("W0".to_string()), 9)
             .await
             .expect("seed running W0");
         scheduler
-            .set_worker_running_count(&WorkerId("W1".to_string()), 2)
+            .set_worker_running_count(&WorkerId("W1".to_string()), 8)
             .await
             .expect("seed running W1");
         // W0 warm on c (a FULL-snapshot cached-subtree update).
@@ -11821,8 +11919,8 @@ mod tests {
         assert_eq!(
             gain.greedy_score, 205000,
             "#batch-sched M1-replay: GREEDY places A1(r1)→W0 (c-match 205000), pushing W0 \
-             to running=4 → loses p_headroom; A2/A3 (r2) find W0 gate-excluded and land \
-             cold on W1 (0 each; greedy models no warming) → G=205000. got {}",
+             to running=10 (p+e) → loses p_headroom; A2/A3 (r2) find W0 gate-excluded and \
+             land cold on W1 (0 each; greedy models no warming) → G=205000. got {}",
             gain.greedy_score
         );
         assert_eq!(

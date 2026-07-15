@@ -95,6 +95,10 @@ fn build_workers() -> Vec<BatchSchedWorker> {
                 cached_subtree_digests,
                 running: 4,
                 p_core_count: 8,
+                // (#sched-work-conservation) e_core_count = 0 → total-core term
+                // collapses to `running < p_core_count`; this timing fixture is
+                // unchanged.
+                e_core_count: 0,
                 p_core_load_pct: 50,
                 load_penalty: 0,
             }

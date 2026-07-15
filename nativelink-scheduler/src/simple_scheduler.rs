@@ -338,9 +338,17 @@ pub struct BatchSchedWorker {
     // scratch counter, not a network buffer.
     pub running: u64,
     /// (M1-replay) The worker's real reported P-core logical count. `has_p_headroom`
-    /// is `p_core_count == 0 || running < p_core_count || (override)`; a
-    /// `p_core_count == 0` worker (legacy/Linux/Intel-Mac) is ALWAYS ungated (A5).
+    /// is `p_core_count == 0 || running < p_core_count || running < p+e ||
+    /// (override)`; a `p_core_count == 0` worker (legacy/Linux/Intel-Mac) is
+    /// ALWAYS ungated (A5).
     pub p_core_count: u32,
+    /// (#sched-work-conservation) The worker's real reported E-core logical
+    /// count. Feeds the total-core term of `has_p_headroom` (`running <
+    /// p_core_count + e_core_count`) so the observability-only counterfactual's
+    /// eligibility decisions stay byte-identical to the dispatch gate after the
+    /// E-core spill fix. GAUGE FIDELITY only — the batch solve routes zero
+    /// traffic.
+    pub e_core_count: u32,
     /// (M1-replay) The worker's real reported P-core load percent. Feeds the
     /// bounded override clause of `has_p_headroom` (`p_core_load_pct <
     /// idle_threshold_pct && running < p_core_count*override_factor`). Inert at the
@@ -376,15 +384,20 @@ pub struct BatchSchedGateCfg {
 }
 
 impl BatchSchedGateCfg {
-    /// (M1-replay) Mirror of `worker_has_p_headroom` (`api_worker_scheduler.rs`).
-    /// A worker has P-headroom when: A5 `p_core_count == 0` (ungated legacy), OR a
-    /// genuine free P slot by the FRESH count (`running < p_core_count`), OR the
-    /// bounded idle-P override (`p_load < idle_threshold_pct && running <
-    /// p_core_count * override_factor`). All `u64` to match `running` against
-    /// `p_core_count` without truncation.
+    /// (#sched-work-conservation) Mirror of `worker_has_p_headroom`
+    /// (`api_worker_scheduler.rs`). A worker has P-headroom when: A5
+    /// `p_core_count == 0` (ungated legacy), OR a genuine free P slot by the
+    /// FRESH count (`running < p_core_count`), OR the total-core term (E-core
+    /// spill: `running < p_core_count + e_core_count`), OR the bounded idle-P
+    /// override (`p_load < idle_threshold_pct && running < p_core_count *
+    /// override_factor`). All `u64` to match `running` against the `u32` core
+    /// counts without truncation. GAUGE FIDELITY only — kept byte-identical to
+    /// the dispatch gate so the counterfactual gauge does not diverge by the
+    /// E-spill fix; the batch solve routes zero traffic.
     fn has_p_headroom(&self, w: &BatchSchedWorker) -> bool {
         w.p_core_count == 0
             || w.running < u64::from(w.p_core_count)
+            || w.running < u64::from(w.p_core_count) + u64::from(w.e_core_count)
             || (w.p_core_load_pct < self.idle_threshold_pct
                 && w.running < u64::from(w.p_core_count) * u64::from(self.override_factor))
     }
@@ -3288,6 +3301,11 @@ mod batch_sched_gain_test {
             cached_subtree_digests: cache.iter().copied().collect(),
             running,
             p_core_count,
+            // (#sched-work-conservation) These solver fixtures test the
+            // assignment logic, not the E-spill cap; `e_core_count = 0` makes the
+            // total-core term collapse to `running < p_core_count`, so their gate
+            // behavior is byte-identical to before the fix.
+            e_core_count: 0,
             p_core_load_pct,
             load_penalty,
         }
@@ -3301,6 +3319,48 @@ mod batch_sched_gain_test {
         idle_threshold_pct: 0,
         override_factor: 2,
     };
+
+    /// (#sched-work-conservation) The observability-only batch mirror must
+    /// consult E-core capacity exactly like the dispatch gate
+    /// (`worker_has_p_headroom`), so the counterfactual gauge does not diverge by
+    /// the E-spill fix. CPU-bound worker (p_load 98 >= threshold 50 → idle-P
+    /// override dead), 4 P + 6 E = 10 total cores.
+    ///
+    /// MUTATION: removing the `|| w.running < p + e` term from
+    /// `BatchSchedGateCfg::has_p_headroom` makes the admit assertions RED-fail
+    /// (the mirror would deny at running >= 4), proving the term is load-bearing.
+    #[test]
+    fn test_batch_mirror_p_headroom_spills_to_e_cores() {
+        // Prod config: enabled, threshold 50, factor 4.
+        let gate = BatchSchedGateCfg {
+            enabled: true,
+            idle_threshold_pct: 50,
+            override_factor: 4,
+        };
+        let mk = |running: u64| BatchSchedWorker {
+            cached_subtree_digests: HashSet::new(),
+            running,
+            p_core_count: 4,
+            e_core_count: 6, // 4 P + 6 E = 10 total cores
+            p_core_load_pct: 98, // CPU-bound → idle-P override dead
+            load_penalty: 0,
+        };
+        // E-spill band [4, 10): headroom via the total-core term.
+        for running in 4..=9 {
+            assert!(
+                gate.has_p_headroom(&mk(running)),
+                "batch mirror: CPU-bound worker with 6 idle E-cores has headroom \
+                 at running={running} (< p+e = 10) — gauge fidelity with the \
+                 dispatch gate's E-core spill"
+            );
+        }
+        // Equilibrium: running == p+e = 10 → denied (E full, override dead).
+        assert!(
+            !gate.has_p_headroom(&mk(10)),
+            "batch mirror: at running == p+e(10) both P and E slots are full and \
+             the CPU-bound override is dead → denied, matching the dispatch gate"
+        );
+    }
 
     /// (Test 1) CONTENDED-BAND GAIN. Warm cache-holders are gate-EXCLUDED
     /// (`running ≥ p_core=4`); only a few coldish workers retain p_headroom

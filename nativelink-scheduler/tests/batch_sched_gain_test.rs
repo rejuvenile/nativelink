@@ -120,6 +120,9 @@ fn worker(
         cached_subtree_digests: cached.iter().map(|&d| dir(d)).collect(),
         running,
         p_core_count,
+        // (#sched-work-conservation) e_core_count = 0 → total-core term collapses
+        // to `running < p_core_count`; these gauge fixtures are unchanged.
+        e_core_count: 0,
         p_core_load_pct,
         load_penalty,
     }
