@@ -9396,6 +9396,170 @@ mod tests {
         );
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // #sched: p_headroom dispatch-gate regime pins (TESTS ONLY, no behavior
+    // change). These isolate the pure predicate `worker_has_p_headroom` and
+    // pin THREE regimes that were previously asserted only verbally: (1) the
+    // live CPU-bound compile backlog where the idle-P override cannot rescue
+    // the cap, (2) the gate's total blindness to E-core capacity, and (3) the
+    // per-worker→fleet cap arithmetic (4/worker × 10 → 40 in-flight).
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Pure helper: the LARGEST `running` for which `worker_has_p_headroom`
+    /// still admits a worker at `(p_count, p_load)` under `(threshold, factor)`.
+    /// Loops `running` upward from 0, capped at 64 to stay bounded, and asserts
+    /// it found a cap strictly below the ceiling (a runaway gate would return
+    /// 64 and trip the assert). The gate is monotone non-increasing in `running`
+    /// (both live clauses `running < p_count` and `running < p_count*factor` can
+    /// only go false as `running` grows), so the largest admitting `running` is
+    /// the last one before the gate shuts; `+ 1` is the per-worker in-flight cap.
+    fn max_admit_running(p_count: u32, p_load: u32, threshold: u32, factor: u32) -> u64 {
+        let mut best: Option<u64> = None;
+        for running in 0..=64usize {
+            let w = worker_with_running("cap", p_count, p_load, running);
+            if worker_has_p_headroom(&w, threshold, factor) {
+                best = Some(running as u64);
+            }
+        }
+        let best = best
+            .expect("gate must admit at least running=0 within the 0..=64 probe window");
+        assert!(
+            best < 64,
+            "max_admit_running must terminate strictly below the loop ceiling \
+             (64) for p_count={p_count} p_load={p_load} threshold={threshold} \
+             factor={factor}; got {best} (a runaway cap would hit the ceiling)"
+        );
+        best
+    }
+
+    /// (#sched regime 1) The EXACT live regime: P cores genuinely CPU-bound on a
+    /// compile backlog (`p_load` pinned 90-100%), P-slots full. Proves the
+    /// idle-P override cannot rescue it in EITHER config — the load-bearing fact
+    /// that the io_bound override is the WRONG lever for a CPU-saturated build.
+    #[test]
+    fn test_worker_has_p_headroom_live_compile_backlog_regime() {
+        for p_load in [90u32, 95, 98, 100] {
+            // 4 P-cores, `running == p_core_count` (P-slots full), P CPU-bound.
+            let w = worker_with_running("BACKLOG", 4, p_load, 4);
+
+            // threshold 0 (the PROD default `p_idle_threshold_pct`): the override
+            // clause `p_load < 0` is never true → v2 collapses to EXACT v1 →
+            // `running(4)` NOT `< p_count(4)` → DENIED. This is the ~4/worker cap
+            // that pinned the live fleet at ~40 in-flight behind a 100-deep queue.
+            assert!(
+                !worker_has_p_headroom(&w, 0, 2),
+                "live regime p_load={p_load}: at threshold 0 (prod default) the \
+                 idle-P override is dead (`p_load < 0` never) → v1 collapse → a \
+                 full-P worker (running==p_core_count) is DENIED"
+            );
+
+            // Even with the idle-P override "enabled" (threshold 50), a CPU-bound
+            // worker (p_load >= 90 >= 50) is STILL denied: `p_load < threshold` is
+            // false, so clause 3's idle-P precondition can never hold. Enabling
+            // the io_bound override does NOT relax a CPU-bound compile backlog —
+            // it is the WRONG lever for CPU-saturated builds (E-core spill needs a
+            // code change, per the 2026-07-15 E-core spill-gate design).
+            assert!(
+                !worker_has_p_headroom(&w, 50, 2),
+                "live regime p_load={p_load}: enabling the idle-P override \
+                 (threshold 50) does NOT relax a CPU-bound worker — p_load({p_load}) \
+                 >= threshold(50) makes clause 3's idle-P precondition false → \
+                 DENIED. The idle-P override is the WRONG lever for CPU-saturated \
+                 compile backlogs"
+            );
+        }
+    }
+
+    /// (#sched regime 2) The gate is BLIND to E-core capacity: it reads only
+    /// `running`, `p_core_count`, `p_core_load_pct` — never `e_core_count`. So
+    /// "spill CPU-bound work onto idle E-cores" is NOT achievable by config; it
+    /// needs a code change. Uses a REAL `e_core_count = 6` (4 P + 6 E = 10 total
+    /// cores) and shows the 6 idle E-cores do not lift the 4-slot cap.
+    ///
+    /// MUTATION NOTE: commenting the `w.set_core_counts(4, 6)` line (reverting
+    /// e_core_count to 0) leaves this test GREEN — the deny is identical either
+    /// way, proving it is the GATE's blindness, not the fixture, that strands the
+    /// E capacity. No assertion below depends on `e_core_count` being 6.
+    #[test]
+    fn test_worker_has_p_headroom_ignores_e_cores() {
+        // Live worker: 4 P-cores, p_load 98 (CPU-bound), P-slots full (running 4).
+        let mut w = worker_with_running("ECORE", 4, 98, 4);
+        // Give it 6 REAL E-cores → 4 P + 6 E = 10 total cores, 6 of them idle.
+        w.set_core_counts(4, 6);
+
+        // The 6 idle E-cores cannot admit the worker at the prod default
+        // (threshold 0) — the gate never consults `e_core_count`.
+        assert!(
+            !worker_has_p_headroom(&w, 0, 2),
+            "gate is blind to E-cores: 6 idle E-cores do NOT admit a worker whose \
+             4 P-slots are full at threshold 0 (v1 collapse) — stranded capacity"
+        );
+        // Nor with the idle-P override enabled (threshold 50): p_load(98) >= 50
+        // keeps it denied. The 6 idle E-cores are unreachable by config alone.
+        assert!(
+            !worker_has_p_headroom(&w, 50, 2),
+            "gate is blind to E-cores: even with the idle-P override enabled \
+             (threshold 50), p_load(98) >= 50 keeps a 10-core worker denied — the \
+             6 idle E-cores are unreachable capacity without a code change"
+        );
+
+        // Quantify the stranded capacity: the per-worker eligibility cap is
+        // p_core_count (4), NOT the 10 total cores. `max_admit_running` builds
+        // e_core_count=0 workers, which is exactly the point — it returns the
+        // SAME cap (3 → 4) because the gate never reads `e_core_count`. So a
+        // 10-core worker admits no more actions than a 4-core one.
+        let per_worker_cap = max_admit_running(4, 98, 0, 2) + 1;
+        assert_eq!(
+            per_worker_cap, 4,
+            "per-worker eligibility cap is p_core_count(4) even though the worker \
+             has 10 total cores (4 P + 6 E) — the 6 E-cores are stranded"
+        );
+    }
+
+    /// (#sched regime 3) Turn "why only 4/worker → 40 fleet-wide" into an
+    /// assertion. Ties the per-worker predicate cap to the observed live
+    /// `run=40` across 10 workers, and contrasts with the idle-P override raising
+    /// the ceiling to 8/worker ONLY when P is reported idle.
+    #[test]
+    fn test_p_headroom_per_worker_and_fleet_cap() {
+        // CPU-bound live regime at the prod default (threshold 0): the last
+        // admitting `running` is 3 → the gate stops dispatching once `running`
+        // reaches p_core_count(4).
+        let last_admit_cpu = max_admit_running(4, 98, 0, 2);
+        assert_eq!(
+            last_admit_cpu, 3,
+            "threshold 0, CPU-bound (p_load 98): last admitting running is 3 → \
+             dispatch stops when running reaches p_core_count(4)"
+        );
+        let per_worker_cap = last_admit_cpu + 1;
+        assert_eq!(
+            per_worker_cap, 4,
+            "per-worker in-flight cap = last-admit(3) + 1 = 4 (== p_core_count) — \
+             the ~4/worker the live heavy build showed"
+        );
+
+        // Fleet-wide: 10 workers × 4/worker = 40 in-flight, exactly the live
+        // `run=40` observed while a 100-deep queue waited behind it.
+        assert_eq!(
+            per_worker_cap * 10,
+            40,
+            "fleet cap = per-worker cap(4) × 10 workers = 40 in-flight — ties the \
+             predicate cap to the observed live run=40 (100-deep queue behind it)"
+        );
+
+        // Contrast: ONLY when P is reported IDLE (p_load 10 < threshold 50) does
+        // the override lift the ceiling to p_count*factor = 8, so the last
+        // admitting `running` is 7 (deny at 8). The ceiling rises to 8/worker
+        // only for genuinely idle-P workers, NEVER under a CPU-bound backlog.
+        let last_admit_idle = max_admit_running(4, 10, 50, 2);
+        assert_eq!(
+            last_admit_idle, 7,
+            "idle-P override (p_load 10 < threshold 50): ceiling 4*2=8 → last \
+             admitting running is 7 (deny at 8) — the ceiling only rises to \
+             8/worker when P is reported idle, not under a CPU-bound backlog"
+        );
+    }
+
     /// Helper: encode a Directory proto and compute its DigestInfo (SHA256).
     fn encode_directory(dir: &Directory) -> (Vec<u8>, DigestInfo) {
         let dir_bytes = dir.encode_to_vec();
