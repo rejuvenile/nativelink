@@ -6524,13 +6524,15 @@ pub const WORKER_EXEC_FSS_METRIC_PREFIX: &str = "nativelink.WORKER_EXEC_FAST_SLO
 /// A worker with `cas_server_port` set runs TWO `FastSlowStore` instances for
 /// `WORKER_FAST_SLOW_STORE`:
 ///
-/// 1. **Idle CAS-server instance** — built by `build_store_manager` from
-///    `cfg.stores`, wrapped in a `WorkerProxyStore`, and registered via
+/// 1. **Config-built container instance** — built by `build_store_manager`
+///    from `cfg.stores`, wrapped in a `WorkerProxyStore`, and registered via
 ///    `metrics_registry.register("nativelink", store_manager)`
-///    (`src/bin/nativelink.rs`). It backs the worker's local CAS server
-///    (`cas_server_port`, e.g. `:50051`) for mirror/peer reads and is near-idle
-///    for peer-fetch, so its `nativelink_WORKER_FAST_SLOW_STORE_...` subtree
-///    reads ~0.
+///    (`src/bin/nativelink.rs`). It is a tier-container from which the
+///    execution instance (#2) and a SEPARATE read-only CAS-server instance
+///    (`effective_cas_store_for_cas_server`, served at `cas_server_port`,
+///    e.g. `:50051`) are derived; it does NOT itself serve the CAS server and
+///    is otherwise near-idle, so its `nativelink_WORKER_FAST_SLOW_STORE_...`
+///    subtree reads ~0.
 ///
 /// 2. **Execution instance** — a FRESH `FastSlowStore` (`effective_cas_store`)
 ///    built inside [`new_local_worker`] whose slow tier is a worker-local
@@ -6544,10 +6546,23 @@ pub const WORKER_EXEC_FSS_METRIC_PREFIX: &str = "nativelink.WORKER_EXEC_FAST_SLO
 ///    `FilesystemStore` fast tier (`evicting_map_*`) and the process-singleton
 ///    `dir_cache_*` / `o11_*` families rendered normally.
 ///
-/// This registers instance #2 under [`WORKER_EXEC_FSS_METRIC_PREFIX`].
-/// Late registration is safe: `MetricsRegistry` is `Arc<Mutex<Vec<..>>>` and
-/// `render_prometheus` snapshots the live component list at scrape time, so a
-/// registration performed after the metrics service was wired still renders.
+/// This registers instance #2 under [`WORKER_EXEC_FSS_METRIC_PREFIX`], and is
+/// only wired when `cas_server_port` is set (the condition under which the
+/// distinct instance #2 exists — see `src/bin/nativelink.rs`); with no port,
+/// `effective_cas_store` IS instance #1 and re-registering it would duplicate
+/// the whole subtree. Late registration is safe: `MetricsRegistry` is
+/// `Arc<Mutex<Vec<..>>>` and `render_prometheus` snapshots the live component
+/// list at scrape time, so a registration performed after the metrics service
+/// was wired still renders.
+///
+/// NOTE (shared fast tier): instance #2 SHARES the `FilesystemStore` fast-tier
+/// Arc with instance #1, so the fast-tier families (`evicting_map_*`,
+/// `fast_store_*`) re-render under BOTH prefixes with identical values. Key on
+/// the execution-instance-DISTINCT families — `fast_store_hit_count` /
+/// `slow_store_hit_count` / `populate_spawn_count` (FSS-level) and
+/// `worker_proxy_peer_fetch_*` / `wps_worker_read_inner_hit_total` /
+/// `singleflight_*` (slow-tier WPS) — and do NOT sum `evicting_map_*` across
+/// the two prefixes (that double-counts disk).
 ///
 /// Observability-only: no runtime path changes — the counters already
 /// increment on the execution instance; they were simply never rendered.

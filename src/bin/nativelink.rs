@@ -2879,6 +2879,10 @@ async fn inner_main(
                     } else {
                         fast_slow_store.clone()
                     };
+                    // Capture before `local_worker_cfg` is moved into
+                    // `new_local_worker` below — gates the exec-metrics
+                    // registration (a distinct execution FSS exists iff set).
+                    let has_distinct_exec_store = local_worker_cfg.cas_server_port.is_some();
                     let local_worker = new_local_worker(
                         Arc::new(local_worker_cfg),
                         fast_slow_store,
@@ -2904,11 +2908,20 @@ async fn inner_main(
                     // `register_execution_store_metrics` for the two-FSS
                     // topology. Late registration is safe: `MetricsRegistry` is
                     // Arc<Mutex<Vec>> and render snapshots live at scrape time.
-                    if let Some(exec_fss) = local_worker.execution_fast_slow_store() {
-                        nativelink_worker::local_worker::register_execution_store_metrics(
-                            &metrics_registry,
-                            exec_fss,
-                        );
+                    // Only register when a DISTINCT execution instance exists —
+                    // i.e. `cas_server_port` is set (the condition under which
+                    // `new_local_worker` builds a fresh `effective_cas_store`).
+                    // With no port, `effective_cas_store` is the SAME Arc already
+                    // registered as `WORKER_FAST_SLOW_STORE`, so registering it
+                    // again under the EXEC prefix would render the whole subtree
+                    // twice with identical values (review 43ef0d58 MEDIUM-1).
+                    if has_distinct_exec_store {
+                        if let Some(exec_fss) = local_worker.execution_fast_slow_store() {
+                            nativelink_worker::local_worker::register_execution_store_metrics(
+                                &metrics_registry,
+                                exec_fss,
+                            );
+                        }
                     }
 
                     let name = if local_worker.name().is_empty() {
