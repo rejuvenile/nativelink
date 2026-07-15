@@ -139,7 +139,7 @@ async fn drive_update(store: &Store, key: StoreKey<'_>, payload: Bytes) -> Resul
     let update_fut = store.update(key, rx, UploadSizeInfo::ExactSize(payload_len));
     let (send_res, update_res) = tokio::join!(send_fut, update_fut);
     send_res?;
-    update_res
+    update_res.map(|_| ())
 }
 
 /// Test 1 — the D6 fix itself.
@@ -414,7 +414,7 @@ async fn drive_update_chunked(
     // Producer-side Err (channel-closed mid-send) is expected and harmless;
     // the load-bearing assertion is on `update_res`.
     drop(send_res);
-    update_res
+    update_res.map(|_| ())
 }
 
 /// **M1 (cascade bundle pass-2 dsr review).** When the chunked

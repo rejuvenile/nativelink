@@ -190,7 +190,7 @@ async fn run_update(
     };
     let (writer_res, store_res) = tokio::join!(update_fut, store_call);
     writer_res?;
-    store_res
+    store_res.map(|_| ())
 }
 
 /// **S2 dispatcher↔registry wire** — drives a real `BazelChunkedDispatcherImpl`

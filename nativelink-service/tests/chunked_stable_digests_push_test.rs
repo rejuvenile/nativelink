@@ -234,7 +234,7 @@ async fn run_update(
             .await
     };
     let (_, store_res) = tokio::join!(writer_fut, store_call);
-    store_res
+    store_res.map(|_| ())
 }
 
 // =============================================================================

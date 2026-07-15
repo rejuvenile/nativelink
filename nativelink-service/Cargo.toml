@@ -251,6 +251,17 @@ required-features = ["chunked_fast_slow"]
 name = "writer_site_logs_test"
 required-features = ["chunked_fast_slow", "test-utils"]
 
+# #501 per-site commit-watchdog soft-warn observability tests. File body is
+# `#![cfg(feature = "chunked_fast_slow")]` but exercises `test-utils`-gated
+# items (`v2_await_commit_result_for_test`, `new_with_state_for_test`, and the
+# `SoftWarnSet` `clear`/`len` test accessors). Without this `required-features`
+# declaration a whole-suite `cargo test --features chunked_fast_slow` (no
+# `test-utils`) fails to compile the file instead of auto-skipping it — the
+# same gap the sibling chunked entries above close.
+[[test]]
+name = "chunked_commit_soft_warn_test"
+required-features = ["chunked_fast_slow", "test-utils"]
+
 # #44 Layer C — server-side `inner_read` unfold cap exercised at the
 # streaming-blob branch (`:1493`) by injecting a forged-overshoot inner
 # via the `_for_test` accessors gated behind `test-utils`.

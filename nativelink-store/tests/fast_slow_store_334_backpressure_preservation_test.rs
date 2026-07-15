@@ -150,7 +150,7 @@ async fn drive_update(store: &Store, key: StoreKey<'_>, payload: Bytes) -> Resul
     };
     let update_fut = store.update(key, rx, UploadSizeInfo::ExactSize(payload_len));
     let (_send_res, update_res) = tokio::join!(send_fut, update_fut);
-    update_res
+    update_res.map(|_| ())
 }
 
 /// Build a real `FastSlowStore` with a tiny-cap `MemoryStore` fast tier
@@ -174,6 +174,7 @@ fn make_fast_slow_with_tiny_fast_cap(fast_cap_bytes: usize) -> (Arc<FastSlowStor
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
             slow_writes_in_flight_max_bytes: 0, // 0 = uncapped (test default)
+            bypass_dedup_threshold_bytes: 0,
         },
         fast.clone(),
         slow.clone(),

@@ -63,7 +63,15 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// when the `io-uring` feature is compiled out. Returns `true` when
 /// the test should proceed.
 async fn skip_if_no_io_uring(test_name: &str) -> bool {
+    // `is_io_uring_available` only exists when the `io-uring` feature is
+    // compiled in (gated `#[cfg(all(feature = "io-uring", target_os =
+    // "linux"))]` in `nativelink_util::fs`). With the feature compiled out
+    // there is no io_uring path to exercise, so treat it as unavailable and
+    // let the caller SKIP — matching this guard's documented intent.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
     let available = nativelink_util::fs::is_io_uring_available().await;
+    #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+    let available = false;
     if !available {
         eprintln!(
             "SKIP {test_name}: io_uring not available on this host — Path A not exercised; \
