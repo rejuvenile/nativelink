@@ -6793,6 +6793,10 @@ pub async fn new_local_worker(
     };
     // Keep a reference for mirror blob cleanup in BlobsInStableStorage.
     let cas_server_fss = effective_cas_store_for_cas_server.clone();
+    // Diagnostic-only (observability): surface server-pushed mirror blobs
+    // still held on this worker (un-acked by BlobsInStableStorage) past 30s.
+    // Idempotent spawn; drops nothing.
+    cas_server_fss.start_stale_mirror_alert();
 
     // Walk the AC store wrapper chain to find its underlying
     // `FastSlowStore`. Uses the same `find_fast_slow_for_pin` walker

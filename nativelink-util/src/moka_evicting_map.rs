@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::borrow::Borrow;
-use core::fmt::Debug;
+use core::fmt::{Debug, Display};
 use core::hash::Hash;
 use core::ops::RangeBounds;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -88,6 +88,22 @@ pub const PIN_TIMEOUT_SECS: u64 = 120;
 /// it adds no `time_to_live`/`time_to_idle` to cache entries; it is a
 /// loop-driven maintenance call exactly like `expire_stale_pins`.
 const DRAIN_INTERVAL_SECS: u64 = 10;
+/// Diagnostic-only stale-pin alert threshold. An INDEFINITE pin
+/// (worker-local F2 output blob, held until the server's
+/// BlobsInStableStorage ack calls [`MokaEvictingMap::unpin_key`]) that is
+/// still held past this age is surfaced by
+/// [`MokaEvictingMap::sweep_stale_indefinite_pins`] as un-acked. Purely
+/// observational — the sweep NEVER releases a pin (release stays
+/// BIS-ack-driven). A sustained stale set is the signature of the
+/// production leak where indefinite pins are never BIS-acked and
+/// accumulate to `indefinite_pin_cap`.
+const STALE_INDEFINITE_PIN_ALERT_SECS: u64 = 30;
+/// Cap on individual per-pin WARN lines emitted in a single
+/// [`MokaEvictingMap::sweep_stale_indefinite_pins`] sweep, so a large
+/// pending-BIS backlog cannot flood the log. One summary WARN carrying the
+/// full `stale_count` / `stale_bytes` totals is always emitted after the
+/// (capped) per-pin lines.
+const STALE_PIN_ALERT_MAX_LINES: usize = 50;
 // Eviction channel is unbounded (mpsc::unbounded_channel). Each EvictionEvent
 // is ~64 bytes (Arc<K> + T). At 1M entries that's ~64MB, well within budget.
 // Unbounded avoids blocking moka's internal lock during burst eviction
@@ -161,6 +177,21 @@ pub struct EvictedReport {
     pub evicted_bytes: u64,
     pub iter_scanned: u64,
     pub iter_truncated: bool,
+}
+
+/// Summary of one [`MokaEvictingMap::sweep_stale_indefinite_pins`] pass,
+/// returned so tests can assert the detection contract deterministically
+/// (the sweep itself only emits `warn!` diagnostics). Purely observational.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StalePinAlertSummary {
+    /// INDEFINITE pins found held past `STALE_INDEFINITE_PIN_ALERT_SECS`.
+    pub stale_count: u64,
+    /// Sum of `PinnedEntry::size` over those stale pins.
+    pub stale_bytes: u64,
+    /// Per-pin WARN lines actually emitted (`stale_count`, capped at
+    /// `STALE_PIN_ALERT_MAX_LINES`). Distinct from `stale_count` so the
+    /// flood cap is independently testable.
+    pub lines_emitted: usize,
 }
 
 /// Hard cap on entries `evict_unpinned_lru_bytes` may scan in a single
@@ -521,7 +552,11 @@ where
 impl<K, Q, T, I, C> MokaEvictingMap<K, Q, T, I, C>
 where
     K: Ord + Hash + Eq + Clone + Debug + Send + Sync + Borrow<Q> + 'static,
-    Q: Ord + Hash + Eq + Debug + Send + Sync + 'static,
+    // `Display` (added for the stale-pin diagnostic in
+    // `sweep_stale_indefinite_pins`) is satisfied by every production Q:
+    // StoreKey, DigestInfo, OperationId, and the u64 test key. Compile-time
+    // bound only — zero runtime behavior change.
+    Q: Ord + Hash + Eq + Debug + Display + Send + Sync + 'static,
     T: LenEntry + Debug + Clone + Send + Sync + 'static,
     I: InstantWrapper,
     C: ItemCallback<Q> + Clone + 'static,
@@ -2330,6 +2365,12 @@ where
                 }
                 _ = pin_check_interval.tick() => {
                     self.expire_stale_pins().await;
+                    // Diagnostic-only (observability): surface INDEFINITE pins
+                    // held past 30s without a BIS-ack. Releases nothing; shares
+                    // the existing 10s maintenance cadence. Independent of
+                    // `expire_stale_pins` (which SKIPS indefinite pins), so order
+                    // within the tick does not matter.
+                    self.sweep_stale_indefinite_pins();
                 }
                 _ = drain_interval.tick() => {
                     // (FL-688 v3 Stage C) Skip the forced drain during the
@@ -2376,6 +2417,67 @@ where
             while futs.next().await.is_some() {}
         }
         drop(event);
+    }
+
+    /// Diagnostic sweep (observability ONLY — releases nothing): scan the
+    /// `pinned` map for INDEFINITE pins held longer than
+    /// `STALE_INDEFINITE_PIN_ALERT_SECS` without a BlobsInStableStorage
+    /// ack ([`Self::unpin_key`]), emitting a WARN per stale pin (capped at
+    /// `STALE_PIN_ALERT_MAX_LINES`) plus one summary WARN carrying the full
+    /// `stale_count` / `stale_bytes` totals. Emits nothing when no pin is
+    /// stale. A sustained stale set is the signature of the production
+    /// indefinite-pin leak: pins that are never BIS-acked accumulate to
+    /// `indefinite_pin_cap` and wedge the fleet.
+    ///
+    /// NEVER releases a pin — release stays BIS-ack-driven, exactly as
+    /// [`Self::expire_stale_pins`] leaves indefinite pins untouched. Called
+    /// once per `pin_check_interval` tick by the background `drain_evictions`
+    /// loop; `#[doc(hidden)] pub` so tests can drive it deterministically.
+    /// Returns the sweep summary for assertions.
+    #[doc(hidden)]
+    pub fn sweep_stale_indefinite_pins(&self) -> StalePinAlertSummary {
+        let threshold = Duration::from_secs(STALE_INDEFINITE_PIN_ALERT_SECS);
+        // Collect (key, age_secs, size) while iterating so the DashMap shard
+        // guards are dropped BEFORE any `warn!` — the emission holds no lock
+        // (and there is no `.await` anywhere in this method).
+        let mut stale: Vec<(K, u64, u64)> = Vec::new();
+        for entry in self.pinned.iter() {
+            if !entry.indefinite {
+                continue;
+            }
+            let age = entry.pinned_at.elapsed();
+            if age < threshold {
+                continue;
+            }
+            stale.push((entry.key().clone(), age.as_secs(), entry.size));
+        }
+        if stale.is_empty() {
+            return StalePinAlertSummary::default();
+        }
+        let stale_count = stale.len() as u64;
+        let stale_bytes: u64 = stale.iter().map(|(_, _, size)| *size).sum();
+        let lines_emitted = stale.len().min(STALE_PIN_ALERT_MAX_LINES);
+        for (key, age_secs, size_bytes) in stale.into_iter().take(STALE_PIN_ALERT_MAX_LINES) {
+            let q: &Q = key.borrow();
+            warn!(
+                target: "nativelink::stale_pin_alert",
+                stale_pin = %q,
+                age_secs,
+                size_bytes,
+                "indefinite pin not BIS-acked after 30s"
+            );
+        }
+        warn!(
+            target: "nativelink::stale_pin_alert",
+            stale_count,
+            stale_bytes,
+            "stale indefinite-pin sweep summary"
+        );
+        StalePinAlertSummary {
+            stale_count,
+            stale_bytes,
+            lines_emitted,
+        }
     }
 
     /// Sweep the `pinned` map and demote any entries whose
@@ -3323,6 +3425,138 @@ mod tests {
         assert!(
             map.get(&1).await.is_some(),
             "released blob must remain reachable from the LRU cache after BIS-ack"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Diagnostic stale-INDEFINITE-pin alert (observability ONLY): an
+    // indefinite pin held past STALE_INDEFINITE_PIN_ALERT_SECS without a
+    // BIS-ack is surfaced by `sweep_stale_indefinite_pins`. The sweep
+    // NEVER releases a pin — these tests assert the DETECTION contract
+    // (which pins are flagged) and the flood cap.
+    // ---------------------------------------------------------------
+
+    /// Rewind a pinned entry's `pinned_at` by `secs` so it reads as aged.
+    fn age_indefinite_pin_secs(map: &TestMapCb, key: u64, secs: u64) {
+        let mut entry = map.pinned.get_mut(&key).expect("key should be pinned");
+        entry.pinned_at = Instant::now() - core::time::Duration::from_secs(secs);
+    }
+
+    #[tokio::test]
+    async fn stale_pin_alert_flags_only_aged_indefinite_pins() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // key 0: indefinite + aged 31s → STALE.
+        map.insert(0, BytesEntry(2048)).await;
+        assert!(map.pin_key_indefinite(0), "indefinite pin of key 0");
+        age_indefinite_pin_secs(&map, 0, 31);
+
+        // key 1: indefinite + fresh (age ~0) → NOT stale (below 30s).
+        map.insert(1, BytesEntry(4096)).await;
+        assert!(map.pin_key_indefinite(1), "indefinite pin of key 1");
+
+        // key 2: TIME-BOUNDED + aged 31s → NOT stale (not indefinite).
+        map.insert(2, BytesEntry(8192)).await;
+        assert!(map.pin_key(2), "time-bounded pin of key 2");
+        age_indefinite_pin_secs(&map, 2, 31);
+
+        let summary = map.sweep_stale_indefinite_pins();
+        assert_eq!(
+            summary.stale_count, 1,
+            "only the AGED INDEFINITE pin (key 0) is stale — a fresh indefinite \
+             pin (key 1) and an aged TIME-BOUNDED pin (key 2) must be excluded"
+        );
+        assert_eq!(
+            summary.stale_bytes, 2048,
+            "stale_bytes must be key 0's size only (2048), not key 1/2's bytes"
+        );
+        assert_eq!(
+            summary.lines_emitted, 1,
+            "exactly one per-pin WARN line for the single stale pin"
+        );
+
+        // Observability only: the sweep must NOT release the pin.
+        assert!(
+            map.pinned.contains_key(&0u64),
+            "sweep must NOT unpin a stale indefinite pin — release is BIS-ack-only"
+        );
+        assert_eq!(
+            map.pinned_bytes(),
+            2048 + 4096 + 8192,
+            "no pin may be released by the diagnostic sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pin_alert_emits_nothing_when_none_stale() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // Fresh indefinite pin (age ~0) — not stale.
+        map.insert(0, BytesEntry(2048)).await;
+        assert!(map.pin_key_indefinite(0), "indefinite pin");
+
+        let summary = map.sweep_stale_indefinite_pins();
+        assert_eq!(
+            summary,
+            super::StalePinAlertSummary::default(),
+            "no indefinite pin is past 30s — the sweep must report an empty summary \
+             (stale_count / stale_bytes / lines_emitted all zero)"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pin_alert_caps_warn_lines_but_summary_counts_all() {
+        // Large pin budget so 60 indefinite pins all fit.
+        let cfg = policy(64 * 1024 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        let n: u64 = super::STALE_PIN_ALERT_MAX_LINES as u64 + 10; // 60
+        for k in 0..n {
+            map.insert(k, BytesEntry(1024)).await;
+            assert!(map.pin_key_indefinite(k), "indefinite pin");
+            age_indefinite_pin_secs(&map, k, 31);
+        }
+
+        let summary = map.sweep_stale_indefinite_pins();
+        assert_eq!(
+            summary.stale_count, n,
+            "summary must count ALL stale pins ({n}), not just the emitted lines"
+        );
+        assert_eq!(
+            summary.stale_bytes,
+            n * 1024,
+            "summary bytes must total ALL stale pins"
+        );
+        assert_eq!(
+            summary.lines_emitted,
+            super::STALE_PIN_ALERT_MAX_LINES,
+            "per-pin WARN lines must be capped at STALE_PIN_ALERT_MAX_LINES (50) to \
+             avoid flooding, even though 60 pins are stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pin_alert_threshold_is_30s() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+
+        // key 0 aged 29s → below threshold → NOT stale.
+        map.insert(0, BytesEntry(1024)).await;
+        assert!(map.pin_key_indefinite(0), "indefinite pin key 0");
+        age_indefinite_pin_secs(&map, 0, 29);
+
+        // key 1 aged 31s → above threshold → stale.
+        map.insert(1, BytesEntry(1024)).await;
+        assert!(map.pin_key_indefinite(1), "indefinite pin key 1");
+        age_indefinite_pin_secs(&map, 1, 31);
+
+        let summary = map.sweep_stale_indefinite_pins();
+        assert_eq!(
+            summary.stale_count, 1,
+            "only the pin aged past STALE_INDEFINITE_PIN_ALERT_SECS (30s) is stale: \
+             key 1 (31s) yes, key 0 (29s) no"
         );
     }
 

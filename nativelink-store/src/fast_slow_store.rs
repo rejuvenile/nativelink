@@ -33,6 +33,7 @@ use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
+use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
@@ -95,6 +96,38 @@ pub type ChunkedInFlightMap = Arc<Mutex<HashMap<DigestInfo, ChunkedInFlightEntry
 /// `insert_mirror_blob` returns `Err(ResourceExhausted)` so the mirror
 /// writer can record a per-peer failure and route the next attempt elsewhere.
 const DEFAULT_MIRROR_BLOBS_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Diagnostic-only stale-mirror alert threshold. A server-pushed mirror
+/// blob still held in `mirror_blobs` past this age has NOT been made
+/// durable on the server (the server clears it only via a
+/// BlobsInStableStorage ack → [`FastSlowStore::remove_mirror_blobs`]).
+/// Surfaced by [`FastSlowStore::sweep_stale_mirror_pins`]. Observability
+/// only — the sweep NEVER drops a blob (release stays BIS-ack-driven).
+const STALE_MIRROR_ALERT_SECS: u64 = 30;
+/// Cap on individual per-blob WARN lines emitted in a single
+/// [`FastSlowStore::sweep_stale_mirror_pins`] sweep, so a large pending-BIS
+/// mirror backlog cannot flood the log. One summary WARN with the full
+/// `stale_mirror_count` / `stale_mirror_bytes` totals always follows.
+const STALE_MIRROR_ALERT_MAX_LINES: usize = 50;
+/// Cadence of the diagnostic stale-mirror sweep spawned by
+/// [`FastSlowStore::start_stale_mirror_alert`]. Matches the sibling
+/// pin-alert maintenance heartbeat in `MokaEvictingMap` (10 s).
+const STALE_MIRROR_ALERT_INTERVAL_SECS: u64 = 10;
+
+/// Summary of one [`FastSlowStore::sweep_stale_mirror_pins`] pass, returned
+/// so tests can assert the detection contract deterministically (the sweep
+/// itself only emits `warn!` diagnostics). Purely observational.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StaleMirrorAlertSummary {
+    /// Mirror blobs found held past `STALE_MIRROR_ALERT_SECS`.
+    pub stale_count: u64,
+    /// Sum of held bytes over those stale mirror blobs.
+    pub stale_bytes: u64,
+    /// Per-blob WARN lines actually emitted (`stale_count`, capped at
+    /// `STALE_MIRROR_ALERT_MAX_LINES`). Distinct from `stale_count` so the
+    /// flood cap is independently testable.
+    pub lines_emitted: usize,
+}
 
 /// CAPPED AT 1_000_000: ceiling enforced on ONE producer of the
 /// `failed_slow_writes` set — the worker WORKER→SERVER re-queue path
@@ -1263,6 +1296,11 @@ pub struct FastSlowStore {
     /// construction; readers see it via `Ordering::Relaxed` since it is
     /// not synchronizing other state.
     local_only_reads: AtomicBool,
+    /// Spawn-once guard for the diagnostic stale-mirror alert task
+    /// ([`Self::start_stale_mirror_alert`]). `false` until the first
+    /// `start` call flips it; later calls are no-ops. Observability-only —
+    /// no data-plane state.
+    stale_mirror_alert_running: AtomicBool,
     /// #212 Phase 2.5 read-cascade hook: optional registry of in-flight
     /// `ChunkedDriver`s. When set AND [`Self::chunked_reads_enabled`]
     /// is `true`, [`FastSlowStore::get_part`] consults the registry
@@ -1565,6 +1603,7 @@ impl FastSlowStore {
             mirror_changes: Mutex::new(MirrorChanges::default()),
             mirror_changes_notify: Arc::new(Notify::new()),
             local_only_reads: AtomicBool::new(false),
+            stale_mirror_alert_running: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_read_registry: OnceLock::new(),
             #[cfg(feature = "chunked_fast_slow")]
@@ -3555,6 +3594,7 @@ impl FastSlowStore {
             mirror_changes: Mutex::new(MirrorChanges::default()),
             mirror_changes_notify: Arc::new(Notify::new()),
             local_only_reads: AtomicBool::new(false),
+            stale_mirror_alert_running: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_read_registry: OnceLock::new(),
             #[cfg(feature = "chunked_fast_slow")]
@@ -3724,6 +3764,124 @@ impl FastSlowStore {
         drop(pins);
         if removed > 0 {
             self.mirror_changes_notify.notify_one();
+        }
+    }
+
+    /// Diagnostic sweep (observability ONLY — drops nothing): scan
+    /// `mirror_blobs` for server-pushed mirror blobs held longer than
+    /// `STALE_MIRROR_ALERT_SECS` without a BlobsInStableStorage ack (the
+    /// server clears them via [`Self::remove_mirror_blobs`]). Emits a WARN
+    /// per stale blob (capped at `STALE_MIRROR_ALERT_MAX_LINES`) plus one
+    /// summary WARN with the full totals. Emits nothing when none is stale.
+    /// A sustained stale set means the server has not made this worker's
+    /// mirrored copies durable — the mirror-write durability backlog.
+    ///
+    /// Sweeps `mirror_blobs` (NOT `dispatched_mirror_pins`) because the
+    /// dominant server-push path (`IS_MIRROR_REQUEST` update →
+    /// `insert_mirror_blob`) lands ONLY in `mirror_blobs`; the
+    /// `dispatched_mirror_pins` index covers only the worker's peer-dispatch
+    /// (BatchWriteSmallBlobs) and AC-pin paths and would miss server pushes.
+    /// Reads the per-blob insert `Instant` already stored alongside each blob
+    /// (set in `insert_mirror_blob`), so no separate timestamp is tracked.
+    /// `store_id` is best-effort enriched from `dispatched_mirror_pins`
+    /// (present for the peer-dispatch path; server pushes record no source
+    /// store_id, so those log the `""` CAS sentinel). Returns the sweep
+    /// summary for tests; `#[doc(hidden)] pub` so tests can drive it.
+    #[doc(hidden)]
+    pub fn sweep_stale_mirror_pins(&self) -> StaleMirrorAlertSummary {
+        let threshold = Duration::from_secs(STALE_MIRROR_ALERT_SECS);
+        // Collect (digest, age_secs, size) under the read lock, then release
+        // it BEFORE emitting — no lock is held across any `warn!` (and there
+        // is no `.await` in this method).
+        let mut stale: Vec<(DigestInfo, u64, u64)> = Vec::new();
+        {
+            let blobs = self.mirror_blobs.read();
+            for (digest, (data, inserted_at)) in blobs.iter() {
+                let age = inserted_at.elapsed();
+                if age >= threshold {
+                    stale.push((*digest, age.as_secs(), data.len() as u64));
+                }
+            }
+        }
+        if stale.is_empty() {
+            return StaleMirrorAlertSummary::default();
+        }
+        // Best-effort source store_id per digest (see the doc comment). The
+        // snapshot lock is acquired only AFTER `mirror_blobs` was released,
+        // so the documented lock order (pins after mirror_blobs) holds.
+        let store_ids: HashMap<DigestInfo, Arc<str>> = self
+            .dispatched_mirror_pin_snapshot()
+            .into_iter()
+            .map(|(sid, d)| (d, sid))
+            .collect();
+        let stale_count = stale.len() as u64;
+        let stale_bytes: u64 = stale.iter().map(|(_, _, size)| *size).sum();
+        let lines_emitted = stale.len().min(STALE_MIRROR_ALERT_MAX_LINES);
+        for (digest, age_secs, size_bytes) in stale.into_iter().take(STALE_MIRROR_ALERT_MAX_LINES) {
+            let store_id: &str = store_ids.get(&digest).map_or("", |sid| &**sid);
+            warn!(
+                target: "nativelink::stale_mirror_alert",
+                %digest,
+                store_id,
+                age_secs,
+                size_bytes,
+                "mirror write not durable on server after 30s"
+            );
+        }
+        warn!(
+            target: "nativelink::stale_mirror_alert",
+            stale_mirror_count = stale_count,
+            stale_mirror_bytes = stale_bytes,
+            "stale mirror-pin sweep summary"
+        );
+        StaleMirrorAlertSummary {
+            stale_count,
+            stale_bytes,
+            lines_emitted,
+        }
+    }
+
+    /// Spawn the periodic diagnostic stale-mirror sweep (observability only).
+    /// Idempotent: the first call spawns the task; later calls are no-ops
+    /// (guarded by `stale_mirror_alert_running`). Intended to be started once
+    /// on the worker's CAS-server `FastSlowStore` (`cas_server_fss`), where
+    /// server-pushed mirror blobs are held in `mirror_blobs` until a
+    /// BlobsInStableStorage ack clears them. The task never blocks a runtime
+    /// worker (a 10 s `tokio::time::interval` tick; the sweep holds no lock
+    /// across `.await` and does no blocking work).
+    pub fn start_stale_mirror_alert(self: &Arc<Self>) {
+        if self
+            .stale_mirror_alert_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let this = Arc::clone(self);
+        drop(background_spawn!(
+            "fast_slow_store_stale_mirror_alert",
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(
+                    STALE_MIRROR_ALERT_INTERVAL_SECS,
+                ));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    this.sweep_stale_mirror_pins();
+                }
+            }
+        ));
+    }
+
+    /// Test-only: rewind a mirror blob's stored insert `Instant` by `back`
+    /// so [`Self::sweep_stale_mirror_pins`] treats it as aged without waiting
+    /// on wall-clock. No-op if the digest is not held.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn rewind_mirror_blob_inserted_at_for_test(&self, digest: &DigestInfo, back: Duration) {
+        let mut blobs = self.mirror_blobs.write();
+        if let Some((_, inserted_at)) = blobs.get_mut(digest) {
+            *inserted_at = Instant::now().checked_sub(back).unwrap_or(*inserted_at);
         }
     }
 

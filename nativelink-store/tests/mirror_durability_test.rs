@@ -892,3 +892,126 @@ async fn mirror_blobs_cap_exceeded_increments_counter() -> Result<(), Error> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------
+// Diagnostic stale-mirror alert (observability ONLY): a server-pushed
+// mirror blob still held in `mirror_blobs` past 30s without a
+// BlobsInStableStorage ack is surfaced by `sweep_stale_mirror_pins`.
+// The sweep NEVER drops a blob — these tests assert the DETECTION
+// contract (which blobs are flagged) and the flood cap.
+// ---------------------------------------------------------------
+
+#[nativelink_test]
+async fn stale_mirror_alert_flags_only_aged_mirror_blobs() {
+    use core::time::Duration;
+
+    let fss = make_fss();
+
+    // Blob A: mirrored + aged 31s → STALE.
+    let d_stale = d(0xA1, 16);
+    fss.insert_dispatched_mirror_blob("cas", d_stale, Bytes::from(vec![0u8; 16]))
+        .expect("insert stale mirror blob");
+    fss.rewind_mirror_blob_inserted_at_for_test(&d_stale, Duration::from_secs(31));
+
+    // Blob B: mirrored + fresh (age ~0) → NOT stale.
+    let d_fresh = d(0xB2, 32);
+    fss.insert_dispatched_mirror_blob("cas", d_fresh, Bytes::from(vec![1u8; 32]))
+        .expect("insert fresh mirror blob");
+
+    let summary = fss.sweep_stale_mirror_pins();
+    assert_eq!(
+        summary.stale_count, 1,
+        "only the AGED mirror blob (31s) is stale; the fresh blob must be excluded"
+    );
+    assert_eq!(
+        summary.stale_bytes, 16,
+        "stale_bytes must be the aged blob's size only (16), not the fresh blob's 32"
+    );
+    assert_eq!(
+        summary.lines_emitted, 1,
+        "exactly one per-blob WARN line for the single stale mirror blob"
+    );
+
+    // Observability only: the sweep must NOT drop any mirror blob.
+    assert_eq!(
+        fss.mirror_blob_count(),
+        2,
+        "sweep must NOT remove a stale mirror blob — release is BIS-ack-only"
+    );
+}
+
+#[nativelink_test]
+async fn stale_mirror_alert_emits_nothing_when_none_stale() {
+    let fss = make_fss();
+
+    // Fresh mirror blob (age ~0) — not stale.
+    let digest = d(0xC3, 16);
+    fss.insert_dispatched_mirror_blob("cas", digest, Bytes::from(vec![0u8; 16]))
+        .expect("insert fresh mirror blob");
+
+    let summary = fss.sweep_stale_mirror_pins();
+    assert_eq!(
+        summary.stale_count, 0,
+        "no mirror blob is past 30s — stale_count must be 0"
+    );
+    assert_eq!(summary.stale_bytes, 0, "no stale bytes when none stale");
+    assert_eq!(summary.lines_emitted, 0, "no WARN lines when none stale");
+}
+
+#[nativelink_test]
+async fn stale_mirror_alert_caps_warn_lines_but_summary_counts_all() {
+    use core::time::Duration;
+
+    let fss = make_fss();
+
+    // 60 aged mirror blobs > the 50-line cap.
+    let n: u64 = 60;
+    for seed in 0..n {
+        let digest = d(seed as u8, 16);
+        fss.insert_dispatched_mirror_blob("cas", digest, Bytes::from(vec![0u8; 16]))
+            .expect("insert mirror blob");
+        fss.rewind_mirror_blob_inserted_at_for_test(&digest, Duration::from_secs(31));
+    }
+
+    let summary = fss.sweep_stale_mirror_pins();
+    assert_eq!(
+        summary.stale_count, n,
+        "summary must count ALL stale mirror blobs (60), not just the emitted lines"
+    );
+    assert_eq!(
+        summary.stale_bytes,
+        n * 16,
+        "summary bytes must total ALL stale mirror blobs"
+    );
+    assert_eq!(
+        summary.lines_emitted, 50,
+        "per-blob WARN lines must be capped at 50 to avoid flooding, even though \
+         60 mirror blobs are stale"
+    );
+}
+
+#[nativelink_test]
+async fn stale_mirror_alert_threshold_is_30s() {
+    use core::time::Duration;
+
+    let fss = make_fss();
+
+    // Blob aged 29s → below threshold → NOT stale.
+    let d_below = d(0xD4, 16);
+    fss.insert_dispatched_mirror_blob("cas", d_below, Bytes::from(vec![0u8; 16]))
+        .expect("insert below-threshold mirror blob");
+    fss.rewind_mirror_blob_inserted_at_for_test(&d_below, Duration::from_secs(29));
+
+    // Blob aged 31s → above threshold → stale.
+    let d_above = d(0xE5, 16);
+    fss.insert_dispatched_mirror_blob("cas", d_above, Bytes::from(vec![0u8; 16]))
+        .expect("insert above-threshold mirror blob");
+    fss.rewind_mirror_blob_inserted_at_for_test(&d_above, Duration::from_secs(31));
+
+    let summary = fss.sweep_stale_mirror_pins();
+    assert_eq!(
+        summary.stale_count, 1,
+        "only the blob aged past STALE_MIRROR_ALERT_SECS (30s) is stale: \
+         31s yes, 29s no"
+    );
+}
