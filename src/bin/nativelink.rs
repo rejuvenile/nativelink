@@ -2889,6 +2889,28 @@ async fn inner_main(
                     .await
                     .err_tip(|| "Could not make LocalWorker")?;
 
+                    // #perf-obs: register the worker's EXECUTION FastSlowStore
+                    // metrics subtree so its previously-dark read-path +
+                    // peer-fetch counters render on /metrics. This is a SEPARATE
+                    // instance from the idle CAS-server WORKER_FAST_SLOW_STORE
+                    // registered via `store_manager` above (the one wrapped in a
+                    // WorkerProxyStore for the local CAS server at
+                    // `cas_server_port`): when `cas_server_port` is set,
+                    // `new_local_worker` builds a fresh `effective_cas_store`
+                    // (slow tier = worker-local WorkerProxyStore) that the
+                    // RunningActionsManager reads/writes but which never reached
+                    // this registry. Registered under the distinct
+                    // `WORKER_EXEC_FAST_SLOW_STORE` prefix — see
+                    // `register_execution_store_metrics` for the two-FSS
+                    // topology. Late registration is safe: `MetricsRegistry` is
+                    // Arc<Mutex<Vec>> and render snapshots live at scrape time.
+                    if let Some(exec_fss) = local_worker.execution_fast_slow_store() {
+                        nativelink_worker::local_worker::register_execution_store_metrics(
+                            &metrics_registry,
+                            exec_fss,
+                        );
+                    }
+
                     let name = if local_worker.name().is_empty() {
                         format!("worker_{i}")
                     } else {

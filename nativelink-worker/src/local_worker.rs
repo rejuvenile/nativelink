@@ -45,6 +45,7 @@ use nativelink_util::blob_locality_map::{SharedBlobLocalityMap, Stamp};
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::metrics_publisher::MetricsRegistry;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, Counter, CounterWithTime};
 use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::shutdown_guard::ShutdownGuard;
@@ -6505,6 +6506,58 @@ impl<
     }
 }
 
+/// Metrics registry prefix for the worker's EXECUTION `FastSlowStore`
+/// subtree. Dots become underscores in the rendered Prometheus name, so
+/// counters appear as `nativelink_WORKER_EXEC_FAST_SLOW_STORE_...`. Chosen
+/// DISTINCT from `WORKER_FAST_SLOW_STORE` (the idle CAS-server instance
+/// registered via `store_manager` in `src/bin/nativelink.rs`) so the two
+/// subtrees are unmistakable on `/metrics` — see
+/// [`register_execution_store_metrics`] for the two-instance topology.
+pub const WORKER_EXEC_FSS_METRIC_PREFIX: &str = "nativelink.WORKER_EXEC_FAST_SLOW_STORE";
+
+/// Register the worker's EXECUTION `FastSlowStore` metrics subtree into the
+/// process [`MetricsRegistry`] so its previously-dark read-path and
+/// peer-fetch counters render on `/metrics`.
+///
+/// # Two-`FastSlowStore`-instance topology (root cause of the dark counters)
+///
+/// A worker with `cas_server_port` set runs TWO `FastSlowStore` instances for
+/// `WORKER_FAST_SLOW_STORE`:
+///
+/// 1. **Idle CAS-server instance** — built by `build_store_manager` from
+///    `cfg.stores`, wrapped in a `WorkerProxyStore`, and registered via
+///    `metrics_registry.register("nativelink", store_manager)`
+///    (`src/bin/nativelink.rs`). It backs the worker's local CAS server
+///    (`cas_server_port`, e.g. `:50051`) for mirror/peer reads and is near-idle
+///    for peer-fetch, so its `nativelink_WORKER_FAST_SLOW_STORE_...` subtree
+///    reads ~0.
+///
+/// 2. **Execution instance** — a FRESH `FastSlowStore` (`effective_cas_store`)
+///    built inside [`new_local_worker`] whose slow tier is a worker-local
+///    `WorkerProxyStore` fed by the worker-local peer-locality map. This is the
+///    store the `RunningActionsManager` reads/writes to materialize action
+///    inputs and store outputs. It is NOT in `store_manager`, so it never
+///    reached the registry: its read-path (`fast_store_hit_count`,
+///    `slow_store_hit_count`, `populate_spawn_count`) and peer-fetch
+///    (`worker_proxy_peer_fetch_*`, `wps_worker_read_inner_hit_total`,
+///    `singleflight_*`) counters were structurally dark while the shared
+///    `FilesystemStore` fast tier (`evicting_map_*`) and the process-singleton
+///    `dir_cache_*` / `o11_*` families rendered normally.
+///
+/// This registers instance #2 under [`WORKER_EXEC_FSS_METRIC_PREFIX`].
+/// Late registration is safe: `MetricsRegistry` is `Arc<Mutex<Vec<..>>>` and
+/// `render_prometheus` snapshots the live component list at scrape time, so a
+/// registration performed after the metrics service was wired still renders.
+///
+/// Observability-only: no runtime path changes — the counters already
+/// increment on the execution instance; they were simply never rendered.
+pub fn register_execution_store_metrics(
+    metrics_registry: &MetricsRegistry,
+    execution_fast_slow_store: Arc<FastSlowStore>,
+) {
+    metrics_registry.register(WORKER_EXEC_FSS_METRIC_PREFIX, execution_fast_slow_store);
+}
+
 /// Creates a new `LocalWorker`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
 ///
@@ -7432,6 +7485,17 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
         &self.config.name
     }
 
+    /// The worker's EXECUTION `FastSlowStore` — the `effective_cas_store` the
+    /// `RunningActionsManager` reads/writes to materialize action inputs and
+    /// store outputs. Returns `None` when the running-actions manager exposes
+    /// no CAS store (test fakes). The binary uses this to register the
+    /// execution instance's metrics on `/metrics`; see
+    /// [`register_execution_store_metrics`] for why this instance is distinct
+    /// from the idle CAS-server `WORKER_FAST_SLOW_STORE`.
+    pub fn execution_fast_slow_store(&self) -> Option<Arc<FastSlowStore>> {
+        self.running_actions_manager.get_cas_store()
+    }
+
     async fn register_worker(
         &self,
         client: &mut T,
@@ -7715,11 +7779,121 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    use nativelink_macro::nativelink_test;
     use nativelink_util::common::DigestInfo;
     use nativelink_util::store_trait::StoreKey;
     use serial_test::serial;
 
     use super::*;
+
+    /// #perf-obs render-test — pins the LITERAL Prometheus names of the
+    /// worker EXECUTION `FastSlowStore` subtree that were structurally dark
+    /// (the two-FSS-instance topology: the execution `effective_cas_store`
+    /// built in `new_local_worker` is a SEPARATE instance from the idle
+    /// CAS-server `WORKER_FAST_SLOW_STORE` registered via `store_manager`,
+    /// so its read-path + peer-fetch counters never reached the registry).
+    ///
+    /// Builds the production-composition shape — `FastSlowStore` whose slow
+    /// tier is a `WorkerProxyStore` — registers it through the production
+    /// [`register_execution_store_metrics`], renders via the real
+    /// `render_prometheus` path, and asserts the exact emitted names appear
+    /// under the distinct `WORKER_EXEC_FAST_SLOW_STORE` prefix. Pins the
+    /// counters that carry real execution activity (peer-fetch, singleflight
+    /// dedup, worker inner-hit) plus the `slow_store` group placement.
+    ///
+    /// Guards the doubled-name / silent-zero trap (memory
+    /// `worker-metrics-exposure-pattern` #86) AND the `CounterWithTime`
+    /// `_counter` suffix artifact (peer-fetch is a `CounterWithTime`).
+    ///
+    /// Mutation (CLAUDE.md TDD #5): comment out the `metrics_registry.register`
+    /// line in [`register_execution_store_metrics`] → the exec-instance names
+    /// vanish from the render and this test red-fails with the bespoke
+    /// `got:\n{body}` message naming the missing metric.
+    #[nativelink_test]
+    async fn execution_fss_metrics_render_under_exec_prefix() {
+        use nativelink_config::stores::{FastSlowSpec, StoreDirection, StoreSpec};
+        use nativelink_store::memory_store::MemoryStore;
+        use nativelink_store::worker_proxy_store::WorkerProxyStore;
+        use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
+        use nativelink_util::metrics_publisher::render_prometheus;
+        use nativelink_util::store_trait::Store;
+
+        // Production-composition shape: FastSlowStore { fast: Memory,
+        // slow: WorkerProxyStore(Memory) } — mirrors the execution
+        // `effective_cas_store` built in `new_local_worker` (fast on-disk,
+        // slow = worker-local WorkerProxyStore). `MemoryStore` fast tier
+        // stands in for `FilesystemStore` (same MetricsComponent contract for
+        // the counters under test, which live on the FSS + the slow-tier WPS).
+        let fast = Store::new(MemoryStore::new(&nativelink_config::stores::MemorySpec::default()));
+        let inner_slow =
+            Store::new(MemoryStore::new(&nativelink_config::stores::MemorySpec::default()));
+        let proxy = WorkerProxyStore::new(inner_slow, new_shared_blob_locality_map());
+        let slow = Store::new(proxy);
+        // spec.fast / spec.slow are Noop because `FastSlowStore::new` takes the
+        // concrete store handles directly; the spec only carries directions +
+        // flags (same as the production construction in `new_local_worker`).
+        let spec = FastSlowSpec {
+            fast: StoreSpec::Noop(Default::default()),
+            slow: StoreSpec::Noop(Default::default()),
+            fast_direction: StoreDirection::Both,
+            slow_direction: StoreDirection::Both,
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+            bypass_dedup_threshold_bytes: 0,
+        };
+        let exec_fss: Arc<FastSlowStore> = FastSlowStore::new(&spec, fast, slow);
+
+        let registry = MetricsRegistry::new();
+        // The production registration path — the load-bearing line the
+        // mutation guard comments out.
+        register_execution_store_metrics(&registry, exec_fss);
+        let body = render_prometheus(&registry);
+
+        // Peer-fetch is a `CounterWithTime`, so it renders with the `_counter`
+        // suffix under the `slow_store` group of the exec FSS. Pinning the
+        // literal string catches both a lost `slow_store` group and a lost
+        // `_counter` suffix.
+        assert!(
+            body.contains(
+                "nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_worker_proxy_peer_fetch_notfound_total_counter"
+            ),
+            "expected execution-instance peer-fetch counter \
+             `nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_worker_proxy_peer_fetch_notfound_total_counter`, \
+             got:\n{body}"
+        );
+        // Singleflight dedup hits (bare AtomicU64, nested slow_store→singleflight→inner).
+        assert!(
+            body.contains(
+                "nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_singleflight_inner_total_dedup_hits"
+            ),
+            "expected execution-instance singleflight dedup counter \
+             `nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_singleflight_inner_total_dedup_hits`, \
+             got:\n{body}"
+        );
+        // Worker inner-hit (bare AtomicU64 `_total`, no CounterWithTime suffix).
+        assert!(
+            body.contains(
+                "nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_wps_worker_read_inner_hit_total"
+            ),
+            "expected execution-instance worker inner-hit counter \
+             `nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_wps_worker_read_inner_hit_total`, \
+             got:\n{body}"
+        );
+        // Read-path hit counters render directly on the FSS (no group).
+        assert!(
+            body.contains("nativelink_WORKER_EXEC_FAST_SLOW_STORE_fast_store_hit_count"),
+            "expected execution-instance `nativelink_WORKER_EXEC_FAST_SLOW_STORE_fast_store_hit_count`, \
+             got:\n{body}"
+        );
+        // Regression guard: the inner-hit must NOT pick up a CounterWithTime
+        // `_counter` suffix (it is a bare AtomicU64) — the doubled-artifact trap.
+        assert!(
+            !body.contains(
+                "nativelink_WORKER_EXEC_FAST_SLOW_STORE_slow_store_wps_worker_read_inner_hit_total_counter"
+            ),
+            "inner-hit must render as bare `_total`, not with a `_counter` suffix, got:\n{body}"
+        );
+    }
 
     /// (A1 fix) T1 — empty-tick suppression. Stable steady state with
     /// N AC pins, no other deltas: the gate predicate MUST be true so
