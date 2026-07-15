@@ -127,7 +127,7 @@ const EARLY_RETURN_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 /// did in BOTH cases. So a terminal `Err(Code::Cancelled)` is treated as
 /// drain-COMPLETE (success). Any OTHER terminal `Err` is surfaced.
 ///
-/// **Bounds (copied from `bounded_drain_grpc_stream`):**
+/// **Bounds:**
 /// 1. Per-`recv` no-progress timeout of [`EARLY_RETURN_DRAIN_PER_RECV_TIMEOUT`]
 ///    (`Code::DeadlineExceeded` on a stalled producer); NOT a whole-drain
 ///    deadline.

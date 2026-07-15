@@ -5032,7 +5032,7 @@ pub async fn f1_g1b_dedup_coalesce_drains_inbound_half_close()
 /// Over-cap: a client that streams MORE than `declared + 4 MiB` slack on
 /// the G1 short-circuit drain must trip the drain's OWN cumulative size cap
 /// and surface an error rather than buffering the over-claim. Mirrors the
-/// bound in `bounded_drain_grpc_stream` (declared +
+/// bound in `drain_write_request_stream_to_eof` (declared +
 /// EARLY_DEDUP_DRAIN_SIZE_SLACK).
 ///
 /// SUBTLETY: `WriteRequestStreamWrapper` already rejects a frame whose

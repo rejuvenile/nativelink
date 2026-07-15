@@ -194,7 +194,7 @@ const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 /// "Divergence from legacy" below.
 ///
 /// **Upstream gRPC client deadline** (red-team finding P4 / #286
-/// sub-item 4): `chunked_client.rs:209` `client.write_chunked(stream)`
+/// sub-item 4): `chunked_client.rs:227` `client.write_chunked_v2(stream)`
 /// does NOT call `tonic::Request::set_timeout`, so the chunked path
 /// has no client-side per-RPC deadline by default. This watchdog is
 /// therefore the **server-side** deadline only. If a tonic-level
@@ -249,9 +249,8 @@ pub const CHUNKED_COMMIT_WATCHDOG_SECS: u64 = 60;
 
 /// #501 (narrow scope): soft-warn deadline for chunked-commit observability.
 ///
-/// **What:** at every commit-watchdog site (v1 reaper, v2 sibling,
-/// BazelChunkedDispatcher AwaitCommit, and #510's 4th-site coverage of
-/// `await_inflight_commit_with_watchdog`) we install an early `warn!` +
+/// **What:** at every commit-watchdog site (v1 reaper, v2 sibling, and
+/// BazelChunkedDispatcher AwaitCommit) we install an early `warn!` +
 /// counter-bump that fires ~half-way between commit start and the
 /// destructive `CHUNKED_COMMIT_WATCHDOG_SECS=60` deadline. The
 /// infra-integrity watchdog is byte-identical to today — soft-warn is
@@ -305,9 +304,9 @@ const _ASSERT_WATCHDOG_ORDERING: () = {
 
 /// #501 (narrow scope): per-site one-shot soft-warn dedup set.
 ///
-/// Each commit-watchdog site (v1 reaper, v2 sibling, BazelChunkedDispatcher
-/// AwaitCommit, and #510's `await_inflight_commit_with_watchdog`) owns
-/// its OWN `SoftWarnSet` via a dedicated module-level static. Cross-site sharing was rejected by red-team review on the
+/// Each commit-watchdog site (v1 reaper, v2 sibling, and
+/// BazelChunkedDispatcher AwaitCommit) owns its OWN `SoftWarnSet` via a
+/// dedicated module-level static. Cross-site sharing was rejected by red-team review on the
 /// prior full-Option-A attempt — production wiring did not thread a
 /// shared set across crates, so the test that exercised cross-site
 /// dedup ran in a topology production never reaches. Per-site statics
@@ -400,17 +399,6 @@ pub static BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSe
 /// `pub` so the v2 file (sibling module) and integration tests can
 /// reference it.
 pub static V2_AWAITER_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
-    std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
-
-/// #510 4th-site soft-warn dedup. Used by the v1 worker
-/// `WriteChunked` cross-version AwaitCommit notify path
-/// (`await_inflight_commit_with_watchdog`). Added by #447 Notify-wait
-/// conversion; #501 narrow-scope shipped without observability on this
-/// site because #447 had not yet merged at design time. Per the per-site
-/// `SoftWarnSet` rationale on `V1_REAPER_SOFT_WARN_SEEN`, each site owns
-/// its own dedup set to keep the test fixture local. `pub` so integration
-/// tests can `clear()` between rounds.
-pub static AWAIT_INFLIGHT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
     std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
 
 // ---------------------------------------------------------------------------
@@ -776,7 +764,7 @@ pub struct ChunkedWriteHandlerMetrics {
     /// recovering" signal that does NOT degrade durability (no
     /// failed_slow_writes inserts, no synthetic Err to clients).
     #[metric(
-        help = "Chunked commit slow: digests that crossed CHUNKED_COMMIT_SOFT_WARN_SECS (30s) but may still complete before CHUNKED_COMMIT_WATCHDOG_SECS (60s); aggregated across v1 reaper + v2 sibling + BazelChunkedDispatcher AwaitCommit + #447 await_inflight_commit_with_watchdog sites; per-site dedup ensures one bump per digest per site"
+        help = "Chunked commit slow: digests that crossed CHUNKED_COMMIT_SOFT_WARN_SECS (30s) but may still complete before CHUNKED_COMMIT_WATCHDOG_SECS (60s); aggregated across v1 reaper + v2 sibling + BazelChunkedDispatcher AwaitCommit sites; per-site dedup ensures one bump per digest per site"
     )]
     pub commit_watchdog_soft_warn_total: AtomicU64,
     /// #494-v3 Phase 2: max concurrent writers per digest seen since
@@ -2049,7 +2037,7 @@ pub fn admit_prepared_chunk(
 /// sweep.
 ///
 /// **Upstream gRPC deadline note** (red-team finding P4 / #286
-/// sub-item 4): the `chunked_client.rs:209` `client.write_chunked(..)`
+/// sub-item 4): the `chunked_client.rs:227` `client.write_chunked_v2(..)`
 /// call does NOT call `tonic::Request::set_timeout`, so the chunked
 /// path has no client-side per-RPC deadline by default. This watchdog
 /// is therefore the SERVER-side deadline. If a tonic-level deadline is
@@ -4071,193 +4059,6 @@ async fn bounded_drain_reader(
             ));
         }
     }
-}
-
-/// Wait on the per-digest race-state's `commit_done` Notify, with a
-/// `CHUNKED_COMMIT_WATCHDOG_SECS`-second deadline. Returns the
-/// committed size on success, or `Code::DeadlineExceeded` if the
-/// in-flight writer's commit exceeded the watchdog.
-///
-/// #447 Notify-wait conversion: this is the architectural replacement
-/// for the previous worker-mirror upload retry-on-Aborted shape. When a
-/// v1 worker `WriteChunked` (or any single-stream writer) arrives and
-/// observes another writer mid-commit, it MUST NOT return
-/// `Code::Aborted + BackpressureSignal { retry_after_ms = 250 }` and
-/// force the client into polling-retry: that path racks up a fixed
-/// retry budget against an in-flight writer whose commit window can
-/// exceed the budget for any multi-MiB blob (the original #447
-/// production symptom — 750 ms budget vs multi-second slow-tier
-/// commit). Instead, attach to the SAME per-digest Notify primitive
-/// the `BazelChunkedDispatcher::dispatch` AwaitCommit branch
-/// (`chunked_write_handler.rs:3431+`) and v2's `v2_await_commit_result`
-/// (`chunked_write_handler_v2.rs:938+`) already use. The loser's RPC
-/// blocks until the winner's commit publishes, then returns
-/// success/failure based on the winner's outcome.
-///
-/// **Cancel-safety:** the returned `Notified<'_>` future borrows the
-/// race-state via `&self`. The race-state's lifetime is bounded by the
-/// `Arc<ChunkRaceState>` the caller holds. If the client drops the
-/// gRPC RPC mid-wait, dropping this future drops the `Notified`
-/// subscription cleanly (Tokio's `Notify` deregisters waiters on
-/// `Notified::Drop` — no leaked registry entries, no leaked
-/// subscribers).
-///
-/// **Missed-wakeup defense:** Tokio 1.49's `Notify::notified()`
-/// captures `notify_waiters_calls` at FUTURE-CREATION time and
-/// `Notified::poll` resolves immediately if the counter advanced
-/// (`notify.rs:1148`). So `subscribe_commit_done() → ... → notified.await`
-/// is race-free against `publish_commit_result` between subscribe and
-/// poll IN THIS TOKIO VERSION. The pin + `enable()` is
-/// belt-and-suspenders against future tokio API drift (mirrors the
-/// same comment block in v2's awaiter).
-///
-/// **Watchdog discriminator (#447 fix-up addressing red-team
-/// RECONSIDER + mirroring #508):** the returned `Code::DeadlineExceeded`
-/// at watchdog timeout MUST carry a `WatchdogTimeoutSignal` detail so
-/// `chunked_client.rs::classify_retryable` (`:618-628`) returns
-/// `Retry { WatchdogDeadline }` rather than `Abort`. Bare
-/// `DeadlineExceeded` would map to `Abort` at the classifier, making
-/// this path 80× WORSE than the pre-#447 Aborted+BackpressureSignal
-/// shape (same Bazel-visible outcome — RetryDecision::Abort — but at
-/// 60s wall-clock vs the original ~750ms, and holding an RPC slot the
-/// entire time). Mirrors v1's commit-runner arm at
-/// `chunked_write_handler.rs:2354-2358` and the v2 awaiter's
-/// `v2_await_commit_result` post-#508. The v1 commit-runner reaper
-/// (`run_async_commit_reaper:2347`) is the originating wedge-detector;
-/// siblings observing the missed wakeup must ALSO carry the
-/// discriminator so the client treats the sibling's symptom as the
-/// SAME retry class as the runner-side wedge — anything else
-/// silently degrades to Abort.
-async fn await_inflight_commit_with_watchdog(
-    race_state: &std::sync::Arc<
-        nativelink_store::chunked::chunked_race_state::ChunkRaceState,
-    >,
-    digest: DigestInfo,
-    metrics: &Arc<ChunkedWriteHandlerMetrics>,
-) -> Result<u64, Error> {
-    let notified = race_state.subscribe_commit_done();
-    tokio::pin!(notified);
-    notified.as_mut().enable();
-    // Belt-and-suspenders for the missed-wakeup race: if a commit
-    // already published BEFORE we subscribed, peek returns Some and we
-    // skip the wait entirely.
-    if let Some(result) = race_state.peek_commit_result() {
-        return result.map(|r| r.committed_size);
-    }
-    let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
-    // #510 4th-site soft-warn observability: the #501 narrow-scope diff
-    // covered the v1 reaper, v2 sibling, and BazelChunkedDispatcher
-    // AwaitCommit sites. This site (`await_inflight_commit_with_watchdog`,
-    // added by #447 AFTER the #501 design landed) is the v1 worker
-    // WriteChunked cross-version coordination path: a worker arriving
-    // while another writer holds the per-digest single-stream gate parks
-    // on the per-digest Notify here. Without an early signal at 30 s,
-    // operators get no warning before the destructive 60 s
-    // infra-integrity watchdog fires. Mirrors the 3 existing sites:
-    //   - select! biased toward the watchdog branch so simultaneous-poll
-    //     ties resolve in favor of the existing path (zero behavior
-    //     change at 60 s).
-    //   - one-shot per digest via `AWAIT_INFLIGHT_SOFT_WARN_SEEN`
-    //     (dedicated per-site set per the #501 narrow-scope decision).
-    //   - counter always bumped (load-bearing operator-visible signal);
-    //     `warn!` log line suppressed only if dedup set is at cap OR the
-    //     digest already fired soft-warn here.
-    //   - dedup entry drained on ANY watchdog outcome (Ok/Err) so a
-    //     long-running process doesn't accumulate entries.
-    let watchdog_fut = tokio::time::timeout(watchdog, notified);
-    tokio::pin!(watchdog_fut);
-    let soft_warn_at = tokio::time::sleep(core::time::Duration::from_secs(
-        CHUNKED_COMMIT_SOFT_WARN_SECS,
-    ));
-    tokio::pin!(soft_warn_at);
-    let mut soft_warned = false;
-    let watchdog_result = loop {
-        tokio::select! {
-            biased;
-            r = &mut watchdog_fut => break r,
-            () = &mut soft_warn_at, if !soft_warned => {
-                soft_warned = true;
-                metrics
-                    .commit_watchdog_soft_warn_total
-                    .fetch_add(1, Ordering::Relaxed);
-                if AWAIT_INFLIGHT_SOFT_WARN_SEEN.insert_one_shot(digest) {
-                    warn!(
-                        ?digest,
-                        soft_warn_secs = CHUNKED_COMMIT_SOFT_WARN_SECS,
-                        infra_integrity_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
-                        site = "worker_await_inflight",
-                        "#510: chunked commit slow — v1 worker WriteChunked \
-                         cross-version awaiter crossed soft-warn threshold; \
-                         infra-integrity watchdog will fire if no progress \
-                         before destructive deadline"
-                    );
-                }
-            }
-        }
-    };
-    // Drain the per-digest entry on ANY outcome (success or watchdog
-    // fire). Safe to call unconditionally — `remove` on a missing key is
-    // a no-op. Mirrors the v1 reaper, v2 sibling, and BazelDispatcher
-    // remove-on-completion semantics.
-    AWAIT_INFLIGHT_SOFT_WARN_SEEN.remove(&digest);
-    match watchdog_result {
-        Ok(()) => race_state
-            .peek_commit_result()
-            .unwrap_or_else(|| {
-                Err(make_err!(
-                    Code::Internal,
-                    "#447 WriteChunked AwaitCommit: commit_done fired but \
-                     commit_result missing for digest {digest} (programmer bug)"
-                ))
-            })
-            .map(|r| r.committed_size),
-        Err(_elapsed) => {
-            // #447 fix-up (closes red-team RECONSIDER + mirrors #508):
-            // attach the `WatchdogTimeoutSignal` discriminator so the
-            // chunked client's `classify_retryable` predicate
-            // (`chunked_client.rs::classify_retryable` `:618-628`)
-            // returns `Retry { WatchdogDeadline }` instead of `Abort`.
-            // Without this, bare `DeadlineExceeded` maps to `Abort` at
-            // the classifier — making this path 80× worse than the
-            // pre-#447 Aborted+BackpressureSignal shape it replaced
-            // (60s wedge vs ~750ms, same Bazel-visible outcome,
-            // holding an RPC slot the entire time). Mirrors v1 at
-            // `chunked_write_handler.rs:2354-2358` and the v2 awaiter
-            // post-#508 at `chunked_write_handler_v2.rs`.
-            let detail = encode_watchdog_timeout_signal_any(
-                watchdog_timeout_signal::Reason::ChunkedCommitWatchdog,
-                CHUNKED_COMMIT_WATCHDOG_SECS,
-            );
-            Err(Error::deadline_exceeded_with_detail(
-                format!(
-                    "#447 WriteChunked AwaitCommit: in-flight writer's commit \
-                     exceeded {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog for digest {digest}"
-                ),
-                detail,
-            ))
-        }
-    }
-}
-
-/// #510 test-only shim: expose the module-private
-/// `await_inflight_commit_with_watchdog` to integration tests in
-/// `tests/chunked_commit_soft_warn_test.rs`. Mirrors v2's
-/// `v2_await_commit_result_for_test` pattern at
-/// `chunked_write_handler_v2.rs:1076`. The integration test exercises
-/// both the soft-warn under-action (counter bumps at 30 s on park) and
-/// over-action (counter stays 0 when publisher fires before 30 s)
-/// contracts; it cannot reach this function via the WriteChunked RPC
-/// without a full gRPC server fixture, hence the shim.
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub async fn await_inflight_commit_with_watchdog_for_test(
-    race_state: &std::sync::Arc<
-        nativelink_store::chunked::chunked_race_state::ChunkRaceState,
-    >,
-    digest: DigestInfo,
-    metrics: &Arc<ChunkedWriteHandlerMetrics>,
-) -> Result<u64, Error> {
-    await_inflight_commit_with_watchdog(race_state, digest, metrics).await
 }
 
 pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
