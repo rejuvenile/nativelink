@@ -107,6 +107,51 @@ fn next_writer_id() -> WriterId {
 /// flow control kicks in.
 const ACK_CHANNEL_CAP: usize = 64;
 
+/// #perf: sample period for the two per-session `WriteChunkedV2` lifecycle
+/// `info!` lines ("RPC entry" at session start + "session opened" after
+/// admission). Production fires each ONCE per chunked write (measured 777 in
+/// one 15-min window 2026-07-14); under a 140-executor build burst these
+/// multiply into the known write-burst-stall regime. The two lines exist for
+/// #247/#477 wire-shape attribution — a load-bearing signal, so they are
+/// SAMPLED, not demoted to `debug!` (which `release_max_level_info` strips
+/// from the release binary; see the `logging-release-max-level` memory).
+/// Emit the FIRST occurrence + every `V2_LIFECYCLE_LOG_SAMPLE_PERIOD`-th
+/// thereafter; each emitted line carries the always-incremented `cumulative`
+/// count so the true per-site rate stays recoverable from the journal. Same
+/// first-then-every-Nth precedent as `fallback_log_gate`
+/// (`nativelink-util/src/task.rs`) and `CHUNKED_INFLIGHT_LOG_SAMPLE_PERIOD`
+/// (`chunked_write_handler.rs`).
+const V2_LIFECYCLE_LOG_SAMPLE_PERIOD: u64 = 64;
+
+/// Cumulative count of `WriteChunkedV2 RPC entry` occurrences (sampled +
+/// suppressed). Incremented on EVERY RPC entry so the emitted line's
+/// `cumulative` field conveys the true invocation rate even though only
+/// 1-in-`V2_LIFECYCLE_LOG_SAMPLE_PERIOD` lines are written.
+static V2_RPC_ENTRY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of `WriteChunkedV2: session opened` occurrences.
+/// Independent from the RPC-entry counter — a session-open is skipped on
+/// early zero-size / digest-parse rejects, so the two rates diverge.
+static V2_SESSION_OPENED_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns `true` if the sampled lifecycle `info!` should be emitted for
+/// cumulative occurrence `count` (1-based): the first occurrence and every
+/// `V2_LIFECYCLE_LOG_SAMPLE_PERIOD`-th thereafter. Pure and deterministic
+/// (count → bool) for testability.
+const fn v2_lifecycle_log_gate(count: u64) -> bool {
+    count == 1 || count % V2_LIFECYCLE_LOG_SAMPLE_PERIOD == 0
+}
+
+/// Increment `counter` and return `(new_count, should_log)`. The counter
+/// bumps on EVERY call (unconditionally) so the true rate is preserved;
+/// `should_log` samples via [`v2_lifecycle_log_gate`]. Factored so a unit
+/// test can prove "counter increments every call while the log samples"
+/// against a fresh atomic without exercising the RPC path.
+fn v2_lifecycle_log_decision(counter: &AtomicU64) -> (u64, bool) {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    (count, v2_lifecycle_log_gate(count))
+}
+
 /// Watchdog deadline for waiting on `commit_done` after the last chunk
 /// is admitted. If the commit-runner wedges (slow tier hang, panic
 /// during BLAKE3 hash), siblings observe `Err(DeadlineExceeded)` and
@@ -157,19 +202,28 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         self: Arc<Self>,
         request: Request<Streaming<WriteChunk>>,
     ) -> Result<Response<WriteChunkedV2Stream>, Status> {
-        // #247+#477 DS-reviewer disambiguation: emit one info! per v2
-        // server-side RPC entry so a journal scan can attribute every
-        // worker→server WriteChunkedV2 invocation to this wire shape.
-        let peer_addr = request
-            .remote_addr()
-            .map_or_else(|| "unknown".to_string(), |a| a.to_string());
-        info!(
-            target: "nativelink_service::chunked_write_handler_v2",
-            writer_path = "server_v2_rpc",
-            wire_shape = "v2",
-            %peer_addr,
-            "WriteChunkedV2 RPC entry",
-        );
+        // #247+#477 DS-reviewer disambiguation: attribute every worker→server
+        // WriteChunkedV2 invocation to this wire shape.
+        // #perf: SAMPLED (first + every V2_LIFECYCLE_LOG_SAMPLE_PERIOD-th) —
+        // under a build burst this fired ~777/15min into the write-burst-stall
+        // regime. The always-incremented V2_RPC_ENTRY_LOG_COUNT conveys the
+        // true rate on each emitted line; `peer_addr` is resolved ONLY on the
+        // emitted path so the suppressed path skips the SocketAddr→String alloc.
+        let (rpc_entry_count, should_log_rpc_entry) =
+            v2_lifecycle_log_decision(&V2_RPC_ENTRY_LOG_COUNT);
+        if should_log_rpc_entry {
+            let peer_addr = request
+                .remote_addr()
+                .map_or_else(|| "unknown".to_string(), |a| a.to_string());
+            info!(
+                target: "nativelink_service::chunked_write_handler_v2",
+                writer_path = "server_v2_rpc",
+                wire_shape = "v2",
+                %peer_addr,
+                cumulative = rpc_entry_count,
+                "WriteChunkedV2 RPC entry",
+            );
+        }
         let mut stream = request.into_inner();
 
         // Receive the first chunk so we learn the digest BEFORE
@@ -304,13 +358,22 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         let metrics = self.metrics_for_v2();
         atomic_max(&metrics.chunked_writers_per_digest_max, attached);
 
-        info!(
-            target: "nativelink_service::chunked_write_handler_v2",
-            ?digest,
-            ?writer_id,
-            attached,
-            "WriteChunkedV2: session opened",
-        );
+        // #perf: SAMPLED session-opened lifecycle line (first + every
+        // V2_LIFECYCLE_LOG_SAMPLE_PERIOD-th). 1 per chunked write in prod;
+        // V2_SESSION_OPENED_LOG_COUNT conveys the true rate on each emitted
+        // line. #247/#477 wire-shape attribution preserved.
+        let (session_log_count, should_log_session) =
+            v2_lifecycle_log_decision(&V2_SESSION_OPENED_LOG_COUNT);
+        if should_log_session {
+            info!(
+                target: "nativelink_service::chunked_write_handler_v2",
+                ?digest,
+                ?writer_id,
+                attached,
+                cumulative = session_log_count,
+                "WriteChunkedV2: session opened",
+            );
+        }
 
         // Send the ADMITTED_SKIP_TO hint if any chunks are already
         // contiguously committed. Best-effort; ignore send error
@@ -1385,3 +1448,99 @@ const _ASSERT_CHUNKER_INVARIANT: () = {
         "WriteChunkedV2 per-chunk dedup safety relies on position-based chunker",
     );
 };
+
+#[cfg(test)]
+mod v2_lifecycle_log_sampling_tests {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        V2_LIFECYCLE_LOG_SAMPLE_PERIOD, v2_lifecycle_log_decision, v2_lifecycle_log_gate,
+    };
+
+    /// Numeric-constant discipline: the sample period literal is the value
+    /// cited in the commit message as the volume-reduction factor for the
+    /// two `WriteChunkedV2` lifecycle `info!` lines.
+    #[test]
+    fn sample_period_constant_is_64() {
+        assert_eq!(
+            V2_LIFECYCLE_LOG_SAMPLE_PERIOD, 64,
+            "V2_LIFECYCLE_LOG_SAMPLE_PERIOD must be exactly 64 (cited as the \
+             ~64x volume reduction for the two WriteChunkedV2 lifecycle logs)"
+        );
+    }
+
+    /// The period must be a real throttle (>1); a period of 1 would emit
+    /// on every call and defeat the fix.
+    #[test]
+    fn sample_period_actually_throttles() {
+        assert!(
+            V2_LIFECYCLE_LOG_SAMPLE_PERIOD > 1,
+            "sample period must be >1 or the gate emits on every call — no throttle"
+        );
+    }
+
+    /// The gate emits on the first occurrence, suppresses everything strictly
+    /// between the first and the period boundary, and re-emits at each period
+    /// boundary.
+    #[test]
+    fn gate_emits_first_then_every_period() {
+        assert!(
+            v2_lifecycle_log_gate(1),
+            "first occurrence MUST log so a journal scan sees the wire shape start"
+        );
+        for c in 2..V2_LIFECYCLE_LOG_SAMPLE_PERIOD {
+            assert!(
+                !v2_lifecycle_log_gate(c),
+                "occurrence {c} between first and period boundary MUST be suppressed \
+                 (spam reduction)"
+            );
+        }
+        assert!(
+            v2_lifecycle_log_gate(V2_LIFECYCLE_LOG_SAMPLE_PERIOD),
+            "occurrence at the period boundary MUST log (periodic heartbeat)"
+        );
+        assert!(
+            !v2_lifecycle_log_gate(V2_LIFECYCLE_LOG_SAMPLE_PERIOD + 1),
+            "occurrence just past the period boundary MUST be suppressed"
+        );
+        assert!(
+            v2_lifecycle_log_gate(2 * V2_LIFECYCLE_LOG_SAMPLE_PERIOD),
+            "second period boundary MUST log"
+        );
+    }
+
+    /// The core contract the dispatch names: the counter increments on EVERY
+    /// call (so the true rate stays recoverable / scrapeable) while the log
+    /// SAMPLES (emits only on the first + every period-th occurrence).
+    #[test]
+    fn counter_increments_every_call_while_log_samples() {
+        let counter = AtomicU64::new(0);
+        let calls = 2 * V2_LIFECYCLE_LOG_SAMPLE_PERIOD + 1;
+        let mut logged_at = Vec::new();
+        for _ in 0..calls {
+            let (count, should_log) = v2_lifecycle_log_decision(&counter);
+            if should_log {
+                logged_at.push(count);
+            }
+        }
+        // Counter bumped on every single call — true cumulative rate.
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            calls,
+            "counter MUST increment on every call so the true rate is recoverable \
+             even when the log is sampled; if it equals the emitted-line count the \
+             fetch_add was wrongly gated behind the sampler"
+        );
+        // Emissions land exactly on 1, PERIOD, 2*PERIOD.
+        assert_eq!(
+            logged_at,
+            vec![
+                1,
+                V2_LIFECYCLE_LOG_SAMPLE_PERIOD,
+                2 * V2_LIFECYCLE_LOG_SAMPLE_PERIOD
+            ],
+            "log MUST emit only on the first occurrence + every period-th; any other \
+             set means the sampler is not throttling as specified"
+        );
+    }
+}

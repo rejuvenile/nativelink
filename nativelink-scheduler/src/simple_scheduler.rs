@@ -2933,7 +2933,22 @@ impl SimpleScheduler {
                         for (worker_id, construct_latency_ms_p95) in
                             worker_scheduler.construct_latency_snapshot().await
                         {
-                            info!(
+                            // #perf: DEMOTED info! → debug!. This per-worker
+                            // gossip line fired ~1,796/15min but is INERT — the
+                            // `T_SETUP` hold gate it was added to feed is not
+                            // wired (0 fires), so it is LOGGED-only and feeds
+                            // nothing today (Chesterton's Fence: the value's
+                            // consumer never landed). Unlike the load-bearing
+                            // #247/#477 lifecycle logs (rate-limited, kept at
+                            // info!), demoting an inert log to debug! is the
+                            // correct fix even though `release_max_level_info`
+                            // strips it from the release binary — there is no
+                            // signal to preserve. The underlying value stays
+                            // available via `construct_latency_snapshot()` (still
+                            // computed each cycle) + `update_worker_construct_latency`
+                            // (the gossip mechanism is untouched); a future
+                            // hold-gate consumer or a debug build re-surfaces it.
+                            debug!(
                                 tag = "worker_construct_latency",
                                 worker_id = %worker_id.0,
                                 construct_latency_ms_p95,
