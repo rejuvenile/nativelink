@@ -877,7 +877,9 @@ message ExecuteComplete {
 
 /// Resource usage observed by the worker while running one action.
 message ActionResourceUsage {
-    /// Peak resident memory observed for the action process tree.
+    /// Peak phys_footprint of the action process tree (macOS per-process memory
+    /// ledger — excludes shared/reclaimable, includes compressed; NOT
+    /// resident/RSS), in KiB.
     uint64 peak_memory_kb = 1;
 
     /// Whether this value came from worker-side sampling.
@@ -889,7 +891,29 @@ message ActionResourceUsage {
     /// The worker ID that observed the resource usage.
     string worker_id = 4;
 
-    reserved 5; // NextId.
+    /// Total CPU time (user+system) in nanoseconds, summed over the action
+    /// process subtree (task-resource-profile Phase 1).
+    uint64 cpu_ns = 5;
+
+    /// Total disk-I/O bytes (read + written) summed over the action process
+    /// subtree (task-resource-profile Phase 1).
+    uint64 disk_bytes = 6;
+
+    /// Bytes fetched to stage the action's inputs — a REAL store-layer
+    /// input-fetch counter (bytes the network transfer moved), NOT the process
+    /// (task-resource-profile Phase 1). Asymmetric with net_output_bytes below,
+    /// which is a declared-size sum, not a transfer counter.
+    uint64 net_input_bytes = 7;
+
+    /// SUM of the DECLARED output digest sizes: each output file's digest size
+    /// PLUS each output directory's Tree-PROTO digest size. This is NOT a
+    /// bytes-uploaded counter — CAS dedup means real upload bytes <= this — and
+    /// for output DIRECTORIES it counts ONLY the Tree-proto size, EXCLUDING the
+    /// file payloads inside the directory. (Asymmetric with net_input_bytes,
+    /// which IS a real fetch counter.) task-resource-profile Phase 1.
+    uint64 net_output_bytes = 8;
+
+    reserved 9; // NextId.
 }
 
 /// Result sent back from the server when a node connects.

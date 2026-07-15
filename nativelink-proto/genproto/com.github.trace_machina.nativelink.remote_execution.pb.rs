@@ -962,7 +962,9 @@ pub struct ExecuteComplete {
 /// / Resource usage observed by the worker while running one action.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ActionResourceUsage {
-    /// / Peak resident memory observed for the action process tree.
+    /// / Peak phys_footprint of the action process tree (macOS per-process memory
+    /// / ledger — excludes shared/reclaimable, includes compressed; NOT
+    /// / resident/RSS), in KiB.
     #[prost(uint64, tag = "1")]
     pub peak_memory_kb: u64,
     /// / Whether this value came from worker-side sampling.
@@ -974,6 +976,28 @@ pub struct ActionResourceUsage {
     /// / The worker ID that observed the resource usage.
     #[prost(string, tag = "4")]
     pub worker_id: ::prost::alloc::string::String,
+    /// / Total CPU time (user+system) in nanoseconds, summed over the action
+    /// / process subtree (task-resource-profile Phase 1).
+    #[prost(uint64, tag = "5")]
+    pub cpu_ns: u64,
+    /// / Total disk-I/O bytes (read + written) summed over the action process
+    /// / subtree (task-resource-profile Phase 1).
+    #[prost(uint64, tag = "6")]
+    pub disk_bytes: u64,
+    /// / Bytes fetched to stage the action's inputs — a REAL store-layer
+    /// / input-fetch counter (bytes the network transfer moved), NOT the process
+    /// / (task-resource-profile Phase 1). Asymmetric with net_output_bytes below,
+    /// / which is a declared-size sum, not a transfer counter.
+    #[prost(uint64, tag = "7")]
+    pub net_input_bytes: u64,
+    /// / SUM of the DECLARED output digest sizes: each output file's digest size
+    /// / PLUS each output directory's Tree-PROTO digest size. This is NOT a
+    /// / bytes-uploaded counter — CAS dedup means real upload bytes <= this — and
+    /// / for output DIRECTORIES it counts ONLY the Tree-proto size, EXCLUDING the
+    /// / file payloads inside the directory. (Asymmetric with net_input_bytes,
+    /// / which IS a real fetch counter.) task-resource-profile Phase 1.
+    #[prost(uint64, tag = "8")]
+    pub net_output_bytes: u64,
 }
 /// / Result sent back from the server when a node connects.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

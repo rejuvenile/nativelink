@@ -5516,12 +5516,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // count as an attempt (simple_scheduler_state_manager.rs:817).
                                             // Code::Unavailable WOULD burn the retry budget.
                                             result: Some(execute_result::Result::InternalError(make_err!(Code::ResourceExhausted, "Worker startup reconcile in progress").into())),
-                                            // resource_usage is intentionally None at every
-                                            // ExecuteResult site: worker-side resource
-                                            // telemetry was declined in the v1.6.1 merge. When
-                                            // origin events are enabled they yield start-execute
-                                            // events but never resource-usage events (no producer
-                                            // populates this field on this fork's worker path).
+                                            // resource_usage is None on this NAK path and every
+                                            // reject/error path: the action never ran, so no
+                                            // resource usage exists to report. The SUCCESS
+                                            // completion path is the sole producer — it populates
+                                            // this from the calib measurements (task-resource-profile
+                                            // Phase 1). Observe-only; the server consumer is a later
+                                            // wave.
                                             resource_usage: None,
                                         }
                                     ).await?;
@@ -6088,7 +6089,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     instance_name,
                                                     operation_id,
                                                     result: Some(execute_result::Result::ExecuteResponse(action_stage.into())),
-                                                    resource_usage: None,
+                                                    // task-resource-profile Phase 1 producer: the sole
+                                                    // populated ExecuteResult site (the action ran and
+                                                    // produced results). `get_resource_usage` returns
+                                                    // `None` for un-sampled actions (the 1/16 calib poll
+                                                    // didn't capture), so most completions still carry
+                                                    // `None`. operation_id/worker_id are left empty for
+                                                    // the server to fill from its transport-derived
+                                                    // values (the existing `record_action_resource_usage`
+                                                    // consumer; observe-only origin event).
+                                                    resource_usage: action_for_publish.get_resource_usage(),
                                                 }
                                             )
                                             .await

@@ -52,7 +52,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     batch_read_blobs_response,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    HistoricalExecuteResponse, StartExecute,
+    ActionResourceUsage, HistoricalExecuteResponse, StartExecute,
 };
 use nativelink_store::ac_utils::{
     ESTIMATED_DIGEST_SIZE, compute_buf_digest, get_and_decode_digest, serialize_and_upload_message,
@@ -352,6 +352,76 @@ fn calib_build_action_record(
     }
 }
 
+/// task-resource-profile Phase 1 transport carrier: the five worker-observed
+/// resource measurements for one completed action, assembled from the calib
+/// state fields, mapped 1:1 into the `ActionResourceUsage` proto by
+/// [`calib_action_resource_usage`]. Pure scalar carrier (no syscalls, no proto
+/// encode) so both the assembly and the proto mapping are unit-testable on the
+/// Linux build box. All-`u64`; no owned-bytes buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CalibResourceUsage {
+    /// Peak phys_footprint (KiB) over the action process subtree (NOT RSS).
+    peak_memory_kb: u64,
+    /// Total CPU time (user+system) in nanoseconds over the subtree.
+    cpu_ns: u64,
+    /// Total disk-I/O bytes (read+written) over the subtree.
+    disk_bytes: u64,
+    /// Real store-layer input-fetch bytes (bytes the transfer moved).
+    net_input_bytes: u64,
+    /// SUM of declared output digest sizes (file digests + output-directory
+    /// Tree-proto digests); NOT bytes-uploaded, excludes directory file payloads.
+    net_output_bytes: u64,
+}
+
+/// Map a [`CalibResourceUsage`] 1:1 into the transport `ActionResourceUsage`.
+/// `sampled = true` marks the value worker-observed. `operation_id` and
+/// `worker_id` are DELIBERATELY left EMPTY: the server consumer
+/// (`api_worker_scheduler::record_action_resource_usage`) fills them from the
+/// TRANSPORT-DERIVED, spoof-safe server-side worker id + the routed operation
+/// id (fill-if-empty), and design §8 requires worker attribution be
+/// transport-derived — a worker-self-reported `worker_id` would (via the
+/// consumer's fill-if-empty) override the spoof-safe value. Pure — the unit
+/// test asserts every measurement crosses and the attribution stays empty.
+fn calib_action_resource_usage(usage: &CalibResourceUsage) -> ActionResourceUsage {
+    ActionResourceUsage {
+        peak_memory_kb: usage.peak_memory_kb,
+        cpu_ns: usage.cpu_ns,
+        disk_bytes: usage.disk_bytes,
+        net_input_bytes: usage.net_input_bytes,
+        net_output_bytes: usage.net_output_bytes,
+        sampled: true,
+        // Left empty on purpose — the server fills these authoritatively.
+        operation_id: String::new(),
+        worker_id: String::new(),
+    }
+}
+
+/// task-resource-profile Phase 1 producer assembly (the logic of
+/// `RunningActionImpl::get_resource_usage`, split out so it is Linux-unit-testable
+/// WITHOUT constructing a `RunningActionImpl`): GATE on the CPU sample
+/// (`calib_cpu_time_ns` — `resource_usage` is meaningful only for a
+/// resource-sampled action; `None` gate → no report), default the other dims to
+/// 0, and map into the transport proto. `get_resource_usage` is then a thin
+/// state-reading wrapper. The unit test drives this directly (each field 1:1 +
+/// the None gate + the defaults), so a field swap / wrong-default here is caught.
+fn calib_resource_usage_from_state(
+    calib_cpu_time_ns: Option<u64>,
+    calib_peak_memory_kb: Option<u64>,
+    calib_disk_bytes: Option<u64>,
+    calib_input_bytes: Option<u64>,
+    calib_output_bytes: Option<u64>,
+) -> Option<ActionResourceUsage> {
+    let cpu_ns = calib_cpu_time_ns?;
+    let usage = CalibResourceUsage {
+        peak_memory_kb: calib_peak_memory_kb.unwrap_or(0),
+        cpu_ns,
+        disk_bytes: calib_disk_bytes.unwrap_or(0),
+        net_input_bytes: calib_input_bytes.unwrap_or(0),
+        net_output_bytes: calib_output_bytes.unwrap_or(0),
+    };
+    Some(calib_action_resource_usage(&usage))
+}
+
 /// Populated P-B record. All fields scalar; no owned-bytes buffer.
 #[derive(Debug, Clone, PartialEq)]
 struct CalibStagingRecord {
@@ -420,7 +490,7 @@ fn calib_tree_totals(tree: &HashMap<DigestInfo, ProtoDirectory>) -> (u64, u64) {
     (bytes, files)
 }
 
-/// Defensive caps on the descendant-tree walk (`calib_capture_subtree_cpu_ns`).
+/// Defensive caps on the descendant-tree walk (`calib_capture_subtree_usage`).
 /// A calibration probe must never fan out unboundedly, even if a pathological
 /// action forks a fork-bomb-shaped tree.
 // CAPPED AT 8: max descendant recursion depth. Real toolchain trees are shallow
@@ -463,7 +533,7 @@ fn calib_ticks_to_ns(ticks: u64, timebase: Option<(u32, u32)>) -> Option<u64> {
 
 /// Read the macOS `mach_timebase_info` ratio ONCE (it is constant per boot) and
 /// cache it. `proc_pidinfo`'s `pti_total_*` fields are raw **mach-timebase
-/// ticks**, NOT nanoseconds (see `calib_capture_cpu_ns`); converting a tick
+/// ticks**, NOT nanoseconds (see `calib_capture_pid_usage`); converting a tick
 /// count to ns requires `ticks * numer / denom`. Cached in a `OnceLock` so the
 /// syscall runs at most once for the whole process. Returns `None` (NOT a 1:1
 /// fabrication) if the syscall fails or reports `denom == 0`, and `warn!`s once
@@ -504,10 +574,62 @@ fn calib_mach_timebase() -> Option<(u32, u32)> {
     })
 }
 
-/// Best-effort single-PID CPU time (user+system) in **nanoseconds**, or `None`
-/// when unavailable for this PID (not running / reaped / permission). This is
-/// the pure single-pid primitive; `calib_capture_cpu_time_ms` wraps it for the
-/// per-action helper and `calib_capture_subtree_cpu_ns` sums it over the tree.
+/// The MONOTONIC-per-pid dimensions folded max-per-field into the task-local
+/// subtree map by `calib_accumulate_subtree_usage`: cumulative CPU time (ns),
+/// cumulative disk-I/O bytes, and the kernel per-process LIFETIME-max
+/// phys_footprint. All three only grow per live process, so max-per-pid is exact
+/// AND — because the map only ever grows and never removes — an EXITED child's
+/// last-observed values are RETAINED (captured at its last live poll): this is
+/// how exited children's CPU/disk stay in the SUMs and a peaked-then-exited
+/// child stays in the memory floor. (The INSTANTANEOUS phys_footprint used for
+/// the concurrent memory sum is NOT here — it lives on `CalibPidSample`, summed
+/// per-poll, never map-folded; folding it max-per-pid would double-count across
+/// time.) Pure cross-platform carrier — declared on ALL platforms because the
+/// (non-cfg-gated) poll-arm site names it as the map's value type; only the
+/// macOS glue that POPULATES it is `cfg`-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CalibPidUsage {
+    cpu_ns: u64,
+    disk_bytes: u64,
+    /// `ri_lifetime_max_phys_footprint` — kernel-tracked lifetime maximum of this
+    /// process's phys_footprint. Monotonic, so max-per-pid is exact; floors the
+    /// reported memory peak so a child that peaks-then-exits between polls is
+    /// never under-reported.
+    lifetime_footprint: u64,
+}
+
+/// One poll's FULL read of a single LIVE pid: the map-folded [`CalibPidUsage`]
+/// PLUS the INSTANTANEOUS `ri_phys_footprint` (current committed memory). The
+/// instantaneous value is NOT folded into the persistent map — it is SUMMED
+/// across the pids live THIS poll to form the concurrent footprint (see
+/// `calib_capture_subtree_usage`); max-per-pid folding would double-count across
+/// time, since different pids peak at different moments.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CalibPidSample {
+    usage: CalibPidUsage,
+    phys_footprint: u64,
+}
+
+/// Aggregated subtree totals for one poll tick: CPU-ns SUMMED (additive across
+/// the tree, incl. exited children retained in the map), disk bytes SUMMED, and
+/// the memory `footprint_peak` = MAX(this-poll concurrent phys_footprint SUM, the
+/// subtree lifetime-max floor). Returned by `calib_capture_subtree_usage` so the
+/// non-cfg-gated poll closure can publish memory/disk alongside cpu without
+/// referencing the `cfg(any(macos,test))` aggregation fns directly. All-platform
+/// (the poll closure reads its fields on every build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct CalibSubtreeTotals {
+    cpu_ns: u64,
+    disk_bytes: u64,
+    footprint_peak: u64,
+}
+
+/// Best-effort single-PID resource sample (CPU ns + disk bytes + lifetime-max
+/// phys_footprint + instantaneous phys_footprint), or `None` when unavailable
+/// for this PID (not running / reaped / permission). This is the pure single-pid
+/// primitive; `calib_capture_subtree_usage` folds it over the descendant tree
+/// and `calib_capture_cpu_time_ms` wraps its CPU arm for the tests.
 ///
 /// **macOS** (the production worker OS — see memory `reference-infrastructure`):
 /// `proc_pidinfo(pid, PROC_PIDTASKINFO, …)` is a READ-ONLY query (it does NOT
@@ -515,9 +637,12 @@ fn calib_mach_timebase() -> Option<(u32, u32)> {
 /// called while the child is still alive: once the child exits and tokio's
 /// reaper collects the zombie, `proc_pidinfo` returns 0/ESRCH → this yields
 /// `None` (which is why an after-`wait()` capture was structurally always
-/// `None`, and why the poll self-terminates on that `None`).
+/// `None`, and why the poll self-terminates on that `None`). CPU comes from
+/// `proc_pidinfo(PROC_PIDTASKINFO)`; the memory (phys_footprint + lifetime-max)
+/// and disk dimensions come from ONE `proc_pid_rusage(RUSAGE_INFO_V4)` read (see
+/// `calib_capture_pid_rusage`).
 ///
-/// **UNITS (empirically verified — the struct field's `u64` type carries NO
+/// **CPU UNITS (empirically verified — the struct field's `u64` type carries NO
 /// unit and Apple's docs mislabel it):** `pti_total_user`/`pti_total_system`
 /// are raw **mach-timebase ticks**, not nanoseconds, on Apple Silicon since the
 /// XNU "Recount" rewrite (macOS 15 Sequoia, the M4 minimum). A controlled 3.002 s
@@ -527,7 +652,20 @@ fn calib_mach_timebase() -> Option<(u32, u32)> {
 /// we convert `ticks * numer / denom` via the cached `calib_mach_timebase()`.
 /// (On x86 Macs and under Rosetta the timebase is 1:1, so a raw read would be
 /// accidentally correct there — masking the bug off the production fleet. See
-/// memory `proc-pidinfo-cpu-time-is-mach-timebase-not-ns`.)
+/// memory `proc-pidinfo-cpu-time-is-mach-timebase-not-ns`.) The #64 unit
+/// conversion is UNCHANGED here.
+///
+/// **MEMORY METRIC (phys_footprint, NOT RSS):** we deliberately do NOT use
+/// `pti_resident_size` (RSS). RSS DOUBLE-COUNTS shared pages — the dyld shared
+/// cache + frameworks are resident in EVERY child, so SUMMING a clang→cc1→ld
+/// tree counts them N times (an over-estimate that would make the downstream
+/// memory reservation over-cap concurrency, the exact bug being fixed) — AND RSS
+/// EXCLUDES compressed memory (misses committed RAM under pressure).
+/// `phys_footprint` is macOS's own per-process memory ledger (what jetsam /
+/// Activity Monitor / per-process limits use): it EXCLUDES shared/reclaimable
+/// pages, so it is SUMMABLE across a process tree WITHOUT double-counting, and
+/// INCLUDES compressed + IOKit memory. Bytes (no timebase conversion, unlike the
+/// rusage CPU-time fields).
 ///
 /// **Linux**: deliberately yields `None`. The thread-safe per-child accounting
 /// primitive is `wait4(pid, …, &rusage)`, but tokio's process reaper already
@@ -537,7 +675,7 @@ fn calib_mach_timebase() -> Option<(u32, u32)> {
 /// for a tokio-managed child, and production workers are macOS, so Linux is
 /// left unavailable rather than made unsafe.
 #[cfg(target_os = "macos")]
-fn calib_capture_cpu_ns(pid: u32) -> Option<u64> {
+fn calib_capture_pid_usage(pid: u32) -> Option<CalibPidSample> {
     // SAFETY: `proc_pidinfo` with `PROC_PIDTASKINFO` fills a `proc_taskinfo` we
     // own; we pass its exact size and only read the returned bytes when the
     // syscall reports it wrote the full struct. The call is read-only (no
@@ -545,9 +683,9 @@ fn calib_capture_cpu_ns(pid: u32) -> Option<u64> {
     // caveat: the `written == size` check does NOT reject a recycled-live PID —
     // if this PID were reaped AND recycled to a live unrelated process within
     // one poll interval, `proc_pidinfo` returns the FULL struct and we would
-    // read THAT process's CPU. This is a bounded, vanishingly-rare data-quality
-    // risk (requires reap + PID-space wraparound within one ≤250 ms interval),
-    // accepted for a sampled best-effort probe — never UB.
+    // read THAT process's CPU/memory. This is a bounded, vanishingly-rare
+    // data-quality risk (requires reap + PID-space wraparound within one
+    // ≤250 ms interval), accepted for a sampled best-effort probe — never UB.
     let mut info: libc::proc_taskinfo = unsafe { core::mem::zeroed() };
     let size = core::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let written = unsafe {
@@ -560,82 +698,208 @@ fn calib_capture_cpu_ns(pid: u32) -> Option<u64> {
         )
     };
     if written != size {
-        // ESRCH (reaped/exited), permission denied, or partial write.
+        // ESRCH (reaped/exited), permission denied, or partial write. A `None`
+        // for the ROOT pid is the poll's self-terminating stop signal.
         return None;
     }
-    // Raw mach-timebase ticks (see UNITS above) → ns via the cached ratio. A
-    // `None` timebase propagates to `None` here (drop-don't-fabricate — the
-    // `?`), so a would-be 40×-wrong sample is dropped rather than emitted.
+    // Raw mach-timebase ticks (see CPU UNITS above) → ns via the cached ratio.
+    // A `None` timebase propagates to `None` here (drop-don't-fabricate — the
+    // `?`), so a would-be 40×-wrong sample is dropped rather than emitted. This
+    // is the UNCHANGED #64 CPU-capture path.
     let ticks = info
         .pti_total_user
         .saturating_add(info.pti_total_system);
-    calib_ticks_to_ns(ticks, calib_mach_timebase())
+    let cpu_ns = calib_ticks_to_ns(ticks, calib_mach_timebase())?;
+    // Memory (phys_footprint + lifetime-max) + disk come from ONE rusage read; a
+    // failure yields zeros for those dims (CPU stays valid) rather than dropping
+    // the whole sample — a live pid with valid CPU still counts.
+    let (disk_bytes, phys_footprint, lifetime_footprint) =
+        calib_capture_pid_rusage(pid).unwrap_or((0, 0, 0));
+    Some(CalibPidSample {
+        usage: CalibPidUsage {
+            cpu_ns,
+            disk_bytes,
+            lifetime_footprint,
+        },
+        phys_footprint,
+    })
+}
+
+/// Best-effort single-PID `(disk-IO bytes, instantaneous phys_footprint,
+/// lifetime-max phys_footprint)` via `proc_pid_rusage(RUSAGE_INFO_V4)`, or `None`
+/// when the query fails / the pid is gone. `RUSAGE_INFO_V4` is the earliest
+/// flavor carrying `ri_lifetime_max_phys_footprint` alongside `ri_phys_footprint`
+/// and the `ri_diskio_*` counters (all verified BY NAME in libc 0.2.186).
+/// `proc_pid_rusage` reports THIS process only — it does NOT sum descendants
+/// (empirically `RUSAGE_SELF`-like, memory `proc-pidinfo-cpu-time-is-mach-timebase-not-ns`),
+/// which is why the subtree walk sums/aggregates per pid. `ri_diskio_*` and the
+/// footprint fields are plain byte counts (no timebase conversion).
+#[cfg(target_os = "macos")]
+fn calib_capture_pid_rusage(pid: u32) -> Option<(u64, u64, u64)> {
+    let mut ri: libc::rusage_info_v4 = unsafe { core::mem::zeroed() };
+    // SAFETY: `proc_pid_rusage` fills the `rusage_info_v4` we own. Its buffer
+    // parameter is typed `*mut rusage_info_t` (= `*mut *mut c_void`) and Apple's
+    // ABI treats it as a pointer to the caller's rusage struct, so we pass the
+    // struct's address reinterpreted to that type via `.cast()`. Read-only
+    // query; does not retain the pointer.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            core::ptr::from_mut(&mut ri).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let disk = ri
+        .ri_diskio_bytesread
+        .saturating_add(ri.ri_diskio_byteswritten);
+    Some((disk, ri.ri_phys_footprint, ri.ri_lifetime_max_phys_footprint))
 }
 
 // Non-macOS single-pid stub: reachable only via `calib_capture_cpu_time_ms`,
 // which is itself test-only on every platform (production reads the SUBTREE via
-// `calib_capture_subtree_cpu_ns`, never this single-pid helper). Gate it to the
+// `calib_capture_subtree_usage`, never this single-pid helper). Gate it to the
 // non-macOS test build so it neither warns dead in the Linux lib build nor
 // pretends to be a production path.
 #[cfg(all(not(target_os = "macos"), test))]
-const fn calib_capture_cpu_ns(_pid: u32) -> Option<u64> {
+fn calib_capture_pid_usage(_pid: u32) -> Option<CalibPidSample> {
     // See doc-comment above: no zero-behavior-change path on non-macOS without
     // double-reaping the tokio-managed child.
     None
 }
 
 /// Best-effort single-PID CPU time in **milliseconds** (the ns primitive
-/// truncated). Pure single-pid helper, kept unit-testable; `None` when the ns
+/// truncated). Pure single-pid helper, kept unit-testable; `None` when the
 /// capture is unavailable. Production reads the whole subtree
-/// (`calib_capture_subtree_cpu_ns`), so this single-pid wrapper exists ONLY for
+/// (`calib_capture_subtree_usage`), so this single-pid wrapper exists ONLY for
 /// the unit/live tests — `#[cfg(test)]` keeps it out of the shipped binary and
 /// silences the dead-code lint on the non-macOS build box.
 #[cfg(test)]
 fn calib_capture_cpu_time_ms(pid: u32) -> Option<u64> {
-    calib_capture_cpu_ns(pid).map(|ns| ns / 1_000_000)
+    calib_capture_pid_usage(pid).map(|s| s.usage.cpu_ns / 1_000_000)
 }
 
-/// Fold one pid's observed `cpu_ns` into a task-local `pid → max-cpu-ns` map.
-/// Pure (cross-platform, unit-testable): keeps the MAX per pid (a transient
-/// accounting glitch cannot lower a value; CPU is monotonic per LIVE process),
-/// and — because the map only ever grows and never removes — a descendant that
-/// exits between poll ticks KEEPS its last observed CPU, so sequential children
-/// (A runs then exits, B runs) are BOTH counted. Summing `map.values()` is then
-/// a monotonic non-decreasing subtree total across ticks. Gated to macOS (the
-/// production subtree walk uses it) OR any test build (the Linux unit test
-/// exercises it); it has no non-macOS production caller.
+/// Fold one pid's monotonic usage into a task-local `pid → max-per-field` map.
+/// Pure (cross-platform, unit-testable): keeps the MAX per pid per dimension (a
+/// transient accounting glitch cannot lower a value; CPU / disk-IO /
+/// lifetime-footprint are all monotonic per LIVE process), and — because the map
+/// only ever grows and never removes — a descendant that EXITS between poll
+/// ticks KEEPS its last observed sample, so sequential children (A runs then
+/// exits, B runs) are BOTH counted in the CPU/disk SUMs and A's lifetime-max
+/// stays in the memory floor. This map-retention IS the exited-child capture:
+/// macOS does not roll a reaped child's CPU into its parent, so a child sampled
+/// while live must persist after it exits. Gated to macOS (the production
+/// subtree walk uses it) OR any test build (the Linux unit test exercises it);
+/// it has no non-macOS production caller.
 #[cfg(any(target_os = "macos", test))]
-fn calib_accumulate_subtree_cpu(map: &mut HashMap<libc::pid_t, u64>, pid: libc::pid_t, cpu_ns: u64) {
+fn calib_accumulate_subtree_usage(
+    map: &mut HashMap<libc::pid_t, CalibPidUsage>,
+    pid: libc::pid_t,
+    usage: CalibPidUsage,
+) {
     map.entry(pid)
-        .and_modify(|prev| *prev = (*prev).max(cpu_ns))
-        .or_insert(cpu_ns);
+        .and_modify(|prev| {
+            prev.cpu_ns = prev.cpu_ns.max(usage.cpu_ns);
+            prev.disk_bytes = prev.disk_bytes.max(usage.disk_bytes);
+            prev.lifetime_footprint = prev.lifetime_footprint.max(usage.lifetime_footprint);
+        })
+        .or_insert(usage);
 }
 
-/// Best-effort capture of the whole descendant-tree CPU (ns) rooted at `pid`,
-/// accumulated into a task-local `map` that survives across poll ticks. Sums
-/// the target pid AND every descendant's `cpu_ns` (via `proc_listchildpids`
-/// recursion), folding each into `map` (max-per-pid). Returns the summed subtree
-/// total, or `None` if the ROOT pid itself is gone (ESRCH) — the poll's
+/// Total subtree CPU-ns: SUM of every walked pid's max CPU. Forked children
+/// (rustc→rust-lld) that `proc_pidinfo` alone misses ARE summed here, INCLUDING
+/// children that exited mid-action — the never-removed map (above) retains their
+/// last-live CPU, so a short-lived spawn-and-exit child (most of a compile's
+/// CPU) is not lost. Pure; Linux-unit-testable. Byte-identical to the former
+/// `map.values().sum()`.
+#[cfg(any(target_os = "macos", test))]
+fn calib_subtree_cpu_ns(map: &HashMap<libc::pid_t, CalibPidUsage>) -> u64 {
+    map.values().map(|u| u.cpu_ns).sum()
+}
+
+/// Total subtree disk-I/O bytes: SUM of every walked pid's cumulative
+/// read+written bytes (exited children retained in the map are included, as for
+/// CPU). `proc_pid_rusage` does NOT sum descendants, so we sum the walked pids
+/// ourselves. Pure; Linux-unit-testable.
+#[cfg(any(target_os = "macos", test))]
+fn calib_subtree_disk_bytes(map: &HashMap<libc::pid_t, CalibPidUsage>) -> u64 {
+    map.values().map(|u| u.disk_bytes).sum()
+}
+
+/// MAX over the subtree of the per-process LIFETIME-max phys_footprint. Because
+/// the map retains EXITED children, this surfaces a child that peaked-then-exited
+/// between polls (its `ri_lifetime_max_phys_footprint` was captured at its last
+/// live poll). It is the FLOOR on the reported memory peak so the single dominant
+/// child is never under-reported. NOTE: this is the MAX over pids (not a sum) —
+/// a single process's lifetime-max is its own peak; the cross-process
+/// simultaneous total is the concurrent-SUM below. Empty map → 0 (never sampled).
+/// Pure; Linux-unit-testable.
+#[cfg(any(target_os = "macos", test))]
+fn calib_subtree_max_lifetime_footprint(map: &HashMap<libc::pid_t, CalibPidUsage>) -> u64 {
+    map.values().map(|u| u.lifetime_footprint).max().unwrap_or(0)
+}
+
+/// The CONCURRENT footprint of ONE poll: the SUM of the INSTANTANEOUS
+/// phys_footprint over the pids LIVE this poll. We SUM (not max) because
+/// phys_footprint EXCLUDES shared/reclaimable pages, so it is additive across a
+/// tree without double-counting — this is the true simultaneous committed memory
+/// the tree needed at this instant (the number a memory reservation must size
+/// to). A per-pid MAX would under-report a parallel memory-heavy tree
+/// (LTO / `make -j`). Pure; Linux-unit-testable.
+#[cfg(any(target_os = "macos", test))]
+fn calib_footprint_concurrent_sum(footprints: &[u64]) -> u64 {
+    footprints.iter().sum()
+}
+
+/// One poll's memory-peak candidate: MAX of (this-poll concurrent footprint SUM,
+/// the subtree lifetime-max FLOOR). The floor ensures a child that peaked-then-
+/// exited BETWEEN polls — never observed live at its peak in a concurrent
+/// sample — is not under-reported; this matters because the number feeds a memory
+/// RESERVATION that must not UNDER-cap. The caller MAX-accumulates this across
+/// polls (peak over time). Pure; Linux-unit-testable.
+#[cfg(any(target_os = "macos", test))]
+fn calib_footprint_poll_peak(concurrent_sum: u64, subtree_max_lifetime: u64) -> u64 {
+    concurrent_sum.max(subtree_max_lifetime)
+}
+
+/// Best-effort capture of the whole descendant-tree resource usage rooted at
+/// `pid`, accumulated into a task-local `map` that survives across poll ticks.
+/// Samples the target pid AND every descendant (via `proc_listchildpids`
+/// recursion). For each LIVE pid THIS poll it (a) folds the MONOTONIC dims
+/// (CPU-ns / disk / lifetime-footprint) max-per-pid into `map`, and (b) collects
+/// the INSTANTANEOUS phys_footprint for the concurrent memory sum. Returns the
+/// aggregated [`CalibSubtreeTotals`]: CPU-ns SUMMED, disk SUMMED (both over the
+/// whole map incl. retained exited children), and `footprint_peak` =
+/// MAX(this-poll concurrent phys_footprint SUM, the subtree lifetime-max floor).
+/// Returns `None` if the ROOT pid itself is gone (ESRCH) — the poll's
 /// self-terminating stop condition (a live root with dead children still returns
-/// `Some`).
+/// `Some`). ONE walk over the SAME `proc_listchildpids` enumeration captures
+/// every dimension (CPU from one `proc_pidinfo` per pid; memory+disk from one
+/// `proc_pid_rusage(V4)` per pid).
 ///
-/// **Why subtree, not single-process:** `proc_pidinfo` sums only the target
-/// TASK's threads, MISSING forked child processes (rustc → rust-lld, cc-wrapper
-/// → cc1) — exactly the fork-heavy link/compile CPU the shape classification
-/// cares about (auditor Claim 1 / red-team A1-2). We enumerate descendants and
-/// sum them.
+/// **Why subtree, not single-process:** `proc_pidinfo`/`proc_pid_rusage` account
+/// only the target PROCESS, MISSING forked children (rustc → rust-lld,
+/// cc-wrapper → cc1) — exactly the fork-heavy link/compile CPU + memory we care
+/// about (auditor Claim 1 / red-team A1-2). We enumerate descendants and
+/// aggregate them. macOS does NOT roll a REAPED child's CPU/memory into its
+/// parent, so each child must be sampled while live and RETAINED after exit (the
+/// never-removed `map` for CPU/disk/lifetime; the concurrent sum only ever needs
+/// LIVE pids, and a peaked-then-exited child is preserved via the lifetime-max
+/// floor).
 ///
-/// **Known residuals (all bias the ratio DOWN — documented, NOT solved in code;
-/// the analyst must caveat the §6 short-action-fraction / Q2 shape-mix
-/// conclusions accordingly; on-worker validation is the canary grep, not a unit
-/// test — see `deferred_tasks.md`):**
+/// **Known residuals (documented, NOT solved in code; on-worker validation is
+/// the canary grep, not a unit test — see `deferred_tasks.md`):**
 /// - **Within-one-interval spawn+die:** a descendant that both spawns AND exits
-///   inside one 250 ms tick is never sampled → its CPU is missed. The shorter
-///   250 ms interval reduces but does not close this window.
+///   inside one 250 ms tick is never sampled → its CPU/disk/memory is missed.
+///   The shorter 250 ms interval reduces but does not close this window. (The
+///   memory lifetime-max floor closes the *peaked-then-exited-but-observed-once*
+///   sub-case; a never-observed pid is still missed.)
 /// - **Reparent-orphan:** the walk roots at the direct child and stops when the
 ///   ROOT returns ESRCH. If an INTERMEDIATE process exits while a descendant
 ///   keeps running, that descendant reparents to launchd (pid 1) and LEAVES the
-///   subtree — `proc_listchildpids` no longer finds it, and its CPU after the
+///   subtree — `proc_listchildpids` no longer finds it, and its usage after the
 ///   reparent point is lost. For the target RBE toolchains this is RARE because
 ///   the root driver waits for all real work (a `process-wrapper` / `rustc`
 ///   waits for its `rust-lld`, so the fork-heavy case that motivates this walk
@@ -645,21 +909,28 @@ fn calib_accumulate_subtree_cpu(map: &mut HashMap<libc::pid_t, u64>, pid: libc::
 ///   shape (the `& wait` keeps the parent alive) and does NOT exercise this
 ///   orphan shape — it is validated on-worker via the canary ratio grep.
 /// - **PID-reuse within one action:** the map keys on pid with `max()`, so if
-///   pid P is descendant A (CPU X), P exits, and P is REUSED by descendant B
-///   (CPU Y), the map keeps `max(X, Y)` — the smaller of the two is dropped
-///   (a SUM error, not a swap). Rare for a normal action (macOS PID space vs
-///   seconds-to-minutes), but a fork-storm action (thousands of short
+///   pid P is descendant A (usage X), P exits, and P is REUSED by descendant B
+///   (usage Y), the map keeps `max(X, Y)` — the smaller of the two is dropped
+///   (a SUM error for CPU/disk, not a swap). Rare for a normal action (macOS PID
+///   space vs seconds-to-minutes), but a fork-storm action (thousands of short
 ///   `cc`/`as`/`ld`) inside one action CAN wrap the pid space; such actions
 ///   under-count and should be excluded from the `>1.5` band conclusions.
 #[cfg(target_os = "macos")]
-fn calib_capture_subtree_cpu_ns(pid: u32, map: &mut HashMap<libc::pid_t, u64>) -> Option<u64> {
+fn calib_capture_subtree_usage(
+    pid: u32,
+    map: &mut HashMap<libc::pid_t, CalibPidUsage>,
+) -> Option<CalibSubtreeTotals> {
     let root = pid as libc::pid_t;
     // Root gone → whole subtree gone; signal stop (self-terminating poll).
-    let root_ns = calib_capture_cpu_ns(pid)?;
-    calib_accumulate_subtree_cpu(map, root, root_ns);
+    let root_sample = calib_capture_pid_usage(pid)?;
+    calib_accumulate_subtree_usage(map, root, root_sample.usage);
+    // This poll's LIVE-pid instantaneous phys_footprints for the concurrent sum.
+    // CAPPED AT CALIB_SUBTREE_MAX_PIDS: the walk below bounds pushes at the cap.
+    let mut live_footprints: Vec<u64> = Vec::new();
+    live_footprints.push(root_sample.phys_footprint);
 
     // Breadth-first descendant walk, depth- and total-pid-capped. `pending`
-    // holds (pid, depth) frontier entries; each dequeued pid's CPU is folded
+    // holds (pid, depth) frontier entries; each dequeued pid's usage is folded
     // and its immediate children enqueued until a cap trips.
     let mut pending: VecDeque<(libc::pid_t, u32)> = VecDeque::new();
     pending.push_back((root, 0));
@@ -673,16 +944,24 @@ fn calib_capture_subtree_cpu_ns(pid: u32, map: &mut HashMap<libc::pid_t, u64>) -
                 break;
             }
             // A child may have exited between the listing and the read → `None`;
-            // its earlier CPU (if any) is already retained in `map`, so skip.
-            if let Some(child_ns) = calib_capture_cpu_ns(child as u32) {
-                calib_accumulate_subtree_cpu(map, child, child_ns);
+            // its earlier usage (if any) is already retained in `map`, so skip.
+            // Only pids LIVE this poll contribute to the concurrent footprint.
+            if let Some(child_sample) = calib_capture_pid_usage(child as u32) {
+                calib_accumulate_subtree_usage(map, child, child_sample.usage);
+                live_footprints.push(child_sample.phys_footprint);
             }
             summed_pids += 1;
             pending.push_back((child, depth + 1));
         }
     }
 
-    Some(map.values().sum())
+    let concurrent_sum = calib_footprint_concurrent_sum(&live_footprints);
+    let max_lifetime = calib_subtree_max_lifetime_footprint(map);
+    Some(CalibSubtreeTotals {
+        cpu_ns: calib_subtree_cpu_ns(map),
+        disk_bytes: calib_subtree_disk_bytes(map),
+        footprint_peak: calib_footprint_poll_peak(concurrent_sum, max_lifetime),
+    })
 }
 
 /// Enumerate the immediate child pids of `ppid` via `proc_listchildpids`.
@@ -730,13 +1009,18 @@ fn calib_list_child_pids(ppid: libc::pid_t) -> Vec<libc::pid_t> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn calib_capture_subtree_cpu_ns(_pid: u32, _map: &mut HashMap<libc::pid_t, u64>) -> Option<u64> {
-    // See `calib_capture_cpu_ns`: no zero-behavior-change path on non-macOS.
+fn calib_capture_subtree_usage(
+    _pid: u32,
+    _map: &mut HashMap<libc::pid_t, CalibPidUsage>,
+) -> Option<CalibSubtreeTotals> {
+    // See `calib_capture_pid_usage`: no zero-behavior-change path on non-macOS.
     None
 }
 
 /// P-A CPU-time poll loop. Repeatedly awaits `capture()` (in production the
-/// live-PID subtree CPU query in **nanoseconds**, `calib_capture_subtree_cpu_ns`
+/// live-PID subtree usage query, `calib_capture_subtree_usage`, which returns
+/// the CPU-ns for `last` and side-publishes the memory-peak/disk into their own
+/// atoms —
 /// run in the poll task), keeping the LAST `Some` value in `last` and setting
 /// `has_value` once any `Some` is seen. Sleeps `interval` between samples. STOPS
 /// on the first `None` — which the capture returns once the ROOT child is
@@ -4343,6 +4627,18 @@ pub trait RunningAction: Sync + Send + Sized + Unpin + 'static {
     fn is_cancelled(&self) -> bool {
         false
     }
+
+    /// task-resource-profile Phase 1: the worker-observed per-action resource
+    /// usage for the `ExecuteResult.resource_usage` transport producer. Returns
+    /// `None` when the action was not resource-sampled (the 1/16 calib poll did
+    /// not arm / capture) — the completion path then leaves `resource_usage`
+    /// `None`, exactly as before. `operation_id`/`worker_id` are left empty for
+    /// the server to fill from its transport-derived values (design §8). Default
+    /// `None` so test stubs need not implement it, mirroring `is_cancelled`.
+    /// Observe-only: no scheduling decision reads this on the worker.
+    fn get_resource_usage(&self) -> Option<ActionResourceUsage> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -4396,6 +4692,31 @@ struct RunningActionImplState {
     /// (so >= 1); this is the WORKER's view, NOT the scheduler dispatch-count.
     /// `None` until execute start populates it. Scalar.
     calib_running_at_start: Option<usize>,
+    /// task-resource-profile Phase 1 (observability-only): the just-completed
+    /// action's subtree CPU time in **nanoseconds**, harvested from the same
+    /// CPU poll as `calib_cpu_time_ms` (this is the un-truncated ns value used
+    /// to populate the `ActionResourceUsage.cpu_ns` transport field, while
+    /// `calib_cpu_time_ms` keeps feeding the shape classifier). `Some` only for
+    /// resource-sampled actions (the 1/16 poll captured a value); `None`
+    /// otherwise, which also gates whether `resource_usage` is reported. Scalar.
+    calib_cpu_time_ns: Option<u64>,
+    /// task-resource-profile Phase 1 (observability-only): peak memory (KiB) over
+    /// the action process subtree, measured as the MAX-over-polls of the
+    /// concurrent SUM of live-pid `phys_footprint`, floored at the subtree's
+    /// per-process lifetime-max footprint (`calib_footprint_poll_peak`). NOT RSS
+    /// (phys_footprint excludes shared/reclaimable pages so it is summable without
+    /// double-counting, and includes compressed memory). `None` until a sample
+    /// lands. Scalar.
+    calib_peak_memory_kb: Option<u64>,
+    /// task-resource-profile Phase 1 (observability-only): total disk-I/O bytes
+    /// (read+written) summed over the action process subtree
+    /// (`calib_subtree_disk_bytes`). `None` until a sample lands. Scalar.
+    calib_disk_bytes: Option<u64>,
+    /// task-resource-profile Phase 1 (observability-only): total output-blob
+    /// bytes for this action (the store-layer `calib_output_bytes` sum), carried
+    /// from the post-upload site to the `ActionResourceUsage.net_output_bytes`
+    /// producer. `None` until `inner_upload_results` populates it. Scalar.
+    calib_output_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -4497,6 +4818,10 @@ impl RunningActionImpl {
                 calib_input_bytes: None,
                 calib_cpu_time_ms: None,
                 calib_running_at_start: None,
+                calib_cpu_time_ns: None,
+                calib_peak_memory_kb: None,
+                calib_disk_bytes: None,
+                calib_output_bytes: None,
             }),
             // Always need to ensure that we're removed from the manager on Drop.
             has_manager_entry: AtomicBool::new(true),
@@ -5040,9 +5365,10 @@ impl RunningActionImpl {
         // representative cpu-shape sample including large actions proportionally,
         // and this is far cheaper than polling every action). While eligible we
         // spawn a background task that every 250 ms reads the LIVE child's whole
-        // DESCENDANT-SUBTREE CPU (`calib_capture_subtree_cpu_ns`: the target task
-        // plus every forked descendant — rustc→rust-lld, cc-wrapper→cc1 — that
-        // `proc_pidinfo` alone would miss) off the tokio worker (`spawn_blocking!`),
+        // DESCENDANT-SUBTREE usage (`calib_capture_subtree_usage`: cpu+rss+disk for
+        // the target task plus every forked descendant — rustc→rust-lld,
+        // cc-wrapper→cc1 — that `proc_pidinfo` alone would miss) off the tokio
+        // worker (`spawn_blocking!`),
         // keeping the last accumulated ns in shared scalar atoms (no owned bytes
         // → no cap annotation). The per-pid `HashMap` accumulator is task-LOCAL
         // (only its summed value crosses the atom); it survives child exits so
@@ -5052,23 +5378,25 @@ impl RunningActionImpl {
         // 1/16 of actions arm the poll; each sampled action holds at most ONE
         // inflight `spawn_blocking` at a time (the loop awaits before re-issuing).
         // That one call does the WHOLE subtree walk: per internal node TWO
-        // `proc_listchildpids` calls (a NULL sizing call + a fetch) plus one
-        // `proc_pidinfo` per pid. A realistic ~30-pid toolchain tree (~10 internal
-        // + 20 leaf) is ~70 read-only syscalls at ~2-5 µs each ≈ 140-350 µs per
-        // walk, at 4/s. At the 2026-06-16 incident peak (~352 in-flight → ~22
-        // sampled poll tasks) that is ≤22 blocking-pool slots held ~250 µs each
-        // per 250 ms window ≈ 22 × 250µs / 250ms ≈ 2.2% time-averaged occupancy
-        // of the 1024-thread pool — call it ~1-3% typical. That clears the 15.3%
-        // (157/1024) the isotope wedge consumed by ~5-13×, AND unlike those
-        // recursive `remove_dir_all` deletes these syscalls are FAST read-only
-        // queries that do NOT go uninterruptible D-state — they hold a thread for
-        // µs, not the unbounded D-state stalls that actually starved the isotope
-        // data plane. What bounds the PATHOLOGICAL tail (a fork-bomb-shaped action
-        // that also lands in the 1/16 sample) is NOT this point estimate but the
-        // caps: CALIB_SUBTREE_MAX_PIDS=512 / _DEPTH=8. The 512-pid worst case is
-        // ~1.5k syscalls ≈ 3-8 ms/walk → ~27-68% occupancy — still cap-terminated,
-        // non-D-state, 1/16-sampled, and per-action-scoped, so real-world risk is
-        // low; the caps, not the ~2% figure, are the tail guarantee. Negligible in
+        // `proc_listchildpids` calls (a NULL sizing call + a fetch) plus TWO reads
+        // per pid — one `proc_pidinfo` (CPU) AND one `proc_pid_rusage` (memory +
+        // disk; net-new vs the pre-Phase-1 CPU-only walk). A realistic ~30-pid
+        // toolchain tree (~10 internal + 20 leaf) is ~80 read-only syscalls at
+        // ~2-5 µs each ≈ 160-400 µs per walk, at 4/s. At the 2026-06-16 incident
+        // peak (~352 in-flight → ~22 sampled poll tasks) that is ≤22 blocking-pool
+        // slots held ~300 µs each per 250 ms window ≈ 22 × 300µs / 250ms ≈ 2.6%
+        // time-averaged occupancy of the 1024-thread pool — call it ~1-3% typical.
+        // That clears the 15.3% (157/1024) the isotope wedge consumed by ~5-12×,
+        // AND unlike those recursive `remove_dir_all` deletes these syscalls are
+        // FAST read-only queries that do NOT go uninterruptible D-state — they hold
+        // a thread for µs, not the unbounded D-state stalls that actually starved
+        // the isotope data plane. What bounds the PATHOLOGICAL tail (a
+        // fork-bomb-shaped action that also lands in the 1/16 sample) is NOT this
+        // point estimate but the caps: CALIB_SUBTREE_MAX_PIDS=512 / _DEPTH=8. The
+        // 512-pid worst case is ~2k syscalls ≈ 4-10 ms/walk → ~35-90% occupancy —
+        // still cap-terminated, non-D-state, 1/16-sampled, and per-action-scoped,
+        // so real-world risk is low; the caps, not the ~2.6% figure, are the tail
+        // guarantee. Negligible in
         // the common case.
         //
         // The task is bounded: it self-terminates on the first `None` (ROOT child
@@ -5077,6 +5405,17 @@ impl RunningActionImpl {
         // linger.
         let calib_cpu_last = Arc::new(core::sync::atomic::AtomicU64::new(0));
         let calib_cpu_has_value = Arc::new(AtomicBool::new(false));
+        // task-resource-profile Phase 1: the memory-peak (phys_footprint BYTES,
+        // peak-over-time via `fetch_max`) and disk-bytes atoms published by the
+        // SAME poll tick as the CPU sample. They carry no has_value flag of their
+        // own — the harvest reads them under the CPU poll's `calib_cpu_has_value`
+        // Acquire gate (the Release of that flag, after the spawn_blocking join
+        // edge, publishes these Relaxed writes). The footprint atom uses
+        // `fetch_max` (NOT store) because the per-poll peak candidate is NOT
+        // monotonic — the concurrent phys_footprint SUM rises and falls as pids
+        // come and go, so the true peak is the MAX over all polls.
+        let calib_footprint_peak_last = Arc::new(core::sync::atomic::AtomicU64::new(0));
+        let calib_disk_last = Arc::new(core::sync::atomic::AtomicU64::new(0));
         let calib_poll_guard = if calib_should_arm_poll(
             calib_child_pid,
             calib_digest_sample_key(&self.action_info.input_root_digest),
@@ -5084,18 +5423,20 @@ impl RunningActionImpl {
             let pid = calib_child_pid.expect("calib_should_arm_poll gated pid.is_some()");
             let last = Arc::clone(&calib_cpu_last);
             let has_value = Arc::clone(&calib_cpu_has_value);
-            // Task-LOCAL pid→max-cpu-ns accumulator, persisting across ticks so an
-            // exited descendant's CPU stays counted. Wrapped in an `Arc<Mutex>`
+            let footprint_peak_last = Arc::clone(&calib_footprint_peak_last);
+            let disk_last = Arc::clone(&calib_disk_last);
+            // Task-LOCAL pid→max-usage accumulator, persisting across ticks so an
+            // exited descendant's usage stays counted. Wrapped in an `Arc<Mutex>`
             // only to hand it into each per-tick `spawn_blocking` closure — no
             // other task touches it, so the mutex is uncontended (task-local by
             // usage, not shared state).
-            // UNBOUNDED-OK: task-local pid→cpu-ns accumulator, freed when the poll
+            // UNBOUNDED-OK: task-local pid→usage accumulator, freed when the poll
             // task ends (action completion — the Arc drops on guard-abort or the
             // None-break; verified it does not outlive the action). It grows with
             // distinct-pids-forked-per-action (tens for a real toolchain tree,
-            // ~48 B/entry), NOT process-lifetime, and only 1/16 of actions arm it;
+            // ~40 B/entry), NOT process-lifetime, and only 1/16 of actions arm it;
             // the per-tick fan-out is separately capped at CALIB_SUBTREE_MAX_PIDS.
-            let subtree_map: Arc<Mutex<HashMap<libc::pid_t, u64>>> =
+            let subtree_map: Arc<Mutex<HashMap<libc::pid_t, CalibPidUsage>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             Some(spawn!("calib_cpu_time_poll", async move {
                 calib_poll_cpu_time_loop(
@@ -5104,11 +5445,29 @@ impl RunningActionImpl {
                         // Off the tokio worker: the subtree walk is a burst of
                         // µs-scale blocking syscalls. Flatten the JoinError/None
                         // into a plain `None` so a spawn failure ends the poll
-                        // cleanly.
+                        // cleanly. ONE walk captures cpu+memory+disk; cpu returns
+                        // to the loop (for `last` + stop-on-None), the memory peak
+                        // (fetch_max over polls) and disk are side-published into
+                        // their atoms for the harvest.
                         let map = Arc::clone(&subtree_map);
+                        let footprint_peak_last = Arc::clone(&footprint_peak_last);
+                        let disk_last = Arc::clone(&disk_last);
                         async move {
                             spawn_blocking!("calib_capture_cpu_time", move || {
-                                calib_capture_subtree_cpu_ns(pid, &mut map.lock())
+                                let totals =
+                                    calib_capture_subtree_usage(pid, &mut map.lock())?;
+                                // Peak-over-time: this poll's peak candidate is
+                                // MAX'd into the running peak (not stored) — the
+                                // concurrent footprint sum is not monotonic.
+                                footprint_peak_last.fetch_max(
+                                    totals.footprint_peak,
+                                    core::sync::atomic::Ordering::Relaxed,
+                                );
+                                disk_last.store(
+                                    totals.disk_bytes,
+                                    core::sync::atomic::Ordering::Relaxed,
+                                );
+                                Some(totals.cpu_ns)
                             })
                             .await
                             .ok()
@@ -5265,11 +5624,29 @@ impl RunningActionImpl {
                     // Dropping the guard aborts the poll task at once so it does
                     // not linger up to the 250 ms interval. Zero behavior change:
                     // no action-EXECUTION decision reads `calib_cpu_time_ms` (only
-                    // the P-A log emit consumes it).
+                    // the P-A log emit + the observe-only resource_usage producer
+                    // consume it).
                     if let Some(cpu_ns) =
                         calib_harvest_cpu_time(&calib_cpu_has_value, &calib_cpu_last)
                     {
-                        self.state.lock().calib_cpu_time_ms = Some(cpu_ns / 1_000_000);
+                        // task-resource-profile Phase 1: the CPU `has_value`
+                        // Acquire above also publishes the memory-peak/disk atoms
+                        // written in the SAME poll tick (§ poll capture closure),
+                        // so read them under this one gate. `calib_cpu_time_ns`
+                        // (raw ns) feeds the `resource_usage` producer; `_ms` still
+                        // feeds the shape classifier. Never-sampled actions leave
+                        // all of these `None` and report no resource_usage.
+                        // The footprint atom is phys_footprint BYTES (peak over
+                        // polls); the proto `peak_memory_kb` wants KiB.
+                        let peak_footprint_bytes = calib_footprint_peak_last
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        let disk_bytes =
+                            calib_disk_last.load(core::sync::atomic::Ordering::Relaxed);
+                        let mut state = self.state.lock();
+                        state.calib_cpu_time_ms = Some(cpu_ns / 1_000_000);
+                        state.calib_cpu_time_ns = Some(cpu_ns);
+                        state.calib_peak_memory_kb = Some(peak_footprint_bytes / 1024);
+                        state.calib_disk_bytes = Some(disk_bytes);
                     }
                     drop(calib_poll_guard);
                     return Ok(self);
@@ -6008,6 +6385,11 @@ impl RunningActionImpl {
                     state.calib_running_at_start.unwrap_or(1),
                 ));
             }
+            // task-resource-profile Phase 1: carry the output-blob byte total to
+            // the `resource_usage` producer's `net_output_bytes`. Stored
+            // unconditionally (independent of the P-A sampling gate) so it is
+            // available whenever the CPU poll sampled the action.
+            state.calib_output_bytes = Some(calib_output_bytes);
 
             state.action_result = Some(ActionResult {
                 output_files,
@@ -6319,6 +6701,25 @@ impl RunningAction for RunningActionImpl {
     /// `local_worker.rs:~2474` reads this via a captured Arc.
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// task-resource-profile Phase 1 producer: assemble the transport
+    /// `ActionResourceUsage` from the calib state fields. A thin state-reading
+    /// wrapper over `calib_resource_usage_from_state` (which holds the gate +
+    /// defaults + 1:1 mapping and is Linux-unit-tested). Gated on the CPU sample
+    /// (`calib_cpu_time_ns`): `resource_usage` is meaningful only for a
+    /// resource-sampled action (the 1/16 poll captured memory/disk/cpu together at
+    /// the harvest gate). Net in/out come from the store-layer byte counters.
+    /// Observe-only: nothing on the worker reads the result for scheduling.
+    fn get_resource_usage(&self) -> Option<ActionResourceUsage> {
+        let state = self.state.lock();
+        calib_resource_usage_from_state(
+            state.calib_cpu_time_ns,
+            state.calib_peak_memory_kb,
+            state.calib_disk_bytes,
+            state.calib_input_bytes,
+            state.calib_output_bytes,
+        )
     }
 }
 
@@ -10528,11 +10929,15 @@ mod calib_probe_tests {
     use nativelink_util::common::DigestInfo;
 
     use super::{
-        CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD,
+        ActionResourceUsage, CALIB_LARGE_EXEC_MS_THRESHOLD, CALIB_LARGE_PAYLOAD_BYTES_THRESHOLD,
         CALIB_LARGE_TREE_BYTES_THRESHOLD, CALIB_SAMPLE_PERIOD, CALIB_SUBTREE_MAX_DEPTH,
-        CALIB_SUBTREE_MAX_PIDS, CalibActionShape, CalibActionRecord, CalibStagingRecord,
-        calib_action_sampled, calib_build_action_record, calib_classify, calib_digest_sample_key,
-        calib_poll_cpu_time_loop, calib_staging_sampled, calib_tree_totals, calib_uniformly_sampled,
+        CALIB_SUBTREE_MAX_PIDS, CalibActionShape, CalibActionRecord, CalibPidUsage,
+        CalibResourceUsage, CalibStagingRecord, calib_accumulate_subtree_usage,
+        calib_action_resource_usage, calib_action_sampled, calib_build_action_record,
+        calib_classify, calib_digest_sample_key, calib_footprint_concurrent_sum,
+        calib_footprint_poll_peak, calib_poll_cpu_time_loop, calib_resource_usage_from_state,
+        calib_staging_sampled, calib_subtree_cpu_ns, calib_subtree_disk_bytes,
+        calib_subtree_max_lifetime_footprint, calib_tree_totals, calib_uniformly_sampled,
     };
 
     /// Build a digest whose first-8-byte LE sampling key is exactly `key`.
@@ -10872,42 +11277,471 @@ mod calib_probe_tests {
         );
     }
 
-    // --- P-A subtree CPU accumulation (task-local pid→max-ns map) ----------
+    // --- P-A subtree usage accumulation (task-local pid→max-per-field map) --
+
+    /// Helper: a per-pid MONOTONIC usage sample `(cpu_ns, disk_bytes,
+    /// lifetime_footprint)` — the fields folded max-per-pid into the map.
+    fn usage(cpu_ns: u64, disk_bytes: u64, lifetime_footprint: u64) -> CalibPidUsage {
+        CalibPidUsage {
+            cpu_ns,
+            disk_bytes,
+            lifetime_footprint,
+        }
+    }
 
     #[test]
-    fn subtree_accumulate_keeps_max_per_pid_and_survives_exit() {
-        // The task-local map must (a) keep the MAX cpu_ns per pid (guards a
-        // transient glitch; CPU is monotonic per live process), and (b) SURVIVE
-        // a pid dropping out of a later poll (a child that ran then exited) so
-        // its CPU stays counted — sequential children A-then-B are both summed
-        // (auditor Claim 1 / red-team A1-2 subtree fix).
-        let mut map: HashMap<i32, u64> = HashMap::new();
+    fn subtree_accumulate_keeps_max_per_field_per_pid_and_survives_exit() {
+        // The task-local map must (a) keep the MAX per pid PER FIELD (guards a
+        // transient glitch; cpu/disk/lifetime are monotonic per live process),
+        // and (b) SURVIVE a pid dropping out of a later poll (a child that ran
+        // then exited) so its usage stays counted — sequential children A-then-B
+        // are both summed (auditor Claim 1 / red-team A1-2 subtree fix). cpu/disk
+        // AGGREGATE via SUM, lifetime-footprint via MAX.
+        let mut map: HashMap<i32, CalibPidUsage> = HashMap::new();
 
-        // Tick 1: parent 100 accrued 10 ns, child 200 accrued 5 ns.
-        super::calib_accumulate_subtree_cpu(&mut map, 100, 10);
-        super::calib_accumulate_subtree_cpu(&mut map, 200, 5);
-        assert_eq!(map.values().sum::<u64>(), 15, "tick 1 sum = 10 + 5");
+        // Tick 1: parent 100 {cpu 10, disk 1000, lifetime 100}, child 200 {cpu 5,
+        // disk 500, lifetime 300}.
+        calib_accumulate_subtree_usage(&mut map, 100, usage(10, 1000, 100));
+        calib_accumulate_subtree_usage(&mut map, 200, usage(5, 500, 300));
+        assert_eq!(calib_subtree_cpu_ns(&map), 15, "tick 1 cpu sum = 10 + 5");
+        assert_eq!(
+            calib_subtree_disk_bytes(&map),
+            1500,
+            "tick 1 disk sum = 1000 + 500"
+        );
+        assert_eq!(
+            calib_subtree_max_lifetime_footprint(&map),
+            300,
+            "tick 1 max lifetime footprint = max(100, 300) = 300"
+        );
 
         // Tick 2: child 200 exited (not observed this tick); parent 100 grew to
-        // 25 ns; a new sequential child 300 accrued 7 ns. The exited child's 5
-        // ns must remain counted.
-        super::calib_accumulate_subtree_cpu(&mut map, 100, 25);
-        super::calib_accumulate_subtree_cpu(&mut map, 300, 7);
+        // {cpu 25, disk 3000, lifetime 150}; a new sequential child 300 {cpu 7,
+        // disk 200, lifetime 50}. The exited child's tick-1 sample must remain.
+        calib_accumulate_subtree_usage(&mut map, 100, usage(25, 3000, 150));
+        calib_accumulate_subtree_usage(&mut map, 300, usage(7, 200, 50));
         assert_eq!(
-            map.values().sum::<u64>(),
+            calib_subtree_cpu_ns(&map),
             37,
             "exited child 200's 5 ns must persist (map survives exit); \
              25 (parent grown) + 5 (exited child) + 7 (new child) = 37"
         );
-
-        // A transient glitch: pid 100 reports a SMALLER value than before. The
-        // max must be retained, not the glitch.
-        super::calib_accumulate_subtree_cpu(&mut map, 100, 3);
         assert_eq!(
-            *map.get(&100).expect("pid 100 present"),
-            25,
-            "a smaller later reading is a glitch; max (25) must be retained — \
-             CPU is monotonic per live process"
+            calib_subtree_disk_bytes(&map),
+            3700,
+            "disk sum = 3000 (parent grown) + 500 (exited child) + 200 (new) = 3700"
+        );
+        assert_eq!(
+            calib_subtree_max_lifetime_footprint(&map),
+            300,
+            "exited child 200's 300 lifetime-footprint must persist as the subtree \
+             floor — the map survives its exit; max(150, 300, 50) = 300"
+        );
+
+        // A transient glitch: pid 100 reports SMALLER values than before. The
+        // per-field max must be retained, not the glitch.
+        calib_accumulate_subtree_usage(&mut map, 100, usage(3, 1, 10));
+        let p100 = *map.get(&100).expect("pid 100 present");
+        assert_eq!(
+            p100,
+            usage(25, 3000, 150),
+            "a smaller later reading is a glitch; the per-field max \
+             {{cpu 25, disk 3000, lifetime 150}} must be retained — usage is \
+             monotonic per live process"
+        );
+    }
+
+    #[test]
+    fn subtree_cpu_sums_persist_exited_children() {
+        // task-resource-profile: macOS does NOT roll a reaped child's CPU into
+        // its parent, so a short-lived compile child (cc1/linker) that accrues
+        // CPU then EXITS mid-action must be captured while live and RETAINED. The
+        // never-removed map is that mechanism. This guards specifically against an
+        // "only-live-pids at action end" aggregation that would drop the bulk of a
+        // compile's CPU. (Mutation: a cleared-each-poll / only-live accumulate
+        // red-fails here.)
+        let mut map: HashMap<i32, CalibPidUsage> = HashMap::new();
+        // Poll 1: root R (pid 100, cpu 10) + child C (pid 200, cpu 500) both LIVE.
+        calib_accumulate_subtree_usage(&mut map, 100, usage(10, 0, 0));
+        calib_accumulate_subtree_usage(&mut map, 200, usage(500, 0, 0));
+        // Poll 2: C has EXITED — the walk no longer sees it, so ONLY R is
+        // re-folded (grown to cpu 15). C is NOT re-observed this poll.
+        calib_accumulate_subtree_usage(&mut map, 100, usage(15, 0, 0));
+        assert_eq!(
+            calib_subtree_cpu_ns(&map),
+            515,
+            "exited child C's 500 ns must remain in the subtree CPU total \
+             (R 15 + C 500 = 515) — an only-live-pids aggregation that dropped the \
+             exited child would report just R's 15, losing the bulk of a compile's \
+             CPU which lives in short-lived cc1/linker children"
+        );
+    }
+
+    #[nativelink_test]
+    async fn poll_loop_shared_map_retains_exited_child_across_ticks() {
+        // Seam 1 (testing-czar): exited-child retention depends on the subtree map
+        // being created ONCE and folded across ticks — production arms it OUTSIDE
+        // the poll loop, then re-locks the SAME `Arc<Mutex<HashMap>>` each tick.
+        // The pure accumulate test folds a manually-shared map, so it would stay
+        // green even if the map were reconstructed per tick. This drives the REAL
+        // `calib_poll_cpu_time_loop` with a capture closure shaped exactly like
+        // production's — a single map Arc cloned per tick — scripting a child that
+        // runs then EXITS mid-sequence, and asserts the LAST stored subtree CPU
+        // still includes it. A per-tick-FRESH / cleared map (the mutation) drops
+        // the exited child and RED-fails this test.
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        use parking_lot::Mutex;
+
+        // The ONE persistent map — created OUTSIDE the loop, as production does.
+        let map: Arc<Mutex<HashMap<libc::pid_t, CalibPidUsage>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // Per-tick observation script: tick 0 sees root R (pid 100, cpu 10) AND
+        // child C (pid 200, cpu 500) live; tick 1 sees only R (grown to cpu 15) —
+        // C has EXITED and drops out of the walk. Exhaustion → `None` → poll stop.
+        let script: Arc<Mutex<std::collections::VecDeque<Vec<(libc::pid_t, u64)>>>> =
+            Arc::new(Mutex::new(
+                [vec![(100, 10u64), (200, 500)], vec![(100, 15)]]
+                    .into_iter()
+                    .collect(),
+            ));
+        let last = Arc::new(AtomicU64::new(0));
+        let has_value = Arc::new(AtomicBool::new(false));
+
+        let map_c = Arc::clone(&map);
+        let script_c = Arc::clone(&script);
+        let last_c = Arc::clone(&last);
+        let has_c = Arc::clone(&has_value);
+        calib_poll_cpu_time_loop(
+            core::time::Duration::ZERO,
+            move || {
+                // Mirror production: clone the SHARED map Arc per tick, fold this
+                // tick's live pids into it, and return the subtree cpu sum.
+                let map = Arc::clone(&map_c);
+                let script = Arc::clone(&script_c);
+                core::future::ready({
+                    match script.lock().pop_front() {
+                        None => None, // script exhausted → root gone → stop
+                        Some(observations) => {
+                            let mut m = map.lock();
+                            for (pid, cpu) in observations {
+                                calib_accumulate_subtree_usage(&mut m, pid, usage(cpu, 0, 0));
+                            }
+                            Some(calib_subtree_cpu_ns(&m))
+                        }
+                    }
+                })
+            },
+            last_c,
+            has_c,
+        )
+        .await;
+
+        assert!(
+            has_value.load(Ordering::Acquire),
+            "the poll must have captured at least one tick"
+        );
+        assert_eq!(
+            last.load(Ordering::Relaxed),
+            515,
+            "the poll loop's map, SHARED across ticks, must retain exited child C's \
+             500 ns after C drops out at tick 1 (R 15 + C 500 = 515) — a per-tick \
+             fresh/cleared map would report only tick 1's R (15), silently losing \
+             every exited child's CPU across the action's lifetime"
+        );
+    }
+
+    // --- task-resource-profile Phase 1: memory (phys_footprint) aggregation -
+
+    #[test]
+    fn subtree_max_lifetime_footprint_is_max_over_all_pids_incl_reaped() {
+        // The lifetime-max floor must be the MAX over the WHOLE subtree, so a
+        // DESCENDANT (incl. a reaped one retained in the map) larger than the root
+        // wins. Root (pid 100) is deliberately the SMALLEST so a "use the root"
+        // regression cannot pass by coincidence.
+        let mut map: HashMap<i32, CalibPidUsage> = HashMap::new();
+        calib_accumulate_subtree_usage(&mut map, 100, usage(0, 0, 64)); // root: smallest
+        calib_accumulate_subtree_usage(&mut map, 200, usage(0, 0, 4096)); // reaped child: LARGEST
+        calib_accumulate_subtree_usage(&mut map, 300, usage(0, 0, 512));
+        assert_eq!(
+            calib_subtree_max_lifetime_footprint(&map),
+            4096,
+            "lifetime-max floor must be the MAX over the subtree (child 200's 4096), \
+             NOT the root's 64 — a root-only aggregation under-reports the dominant child"
+        );
+    }
+
+    #[test]
+    fn subtree_max_lifetime_footprint_empty_map_is_zero() {
+        let map: HashMap<i32, CalibPidUsage> = HashMap::new();
+        assert_eq!(
+            calib_subtree_max_lifetime_footprint(&map),
+            0,
+            "an empty (never-sampled) map must yield 0, not panic"
+        );
+    }
+
+    #[test]
+    fn footprint_concurrent_sum_is_sum_of_live_pids_not_max() {
+        // The concurrent footprint of one poll is the SUM of live-pid
+        // phys_footprint — additive because phys_footprint excludes shared pages.
+        // A max-instead-of-sum regression returns 200 and FAILS. (≥2 concurrent
+        // pids so SUM (350) is unambiguously distinct from the max (200).)
+        assert_eq!(
+            calib_footprint_concurrent_sum(&[100, 200, 50]),
+            350,
+            "concurrent footprint must be the SUM of live-pid phys_footprint \
+             (100 + 200 + 50 = 350), NOT the per-pid max (200) — phys_footprint \
+             excludes shared pages so it is summable without double-counting; a \
+             per-pid max under-reports a parallel memory-heavy tree (LTO/make -j)"
+        );
+        assert_eq!(
+            calib_footprint_concurrent_sum(&[]),
+            0,
+            "no live pids → 0 concurrent footprint"
+        );
+    }
+
+    #[test]
+    fn footprint_poll_peak_floors_at_reaped_child_lifetime_max() {
+        // A child that peaked-then-EXITED between polls contributes via the
+        // lifetime-max floor even though the CURRENT concurrent sum is smaller
+        // (the exited child is no longer live, so it is not in the sum). The peak
+        // must NOT under-report it — the number feeds a memory reservation.
+        // (Mutation: dropping the lifetime floor red-fails here.)
+        let concurrent_sum = 120; // only the small live pids remain this poll
+        let subtree_max_lifetime = 5000; // a reaped child's retained lifetime-max
+        assert_eq!(
+            calib_footprint_poll_peak(concurrent_sum, subtree_max_lifetime),
+            5000,
+            "a reaped child's lifetime-max (5000) must FLOOR the peak even when the \
+             live concurrent sum (120) is smaller — a peak-then-exit child must not \
+             be under-reported (it would under-cap the memory reservation)"
+        );
+    }
+
+    #[test]
+    fn footprint_poll_peak_uses_concurrent_sum_when_it_dominates() {
+        // When the tree is concurrently memory-heavy, the peak is the concurrent
+        // SUM (which exceeds any single child's lifetime-max).
+        assert_eq!(
+            calib_footprint_poll_peak(3000, 500),
+            3000,
+            "the concurrent SUM (3000, simultaneous memory of a parallel tree) must \
+             win over a single child's lifetime-max (500) when it dominates"
+        );
+    }
+
+    #[test]
+    fn footprint_peak_is_max_over_time_of_concurrent_sum() {
+        // The reported peak is the MAX-over-POLLS of the per-poll peak candidate.
+        // This drives the exact production fns across a two-poll sequence where a
+        // concurrent pair peaks in poll 1 and one exits by poll 2, proving the
+        // peak survives even though the LATER concurrent sum is smaller.
+        let mut map: HashMap<i32, CalibPidUsage> = HashMap::new();
+        let mut peak = 0u64;
+
+        // Poll 1: A (pid 100) + B (pid 200) BOTH live — footprints 100 + 200,
+        // lifetimes 100 and 200.
+        calib_accumulate_subtree_usage(&mut map, 100, usage(0, 0, 100));
+        calib_accumulate_subtree_usage(&mut map, 200, usage(0, 0, 200));
+        let sum1 = calib_footprint_concurrent_sum(&[100, 200]); // 300 concurrent
+        peak = peak.max(calib_footprint_poll_peak(
+            sum1,
+            calib_subtree_max_lifetime_footprint(&map),
+        ));
+
+        // Poll 2: A has EXITED; only B live, grown to footprint 250 (lifetime 250).
+        // A is retained in the map but is NOT in this poll's concurrent sum.
+        calib_accumulate_subtree_usage(&mut map, 200, usage(0, 0, 250));
+        let sum2 = calib_footprint_concurrent_sum(&[250]); // 250 concurrent (only B)
+        peak = peak.max(calib_footprint_poll_peak(
+            sum2,
+            calib_subtree_max_lifetime_footprint(&map),
+        ));
+
+        assert_eq!(
+            peak, 300,
+            "peak = MAX over time of the concurrent SUM: poll 1's 100 + 200 = 300 \
+             (a per-pid MAX would give only 200) must beat poll 2's smaller live sum \
+             (250) — the peak is not the last sample nor a per-pid max"
+        );
+    }
+
+    #[test]
+    fn subtree_disk_is_sum_over_all_pids() {
+        // Disk I/O must be SUMMED over the subtree (proc_pid_rusage does not sum
+        // descendants). A max-instead-of-sum regression returns 900 and FAILS.
+        let mut map: HashMap<i32, CalibPidUsage> = HashMap::new();
+        calib_accumulate_subtree_usage(&mut map, 100, usage(0, 100, 0));
+        calib_accumulate_subtree_usage(&mut map, 200, usage(0, 900, 0));
+        calib_accumulate_subtree_usage(&mut map, 300, usage(0, 250, 0));
+        assert_eq!(
+            calib_subtree_disk_bytes(&map),
+            1250,
+            "disk bytes must be the SUM over the subtree (100 + 900 + 250 = 1250), \
+             NOT the per-pid max — proc_pid_rusage never sums descendants"
+        );
+    }
+
+    #[test]
+    fn subtree_cpu_is_sum_over_all_pids() {
+        // CPU must be SUMMED (parity with the pre-refactor `map.values().sum()`).
+        let mut map: HashMap<i32, CalibPidUsage> = HashMap::new();
+        calib_accumulate_subtree_usage(&mut map, 100, usage(3, 0, 0));
+        calib_accumulate_subtree_usage(&mut map, 200, usage(11, 0, 0));
+        assert_eq!(
+            calib_subtree_cpu_ns(&map),
+            14,
+            "cpu ns must be the SUM over the subtree (3 + 11 = 14) — forked-\
+             descendant CPU that proc_pidinfo alone misses is summed here"
+        );
+    }
+
+    // --- task-resource-profile Phase 1: record → proto mapping -------------
+
+    #[test]
+    fn resource_usage_proto_maps_every_field_one_to_one() {
+        // The 1:1 record→proto mapping: every distinct value must land in its
+        // OWN proto field (distinct constants catch a field swap). `sampled` is
+        // forced true; operation_id + worker_id are LEFT EMPTY for the server to
+        // fill from its transport-derived values (design §8 spoof-safe
+        // attribution — see `calib_action_resource_usage`).
+        let record = CalibResourceUsage {
+            peak_memory_kb: 111,
+            cpu_ns: 222,
+            disk_bytes: 333,
+            net_input_bytes: 444,
+            net_output_bytes: 555,
+        };
+        let proto = calib_action_resource_usage(&record);
+        assert_eq!(proto.peak_memory_kb, 111, "peak_memory_kb maps 1:1");
+        assert_eq!(proto.cpu_ns, 222, "cpu_ns maps 1:1");
+        assert_eq!(proto.disk_bytes, 333, "disk_bytes maps 1:1");
+        assert_eq!(
+            proto.net_input_bytes, 444,
+            "net_input_bytes maps 1:1 (not swapped with net_output_bytes)"
+        );
+        assert_eq!(
+            proto.net_output_bytes, 555,
+            "net_output_bytes maps 1:1 (not swapped with net_input_bytes)"
+        );
+        assert!(proto.sampled, "producer marks the value worker-sampled");
+        assert!(
+            proto.operation_id.is_empty(),
+            "operation_id MUST be left empty for the server to fill from its \
+             routed operation id (design §8) — a worker-stamped id would win \
+             over the server fill-if-empty"
+        );
+        assert!(
+            proto.worker_id.is_empty(),
+            "worker_id MUST be left empty for the server to fill from its \
+             TRANSPORT-DERIVED (spoof-safe) worker id (design §8) — a \
+             worker-self-reported id would defeat the spoof-safe attribution"
+        );
+    }
+
+    #[test]
+    fn resource_usage_from_state_gates_defaults_and_maps_each_field() {
+        // Seam 3 (testing-czar): the production `get_resource_usage()` state→proto
+        // assembly (the `calib_cpu_time_ns?` GATE, the per-field `unwrap_or(0)`
+        // defaults, and the 1:1 field placement) was unguarded — a field swap or
+        // wrong default there would ship silently. This drives that assembly
+        // (`calib_resource_usage_from_state`, which `get_resource_usage` delegates
+        // to) with DISTINCT values so a swap is caught, plus the None-gate and the
+        // default paths.
+
+        // (a) Fully-populated state: every field distinct → each maps to its OWN
+        //     proto field (a swap moves a value to the wrong field and FAILS).
+        let proto = calib_resource_usage_from_state(
+            Some(222), // cpu_ns
+            Some(111), // peak_memory_kb
+            Some(333), // disk_bytes
+            Some(444), // net_input_bytes
+            Some(555), // net_output_bytes
+        )
+        .expect("a sampled action (cpu_ns Some) must produce Some(resource_usage)");
+        assert_eq!(proto.cpu_ns, 222, "cpu_ns maps from calib_cpu_time_ns");
+        assert_eq!(
+            proto.peak_memory_kb, 111,
+            "peak_memory_kb maps from calib_peak_memory_kb (not swapped)"
+        );
+        assert_eq!(
+            proto.disk_bytes, 333,
+            "disk_bytes maps from calib_disk_bytes (not swapped with a net field)"
+        );
+        assert_eq!(
+            proto.net_input_bytes, 444,
+            "net_input_bytes maps from calib_input_bytes (not swapped with output)"
+        );
+        assert_eq!(
+            proto.net_output_bytes, 555,
+            "net_output_bytes maps from calib_output_bytes (not swapped with input)"
+        );
+        assert!(proto.sampled, "a produced resource_usage is marked sampled");
+
+        // (b) None GATE: an un-sampled action (no CPU capture) reports NOTHING,
+        //     even if some byte counters happen to be present.
+        assert!(
+            calib_resource_usage_from_state(None, Some(9), Some(9), Some(9), Some(9))
+                .is_none(),
+            "with calib_cpu_time_ns == None the action was never resource-sampled \
+             → get_resource_usage must return None (no resource_usage on the wire), \
+             regardless of any byte counters that were captured"
+        );
+
+        // (c) DEFAULTS: a sampled action with absent memory/disk/net counters
+        //     defaults them to 0 (never panics on unwrap).
+        let proto = calib_resource_usage_from_state(Some(7), None, None, None, None)
+            .expect("cpu_ns Some → Some");
+        assert_eq!(proto.cpu_ns, 7);
+        assert_eq!(
+            (
+                proto.peak_memory_kb,
+                proto.disk_bytes,
+                proto.net_input_bytes,
+                proto.net_output_bytes
+            ),
+            (0, 0, 0, 0),
+            "absent memory/disk/net state fields default to 0 (unwrap_or(0)), \
+             not a panic and not a stale value"
+        );
+    }
+
+    #[test]
+    fn action_resource_usage_proto_round_trips_all_fields() {
+        // Encode → decode must preserve every field, proving the new field tags
+        // (5..=8) are wire-stable and don't collide with the existing 1..=4.
+        use prost::Message;
+
+        let original = ActionResourceUsage {
+            peak_memory_kb: 4096,
+            sampled: true,
+            operation_id: "op-123".to_string(),
+            worker_id: "worker-abc".to_string(),
+            cpu_ns: 9_876_543_210,
+            disk_bytes: 1_073_741_824,
+            net_input_bytes: 65_536,
+            net_output_bytes: 131_072,
+        };
+        let mut buf = Vec::new();
+        original
+            .encode(&mut buf)
+            .expect("ActionResourceUsage must prost-encode");
+        let decoded = ActionResourceUsage::decode(buf.as_slice())
+            .expect("ActionResourceUsage must prost-decode the encoded bytes");
+        assert_eq!(
+            decoded, original,
+            "every field (incl. the new cpu_ns/disk_bytes/net_input_bytes/\
+             net_output_bytes tags 5..=8) must survive an encode→decode round trip"
+        );
+        // Spot-check the new fields explicitly so a silent zero-default decode
+        // of a mis-tagged field is caught even if PartialEq somehow passed.
+        assert_eq!(decoded.cpu_ns, 9_876_543_210, "cpu_ns survives the wire");
+        assert_eq!(
+            decoded.net_output_bytes, 131_072,
+            "net_output_bytes survives the wire (distinct from net_input_bytes)"
         );
     }
 
@@ -11097,20 +11931,21 @@ mod calib_probe_tests {
         );
     }
 
-    /// LIVE SUBTREE test — proves FIX 3: `calib_capture_subtree_cpu_ns` sums the
+    /// LIVE SUBTREE test — proves FIX 3: `calib_capture_subtree_usage` sums the
     /// FORKED-DESCENDANT CPU that a single-process `proc_pidinfo` read misses
     /// (rustc→rust-lld, cc-wrapper→cc1). A thin parent `sh` forks a grandchild
     /// that does the CPU spinning, then `wait`s (near-zero own CPU). Single-pid
     /// capture on the parent would read ≈0; the subtree walk must pick up the
     /// grandchild's CPU. Asserts the summed subtree ns is a plausible fraction of
-    /// wall — i.e. the grandchild's burn IS counted.
+    /// wall — i.e. the grandchild's burn IS counted. Also spot-checks that the
+    /// same walk captures a non-zero memory footprint (task-resource-profile P1).
     ///
     /// **Shape scope (deliberate):** this tests the parent-OUTLIVES-child shape —
     /// the `& wait` keeps the parent alive so the grandchild stays IN the subtree
     /// on every tick, the one shape the walk handles perfectly. It does NOT
     /// exercise the reparent-orphan shape (intermediate exits, descendant
     /// reparents to launchd and leaves the walk — see the
-    /// `calib_capture_subtree_cpu_ns` residuals), which is a known under-count
+    /// `calib_capture_subtree_usage` residuals), which is a known under-count
     /// validated on-worker via the canary ratio grep, not by this test.
     ///
     /// macOS-only (same reason as the value test).
@@ -11120,7 +11955,7 @@ mod calib_probe_tests {
         use std::collections::HashMap;
         use std::time::Instant;
 
-        use super::calib_capture_subtree_cpu_ns;
+        use super::{CalibPidUsage, CalibSubtreeTotals, calib_capture_subtree_usage};
 
         // Parent `sh` forks a grandchild that runs the fork-free busy spin, then
         // `wait`s for it (the parent itself burns ≈0 CPU — its work is the fork +
@@ -11137,12 +11972,12 @@ mod calib_probe_tests {
 
         // Poll the subtree directly (not through the generic loop) so we exercise
         // the descendant walk + the task-local accumulator across ticks. Keep the
-        // last non-None subtree total; stop on the first None (root reaped).
-        let mut map: HashMap<libc::pid_t, u64> = HashMap::new();
-        let mut last_subtree_ns: Option<u64> = None;
+        // last non-None subtree totals; stop on the first None (root reaped).
+        let mut map: HashMap<libc::pid_t, CalibPidUsage> = HashMap::new();
+        let mut last_totals: Option<CalibSubtreeTotals> = None;
         loop {
-            match calib_capture_subtree_cpu_ns(pid, &mut map) {
-                Some(ns) => last_subtree_ns = Some(ns),
+            match calib_capture_subtree_usage(pid, &mut map) {
+                Some(totals) => last_totals = Some(totals),
                 None => break,
             }
             tokio::time::sleep(core::time::Duration::from_millis(50)).await;
@@ -11150,9 +11985,18 @@ mod calib_probe_tests {
         child.wait().await.expect("child must exit");
         let child_wall_ms = child_wall_start.elapsed().as_millis() as u64;
 
-        let subtree_ns =
-            last_subtree_ns.expect("subtree poll must have captured at least one live sample");
-        let subtree_ms = subtree_ns / 1_000_000;
+        let totals =
+            last_totals.expect("subtree poll must have captured at least one live sample");
+        let subtree_ms = totals.cpu_ns / 1_000_000;
+        // task-resource-profile Phase 1: the SAME walk must observe a live
+        // process tree's memory — a live process has non-zero phys_footprint, so
+        // the concurrent-sum/lifetime-floor peak must be non-zero.
+        assert!(
+            totals.footprint_peak > 0,
+            "the subtree walk must capture a non-zero memory footprint_peak for a \
+             live process tree (proc_pid_rusage ri_phys_footprint /  \
+             ri_lifetime_max_phys_footprint read); 0 means the memory harvest is broken"
+        );
 
         // The grandchild burned CPU ≈ its wall time; the parent burned ≈0. If the
         // subtree walk correctly summed the grandchild, subtree_ms is a large
