@@ -79,6 +79,25 @@ pub struct PendingActionInfoData {
     /// EWMA. This is the correct degenerate behavior: an un-timed record is
     /// simply invisible to the temporal estimate.
     pub exec_start_time: Option<SystemTime>,
+
+    /// (#task-resource-profile Phase-2c) OBSERVE-ONLY dispatch-time memory
+    /// prediction, stashed here so the completion path can do a TRUE out-of-sample
+    /// leave-one-out accuracy check: the action's ACTUAL peak measured against the
+    /// tail that stood AT THIS ACTION'S DISPATCH — NOT re-derived at completion, so
+    /// same-key samples that folded in AFTER this action was dispatched can never
+    /// leak in (removing the hindsight bias the cadre flagged).
+    ///
+    /// `Some((tail_kb, prior_samples))` = the tail-aware memory reservation the
+    /// enforce phase WOULD have stood at dispatch, peeked (non-recency-bumping) from
+    /// the profile-so-far by `ApiWorkerScheduler::find_and_reserve_worker`.
+    /// `None` = no profile existed at dispatch (map still warming, absent Bazel
+    /// baggage, or the dead reconnect-notify insert path).
+    ///
+    /// It lives IN this per-op record, so it is auto-cleaned on EVERY terminal path
+    /// (`complete_action`, `inner_unreserve_worker`, `immediate_evict_worker` drain,
+    /// `remove_worker`) with zero bespoke cleanup — no side map, no leak surface.
+    /// Read (never enforced) at completion by `record_action_resource_usage`.
+    pub dispatch_memory_prediction: Option<(u64, u64)>,
 }
 
 /// (#sched-blend, security S1) Upper bound on the worker-reported P/E
@@ -505,6 +524,9 @@ impl Worker {
                     PendingActionInfoData {
                         action_info,
                         exec_start_time: None,
+                        // (#task-resource-profile Phase-2c) reconnect-notify insert
+                        // is dead in prod (Disconnect-only) → no dispatch prediction.
+                        dispatch_memory_prediction: None,
                     },
                 );
 

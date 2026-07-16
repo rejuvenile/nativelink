@@ -706,42 +706,59 @@ pub struct SchedulerMetrics {
     )]
     pub inject_observe_skipped_no_profile: AtomicU64,
 
-    /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose LEAVE-ONE-OUT
-    /// profile tail (the profile-so-far, EXCLUDING this sample) COVERED the action's
-    /// ACTUAL measured peak (`tail >= peak_memory_kb`). NOTE the tail is recomputed at
-    /// COMPLETION (a monotone max), so it is >= the tail that stood at dispatch —
-    /// `Covered` is thus HINDSIGHT-optimistic (see `accuracy_predicted_under`).
+    /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose TRUE
+    /// DISPATCH-TIME leave-one-out prediction — the tail-aware statistic that stood at
+    /// THIS action's dispatch (peeked BEFORE its own sample folded, stashed on the
+    /// running action, NOT re-derived at completion) — COVERED the action's ACTUAL
+    /// measured peak (`tail_at_dispatch >= peak_memory_kb`). Hindsight-free: same-key
+    /// samples that folded in AFTER dispatch cannot inflate this tail (the cadre's
+    /// completion-time-recompute bias, now fixed). A safe over-estimate at dispatch.
     #[metric(
-        help = "(#task-resource-profile Phase-2c) folded samples whose leave-one-out profile tail covered the actual peak (tail >= actual; safe over-estimate)"
+        help = "(#task-resource-profile Phase-2c) folded samples whose dispatch-time leave-one-out tail covered the actual peak (tail >= actual; safe over-estimate)"
     )]
     pub accuracy_predicted_covered: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) COUNTER — a Phase-3 FALSIFIER (NOT a
-    /// sufficiency gate): folded samples whose leave-one-out profile tail UNDER-predicted
-    /// the action's actual peak (`tail < peak_memory_kb`) → enforce would under-reserve →
-    /// OOM risk. SOUND direction: if this fires with any regularity the tail is DEFINITELY
-    /// NOT a safe reservation (the Phase-3 down-override must not be enabled). UNSOUND to
-    /// invert: `≈0` does NOT prove safety — the tail is a monotone max, so `under` fires
-    /// only on a fresh all-time-max and its RATE decays to 0 by construction over any soak,
+    /// sufficiency gate): folded samples whose TRUE DISPATCH-TIME leave-one-out tail
+    /// UNDER-predicted the action's actual peak (`tail_at_dispatch < peak_memory_kb`) →
+    /// enforce would under-reserve → OOM risk. This is the hindsight-free out-of-sample
+    /// under-rate (the completion-time recompute bias the cadre flagged is removed by
+    /// stashing the dispatch-time tail). SOUND direction: if this fires with any
+    /// regularity the tail is DEFINITELY NOT a safe reservation (the Phase-3 down-override
+    /// must not be enabled). UNSOUND to invert: `≈0` does NOT prove safety — the tail is a
+    /// monotone max, so `under` fires only when an action exceeds the all-time bucket-max
+    /// of its key's prior history, and that RATE decays to 0 BY CONSTRUCTION over any soak
     /// regardless of predictive quality (cadre 2026-07-15, `.claude/reviews/phase-2c-3ddef839/`).
     /// A near-zero reading is NECESSARY-not-sufficient, meaningful only alongside
     /// `accuracy_predicted_covered ≫ 0` AND a low `skipped_low_sample`/total ratio AND a
-    /// workload-stationarity check. Also SILENT on over-reservation waste (the coarse
-    /// `(instance,target,mnemonic)` key can read all-covered while enforce over-reserves
-    /// cheap actions by the blend-max). Read as a falsifier only.
+    /// workload-stationarity check. This counter watches only the OOM (under) half; the
+    /// over-reservation WASTE half is now surfaced separately by
+    /// `accuracy_over_ratio_{max,sum}_x100` + `accuracy_over_samples`.
     #[metric(
-        help = "(#task-resource-profile Phase-2c) FALSIFIER: folded samples whose leave-one-out tail under-predicted the actual peak (tail < actual → enforce would under-reserve → OOM risk). Firing DISPROVES safety; ≈0 is necessary-not-sufficient (decays to 0 by construction)"
+        help = "(#task-resource-profile Phase-2c) FALSIFIER: folded samples whose dispatch-time leave-one-out tail under-predicted the actual peak (tail < actual → enforce would under-reserve → OOM risk). Firing DISPROVES safety; ≈0 is necessary-not-sufficient (decays to 0 by construction)"
     )]
     pub accuracy_predicted_under: AtomicU64,
 
-    /// (#task-resource-profile Phase-2c) COUNTER: folded samples with `< K`
-    /// leave-one-out samples (including the key's very first sample, which has no
-    /// prior profile). Below `K` no trustworthy prediction existed, so the sample is
-    /// neither a cover nor an under — it is excluded from the accuracy ratio.
+    /// (#task-resource-profile Phase-2c) COUNTER: folded samples that HAD a
+    /// dispatch-time profile but with `< K` prior samples (the tail was not yet
+    /// trustworthy). Excluded from the accuracy ratio — distinct from
+    /// `accuracy_skipped_no_dispatch` (no dispatch prediction existed at all).
     #[metric(
-        help = "(#task-resource-profile Phase-2c) folded samples with < K prior samples (no trustworthy prediction existed → excluded from the accuracy ratio)"
+        help = "(#task-resource-profile Phase-2c) folded samples with a dispatch prediction but < K prior samples (tail untrusted → excluded from the accuracy ratio)"
     )]
     pub accuracy_skipped_low_sample: AtomicU64,
+
+    /// (#task-resource-profile Phase-2c) COUNTER: folded samples for which NO
+    /// dispatch-time prediction was stashed — the map had no profile for the key when
+    /// the action was reserved (map still warming, absent Bazel baggage), or the op
+    /// never traversed the reserve path (raced completion). No out-of-sample prediction
+    /// existed, so the sample is neither a cover nor an under. Right after a Phase-2a
+    /// deploy this DOMINATES (empty map) then decays as profiles accumulate — the
+    /// EXPECTED early accuracy-warming signal, distinct from `skipped_low_sample`.
+    #[metric(
+        help = "(#task-resource-profile Phase-2c) folded samples with no dispatch-time prediction stashed (map warming / absent baggage / raced reserve; excluded from the accuracy ratio)"
+    )]
+    pub accuracy_skipped_no_dispatch: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) GAUGE: the WORST (max) observed
     /// under-prediction ratio, `actual * 100 / tail` (×100 integer), across all
@@ -755,6 +772,41 @@ pub struct SchedulerMetrics {
         help = "(#task-resource-profile Phase-2c) worst observed under-prediction ratio actual*100/tail (×100), max over all under samples (gauge)"
     )]
     pub accuracy_under_ratio_max_x100: AtomicU64,
+
+    /// (#task-resource-profile Phase-2c, Upgrade 2) GAUGE: the WORST (max) observed
+    /// OVER-reservation ratio, `tail * 100 / actual` (×100 integer), over the covered
+    /// (≥K, `tail > actual`) samples. This is the concurrency-starvation half the under
+    /// counter is blind to: the coarse `(instance,target,mnemonic)` key blends cheap and
+    /// expensive actions, so enforce would reserve the blend-MAX tail for EVERY action —
+    /// a cheap action whose real peak is far under the tail is over-reserved by this
+    /// ratio, and at scale that collapses concurrency. Pair with the sum+count (below) to
+    /// read TYPICAL vs WORST: a max-only gauge cannot tell a single rare-severe outlier
+    /// from pervasive waste. `0` while no over-reservation has fired; a degenerate
+    /// `actual==0` sample inflates it to `tail*100` (guarded finite via `actual.max(1)`).
+    #[metric(
+        help = "(#task-resource-profile Phase-2c) worst observed over-reservation ratio tail*100/actual (×100), max over covered samples where tail>actual (gauge)"
+    )]
+    pub accuracy_over_ratio_max_x100: AtomicU64,
+
+    /// (#task-resource-profile Phase-2c, Upgrade 2) COUNTER: saturating SUM of the
+    /// over-reservation ratios (`tail*100/actual`, ×100) across all counted over samples.
+    /// `sum / accuracy_over_samples` is the MEAN over-reservation an operator reads to
+    /// judge TYPICAL waste (vs the `max` gauge's worst) — the max-only-can't-distinguish
+    /// gap the cadre flagged for the under gauge, not repeated here. Saturating so the
+    /// degenerate `actual==0` (ratio up to `u64::MAX`) can never wrap the running total.
+    #[metric(
+        help = "(#task-resource-profile Phase-2c) saturating sum of over-reservation ratios tail*100/actual (×100) over counted over samples; mean = sum/accuracy_over_samples"
+    )]
+    pub accuracy_over_ratio_sum_x100: AtomicU64,
+
+    /// (#task-resource-profile Phase-2c, Upgrade 2) COUNTER: number of covered samples
+    /// that actually OVER-reserved (`tail > actual`), i.e. the denominator for the mean
+    /// over-reservation ratio and the count of how PERVASIVE over-reservation is
+    /// (contrast the single worst spike in `accuracy_over_ratio_max_x100`).
+    #[metric(
+        help = "(#task-resource-profile Phase-2c) count of covered samples that over-reserved (tail > actual); denominator for the mean over-reservation ratio"
+    )]
+    pub accuracy_over_samples: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -920,24 +972,27 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
 }
 
 /// (#task-resource-profile Phase-2c) OBSERVABILITY-ONLY: emit ONE
-/// `tag = "resource_profile_accuracy"` info-log carrying the LEAVE-ONE-OUT
-/// prediction-accuracy counters — a Phase-3 FALSIFIER (not a sufficiency gate).
-/// `accuracy_predicted_under` climbing DISPROVES safety (the profile tail
-/// under-predicted real peaks → enforce would under-reserve → do NOT enable the
-/// down-override). Its ABSENCE does not prove safety: the tail is a monotone max so
-/// the under-rate decays to 0 by construction — read `≈0` only alongside `covered ≫ 0`,
-/// a low `skipped_low_sample` ratio, and a stationarity check, and know it is silent on
-/// over-reservation waste (cadre 2026-07-15). Same DARK-on-`/metrics` rationale as
-/// [`emit_resource_profile_counters_log`] (the `SchedulerMetrics` tree is not
-/// scraped in prod), so WITHOUT this periodic emit the accuracy signal that gates
-/// Phase-3 would ITSELF be dark. MUST be `info!` (`release_max_level_info` strips
-/// lower levels). Wired into the SAME spawn-once periodic task; NEVER per-match.
-/// Reads `Relaxed`, changes no scheduling decision.
+/// `tag = "resource_profile_accuracy"` info-log carrying the TRUE DISPATCH-TIME
+/// leave-one-out prediction-accuracy counters — a Phase-3 FALSIFIER (not a
+/// sufficiency gate). `accuracy_predicted_under` climbing DISPROVES safety (the
+/// dispatch-time profile tail under-predicted real peaks → enforce would under-reserve
+/// → do NOT enable the down-override). Its ABSENCE does not prove safety: the tail is a
+/// monotone max so the under-rate decays to 0 by construction — read `≈0` only alongside
+/// `covered ≫ 0`, a low `skipped_low_sample`/`skipped_no_dispatch` ratio, and a
+/// stationarity check. The over-reservation WASTE half (silent in the under counter) is
+/// surfaced here by `accuracy_over_ratio_{max,sum}_x100` + `accuracy_over_samples`:
+/// `sum/samples` is the TYPICAL over-reservation, `max` the WORST, so an operator can
+/// judge whether injecting the tail would starve concurrency (cadre 2026-07-15). Same
+/// DARK-on-`/metrics` rationale as [`emit_resource_profile_counters_log`] (the
+/// `SchedulerMetrics` tree is not scraped in prod), so WITHOUT this periodic emit the
+/// accuracy signal that gates Phase-3 would ITSELF be dark. MUST be `info!`
+/// (`release_max_level_info` strips lower levels). Wired into the SAME spawn-once
+/// periodic task; NEVER per-match. Reads `Relaxed`, changes no scheduling decision.
 ///
 /// Dark-detector invariant an operator checks:
-/// `accuracy_predicted_covered + accuracy_predicted_under +
-///  accuracy_skipped_low_sample == profile_samples_total` (every folded sample is
-/// classified into exactly one bucket).
+/// `accuracy_predicted_covered + accuracy_predicted_under + accuracy_skipped_low_sample
+///  + accuracy_skipped_no_dispatch == profile_samples_total` (every folded sample is
+/// classified into exactly one bucket). `accuracy_over_samples` is a SUBSET of covered.
 pub fn emit_prediction_accuracy_counters_log(metrics: &SchedulerMetrics) {
     info!(
         tag = "resource_profile_accuracy",
@@ -946,10 +1001,20 @@ pub fn emit_prediction_accuracy_counters_log(metrics: &SchedulerMetrics) {
         accuracy_skipped_low_sample = metrics
             .accuracy_skipped_low_sample
             .load(Ordering::Relaxed),
+        accuracy_skipped_no_dispatch = metrics
+            .accuracy_skipped_no_dispatch
+            .load(Ordering::Relaxed),
         accuracy_under_ratio_max_x100 = metrics
             .accuracy_under_ratio_max_x100
             .load(Ordering::Relaxed),
-        "resource profile leave-one-out prediction-accuracy counters"
+        accuracy_over_ratio_max_x100 = metrics
+            .accuracy_over_ratio_max_x100
+            .load(Ordering::Relaxed),
+        accuracy_over_ratio_sum_x100 = metrics
+            .accuracy_over_ratio_sum_x100
+            .load(Ordering::Relaxed),
+        accuracy_over_samples = metrics.accuracy_over_samples.load(Ordering::Relaxed),
+        "resource profile dispatch-time leave-one-out prediction-accuracy counters"
     );
 }
 
@@ -1388,47 +1453,64 @@ fn action_declared_memory_kb(props: &PlatformProperties) -> u64 {
     }
 }
 
-/// (#task-resource-profile Phase-2c) LEAVE-ONE-OUT classification of one folded
-/// sample: did the profile-so-far's tail-aware statistic — the reservation the
-/// enforce phase (Phase-3) WOULD have stood at this action's dispatch, EXCLUDING
-/// this sample — cover the action's ACTUAL measured peak? Pure: no lock, no I/O,
-/// testable in isolation.
+/// (#task-resource-profile Phase-2c) TRUE DISPATCH-TIME leave-one-out classification
+/// of one folded sample: did the tail-aware statistic the enforce phase (Phase-3)
+/// WOULD have stood at THIS action's dispatch — stashed on the running action when it
+/// was reserved, so it excludes this action's own sample AND any same-key sample folded
+/// after dispatch — cover the action's ACTUAL measured peak? Hindsight-free (no
+/// completion-time recompute). Pure: no lock, no I/O, testable in isolation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PredictionAccuracy {
     /// `tail >= actual`: the reservation would have been a safe over-estimate.
-    Covered,
+    /// `over_ratio_x100 = Some(tail * 100 / actual)` when it strictly OVER-reserved
+    /// (`tail > actual`), the concurrency-waste half of the signal (Upgrade 2);
+    /// `None` when `tail == actual` (an exact, waste-free cover).
+    Covered { over_ratio_x100: Option<u64> },
     /// `tail < actual`: the reservation would have UNDER-reserved this action (the
     /// OOM-risk case the Phase-3 FALSIFIER watches — its firing DISPROVES safety, but its
     /// absence does not prove it; see `accuracy_predicted_under`). `ratio_x100 =
     /// actual * 100 / tail`.
     Under { ratio_x100: u64 },
-    /// `< K` prior samples (or the key's very first sample): no trustworthy
-    /// prediction existed — excluded from the accuracy ratio (same K-gate as the
-    /// inject-observe path; below K the tail is statistically meaningless).
+    /// A dispatch prediction existed but with `< K` prior samples: the tail was not yet
+    /// trustworthy — excluded from the accuracy ratio (same K-gate as the inject-observe
+    /// path; below K the tail is statistically meaningless).
     SkippedLowSample,
+    /// No dispatch-time prediction was stashed (map warming, absent baggage, or the op
+    /// never traversed the reserve path). No out-of-sample prediction existed to score —
+    /// excluded from the accuracy ratio, and counted distinctly from `SkippedLowSample`.
+    SkippedNoDispatch,
 }
 
-/// (#task-resource-profile Phase-2c) Classify a folded sample against the
-/// LEAVE-ONE-OUT (pre-fold) profile tail. `pre_fold` is
+/// (#task-resource-profile Phase-2c) Classify a folded sample against the TRUE
+/// DISPATCH-TIME leave-one-out prediction. `dispatch_prediction` is the
 /// [`ProfileMap::peek_memory_tail`](crate::resource_profile::ProfileMap::peek_memory_tail)
-/// taken BEFORE this sample is folded: `None` when the key had no prior samples,
-/// else `(tail_kb, prior_samples)`. `actual_kb` is this action's measured peak.
+/// result captured AT THIS ACTION'S DISPATCH (stashed on the running action), NOT a
+/// completion-time recompute: `None` when no profile existed at dispatch, else
+/// `(tail_kb, prior_samples)`. `actual_kb` is this action's measured peak.
 fn classify_prediction_accuracy(
-    pre_fold: Option<(u64, u64)>,
+    dispatch_prediction: Option<(u64, u64)>,
     actual_kb: u64,
 ) -> PredictionAccuracy {
-    match pre_fold {
-        // No prior profile at all → 0 < K.
-        None => PredictionAccuracy::SkippedLowSample,
-        // Profile present but below K: the tail is not yet trustworthy (a
-        // freshly-LRU-re-admitted key is low-sample; pair-a MINOR / red-team A1b),
-        // so no prediction stood — skip rather than score a spurious cover/under.
+    match dispatch_prediction {
+        // No dispatch-time prediction existed (map warming / absent baggage / raced).
+        None => PredictionAccuracy::SkippedNoDispatch,
+        // Prediction present but below K at dispatch: the tail was not yet trustworthy
+        // (pair-a MINOR / red-team A1b), so no prediction stood — skip rather than score
+        // a spurious cover/under.
         Some((_, prior_samples)) if prior_samples < PROFILE_MIN_SAMPLES => {
             PredictionAccuracy::SkippedLowSample
         }
         Some((tail_kb, _)) => {
             if tail_kb >= actual_kb {
-                PredictionAccuracy::Covered
+                // Over-reservation waste (Upgrade 2): record the ratio only when the
+                // reservation STRICTLY exceeds the actual peak. Guard `actual == 0` (a
+                // degenerate 0-memory action) with `max(1)` so the ratio stays finite.
+                let over_ratio_x100 = if tail_kb > actual_kb {
+                    Some(tail_kb.saturating_mul(100) / actual_kb.max(1))
+                } else {
+                    None
+                };
+                PredictionAccuracy::Covered { over_ratio_x100 }
             } else {
                 // tail < actual → under-reserve. Guard `tail == 0` (a degenerate
                 // ≥K all-zero-memory key): divide by at least 1 so the ratio stays
@@ -1438,6 +1520,23 @@ fn classify_prediction_accuracy(
             }
         }
     }
+}
+
+/// (#task-resource-profile) Derive the coarse profile key for an action from its
+/// routing instance + joined Bazel baggage (`origin_metadata.bazel_metadata`), or
+/// `None` when baggage is absent (no derivable key). Shared by the completion fold,
+/// the dispatch inject-observe, and the dispatch-time prediction stash so all three
+/// key IDENTICALLY (a divergence would silently mis-attribute samples).
+fn resource_profile_key(action_info: &ActionInfoWithProps) -> Option<ProfileKey> {
+    let instance_name = action_info.inner.instance_name();
+    let (target_id, action_mnemonic) = action_info
+        .origin_metadata
+        .bazel_metadata
+        .as_ref()
+        .map_or(("", ""), |m| {
+            (m.target_id.as_str(), m.action_mnemonic.as_str())
+        });
+    ProfileKey::from_parts(instance_name, target_id, action_mnemonic)
 }
 
 fn decision_trace_min_props(props: &PlatformProperties) -> String {
@@ -4019,6 +4118,10 @@ impl ApiWorkerSchedulerImpl {
             PendingActionInfoData {
                 action_info: action_info.clone(),
                 exec_start_time,
+                // (#task-resource-profile Phase-2c) stamped just after reservation by
+                // `find_and_reserve_worker` once the dispatch-time profile tail is
+                // peeked; `None` here is the pre-stamp default (map warming / no key).
+                dispatch_memory_prediction: None,
             },
         );
         // (#specprefetch-rebind) MEASUREMENT-ONLY prewarm-landing read: if this op
@@ -5503,6 +5606,29 @@ impl ApiWorkerScheduler {
             .map(|pending_action_info| pending_action_info.action_info.clone())
     }
 
+    /// (#task-resource-profile Phase-2c) Like [`Self::running_action_info`] but ALSO
+    /// returns the dispatch-time memory prediction stashed on the running action at
+    /// reservation, so the completion fold can do a hindsight-free leave-one-out check.
+    /// One read-lock acquisition (`peek`, non-recency-bumping) fetches both. `None` when
+    /// the op is no longer running (completion/cancel raced the usage report).
+    async fn running_action_info_and_dispatch_prediction(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+    ) -> Option<(ActionInfoWithProps, Option<(u64, u64)>)> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .peek(worker_id)
+            .and_then(|worker| worker.running_action_infos.get(operation_id))
+            .map(|pending| {
+                (
+                    pending.action_info.clone(),
+                    pending.dispatch_memory_prediction,
+                )
+            })
+    }
+
     /// (#task-resource-profile Phase-2a) OBSERVE-ONLY fold of one completed
     /// action's worker-reported resource usage into the bounded, instance-scoped
     /// profile map. Runs on the COMPLETION path (per finished action), NOT in
@@ -5515,6 +5641,12 @@ impl ApiWorkerScheduler {
         &self,
         action_info: &ActionInfoWithProps,
         usage: &ActionResourceUsage,
+        // (#task-resource-profile Phase-2c) The TRUE dispatch-time leave-one-out
+        // prediction stashed on this action's running-action record when it was
+        // reserved (`Some((tail_kb, prior_samples))`), or `None` when no profile
+        // existed at dispatch. Classified against the actual peak WITHOUT any
+        // completion-time recompute → hindsight-free.
+        dispatch_prediction: Option<(u64, u64)>,
     ) {
         // Gate on `sampled`: an unsampled report carries no real measurement, and
         // folding its (typically 0) memory would poison the variance signal — a
@@ -5529,19 +5661,10 @@ impl ApiWorkerScheduler {
             return;
         }
 
-        let instance_name = action_info.inner.instance_name();
         // target_id + action_mnemonic come from the joined Bazel baggage
         // (`origin_metadata.bazel_metadata`, parsed at cache_lookup and joined
-        // onto the running action). Absent baggage → empty parts → skip.
-        let (target_id, action_mnemonic) = action_info
-            .origin_metadata
-            .bazel_metadata
-            .as_ref()
-            .map_or(("", ""), |m| {
-                (m.target_id.as_str(), m.action_mnemonic.as_str())
-            });
-
-        let Some(key) = ProfileKey::from_parts(instance_name, target_id, action_mnemonic) else {
+        // onto the running action). Absent baggage → no key → skip.
+        let Some(key) = resource_profile_key(action_info) else {
             // No derivable key (baggage absent) — count + skip so a dark
             // (never-recording) feature is visible against profile_samples_total.
             self.metrics
@@ -5560,34 +5683,48 @@ impl ApiWorkerScheduler {
                 .saturating_add(usage.net_output_bytes),
         };
 
-        // (#task-resource-profile Phase-2c) LEAVE-ONE-OUT prediction-accuracy check —
-        // a FALSIFIER, not a safety proof (see the counter docs). Read the profile-so-far
-        // tail (`peek_memory_tail`) BEFORE folding this sample and classify whether it
-        // covered the action's ACTUAL measured peak. NOTE this is a COMPLETION-time
-        // recompute, NOT the dispatch-time reservation: the tail is read now (at
-        // completion) and is a monotone max, so it includes same-key samples that folded
-        // in BETWEEN this action's dispatch and completion → it is >= the tail that
-        // actually stood at dispatch → the check is HINDSIGHT-optimistic (under-counts the
-        // unders enforce would truly have suffered). Read + fold under ONE lock so no
-        // interleaving fold perturbs the leave-one-out tail; `peek` never bumps LRU
-        // recency. OBSERVE-ONLY: changes no fold/reservation.
+        // (#task-resource-profile Phase-2c) TRUE DISPATCH-TIME leave-one-out
+        // prediction-accuracy — a FALSIFIER, not a safety proof (see the counter docs).
+        // Classify the action's ACTUAL peak against the tail that stood AT DISPATCH
+        // (`dispatch_prediction`, stashed on the running action when it was reserved),
+        // NOT a completion-time recompute — so same-key samples that folded in after
+        // dispatch can never inflate it (the cadre's hindsight bias, now removed).
+        // Classification is independent of the map, so it needs no lock. OBSERVE-ONLY.
         let actual_kb = usage.peak_memory_kb;
-        let (outcome, accuracy) = {
-            // Sync critical section: O(1) peek + O(1) fold, no `.await` held.
-            let mut map = self.resource_profile_map.lock();
-            let accuracy = classify_prediction_accuracy(map.peek_memory_tail(&key), actual_kb);
-            let outcome = map.record(key, sample);
-            (outcome, accuracy)
-        };
+        let accuracy = classify_prediction_accuracy(dispatch_prediction, actual_kb);
+        // Aggregation fold is unchanged (bounded LRU record under its own lock); the
+        // accuracy classification above does NOT read the map, so no peek is needed.
+        let outcome = self.resource_profile_map.lock().record(key, sample);
 
         // Attribute the leave-one-out result. Exactly ONE counter advances per folded
-        // sample, so `covered + under + skipped_low_sample == profile_samples_total`
-        // (the dark-detector invariant the periodic accuracy emit surfaces).
+        // sample, so `covered + under + skipped_low_sample + skipped_no_dispatch ==
+        // profile_samples_total` (the dark-detector invariant the periodic accuracy
+        // emit surfaces); `accuracy_over_samples` is a SUBSET of covered.
         match accuracy {
-            PredictionAccuracy::Covered => {
+            PredictionAccuracy::Covered { over_ratio_x100 } => {
                 self.metrics
                     .accuracy_predicted_covered
                     .fetch_add(1, Ordering::Relaxed);
+                // (Upgrade 2) Over-reservation waste: when the dispatch tail STRICTLY
+                // exceeds the actual peak, record max + saturating-sum + count so an
+                // operator reads TYPICAL (sum/count) vs WORST (max) — a max-only gauge
+                // cannot tell a rare-severe outlier from pervasive waste.
+                if let Some(over) = over_ratio_x100 {
+                    self.metrics
+                        .accuracy_over_ratio_max_x100
+                        .fetch_max(over, Ordering::Relaxed);
+                    // Saturating so a degenerate actual==0 (over up to u64::MAX) can
+                    // never wrap the running total. Telemetry — the fetch_update loop
+                    // runs once per over-sample on the completion path.
+                    let _ = self.metrics.accuracy_over_ratio_sum_x100.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |s| Some(s.saturating_add(over)),
+                    );
+                    self.metrics
+                        .accuracy_over_samples
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             PredictionAccuracy::Under { ratio_x100 } => {
                 self.metrics
@@ -5602,6 +5739,11 @@ impl ApiWorkerScheduler {
             PredictionAccuracy::SkippedLowSample => {
                 self.metrics
                     .accuracy_skipped_low_sample
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PredictionAccuracy::SkippedNoDispatch => {
+                self.metrics
+                    .accuracy_skipped_no_dispatch
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -5651,19 +5793,12 @@ impl ApiWorkerScheduler {
             .fetch_add(1, Ordering::Relaxed);
 
         // Derive the SAME (instance, target, mnemonic) key the completion-path fold
-        // keys on (instance + joined Bazel baggage). Absent baggage → no key → no
-        // usable profile. STEP-0 (design §3): this key is fully computable at
-        // dispatch time from the `ActionInfoWithProps` already in hand — no Command
-        // CAS fetch — because Phase-2a keys on baggage, not `output_set_hash`.
-        let instance_name = action_info.inner.instance_name();
-        let (target_id, action_mnemonic) = action_info
-            .origin_metadata
-            .bazel_metadata
-            .as_ref()
-            .map_or(("", ""), |m| {
-                (m.target_id.as_str(), m.action_mnemonic.as_str())
-            });
-        let Some(key) = ProfileKey::from_parts(instance_name, target_id, action_mnemonic) else {
+        // keys on (instance + joined Bazel baggage) via the shared `resource_profile_key`.
+        // Absent baggage → no key → no usable profile. STEP-0 (design §3): this key is
+        // fully computable at dispatch time from the `ActionInfoWithProps` already in
+        // hand — no Command CAS fetch — because Phase-2a keys on baggage, not
+        // `output_set_hash`.
+        let Some(key) = resource_profile_key(action_info) else {
             self.metrics
                 .inject_observe_skipped_no_profile
                 .fetch_add(1, Ordering::Relaxed);
@@ -6113,6 +6248,33 @@ impl ApiWorkerScheduler {
         self.metrics
             .find_worker_time_ns
             .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        // (#task-resource-profile Phase-2c) TRUE dispatch-time leave-one-out: stash the
+        // tail-aware memory reservation the enforce phase WOULD have stood RIGHT NOW —
+        // peeked (non-recency-bumping) from the profile-so-far, before this action's own
+        // sample folds at completion — onto the reserved running action, so the
+        // completion path can classify actual-vs-DISPATCH tail with NO hindsight.
+        // Runs only when a worker was reserved. Done while the `inner` write lock is
+        // still held: `workers.peek_mut` is NON-PROMOTING (no worker-LRU perturbation),
+        // and the running-action entry auto-cleans the stash on EVERY terminal path
+        // (complete_action / inner_unreserve_worker / immediate_evict_worker /
+        // remove_worker) — no side map, no leak. Lock order inner→resource_profile_map
+        // is ACYCLIC (the completion fold + inject-observe take resource_profile_map
+        // WITHOUT holding inner). OBSERVE-ONLY: no reservation/gate/dispatch change.
+        if let Some((reserved_worker_id, _, _)) = result.as_ref() {
+            if let Some(key) = resource_profile_key(action_info) {
+                let dispatch_prediction = self.resource_profile_map.lock().peek_memory_tail(&key);
+                if dispatch_prediction.is_some() {
+                    if let Some(worker) = inner.workers.peek_mut(reserved_worker_id) {
+                        if let Some(pending) =
+                            worker.running_action_infos.get_mut(operation_id)
+                        {
+                            pending.dispatch_memory_prediction = dispatch_prediction;
+                        }
+                    }
+                }
+            }
+        }
 
         // Drop the write lock before spawning prefetch.
         drop(inner);
@@ -9432,6 +9594,7 @@ impl ApiWorkerScheduler {
                 PendingActionInfoData {
                     action_info: action,
                     exec_start_time: None,
+                    dispatch_memory_prediction: None,
                 },
             );
         }
@@ -9526,6 +9689,26 @@ impl ApiWorkerScheduler {
         self.resource_profile_map.lock().record(key, sample);
     }
 
+    /// (#task-resource-profile Phase-2c) Test-only: the dispatch-time memory prediction
+    /// stashed on a running action, distinguishing THREE states so a test can prove both
+    /// the stash and the auto-cleanup: `None` = the op is NOT in `running_action_infos`
+    /// (proves the stash was dropped with the entry on a terminal path — no leak);
+    /// `Some(None)` = the entry exists but no prediction was stashed (map was empty at
+    /// dispatch); `Some(Some((tail, samples)))` = the entry exists with the stashed
+    /// dispatch prediction.
+    async fn running_action_dispatch_prediction(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+    ) -> Option<Option<(u64, u64)>> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .peek(worker_id)
+            .and_then(|worker| worker.running_action_infos.get(operation_id))
+            .map(|pending| pending.dispatch_memory_prediction)
+    }
+
     /// (#task-resource-profile Phase-2b) Test-only: a worker's CURRENT `Minimum`
     /// value for `prop` (e.g. `memory_kb`) — its remaining capacity after any
     /// reservation was `reduce_platform_properties`-decremented. Proves the
@@ -9559,9 +9742,15 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // None). The join is hoisted above the guard because the origin-event
         // build (formerly the sole owner of the lookup) is skipped in prod, and
         // the fold needs the joined `origin_metadata.bazel_metadata` for the key.
-        let maybe_action_info = self.running_action_info(worker_id, operation_id).await;
-        match maybe_action_info.as_ref() {
-            Some(action_info) => self.fold_resource_profile(action_info, &resource_usage),
+        // (#task-resource-profile Phase-2c) also fetch the dispatch-time prediction
+        // stashed on the running action so the fold's accuracy check is hindsight-free.
+        let maybe = self
+            .running_action_info_and_dispatch_prediction(worker_id, operation_id)
+            .await;
+        match maybe.as_ref() {
+            Some((action_info, dispatch_prediction)) => {
+                self.fold_resource_profile(action_info, &resource_usage, *dispatch_prediction);
+            }
             // The op was already gone from `running_action_infos` (completion /
             // cancellation raced this usage report). Count it so the dark-detector
             // invariant holds: samples_total + skipped_empty_key +
@@ -9582,7 +9771,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
         let Some(origin_event_tx) = self.maybe_origin_event_tx.as_ref() else {
             return Ok(());
         };
-        let Some(action_info) = maybe_action_info else {
+        let Some((action_info, _dispatch_prediction)) = maybe else {
             return Ok(());
         };
 
@@ -10717,6 +10906,7 @@ mod tests {
                 PendingActionInfoData {
                     action_info: action,
                     exec_start_time: None,
+                    dispatch_memory_prediction: None,
                 },
             );
         }
@@ -16630,13 +16820,16 @@ mod b1_lock_decouple_tests {
         );
     }
 
-    // ── (#task-resource-profile Phase-2c) LEAVE-ONE-OUT prediction-accuracy ──
+    // ── (#task-resource-profile Phase-2c) DISPATCH-TIME leave-one-out accuracy ──
     //
     // These drive `fold_resource_profile` directly (the completion-path fold) with a
-    // memory-only usage sample, pre-seeding the profile via `resource_profile_record_sample`
-    // (which folds into the map WITHOUT running the accuracy check, so it stands in for
-    // "the profile as it was before this action ran"). The accuracy check reads the tail
-    // BEFORE the fold mutates the Agg (leave-one-out) and classifies covered/under/skip.
+    // memory-only usage sample AND an explicit `dispatch_prediction` — the tail that
+    // stood at THIS action's dispatch (stashed on the running action at reservation).
+    // The accuracy check classifies the actual peak against THAT dispatch prediction,
+    // NOT the map's current (completion-time) tail — proving the classification is
+    // hindsight-free. The production-composition wiring (reserve stashes → completion
+    // reads) is covered by `accuracy_dispatch_time_not_hindsight` +
+    // `dispatch_prediction_stashed_and_cleaned_on_terminal_paths` below.
 
     /// A memory-only `sampled=true` usage report (all other dims 0) for the fold.
     fn usage_mem(
@@ -16650,10 +16843,11 @@ mod b1_lock_decouple_tests {
         }
     }
 
-    /// (a) LEAVE-ONE-OUT tail >= actual → `accuracy_predicted_covered` (safe
-    /// over-estimate), NOT `accuracy_predicted_under`. Pre-seed ≥K samples at
-    /// 50_000 KiB → tail 2^16 = 65_536; fold an action whose ACTUAL peak (40_000)
-    /// is covered by that tail.
+    /// (a) DISPATCH-TIME tail >= actual → `accuracy_predicted_covered` (safe
+    /// over-estimate), NOT `accuracy_predicted_under`. The dispatch prediction is
+    /// passed EXPLICITLY (`Some((65536, 20))` — tail 65_536, 20 prior samples ≥ K),
+    /// proving the classification is independent of the map's current tail. An EXACT
+    /// cover (`tail == actual == 65_536`) records NO over-reservation waste.
     ///
     /// MUTATION: comment out the `accuracy_predicted_covered.fetch_add` in
     /// `fold_resource_profile` → covered stays 0 → this red-fails with the bespoke
@@ -16663,21 +16857,17 @@ mod b1_lock_decouple_tests {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
 
-        // Pre-seed a reliable (≥K) profile: tail = 2^16 = 65_536.
-        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
-            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
-        }
-
         let action = action_with_memory_and_baggage("W", 0xe1, 4096.0);
-        // ACTUAL peak 40_000 < tail 65_536 → the tail COVERED this action.
-        scheduler.fold_resource_profile(&action, &usage_mem(40_000));
+        // ACTUAL peak 65_536 == dispatch tail 65_536 → an EXACT (waste-free) cover.
+        scheduler.fold_resource_profile(&action, &usage_mem(65_536), Some((65_536, 20)));
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
-        let skipped = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_low = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_nd = scheduler.metrics.accuracy_skipped_no_dispatch.load(Ordering::Relaxed);
         assert_eq!(
             covered, 1,
-            "leave-one-out tail (65536) >= actual peak (40000) → must count \
+            "dispatch tail (65536) >= actual peak (65536) → must count \
              accuracy_predicted_covered (safe over-estimate), got {covered}"
         );
         assert_eq!(
@@ -16685,28 +16875,29 @@ mod b1_lock_decouple_tests {
             "a covered prediction must NOT count accuracy_predicted_under, got {under}"
         );
         assert_eq!(
-            skipped, 0,
-            "a ≥K profile is not a low-sample skip, got {skipped}"
+            skipped_low + skipped_nd, 0,
+            "a ≥K dispatch prediction is neither a low-sample nor a no-dispatch skip, \
+             got low={skipped_low} no_dispatch={skipped_nd}"
         );
         assert_eq!(
-            scheduler.metrics.accuracy_under_ratio_max_x100.load(Ordering::Relaxed),
+            scheduler.metrics.accuracy_over_samples.load(Ordering::Relaxed),
             0,
-            "no under-prediction fired → the residual ratio gauge must stay 0"
+            "an EXACT cover (tail == actual) is not over-reservation → accuracy_over_samples \
+             must stay 0"
         );
-        // Dark-detector invariant: covered + under + skipped_low_sample ==
-        // profile_samples_total (only the ONE fold counts; the pre-seed used
-        // record_sample, which bypasses fold's total).
+        // Dark-detector invariant: covered + under + skipped_low + skipped_no_dispatch ==
+        // profile_samples_total (only the ONE fold counts).
         assert_eq!(
-            covered + under + skipped,
+            covered + under + skipped_low + skipped_nd,
             scheduler.metrics.profile_samples_total.load(Ordering::Relaxed),
-            "dark-detector invariant: the three accuracy counters must sum to \
+            "dark-detector invariant: the four accuracy counters must sum to \
              profile_samples_total (every folded sample classified exactly once)"
         );
     }
 
-    /// (b) LEAVE-ONE-OUT tail < actual → `accuracy_predicted_under` (the OOM-risk
-    /// case the Phase-3 gate watches) WITH the residual ratio recorded. Pre-seed ≥K
-    /// at 50_000 KiB → tail 65_536; fold an ACTUAL peak of 131_072 (= 2× tail) →
+    /// (b) DISPATCH-TIME tail < actual → `accuracy_predicted_under` (the OOM-risk
+    /// case the Phase-3 FALSIFIER watches) WITH the residual ratio recorded. Dispatch
+    /// prediction `Some((65536, 20))`; ACTUAL peak 131_072 (= 2× tail) →
     /// under-prediction ratio = 131072*100/65536 = 200.
     ///
     /// MUTATION A (counter): comment out `accuracy_predicted_under.fetch_add` →
@@ -16718,20 +16909,17 @@ mod b1_lock_decouple_tests {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
 
-        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
-            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
-        }
-
         let action = action_with_memory_and_baggage("W", 0xe2, 4096.0);
-        // ACTUAL peak 131_072 > tail 65_536 → the tail UNDER-predicted this action.
-        scheduler.fold_resource_profile(&action, &usage_mem(131_072));
+        // ACTUAL peak 131_072 > dispatch tail 65_536 → the tail UNDER-predicted.
+        scheduler.fold_resource_profile(&action, &usage_mem(131_072), Some((65_536, 20)));
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
-        let skipped = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_low = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_nd = scheduler.metrics.accuracy_skipped_no_dispatch.load(Ordering::Relaxed);
         assert_eq!(
             under, 1,
-            "leave-one-out tail (65536) < actual peak (131072) → must count \
+            "dispatch tail (65536) < actual peak (131072) → must count \
              accuracy_predicted_under (enforce would under-reserve → OOM risk), got {under}"
         );
         assert_eq!(
@@ -16739,8 +16927,8 @@ mod b1_lock_decouple_tests {
             "an under-prediction must NOT count accuracy_predicted_covered, got {covered}"
         );
         assert_eq!(
-            skipped, 0,
-            "a ≥K profile is not a low-sample skip, got {skipped}"
+            skipped_low + skipped_nd, 0,
+            "a ≥K dispatch prediction is not a skip, got low={skipped_low} no_dispatch={skipped_nd}"
         );
         assert_eq!(
             scheduler.metrics.accuracy_under_ratio_max_x100.load(Ordering::Relaxed),
@@ -16749,47 +16937,44 @@ mod b1_lock_decouple_tests {
              must be recorded as 200 (×100) in the max-ratio gauge"
         );
         assert_eq!(
-            covered + under + skipped,
+            covered + under + skipped_low + skipped_nd,
             scheduler.metrics.profile_samples_total.load(Ordering::Relaxed),
-            "dark-detector invariant: the three accuracy counters must sum to \
+            "dark-detector invariant: the four accuracy counters must sum to \
              profile_samples_total"
         );
     }
 
-    /// (c) `< K` leave-one-out samples → `accuracy_skipped_low_sample`, never
-    /// covered/under, even when the tail WOULD under-predict — below K no
-    /// trustworthy prediction existed. Two folds on a FRESH map:
-    ///   fold 1: no prior samples (None) → skipped_low_sample.
-    ///   fold 2: 1 prior sample present (tail 1024 < actual 200_000 → would be an
-    ///           UNDER), but 1 < K=20 → the K-gate suppresses scoring it → skipped.
+    /// (c) A dispatch prediction with `< K` prior samples → `accuracy_skipped_low_sample`,
+    /// never covered/under, even when the tail WOULD under-predict — below K no
+    /// trustworthy prediction existed. Dispatch prediction `Some((1024, 1))` (tail 1024,
+    /// 1 prior sample < K=20); actual 200_000 (tail 1024 < 200_000 → WOULD under) is
+    /// suppressed by the K-gate.
     ///
     /// MUTATION: comment out the `prior_samples < PROFILE_MIN_SAMPLES` guard in
-    /// `classify_prediction_accuracy` → fold 2's would-under is scored → under
-    /// becomes 1 and skipped becomes 1 → this red-fails.
+    /// `classify_prediction_accuracy` → the would-under is scored → under becomes 1
+    /// and skipped_low becomes 0 → this red-fails.
     #[nativelink_test]
     async fn accuracy_low_sample_is_skipped_not_scored() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
         let action = action_with_memory_and_baggage("W", 0xe3, 4096.0);
 
-        // Fold 1: fresh key, no prior profile → skipped_low_sample.
-        // Seeds a small tail (1000 KiB → bucket 10 → tail 1024).
-        scheduler.fold_resource_profile(&action, &usage_mem(1000));
-        // Fold 2: 1 prior sample (< K). Tail 1024 < actual 200_000 → WOULD under,
-        // but the K-gate suppresses it → skipped_low_sample.
-        scheduler.fold_resource_profile(&action, &usage_mem(200_000));
+        // Dispatch prediction present but with only 1 prior sample (< K). Tail 1024 <
+        // actual 200_000 → WOULD under, but the K-gate suppresses it → skipped_low_sample.
+        scheduler.fold_resource_profile(&action, &usage_mem(200_000), Some((1024, 1)));
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
-        let skipped = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_low = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_nd = scheduler.metrics.accuracy_skipped_no_dispatch.load(Ordering::Relaxed);
         assert_eq!(
-            skipped, 2,
-            "both folds have < K leave-one-out samples (fold 1 none, fold 2 one) → \
-             both must count accuracy_skipped_low_sample, got {skipped}"
+            skipped_low, 1,
+            "a dispatch prediction with < K prior samples → accuracy_skipped_low_sample, \
+             got {skipped_low}"
         );
         assert_eq!(
             under, 0,
-            "the K-gate must suppress fold 2's would-be under-prediction (tail 1024 \
+            "the K-gate must suppress the would-be under-prediction (tail 1024 \
              < actual 200000) → accuracy_predicted_under must stay 0, got {under}"
         );
         assert_eq!(
@@ -16797,27 +16982,116 @@ mod b1_lock_decouple_tests {
             "no ≥K prediction existed → accuracy_predicted_covered must stay 0, got {covered}"
         );
         assert_eq!(
-            scheduler.metrics.accuracy_under_ratio_max_x100.load(Ordering::Relaxed),
-            0,
-            "no under scored → residual ratio gauge stays 0"
+            skipped_nd, 0,
+            "a prediction WAS stashed (Some) → this is a low-sample skip, NOT a \
+             no-dispatch skip, got {skipped_nd}"
         );
         assert_eq!(
-            covered + under + skipped,
+            covered + under + skipped_low + skipped_nd,
             scheduler.metrics.profile_samples_total.load(Ordering::Relaxed),
-            "dark-detector invariant: the three accuracy counters must sum to \
-             profile_samples_total (both folds classified)"
+            "dark-detector invariant: the four accuracy counters must sum to \
+             profile_samples_total"
         );
     }
 
-    /// (d) OBSERVE-ONLY: the leave-one-out accuracy check perturbs NOTHING. Drive a
-    /// mixed sample sequence through the REAL fold path (which runs the accuracy
-    /// check) and through a reference `ProfileMap` with NO accuracy code; the
-    /// resident memory aggregation (p50/p95/tail/count) must be byte-identical. Also
-    /// asserts the fold path reserves nothing (it only aggregates).
+    /// (c2) NO dispatch prediction (`None`) → `accuracy_skipped_no_dispatch`, distinct
+    /// from the `< K` low-sample skip. This is the map-warming / absent-baggage /
+    /// raced-reserve case: no out-of-sample prediction existed to score.
     ///
-    /// MUTATION: add a second `map.record(key, sample)` inside the accuracy block of
-    /// `fold_resource_profile` (double-fold) → the real map's sample_count/tail
-    /// diverge from the reference → this red-fails.
+    /// MUTATION: comment out the `accuracy_skipped_no_dispatch.fetch_add` arm in
+    /// `fold_resource_profile` → skipped_no_dispatch stays 0 → this red-fails.
+    #[nativelink_test]
+    async fn accuracy_no_dispatch_prediction_is_skipped() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let action = action_with_memory_and_baggage("W", 0xe5, 4096.0);
+
+        // No dispatch prediction was stashed (None) — nothing to score.
+        scheduler.fold_resource_profile(&action, &usage_mem(200_000), None);
+
+        let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
+        let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
+        let skipped_low = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_nd = scheduler.metrics.accuracy_skipped_no_dispatch.load(Ordering::Relaxed);
+        assert_eq!(
+            skipped_nd, 1,
+            "a fold with no dispatch prediction (None) → accuracy_skipped_no_dispatch, \
+             got {skipped_nd}"
+        );
+        assert_eq!(
+            skipped_low, 0,
+            "no prediction was stashed → NOT a low-sample skip, got {skipped_low}"
+        );
+        assert_eq!(
+            covered + under, 0,
+            "no prediction existed → neither covered nor under, got covered={covered} \
+             under={under}"
+        );
+        assert_eq!(
+            covered + under + skipped_low + skipped_nd,
+            scheduler.metrics.profile_samples_total.load(Ordering::Relaxed),
+            "dark-detector invariant: the four accuracy counters must sum to \
+             profile_samples_total"
+        );
+    }
+
+    /// (Upgrade 2) When the dispatch tail STRICTLY over-reserves (`tail > actual`) the
+    /// covered sample ALSO records the over-reservation waste signal: max ratio, a
+    /// saturating sum, and a count (so an operator reads TYPICAL = sum/count vs WORST =
+    /// max). Dispatch `Some((65536, 20))`, actual 16_384 → over ratio =
+    /// 65536*100/16384 = 400.
+    ///
+    /// MUTATION A: comment out `accuracy_over_ratio_max_x100.fetch_max` → max stays 0.
+    /// MUTATION B: comment out the `accuracy_over_ratio_sum_x100.fetch_update` → sum 0.
+    /// MUTATION C: comment out `accuracy_over_samples.fetch_add` → count stays 0.
+    #[nativelink_test]
+    async fn accuracy_over_reservation_ratio_recorded() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let action = action_with_memory_and_baggage("W", 0xe6, 4096.0);
+
+        // Dispatch tail 65_536 STRICTLY exceeds actual 16_384 → covered + over-reserved.
+        scheduler.fold_resource_profile(&action, &usage_mem(16_384), Some((65_536, 20)));
+
+        assert_eq!(
+            scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed),
+            1,
+            "tail 65536 >= actual 16384 → covered"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed),
+            0,
+            "an over-reserved cover is not an under"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_over_samples.load(Ordering::Relaxed),
+            1,
+            "tail (65536) STRICTLY exceeds actual (16384) → one over-reservation sample \
+             must be counted (accuracy_over_samples)"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_over_ratio_max_x100.load(Ordering::Relaxed),
+            400,
+            "the over-reservation ratio (tail*100/actual = 65536*100/16384) must be \
+             recorded as 400 (×100) in the max gauge"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_over_ratio_sum_x100.load(Ordering::Relaxed),
+            400,
+            "the single over sample's ratio (400) must be added to the saturating sum \
+             (sum/samples = mean over-reservation)"
+        );
+    }
+
+    /// (d) OBSERVE-ONLY: the dispatch-time accuracy check perturbs NOTHING. Drive a
+    /// mixed sample sequence through the REAL fold path (which runs the accuracy
+    /// check with a varying dispatch prediction) and through a reference `ProfileMap`
+    /// with NO accuracy code; the resident memory aggregation (p50/p95/tail/count) must
+    /// be byte-identical. Also asserts the fold path reserves nothing (it only aggregates).
+    ///
+    /// MUTATION: add a second `map.record(key, sample)` inside `fold_resource_profile`
+    /// (double-fold) → the real map's sample_count/tail diverge from the reference →
+    /// this red-fails.
     #[nativelink_test]
     async fn accuracy_check_is_observe_only_aggregation_identical() {
         use crate::resource_profile::ProfileMap;
@@ -16835,7 +17109,9 @@ mod b1_lock_decouple_tests {
             777, 33_333, 262_144, 100, 50_000,
         ];
         for &kb in &samples {
-            scheduler.fold_resource_profile(&action, &usage_mem(kb));
+            // A varying dispatch prediction exercises the covered/under/over/skip arms;
+            // NONE of them may perturb the aggregation the reference computes.
+            scheduler.fold_resource_profile(&action, &usage_mem(kb), Some((65_536, 20)));
             reference.record(observe_key(), mem_only_sample(kb));
         }
 
@@ -16862,6 +17138,191 @@ mod b1_lock_decouple_tests {
             Some(samples.len() as u64),
             "the fold path must record exactly one sample per call (accuracy check \
              adds no extra fold)"
+        );
+    }
+
+    /// (Upgrade 1, PRODUCTION-COMPOSITION) The accuracy classification uses the
+    /// DISPATCH-time tail, NOT a completion-time recompute — the hindsight bias the
+    /// cadre flagged is removed. Reserve an action when the profile tail is 65_536
+    /// (stashed on the running action); then fold MANY same-key samples that raise the
+    /// COMPLETION-time map tail to 262_144 (well ABOVE the action's actual peak); then
+    /// report the actual peak 131_072 on completion. The dispatch tail (65_536) <
+    /// 131_072 → UNDER. If the metric wrongly used the completion tail (262_144 >=
+    /// 131_072) it would read COVERED — the exact hindsight bug this fix kills.
+    ///
+    /// MUTATION: comment out `pending.dispatch_memory_prediction = dispatch_prediction`
+    /// in `find_and_reserve_worker` → completion reads `None` → SkippedNoDispatch →
+    /// `accuracy_predicted_under` stays 0 → this red-fails.
+    #[nativelink_test]
+    async fn accuracy_dispatch_time_not_hindsight() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+
+        // Pre-seed a reliable (≥K) profile: dispatch tail = 2^16 = 65_536, 20 samples.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xf1, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        // The dispatch-time prediction (tail 65_536, 20 samples) was stashed on the
+        // running action.
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
+                .await,
+            Some(Some((65_536, 20))),
+            "the dispatch-time tail (65536, 20 samples) must be stashed on the reserved \
+             running action for the out-of-sample check"
+        );
+        // The stash changed NO reservation: worker W (500_000) reserved the DECLARED
+        // 4096 → 495_904 remaining, never the tail.
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(495_904.0),
+            "OBSERVE-ONLY: stashing the dispatch prediction must not change the reservation \
+             (remaining reflects declared 4096, not the tail)"
+        );
+
+        // MORE same-key actions complete, raising the COMPLETION-time map tail to
+        // 262_144 (200_000 KiB → bucket 18 → tail 2^18) — far above the action's peak.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(200_000));
+        }
+        assert_eq!(
+            scheduler
+                .resource_profile_peek_tail(&observe_key())
+                .map(|(t, _)| t),
+            Some(262_144),
+            "the completion-time map tail must now be 262144 (> the action's 131072 peak) \
+             — a hindsight recompute would read COVERED"
+        );
+
+        // The worker reports the action's ACTUAL peak (131_072) on completion.
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 131_072,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record_action_resource_usage must return Ok");
+
+        let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
+        let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
+        assert_eq!(
+            under, 1,
+            "classified against the DISPATCH tail (65536 < 131072) → UNDER. A completion-time \
+             hindsight recompute (262144 >= 131072) would wrongly read COVERED. got under={under}"
+        );
+        assert_eq!(
+            covered, 0,
+            "the dispatch-time tail under-predicted → NOT covered (a covered reading would be \
+             the hindsight bug), got covered={covered}"
+        );
+    }
+
+    /// (Upgrade 1, no-leak) The dispatch prediction lives IN the running-action record,
+    /// so it is auto-cleaned on every terminal path with NO bespoke cleanup — no side
+    /// map, no leak. Proves removal on CANCELLATION (`unreserve_worker` →
+    /// `inner_unreserve_worker`) and on EVICTION/DISCONNECT (`remove_worker` →
+    /// `immediate_evict_worker` drain). Completion (`complete_action`) removes the SAME
+    /// `running_action_infos` entry via `HashMap::remove`, so it is covered by the same
+    /// mechanism.
+    ///
+    /// MUTATION: comment out the `running_action_infos.remove` in `inner_unreserve_worker`
+    /// → the cancellation assertion (`== None`) red-fails (the entry, and its stashed
+    /// prediction, would leak).
+    #[nativelink_test]
+    async fn dispatch_prediction_stashed_and_cleaned_on_terminal_paths() {
+        let wsm = BarrierWorkerStateManager::new();
+        let release = wsm.release.clone();
+        let entered = wsm.entered.clone();
+        let scheduler = build_scheduler(wsm);
+        let _rx1 = add_worker_with_memory(&scheduler, "W1", 100_000.0).await;
+        let _rx2 = add_worker_with_memory(&scheduler, "W2", 100_000.0).await;
+
+        // A ≥K profile so a Some prediction is stashed on every reserve.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        // ── CANCELLATION (unreserve) ──
+        let op_cancel = OperationId::default();
+        let action1 = action_with_memory_and_baggage("W1", 0xf2, 4096.0);
+        let (reserved1, _tx1, _msg1) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W1", 4096.0), &op_cancel, &action1, false)
+            .await
+            .expect("op must reserve W1");
+        assert_eq!(reserved1, WorkerId("W1".to_string()));
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W1".to_string()), &op_cancel)
+                .await,
+            Some(Some((65_536, 20))),
+            "reserve must stash the dispatch prediction on W1's running action"
+        );
+        scheduler
+            .unreserve_worker(&WorkerId("W1".to_string()), &op_cancel)
+            .await;
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W1".to_string()), &op_cancel)
+                .await,
+            None,
+            "after cancellation (unreserve) the running-action entry — and its stashed \
+             prediction — must be GONE (no side-map leak)"
+        );
+
+        // ── EVICTION / DISCONNECT (remove_worker drains running_action_infos) ──
+        let op_evict = OperationId::default();
+        let action2 = action_with_memory_and_baggage("W2", 0xf3, 4096.0);
+        let (reserved2, _tx2, _msg2) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W2", 4096.0), &op_evict, &action2, false)
+            .await
+            .expect("op must reserve W2");
+        assert_eq!(reserved2, WorkerId("W2".to_string()));
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W2".to_string()), &op_evict)
+                .await,
+            Some(Some((65_536, 20))),
+            "reserve must stash the dispatch prediction on W2's running action"
+        );
+        // remove_worker → immediate_evict_worker drains the op and re-queues it through
+        // the (barrier-parking) state manager; spawn it and release the barrier.
+        let sched_evict = scheduler.clone();
+        let evict = tokio::spawn(async move {
+            sched_evict
+                .remove_worker(&WorkerId("W2".to_string()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("remove_worker must enter the state-manager update for the drained op");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), evict)
+            .await
+            .expect("remove_worker task must finish after release")
+            .expect("remove_worker join")
+            .expect("remove_worker must return Ok");
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W2".to_string()), &op_evict)
+                .await,
+            None,
+            "after eviction/disconnect (remove_worker drain) the running-action entry — \
+             and its stashed prediction — must be GONE (no side-map leak)"
         );
     }
 
@@ -17544,6 +18005,7 @@ mod b1_lock_decouple_tests {
                     PendingActionInfoData {
                         action_info: pool_action(),
                         exec_start_time: None,
+                        dispatch_memory_prediction: None,
                     },
                 );
             }
@@ -18675,6 +19137,7 @@ mod b1_lock_decouple_tests {
                     PendingActionInfoData {
                         action_info: pool_action(),
                         exec_start_time: Some(*start),
+                        dispatch_memory_prediction: None,
                     },
                 );
             }
