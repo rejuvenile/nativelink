@@ -1313,8 +1313,8 @@ const fn is_e_spill_admit(running_before: u64, p_core_count: u32, e_core_count: 
 /// (#sched-cpu-first §5) Rounds a load percentage to the NEAREST decile
 /// {0,10,…,100}. Pure `const fn`, unit-testable (mirrors `is_e_spill_admit`).
 /// `(x + 5) / 10 * 10` gives round-half-up: 84→80, 85→90, 90→90, 95→100. The
-/// `.min(100)` clamp is defensive against a >100 wire glitch (`x <= 100` already
-/// yields at most `(105/10)*10 == 100`). Used by (a) the Regime-B fleet-wide
+/// `if r > 100 { 100 } else { r }` clamp is defensive against a >100 wire glitch
+/// (`x <= 100` already yields at most `(105/10)*10 == 100`). Used by (a) the Regime-B fleet-wide
 /// P-saturation trigger (`round_decile(p_core_load_pct) >= 90`, i.e. raw
 /// `p_load >= 85`) and (b) the Regime-B total-CPU-load decile bucketing.
 const fn round_decile(x: u32) -> u32 {
@@ -1370,8 +1370,28 @@ fn synthetic_pending(w: &Worker) -> usize {
 /// preserves by reusing `effective_load_score` verbatim). This fn keeps the
 /// verbatim reuse (the design's central §2 instruction); the never-reported case
 /// therefore scores `u64::MAX`, NOT 0.
+///
+/// (#sched-cpu-first §8-F4 cold-start fix) The synthetic report-lag term is
+/// applied ONLY when `w.has_reported_load` is true. Its purpose is to bridge the
+/// ~2.5s gap between an assignment and the reporting worker's next load reading;
+/// a NEVER-reported worker has no reading to bridge. Without this gate a fresh
+/// worker with ≥1 pending assignment would score `eff_p = synthetic > 0`, taking
+/// `effective_load_score`'s `p_load > 0` branch and returning a FINITE score
+/// instead of the never-reported `u64::MAX` sentinel — so on a cold fleet (every
+/// `has_reported_load == false`, e.g. scheduler restart / mass reconnect) the
+/// burst would concentrate onto the first-assigned worker until its first report,
+/// the OPPOSITE of the spreading intent. Gating the synthetic term keeps a
+/// never-reported worker at `u64::MAX` (worst) regardless of pending assignments,
+/// so a cold fleet degrades to the LRU/MRU tie order — the CacheAffinityFirst
+/// cold behavior design §8-F4 always claimed. Reported workers keep the full
+/// synthetic bridge (its actual purpose).
 fn cpu_first_score(w: &Worker, synth_pct_per_task: u32) -> u64 {
-    let eff_p = effective_p_load(w.p_core_load_pct, synthetic_pending(w), synth_pct_per_task);
+    let synthetic_count = if w.has_reported_load {
+        synthetic_pending(w)
+    } else {
+        0
+    };
+    let eff_p = effective_p_load(w.p_core_load_pct, synthetic_count, synth_pct_per_task);
     effective_load_score(eff_p, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load)
 }
 
@@ -3091,19 +3111,21 @@ impl ApiWorkerSchedulerImpl {
         // `min_by_key`-style first-min ⇒ ties fall to `&candidates` iteration
         // order. Guarded by `cpu_first` so CacheAffinityFirst pays nothing.
         let cpu_first_winner: Option<WorkerId> = if cpu_first {
-            let mut best: Option<(WorkerId, u64)> = None;
-            for wid in &candidates {
-                if let Some(w) = self.workers.0.peek(wid) {
-                    if worker_is_viable_gated(wid) {
-                        let score = cpu_first_score(w, synth_pct);
-                        let dominated = best.as_ref().is_some_and(|(_, best_score)| score >= *best_score);
-                        if !dominated {
-                            best = Some((wid.clone(), score));
-                        }
-                    }
-                }
-            }
-            if let Some((ref wid, score)) = best {
+            // First-min on ties (min_by_key returns the FIRST minimum) preserves
+            // the `&candidates` iteration order the hand-rolled dominated-loop
+            // used (strict `<` update ⇒ first occurrence wins) — behavior-
+            // identical, matches the six sibling `min_by_key` selectors.
+            let winner = candidates
+                .iter()
+                .filter(|wid| worker_is_viable_gated(wid))
+                .filter_map(|wid| {
+                    self.workers
+                        .0
+                        .peek(wid)
+                        .map(|w| (wid.clone(), cpu_first_score(w, synth_pct)))
+                })
+                .min_by_key(|(_, score)| *score);
+            if let Some((ref wid, score)) = winner {
                 debug!(
                     ?wid,
                     cpu_first_score = score,
@@ -3112,7 +3134,7 @@ impl ApiWorkerSchedulerImpl {
                     "cpu-idle-first winner — lowest (synthetic-compensated) P-load"
                 );
             }
-            best.map(|(wid, _)| wid)
+            winner.map(|(wid, _)| wid)
         } else {
             None
         };
@@ -10086,6 +10108,80 @@ mod tests {
             cpu_first_score(&reported, 25),
             0,
             "after the load report resets the snapshot, synthetic decays to 0"
+        );
+    }
+
+    /// (§8-F4 cold-start fix) A NEVER-reported worker with pending assignments
+    /// must stay `u64::MAX` (WORST). The synthetic report-lag term is gated on
+    /// `has_reported_load`, so a never-reported worker keeps the `#sched-zeroload`
+    /// never-reported sentinel regardless of how many assignments it has taken.
+    /// Pre-fix (un-gated) `synthetic_pending` pushed `eff_p > 0`, taking
+    /// `effective_load_score`'s `p_load > 0` branch → a FINITE score < MAX → the
+    /// cold-fleet pile-on. Mutation: remove the `has_reported_load` gate (feed
+    /// `synthetic_pending(w)` unconditionally) → this test red-fails, the
+    /// never-reported+pending worker scoring `min(3*25,100) == 75`, not MAX.
+    #[test]
+    fn test_cpu_first_score_never_reported_with_pending_stays_max() {
+        // Never-reported, 3 pending assignments (running 3, snapshot 0).
+        let mut never = worker_with_running("NEVER_PENDING", 4, 0, 3);
+        never.has_reported_load = false;
+        never.running_at_last_load_report = 0; // synthetic_pending == 3
+        never.e_core_load_pct = 0;
+        never.cpu_load_pct = 0;
+
+        assert_eq!(
+            cpu_first_score(&never, 25),
+            u64::MAX,
+            "never-reported worker with pending assignments must stay u64::MAX \
+             (worst) — synthetic compensation is gated on has_reported_load; \
+             pre-fix it scored min(3*25,100)=75 and won the cold-fleet burst"
+        );
+
+        // It must lose to ANY reported worker — even a fully-loaded one.
+        let mut reported_busy = worker_with_running("REPORTED_BUSY", 4, 99, 0);
+        reported_busy.has_reported_load = true;
+        reported_busy.e_core_load_pct = 90;
+        reported_busy.cpu_load_pct = 99;
+        assert!(
+            cpu_first_score(&reported_busy, 25) < cpu_first_score(&never, 25),
+            "a reported (even busy) worker must out-rank a never-reported worker \
+             with pending assignments"
+        );
+    }
+
+    /// (§8-F4 cold-start fix) On a COLD fleet (every worker never-reported) a
+    /// worker that has already taken an assignment must TIE (`u64::MAX`) with an
+    /// untouched peer, so the burst does NOT concentrate onto the first-assigned
+    /// worker. Pre-fix the touched worker scored `< MAX` and beat every untouched
+    /// peer on each subsequent pick — the pile-on. Mutation: remove the
+    /// `has_reported_load` gate → the touched worker scores 50 (< MAX) → the two
+    /// scores diverge → the equality assert red-fails.
+    #[test]
+    fn test_cpu_first_score_cold_fleet_never_reported_workers_tie_at_max() {
+        // Touched: never-reported, 2 pending assignments.
+        let mut touched = worker_with_running("TOUCHED", 4, 0, 2);
+        touched.has_reported_load = false;
+        touched.running_at_last_load_report = 0;
+        touched.e_core_load_pct = 0;
+        touched.cpu_load_pct = 0;
+
+        // Untouched: never-reported, no assignments.
+        let mut untouched = worker_with_running("UNTOUCHED", 4, 0, 0);
+        untouched.has_reported_load = false;
+        untouched.running_at_last_load_report = 0;
+        untouched.e_core_load_pct = 0;
+        untouched.cpu_load_pct = 0;
+
+        assert_eq!(
+            cpu_first_score(&touched, 25),
+            cpu_first_score(&untouched, 25),
+            "on a cold fleet a touched never-reported worker must TIE (u64::MAX) \
+             with an untouched peer — no pile-on onto the first-assigned worker"
+        );
+        assert_eq!(
+            cpu_first_score(&touched, 25),
+            u64::MAX,
+            "both never-reported workers tie at the u64::MAX sentinel"
         );
     }
 

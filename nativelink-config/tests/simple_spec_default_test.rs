@@ -32,7 +32,7 @@
 //! `impl Default` drifts from its `#[serde(default = ...)]`, this test
 //! red-fails on that specific field.
 
-use nativelink_config::schedulers::{SimpleSpec, WorkerAllocationStrategy};
+use nativelink_config::schedulers::{PlacementMode, SimpleSpec, WorkerAllocationStrategy};
 use pretty_assertions::assert_eq;
 
 /// `SimpleSpec::default()` MUST equal a deserialized empty config, field for
@@ -214,5 +214,21 @@ fn simple_spec_default_concrete_values() {
         "scheduler_decision_trace_enabled default must be FALSE — the dispatch-decision \
          diagnostic dump is a short-lived operator tool, OFF unless explicitly enabled \
          in config; a default-ON would emit the trace on every fleet with no operator ask"
+    );
+    // (#sched-cpu-first) The placement mode defaults to cache-affinity-first, so
+    // an absent-in-config scheduler is byte-identical to the pre-#sched-cpu-first
+    // matcher until an operator opts into CpuIdleFirst. Asserted via `matches!`
+    // (mirroring the `WorkerAllocationStrategy` sibling above) because
+    // `PlacementMode` carries no `PartialEq` — the code uses only `matches!`.
+    assert!(
+        matches!(spec.placement_mode, PlacementMode::CacheAffinityFirst),
+        "placement_mode default must be CacheAffinityFirst (PlacementMode::default) \
+         — byte-identical to today until an operator selects CpuIdleFirst"
+    );
+    assert_eq!(
+        spec.cpu_first_synthetic_pct_per_task, 25,
+        "cpu_first_synthetic_pct_per_task default must be 25 \
+         (default_cpu_first_synthetic_pct_per_task); a bare #[serde(default)] would \
+         yield 0 and disable the anti-pile synthetic bridge under CpuIdleFirst"
     );
 }

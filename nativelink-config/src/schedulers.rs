@@ -82,7 +82,7 @@ pub enum WorkerAllocationStrategy {
 /// (#sched-cpu-first) Selects how the worker matcher RANKS the winner among
 /// eligible workers. Eligibility (viability, pressure gates, the P-headroom
 /// gate) is IDENTICAL in both modes — only the winner-ranking differs.
-#[derive(Copy, Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Deserialize, Serialize, Debug, Default)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub enum PlacementMode {
