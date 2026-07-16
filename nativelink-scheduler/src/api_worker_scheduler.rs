@@ -578,6 +578,74 @@ pub struct SchedulerMetrics {
         help = "(#output-locality-probe) cumulative output FILE digests inserted into the bounded output-file->producer map by the recorder (top-level output_files + in-folder Tree FileNodes, zero-size excluded)"
     )]
     pub output_files_recorded: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) GAUGE: distinct keys currently resident
+    /// in the bounded resource `ProfileMap`. Push-updated after each completed
+    /// action's fold (last-write-wins, like a resident-count gauge). If it sits
+    /// at `PROFILE_MAP_MAX_KEYS` the working set exceeds the cap — read against
+    /// `profile_map_evictions_total`.
+    #[metric(
+        help = "(#task-resource-profile) distinct keys currently resident in the bounded resource profile map (gauge)"
+    )]
+    pub profile_keys_tracked: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) COUNTER: total resource-usage samples
+    /// folded into the profile map (one per completed action with derivable
+    /// baggage). The headline "are profiles accumulating?" signal.
+    #[metric(
+        help = "(#task-resource-profile) total resource-usage samples folded into the profile map"
+    )]
+    pub profile_samples_total: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) COUNTER: LRU evictions from the profile
+    /// map. Nonzero means the active-target working set exceeds
+    /// `PROFILE_MAP_MAX_KEYS` (percentiles for churned keys cover a shorter
+    /// window) — makes working-set overflow visible instead of silent.
+    #[metric(
+        help = "(#task-resource-profile) LRU evictions from the bounded profile map (working-set overflow signal)"
+    )]
+    pub profile_map_evictions_total: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) COUNTER: completed actions SKIPPED
+    /// because the Bazel baggage (`target_id` / `action_mnemonic`) was absent, so
+    /// no homogeneous key could be formed. Surfaces "does baggage reach the
+    /// scheduler in prod?" — a dark (never-recording) feature would show this
+    /// climbing while `profile_samples_total` stays flat.
+    #[metric(
+        help = "(#task-resource-profile) completed actions skipped for absent baggage (no derivable profile key)"
+    )]
+    pub profile_samples_skipped_empty_key: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) COUNTER: resource-usage reports whose
+    /// operation was NO LONGER in `running_action_infos` at report time (a
+    /// completion/cancellation racing the usage report). Without this, `samples +
+    /// skipped_empty_key != completions` and the dark-detector invariant breaks
+    /// ("no load" is indistinguishable from "action gone before record").
+    #[metric(
+        help = "(#task-resource-profile) resource-usage reports skipped because the op was already gone from running_action_infos (completion/cancel race)"
+    )]
+    pub profile_samples_skipped_no_action: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) COUNTER: resource-usage reports skipped
+    /// because `sampled == false`. An unsampled report carries no real
+    /// measurement (a 0-memory unsampled fold would poison the variance signal),
+    /// so it is not folded. Today's Phase-1 producer always sets `sampled = true`
+    /// (gated on a CPU sample), so this stays 0 in prod — a rising value flags a
+    /// producer that started emitting unsampled reports.
+    #[metric(
+        help = "(#task-resource-profile) resource-usage reports skipped because sampled=false (not folded)"
+    )]
+    pub profile_samples_skipped_unsampled: AtomicU64,
+
+    /// (#task-resource-profile Phase-2a) GAUGE: keys currently classified
+    /// high-variance (memory p95/p50 >= threshold with >= K samples). The whole
+    /// point of the variance monitor: SEE where the coarse (instance, target,
+    /// mnemonic) key is NOT predictive of memory (a finer per-output key would
+    /// be needed there). Maintained incrementally — no per-scrape map scan.
+    #[metric(
+        help = "(#task-resource-profile) keys currently classified high memory-variance (p95/p50 >= threshold, >= K samples) (gauge)"
+    )]
+    pub profile_high_variance_keys: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -666,6 +734,46 @@ pub fn emit_speculative_hold_counters_log(metrics: &SchedulerMetrics) {
             .speculative_prefetch_no_target
             .load(Ordering::Relaxed),
         "stage A/B decision counters"
+    );
+}
+
+/// (#task-resource-profile Phase-2a) OBSERVABILITY-ONLY: emit ONE
+/// `tag = "resource_profile_counters"` info-log carrying the five profile-map
+/// counters/gauges + the two skip counters. The `SchedulerMetrics` tree is DARK
+/// on the HTTP `/metrics` endpoint in production (empty on all ports — see the
+/// sibling `emit_speculative_hold_counters_log`), so WITHOUT this periodic emit
+/// an operator could not read the profile signal at all and the whole
+/// observe-only value (SEE profiles accumulate + the baggage-reaches-prod
+/// dark-detector) would ITSELF be dark. MUST be `info!` (not `debug!`/`trace!`)
+/// because the release build pins `release_max_level_info` and would compile the
+/// lower levels out.
+///
+/// Reads every counter `Relaxed` (telemetry — no ordering dependency), changes
+/// NO scheduling decision, and is called once per `HOLD_COUNTERS_LOG_INTERVAL_S`
+/// from the scheduler's periodic task — NEVER per-match. The dark-detector
+/// invariant an operator checks: `samples_total + skipped_empty_key +
+/// skipped_no_action + skipped_unsampled == completed actions carrying usage`.
+pub fn emit_resource_profile_counters_log(metrics: &SchedulerMetrics) {
+    info!(
+        tag = "resource_profile_counters",
+        profile_keys_tracked = metrics.profile_keys_tracked.load(Ordering::Relaxed),
+        profile_samples_total = metrics.profile_samples_total.load(Ordering::Relaxed),
+        profile_map_evictions_total = metrics
+            .profile_map_evictions_total
+            .load(Ordering::Relaxed),
+        profile_high_variance_keys = metrics
+            .profile_high_variance_keys
+            .load(Ordering::Relaxed),
+        profile_samples_skipped_empty_key = metrics
+            .profile_samples_skipped_empty_key
+            .load(Ordering::Relaxed),
+        profile_samples_skipped_no_action = metrics
+            .profile_samples_skipped_no_action
+            .load(Ordering::Relaxed),
+        profile_samples_skipped_unsampled = metrics
+            .profile_samples_skipped_unsampled
+            .load(Ordering::Relaxed),
+        "resource profile aggregation counters"
     );
 }
 
@@ -807,6 +915,7 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 100_000;
 pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
+use crate::resource_profile::{ProfileKey, ProfileMap, ResourceSample};
 use crate::simple_scheduler::{
     BatchSchedAction, BatchSchedGain, BatchSchedGateCfg, BatchSchedWorker, compute_batch_sched_gain,
 };
@@ -3712,6 +3821,19 @@ pub struct ApiWorkerScheduler {
     // (`src/bin/nativelink.rs` origin-event wiring); None in prod
     // (experimental_origin_events unset), so no unbounded growth on this path.
     maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+
+    /// (#task-resource-profile Phase-2a) OBSERVE-ONLY bounded, instance-scoped
+    /// per-action resource profile map. Written from the COMPLETION path
+    /// (`record_action_resource_usage`, per finished action) and NOT read by any
+    /// scheduling / placement / matching / reservation decision in this phase
+    /// (a later phase consumes it under user authorization). `parking_lot::Mutex`
+    /// because the fold is a synchronous O(1) in-memory update held only for the
+    /// record — NEVER across an `.await`.
+    // CAPPED AT PROFILE_MAP_MAX_KEYS (16384): bounded LRU; over-cap evicts the
+    // LRU key (counted via `profile_map_evictions_total`). Each entry is a
+    // fixed-size sketch (~1.25 KiB/entry incl. key + LRU node), no owned network
+    // bytes and no per-sample growth → total ~20 MiB bounded.
+    resource_profile_map: ParkingMutex<ProfileMap>,
 }
 
 /// Probe a CAS store chain to find the SizePartitioningStore threshold.
@@ -4594,6 +4716,10 @@ impl ApiWorkerScheduler {
                 token
             },
             maybe_origin_event_tx,
+            // (#task-resource-profile Phase-2a) OBSERVE-ONLY bounded profile map,
+            // always constructed (no config flag — this is pure data collection
+            // and must not be dark; see the field doc). See PROFILE_MAP_MAX_KEYS.
+            resource_profile_map: ParkingMutex::new(ProfileMap::with_default_tuning()),
         })
     }
 
@@ -4800,6 +4926,87 @@ impl ApiWorkerScheduler {
             .peek(worker_id)
             .and_then(|worker| worker.running_action_infos.get(operation_id))
             .map(|pending_action_info| pending_action_info.action_info.clone())
+    }
+
+    /// (#task-resource-profile Phase-2a) OBSERVE-ONLY fold of one completed
+    /// action's worker-reported resource usage into the bounded, instance-scoped
+    /// profile map. Runs on the COMPLETION path (per finished action), NOT in
+    /// `do_try_match` / the match loop — so this is never a per-match hot-loop
+    /// fold (the 2026-07-06 91%-CPU trap). Synchronous, O(1) amortized, no I/O;
+    /// the `parking_lot::Mutex` is held only for the in-memory record, never
+    /// across an `.await`. The map is WRITE-only here — nothing reads it to
+    /// influence any scheduling decision in this phase.
+    fn fold_resource_profile(
+        &self,
+        action_info: &ActionInfoWithProps,
+        usage: &ActionResourceUsage,
+    ) {
+        // Gate on `sampled`: an unsampled report carries no real measurement, and
+        // folding its (typically 0) memory would poison the variance signal — a
+        // key with >=50% 0-memory samples reads p50=0, p95>0 → ratio u64::MAX →
+        // false high-variance. Today's Phase-1 producer always sets sampled=true
+        // (gated on a CPU sample), so this never fires in prod; the counter flags
+        // a future producer that starts emitting unsampled reports.
+        if !usage.sampled {
+            self.metrics
+                .profile_samples_skipped_unsampled
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let instance_name = action_info.inner.instance_name();
+        // target_id + action_mnemonic come from the joined Bazel baggage
+        // (`origin_metadata.bazel_metadata`, parsed at cache_lookup and joined
+        // onto the running action). Absent baggage → empty parts → skip.
+        let (target_id, action_mnemonic) = action_info
+            .origin_metadata
+            .bazel_metadata
+            .as_ref()
+            .map_or(("", ""), |m| {
+                (m.target_id.as_str(), m.action_mnemonic.as_str())
+            });
+
+        let Some(key) = ProfileKey::from_parts(instance_name, target_id, action_mnemonic) else {
+            // No derivable key (baggage absent) — count + skip so a dark
+            // (never-recording) feature is visible against profile_samples_total.
+            self.metrics
+                .profile_samples_skipped_empty_key
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        let sample = ResourceSample {
+            memory_kb: usage.peak_memory_kb,
+            cpu_ns: usage.cpu_ns,
+            disk_bytes: usage.disk_bytes,
+            // Single "net" dimension = input-fetch + output-write bytes.
+            net_bytes: usage
+                .net_input_bytes
+                .saturating_add(usage.net_output_bytes),
+        };
+
+        let outcome = {
+            // Sync critical section: O(1) fold, no `.await` held.
+            let mut map = self.resource_profile_map.lock();
+            map.record(key, sample)
+        };
+
+        self.metrics
+            .profile_samples_total
+            .fetch_add(1, Ordering::Relaxed);
+        if outcome.evicted {
+            self.metrics
+                .profile_map_evictions_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Gauges: last-write-wins resident snapshots (converge to the live map
+        // state on each completed action).
+        self.metrics
+            .profile_keys_tracked
+            .store(outcome.keys_tracked, Ordering::Relaxed);
+        self.metrics
+            .profile_high_variance_keys
+            .store(outcome.high_variance_keys, Ordering::Relaxed);
     }
 
     /// (merge v1.6.1) Post-reserve linkage for the scheduler start-execute origin
@@ -8542,6 +8749,30 @@ impl ApiWorkerScheduler {
     async fn output_file_producer_map_len(&self) -> usize {
         self.output_file_producer_map.lock().await.len()
     }
+
+    /// (#task-resource-profile Phase-2a) Test-only: current resident key count of
+    /// the bounded resource profile map.
+    fn resource_profile_map_len(&self) -> usize {
+        self.resource_profile_map.lock().len()
+    }
+
+    /// (#task-resource-profile Phase-2a) Test-only: memory p50/p95 of a profiled
+    /// key, or `None` if the key is absent (proves a specific fold landed).
+    fn resource_profile_peek_memory(&self, key: &ProfileKey) -> Option<(u64, u64)> {
+        self.resource_profile_map
+            .lock()
+            .peek(key)
+            .map(|agg| (agg.memory_p50(), agg.memory_p95()))
+    }
+
+    /// (#task-resource-profile Phase-2a) Test-only: net-dimension p95 of a
+    /// profiled key (proves the `net_input + net_output` collapse landed).
+    fn resource_profile_peek_net_p95(&self, key: &ProfileKey) -> Option<u64> {
+        self.resource_profile_map
+            .lock()
+            .peek(key)
+            .map(|agg| agg.net_bytes_p95())
+    }
 }
 
 #[async_trait]
@@ -8556,6 +8787,27 @@ impl WorkerScheduler for ApiWorkerScheduler {
         operation_id: &OperationId,
         mut resource_usage: ActionResourceUsage,
     ) -> Result<(), Error> {
+        // (#task-resource-profile Phase-2a) DEAD-FOLD-POINT FIX (v2 cadre BLOCK):
+        // the profile fold and the `running_action_info` join BOTH run BEFORE the
+        // `maybe_origin_event_tx` early-return below, so aggregation happens in
+        // production where origin events are DISABLED (`maybe_origin_event_tx` is
+        // None). The join is hoisted above the guard because the origin-event
+        // build (formerly the sole owner of the lookup) is skipped in prod, and
+        // the fold needs the joined `origin_metadata.bazel_metadata` for the key.
+        let maybe_action_info = self.running_action_info(worker_id, operation_id).await;
+        match maybe_action_info.as_ref() {
+            Some(action_info) => self.fold_resource_profile(action_info, &resource_usage),
+            // The op was already gone from `running_action_infos` (completion /
+            // cancellation raced this usage report). Count it so the dark-detector
+            // invariant holds: samples_total + skipped_empty_key +
+            // skipped_no_action + skipped_unsampled == completions carrying usage.
+            None => {
+                self.metrics
+                    .profile_samples_skipped_no_action
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         // The worker API talks to this `ApiWorkerScheduler` (it is the
         // `WorkerScheduler` returned by `SimpleScheduler::new`), so the
         // resource-usage origin event must be published here. Previously the
@@ -8565,7 +8817,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
         let Some(origin_event_tx) = self.maybe_origin_event_tx.as_ref() else {
             return Ok(());
         };
-        let Some(action_info) = self.running_action_info(worker_id, operation_id).await else {
+        let Some(action_info) = maybe_action_info else {
             return Ok(());
         };
 
@@ -14656,6 +14908,323 @@ mod b1_lock_decouple_tests {
         );
         scheduler.add_worker(worker).await.expect("add_worker");
         rx
+    }
+
+    /// (#task-resource-profile Phase-2a) PRODUCTION-COMPOSITION test of the
+    /// dead-fold-point fix: with origin events OFF (`maybe_origin_event_tx =
+    /// None`, exactly the prod wiring `build_scheduler` uses), a worker-reported
+    /// `resource_usage` reaching `record_action_resource_usage` MUST still be
+    /// folded into the profile map — the fold runs BEFORE the origin-event
+    /// early-return. Composes the real reserve path (so the running action carries
+    /// its joined `origin_metadata.bazel_metadata`) + the real
+    /// `record_action_resource_usage` entrypoint the worker API calls.
+    ///
+    /// MUTATION: move `fold_resource_profile` to AFTER the `maybe_origin_event_tx`
+    /// guard → with tx=None the fold never runs → `resource_profile_map_len()`
+    /// stays 0 → this test red-fails with the bespoke message below.
+    #[nativelink_test]
+    async fn resource_profile_folds_with_origin_events_off() {
+        use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+        use nativelink_util::origin_event::OriginMetadata;
+
+        use crate::resource_profile::ProfileKey;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        // Sanity: this is the PROD composition — origin events are OFF.
+        assert!(
+            scheduler.maybe_origin_event_tx.is_none(),
+            "test must compose the production shape (origin events OFF)"
+        );
+
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        // Reserve op on W via the real reservation path so the running action
+        // carries the joined bazel baggage the fold keys on.
+        let op = OperationId::default();
+        let mut action_w = make_action_info_with_props("W", 0xaa);
+        action_w.origin_metadata = OriginMetadata {
+            identity: String::new(),
+            bazel_metadata: Some(RequestMetadata {
+                action_mnemonic: "CppCompile".to_string(),
+                target_id: "//foo:bar".to_string(),
+                ..Default::default()
+            }),
+        };
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named("W"), &op, &action_w, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        // The worker reports resource usage on completion (4096 KiB memory).
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 4096,
+            cpu_ns: 1 << 30,
+            disk_bytes: 4096,
+            net_input_bytes: 1000,
+            net_output_bytes: 2000,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record_action_resource_usage must return Ok on the prod path");
+
+        // THE contract: the fold ran even though origin events are OFF.
+        assert_eq!(
+            scheduler.resource_profile_map_len(),
+            1,
+            "fold dark when origin events off — resource profile not recorded on \
+             the production (maybe_origin_event_tx = None) path; the aggregation \
+             must run BEFORE the origin-event early-return"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .profile_samples_total
+                .load(Ordering::Relaxed),
+            1,
+            "profile_samples_total must advance on the prod fold path"
+        );
+
+        // The RIGHT sample landed under the derived key: 4096 KiB → bucket
+        // [4096,8192) → representative 6144.
+        let key = ProfileKey::from_parts("main", "//foo:bar", "CppCompile").unwrap();
+        assert_eq!(
+            scheduler.resource_profile_peek_memory(&key),
+            Some((6144, 6144)),
+            "the folded memory sample (4096 KiB) must be readable under the derived \
+             (instance, target, mnemonic) key"
+        );
+    }
+
+    /// (#task-resource-profile Phase-2a) A completed action WITHOUT Bazel baggage
+    /// (no `bazel_metadata`) must be SKIPPED (no key) and counted in
+    /// `profile_samples_skipped_empty_key`, not folded — so a dark, never-keying
+    /// feature is visible against `profile_samples_total`.
+    #[nativelink_test]
+    async fn resource_profile_skips_action_without_baggage() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        let op = OperationId::default();
+        // Default origin_metadata → bazel_metadata None → no derivable key.
+        let action_w = make_action_info_with_props("W", 0xbb);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named("W"), &op, &action_w, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 4096,
+            // sampled=true so the report reaches the KEY-derivation skip (empty
+            // baggage), not the earlier unsampled skip.
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record must return Ok even when skipping");
+
+        assert_eq!(
+            scheduler.resource_profile_map_len(),
+            0,
+            "an action with absent baggage must NOT be folded (no key)"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .profile_samples_skipped_empty_key
+                .load(Ordering::Relaxed),
+            1,
+            "the skipped-empty-key counter must advance so a never-keying feature \
+             is visible against profile_samples_total"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .profile_samples_total
+                .load(Ordering::Relaxed),
+            0,
+            "profile_samples_total must NOT advance for a skipped action"
+        );
+    }
+
+    /// (#task-resource-profile Phase-2a, pair-b T-SEAM-1) The
+    /// `net_bytes = net_input + net_output` collapse in `fold_resource_profile`
+    /// must sum BOTH transfer legs into the single net dimension. Feeds
+    /// net_input=1000, net_output=2000 through the real fold and reads the net
+    /// p95 back = 3000's bucket [2048,4096) → rep 3072.
+    ///
+    /// MUTATION: drop `net_output_bytes` from the collapse (`:fold_resource_profile`)
+    /// → net = 1000 → bucket [512,1024) rep 768 → this test red-fails.
+    #[nativelink_test]
+    async fn resource_profile_net_dimension_sums_both_legs() {
+        use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+        use nativelink_util::origin_event::OriginMetadata;
+
+        use crate::resource_profile::ProfileKey;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        let op = OperationId::default();
+        let mut action_w = make_action_info_with_props("W", 0xcc);
+        action_w.origin_metadata = OriginMetadata {
+            identity: String::new(),
+            bazel_metadata: Some(RequestMetadata {
+                action_mnemonic: "CppCompile".to_string(),
+                target_id: "//net:probe".to_string(),
+                ..Default::default()
+            }),
+        };
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named("W"), &op, &action_w, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 1,
+            net_input_bytes: 1000,
+            net_output_bytes: 2000,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record must return Ok");
+
+        let key = ProfileKey::from_parts("main", "//net:probe", "CppCompile").unwrap();
+        assert_eq!(
+            scheduler.resource_profile_peek_net_p95(&key),
+            Some(3072),
+            "net dimension must sum net_input (1000) + net_output (2000) = 3000 → \
+             bucket [2048,4096) rep 3072; dropping either leg changes the bucket"
+        );
+    }
+
+    /// (#task-resource-profile Phase-2a, pair-b C2) An UNSAMPLED report
+    /// (`sampled=false`) must NOT be folded (a 0-memory unsampled fold would
+    /// poison the variance signal); it is counted in
+    /// `profile_samples_skipped_unsampled` instead.
+    ///
+    /// MUTATION: remove the `if !usage.sampled { … return }` gate in
+    /// `fold_resource_profile` → the 0-memory sample folds → map_len 1 → red-fail.
+    #[nativelink_test]
+    async fn resource_profile_skips_unsampled_report() {
+        use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+        use nativelink_util::origin_event::OriginMetadata;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        let op = OperationId::default();
+        let mut action_w = make_action_info_with_props("W", 0xdd);
+        action_w.origin_metadata = OriginMetadata {
+            identity: String::new(),
+            bazel_metadata: Some(RequestMetadata {
+                action_mnemonic: "CppCompile".to_string(),
+                target_id: "//foo:bar".to_string(),
+                ..Default::default()
+            }),
+        };
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named("W"), &op, &action_w, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        // Baggage IS present (would key fine) but the report is unsampled.
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 0,
+            sampled: false,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record must return Ok even when skipping");
+
+        assert_eq!(
+            scheduler.resource_profile_map_len(),
+            0,
+            "an unsampled report must NOT be folded (would poison variance with a 0)"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .profile_samples_skipped_unsampled
+                .load(Ordering::Relaxed),
+            1,
+            "the unsampled-skip counter must advance (keeps the dark-detector \
+             invariant: samples + all skips == completions)"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .profile_samples_total
+                .load(Ordering::Relaxed),
+            0,
+            "profile_samples_total must NOT advance for an unsampled report"
+        );
+    }
+
+    /// (#task-resource-profile Phase-2a, pair-a) A resource-usage report whose op
+    /// is NO LONGER in `running_action_infos` (completion/cancellation raced the
+    /// report) must be counted in `profile_samples_skipped_no_action`, not
+    /// silently dropped — else the dark-detector invariant breaks.
+    ///
+    /// MUTATION: drop the `None => { … skipped_no_action.fetch_add }` arm in
+    /// `record_action_resource_usage` → counter stays 0 → red-fail.
+    #[nativelink_test]
+    async fn resource_profile_counts_no_action_skip() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_named(&scheduler, "W", 4).await;
+
+        // Never reserve an action — this op is absent from running_action_infos,
+        // so `running_action_info` returns None (the race the counter tracks).
+        let missing_op = OperationId::default();
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 4096,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &missing_op, usage)
+            .await
+            .expect("record must return Ok when the op is already gone");
+
+        assert_eq!(
+            scheduler.resource_profile_map_len(),
+            0,
+            "a report for a vanished op must not be folded"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .profile_samples_skipped_no_action
+                .load(Ordering::Relaxed),
+            1,
+            "profile_samples_skipped_no_action must advance so a completion/cancel \
+             race is distinguishable from 'no load'"
+        );
     }
 
     /// (#specprefetch-rebind Stage B v3) Like `add_worker_named` but with a
