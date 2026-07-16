@@ -169,6 +169,32 @@ impl LogHistogram {
         // return the top populated bucket's representative.
         bucket_representative(HIST_BUCKETS - 1)
     }
+
+    /// TAIL-AWARE statistic: the UPPER BOUND of the highest populated bucket —
+    /// strictly greater than every value ever folded into the sketch, so a
+    /// reservation sized on it never under-reserves the observed peak. `0` for an
+    /// empty sketch (or a sketch holding only the value `0`).
+    ///
+    /// This is the statistic a memory RESERVATION must use, NOT p95: p95 is BLIND
+    /// to the sub-5% catastrophic tail (review A1b / the TLC lower-bound result) —
+    /// a 96%@2 GB / 4%@20 GB key has p95 in the 2 GB mode → under-reserve → OOM.
+    /// Over-reserve is the OOM-safe direction, so the worst observed MAGNITUDE
+    /// (bucket upper bound) is the safe input.
+    ///
+    /// Bucket `i` (`1 <= i <= 62`) holds `[2^(i-1), 2^i)`; its upper bound is
+    /// `2^i`. Bucket `0` holds only `0` → upper bound `0`. The saturating top
+    /// bucket `63` conceptually merges `[2^62, 2^64)`; its reported upper bound
+    /// `2^63` under-states that merged octave — a purely theoretical imprecision
+    /// at magnitudes (≥ 2^62 KiB ≈ 4.6 EiB) far above any real resource value
+    /// (mirrors [`bucket_representative`]'s top-octave saturation note).
+    fn max_bucket_upper_bound(&self) -> u64 {
+        for (i, &count) in self.buckets.iter().enumerate().rev() {
+            if count > 0 {
+                return if i == 0 { 0 } else { 1u64 << i };
+            }
+        }
+        0
+    }
 }
 
 /// One completed action's worker-reported resource usage, normalized for the
@@ -217,6 +243,16 @@ impl Agg {
     #[inline]
     pub fn memory_p95(&self) -> u64 {
         self.memory_kb.quantile(19, 20, self.sample_count)
+    }
+
+    /// (#task-resource-profile Phase-2b) TAIL-AWARE memory statistic for a
+    /// reservation (the enforce phase's injected memory floor). Returns the upper
+    /// bound of the highest populated memory bucket — NEVER p95, which is blind to
+    /// the sub-5% catastrophic tail (review A1b). See
+    /// [`LogHistogram::max_bucket_upper_bound`].
+    #[inline]
+    pub fn memory_tail_kb(&self) -> u64 {
+        self.memory_kb.max_bucket_upper_bound()
     }
 
     #[inline]
@@ -432,12 +468,24 @@ impl ProfileMap {
     }
 
     /// Read an aggregate WITHOUT bumping LRU recency (`peek`, not `get`). The
-    /// eventual match-path reader must use this so an observe-only read never
-    /// perturbs eviction order (design §6 / N-3). Unused in Phase-2a beyond
-    /// tests, kept for the read-path chunk.
+    /// match-path reader must use this so an observe-only read never perturbs
+    /// eviction order (design §6 / N-3).
     #[cfg(test)]
     pub fn peek(&self, key: &ProfileKey) -> Option<&Agg> {
         self.cache.peek(key)
+    }
+
+    /// (#task-resource-profile Phase-2b) OBSERVE-PATH read: the tail-aware memory
+    /// statistic and current sample count for `key`, or `None` when the key is
+    /// absent. Uses `peek` (never `get`) so an observe read never bumps LRU
+    /// recency (N-3). The caller applies the `K` sample-count gate — a
+    /// freshly-LRU-re-admitted low-sample key must NOT be trusted (pair-a MINOR /
+    /// red-team A1b), which is why the raw `sample_count` is returned alongside
+    /// the tail rather than pre-gated here.
+    pub fn peek_memory_tail(&self, key: &ProfileKey) -> Option<(u64, u64)> {
+        self.cache
+            .peek(key)
+            .map(|agg| (agg.memory_tail_kb(), agg.sample_count()))
     }
 
     #[inline]
@@ -666,6 +714,95 @@ mod tests {
             o.high_variance_keys, 0,
             "2 samples < K=20 → variance not trusted → not high-variance, got {}",
             o.high_variance_keys
+        );
+    }
+
+    // ── (Phase-2b) tail-aware memory statistic (NOT p95) ──
+
+    #[test]
+    fn tail_stat_picks_the_tail_not_p95() {
+        // The bimodal catastrophe (red-team A1b): 96% at ~2 GB, 4% at ~20 GB.
+        // p95 sits IN the 2 GB mode (blind to the 4% tail that OOM-kills); the
+        // tail statistic must capture the 20 GB mode.
+        //   2 GB  = 2_097_152 KiB → bit_len 22 → bucket 22 = [2^21,2^22), tail 2^22
+        //   20 GB = 20_971_520 KiB → bit_len 25 → bucket 25 = [2^24,2^25), tail 2^25
+        let low = 2_097_152;
+        let high = 20_971_520;
+        let mut agg = Agg::default();
+        for _ in 0..96 {
+            agg.fold(mem_sample(low));
+        }
+        for _ in 0..4 {
+            agg.fold(mem_sample(high));
+        }
+        assert_eq!(agg.sample_count(), 100);
+
+        // p95 lands in the LOW (2 GB) mode — the blindness the reservation must avoid.
+        let p95 = agg.memory_p95();
+        assert_eq!(
+            p95, 3_145_728,
+            "p95 must sit in the 2 GB mode (bucket 22 rep 3145728) — blind to the \
+             4% 20 GB tail; got {p95}"
+        );
+
+        // The tail statistic captures the 20 GB mode (upper bound of the highest
+        // populated bucket 25 = 2^25 = 33_554_432).
+        let tail = agg.memory_tail_kb();
+        assert_eq!(
+            tail, 33_554_432,
+            "memory_tail_kb must be the upper bound of the highest populated bucket \
+             (bucket 25 → 2^25 = 33554432), capturing the catastrophic 20 GB tail; \
+             got {tail}"
+        );
+        assert!(
+            tail > p95,
+            "the tail statistic MUST exceed p95 on a bimodal key (over-reserve is the \
+             OOM-safe direction) — tail {tail} !> p95 {p95}"
+        );
+        assert!(
+            tail >= high,
+            "the tail statistic must be >= the max observed sample ({high}) so a \
+             reservation sized on it never under-reserves the observed peak; got {tail}"
+        );
+    }
+
+    #[test]
+    fn tail_stat_of_empty_agg_is_zero() {
+        let agg = Agg::default();
+        assert_eq!(
+            agg.memory_tail_kb(),
+            0,
+            "an un-sampled agg has no tail → 0 (the K-gate keeps it out of any raise)"
+        );
+    }
+
+    #[test]
+    fn peek_memory_tail_reads_tail_and_count_without_recency_bump() {
+        // cap 2: prove peek_memory_tail returns (tail, samples) for a present key,
+        // None for an absent one, and (unlike get) does NOT bump LRU recency.
+        let mut map = ProfileMap::new(NonZeroUsize::new(2).unwrap(), 1, 200);
+        let (k1, k2, k3) = (key("//a", "M"), key("//b", "M"), key("//c", "M"));
+        map.record(k1.clone(), mem_sample(2_097_152)); // bucket 22 → tail 2^22
+        map.record(k1.clone(), mem_sample(20_971_520)); // bucket 25 → tail 2^25
+        map.record(k2.clone(), mem_sample(100));
+
+        assert_eq!(
+            map.peek_memory_tail(&k1),
+            Some((33_554_432, 2)),
+            "peek_memory_tail must return (tail=2^25, samples=2) for a profiled key"
+        );
+        assert_eq!(
+            map.peek_memory_tail(&key("//absent", "M")),
+            None,
+            "peek_memory_tail must return None for an unprofiled key"
+        );
+
+        // peek did NOT bump recency: k1 is still LRU, so inserting k3 evicts k1.
+        let o = map.record(k3.clone(), mem_sample(100));
+        assert!(o.evicted);
+        assert!(
+            map.peek_memory_tail(&k1).is_none(),
+            "peek must not bump recency — k1 (peeked but not get) stays LRU and evicts"
         );
     }
 

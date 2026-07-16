@@ -668,6 +668,43 @@ pub struct SchedulerMetrics {
         help = "(#task-resource-profile) keys currently classified high memory-variance (p95/p50 >= threshold, >= K samples) (gauge)"
     )]
     pub profile_high_variance_keys: AtomicU64,
+
+    /// (#task-resource-profile Phase-2b) COUNTER: reserved-dispatch decisions on
+    /// which the inject-OBSERVE counterfactual ran (one per reserved worker). The
+    /// denominator for the skip/raise ratios; a would_raise/skip that never moves
+    /// against a climbing total flags a dark observe path.
+    #[metric(
+        help = "(#task-resource-profile Phase-2b) reserved dispatches on which the inject-observe counterfactual ran"
+    )]
+    pub inject_observe_total: AtomicU64,
+
+    /// (#task-resource-profile Phase-2b) COUNTER: reserved dispatches where the
+    /// profiled tail-aware memory statistic EXCEEDS the client-declared `memory_kb`
+    /// — the enforce phase (Phase-3) WOULD raise the reservation (RAISE-ONLY).
+    /// OBSERVE-ONLY: no reservation is actually changed in this phase.
+    #[metric(
+        help = "(#task-resource-profile Phase-2b) reserved dispatches whose profiled tail exceeds declared memory_kb (would-raise; NOT applied)"
+    )]
+    pub inject_observe_would_raise: AtomicU64,
+
+    /// (#task-resource-profile Phase-2b) COUNTER: reserved dispatches with a
+    /// profile present but `< K` samples → the tail is not yet trusted (a
+    /// freshly-LRU-re-admitted key is low-sample; pair-a MINOR / red-team A1b), so
+    /// no counterfactual raise is computed.
+    #[metric(
+        help = "(#task-resource-profile Phase-2b) reserved dispatches skipped for < K profile samples (tail untrusted)"
+    )]
+    pub inject_observe_skipped_low_sample: AtomicU64,
+
+    /// (#task-resource-profile Phase-2b) COUNTER: reserved dispatches with NO
+    /// usable profile — either absent Bazel baggage (no derivable key) or the
+    /// derived key is not yet in the map. Right after Phase-2a deploy the map is
+    /// empty, so this DOMINATING while would_raise stays 0 is the EXPECTED early
+    /// signal (the accuracy data accumulating), not a fault.
+    #[metric(
+        help = "(#task-resource-profile Phase-2b) reserved dispatches skipped for no usable profile (absent baggage or key not yet profiled)"
+    )]
+    pub inject_observe_skipped_no_profile: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -801,6 +838,34 @@ pub fn emit_resource_profile_counters_log(metrics: &SchedulerMetrics) {
             .profile_samples_skipped_unsampled
             .load(Ordering::Relaxed),
         "resource profile aggregation counters"
+    );
+}
+
+/// (#task-resource-profile Phase-2b) OBSERVABILITY-ONLY: emit ONE
+/// `tag = "resource_profile_inject_observe"` info-log carrying the four
+/// inject-observe counterfactual counters. Same DARK-on-`/metrics` rationale as
+/// [`emit_resource_profile_counters_log`] (the `SchedulerMetrics` tree is not
+/// scraped in prod), so WITHOUT this periodic emit the whole Phase-2b observe
+/// signal — the accuracy data the enforce phase depends on — would ITSELF be
+/// dark. MUST be `info!` (`release_max_level_info` strips lower levels). Wired
+/// into the SAME spawn-once periodic task that emits the aggregation counters;
+/// NEVER per-match. Reads `Relaxed`, changes no scheduling decision.
+///
+/// Dark-detector invariant an operator checks:
+/// `would_raise + skipped_low_sample + skipped_no_profile <= inject_observe_total`
+/// (the residual is "profiled, ≥K, tail ≤ declared" — an observed non-raise).
+pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
+    info!(
+        tag = "resource_profile_inject_observe",
+        inject_observe_total = metrics.inject_observe_total.load(Ordering::Relaxed),
+        inject_observe_would_raise = metrics.inject_observe_would_raise.load(Ordering::Relaxed),
+        inject_observe_skipped_low_sample = metrics
+            .inject_observe_skipped_low_sample
+            .load(Ordering::Relaxed),
+        inject_observe_skipped_no_profile = metrics
+            .inject_observe_skipped_no_profile
+            .load(Ordering::Relaxed),
+        "resource profile inject-observe counterfactual counters"
     );
 }
 
@@ -942,7 +1007,7 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 100_000;
 pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
-use crate::resource_profile::{ProfileKey, ProfileMap, ResourceSample};
+use crate::resource_profile::{PROFILE_MIN_SAMPLES, ProfileKey, ProfileMap, ResourceSample};
 use crate::simple_scheduler::{
     BatchSchedAction, BatchSchedGain, BatchSchedGateCfg, BatchSchedWorker, compute_batch_sched_gain,
 };
@@ -1208,6 +1273,37 @@ const DECISION_TRACE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// an action's set is its REQUIREMENT — logging both lets the reader see an
 /// `is_satisfied_by` shortfall directly. Built ONLY inside the flag-on,
 /// rate-limited emit path, so it costs nothing when the trace is off.
+/// (#task-resource-profile Phase-2b) The platform-property key the memory
+/// reservation reads: the per-action `memory_kb` `Minimum` that
+/// `reduce_platform_properties` decrements and `is_satisfied_by` gates on. Matches
+/// the completion-path profile dimension (`peak_memory_kb`) and the config default
+/// (`schedulers.rs` `default_memory_property_name`). Phase-2b observes an injection
+/// on this dimension ONLY — memory is the OOM-load-bearing dimension; disk/cpu stay
+/// observe-nothing (no `disk_*` is advertised at admit, so injecting one would
+/// WEDGE the action — design §7).
+const MEMORY_KB_PROPERTY: &str = "memory_kb";
+
+/// (#task-resource-profile Phase-2b) Rate-limit for the per-decision inject-observe
+/// SAMPLE log so it cannot flood (mirrors [`DECISION_TRACE_MIN_INTERVAL`]): at most
+/// one `resource_profile_inject_observe_sample` line per second. The aggregate
+/// counters (emitted on the periodic cadence) carry the full signal; the sample
+/// line is a spot check an operator can read for one decision's numbers.
+const INJECT_OBSERVE_SAMPLE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// (#task-resource-profile Phase-2b) The client-DECLARED memory reservation
+/// (`memory_kb` `Minimum`, KiB) for an action, or `0` when the action declares
+/// none. `0` is the correct floor for the raise-only counterfactual: with no
+/// declared minimum the injected floor would be the tail statistic itself
+/// (`max(0, tail) == tail`). Reads the SAME property the reservation reads, so the
+/// observed `declared` matches what the enforce phase would raise from.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn action_declared_memory_kb(props: &PlatformProperties) -> u64 {
+    match props.properties.get(MEMORY_KB_PROPERTY) {
+        Some(PlatformPropertyValue::Minimum(v)) => v.max(0.0) as u64,
+        _ => 0,
+    }
+}
+
 fn decision_trace_min_props(props: &PlatformProperties) -> String {
     let mut mins: Vec<(&str, f64)> = props
         .properties
@@ -4140,6 +4236,15 @@ pub struct ApiWorkerScheduler {
     // fixed-size sketch (~1.25 KiB/entry incl. key + LRU node), no owned network
     // bytes and no per-sample growth → total ~20 MiB bounded.
     resource_profile_map: ParkingMutex<ProfileMap>,
+
+    /// (#task-resource-profile Phase-2b) Rate-limit state for the per-decision
+    /// inject-observe SAMPLE log (`tag = resource_profile_inject_observe_sample`):
+    /// wall-clock instant of the last emitted line. Interior-mutable because the
+    /// outer `find_and_reserve_worker` runs on `&self`; a brief `parking_lot` lock
+    /// taken only on the reserved-dispatch path, NEVER held across an `.await`.
+    /// `None` until the first sample. Throttles to at most one line per
+    /// `INJECT_OBSERVE_SAMPLE_MIN_INTERVAL`.
+    inject_observe_sample_at: ParkingMutex<Option<Instant>>,
 }
 
 /// Probe a CAS store chain to find the SizePartitioningStore threshold.
@@ -5036,6 +5141,7 @@ impl ApiWorkerScheduler {
             // always constructed (no config flag — this is pure data collection
             // and must not be dark; see the field doc). See PROFILE_MAP_MAX_KEYS.
             resource_profile_map: ParkingMutex::new(ProfileMap::with_default_tuning()),
+            inject_observe_sample_at: ParkingMutex::new(None),
         })
     }
 
@@ -5340,6 +5446,116 @@ impl ApiWorkerScheduler {
         self.metrics
             .profile_high_variance_keys
             .store(outcome.high_variance_keys, Ordering::Relaxed);
+    }
+
+    /// (#task-resource-profile Phase-2b) OBSERVE-ONLY inject counterfactual. Called
+    /// AFTER a worker has been reserved for `action_info` (once per reserved
+    /// dispatch — NOT per `do_try_match` cycle, so no per-match hot-loop cost), it
+    /// looks up the action's resource profile by the SAME key the completion-path
+    /// fold uses, computes the memory reservation the enforce phase (Phase-3) WOULD
+    /// inject — `would_raise_to = max(declared_memory_kb, tail_stat)`, RAISE-ONLY —
+    /// and LOGS it.
+    ///
+    /// It changes NOTHING: the reservation was already made above with the
+    /// client-declared props; this reads the profile map via `peek` (no LRU-recency
+    /// perturbation, N-3), reads the action's declared props, updates telemetry
+    /// counters, and emits a rate-limited sample line. No `is_satisfied_by` /
+    /// `reduce_platform_properties` / dispatch decision is touched. Enforcement is
+    /// Phase-3 (user-authorized, gated on accuracy-verified profiles + the §7 safety
+    /// bundle: tail-aware estimate, mandatory count ceiling, all-task injection);
+    /// this phase PRODUCES that accuracy data on empty/unverified profiles with zero
+    /// OOM risk.
+    ///
+    /// MEMORY ONLY (design §7): the tail-aware `memory_kb` is the OOM-load-bearing
+    /// dimension. Disk/cpu are observe-nothing here — no `disk_*` is advertised at
+    /// admit, so an injected `disk_*` Minimum would WEDGE the action.
+    fn observe_inject_counterfactual(&self, action_info: &ActionInfoWithProps, worker_id: &WorkerId) {
+        self.metrics
+            .inject_observe_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Derive the SAME (instance, target, mnemonic) key the completion-path fold
+        // keys on (instance + joined Bazel baggage). Absent baggage → no key → no
+        // usable profile. STEP-0 (design §3): this key is fully computable at
+        // dispatch time from the `ActionInfoWithProps` already in hand — no Command
+        // CAS fetch — because Phase-2a keys on baggage, not `output_set_hash`.
+        let instance_name = action_info.inner.instance_name();
+        let (target_id, action_mnemonic) = action_info
+            .origin_metadata
+            .bazel_metadata
+            .as_ref()
+            .map_or(("", ""), |m| {
+                (m.target_id.as_str(), m.action_mnemonic.as_str())
+            });
+        let Some(key) = ProfileKey::from_parts(instance_name, target_id, action_mnemonic) else {
+            self.metrics
+                .inject_observe_skipped_no_profile
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        // `peek` (never `get`): an observe read must not bump LRU recency (N-3).
+        let Some((tail_kb, samples)) = self.resource_profile_map.lock().peek_memory_tail(&key)
+        else {
+            // Key derivable but not yet profiled — the empty-map norm right after
+            // Phase-2a deploy. Counting this (climbing while would_raise stays 0) is
+            // the EXPECTED early accuracy-accumulation signal, not a fault.
+            self.metrics
+                .inject_observe_skipped_no_profile
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+
+        // Reliability gate: a freshly-LRU-re-admitted key is low-sample; below K the
+        // tail statistic is statistically meaningless (pair-a MINOR / red-team A1b's
+        // K-gate). Keep it out of any counterfactual raise.
+        if samples < PROFILE_MIN_SAMPLES {
+            self.metrics
+                .inject_observe_skipped_low_sample
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let declared_kb = action_declared_memory_kb(&action_info.platform_properties);
+        // RAISE-ONLY: the injection could only ever RAISE the reserved memory toward
+        // the tail statistic, never below the client-declared value (Phase-2b is
+        // OOM-safe: tightening only). `would_raise_to == declared` when the tail is
+        // at/under declared (no raise).
+        let would_raise_to = declared_kb.max(tail_kb);
+        let delta_kb = would_raise_to - declared_kb;
+        if delta_kb > 0 {
+            self.metrics
+                .inject_observe_would_raise
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Rate-limited (≤ 1/s) per-decision sample so an operator can SEE one
+        // decision's key/declared/tail/would_raise/delta without flooding.
+        let now = Instant::now();
+        let due = {
+            let mut last = self.inject_observe_sample_at.lock();
+            let due = last
+                .is_none_or(|t| now.duration_since(t) >= INJECT_OBSERVE_SAMPLE_MIN_INTERVAL);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if due {
+            info!(
+                tag = "resource_profile_inject_observe_sample",
+                instance_name = %key.instance_name,
+                target_id = %key.target_id,
+                action_mnemonic = %key.action_mnemonic,
+                worker_id = %worker_id.0,
+                samples,
+                declared_memory_kb = declared_kb,
+                tail_stat_kb = tail_kb,
+                would_raise_to_kb = would_raise_to,
+                delta_kb,
+                "resource-profile inject-observe counterfactual (OBSERVE-ONLY; no reservation changed)"
+            );
+        }
     }
 
     /// (merge v1.6.1) Post-reserve linkage for the scheduler start-execute origin
@@ -5724,6 +5940,15 @@ impl ApiWorkerScheduler {
 
         // Drop the write lock before spawning prefetch.
         drop(inner);
+
+        // (#task-resource-profile Phase-2b) OBSERVE-ONLY inject counterfactual. Runs
+        // only when a worker was actually reserved (`result.is_some()` → a real
+        // dispatch, so an injection WOULD occur) — never on the no-match cycle. Runs
+        // AFTER the worker write lock is dropped: it peeks only the separate
+        // profile-map mutex and changes NOTHING about the reservation just made.
+        if let Some((reserved_worker_id, _, _)) = result.as_ref() {
+            self.observe_inject_counterfactual(action_info, reserved_worker_id);
+        }
 
         // ── Phase 2.5 deferred: inject pre-resolved tree into StartExecute ──
         // `to_proto_vecs()` clones the Directory protos and is only called
@@ -9105,6 +9330,29 @@ impl ApiWorkerScheduler {
             .lock()
             .peek(key)
             .map(|agg| agg.net_bytes_p95())
+    }
+
+    /// (#task-resource-profile Phase-2b) Test-only: directly fold a sample under a
+    /// key so a test can pre-populate a profile the dispatch-path observe reads.
+    fn resource_profile_record_sample(
+        &self,
+        key: crate::resource_profile::ProfileKey,
+        sample: crate::resource_profile::ResourceSample,
+    ) {
+        self.resource_profile_map.lock().record(key, sample);
+    }
+
+    /// (#task-resource-profile Phase-2b) Test-only: a worker's CURRENT `Minimum`
+    /// value for `prop` (e.g. `memory_kb`) — its remaining capacity after any
+    /// reservation was `reduce_platform_properties`-decremented. Proves the
+    /// observe-only inject changes NO reservation (remaining reflects declared,
+    /// not the counterfactual tail).
+    async fn worker_min_prop(&self, worker_id: &WorkerId, prop: &str) -> Option<f64> {
+        let inner = self.inner.read().await;
+        match inner.workers.peek(worker_id)?.platform_properties.properties.get(prop)? {
+            PlatformPropertyValue::Minimum(v) => Some(*v),
+            _ => None,
+        }
     }
 }
 
@@ -15925,6 +16173,276 @@ mod b1_lock_decouple_tests {
             1,
             "profile_samples_skipped_no_action must advance so a completion/cancel \
              race is distinguishable from 'no load'"
+        );
+    }
+
+    // ── (#task-resource-profile Phase-2b) inject-OBSERVE counterfactual ──
+
+    /// Platform properties carrying a `name` Exact (for capability matching) and a
+    /// `memory_kb` Minimum (the reservation the observe reads/reduces).
+    fn props_named_with_memory(name: &str, memory_kb: f64) -> PlatformProperties {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            PlatformPropertyValue::Exact(name.to_string()),
+        );
+        properties.insert(
+            "memory_kb".to_string(),
+            PlatformPropertyValue::Minimum(memory_kb),
+        );
+        PlatformProperties { properties }
+    }
+
+    async fn add_worker_with_memory(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+        memory_kb: f64,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(
+            WorkerId(name.to_string()),
+            props_named_with_memory(name, memory_kb),
+            tx,
+            42,
+            0, // max_inflight_tasks = 0 (unlimited), the deployed config
+        );
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
+    /// Build an action requiring `declared_kb` memory on worker `name`, carrying the
+    /// Bazel baggage the profile key derives from (`//foo:bar` / `CppCompile`).
+    fn action_with_memory_and_baggage(name: &str, seed: u8, declared_kb: f64) -> ActionInfoWithProps {
+        use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+        use nativelink_util::origin_event::OriginMetadata;
+
+        let mut action = make_action_info_with_props(name, seed);
+        action.platform_properties = props_named_with_memory(name, declared_kb);
+        action.origin_metadata = OriginMetadata {
+            identity: String::new(),
+            bazel_metadata: Some(RequestMetadata {
+                action_mnemonic: "CppCompile".to_string(),
+                target_id: "//foo:bar".to_string(),
+                ..Default::default()
+            }),
+        };
+        action
+    }
+
+    /// The observe key for `action_with_memory_and_baggage` (instance "main" comes
+    /// from `make_action_info_with_props`'s unique_qualifier).
+    fn observe_key() -> crate::resource_profile::ProfileKey {
+        crate::resource_profile::ProfileKey::from_parts("main", "//foo:bar", "CppCompile").unwrap()
+    }
+
+    fn mem_only_sample(memory_kb: u64) -> crate::resource_profile::ResourceSample {
+        crate::resource_profile::ResourceSample {
+            memory_kb,
+            cpu_ns: 0,
+            disk_bytes: 0,
+            net_bytes: 0,
+        }
+    }
+
+    /// THE load-bearing observe-only contract: with a ≥K-sample profile whose
+    /// tail-aware memory statistic FAR exceeds the action's declared `memory_kb`,
+    /// the dispatch computes the counterfactual raise (`would_raise` fires) yet the
+    /// actual reservation is BYTE-IDENTICAL to the no-injection path — the worker's
+    /// remaining `memory_kb` reflects the DECLARED value subtracted, never the tail.
+    ///
+    /// MUTATION A (counter): comment out the `inject_observe_would_raise.fetch_add`
+    /// → the would_raise assert red-fails.
+    /// MUTATION B (observe-only broken): if the observe were changed to APPLY the
+    /// raise to the reserved worker, the remaining-memory assert red-fails (it would
+    /// read `capacity − would_raise_to`, not `capacity − declared`).
+    #[nativelink_test]
+    async fn inject_observe_raise_only_never_mutates_reservation() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
+
+        // Pre-populate a reliable (≥K) profile whose tail exceeds declared. 50_000
+        // KiB → bucket 16 [2^15,2^16) → tail 2^16 = 65_536 ≫ declared 4096.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        assert_eq!(
+            scheduler.resource_profile_map_len(),
+            1,
+            "profile must be pre-populated before dispatch"
+        );
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xc1, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        // The observe ran and SAW a raise (tail 65536 > declared 4096).
+        assert_eq!(
+            scheduler.metrics.inject_observe_total.load(Ordering::Relaxed),
+            1,
+            "inject_observe_total must advance once per reserved dispatch"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_would_raise
+                .load(Ordering::Relaxed),
+            1,
+            "the profiled tail (65536) exceeds declared (4096) → inject_observe_would_raise \
+             must fire (the counterfactual computed a raise)"
+        );
+
+        // THE contract: the reservation is UNCHANGED. Worker W had 100_000 KiB; the
+        // action declared 4096 → remaining must be 100_000 − 4096 = 95_904, NOT
+        // 100_000 − 65_536 (the would-raise value). Observe changed no reservation.
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(95_904.0),
+            "OBSERVE-ONLY VIOLATED: worker remaining memory_kb must reflect the DECLARED \
+             4096 subtracted (95904), not the counterfactual tail 65536 — the inject-observe \
+             phase must change NO reservation"
+        );
+    }
+
+    /// declared > tail → RAISE-ONLY yields no raise: the counterfactual would_raise_to
+    /// equals declared, so `inject_observe_would_raise` does NOT fire even though a
+    /// reliable profile is present (the residual observed-non-raise case).
+    ///
+    /// MUTATION: change `would_raise_to = declared_kb.max(tail_kb)` to `tail_kb`
+    /// (drop the raise-only floor) → declared 100_000 > tail 65_536 would then read a
+    /// LOWER value ≠ declared → `delta_kb > 0` → would_raise fires → this test red-fails.
+    #[nativelink_test]
+    async fn inject_observe_declared_above_tail_does_not_raise() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 200_000.0).await;
+
+        // Tail 65_536 (from 50_000-KiB samples) is BELOW the declared 100_000.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xc2, 100_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.metrics.inject_observe_total.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_would_raise
+                .load(Ordering::Relaxed),
+            0,
+            "declared (100000) exceeds the profiled tail (65536) → RAISE-ONLY yields no \
+             raise → inject_observe_would_raise must stay 0"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_skipped_low_sample
+                .load(Ordering::Relaxed),
+            0,
+            "the profile has ≥K samples → NOT a low-sample skip"
+        );
+    }
+
+    /// A profile present but with `< K` samples must NOT be trusted: the observe
+    /// counts `inject_observe_skipped_low_sample` and computes no raise (a
+    /// freshly-LRU-re-admitted key is low-sample; pair-a MINOR / A1b K-gate).
+    ///
+    /// MUTATION: comment out the `samples < PROFILE_MIN_SAMPLES` early-return →
+    /// the 1-sample tail (65536 > 4096) would fire would_raise → this test red-fails
+    /// (skipped_low_sample stays 0 AND would_raise becomes 1).
+    #[nativelink_test]
+    async fn inject_observe_skips_low_sample() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
+
+        // Only ONE sample — below K = PROFILE_MIN_SAMPLES (20).
+        scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xc3, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_skipped_low_sample
+                .load(Ordering::Relaxed),
+            1,
+            "a profile with < K samples must be counted skipped_low_sample (tail untrusted)"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_would_raise
+                .load(Ordering::Relaxed),
+            0,
+            "a low-sample key must never compute a counterfactual raise"
+        );
+    }
+
+    /// No usable profile (empty map — the Phase-2a-just-deployed norm): the observe
+    /// counts `inject_observe_skipped_no_profile` and computes no raise.
+    ///
+    /// MUTATION: comment out the `peek_memory_tail(...) else` skip-return → a `None`
+    /// tail would flow on and panic/misbehave; with the skip, the counter fires and
+    /// would_raise stays 0. (Also proves the empty-map dispatch is safe.)
+    #[nativelink_test]
+    async fn inject_observe_skips_no_profile() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
+
+        // NO profile pre-populated — the map is empty.
+        assert_eq!(scheduler.resource_profile_map_len(), 0);
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xc4, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_skipped_no_profile
+                .load(Ordering::Relaxed),
+            1,
+            "an unprofiled key (empty map) must be counted skipped_no_profile"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .inject_observe_would_raise
+                .load(Ordering::Relaxed),
+            0,
+            "no profile → no counterfactual raise"
+        );
+        // The reservation still happened normally: worker remaining = 100000 − 4096.
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(95_904.0),
+            "the observe skip must not disturb the normal reservation"
         );
     }
 

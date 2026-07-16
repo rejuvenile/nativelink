@@ -51,7 +51,8 @@ use uuid::Uuid;
 
 use crate::api_worker_scheduler::{
     ApiWorkerScheduler, HOLD_COUNTERS_LOG_INTERVAL_S, compute_dedup_cached_score,
-    emit_resource_profile_counters_log, emit_speculative_hold_counters_log,
+    emit_inject_observe_counters_log, emit_resource_profile_counters_log,
+    emit_speculative_hold_counters_log,
 };
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
 use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
@@ -2962,6 +2963,11 @@ impl SimpleScheduler {
                         // same DARK-on-/metrics rationale: surface the profile-map
                         // counters so the observe-only signal is readable in prod.
                         emit_resource_profile_counters_log(worker_scheduler.get_metrics());
+                        // (#task-resource-profile Phase-2b) Same spawn-once cadence,
+                        // same DARK-on-/metrics rationale: surface the inject-observe
+                        // counterfactual counters so the observe-only accuracy signal
+                        // (the enforce phase depends on) is readable in prod.
+                        emit_inject_observe_counters_log(worker_scheduler.get_metrics());
                         for (worker_id, construct_latency_ms_p95) in
                             worker_scheduler.construct_latency_snapshot().await
                         {
