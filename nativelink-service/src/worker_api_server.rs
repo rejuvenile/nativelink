@@ -1041,6 +1041,14 @@ impl WorkerApiServer {
             // authoritative ingest clamp, not the proto.
             let p_core_count = connect_worker_request.p_core_count.min(MAX_PLAUSIBLE_CORES);
             let e_core_count = connect_worker_request.e_core_count.min(MAX_PLAUSIBLE_CORES);
+            // (#task-resource-profile Phase-3 §6) Total physical RAM (KiB) rides the
+            // connect frame alongside the core counts. Unclamped: it is an additive
+            // capacity ceiling for the RAISE starvation clamp (larger = more headroom),
+            // NOT a penalty denominator, so an over-report cannot monopolize placement
+            // the way an over-reported core count could — the worst case of an
+            // over-report is a RAISE clamp that leaves an action slightly higher than
+            // any real worker can hold, which the clamp itself then bounds.
+            let total_memory_kb = connect_worker_request.total_memory_kb;
             let worker = Worker::new_with_cas_endpoint(
                 worker_id.clone(),
                 platform_properties,
@@ -1050,6 +1058,7 @@ impl WorkerApiServer {
                 worker_cas_endpoint.clone(),
                 p_core_count,
                 e_core_count,
+                total_memory_kb,
             );
             self.scheduler
                 .add_worker(worker)

@@ -113,6 +113,22 @@ pub struct ConnectWorkerRequest {
     /// / (#sched-blend: continuous cache-vs-load blend)
     #[prost(uint32, tag = "10")]
     pub e_core_count: u32,
+    /// / Total physical RAM on this worker in KiB (KILObytes-of-1024).
+    /// / macOS: hw.memsize / 1024. Linux: MemTotal from /proc/meminfo.
+    /// / 0 = unknown (legacy worker built before this field, or a platform
+    /// / where the query failed — best-effort, never crashes the worker).
+    /// / Static for the worker's lifetime, so it rides the connect hello
+    /// / frame (not the per-tick KeepAlive), alongside p_core_count /
+    /// / e_core_count. The scheduler stores it as `Worker.total_memory_kb`
+    /// / and uses it ONLY for the Phase-3 RAISE starvation clamp (an action
+    /// / whose raised memory_kb exceeds every worker's total RAM is clamped
+    /// / to the max worker capacity so it stays schedulable rather than
+    /// / stranding). `0` means the scheduler cannot bound the action against
+    /// / this worker's capacity, so the clamp treats it as contributing no
+    /// / capacity ceiling (§6 / §7).
+    /// / (#task-resource-profile Phase-3: memory-prediction enforcement)
+    #[prost(uint64, tag = "11")]
+    pub total_memory_kb: u64,
 }
 /// / Per-digest info reported by workers in BlobsAvailableNotification.
 /// / The previous `last_access_timestamp` field (retired tag 2) was a WALL-TIME

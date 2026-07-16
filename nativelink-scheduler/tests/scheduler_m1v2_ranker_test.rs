@@ -84,6 +84,7 @@ async fn setup_worker(
         String::new(),
         4,
         4,
+        0, // total_memory_kb (Phase-3 off in this test)
     );
     scheduler
         .add_worker(worker)

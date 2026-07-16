@@ -178,6 +178,7 @@ async fn add_worker_pcores(
         String::new(),
         p_core_count,
         p_core_count, // e_core_count mirrors; irrelevant to the P gate
+        0,            // total_memory_kb (Phase-3 off in this test)
     );
     scheduler
         .add_worker(worker)

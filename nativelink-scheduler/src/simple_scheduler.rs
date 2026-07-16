@@ -2669,6 +2669,17 @@ impl SimpleScheduler {
         worker_scheduler
             .set_placement_mode(spec.placement_mode, spec.cpu_first_synthetic_pct_per_task);
 
+        // (#task-resource-profile Phase-3) Wire the memory-prediction enforcement
+        // gates from config (all default OFF / factor 1.0 = byte-identical declared-
+        // only reservation ledger). Mirrors the `set_placement_mode` one-shot wiring
+        // above (uncontended try_write on the freshly-built Arc). The observe metric
+        // ships ON regardless of these gates.
+        worker_scheduler.set_phase3_enforcement(
+            spec.phase3_raise_enabled,
+            spec.phase3_down_overcommit_enabled,
+            spec.phase3_overcommit_max_factor,
+        );
+
         let worker_scheduler_clone = worker_scheduler.clone();
 
         let action_scheduler = Arc::new_cyclic(move |weak_self| -> Self {

@@ -81,6 +81,8 @@ fn assert_default_connect_request(actual: ConnectWorkerRequest) {
     let stripped = ConnectWorkerRequest {
         boot_epoch_id: 0,
         build_sha: String::new(),
+        // Host-dependent RAM read (#task-resource-profile Phase-3 §6); strip like the epoch.
+        total_memory_kb: 0,
         ..actual
     };
     assert_eq!(stripped, ConnectWorkerRequest::default());
@@ -136,6 +138,10 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
     // build_sha is set from the running binary's actual SHA per #216;
     // normalize like boot_epoch_id so the assertion is shape-only.
     connect_worker_request.build_sha = String::new();
+    // total_memory_kb is read from the HOST (/proc/meminfo on the Linux CI box)
+    // per Phase-3 §6, so it is environment-dependent — normalize like boot_epoch_id
+    // so the assertion stays shape-only.
+    connect_worker_request.total_memory_kb = 0;
     assert_eq!(
         connect_worker_request,
         ConnectWorkerRequest {
@@ -166,6 +172,8 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
             // back to assume_core_count. (#sched-blend c355fb77)
             p_core_count: 0,
             e_core_count: 0,
+            // Normalized to 0 above (host-dependent RAM read). (#task-resource-profile Phase-3 §6)
+            total_memory_kb: 0,
         }
     );
 
@@ -466,6 +474,10 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
             result: Some(execute_result::Result::ExecuteResponse(
                 ActionStage::Completed(action_result).into()
             )),
+            // Pre-existing gated-target fix (#task-resource-profile Phase-3):
+            // ExecuteResult.resource_usage was added to the proto but this
+            // test-utils target was never updated. None = no usage reported.
+            resource_usage: None,
         }
     );
 
@@ -1057,6 +1069,10 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
             result: Some(execute_result::Result::InternalError(
                 make_err!(Code::ResourceExhausted, "{}", EXPECTED_MSG,).into()
             )),
+            // Pre-existing gated-target fix (#task-resource-profile Phase-3):
+            // ExecuteResult.resource_usage was added to the proto but this
+            // test-utils target was never updated. None = no usage reported.
+            resource_usage: None,
         }
     );
 
@@ -1276,6 +1292,10 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
             result: Some(execute_result::Result::ExecuteResponse(
                 ActionStage::Completed(expected_action_result).into()
             )),
+            // Pre-existing gated-target fix (#task-resource-profile Phase-3):
+            // ExecuteResult.resource_usage was added to the proto but this
+            // test-utils target was never updated. None = no usage reported.
+            resource_usage: None,
         }
     );
 
@@ -1531,6 +1551,10 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
             result: Some(execute_result::Result::InternalError(
                 other_not_found_error.into()
             )),
+            // Pre-existing gated-target fix (#task-resource-profile Phase-3):
+            // ExecuteResult.resource_usage was added to the proto but this
+            // test-utils target was never updated. None = no usage reported.
+            resource_usage: None,
         }
     );
 
@@ -1911,6 +1935,10 @@ async fn non_not_found_with_precondition_detail_does_not_translate() -> Result<(
             instance_name: INSTANCE_NAME.to_string(),
             operation_id: String::new(),
             result: Some(execute_result::Result::InternalError(source_err_clone.into())),
+            // Pre-existing gated-target fix (#task-resource-profile Phase-3):
+            // ExecuteResult.resource_usage was added to the proto but this
+            // test-utils target was never updated. None = no usage reported.
+            resource_usage: None,
         }
     );
 
@@ -2071,6 +2099,10 @@ async fn not_found_with_non_pf_detail_and_no_substring_does_not_translate() -> R
             instance_name: INSTANCE_NAME.to_string(),
             operation_id: String::new(),
             result: Some(execute_result::Result::InternalError(source_err_clone.into())),
+            // Pre-existing gated-target fix (#task-resource-profile Phase-3):
+            // ExecuteResult.resource_usage was added to the proto but this
+            // test-utils target was never updated. None = no usage reported.
+            resource_usage: None,
         }
     );
 

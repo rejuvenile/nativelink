@@ -131,6 +131,7 @@ async fn register_worker_endpoint(
         cas_endpoint.to_string(),
         0,
         0,
+        0, // total_memory_kb (unknown in this test)
     );
     WorkerScheduler::add_worker(scheduler.as_ref(), worker)
         .await

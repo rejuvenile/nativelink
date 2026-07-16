@@ -386,21 +386,45 @@ pub enum ProfileTier {
 /// samples (the ~2.5-samples/key prod regime) can borrow the ALREADY-mature
 /// coarse `(instance, mnemonic)` key's tail, so the observe pipeline has
 /// coverage immediately instead of after the fine keys mature (~18 h).
+/// (#task-resource-profile Phase-3 §8) One key's peeked memory statistics — the
+/// tail (monotone max upper bound), the p50 central estimate, the p95/p50 variance
+/// ratio ×100, and the sample count. Internal bundle so [`ProfileMap::lookup_tiered`]
+/// reads all four in one `peek` per tier.
+#[derive(Clone, Copy, Debug)]
+struct TierStats {
+    tail_kb: u64,
+    p50_kb: u64,
+    variance_ratio_x100: u64,
+    samples: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TieredTail {
     /// The chosen tier (fine preferred, else coarse) reached `>= K` samples — a
-    /// trusted tail. `tier` records WHICH tier; `tail_kb`/`samples` are from it.
+    /// trusted tail. `tier` records WHICH tier; the statistics are from it.
+    ///
+    /// (#task-resource-profile Phase-3 §8) `p50_kb` (the central estimate) and
+    /// `variance_ratio_x100` (memory p95/p50 ×100) ride alongside the `tail_kb`
+    /// so the Phase-3 DOWN-overcommit margin function can size a reserve from the
+    /// central estimate + the measured spread WITHOUT a second map read — the tail
+    /// alone (a monotone max) cannot express "reserve p50 × (1 + margin(variance))".
     Trusted {
         tier: ProfileTier,
         tail_kb: u64,
+        p50_kb: u64,
+        variance_ratio_x100: u64,
         samples: u64,
     },
     /// A profile existed at >= 1 tier but NEITHER reached `K` samples (untrusted
     /// tail). Carries the consulted tier's data (fine preferred) so a dispatch-time
     /// stash can represent "present-but-untrusted" for the leave-one-out check.
+    /// `p50_kb`/`variance_ratio_x100` are carried for symmetry with `Trusted` but
+    /// are NOT trustworthy below `K` (the caller gates on `samples >= K`).
     LowSample {
         tier: ProfileTier,
         tail_kb: u64,
+        p50_kb: u64,
+        variance_ratio_x100: u64,
         samples: u64,
     },
     /// No profile at either tier (map warming / absent baggage).
@@ -577,29 +601,27 @@ impl ProfileMap {
     /// Both reads use `peek` (never `get`) so an observe-only lookup NEVER bumps
     /// LRU recency (design §6 / N-3) for either tier.
     pub fn lookup_tiered(&self, fine: &ProfileKey, coarse: &ProfileKey) -> TieredTail {
-        let fine_peek = self
-            .cache
-            .peek(fine)
-            .map(|agg| (agg.memory_tail_kb(), agg.sample_count()));
-        if let Some((tail_kb, samples)) = fine_peek {
-            if samples >= self.min_samples {
+        let fine_peek = self.peek_tier_stats(fine);
+        if let Some(s) = fine_peek {
+            if s.samples >= self.min_samples {
                 return TieredTail::Trusted {
                     tier: ProfileTier::Fine,
-                    tail_kb,
-                    samples,
+                    tail_kb: s.tail_kb,
+                    p50_kb: s.p50_kb,
+                    variance_ratio_x100: s.variance_ratio_x100,
+                    samples: s.samples,
                 };
             }
         }
-        let coarse_peek = self
-            .cache
-            .peek(coarse)
-            .map(|agg| (agg.memory_tail_kb(), agg.sample_count()));
-        if let Some((tail_kb, samples)) = coarse_peek {
-            if samples >= self.min_samples {
+        let coarse_peek = self.peek_tier_stats(coarse);
+        if let Some(s) = coarse_peek {
+            if s.samples >= self.min_samples {
                 return TieredTail::Trusted {
                     tier: ProfileTier::Coarse,
-                    tail_kb,
-                    samples,
+                    tail_kb: s.tail_kb,
+                    p50_kb: s.p50_kb,
+                    variance_ratio_x100: s.variance_ratio_x100,
+                    samples: s.samples,
                 };
             }
         }
@@ -607,18 +629,37 @@ impl ProfileMap {
         // the caller keeps the low-sample vs no-profile counters (and the accuracy
         // path's leave-one-out low-sample vs no-dispatch classification).
         match (fine_peek, coarse_peek) {
-            (Some((tail_kb, samples)), _) => TieredTail::LowSample {
+            (Some(s), _) => TieredTail::LowSample {
                 tier: ProfileTier::Fine,
-                tail_kb,
-                samples,
+                tail_kb: s.tail_kb,
+                p50_kb: s.p50_kb,
+                variance_ratio_x100: s.variance_ratio_x100,
+                samples: s.samples,
             },
-            (None, Some((tail_kb, samples))) => TieredTail::LowSample {
+            (None, Some(s)) => TieredTail::LowSample {
                 tier: ProfileTier::Coarse,
-                tail_kb,
-                samples,
+                tail_kb: s.tail_kb,
+                p50_kb: s.p50_kb,
+                variance_ratio_x100: s.variance_ratio_x100,
+                samples: s.samples,
             },
             (None, None) => TieredTail::NoProfile,
         }
+    }
+
+    /// (#task-resource-profile Phase-3 §8) Peek one key's memory statistics WITHOUT
+    /// bumping LRU recency (`peek`, never `get`): the tail (monotone max), the p50
+    /// central estimate, the p95/p50 variance ratio ×100, and the sample count.
+    /// `None` when the key is absent. Shared by [`Self::lookup_tiered`] so both
+    /// tiers derive the same stat bundle; the caller applies the `K` gate on
+    /// `samples`.
+    fn peek_tier_stats(&self, key: &ProfileKey) -> Option<TierStats> {
+        self.cache.peek(key).map(|agg| TierStats {
+            tail_kb: agg.memory_tail_kb(),
+            p50_kb: agg.memory_p50(),
+            variance_ratio_x100: agg.memory_variance_ratio_x100(),
+            samples: agg.sample_count(),
+        })
     }
 
     #[inline]
@@ -1039,9 +1080,47 @@ mod tests {
             TieredTail::Trusted {
                 tier: ProfileTier::Fine,
                 tail_kb: 1 << 16,
+                // 50000 → bucket 16 [2^15,2^16) → p50 rep 1.5·2^15 = 49152; a
+                // single-bucket (tight) distribution → p95==p50 → ratio 100.
+                p50_kb: 49_152,
+                variance_ratio_x100: 100,
                 samples: 3,
             },
             "a fine key with ≥K samples must be chosen over coarse (Fine tier, fine's tail)"
+        );
+    }
+
+    #[test]
+    fn lookup_tiered_carries_p50_and_variance_for_the_margin_function() {
+        // (#task-resource-profile Phase-3 §8) The DOWN-overcommit margin function
+        // needs BOTH the central estimate (p50) and the spread (p95/p50 ×100) — the
+        // tail alone (a monotone max) cannot express `p50 × (1 + margin(variance))`.
+        // Prove a SPREAD trusted key threads them through, not just the tail.
+        // 15 samples @1000 (bucket10 rep 768) + 5 @100000 (bucket17 rep 98304), K=20.
+        let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 20, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..15 {
+            map.record(fine.clone(), mem_sample(1000));
+        }
+        for _ in 0..5 {
+            map.record(fine.clone(), mem_sample(100_000));
+        }
+        assert_eq!(
+            map.lookup_tiered(&fine, &coarse),
+            TieredTail::Trusted {
+                tier: ProfileTier::Fine,
+                // tail = upper bound of the highest populated bucket 17 = 2^17.
+                tail_kb: 1 << 17,
+                // p50 rank 10 lands in the 15-sample low mode → bucket10 rep 768.
+                p50_kb: 768,
+                // p95 rank 19 lands in the high mode → bucket17 rep 98304;
+                // variance = 98304·100/768 = 12800 (128×).
+                variance_ratio_x100: 12_800,
+                samples: 20,
+            },
+            "lookup_tiered must carry p50_kb (central estimate) AND variance_ratio_x100 \
+             (p95/p50 ×100) alongside the tail so the Phase-3 margin function can size \
+             p50 × (1 + margin(variance)); a spread key must report p50=768, variance=12800"
         );
     }
 
@@ -1062,6 +1141,8 @@ mod tests {
             TieredTail::Trusted {
                 tier: ProfileTier::Coarse,
                 tail_kb: 1 << 16,
+                p50_kb: 49_152,
+                variance_ratio_x100: 100,
                 samples: 4,
             },
             "fine below K but coarse ≥K → the fallback must borrow the mature coarse tail \
@@ -1086,6 +1167,9 @@ mod tests {
             TieredTail::LowSample {
                 tier: ProfileTier::Fine,
                 tail_kb: 1 << 10,
+                // 1000 → bucket 10 [512,1024) → p50 rep 768; tight → ratio 100.
+                p50_kb: 768,
+                variance_ratio_x100: 100,
                 samples: 2,
             },
             "neither tier reaching K → LowSample carrying the fine (preferred) tier's data"

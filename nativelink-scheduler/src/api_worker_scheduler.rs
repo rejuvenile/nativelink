@@ -791,7 +791,7 @@ pub struct SchedulerMetrics {
     /// `accuracy_predicted_covered ≫ 0` AND a low `skipped_low_sample`/total ratio AND a
     /// workload-stationarity check. This counter watches only the OOM (under) half; the
     /// over-reservation WASTE half is now surfaced separately by
-    /// `accuracy_over_ratio_{max,sum}_x100` + `accuracy_over_samples`.
+    /// `accuracy_over_ratio_{max,sum}_x100` + `predicted_tail_over_actual_samples`.
     #[metric(
         help = "(#task-resource-profile Phase-2c) FALSIFIER: folded samples whose dispatch-time leave-one-out tail under-predicted the actual peak (tail < actual → enforce would under-reserve → OOM risk). Firing DISPROVES safety; ≈0 is necessary-not-sufficient (decays to 0 by construction)"
     )]
@@ -852,9 +852,15 @@ pub struct SchedulerMetrics {
     )]
     pub accuracy_under_ratio_max_x100: AtomicU64,
 
-    /// (#task-resource-profile Phase-2c, Upgrade 2) GAUGE: the WORST (max) observed
-    /// OVER-reservation ratio, `tail * 100 / actual` (×100 integer), over the covered
-    /// (≥K, `tail > actual`) samples. This is the concurrency-starvation half the under
+    /// (#task-resource-profile Phase-3 §4, RENAMED from `accuracy_over_ratio_max_x100`)
+    /// GAUGE: the WORST (max) observed ratio of the PREDICTED TAIL to the ACTUAL
+    /// MEASURED PEAK, `tail * 100 / actual` (×100 integer), over the covered
+    /// (≥K, `tail > actual`) samples. RENAMED per cadre C4: the old
+    /// `accuracy_over_ratio` name misread this as `declared/actual` over-reservation;
+    /// BOTH operands are MEASURED peaks (`tail` = predicted profile tail, `actual` =
+    /// `usage.peak_memory_kb`) — declared is NOT in the ratio. This is the residual
+    /// RAISE-side waste (reserving the tail is `N×` the actual), NOT the DOWN
+    /// opportunity (that is `down_opportunity_*` = declared/p50). This is the
     /// counter is blind to: the coarse `(instance,target,mnemonic)` key blends cheap and
     /// expensive actions, so enforce would reserve the blend-MAX tail for EVERY action —
     /// a cheap action whose real peak is far under the tail is over-reserved by this
@@ -865,27 +871,78 @@ pub struct SchedulerMetrics {
     #[metric(
         help = "(#task-resource-profile Phase-2c) worst observed over-reservation ratio tail*100/actual (×100), max over covered samples where tail>actual (gauge)"
     )]
-    pub accuracy_over_ratio_max_x100: AtomicU64,
+    pub predicted_tail_over_actual_max_x100: AtomicU64,
 
     /// (#task-resource-profile Phase-2c, Upgrade 2) COUNTER: saturating SUM of the
     /// over-reservation ratios (`tail*100/actual`, ×100) across all counted over samples.
-    /// `sum / accuracy_over_samples` is the MEAN over-reservation an operator reads to
+    /// `sum / predicted_tail_over_actual_samples` is the MEAN over-reservation an operator reads to
     /// judge TYPICAL waste (vs the `max` gauge's worst) — the max-only-can't-distinguish
     /// gap the cadre flagged for the under gauge, not repeated here. Saturating so the
     /// degenerate `actual==0` (ratio up to `u64::MAX`) can never wrap the running total.
     #[metric(
-        help = "(#task-resource-profile Phase-2c) saturating sum of over-reservation ratios tail*100/actual (×100) over counted over samples; mean = sum/accuracy_over_samples"
+        help = "(#task-resource-profile Phase-2c) saturating sum of over-reservation ratios tail*100/actual (×100) over counted over samples; mean = sum/predicted_tail_over_actual_samples"
     )]
-    pub accuracy_over_ratio_sum_x100: AtomicU64,
+    pub predicted_tail_over_actual_sum_x100: AtomicU64,
 
     /// (#task-resource-profile Phase-2c, Upgrade 2) COUNTER: number of covered samples
     /// that actually OVER-reserved (`tail > actual`), i.e. the denominator for the mean
     /// over-reservation ratio and the count of how PERVASIVE over-reservation is
-    /// (contrast the single worst spike in `accuracy_over_ratio_max_x100`).
+    /// (contrast the single worst spike in `predicted_tail_over_actual_max_x100`).
     #[metric(
         help = "(#task-resource-profile Phase-2c) count of covered samples that over-reserved (tail > actual); denominator for the mean over-reservation ratio"
     )]
-    pub accuracy_over_samples: AtomicU64,
+    pub predicted_tail_over_actual_samples: AtomicU64,
+
+    /// (#task-resource-profile Phase-3 §4) COUNTER: saturating SUM of the DOWN
+    /// OPPORTUNITY ratio `declared * 100 / p50` (×100 integer) over trusted (≥K)
+    /// dispatches. THIS is the metric the cadre C4 said was missing — the REAL DOWN
+    /// headroom (how far the client-DECLARED reservation sits above the measured
+    /// CENTRAL estimate p50), measured at dispatch from the same tiered lookup the
+    /// enforce phase reads. `sum / down_opportunity_samples` is the TYPICAL
+    /// over-declaration an operator reads to size `phase3_overcommit_max_factor`.
+    /// `> 100` means declared exceeds p50 (DOWN could pack); `== 100` no headroom;
+    /// `< 100` a key that under-declares (RAISE territory, not DOWN). Saturating so a
+    /// degenerate `p50 == 0` (ratio guarded via `p50.max(1)`) can never wrap.
+    #[metric(
+        help = "(#task-resource-profile Phase-3) saturating sum of DOWN-opportunity ratios declared*100/p50 (×100) over trusted (>=K) dispatches; mean = sum/down_opportunity_samples"
+    )]
+    pub down_opportunity_sum_x100: AtomicU64,
+
+    /// (#task-resource-profile Phase-3 §4) GAUGE: the LARGEST observed DOWN-opportunity
+    /// ratio `declared * 100 / p50` (×100) — the single key with the most headroom
+    /// between declared and its p50. Pair with the sum+samples to read TYPICAL vs BEST.
+    /// `0` while no trusted dispatch has been observed.
+    #[metric(
+        help = "(#task-resource-profile Phase-3) largest observed DOWN-opportunity ratio declared*100/p50 (×100) over trusted dispatches (gauge)"
+    )]
+    pub down_opportunity_max_x100: AtomicU64,
+
+    /// (#task-resource-profile Phase-3 §4) COUNTER: trusted (≥K) dispatches on which a
+    /// DOWN-opportunity ratio was folded — the denominator for the mean. Partitioned by
+    /// tier into `_fine` + `_coarse` (they sum to this). A high FINE share means the
+    /// opportunity rests on trustworthy per-target profiles the DOWN direction can use.
+    #[metric(
+        help = "(#task-resource-profile Phase-3) trusted (>=K) dispatches with a folded DOWN-opportunity ratio; denominator for the mean (= _fine + _coarse)"
+    )]
+    pub down_opportunity_samples: AtomicU64,
+
+    /// (#task-resource-profile Phase-3 §4) COUNTER: the FINE-tier subset of
+    /// `down_opportunity_samples` (the tiered lookup resolved to a trusted fine
+    /// `(instance,target,mnemonic)` key). `down_opportunity_fine_samples +
+    /// down_opportunity_coarse_samples == down_opportunity_samples`.
+    #[metric(
+        help = "(#task-resource-profile Phase-3) FINE-tier subset of down_opportunity_samples (trusted fine (instance,target,mnemonic) key)"
+    )]
+    pub down_opportunity_fine_samples: AtomicU64,
+
+    /// (#task-resource-profile Phase-3 §4) COUNTER: the COARSE-tier subset of
+    /// `down_opportunity_samples` (the tiered lookup fell back to a trusted coarse
+    /// `(instance,mnemonic)` blend). A coarse opportunity rests on a higher-variance
+    /// blended p50, so the DOWN margin function penalizes it (larger margin).
+    #[metric(
+        help = "(#task-resource-profile Phase-3) COARSE-tier subset of down_opportunity_samples (trusted coarse (instance,mnemonic) blend)"
+    )]
+    pub down_opportunity_coarse_samples: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -1055,6 +1112,19 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
         profile_lookup_fine = metrics.profile_lookup_fine.load(Ordering::Relaxed),
         profile_lookup_coarse = metrics.profile_lookup_coarse.load(Ordering::Relaxed),
         profile_lookup_skip = metrics.profile_lookup_skip.load(Ordering::Relaxed),
+        // (#task-resource-profile Phase-3 §4) DOWN-opportunity aggregate: the REAL
+        // DOWN headroom (`declared/p50`, ×100) over trusted (≥K) dispatches. mean =
+        // sum/samples (TYPICAL over-declaration), max = BEST single key; the fine/coarse
+        // split shows whether the opportunity rests on trustworthy per-target profiles.
+        down_opportunity_sum_x100 = metrics.down_opportunity_sum_x100.load(Ordering::Relaxed),
+        down_opportunity_max_x100 = metrics.down_opportunity_max_x100.load(Ordering::Relaxed),
+        down_opportunity_samples = metrics.down_opportunity_samples.load(Ordering::Relaxed),
+        down_opportunity_fine_samples = metrics
+            .down_opportunity_fine_samples
+            .load(Ordering::Relaxed),
+        down_opportunity_coarse_samples = metrics
+            .down_opportunity_coarse_samples
+            .load(Ordering::Relaxed),
         "resource profile inject-observe counterfactual counters"
     );
 }
@@ -1068,7 +1138,7 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
 /// monotone max so the under-rate decays to 0 by construction — read `≈0` only alongside
 /// `covered ≫ 0`, a low `skipped_low_sample`/`skipped_no_dispatch` ratio, and a
 /// stationarity check. The over-reservation WASTE half (silent in the under counter) is
-/// surfaced here by `accuracy_over_ratio_{max,sum}_x100` + `accuracy_over_samples`:
+/// surfaced here by `predicted_tail_over_actual_{max,sum}_x100` + `predicted_tail_over_actual_samples`:
 /// `sum/samples` is the TYPICAL over-reservation, `max` the WORST, so an operator can
 /// judge whether injecting the tail would starve concurrency (cadre 2026-07-15). Same
 /// DARK-on-`/metrics` rationale as [`emit_resource_profile_counters_log`] (the
@@ -1080,7 +1150,7 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
 /// Dark-detector invariant an operator checks:
 /// `accuracy_predicted_covered + accuracy_predicted_under + accuracy_skipped_low_sample
 ///  + accuracy_skipped_no_dispatch == profile_samples_total` (every folded sample is
-/// classified into exactly one bucket). `accuracy_over_samples` is a SUBSET of covered.
+/// classified into exactly one bucket). `predicted_tail_over_actual_samples` is a SUBSET of covered.
 /// The tier split further partitions each total EXACTLY:
 /// `accuracy_predicted_covered_fine + accuracy_predicted_covered_coarse ==
 /// accuracy_predicted_covered` and likewise for the two `_under_*` counters.
@@ -1115,13 +1185,13 @@ pub fn emit_prediction_accuracy_counters_log(metrics: &SchedulerMetrics) {
         accuracy_under_ratio_max_x100 = metrics
             .accuracy_under_ratio_max_x100
             .load(Ordering::Relaxed),
-        accuracy_over_ratio_max_x100 = metrics
-            .accuracy_over_ratio_max_x100
+        predicted_tail_over_actual_max_x100 = metrics
+            .predicted_tail_over_actual_max_x100
             .load(Ordering::Relaxed),
-        accuracy_over_ratio_sum_x100 = metrics
-            .accuracy_over_ratio_sum_x100
+        predicted_tail_over_actual_sum_x100 = metrics
+            .predicted_tail_over_actual_sum_x100
             .load(Ordering::Relaxed),
-        accuracy_over_samples = metrics.accuracy_over_samples.load(Ordering::Relaxed),
+        predicted_tail_over_actual_samples = metrics.predicted_tail_over_actual_samples.load(Ordering::Relaxed),
         "resource profile dispatch-time leave-one-out prediction-accuracy counters"
     );
 }
@@ -2073,6 +2143,26 @@ struct ApiWorkerSchedulerImpl {
     /// completion path under the `inner` write lock. Observability/decision-input
     /// state only — it changes NO scheduling decision at Stage C.
     duration_estimate_ewma: DurationEwma,
+
+    /// (#task-resource-profile Phase-3 §7 RAISE) Master gate for the RAISE
+    /// enforcement direction (`SimpleSpec::phase3_raise_enabled`, default OFF).
+    /// When OFF the reservation is byte-identical to the declared-only ledger; the
+    /// observe metric still emits. Read once per reserve under the `inner` write
+    /// lock (the same lock `compute_effective_memory_kb` needs for worker totals).
+    /// Wired post-construction via `set_phase3_enforcement`, mirroring
+    /// `set_placement_mode`, so no constructor call site changes.
+    phase3_raise_enabled: bool,
+
+    /// (#task-resource-profile Phase-3 §3 DOWN) Master gate for the DOWN
+    /// statistical-overcommit direction (`SimpleSpec::phase3_down_overcommit_enabled`,
+    /// default OFF, and inert until `phase3_overcommit_max_factor > 1.0`). Read once
+    /// per reserve under the `inner` write lock.
+    phase3_down_overcommit_enabled: bool,
+
+    /// (#task-resource-profile Phase-3 §6 floor) Profile-INDEPENDENT overcommit
+    /// bound (`SimpleSpec::phase3_overcommit_max_factor`, default 1.0 = DOWN inert).
+    /// The DOWN reserve floors at `declared / max(1.0, this)`; also the DOWN kill-dial.
+    phase3_overcommit_max_factor: f64,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -5456,6 +5546,16 @@ impl ApiWorkerScheduler {
                 // through the full scheduler drive exec-start/duration timing.
                 exec_clock: Arc::new(SystemTime::now),
                 duration_estimate_ewma: DurationEwma::default(),
+                // (#task-resource-profile Phase-3) Enforcement gates default OFF /
+                // inert (factor 1.0). The production wiring (`SimpleScheduler::new`)
+                // injects the configured values via `set_phase3_enforcement`
+                // post-construction (mirrors `set_placement_mode`), so no constructor
+                // call site changes. Factor default sourced from the SAME config
+                // default fn (single source of truth — no drift).
+                phase3_raise_enabled: false,
+                phase3_down_overcommit_enabled: false,
+                phase3_overcommit_max_factor:
+                    nativelink_config::schedulers::default_phase3_overcommit_max_factor(),
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -5583,6 +5683,29 @@ impl ApiWorkerScheduler {
         );
         inner.placement_mode = placement_mode;
         inner.cpu_first_synthetic_pct_per_task = synthetic_pct_per_task;
+    }
+
+    /// (#task-resource-profile Phase-3) Inject the Phase-3 memory-prediction
+    /// enforcement gates (`SimpleSpec::{phase3_raise_enabled,
+    /// phase3_down_overcommit_enabled, phase3_overcommit_max_factor}`). Wired ONCE by
+    /// `SimpleScheduler::new` right after construction, mirroring `set_placement_mode`
+    /// — SYNCHRONOUS one-shot wiring on the freshly-returned `Arc<Self>` before any
+    /// task can hold `inner`, so `try_write()` is uncontended. Tests call it to
+    /// activate RAISE / DOWN before driving a dispatch. All-OFF (the default) leaves
+    /// the reservation byte-identical to the declared-only ledger.
+    pub fn set_phase3_enforcement(
+        &self,
+        raise_enabled: bool,
+        down_overcommit_enabled: bool,
+        overcommit_max_factor: f64,
+    ) {
+        let mut inner = self.inner.try_write().expect(
+            "set_phase3_enforcement must be called during one-shot wiring, before any \
+             task holds the inner lock",
+        );
+        inner.phase3_raise_enabled = raise_enabled;
+        inner.phase3_down_overcommit_enabled = down_overcommit_enabled;
+        inner.phase3_overcommit_max_factor = overcommit_max_factor;
     }
 
     /// (#specprefetch-rebind Stage B/C v3) `T_wait_W`: the worker's expected time to
@@ -5848,7 +5971,7 @@ impl ApiWorkerScheduler {
         // Attribute the leave-one-out result. Exactly ONE counter advances per folded
         // sample, so `covered + under + skipped_low_sample + skipped_no_dispatch ==
         // profile_samples_total` (the dark-detector invariant the periodic accuracy
-        // emit surfaces); `accuracy_over_samples` is a SUBSET of covered.
+        // emit surfaces); `predicted_tail_over_actual_samples` is a SUBSET of covered.
         match accuracy {
             // `tier` selects the per-tier telemetry split below (still OBSERVE-ONLY — it
             // gates NO scheduling decision); it is also carried for the eventual Phase-3
@@ -5881,18 +6004,18 @@ impl ApiWorkerScheduler {
                 // cannot tell a rare-severe outlier from pervasive waste.
                 if let Some(over) = over_ratio_x100 {
                     self.metrics
-                        .accuracy_over_ratio_max_x100
+                        .predicted_tail_over_actual_max_x100
                         .fetch_max(over, Ordering::Relaxed);
                     // Saturating so a degenerate actual==0 (over up to u64::MAX) can
                     // never wrap the running total. Telemetry — the fetch_update loop
                     // runs once per over-sample on the completion path.
-                    let _ = self.metrics.accuracy_over_ratio_sum_x100.fetch_update(
+                    let _ = self.metrics.predicted_tail_over_actual_sum_x100.fetch_update(
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                         |s| Some(s.saturating_add(over)),
                     );
                     self.metrics
-                        .accuracy_over_samples
+                        .predicted_tail_over_actual_samples
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -6013,11 +6136,13 @@ impl ApiWorkerScheduler {
             .resource_profile_map
             .lock()
             .lookup_tiered(&fine_key, &coarse_key);
-        let (tier, tail_kb, samples) = match lookup {
+        let (tier, tail_kb, p50_kb, samples) = match lookup {
             TieredTail::Trusted {
                 tier,
                 tail_kb,
+                p50_kb,
                 samples,
+                ..
             } => {
                 // Record WHICH tier resolved (fine + coarse + skip partition total).
                 match tier {
@@ -6025,7 +6150,7 @@ impl ApiWorkerScheduler {
                     ProfileTier::Coarse => &self.metrics.profile_lookup_coarse,
                 }
                 .fetch_add(1, Ordering::Relaxed);
-                (tier, tail_kb, samples)
+                (tier, tail_kb, p50_kb, samples)
             }
             TieredTail::LowSample { .. } => {
                 // A profile exists at some tier but below K → tail untrusted (pair-a
@@ -6065,6 +6190,30 @@ impl ApiWorkerScheduler {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
+        // (#task-resource-profile Phase-3 §4) DOWN-OPPORTUNITY observe metric — the
+        // REAL DOWN headroom (`declared / p50`, ×100) the cadre C4 said was missing.
+        // Measured here on the TRUSTED (≥K) tiered lookup so it uses the same central
+        // estimate the enforce phase's margin function reads. `p50.max(1)` guards a
+        // degenerate ≥K all-zero-memory key (ratio finite, never a divide-by-zero).
+        // OBSERVE-ONLY: emitted whether or not any enforcement flag is on (ships ON).
+        let down_opportunity_x100 = declared_kb.saturating_mul(100) / p50_kb.max(1);
+        self.metrics
+            .down_opportunity_max_x100
+            .fetch_max(down_opportunity_x100, Ordering::Relaxed);
+        let _ = self.metrics.down_opportunity_sum_x100.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |s| Some(s.saturating_add(down_opportunity_x100)),
+        );
+        self.metrics
+            .down_opportunity_samples
+            .fetch_add(1, Ordering::Relaxed);
+        match tier {
+            ProfileTier::Fine => &self.metrics.down_opportunity_fine_samples,
+            ProfileTier::Coarse => &self.metrics.down_opportunity_coarse_samples,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+
         // Rate-limited (≤ 1/s) per-decision sample so an operator can SEE one
         // decision's key/declared/tail/would_raise/delta without flooding.
         let now = Instant::now();
@@ -6092,6 +6241,10 @@ impl ApiWorkerScheduler {
                 tail_stat_kb = tail_kb,
                 would_raise_to_kb = would_raise_to,
                 delta_kb,
+                // (#task-resource-profile Phase-3 §4) DOWN-opportunity spot values:
+                // the central estimate and the declared/p50 gap (×100) for this key.
+                p50_kb,
+                down_opportunity_x100,
                 "resource-profile inject-observe counterfactual (OBSERVE-ONLY; no reservation changed)"
             );
         }
@@ -6505,11 +6658,13 @@ impl ApiWorkerScheduler {
                         tier,
                         tail_kb,
                         samples,
+                        ..
                     }
                     | TieredTail::LowSample {
                         tier,
                         tail_kb,
                         samples,
+                        ..
                     } => Some((tier, tail_kb, samples)),
                     TieredTail::NoProfile => None,
                 };
@@ -15117,6 +15272,7 @@ mod tests {
             cas_endpoint.to_string(),
             0, // p_core_count (unknown in this test)
             0, // e_core_count (unknown in this test)
+            0, // total_memory_kb (unknown in this test)
         );
         scheduler.add_worker(worker).await.expect("add_worker");
         rx
@@ -17098,6 +17254,72 @@ mod b1_lock_decouple_tests {
         );
     }
 
+    /// (#task-resource-profile Phase-3 §4) DOWN-OPPORTUNITY observe metric: when a
+    /// trusted (≥K) profile's p50 sits BELOW the client-declared `memory_kb`, the
+    /// dispatch folds `declared*100/p50` (×100) into the `down_opportunity_*`
+    /// aggregate — the REAL DOWN headroom the cadre C4 said was missing. 20 samples
+    /// @2000 KiB → p50 = 1536 (bucket 11 rep); declared 15_360 → ratio 1000 (10.0×),
+    /// tier Fine. No raise fires (declared > tail 2048), so this is a pure DOWN case.
+    ///
+    /// MUTATION: comment out `down_opportunity_samples.fetch_add` in
+    /// `observe_inject_counterfactual` → `down_opportunity_samples` stays 0 → the
+    /// samples assert red-fails with its bespoke message.
+    #[nativelink_test]
+    async fn down_opportunity_metric_folds_declared_over_p50() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
+
+        // Pre-populate a trusted (≥K) profile whose p50 (1536) sits well BELOW the
+        // declared 15_360 — a genuine DOWN-overcommit opportunity.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(2000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xdb, 15_360.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 15_360.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.metrics.down_opportunity_samples.load(Ordering::Relaxed),
+            1,
+            "a trusted (≥K) dispatch with declared>p50 must fold exactly one \
+             down_opportunity sample"
+        );
+        assert_eq!(
+            scheduler.metrics.down_opportunity_sum_x100.load(Ordering::Relaxed),
+            1000,
+            "down_opportunity = declared*100/p50 = 15360*100/1536 = 1000 (10.0×) must be \
+             summed — this is the REAL DOWN headroom (declared vs the p50 central estimate)"
+        );
+        assert_eq!(
+            scheduler.metrics.down_opportunity_max_x100.load(Ordering::Relaxed),
+            1000,
+            "the single sample's ratio (1000) must set the max gauge"
+        );
+        assert_eq!(
+            scheduler.metrics.down_opportunity_fine_samples.load(Ordering::Relaxed),
+            1,
+            "the trusted profile resolved to the FINE tier → the fine subset counter must fire"
+        );
+        assert_eq!(
+            scheduler.metrics.down_opportunity_coarse_samples.load(Ordering::Relaxed),
+            0,
+            "no coarse fallback occurred → the coarse subset must stay 0 (fine+coarse==samples)"
+        );
+        // The RAISE-side would_raise must NOT fire: declared 15360 > tail 2048, so this
+        // is a pure DOWN opportunity, cleanly separated from the RAISE signal.
+        assert_eq!(
+            scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
+            0,
+            "declared (15360) exceeds the tail (2048) → no raise; DOWN opportunity only"
+        );
+    }
+
     // ── (#task-resource-profile hierarchical-key) fine→coarse fallback ──
 
     /// An action carrying `target`/`mnemonic` Bazel baggage (for the fold key), no
@@ -17662,9 +17884,9 @@ mod b1_lock_decouple_tests {
              got low={skipped_low} no_dispatch={skipped_nd}"
         );
         assert_eq!(
-            scheduler.metrics.accuracy_over_samples.load(Ordering::Relaxed),
+            scheduler.metrics.predicted_tail_over_actual_samples.load(Ordering::Relaxed),
             0,
-            "an EXACT cover (tail == actual) is not over-reservation → accuracy_over_samples \
+            "an EXACT cover (tail == actual) is not over-reservation → predicted_tail_over_actual_samples \
              must stay 0"
         );
         // Dark-detector invariant: covered + under + skipped_low + skipped_no_dispatch ==
@@ -17823,9 +18045,9 @@ mod b1_lock_decouple_tests {
     /// max). Dispatch `Some((65536, 20))`, actual 16_384 → over ratio =
     /// 65536*100/16384 = 400.
     ///
-    /// MUTATION A: comment out `accuracy_over_ratio_max_x100.fetch_max` → max stays 0.
-    /// MUTATION B: comment out the `accuracy_over_ratio_sum_x100.fetch_update` → sum 0.
-    /// MUTATION C: comment out `accuracy_over_samples.fetch_add` → count stays 0.
+    /// MUTATION A: comment out `predicted_tail_over_actual_max_x100.fetch_max` → max stays 0.
+    /// MUTATION B: comment out the `predicted_tail_over_actual_sum_x100.fetch_update` → sum 0.
+    /// MUTATION C: comment out `predicted_tail_over_actual_samples.fetch_add` → count stays 0.
     #[nativelink_test]
     async fn accuracy_over_reservation_ratio_recorded() {
         let wsm = BarrierWorkerStateManager::new();
@@ -17846,19 +18068,19 @@ mod b1_lock_decouple_tests {
             "an over-reserved cover is not an under"
         );
         assert_eq!(
-            scheduler.metrics.accuracy_over_samples.load(Ordering::Relaxed),
+            scheduler.metrics.predicted_tail_over_actual_samples.load(Ordering::Relaxed),
             1,
             "tail (65536) STRICTLY exceeds actual (16384) → one over-reservation sample \
-             must be counted (accuracy_over_samples)"
+             must be counted (predicted_tail_over_actual_samples)"
         );
         assert_eq!(
-            scheduler.metrics.accuracy_over_ratio_max_x100.load(Ordering::Relaxed),
+            scheduler.metrics.predicted_tail_over_actual_max_x100.load(Ordering::Relaxed),
             400,
             "the over-reservation ratio (tail*100/actual = 65536*100/16384) must be \
              recorded as 400 (×100) in the max gauge"
         );
         assert_eq!(
-            scheduler.metrics.accuracy_over_ratio_sum_x100.load(Ordering::Relaxed),
+            scheduler.metrics.predicted_tail_over_actual_sum_x100.load(Ordering::Relaxed),
             400,
             "the single over sample's ratio (400) must be added to the saturating sum \
              (sum/samples = mean over-reservation)"
@@ -18128,6 +18350,7 @@ mod b1_lock_decouple_tests {
             String::new(),
             p_core_count,
             p_core_count,
+            0, // total_memory_kb (not exercised by these temporal-order tests)
         );
         scheduler.add_worker(worker).await.expect("add_worker");
         rx
@@ -19673,6 +19896,7 @@ mod b1_lock_decouple_tests {
                     y_endpoint.to_string(),
                     8,
                     0,
+                    0,
                 );
                 worker.set_core_counts(8, 0);
                 scheduler.add_worker(worker).await.expect("add Y_BLOB");
@@ -19754,6 +19978,7 @@ mod b1_lock_decouple_tests {
                     0,
                     x_endpoint.to_string(),
                     8,
+                    0,
                     0,
                 );
                 scheduler.add_worker(worker).await.expect("add X_BLOB");
@@ -20052,6 +20277,7 @@ mod b1_lock_decouple_tests {
                     0,
                     x_endpoint.to_string(),
                     8,
+                    0,
                     0,
                 );
                 scheduler.add_worker(worker).await.expect("add X_BLOB");

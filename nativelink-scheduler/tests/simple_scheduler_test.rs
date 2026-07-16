@@ -143,6 +143,7 @@ async fn setup_new_worker_with_core_counts(
         String::new(), // no CAS endpoint — counts only, no locality wiring
         p_core_count,
         e_core_count,
+        0, // total_memory_kb (Phase-3 off in this test)
     );
     scheduler
         .add_worker(worker)
@@ -3544,6 +3545,7 @@ async fn setup_new_worker_with_cas_endpoint(
         cas_endpoint.to_string(),
         0, // p_core_count (#sched-blend; unknown in this test)
         0, // e_core_count
+        0, // total_memory_kb (unknown in this test)
     );
     scheduler
         .add_worker(worker)
@@ -3579,6 +3581,7 @@ async fn setup_new_worker_with_cas_endpoint_and_cores(
         cas_endpoint.to_string(),
         p_core_count,
         e_core_count,
+        0, // total_memory_kb (Phase-3 off in this test)
     );
     scheduler
         .add_worker(worker)

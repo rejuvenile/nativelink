@@ -413,3 +413,80 @@ async fn schedmetric_drain_updates_workers_at_capacity_immediately() -> Result<(
 
     Ok(())
 }
+
+/// (#task-resource-profile Phase-3 §4) RENDER TEST — pins the LITERAL Phase-3
+/// observe-metric names on the rendered `/metrics` surface, at 0, so the
+/// dark-counter trap cannot hide them: an absent name (dropped `#[metric]`, a
+/// typo, or a rename that misses the emit) would fail here. Covers BOTH the NEW
+/// `down_opportunity_*` DOWN-headroom counters (§4) AND the RELABELED
+/// `predicted_tail_over_actual_*` counters (cadre C4 — formerly the misread
+/// `accuracy_over_ratio_*`), so a future rename must update the pinned name here.
+///
+/// MUTATION: rename any of the pinned `#[metric]` fields (e.g.
+/// `down_opportunity_sum_x100`) without updating this test → the corresponding
+/// `body.contains(...)` red-fails with its bespoke message.
+#[nativelink_test]
+async fn schedmetric_phase3_observe_metric_names_render() -> Result<(), Error> {
+    let task_notify = Arc::new(Notify::new());
+    let awaited_action_db = memory_awaited_action_db_factory(
+        0,
+        &task_notify.clone(),
+        MockInstantWrapped::default,
+    );
+    let spec = SimpleSpec {
+        worker_timeout_s: 100,
+        ..Default::default()
+    };
+    let (scheduler, worker_scheduler) = SimpleScheduler::new(
+        &spec,
+        awaited_action_db,
+        task_notify.clone(),
+        None,
+    );
+
+    let registry = make_and_register(scheduler, worker_scheduler);
+    let body = render_prometheus(&registry);
+
+    // ── §4 DOWN-opportunity counters (declared/p50 headroom) ──
+    for name in [
+        "down_opportunity_sum_x100",
+        "down_opportunity_max_x100",
+        "down_opportunity_samples",
+        "down_opportunity_fine_samples",
+        "down_opportunity_coarse_samples",
+    ] {
+        assert!(
+            body.contains(&format!(
+                "\nscheduler_test_worker_scheduler_metrics_{name} 0\n"
+            )),
+            "#phase3-observe: the §4 DOWN-opportunity metric `{name}` must render at 0 on \
+             an idle scheduler (dark-counter trap: an absent name would make the DOWN \
+             headroom invisible). body=\n{body}"
+        );
+    }
+
+    // ── C4 relabel: predicted_tail_over_actual_* (formerly accuracy_over_ratio_*) ──
+    for name in [
+        "predicted_tail_over_actual_max_x100",
+        "predicted_tail_over_actual_sum_x100",
+        "predicted_tail_over_actual_samples",
+    ] {
+        assert!(
+            body.contains(&format!(
+                "\nscheduler_test_worker_scheduler_metrics_{name} 0\n"
+            )),
+            "#phase3-observe: the RELABELED metric `{name}` (cadre C4 — the old \
+             `accuracy_over_ratio_*` misread declared/actual) must render at 0; a stale \
+             `accuracy_over_ratio_*` name here means the relabel was incomplete. body=\n{body}"
+        );
+    }
+    // The OLD mislabeled names must be GONE (the relabel must be complete).
+    assert!(
+        !body.contains("accuracy_over_ratio_max_x100")
+            && !body.contains("accuracy_over_samples"),
+        "#phase3-observe: the old mislabeled `accuracy_over_*` metric names must NOT render \
+         after the C4 relabel. body=\n{body}"
+    );
+
+    Ok(())
+}

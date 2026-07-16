@@ -136,6 +136,26 @@ mod cpu_impl {
     pub(super) const fn core_counts() -> (u32, u32) {
         (0, 0)
     }
+
+    /// (#task-resource-profile Phase-3 §6) Total physical RAM in KiB from
+    /// `/proc/meminfo` `MemTotal` (already reported in kB by the kernel).
+    /// `0` on any read/parse failure — best-effort, never crashes the worker;
+    /// the scheduler treats `0` as "unknown" (contributes no RAISE-clamp
+    /// capacity ceiling). Read ONCE at connect (static for the worker's life).
+    pub(super) fn total_memory_kb() -> u64 {
+        let Ok(contents) = std::fs::read_to_string("/proc/meminfo") else {
+            return 0;
+        };
+        for line in contents.lines() {
+            // Format: "MemTotal:       16327624 kB"
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    return kb.parse().unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -193,6 +213,35 @@ mod cpu_impl {
     /// free core capacity. Both `OnceLock`-cached — no per-call syscall.
     pub(super) fn core_counts() -> (u32, u32) {
         (p_core_count(), e_core_count())
+    }
+
+    /// (#task-resource-profile Phase-3 §6) Total physical RAM in KiB from the
+    /// `hw.memsize` sysctl (reported in BYTES) divided by 1024. `0` on failure —
+    /// best-effort, never crashes the worker. `OnceLock`-cached (static for the
+    /// worker's life). The scheduler treats `0` as "unknown" (no RAISE-clamp
+    /// capacity ceiling).
+    pub(super) fn total_memory_kb() -> u64 {
+        use std::sync::OnceLock;
+        static KB: OnceLock<u64> = OnceLock::new();
+        *KB.get_or_init(|| sysctl_u64("hw.memsize").map_or(0, |bytes| bytes / 1024))
+    }
+
+    fn sysctl_u64(name: &str) -> Option<u64> {
+        use std::ffi::CString;
+        let cname = CString::new(name).ok()?;
+        let mut val: u64 = 0;
+        let mut len = core::mem::size_of::<u64>();
+        // SAFETY: sysctlbyname is a stable POSIX API on macOS.
+        let ret = unsafe {
+            libc::sysctlbyname(
+                cname.as_ptr(),
+                &raw mut val as *mut _,
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 { Some(val) } else { None }
     }
 
     fn sysctl_u32(name: &str) -> Option<u32> {
@@ -306,6 +355,12 @@ mod cpu_impl {
     /// the scheduler uses its `assume_core_count` fallback.
     pub(super) const fn core_counts() -> (u32, u32) {
         (0, 0)
+    }
+
+    /// (#task-resource-profile Phase-3 §6) No RAM query on this platform →
+    /// `0` ("unknown"); the scheduler contributes no RAISE-clamp ceiling.
+    pub(super) const fn total_memory_kb() -> u64 {
+        0
     }
 }
 
@@ -7623,6 +7678,10 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
         // scheduling. macOS reports real counts; Linux/other report (0,0)
         // → scheduler uses `assume_core_count`. OnceLock-cached, no syscall.
         let (p_core_count, e_core_count) = cpu_impl::core_counts();
+        // (#task-resource-profile Phase-3 §6) Total physical RAM (KiB), static for
+        // the worker's life, rides the same connect frame as the core counts. `0` on
+        // an unsupported platform / query failure → scheduler treats as unknown.
+        let total_memory_kb = cpu_impl::total_memory_kb();
         let connect_worker_request = make_connect_worker_request(
             self.config.name.clone(),
             &self.config.platform_properties,
@@ -7631,6 +7690,7 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             cas_endpoint,
             p_core_count,
             e_core_count,
+            total_memory_kb,
         )
         .await?;
         let mut update_for_worker_stream = client

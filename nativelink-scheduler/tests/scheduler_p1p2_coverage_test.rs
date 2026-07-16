@@ -143,6 +143,7 @@ async fn setup_new_worker_with_core_counts(
         String::new(),
         p_core_count,
         e_core_count,
+        0, // total_memory_kb (Phase-3 off in this test)
     );
     scheduler
         .add_worker(worker)

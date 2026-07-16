@@ -23,7 +23,7 @@ async fn make_connect_worker_request_with_extra_envs() -> Result<(), Error> {
     extra_envs.insert("PATH".into(), env::var("PATH").unwrap());
 
     let res =
-        make_connect_worker_request("1234".to_string(), &worker_properties, &extra_envs, 1, String::new(), 8, 4).await?;
+        make_connect_worker_request("1234".to_string(), &worker_properties, &extra_envs, 1, String::new(), 8, 4, 16_777_216).await?;
     assert_eq!(
         res.properties.first(),
         Some(&Property {
@@ -34,6 +34,11 @@ async fn make_connect_worker_request_with_extra_envs() -> Result<(), Error> {
     // (#sched-blend) the two new core-count args plumb into the hello frame.
     assert_eq!(res.p_core_count, 8, "p_core_count must be carried on the connect frame");
     assert_eq!(res.e_core_count, 4, "e_core_count must be carried on the connect frame");
+    // (#task-resource-profile Phase-3 §6) total RAM plumbs onto the hello frame.
+    assert_eq!(
+        res.total_memory_kb, 16_777_216,
+        "total_memory_kb must be carried on the connect frame (Phase-3 RAISE clamp input)"
+    );
     Ok(())
 }
 
@@ -54,6 +59,7 @@ async fn make_connect_worker_request_populates_build_sha() -> Result<(), Error> 
         &extra_envs,
         1,
         String::new(),
+        0,
         0,
         0,
     )

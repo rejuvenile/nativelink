@@ -155,6 +155,22 @@ fn simple_spec_default_matches_deserialize_empty() {
          dispatch-decision diagnostic dump is OFF by default; an operator turns it ON \
          briefly via config to diagnose a placement question, then OFF)"
     );
+    assert_eq!(
+        derived.phase3_raise_enabled, deserialized.phase3_raise_enabled,
+        "phase3_raise_enabled default drift (both should be false — RAISE \
+         enforcement OFF by default; Phase-3 ships flag-gated OFF)"
+    );
+    assert_eq!(
+        derived.phase3_down_overcommit_enabled, deserialized.phase3_down_overcommit_enabled,
+        "phase3_down_overcommit_enabled default drift (both should be false — \
+         DOWN overcommit OFF by default)"
+    );
+    assert_eq!(
+        derived.phase3_overcommit_max_factor, deserialized.phase3_overcommit_max_factor,
+        "phase3_overcommit_max_factor default drift — serde default is 1.0 \
+         (default_phase3_overcommit_max_factor = DOWN inert); a bare #[serde(default)] \
+         would yield 0.0 → floor declared/0 = +inf and break the clamp"
+    );
 }
 
 /// Direct assertions on the concrete default values, so the intent is legible
@@ -230,5 +246,21 @@ fn simple_spec_default_concrete_values() {
         "cpu_first_synthetic_pct_per_task default must be 25 \
          (default_cpu_first_synthetic_pct_per_task); a bare #[serde(default)] would \
          yield 0 and disable the anti-pile synthetic bridge under CpuIdleFirst"
+    );
+    assert!(
+        !spec.phase3_raise_enabled,
+        "phase3_raise_enabled default must be FALSE — Phase-3 memory-prediction \
+         enforcement ships flag-gated OFF (architectural reservation-ledger change)"
+    );
+    assert!(
+        !spec.phase3_down_overcommit_enabled,
+        "phase3_down_overcommit_enabled default must be FALSE — DOWN statistical \
+         overcommit ships hard-OFF until a workload + observe metric justify it"
+    );
+    assert_eq!(
+        spec.phase3_overcommit_max_factor, 1.0,
+        "phase3_overcommit_max_factor default must be 1.0 \
+         (default_phase3_overcommit_max_factor) — floor == declared → DOWN inert even \
+         if enabled; NOT the f64 type default 0.0, which would make the floor +inf"
     );
 }

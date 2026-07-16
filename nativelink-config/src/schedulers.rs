@@ -487,6 +487,52 @@ pub struct SimpleSpec {
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub cpu_first_synthetic_pct_per_task: u32,
+
+    /// (#task-resource-profile Phase-3 §7 RAISE) Master gate for the RAISE
+    /// enforcement direction: reserve `max(declared_memory_kb, profiled_tail)`
+    /// instead of the client-declared `memory_kb`. OOM-SAFE (it only ever tightens
+    /// the reservation upward toward the measured worst-case tail), so a link step
+    /// whose client under-declares memory cannot over-pack a worker into an OOM.
+    ///
+    /// Default: false (OFF). Phase-3 is an ARCHITECTURAL change to the reservation
+    /// ledger; it ships flag-gated OFF and is enabled per-workload once the observe
+    /// metric (`down_opportunity_*` / `predicted_tail_over_actual_*`) shows the
+    /// profiles are K-mature and accurate. When OFF the reservation is byte-identical
+    /// to today's declared-only ledger (the observe metric still emits). The flag is
+    /// the operational KILL-SWITCH, not a permanent resting state.
+    #[serde(default)]
+    pub phase3_raise_enabled: bool,
+
+    /// (#task-resource-profile Phase-3 §3 DOWN) Master gate for the DOWN
+    /// statistical-OVERCOMMIT direction: reserve a CENTRAL estimate
+    /// `p50 × (1 + margin(variance, tier))` clamped into
+    /// `[declared / phase3_overcommit_max_factor, declared]` — BELOW the declared
+    /// value — so more actions pack per worker. Safety rests on the worker
+    /// `memory_gate` NAK backstop (re-queue on real pressure), NOT the prediction.
+    ///
+    /// Default: false (OFF) AND inert even when ON until
+    /// `phase3_overcommit_max_factor > 1.0` (the floor `declared / 1.0 == declared`
+    /// pins the reserve at declared). HARD-OFF until a future workload + the observe
+    /// metric show real DOWN headroom and the backstop is proven. When OFF the
+    /// reservation is byte-identical to today.
+    #[serde(default)]
+    pub phase3_down_overcommit_enabled: bool,
+
+    /// (#task-resource-profile Phase-3 §6 floor) The profile-INDEPENDENT overcommit
+    /// bound: the DOWN reserve is floored at `declared / phase3_overcommit_max_factor`,
+    /// so a single wrong-low prediction can under-reserve by at most this factor
+    /// (a config CONSTANT, NOT derived from the poisonable per-key histogram). It is
+    /// ALSO the DOWN kill-dial: `1.0` (the default) makes the floor equal the declared
+    /// value → DOWN is INERT even when `phase3_down_overcommit_enabled` is true; the
+    /// operator dials it up (e.g. `2.0` = allow reserving down to half of declared)
+    /// per workload as the observe metric justifies. Values `< 1.0` are clamped to
+    /// `1.0` at use (a factor below 1 would RAISE the floor above declared, which is
+    /// the RAISE direction's job). Has no effect on the RAISE direction.
+    ///
+    /// Numeric-constant note (reviewer rule): verify at the `default_phase3_overcommit_max_factor`
+    /// declaration, not from this doc-comment. The literal there is the ship default.
+    #[serde(default = "default_phase3_overcommit_max_factor")]
+    pub phase3_overcommit_max_factor: f64,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -570,8 +616,32 @@ impl Default for SimpleSpec {
             placement_mode: PlacementMode::default(),
             // #[serde(default = "default_cpu_first_synthetic_pct_per_task")] → 25.
             cpu_first_synthetic_pct_per_task: default_cpu_first_synthetic_pct_per_task(),
+            // (#task-resource-profile Phase-3) #[serde(default)] → bool false =
+            // RAISE enforcement OFF (byte-identical declared-only ledger until an
+            // operator enables it; the observe metric still emits).
+            phase3_raise_enabled: false,
+            // #[serde(default)] → bool false = DOWN overcommit OFF (and inert until
+            // phase3_overcommit_max_factor > 1.0 even if flipped on).
+            phase3_down_overcommit_enabled: false,
+            // #[serde(default = "default_phase3_overcommit_max_factor")] → 1.0 =
+            // DOWN inert (floor == declared). NOT the f64 type default (0.0), which
+            // would make the floor `declared/0` = +inf and invert the clamp.
+            phase3_overcommit_max_factor: default_phase3_overcommit_max_factor(),
         }
     }
+}
+
+/// (#task-resource-profile Phase-3 §6) Default profile-independent overcommit
+/// factor: `1.0` = DOWN inert (the floor `declared / 1.0 == declared` pins the
+/// reserve at the declared value even when `phase3_down_overcommit_enabled` is on).
+/// MUST be a named default fn (not a bare `#[serde(default)]`, whose f64 `0.0`
+/// would make the floor `declared / 0.0 == +inf` and break the clamp). An operator
+/// dials it up per workload (e.g. `2.0` = reserve down to half of declared). `pub`
+/// for the single-source-of-truth reason as the sibling defaults.
+///
+/// Numeric-constant rule: the literal below is the authoritative ship default.
+pub fn default_phase3_overcommit_max_factor() -> f64 {
+    1.0
 }
 
 /// (#sched-cpu-first §3) Default synthetic P-load per assigned-but-unreported

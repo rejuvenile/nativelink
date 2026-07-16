@@ -257,6 +257,18 @@ pub struct Worker {
     #[metric(help = "Number of E logical CPUs reported by the worker (0 = none/unknown).")]
     pub e_core_count: u32,
 
+    /// (#task-resource-profile Phase-3 §6) Total physical RAM this worker reported
+    /// on its connect hello frame, in KiB. Static for the worker's lifetime (RAM
+    /// does not change at runtime), so it rides the connect frame, not the per-tick
+    /// load path. `0` means the worker did not report it (legacy worker, or a
+    /// platform where the RAM query failed) — the Phase-3 RAISE starvation clamp
+    /// treats `0` as "unknown / contributes no capacity ceiling" so a non-reporting
+    /// worker never becomes the clamp's `max_worker_total_memory_kb`. NEEDED because
+    /// `platform_properties["memory_kb"]` holds only the REMAINING reservation
+    /// budget (decremented in place by `reduce_platform_properties`), not the total.
+    #[metric(help = "Total physical RAM reported by the worker (KiB); 0 = unknown.")]
+    pub total_memory_kb: u64,
+
     /// (FL-681 re-saturation gate) Whether the worker's local CAS
     /// FilesystemStore reported its indefinite-pin cap saturated in its last
     /// `BlobsAvailable` heartbeat. While `true`, the matcher
@@ -385,6 +397,7 @@ impl Worker {
             String::new(),
             0,
             0,
+            0,
         )
     }
 
@@ -397,6 +410,7 @@ impl Worker {
         cas_endpoint: String,
         p_core_count: u32,
         e_core_count: u32,
+        total_memory_kb: u64,
     ) -> Self {
         Self {
             id,
@@ -422,6 +436,7 @@ impl Worker {
             running_at_last_load_report: 0,
             p_core_count,
             e_core_count,
+            total_memory_kb,
             indefinite_pin_saturated: false,
             swap_pressured: false,
             swap_pressure_rate_per_sec: 0,

@@ -61,6 +61,7 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
     cas_endpoint: String,
     p_core_count: u32,
     e_core_count: u32,
+    total_memory_kb: u64,
 ) -> Result<ConnectWorkerRequest, Error> {
     let mut futures = vec![];
     for (property_name, worker_property) in worker_properties {
@@ -147,5 +148,9 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         // (Linux / Intel Mac) → scheduler uses `assume_core_count`.
         p_core_count,
         e_core_count,
+        // (#task-resource-profile Phase-3 §6) static total physical RAM (KiB)
+        // for the RAISE starvation clamp. `0` = unknown (unsupported platform /
+        // query failure) → scheduler contributes no clamp ceiling for this worker.
+        total_memory_kb,
     })
 }
