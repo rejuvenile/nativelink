@@ -707,22 +707,30 @@ pub struct SchedulerMetrics {
     pub inject_observe_skipped_no_profile: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose LEAVE-ONE-OUT
-    /// profile tail (the profile-so-far, EXCLUDING this sample — the reservation the
-    /// enforce phase would have stood at this action's dispatch) COVERED the action's
-    /// ACTUAL measured peak (`tail >= peak_memory_kb`). A safe over-estimate: enforce
-    /// would have reserved enough.
+    /// profile tail (the profile-so-far, EXCLUDING this sample) COVERED the action's
+    /// ACTUAL measured peak (`tail >= peak_memory_kb`). NOTE the tail is recomputed at
+    /// COMPLETION (a monotone max), so it is >= the tail that stood at dispatch —
+    /// `Covered` is thus HINDSIGHT-optimistic (see `accuracy_predicted_under`).
     #[metric(
         help = "(#task-resource-profile Phase-2c) folded samples whose leave-one-out profile tail covered the actual peak (tail >= actual; safe over-estimate)"
     )]
     pub accuracy_predicted_covered: AtomicU64,
 
-    /// (#task-resource-profile Phase-2c) COUNTER — the LOAD-BEARING Phase-3 gate
-    /// signal: folded samples whose leave-one-out profile tail UNDER-predicted the
-    /// action's actual peak (`tail < peak_memory_kb`). DANGEROUS: enforce would have
-    /// under-reserved this action → OOM risk. If this stays ≈0 across a soak the tail
-    /// is a safe reservation; if it fires often, enforce is NOT safe.
+    /// (#task-resource-profile Phase-2c) COUNTER — a Phase-3 FALSIFIER (NOT a
+    /// sufficiency gate): folded samples whose leave-one-out profile tail UNDER-predicted
+    /// the action's actual peak (`tail < peak_memory_kb`) → enforce would under-reserve →
+    /// OOM risk. SOUND direction: if this fires with any regularity the tail is DEFINITELY
+    /// NOT a safe reservation (the Phase-3 down-override must not be enabled). UNSOUND to
+    /// invert: `≈0` does NOT prove safety — the tail is a monotone max, so `under` fires
+    /// only on a fresh all-time-max and its RATE decays to 0 by construction over any soak,
+    /// regardless of predictive quality (cadre 2026-07-15, `.claude/reviews/phase-2c-3ddef839/`).
+    /// A near-zero reading is NECESSARY-not-sufficient, meaningful only alongside
+    /// `accuracy_predicted_covered ≫ 0` AND a low `skipped_low_sample`/total ratio AND a
+    /// workload-stationarity check. Also SILENT on over-reservation waste (the coarse
+    /// `(instance,target,mnemonic)` key can read all-covered while enforce over-reserves
+    /// cheap actions by the blend-max). Read as a falsifier only.
     #[metric(
-        help = "(#task-resource-profile Phase-2c) folded samples whose leave-one-out profile tail under-predicted the actual peak (tail < actual; enforce would under-reserve → OOM risk — the Phase-3 accuracy gate)"
+        help = "(#task-resource-profile Phase-2c) FALSIFIER: folded samples whose leave-one-out tail under-predicted the actual peak (tail < actual → enforce would under-reserve → OOM risk). Firing DISPROVES safety; ≈0 is necessary-not-sufficient (decays to 0 by construction)"
     )]
     pub accuracy_predicted_under: AtomicU64,
 
@@ -739,7 +747,10 @@ pub struct SchedulerMetrics {
     /// under-prediction ratio, `actual * 100 / tail` (×100 integer), across all
     /// `accuracy_predicted_under` samples. Quantifies HOW BADLY the tail
     /// under-reserved at its worst — a bounded `fetch_max` gauge (no per-sample
-    /// state). `0` while no under has ever fired.
+    /// state). `0` while no under has ever fired. CAVEAT: it never resets/decays, so one
+    /// outlier pins it forever and it cannot distinguish rare-severe from common-mild
+    /// unders (pair it with the `accuracy_predicted_under` count); a degenerate `tail==0`
+    /// ≥K key inflates it to `actual*100` (guarded finite, not bounded in magnitude).
     #[metric(
         help = "(#task-resource-profile Phase-2c) worst observed under-prediction ratio actual*100/tail (×100), max over all under samples (gauge)"
     )]
@@ -910,10 +921,13 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
 
 /// (#task-resource-profile Phase-2c) OBSERVABILITY-ONLY: emit ONE
 /// `tag = "resource_profile_accuracy"` info-log carrying the LEAVE-ONE-OUT
-/// prediction-accuracy counters — the LOAD-BEARING Phase-3 gate signal.
-/// `accuracy_predicted_under` climbing means the profile tail UNDER-predicted real
-/// peaks → enforce would under-reserve → NOT safe to enable; staying ≈0 across a
-/// soak means the tail is a safe reservation. Same DARK-on-`/metrics` rationale as
+/// prediction-accuracy counters — a Phase-3 FALSIFIER (not a sufficiency gate).
+/// `accuracy_predicted_under` climbing DISPROVES safety (the profile tail
+/// under-predicted real peaks → enforce would under-reserve → do NOT enable the
+/// down-override). Its ABSENCE does not prove safety: the tail is a monotone max so
+/// the under-rate decays to 0 by construction — read `≈0` only alongside `covered ≫ 0`,
+/// a low `skipped_low_sample` ratio, and a stationarity check, and know it is silent on
+/// over-reservation waste (cadre 2026-07-15). Same DARK-on-`/metrics` rationale as
 /// [`emit_resource_profile_counters_log`] (the `SchedulerMetrics` tree is not
 /// scraped in prod), so WITHOUT this periodic emit the accuracy signal that gates
 /// Phase-3 would ITSELF be dark. MUST be `info!` (`release_max_level_info` strips
@@ -1384,7 +1398,9 @@ enum PredictionAccuracy {
     /// `tail >= actual`: the reservation would have been a safe over-estimate.
     Covered,
     /// `tail < actual`: the reservation would have UNDER-reserved this action (the
-    /// OOM-risk case the Phase-3 gate watches). `ratio_x100 = actual * 100 / tail`.
+    /// OOM-risk case the Phase-3 FALSIFIER watches — its firing DISPROVES safety, but its
+    /// absence does not prove it; see `accuracy_predicted_under`). `ratio_x100 =
+    /// actual * 100 / tail`.
     Under { ratio_x100: u64 },
     /// `< K` prior samples (or the key's very first sample): no trustworthy
     /// prediction existed — excluded from the accuracy ratio (same K-gate as the
@@ -5544,13 +5560,17 @@ impl ApiWorkerScheduler {
                 .saturating_add(usage.net_output_bytes),
         };
 
-        // (#task-resource-profile Phase-2c) LEAVE-ONE-OUT prediction-accuracy check.
-        // Read the profile-so-far tail (`peek_memory_tail`) BEFORE folding this
-        // sample — that tail is EXACTLY the reservation the enforce phase (Phase-3)
-        // would have stood at THIS action's dispatch, excluding this sample. Classify
-        // whether it covered the action's ACTUAL measured peak. The read + fold happen
-        // under ONE lock so no interleaving fold can perturb the leave-one-out tail;
-        // `peek` never bumps LRU recency. OBSERVE-ONLY: changes no fold/reservation.
+        // (#task-resource-profile Phase-2c) LEAVE-ONE-OUT prediction-accuracy check —
+        // a FALSIFIER, not a safety proof (see the counter docs). Read the profile-so-far
+        // tail (`peek_memory_tail`) BEFORE folding this sample and classify whether it
+        // covered the action's ACTUAL measured peak. NOTE this is a COMPLETION-time
+        // recompute, NOT the dispatch-time reservation: the tail is read now (at
+        // completion) and is a monotone max, so it includes same-key samples that folded
+        // in BETWEEN this action's dispatch and completion → it is >= the tail that
+        // actually stood at dispatch → the check is HINDSIGHT-optimistic (under-counts the
+        // unders enforce would truly have suffered). Read + fold under ONE lock so no
+        // interleaving fold perturbs the leave-one-out tail; `peek` never bumps LRU
+        // recency. OBSERVE-ONLY: changes no fold/reservation.
         let actual_kb = usage.peak_memory_kb;
         let (outcome, accuracy) = {
             // Sync critical section: O(1) peek + O(1) fold, no `.await` held.
