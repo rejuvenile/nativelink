@@ -706,6 +706,41 @@ pub struct SchedulerMetrics {
     )]
     pub inject_observe_skipped_no_profile: AtomicU64,
 
+    /// (#task-resource-profile hierarchical-key) COUNTER: reserved dispatches whose
+    /// hierarchical lookup resolved to the FINE `(instance, target, mnemonic)` tier
+    /// (fine key had `>= K` samples). Partitions `inject_observe_total` with
+    /// `profile_lookup_coarse` + `profile_lookup_skip`. The fine-vs-coarse split is
+    /// THE signal this change exists to surface: right after deploy the fine keys are
+    /// K-starved (~2.5 samples/key) so this stays low while `profile_lookup_coarse`
+    /// carries coverage, then this climbs as the fine keys mature (~18 h).
+    #[metric(
+        help = "(#task-resource-profile) reserved dispatches whose hierarchical lookup resolved to the FINE (instance,target,mnemonic) tier (>= K samples)"
+    )]
+    pub profile_lookup_fine: AtomicU64,
+
+    /// (#task-resource-profile hierarchical-key) COUNTER: reserved dispatches whose
+    /// hierarchical lookup FELL BACK to the COARSE `(instance, mnemonic)` tier (fine
+    /// below `K`, coarse `>= K`). This is the K-starvation defeat in action — a
+    /// climbing value while `inject_observe_would_raise`/accuracy counters (formerly
+    /// dark at 0) now fire proves the coarse fallback gave immediate coverage. A
+    /// coarse profile blends all targets of a mnemonic (higher variance), so the
+    /// eventual Phase-3 down-override must treat these conservatively.
+    #[metric(
+        help = "(#task-resource-profile) reserved dispatches whose hierarchical lookup fell back to the COARSE (instance,mnemonic) tier (fine < K, coarse >= K)"
+    )]
+    pub profile_lookup_coarse: AtomicU64,
+
+    /// (#task-resource-profile hierarchical-key) COUNTER: reserved dispatches whose
+    /// hierarchical lookup found NO trusted tier — absent baggage (no derivable key),
+    /// a present-but-`< K` profile at both tiers, or neither tier profiled. The
+    /// residual of `inject_observe_total − profile_lookup_fine − profile_lookup_coarse`;
+    /// aggregates the existing `skipped_low_sample` + `skipped_no_profile` split into
+    /// the single "no coverage" bucket for the fine/coarse/skip partition.
+    #[metric(
+        help = "(#task-resource-profile) reserved dispatches whose hierarchical lookup found no trusted tier (absent baggage, < K at both tiers, or unprofiled)"
+    )]
+    pub profile_lookup_skip: AtomicU64,
+
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose TRUE
     /// DISPATCH-TIME leave-one-out prediction — the tail-aware statistic that stood at
     /// THIS action's dispatch (peeked BEFORE its own sample folded, stashed on the
@@ -956,6 +991,8 @@ pub fn emit_resource_profile_counters_log(metrics: &SchedulerMetrics) {
 /// Dark-detector invariant an operator checks:
 /// `would_raise + skipped_low_sample + skipped_no_profile <= inject_observe_total`
 /// (the residual is "profiled, ≥K, tail ≤ declared" — an observed non-raise).
+/// The hierarchical fine/coarse/skip partition is EXACT:
+/// `profile_lookup_fine + profile_lookup_coarse + profile_lookup_skip == inject_observe_total`.
 pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
     info!(
         tag = "resource_profile_inject_observe",
@@ -967,6 +1004,13 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
         inject_observe_skipped_no_profile = metrics
             .inject_observe_skipped_no_profile
             .load(Ordering::Relaxed),
+        // (#task-resource-profile hierarchical-key) fine-vs-coarse coverage: these three
+        // partition inject_observe_total (fine + coarse + skip == total). The whole point
+        // of the hierarchical key — an operator reads immediate coarse coverage while the
+        // fine keys are still K-starved.
+        profile_lookup_fine = metrics.profile_lookup_fine.load(Ordering::Relaxed),
+        profile_lookup_coarse = metrics.profile_lookup_coarse.load(Ordering::Relaxed),
+        profile_lookup_skip = metrics.profile_lookup_skip.load(Ordering::Relaxed),
         "resource profile inject-observe counterfactual counters"
     );
 }
@@ -1156,7 +1200,9 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 100_000;
 pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
-use crate::resource_profile::{PROFILE_MIN_SAMPLES, ProfileKey, ProfileMap, ResourceSample};
+use crate::resource_profile::{
+    PROFILE_MIN_SAMPLES, ProfileKey, ProfileMap, ProfileTier, ResourceSample, TieredTail,
+};
 use crate::simple_scheduler::{
     BatchSchedAction, BatchSchedGain, BatchSchedGateCfg, BatchSchedWorker, compute_batch_sched_gain,
 };
@@ -1465,12 +1511,24 @@ enum PredictionAccuracy {
     /// `over_ratio_x100 = Some(tail * 100 / actual)` when it strictly OVER-reserved
     /// (`tail > actual`), the concurrency-waste half of the signal (Upgrade 2);
     /// `None` when `tail == actual` (an exact, waste-free cover).
-    Covered { over_ratio_x100: Option<u64> },
+    Covered {
+        /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch tail came
+        /// from. A `Coarse` cover blends all targets of a mnemonic (higher variance), so
+        /// the eventual Phase-3 down-override must NOT trust it — carried so that gate has
+        /// the signal. OBSERVE-ONLY here.
+        tier: ProfileTier,
+        over_ratio_x100: Option<u64>,
+    },
     /// `tail < actual`: the reservation would have UNDER-reserved this action (the
     /// OOM-risk case the Phase-3 FALSIFIER watches — its firing DISPROVES safety, but its
     /// absence does not prove it; see `accuracy_predicted_under`). `ratio_x100 =
     /// actual * 100 / tail`.
-    Under { ratio_x100: u64 },
+    Under {
+        /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch tail came
+        /// from (see [`Self::Covered`]).
+        tier: ProfileTier,
+        ratio_x100: u64,
+    },
     /// A dispatch prediction existed but with `< K` prior samples: the tail was not yet
     /// trustworthy — excluded from the accuracy ratio (same K-gate as the inject-observe
     /// path; below K the tail is statistically meaningless).
@@ -1488,7 +1546,7 @@ enum PredictionAccuracy {
 /// completion-time recompute: `None` when no profile existed at dispatch, else
 /// `(tail_kb, prior_samples)`. `actual_kb` is this action's measured peak.
 fn classify_prediction_accuracy(
-    dispatch_prediction: Option<(u64, u64)>,
+    dispatch_prediction: Option<(ProfileTier, u64, u64)>,
     actual_kb: u64,
 ) -> PredictionAccuracy {
     match dispatch_prediction {
@@ -1496,11 +1554,12 @@ fn classify_prediction_accuracy(
         None => PredictionAccuracy::SkippedNoDispatch,
         // Prediction present but below K at dispatch: the tail was not yet trustworthy
         // (pair-a MINOR / red-team A1b), so no prediction stood — skip rather than score
-        // a spurious cover/under.
-        Some((_, prior_samples)) if prior_samples < PROFILE_MIN_SAMPLES => {
+        // a spurious cover/under. (Defensive: the hierarchical lookup only stashes a
+        // Trusted tier as ≥K, but a direct-fold caller can pass a low-sample tuple.)
+        Some((_, _, prior_samples)) if prior_samples < PROFILE_MIN_SAMPLES => {
             PredictionAccuracy::SkippedLowSample
         }
-        Some((tail_kb, _)) => {
+        Some((tier, tail_kb, _)) => {
             if tail_kb >= actual_kb {
                 // Over-reservation waste (Upgrade 2): record the ratio only when the
                 // reservation STRICTLY exceeds the actual peak. Guard `actual == 0` (a
@@ -1510,24 +1569,32 @@ fn classify_prediction_accuracy(
                 } else {
                     None
                 };
-                PredictionAccuracy::Covered { over_ratio_x100 }
+                PredictionAccuracy::Covered {
+                    tier,
+                    over_ratio_x100,
+                }
             } else {
                 // tail < actual → under-reserve. Guard `tail == 0` (a degenerate
                 // ≥K all-zero-memory key): divide by at least 1 so the ratio stays
                 // finite (predicted-0 / got-A reads as A×100, a huge magnitude).
                 let ratio_x100 = actual_kb.saturating_mul(100) / tail_kb.max(1);
-                PredictionAccuracy::Under { ratio_x100 }
+                PredictionAccuracy::Under { tier, ratio_x100 }
             }
         }
     }
 }
 
-/// (#task-resource-profile) Derive the coarse profile key for an action from its
-/// routing instance + joined Bazel baggage (`origin_metadata.bazel_metadata`), or
-/// `None` when baggage is absent (no derivable key). Shared by the completion fold,
-/// the dispatch inject-observe, and the dispatch-time prediction stash so all three
-/// key IDENTICALLY (a divergence would silently mis-attribute samples).
-fn resource_profile_key(action_info: &ActionInfoWithProps) -> Option<ProfileKey> {
+/// (#task-resource-profile hierarchical-key) Derive BOTH profile keys for an action
+/// from its routing instance + joined Bazel baggage (`origin_metadata.bazel_metadata`):
+/// the FINE `(instance, target, mnemonic)` key and the COARSE `(instance, mnemonic)`
+/// fallback key. Returns `None` when baggage is absent (no derivable key at all).
+///
+/// Shared by the completion fold (records into both), the dispatch inject-observe, and
+/// the dispatch-time prediction stash so all three key IDENTICALLY (a divergence would
+/// silently mis-attribute samples). When the fine key is derivable, the coarse key is
+/// ALWAYS derivable: `from_parts` requires a non-empty mnemonic, which is exactly
+/// `coarse`'s only requirement — hence the `expect` can never fire.
+fn resource_profile_keys(action_info: &ActionInfoWithProps) -> Option<(ProfileKey, ProfileKey)> {
     let instance_name = action_info.inner.instance_name();
     let (target_id, action_mnemonic) = action_info
         .origin_metadata
@@ -1536,7 +1603,10 @@ fn resource_profile_key(action_info: &ActionInfoWithProps) -> Option<ProfileKey>
         .map_or(("", ""), |m| {
             (m.target_id.as_str(), m.action_mnemonic.as_str())
         });
-    ProfileKey::from_parts(instance_name, target_id, action_mnemonic)
+    let fine = ProfileKey::from_parts(instance_name, target_id, action_mnemonic)?;
+    let coarse = ProfileKey::coarse(instance_name, action_mnemonic)
+        .expect("coarse key derivable whenever the fine key is (both require a mnemonic)");
+    Some((fine, coarse))
 }
 
 fn decision_trace_min_props(props: &PlatformProperties) -> String {
@@ -5615,7 +5685,7 @@ impl ApiWorkerScheduler {
         &self,
         worker_id: &WorkerId,
         operation_id: &OperationId,
-    ) -> Option<(ActionInfoWithProps, Option<(u64, u64)>)> {
+    ) -> Option<(ActionInfoWithProps, Option<(ProfileTier, u64, u64)>)> {
         let inner = self.inner.read().await;
         inner
             .workers
@@ -5643,10 +5713,11 @@ impl ApiWorkerScheduler {
         usage: &ActionResourceUsage,
         // (#task-resource-profile Phase-2c) The TRUE dispatch-time leave-one-out
         // prediction stashed on this action's running-action record when it was
-        // reserved (`Some((tail_kb, prior_samples))`), or `None` when no profile
-        // existed at dispatch. Classified against the actual peak WITHOUT any
-        // completion-time recompute → hindsight-free.
-        dispatch_prediction: Option<(u64, u64)>,
+        // reserved (`Some((tier, tail_kb, prior_samples))` from the fine→coarse
+        // hierarchical lookup), or `None` when no profile existed at EITHER tier at
+        // dispatch. Classified against the actual peak WITHOUT any completion-time
+        // recompute → hindsight-free.
+        dispatch_prediction: Option<(ProfileTier, u64, u64)>,
     ) {
         // Gate on `sampled`: an unsampled report carries no real measurement, and
         // folding its (typically 0) memory would poison the variance signal — a
@@ -5663,8 +5734,9 @@ impl ApiWorkerScheduler {
 
         // target_id + action_mnemonic come from the joined Bazel baggage
         // (`origin_metadata.bazel_metadata`, parsed at cache_lookup and joined
-        // onto the running action). Absent baggage → no key → skip.
-        let Some(key) = resource_profile_key(action_info) else {
+        // onto the running action). Absent baggage → no key → skip. Derives BOTH
+        // the fine (instance,target,mnemonic) and coarse (instance,mnemonic) keys.
+        let Some((fine_key, coarse_key)) = resource_profile_keys(action_info) else {
             // No derivable key (baggage absent) — count + skip so a dark
             // (never-recording) feature is visible against profile_samples_total.
             self.metrics
@@ -5692,16 +5764,31 @@ impl ApiWorkerScheduler {
         // Classification is independent of the map, so it needs no lock. OBSERVE-ONLY.
         let actual_kb = usage.peak_memory_kb;
         let accuracy = classify_prediction_accuracy(dispatch_prediction, actual_kb);
-        // Aggregation fold is unchanged (bounded LRU record under its own lock); the
-        // accuracy classification above does NOT read the map, so no peek is needed.
-        let outcome = self.resource_profile_map.lock().record(key, sample);
+        // (#task-resource-profile hierarchical-key) Fold the SAME sample into BOTH tiers
+        // under ONE lock acquisition: the fine (instance,target,mnemonic) key AND the
+        // coarse (instance,mnemonic) fallback key. Both live in the same bounded LRU.
+        // CAPPED AT PROFILE_MAP_MAX_KEYS (16384): the coarse key adds at most ~1 key per
+        // (instance, mnemonic) pair (≈30 mnemonics in prod) — bounded by distinct
+        // mnemonics × instances and, ultimately, by the shared LRU cap that already
+        // bounds the fine keys; no new unbounded buffer.
+        let (fine_outcome, coarse_outcome) = {
+            let mut map = self.resource_profile_map.lock();
+            let fine_outcome = map.record(fine_key, sample);
+            let coarse_outcome = map.record(coarse_key, sample);
+            (fine_outcome, coarse_outcome)
+        };
 
         // Attribute the leave-one-out result. Exactly ONE counter advances per folded
         // sample, so `covered + under + skipped_low_sample + skipped_no_dispatch ==
         // profile_samples_total` (the dark-detector invariant the periodic accuracy
         // emit surfaces); `accuracy_over_samples` is a SUBSET of covered.
         match accuracy {
-            PredictionAccuracy::Covered { over_ratio_x100 } => {
+            // `tier` is carried for the eventual Phase-3 down-override (which must not
+            // trust a coarse cover); OBSERVE-ONLY here, so it does not gate a counter.
+            PredictionAccuracy::Covered {
+                tier: _,
+                over_ratio_x100,
+            } => {
                 self.metrics
                     .accuracy_predicted_covered
                     .fetch_add(1, Ordering::Relaxed);
@@ -5726,7 +5813,10 @@ impl ApiWorkerScheduler {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            PredictionAccuracy::Under { ratio_x100 } => {
+            PredictionAccuracy::Under {
+                tier: _,
+                ratio_x100,
+            } => {
                 self.metrics
                     .accuracy_predicted_under
                     .fetch_add(1, Ordering::Relaxed);
@@ -5748,22 +5838,33 @@ impl ApiWorkerScheduler {
             }
         }
 
+        // ONE completed action = ONE sample (the dark-detector invariant is per-action:
+        // `samples_total + all skips == completions`). Folding into both tiers is an
+        // internal detail and does NOT double-advance this counter.
         self.metrics
             .profile_samples_total
             .fetch_add(1, Ordering::Relaxed);
-        if outcome.evicted {
+        // Either tier's record can trigger an LRU eviction; count both so the
+        // working-set-overflow signal reflects total key churn.
+        if fine_outcome.evicted {
             self.metrics
                 .profile_map_evictions_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        // Gauges: last-write-wins resident snapshots (converge to the live map
-        // state on each completed action).
+        if coarse_outcome.evicted {
+            self.metrics
+                .profile_map_evictions_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Gauges: last-write-wins resident snapshots (converge to the live map state on
+        // each completed action). Use the coarse (LAST) outcome — it reflects the final
+        // resident key count / high-variance count after BOTH records.
         self.metrics
             .profile_keys_tracked
-            .store(outcome.keys_tracked, Ordering::Relaxed);
+            .store(coarse_outcome.keys_tracked, Ordering::Relaxed);
         self.metrics
             .profile_high_variance_keys
-            .store(outcome.high_variance_keys, Ordering::Relaxed);
+            .store(coarse_outcome.high_variance_keys, Ordering::Relaxed);
     }
 
     /// (#task-resource-profile Phase-2b) OBSERVE-ONLY inject counterfactual. Called
@@ -5792,40 +5893,67 @@ impl ApiWorkerScheduler {
             .inject_observe_total
             .fetch_add(1, Ordering::Relaxed);
 
-        // Derive the SAME (instance, target, mnemonic) key the completion-path fold
-        // keys on (instance + joined Bazel baggage) via the shared `resource_profile_key`.
-        // Absent baggage → no key → no usable profile. STEP-0 (design §3): this key is
-        // fully computable at dispatch time from the `ActionInfoWithProps` already in
-        // hand — no Command CAS fetch — because Phase-2a keys on baggage, not
-        // `output_set_hash`.
-        let Some(key) = resource_profile_key(action_info) else {
+        // Derive the SAME fine + coarse keys the completion-path fold keys on (instance +
+        // joined Bazel baggage) via the shared `resource_profile_keys`. Absent baggage →
+        // no key → no usable profile. STEP-0 (design §3): these keys are fully computable
+        // at dispatch time from the `ActionInfoWithProps` already in hand — no Command CAS
+        // fetch — because Phase-2a keys on baggage, not `output_set_hash`.
+        let Some((fine_key, coarse_key)) = resource_profile_keys(action_info) else {
             self.metrics
                 .inject_observe_skipped_no_profile
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .profile_lookup_skip
                 .fetch_add(1, Ordering::Relaxed);
             return;
         };
 
-        // `peek` (never `get`): an observe read must not bump LRU recency (N-3).
-        let Some((tail_kb, samples)) = self.resource_profile_map.lock().peek_memory_tail(&key)
-        else {
-            // Key derivable but not yet profiled — the empty-map norm right after
-            // Phase-2a deploy. Counting this (climbing while would_raise stays 0) is
-            // the EXPECTED early accuracy-accumulation signal, not a fault.
-            self.metrics
-                .inject_observe_skipped_no_profile
+        // (#task-resource-profile hierarchical-key) FINE→COARSE fallback lookup (both
+        // reads are `peek`, never `get`, so an observe read never bumps LRU recency,
+        // N-3). Try the fine key; if it is below K, borrow the mature coarse tail — this
+        // is the K-starvation defeat that gives immediate coverage in prod.
+        let lookup = self
+            .resource_profile_map
+            .lock()
+            .lookup_tiered(&fine_key, &coarse_key);
+        let (tier, tail_kb, samples) = match lookup {
+            TieredTail::Trusted {
+                tier,
+                tail_kb,
+                samples,
+            } => {
+                // Record WHICH tier resolved (fine + coarse + skip partition total).
+                match tier {
+                    ProfileTier::Fine => &self.metrics.profile_lookup_fine,
+                    ProfileTier::Coarse => &self.metrics.profile_lookup_coarse,
+                }
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+                (tier, tail_kb, samples)
+            }
+            TieredTail::LowSample { .. } => {
+                // A profile exists at some tier but below K → tail untrusted (pair-a
+                // MINOR / red-team A1b's K-gate). Keep it out of any counterfactual raise.
+                self.metrics
+                    .inject_observe_skipped_low_sample
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .profile_lookup_skip
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            TieredTail::NoProfile => {
+                // Keys derivable but neither tier profiled — the empty-map norm right
+                // after deploy. Counting this (climbing while would_raise stays 0) is the
+                // EXPECTED early accuracy-accumulation signal, not a fault.
+                self.metrics
+                    .inject_observe_skipped_no_profile
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .profile_lookup_skip
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
-
-        // Reliability gate: a freshly-LRU-re-admitted key is low-sample; below K the
-        // tail statistic is statistically meaningless (pair-a MINOR / red-team A1b's
-        // K-gate). Keep it out of any counterfactual raise.
-        if samples < PROFILE_MIN_SAMPLES {
-            self.metrics
-                .inject_observe_skipped_low_sample
-                .fetch_add(1, Ordering::Relaxed);
-            return;
-        }
 
         let declared_kb = action_declared_memory_kb(&action_info.platform_properties);
         // RAISE-ONLY: the injection could only ever RAISE the reserved memory toward
@@ -5855,10 +5983,13 @@ impl ApiWorkerScheduler {
         if due {
             info!(
                 tag = "resource_profile_inject_observe_sample",
-                instance_name = %key.instance_name,
-                target_id = %key.target_id,
-                action_mnemonic = %key.action_mnemonic,
+                instance_name = %fine_key.instance_name,
+                target_id = %fine_key.target_id,
+                action_mnemonic = %fine_key.action_mnemonic,
                 worker_id = %worker_id.0,
+                // Which tier the tail came from (Fine = this target's own profile;
+                // Coarse = the mnemonic-wide fallback, treat conservatively).
+                profile_tier = ?tier,
                 samples,
                 declared_memory_kb = declared_kb,
                 tail_stat_kb = tail_kb,
@@ -6262,8 +6393,31 @@ impl ApiWorkerScheduler {
         // is ACYCLIC (the completion fold + inject-observe take resource_profile_map
         // WITHOUT holding inner). OBSERVE-ONLY: no reservation/gate/dispatch change.
         if let Some((reserved_worker_id, _, _)) = result.as_ref() {
-            if let Some(key) = resource_profile_key(action_info) {
-                let dispatch_prediction = self.resource_profile_map.lock().peek_memory_tail(&key);
+            if let Some((fine_key, coarse_key)) = resource_profile_keys(action_info) {
+                // (#task-resource-profile hierarchical-key) The FINE→COARSE lookup resolves
+                // the tier the enforce phase WOULD have used at dispatch. Stash
+                // `(tier, tail_kb, samples)` so completion can classify actual-vs-dispatch
+                // WITHOUT hindsight AND know whether the tail was a (conservative) coarse
+                // fallback. Convert to the stash tuple; `NoProfile` stashes nothing.
+                let dispatch_prediction: Option<(ProfileTier, u64, u64)> = match self
+                    .resource_profile_map
+                    .lock()
+                    .lookup_tiered(&fine_key, &coarse_key)
+                {
+                    TieredTail::Trusted {
+                        tier,
+                        tail_kb,
+                        samples,
+                    }
+                    | TieredTail::LowSample {
+                        tier,
+                        tail_kb,
+                        samples,
+                    } => Some((tier, tail_kb, samples)),
+                    TieredTail::NoProfile => None,
+                };
+                // Only walk the worker map when there is something to stash (the empty-map
+                // NoProfile case — dominant right after deploy — skips the peek_mut).
                 if dispatch_prediction.is_some() {
                     if let Some(worker) = inner.workers.peek_mut(reserved_worker_id) {
                         if let Some(pending) =
@@ -9694,13 +9848,13 @@ impl ApiWorkerScheduler {
     /// the stash and the auto-cleanup: `None` = the op is NOT in `running_action_infos`
     /// (proves the stash was dropped with the entry on a terminal path — no leak);
     /// `Some(None)` = the entry exists but no prediction was stashed (map was empty at
-    /// dispatch); `Some(Some((tail, samples)))` = the entry exists with the stashed
-    /// dispatch prediction.
+    /// dispatch); `Some(Some((tier, tail, samples)))` = the entry exists with the stashed
+    /// dispatch prediction (and which hierarchical tier it resolved to).
     async fn running_action_dispatch_prediction(
         &self,
         worker_id: &WorkerId,
         operation_id: &OperationId,
-    ) -> Option<Option<(u64, u64)>> {
+    ) -> Option<Option<(ProfileTier, u64, u64)>> {
         let inner = self.inner.read().await;
         inner
             .workers
@@ -16060,6 +16214,7 @@ mod b1_lock_decouple_tests {
 
     use super::{ApiWorkerScheduler, UpdateForWorker, Worker};
     use crate::platform_property_manager::PlatformPropertyManager;
+    use crate::resource_profile::ProfileTier;
     use crate::worker::ActionInfoWithProps;
     use crate::worker_registry::WorkerRegistry;
     use crate::worker_scheduler::WorkerScheduler;
@@ -16296,13 +16451,16 @@ mod b1_lock_decouple_tests {
             .await
             .expect("record_action_resource_usage must return Ok on the prod path");
 
-        // THE contract: the fold ran even though origin events are OFF.
+        // THE contract: the fold ran even though origin events are OFF. It records BOTH
+        // the fine (instance,target,mnemonic) AND the coarse (instance,mnemonic) key, so
+        // the map holds 2 keys after one completion (the hierarchical-key fold-into-both).
         assert_eq!(
             scheduler.resource_profile_map_len(),
-            1,
+            2,
             "fold dark when origin events off — resource profile not recorded on \
              the production (maybe_origin_event_tx = None) path; the aggregation \
-             must run BEFORE the origin-event early-return"
+             must run BEFORE the origin-event early-return AND fold into BOTH the fine \
+             and coarse keys (2 resident keys)"
         );
         assert_eq!(
             scheduler
@@ -16310,17 +16468,25 @@ mod b1_lock_decouple_tests {
                 .profile_samples_total
                 .load(Ordering::Relaxed),
             1,
-            "profile_samples_total must advance on the prod fold path"
+            "profile_samples_total must advance ONCE per completed action (folding into \
+             both tiers is internal — must NOT double-count)"
         );
 
-        // The RIGHT sample landed under the derived key: 4096 KiB → bucket
+        // The RIGHT sample landed under BOTH derived keys: 4096 KiB → bucket
         // [4096,8192) → representative 6144.
         let key = ProfileKey::from_parts("main", "//foo:bar", "CppCompile").unwrap();
         assert_eq!(
             scheduler.resource_profile_peek_memory(&key),
             Some((6144, 6144)),
             "the folded memory sample (4096 KiB) must be readable under the derived \
-             (instance, target, mnemonic) key"
+             fine (instance, target, mnemonic) key"
+        );
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+        assert_eq!(
+            scheduler.resource_profile_peek_memory(&coarse),
+            Some((6144, 6144)),
+            "the same sample must ALSO be readable under the coarse (instance, mnemonic) \
+             key — the fold folds into both tiers"
         );
     }
 
@@ -16820,6 +16986,273 @@ mod b1_lock_decouple_tests {
         );
     }
 
+    // ── (#task-resource-profile hierarchical-key) fine→coarse fallback ──
+
+    /// An action carrying `target`/`mnemonic` Bazel baggage (for the fold key), no
+    /// memory declaration needed (these drive the fold directly).
+    fn action_baggage(seed: u8, target: &str, mnemonic: &str) -> ActionInfoWithProps {
+        use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+        use nativelink_util::origin_event::OriginMetadata;
+
+        let mut action = make_action_info_with_props("W", seed);
+        action.origin_metadata = OriginMetadata {
+            identity: String::new(),
+            bazel_metadata: Some(RequestMetadata {
+                action_mnemonic: mnemonic.to_string(),
+                target_id: target.to_string(),
+                ..Default::default()
+            }),
+        };
+        action
+    }
+
+    /// (a) A completion folds the sample into BOTH the fine (instance,target,mnemonic)
+    /// key AND the coarse (instance,mnemonic) key. Folding TWO different targets of the
+    /// SAME mnemonic proves the coarse key BLENDS both (2 samples) while each fine key
+    /// holds 1 — the coarse key matures ~targets× faster, which is the whole K-starvation
+    /// defeat premise. `profile_samples_total` counts COMPLETIONS (2), not keys (3).
+    ///
+    /// MUTATION: comment out the coarse `map.record(coarse_key, sample)` in
+    /// `fold_resource_profile` → the coarse key is absent → its sample_count assert
+    /// red-fails with the bespoke message.
+    #[nativelink_test]
+    async fn fold_into_both_coarse_blends_targets_of_a_mnemonic() {
+        use crate::resource_profile::ProfileKey;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let a = action_baggage(0x01, "//a:a", "CppCompile");
+        let b = action_baggage(0x02, "//b:b", "CppCompile");
+        // Two completions, same mnemonic, different targets, no dispatch prediction.
+        scheduler.fold_resource_profile(&a, &usage_mem(1000), None);
+        scheduler.fold_resource_profile(&b, &usage_mem(2000), None);
+
+        let fine_a = ProfileKey::from_parts("main", "//a:a", "CppCompile").unwrap();
+        let fine_b = ProfileKey::from_parts("main", "//b:b", "CppCompile").unwrap();
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+
+        assert_eq!(
+            scheduler.resource_profile_peek_tail(&fine_a).map(|(_, n)| n),
+            Some(1),
+            "the fine key //a:a must have exactly its own 1 sample"
+        );
+        assert_eq!(
+            scheduler.resource_profile_peek_tail(&fine_b).map(|(_, n)| n),
+            Some(1),
+            "the fine key //b:b must have exactly its own 1 sample"
+        );
+        assert_eq!(
+            scheduler.resource_profile_peek_tail(&coarse).map(|(_, n)| n),
+            Some(2),
+            "the coarse (instance,mnemonic) key must BLEND both targets' samples (2) — it \
+             matures faster than any single fine key, which is the K-starvation defeat"
+        );
+        assert_eq!(
+            scheduler.resource_profile_map_len(),
+            3,
+            "2 fine keys + 1 shared coarse key must be resident after two completions"
+        );
+        assert_eq!(
+            scheduler.metrics.profile_samples_total.load(Ordering::Relaxed),
+            2,
+            "profile_samples_total counts COMPLETIONS (2), never keys — folding into both \
+             tiers must not double-count"
+        );
+    }
+
+    /// (b + d) FALLBACK: the fine key is ABSENT (K-starved) but the coarse key is ≥K, so
+    /// the inject lookup falls back to COARSE — `profile_lookup_coarse` fires (fine stays
+    /// 0), the coarse tail (65536) > declared (4096) so `inject_observe_would_raise` fires
+    /// (coverage the fine-only path had DARK at 0), and (OBSERVE-ONLY) the reservation is
+    /// byte-identical — it reflects the DECLARED 4096, never the coarse tail.
+    ///
+    /// MUTATION: comment out the `ProfileTier::Coarse => &self.metrics.profile_lookup_coarse`
+    /// arm's `fetch_add` → profile_lookup_coarse stays 0 → this red-fails.
+    #[nativelink_test]
+    async fn inject_observe_falls_back_to_coarse_when_fine_absent() {
+        use crate::resource_profile::ProfileKey;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
+
+        // Populate ONLY the coarse key to ≥K (50_000 KiB → tail 2^16 = 65_536). The fine
+        // key stays absent — the prod K-starvation regime (coarse mature, fine not yet).
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(coarse.clone(), mem_only_sample(50_000));
+        }
+        assert!(
+            scheduler.resource_profile_peek_memory(&observe_key()).is_none(),
+            "the fine key must be ABSENT so the lookup is forced to the coarse fallback"
+        );
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd1, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.metrics.profile_lookup_coarse.load(Ordering::Relaxed),
+            1,
+            "fine absent + coarse ≥K → the hierarchical lookup must resolve COARSE \
+             (profile_lookup_coarse must fire) — the K-starvation defeat"
+        );
+        assert_eq!(
+            scheduler.metrics.profile_lookup_fine.load(Ordering::Relaxed),
+            0,
+            "no fine tier was trusted → profile_lookup_fine must stay 0"
+        );
+        assert_eq!(
+            scheduler.metrics.profile_lookup_skip.load(Ordering::Relaxed),
+            0,
+            "a trusted coarse tail was found → not a skip"
+        );
+        assert_eq!(
+            scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
+            1,
+            "the coarse tail (65536) exceeds declared (4096) → inject_observe_would_raise \
+             must fire VIA the coarse fallback (this coverage was DARK at 0 before the fix)"
+        );
+        // The fine/coarse/skip partition is EXACT.
+        let fine = scheduler.metrics.profile_lookup_fine.load(Ordering::Relaxed);
+        let coarse_c = scheduler.metrics.profile_lookup_coarse.load(Ordering::Relaxed);
+        let skip = scheduler.metrics.profile_lookup_skip.load(Ordering::Relaxed);
+        assert_eq!(
+            fine + coarse_c + skip,
+            scheduler.metrics.inject_observe_total.load(Ordering::Relaxed),
+            "profile_lookup_fine + _coarse + _skip must partition inject_observe_total exactly"
+        );
+        // (d) OBSERVE-ONLY: the coarse fallback changed NO reservation.
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(95_904.0),
+            "OBSERVE-ONLY VIOLATED: the coarse fallback must change NO reservation — remaining \
+             reflects declared 4096 (95904), never the coarse tail 65536"
+        );
+    }
+
+    /// (b) PREFER FINE: when BOTH tiers are ≥K the lookup uses the FINE tier (the more
+    /// specific per-target profile), not coarse — `profile_lookup_fine` fires,
+    /// `profile_lookup_coarse` stays 0, and the raise uses the FINE tail.
+    ///
+    /// MUTATION: swap the fine/coarse peek order in `lookup_tiered` (try coarse first) →
+    /// with both ≥K it would resolve Coarse → profile_lookup_fine stays 0 → red-fail.
+    #[nativelink_test]
+    async fn inject_observe_prefers_fine_when_both_tiers_trusted() {
+        use crate::resource_profile::ProfileKey;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
+
+        // Fine ≥K at a HIGHER magnitude (50_000 → tail 65_536); coarse ≥K at a LOWER one.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(coarse.clone(), mem_only_sample(1000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd3, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.metrics.profile_lookup_fine.load(Ordering::Relaxed),
+            1,
+            "both tiers ≥K → the lookup must PREFER the fine (per-target) tier"
+        );
+        assert_eq!(
+            scheduler.metrics.profile_lookup_coarse.load(Ordering::Relaxed),
+            0,
+            "the coarse tier must NOT be used when the fine tier is already trusted"
+        );
+        assert_eq!(
+            scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
+            1,
+            "the fine tail (65536) exceeds declared (4096) → would_raise fires from the fine tier"
+        );
+    }
+
+    /// (c, PRODUCTION-COMPOSITION) The dispatch-time stash records the COARSE tier marker
+    /// when the fallback resolved to coarse, so the completion-path accuracy classification
+    /// (and the eventual Phase-3 down-override, which must distrust a coarse tail) can see
+    /// it. Reserve when only the coarse key is ≥K → the stash must be
+    /// `Some((Coarse, 65536, 20))`.
+    ///
+    /// MUTATION: change the stash `TieredTail::Trusted { tier, ... }` arm to hardcode
+    /// `ProfileTier::Fine` → the stashed tier reads Fine → this red-fails.
+    #[nativelink_test]
+    async fn dispatch_prediction_marks_coarse_tier_on_fallback() {
+        use crate::resource_profile::ProfileKey;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(coarse.clone(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd2, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
+                .await,
+            Some(Some((ProfileTier::Coarse, 65_536, 20))),
+            "the dispatch stash must mark the COARSE tier when the fallback resolved to coarse \
+             — so completion (and Phase-3) can treat the coarse tail conservatively"
+        );
+    }
+
+    /// (c, PURE) The Fine/Coarse marker threads THROUGH `classify_prediction_accuracy`:
+    /// a coarse-sourced dispatch prediction classifies `Covered { tier: Coarse }`; a
+    /// fine-sourced under classifies `Under { tier: Fine }`. This is the seam that lets
+    /// Phase-3 refuse to trust a coarse cover.
+    ///
+    /// MUTATION: hardcode `tier: ProfileTier::Fine` in the `Covered` arm of
+    /// `classify_prediction_accuracy` → the Coarse assertion red-fails.
+    #[test]
+    fn classify_prediction_accuracy_threads_the_tier_marker() {
+        use super::{PredictionAccuracy, classify_prediction_accuracy};
+
+        assert_eq!(
+            classify_prediction_accuracy(Some((ProfileTier::Coarse, 65_536, 20)), 4096),
+            PredictionAccuracy::Covered {
+                tier: ProfileTier::Coarse,
+                over_ratio_x100: Some(65_536 * 100 / 4096),
+            },
+            "a coarse-sourced dispatch prediction must classify Covered with tier=Coarse — the \
+             marker MUST thread through so Phase-3 can distrust a coarse cover"
+        );
+        assert_eq!(
+            classify_prediction_accuracy(Some((ProfileTier::Fine, 65_536, 20)), 131_072),
+            PredictionAccuracy::Under {
+                tier: ProfileTier::Fine,
+                ratio_x100: 200,
+            },
+            "a fine-sourced under-prediction must classify Under with tier=Fine"
+        );
+    }
+
     // ── (#task-resource-profile Phase-2c) DISPATCH-TIME leave-one-out accuracy ──
     //
     // These drive `fold_resource_profile` directly (the completion-path fold) with a
@@ -16859,7 +17292,7 @@ mod b1_lock_decouple_tests {
 
         let action = action_with_memory_and_baggage("W", 0xe1, 4096.0);
         // ACTUAL peak 65_536 == dispatch tail 65_536 → an EXACT (waste-free) cover.
-        scheduler.fold_resource_profile(&action, &usage_mem(65_536), Some((65_536, 20)));
+        scheduler.fold_resource_profile(&action, &usage_mem(65_536), Some((ProfileTier::Fine, 65_536, 20)));
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -16911,7 +17344,7 @@ mod b1_lock_decouple_tests {
 
         let action = action_with_memory_and_baggage("W", 0xe2, 4096.0);
         // ACTUAL peak 131_072 > dispatch tail 65_536 → the tail UNDER-predicted.
-        scheduler.fold_resource_profile(&action, &usage_mem(131_072), Some((65_536, 20)));
+        scheduler.fold_resource_profile(&action, &usage_mem(131_072), Some((ProfileTier::Fine, 65_536, 20)));
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -16961,7 +17394,7 @@ mod b1_lock_decouple_tests {
 
         // Dispatch prediction present but with only 1 prior sample (< K). Tail 1024 <
         // actual 200_000 → WOULD under, but the K-gate suppresses it → skipped_low_sample.
-        scheduler.fold_resource_profile(&action, &usage_mem(200_000), Some((1024, 1)));
+        scheduler.fold_resource_profile(&action, &usage_mem(200_000), Some((ProfileTier::Fine, 1024, 1)));
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -17051,7 +17484,7 @@ mod b1_lock_decouple_tests {
         let action = action_with_memory_and_baggage("W", 0xe6, 4096.0);
 
         // Dispatch tail 65_536 STRICTLY exceeds actual 16_384 → covered + over-reserved.
-        scheduler.fold_resource_profile(&action, &usage_mem(16_384), Some((65_536, 20)));
+        scheduler.fold_resource_profile(&action, &usage_mem(16_384), Some((ProfileTier::Fine, 65_536, 20)));
 
         assert_eq!(
             scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed),
@@ -17111,7 +17544,7 @@ mod b1_lock_decouple_tests {
         for &kb in &samples {
             // A varying dispatch prediction exercises the covered/under/over/skip arms;
             // NONE of them may perturb the aggregation the reference computes.
-            scheduler.fold_resource_profile(&action, &usage_mem(kb), Some((65_536, 20)));
+            scheduler.fold_resource_profile(&action, &usage_mem(kb), Some((ProfileTier::Fine, 65_536, 20)));
             reference.record(observe_key(), mem_only_sample(kb));
         }
 
@@ -17180,7 +17613,7 @@ mod b1_lock_decouple_tests {
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
                 .await,
-            Some(Some((65_536, 20))),
+            Some(Some((ProfileTier::Fine, 65_536, 20))),
             "the dispatch-time tail (65536, 20 samples) must be stashed on the reserved \
              running action for the out-of-sample check"
         );
@@ -17269,7 +17702,7 @@ mod b1_lock_decouple_tests {
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W1".to_string()), &op_cancel)
                 .await,
-            Some(Some((65_536, 20))),
+            Some(Some((ProfileTier::Fine, 65_536, 20))),
             "reserve must stash the dispatch prediction on W1's running action"
         );
         scheduler
@@ -17296,7 +17729,7 @@ mod b1_lock_decouple_tests {
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W2".to_string()), &op_evict)
                 .await,
-            Some(Some((65_536, 20))),
+            Some(Some((ProfileTier::Fine, 65_536, 20))),
             "reserve must stash the dispatch prediction on W2's running action"
         );
         // remove_worker → immediate_evict_worker drains the op and re-queues it through

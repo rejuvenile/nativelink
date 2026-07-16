@@ -29,6 +29,8 @@ use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::resource_profile::ProfileTier;
+
 pub type WorkerTimestamp = u64;
 
 /// Represents the action info and the platform properties of the action.
@@ -87,17 +89,21 @@ pub struct PendingActionInfoData {
     /// same-key samples that folded in AFTER this action was dispatched can never
     /// leak in (removing the hindsight bias the cadre flagged).
     ///
-    /// `Some((tail_kb, prior_samples))` = the tail-aware memory reservation the
+    /// `Some((tier, tail_kb, prior_samples))` = the tail-aware memory reservation the
     /// enforce phase WOULD have stood at dispatch, peeked (non-recency-bumping) from
-    /// the profile-so-far by `ApiWorkerScheduler::find_and_reserve_worker`.
-    /// `None` = no profile existed at dispatch (map still warming, absent Bazel
-    /// baggage, or the dead reconnect-notify insert path).
+    /// the profile-so-far by `ApiWorkerScheduler::find_and_reserve_worker` via the
+    /// fine→coarse hierarchical lookup. `tier` records WHICH tier resolved
+    /// ([`ProfileTier::Fine`] or [`ProfileTier::Coarse`]) so the completion-path
+    /// accuracy classification (and the eventual Phase-3 down-override, which must
+    /// NOT trust a coarse tail) can treat a coarse prediction conservatively.
+    /// `None` = no profile existed at EITHER tier at dispatch (map still warming,
+    /// absent Bazel baggage, or the dead reconnect-notify insert path).
     ///
     /// It lives IN this per-op record, so it is auto-cleaned on EVERY terminal path
     /// (`complete_action`, `inner_unreserve_worker`, `immediate_evict_worker` drain,
     /// `remove_worker`) with zero bespoke cleanup — no side map, no leak surface.
     /// Read (never enforced) at completion by `record_action_resource_usage`.
-    pub dispatch_memory_prediction: Option<(u64, u64)>,
+    pub dispatch_memory_prediction: Option<(ProfileTier, u64, u64)>,
 }
 
 /// (#sched-blend, security S1) Upper bound on the worker-reported P/E

@@ -332,6 +332,77 @@ impl ProfileKey {
             action_mnemonic: clamp_key_str(action_mnemonic),
         })
     }
+
+    /// (#task-resource-profile hierarchical-key) Derive the COARSE key
+    /// `(instance_name, "", action_mnemonic)` — the fallback tier that blends ALL
+    /// targets sharing a mnemonic, or `None` when the mnemonic is absent.
+    ///
+    /// The coarse key is keyed with an EMPTY `target_id`, which is the coarse
+    /// MARKER: [`from_parts`](Self::from_parts) REQUIRES a non-empty `target_id`,
+    /// so a fine key can NEVER have an empty target — the coarse key is therefore
+    /// collision-free with the entire fine-key space in the shared [`ProfileMap`].
+    /// Unlike `from_parts` (which SKIPS an empty target as absent baggage), this
+    /// constructor treats the empty target as the intentional coarse discriminant,
+    /// so it must be built via THIS constructor (never `from_parts`).
+    ///
+    /// A coarse key still needs its mnemonic to be meaningful (it groups a
+    /// mnemonic's targets); an empty `action_mnemonic` (absent baggage) returns
+    /// `None`, mirroring `from_parts`'s skip-on-empty-baggage. The empty
+    /// `instance_name` (the DEFAULT instance, NOT baggage) is allowed, same as
+    /// `from_parts`. `PROFILE_KEY_MAX_STR_LEN` clamps the mnemonic (S4).
+    pub fn coarse(instance_name: &str, action_mnemonic: &str) -> Option<Self> {
+        if action_mnemonic.is_empty() {
+            return None;
+        }
+        Some(Self {
+            instance_name: clamp_key_str(instance_name),
+            // The coarse marker: empty target_id, collision-free with all fine keys.
+            target_id: String::new(),
+            action_mnemonic: clamp_key_str(action_mnemonic),
+        })
+    }
+}
+
+/// (#task-resource-profile hierarchical-key) Which tier of the hierarchical
+/// `(instance, target, mnemonic)` → `(instance, mnemonic)` key a lookup resolved
+/// to. A COARSE hit blends all targets of a mnemonic → higher variance /
+/// over-reservation risk, so a downstream consumer (the eventual Phase-3
+/// DOWN-override) must NOT trust a coarse tail; it is carried through so the
+/// fine-vs-coarse coverage is visible and gate-able.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileTier {
+    /// The fine `(instance, target, mnemonic)` key.
+    Fine,
+    /// The coarse `(instance, mnemonic)` fallback key.
+    Coarse,
+}
+
+/// (#task-resource-profile hierarchical-key) Result of a fine→coarse hierarchical
+/// tail lookup with the `K` (`min_samples`) gate applied by the map.
+///
+/// The fallback defeats K-starvation: a fine key that has not yet reached `K`
+/// samples (the ~2.5-samples/key prod regime) can borrow the ALREADY-mature
+/// coarse `(instance, mnemonic)` key's tail, so the observe pipeline has
+/// coverage immediately instead of after the fine keys mature (~18 h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TieredTail {
+    /// The chosen tier (fine preferred, else coarse) reached `>= K` samples — a
+    /// trusted tail. `tier` records WHICH tier; `tail_kb`/`samples` are from it.
+    Trusted {
+        tier: ProfileTier,
+        tail_kb: u64,
+        samples: u64,
+    },
+    /// A profile existed at >= 1 tier but NEITHER reached `K` samples (untrusted
+    /// tail). Carries the consulted tier's data (fine preferred) so a dispatch-time
+    /// stash can represent "present-but-untrusted" for the leave-one-out check.
+    LowSample {
+        tier: ProfileTier,
+        tail_kb: u64,
+        samples: u64,
+    },
+    /// No profile at either tier (map warming / absent baggage).
+    NoProfile,
 }
 
 /// Truncate a key component to at most `PROFILE_KEY_MAX_STR_LEN` CHARS (not
@@ -486,6 +557,66 @@ impl ProfileMap {
         self.cache
             .peek(key)
             .map(|agg| (agg.memory_tail_kb(), agg.sample_count()))
+    }
+
+    /// (#task-resource-profile hierarchical-key) FINE→COARSE fallback tail lookup.
+    ///
+    /// Try the FINE key first: if it has `>= K` (`min_samples`) samples, use its
+    /// tail and mark [`ProfileTier::Fine`]. Otherwise try the COARSE key: if it has
+    /// `>= K` samples, use its tail and mark [`ProfileTier::Coarse`]. If neither
+    /// tier is trusted, return [`TieredTail::LowSample`] when a profile exists at
+    /// SOME tier (fine preferred for the carried data) or [`TieredTail::NoProfile`]
+    /// when neither tier is present.
+    ///
+    /// This is the K-starvation defeat: the coarse `(instance, mnemonic)` key
+    /// matures ~30× faster than a fine `(instance, target, mnemonic)` key, so a
+    /// fine key still under `K` borrows the mature coarse tail immediately.
+    ///
+    /// Both reads use `peek` (never `get`) so an observe-only lookup NEVER bumps
+    /// LRU recency (design §6 / N-3) for either tier.
+    pub fn lookup_tiered(&self, fine: &ProfileKey, coarse: &ProfileKey) -> TieredTail {
+        let fine_peek = self
+            .cache
+            .peek(fine)
+            .map(|agg| (agg.memory_tail_kb(), agg.sample_count()));
+        if let Some((tail_kb, samples)) = fine_peek {
+            if samples >= self.min_samples {
+                return TieredTail::Trusted {
+                    tier: ProfileTier::Fine,
+                    tail_kb,
+                    samples,
+                };
+            }
+        }
+        let coarse_peek = self
+            .cache
+            .peek(coarse)
+            .map(|agg| (agg.memory_tail_kb(), agg.sample_count()));
+        if let Some((tail_kb, samples)) = coarse_peek {
+            if samples >= self.min_samples {
+                return TieredTail::Trusted {
+                    tier: ProfileTier::Coarse,
+                    tail_kb,
+                    samples,
+                };
+            }
+        }
+        // Neither tier trusted: distinguish present-but-low-sample from absent so
+        // the caller keeps the low-sample vs no-profile counters (and the accuracy
+        // path's leave-one-out low-sample vs no-dispatch classification).
+        match (fine_peek, coarse_peek) {
+            (Some((tail_kb, samples)), _) => TieredTail::LowSample {
+                tier: ProfileTier::Fine,
+                tail_kb,
+                samples,
+            },
+            (None, Some((tail_kb, samples))) => TieredTail::LowSample {
+                tier: ProfileTier::Coarse,
+                tail_kb,
+                samples,
+            },
+            (None, None) => TieredTail::NoProfile,
+        }
     }
 
     #[inline]
@@ -837,6 +968,157 @@ mod tests {
         let k = ProfileKey::from_parts("", "//foo:bar", "CppCompile")
             .expect("empty instance_name is the default instance → still Some");
         assert_eq!(k.instance_name, "");
+    }
+
+    fn coarse_key(mnemonic: &str) -> ProfileKey {
+        ProfileKey::coarse("main", mnemonic).expect("non-empty mnemonic")
+    }
+
+    // ── (#task-resource-profile hierarchical-key) coarse key + fallback ──
+
+    #[test]
+    fn coarse_key_has_empty_target_and_is_collision_free_with_fine() {
+        let c = ProfileKey::coarse("main", "CppCompile").expect("non-empty mnemonic → Some");
+        assert_eq!(
+            c.target_id, "",
+            "the coarse key MUST carry an empty target_id (the coarse marker) so it is \
+             collision-free with every fine key (from_parts requires a non-empty target)"
+        );
+        assert_eq!(c.instance_name, "main");
+        assert_eq!(c.action_mnemonic, "CppCompile");
+        // Same instance+mnemonic, fine vs coarse → DISTINCT keys (they must not collapse).
+        let fine = ProfileKey::from_parts("main", "//foo:bar", "CppCompile").unwrap();
+        assert_ne!(
+            fine, c,
+            "the fine (instance,target,mnemonic) and coarse (instance,mnemonic) keys must be \
+             distinct map entries — collapsing them would double-count"
+        );
+    }
+
+    #[test]
+    fn coarse_key_skips_empty_mnemonic_but_allows_empty_instance() {
+        assert!(
+            ProfileKey::coarse("main", "").is_none(),
+            "an empty action_mnemonic (absent baggage) must skip (None) — a coarse key with \
+             no mnemonic groups nothing meaningful"
+        );
+        let c = ProfileKey::coarse("", "CppCompile")
+            .expect("empty instance is the default instance → still Some");
+        assert_eq!(c.instance_name, "");
+    }
+
+    #[test]
+    fn coarse_key_clamps_oversized_mnemonic() {
+        let huge = "m".repeat(1_000_000);
+        let c = ProfileKey::coarse("main", &huge).expect("non-empty mnemonic → Some");
+        assert_eq!(
+            c.action_mnemonic.chars().count(),
+            PROFILE_KEY_MAX_STR_LEN,
+            "an oversized coarse mnemonic must be clamped to PROFILE_KEY_MAX_STR_LEN chars so \
+             the coarse key cannot break the ~20 MiB footprint bound"
+        );
+    }
+
+    #[test]
+    fn lookup_tiered_prefers_fine_when_fine_is_trusted() {
+        // K=3. Fine has 3 samples (≥K) at a HIGHER magnitude than coarse. Fallback must
+        // choose FINE (the more specific tier), not coarse.
+        let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..3 {
+            map.record(fine.clone(), mem_sample(50_000)); // 50000 → bucket16 → tail 2^16
+        }
+        // Coarse has ≥K but at a different magnitude — must be ignored when fine is trusted.
+        for _ in 0..5 {
+            map.record(coarse.clone(), mem_sample(1000));
+        }
+        assert_eq!(
+            map.lookup_tiered(&fine, &coarse),
+            TieredTail::Trusted {
+                tier: ProfileTier::Fine,
+                tail_kb: 1 << 16,
+                samples: 3,
+            },
+            "a fine key with ≥K samples must be chosen over coarse (Fine tier, fine's tail)"
+        );
+    }
+
+    #[test]
+    fn lookup_tiered_falls_back_to_coarse_when_fine_below_k() {
+        // K=3. Fine has only 2 samples (<K) — the prod K-starvation regime. Coarse has
+        // ≥K → the fallback must borrow the COARSE tail and mark Coarse.
+        let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..2 {
+            map.record(fine.clone(), mem_sample(1000));
+        }
+        for _ in 0..4 {
+            map.record(coarse.clone(), mem_sample(50_000)); // tail 2^16
+        }
+        assert_eq!(
+            map.lookup_tiered(&fine, &coarse),
+            TieredTail::Trusted {
+                tier: ProfileTier::Coarse,
+                tail_kb: 1 << 16,
+                samples: 4,
+            },
+            "fine below K but coarse ≥K → the fallback must borrow the mature coarse tail \
+             (Coarse tier) — this is the K-starvation defeat"
+        );
+    }
+
+    #[test]
+    fn lookup_tiered_low_sample_when_neither_tier_reaches_k() {
+        // K=5. Fine=2, coarse=3, both < K → LowSample (a profile exists but is untrusted).
+        // The carried tier is Fine (preferred) so the dispatch stash can represent it.
+        let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 5, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..2 {
+            map.record(fine.clone(), mem_sample(1000));
+        }
+        for _ in 0..3 {
+            map.record(coarse.clone(), mem_sample(1000));
+        }
+        assert_eq!(
+            map.lookup_tiered(&fine, &coarse),
+            TieredTail::LowSample {
+                tier: ProfileTier::Fine,
+                tail_kb: 1 << 10,
+                samples: 2,
+            },
+            "neither tier reaching K → LowSample carrying the fine (preferred) tier's data"
+        );
+    }
+
+    #[test]
+    fn lookup_tiered_no_profile_when_neither_tier_present() {
+        let map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        assert_eq!(
+            map.lookup_tiered(&fine, &coarse),
+            TieredTail::NoProfile,
+            "no profile at either tier → NoProfile"
+        );
+    }
+
+    #[test]
+    fn lookup_tiered_does_not_bump_recency_of_either_tier() {
+        // cap 2, K=1. Populate fine + coarse (2 keys, at cap). A lookup peeks BOTH; if it
+        // bumped recency, inserting a 3rd key would evict differently. Prove peek-only:
+        // both keys stay LRU-ordered as recorded, so the 3rd insert evicts the oldest (fine).
+        let mut map = ProfileMap::new(NonZeroUsize::new(2).unwrap(), 1, 200);
+        let (fine, coarse, other) = (key("//a", "M"), coarse_key("M"), key("//b", "M"));
+        map.record(fine.clone(), mem_sample(1000)); // oldest
+        map.record(coarse.clone(), mem_sample(1000));
+        // Lookup must NOT bump recency of fine or coarse.
+        let _ = map.lookup_tiered(&fine, &coarse);
+        let o = map.record(other.clone(), mem_sample(1000));
+        assert!(o.evicted, "cap 2 → 3rd distinct key evicts the LRU key");
+        assert!(
+            map.peek(&fine).is_none(),
+            "lookup_tiered must not bump recency — fine (the oldest, only peeked) must remain \
+             LRU and be the eviction victim"
+        );
     }
 
     #[test]
