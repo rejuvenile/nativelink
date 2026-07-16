@@ -3040,6 +3040,110 @@ impl ApiWorkerSchedulerImpl {
         best
     }
 
+    /// (#task-resource-profile Phase-3 §7) Largest single worker's total physical
+    /// RAM (KiB) across the pool, or `0` when no worker reports it. The RAISE
+    /// starvation clamp uses it as the schedulability ceiling: an action raised
+    /// above every worker's RAM is clamped to this so it lands on the biggest worker
+    /// rather than stranding. Workers reporting `0` (unknown / legacy) contribute no
+    /// ceiling. O(workers), computed once per reserve under the write lock we already
+    /// hold (no extra lock).
+    fn max_worker_total_memory_kb(&self) -> u64 {
+        self.workers
+            .iter()
+            .map(|(_, w)| w.total_memory_kb)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// (#task-resource-profile Phase-3 §5 STORE-ONCE LEDGER) Compute the effective
+    /// `memory_kb` reservation ONCE at admission. When it differs from the declared
+    /// value, return an `ActionInfoWithProps` clone with that value written into its
+    /// `memory_kb` `Minimum`; the caller passes THIS clone as BOTH the gate props and
+    /// the `action_info` that `reduce_platform_properties` decrements + stores in the
+    /// running-action record. So `is_satisfied_by` (gate), `reduce` (subtract), and
+    /// `restore` (add-back at completion) all read the SAME stored value — symmetric
+    /// BY CONSTRUCTION. The 2026-05-08 / B1 ledger-drift trap (recompute a DIFFERENT
+    /// value at restore from the mutating profile map) is architecturally impossible
+    /// here: `restore_platform_properties` reads the stored clone, never the map.
+    ///
+    /// Returns `None` (no override → byte-identical declared-only ledger) when: both
+    /// enforcement flags are off (fast path — the common case); the action declares no
+    /// `memory_kb` `Minimum` (the override RAISES/LOWERS an EXISTING reservation, never
+    /// INJECTS a new dimension — injecting one could wedge a worker that does not
+    /// advertise it, the observe-path §7 lesson); the action carries no baggage key; no
+    /// TRUSTED (>=K) profile exists at either tier; or the computed effective equals
+    /// declared.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    fn phase3_compute_effective_action_info(
+        &self,
+        action_info: &ActionInfoWithProps,
+        resource_profile_map: &ParkingMutex<ProfileMap>,
+    ) -> Option<ActionInfoWithProps> {
+        // Fast path: no enforcement enabled → no override, no lookup, byte-identical.
+        if !self.phase3_raise_enabled && !self.phase3_down_overcommit_enabled {
+            return None;
+        }
+        // Only an action ALREADY declaring a memory_kb Minimum is eligible.
+        let declared_kb = match action_info
+            .platform_properties
+            .properties
+            .get(MEMORY_KB_PROPERTY)
+        {
+            Some(PlatformPropertyValue::Minimum(v)) => v.max(0.0) as u64,
+            _ => return None,
+        };
+        let (fine_key, coarse_key) = resource_profile_keys(action_info)?;
+        // Only a TRUSTED (>=K) profile may MOVE a reservation — an untrusted tail is
+        // statistically meaningless (same K-gate as the observe path).
+        let TieredTail::Trusted {
+            tail_kb, ..
+        } = resource_profile_map.lock().lookup_tiered(&fine_key, &coarse_key)
+        else {
+            return None;
+        };
+
+        let effective_kb = if self.phase3_raise_enabled && tail_kb > declared_kb {
+            // RAISE (§7): the client under-declared vs the measured worst-case tail →
+            // reserve the tail. OOM-SAFE (tightening only).
+            let raised = tail_kb;
+            // Starvation clamp (C5 / §7): if NO worker can hold the raised value, clamp
+            // to the largest single worker's RAM so the action stays schedulable
+            // instead of stranding above every worker forever.
+            let max_total = self.max_worker_total_memory_kb();
+            if max_total > 0 && raised > max_total {
+                info!(
+                    tag = "phase3_raise_starvation_clamp",
+                    target_id = %fine_key.target_id,
+                    action_mnemonic = %fine_key.action_mnemonic,
+                    declared_kb,
+                    raised_kb = raised,
+                    clamped_kb = max_total,
+                    "phase3 RAISE: raised reservation exceeds every worker's total RAM; \
+                     clamped to the max worker capacity so the action stays schedulable"
+                );
+                max_total
+            } else {
+                raised
+            }
+        } else {
+            // DOWN-overcommit (§3) fills the `tail_kb <= declared_kb` branch in Stage 3;
+            // until then an over-declared key keeps its declared reservation (no-op).
+            declared_kb
+        };
+
+        if effective_kb == declared_kb {
+            return None;
+        }
+        // STORE-ONCE: clone the action and write the effective value into its memory_kb
+        // Minimum. This single object is what the caller gates + reduces + stores.
+        let mut effective = action_info.clone();
+        effective.platform_properties.properties.insert(
+            MEMORY_KB_PROPERTY.to_string(),
+            PlatformPropertyValue::Minimum(effective_kb as f64),
+        );
+        Some(effective)
+    }
+
     /// Atomically finds a suitable worker AND reserves it for the given
     /// operation by mutating the worker's state (reducing platform properties,
     /// inserting into `running_action_infos`). Returns the worker ID, the
@@ -6591,10 +6695,23 @@ impl ApiWorkerScheduler {
         let worker_count = inner.workers.len() as u64;
         let endpoint_scores: Option<&HashMap<Arc<str>, u64>> =
             scoring_result.as_deref().map(|sr| &sr.scores);
+        // (#task-resource-profile Phase-3 §5) STORE-ONCE effective memory override,
+        // computed BEFORE selection so `is_satisfied_by` gates on the SAME value
+        // `reduce`/`restore` use. `None` (all flags off / no trusted profile / no
+        // memory_kb declared / effective==declared) → pass the ORIGINAL refs →
+        // byte-identical declared-only ledger. `Some(eff)` → gate + reduce + the
+        // stored running-action clone ALL read `eff` (symmetric by construction).
+        let effective_action_info =
+            inner.phase3_compute_effective_action_info(action_info, &self.resource_profile_map);
+        let (sel_props, sel_action_info): (&PlatformProperties, &ActionInfoWithProps) =
+            match &effective_action_info {
+                Some(eff) => (&eff.platform_properties, eff),
+                None => (platform_properties, action_info),
+            };
         let mut result = inner.inner_find_and_reserve_worker(
-            platform_properties,
+            sel_props,
             operation_id,
-            action_info,
+            sel_action_info,
             full_worker_logging,
             endpoint_scores,
             resolved_tree.as_deref(),
@@ -17018,6 +17135,31 @@ mod b1_lock_decouple_tests {
         rx
     }
 
+    /// (#task-resource-profile Phase-3) Add a worker advertising `memory_kb` remaining
+    /// AND a connect-frame `total_memory_kb` (the RAISE starvation-clamp ceiling).
+    /// Built via `new_with_cas_endpoint` (unlimited slots, the deployed config).
+    async fn add_worker_with_memory_and_total(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+        memory_kb: f64,
+        total_memory_kb: u64,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new_with_cas_endpoint(
+            WorkerId(name.to_string()),
+            props_named_with_memory(name, memory_kb),
+            tx,
+            42,
+            0, // max_inflight_tasks = 0 (unlimited)
+            String::new(),
+            0,
+            0,
+            total_memory_kb,
+        );
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
     /// Build an action requiring `declared_kb` memory on worker `name`, carrying the
     /// Bazel baggage the profile key derives from (`//foo:bar` / `CppCompile`).
     fn action_with_memory_and_baggage(name: &str, seed: u8, declared_kb: f64) -> ActionInfoWithProps {
@@ -17317,6 +17459,161 @@ mod b1_lock_decouple_tests {
             scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
             0,
             "declared (15360) exceeds the tail (2048) → no raise; DOWN opportunity only"
+        );
+    }
+
+    // ── (#task-resource-profile Phase-3 §5/§7) RAISE + store-once ledger ──
+
+    /// (§7 RAISE + §5 store-once) With RAISE enabled and a trusted (≥K) profile whose
+    /// tail (65_536) EXCEEDS the declared `memory_kb` (4096), the reservation reserves
+    /// the TAIL, and — the store-once contract — the worker's remaining `memory_kb` is
+    /// decremented by the EFFECTIVE (65_536), never the declared (4096). Worker RAM
+    /// (100_000 total + remaining) is large enough that no clamp fires.
+    ///
+    /// MUTATION: in `find_and_reserve_worker`, pass the ORIGINAL `action_info` (not
+    /// `sel_action_info`) to `inner_find_and_reserve_worker` → reduce/store use the
+    /// declared 4096 while the gate used the effective → remaining reads 95_904 (=
+    /// 100_000 − 4096) → this red-fails (the reduce/gate split that breaks store-once).
+    #[nativelink_test]
+    async fn raise_reserves_the_tail_via_store_once_ledger() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        scheduler.set_phase3_enforcement(true, false, 1.0); // RAISE on
+        let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
+
+        // Trusted (≥K) profile: 50_000 KiB → bucket 16 → tail 2^16 = 65_536 ≫ declared 4096.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xf1, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("RAISE-reserved op must land on worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(100_000.0 - 65_536.0),
+            "RAISE must reserve the EFFECTIVE tail (65_536) via the store-once ledger — the \
+             worker's remaining memory_kb must be 100_000−65_536=34_464, NOT 100_000−4096 \
+             (which would mean the gate saw the raise but reduce/store saw the declared)"
+        );
+    }
+
+    /// (§5 store-once SYMMETRY, the 2026-05-08 trap) reduce and restore must be
+    /// symmetric EVEN when the profile map mutates MID-ACTION. Reserve with RAISE
+    /// (tail 65_536), then fold NEW higher samples (tail jumps to 2^23) — a recompute
+    /// at restore would add back the NEW tail — then complete the action: the worker's
+    /// remaining memory_kb must return to the EXACT baseline (100_000), because restore
+    /// reads the STORED effective (65_536), never a recomputed value.
+    ///
+    /// MUTATION: in `find_and_reserve_worker`, pass the ORIGINAL `action_info` to
+    /// `inner_find_and_reserve_worker` → the post-reserve remaining assert (34_464)
+    /// red-fails (store-once write bypassed). [The post-complete baseline holds by
+    /// construction: restore reads the stored clone, so no map mutation can drift it.]
+    #[nativelink_test]
+    async fn raise_reduce_restore_symmetric_under_midaction_map_mutation() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        scheduler.set_phase3_enforcement(true, false, 1.0);
+        let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
+
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xf2, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("RAISE-reserved op must land on worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(34_464.0),
+            "after reserve the remaining must be 100_000−65_536 (the STORED effective)"
+        );
+
+        // MID-ACTION map mutation: fold higher samples so the key's tail jumps to 2^23
+        // (5_000_000 → bucket 23). A restore that RECOMPUTED would add back 8_388_608.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(5_000_000));
+        }
+        assert_eq!(
+            scheduler.resource_profile_peek_tail(&observe_key()).map(|(t, _)| t),
+            Some(1 << 23),
+            "the mid-action fold must have raised the key's tail (to 2^23) so a \
+             recompute-at-restore would drift the ledger — the setup for the trap"
+        );
+
+        // Complete the action → restore_platform_properties(stored props) adds back the
+        // STORED 65_536, never the now-larger recomputed tail.
+        {
+            let mut inner = scheduler.inner.write().await;
+            let w = inner
+                .workers
+                .0
+                .peek_mut(&WorkerId("W".to_string()))
+                .expect("worker W present");
+            w.complete_action(&op).expect("complete_action must restore");
+        }
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(100_000.0),
+            "STORE-ONCE SYMMETRY: after completion the remaining must return to the EXACT \
+             baseline (100_000). A recompute-at-restore from the mutated map would add back \
+             the NEW tail (2^23) and drift the ledger — the 2026-05-08 phantom-FULL trap"
+        );
+    }
+
+    /// (§7 RAISE starvation clamp, C5) When the raised value exceeds EVERY worker's
+    /// total RAM, RAISE clamps to the max worker capacity so the action stays
+    /// schedulable rather than stranding forever. Worker total = remaining = 8_000_000;
+    /// profile tail (2^24 = 16_777_216) > total; declared 4_000_000. The clamp brings
+    /// effective down to 8_000_000, which the worker CAN satisfy → the op reserves.
+    ///
+    /// MUTATION: delete the `max_total > 0 && raised > max_total` clamp branch (return
+    /// `raised` unconditionally) → effective 16_777_216 > 8_000_000 remaining →
+    /// `is_satisfied_by` fails → NO worker → the reserve returns None → the "must not
+    /// strand" expect red-fails with its bespoke message.
+    #[nativelink_test]
+    async fn raise_clamps_to_max_worker_total_not_strand() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        scheduler.set_phase3_enforcement(true, false, 1.0);
+        // Worker total RAM 8_000_000; advertises 8_000_000 remaining.
+        let _rx_w =
+            add_worker_with_memory_and_total(&scheduler, "W", 8_000_000.0, 8_000_000).await;
+
+        // Trusted profile: 10_000_000 KiB → bucket 24 → tail 2^24 = 16_777_216 > total.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(10_000_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xf3, 4_000_000.0);
+        let reserve = scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 4_000_000.0),
+                &op,
+                &action,
+                false,
+            )
+            .await;
+        let (reserved, _tx, _msg) = reserve.expect(
+            "RAISE must CLAMP the raised reservation (2^24) down to the max worker total \
+             (8_000_000) so the action stays schedulable — it must NOT strand above every \
+             worker's RAM",
+        );
+        assert_eq!(reserved, WorkerId("W".to_string()));
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(0.0),
+            "the clamped effective (8_000_000) must be reserved in full → remaining 0"
         );
     }
 
