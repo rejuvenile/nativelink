@@ -79,6 +79,32 @@ pub enum WorkerAllocationStrategy {
     MostRecentlyUsed,
 }
 
+/// (#sched-cpu-first) Selects how the worker matcher RANKS the winner among
+/// eligible workers. Eligibility (viability, pressure gates, the P-headroom
+/// gate) is IDENTICAL in both modes — only the winner-ranking differs.
+#[derive(Copy, Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub enum PlacementMode {
+    /// (DEFAULT) Cache-affinity-first: the exact-root / subtree-coverage /
+    /// blob-locality cascade steers work to the worker that already holds the
+    /// action's input tree, so a cold reconstruct is avoided. Byte-identical to
+    /// the pre-`#sched-cpu-first` matcher. Correct for the mixed / fetch-bound
+    /// workload where input-fetch is the throughput lever.
+    #[default]
+    CacheAffinityFirst,
+    /// CPU-idle-first: rank eligible workers by their (synthetic-compensated)
+    /// P-core load ascending (lowest-P-load wins), abandoning cache affinity
+    /// while any worker has an idle P-core (Regime A). Only when EVERY viable
+    /// worker's P-load rounds >= 90% does cache affinity return as a tiebreak
+    /// within the least-loaded total-CPU decile bucket (Regime B). For a
+    /// CPU-bound-dominant workload (rustc-heavy compiles) where getting onto an
+    /// idle P-core dominates the (post-clonefile ~10ms) cache-affinity saving.
+    /// OPT-IN, operator-toggled per build phase — see the design at
+    /// `.claude/audits/scheduler-cpu-first-placement-mode-design-2026-07-15.md`.
+    CpuIdleFirst,
+}
+
 // defaults to every 10s
 const fn default_worker_match_logging_interval_s() -> i64 {
     10
@@ -424,6 +450,43 @@ pub struct SimpleSpec {
     /// OBSERVABILITY-ONLY: no dispatch decision changes when it is on.
     #[serde(default)]
     pub scheduler_decision_trace_enabled: bool,
+
+    /// (#sched-cpu-first) Worker winner-RANKING policy. `CacheAffinityFirst`
+    /// (the default) is byte-identical to the pre-`#sched-cpu-first` matcher;
+    /// `CpuIdleFirst` ranks by (synthetic-compensated) P-core load ascending,
+    /// re-admitting cache affinity only as a tiebreak when the whole fleet is
+    /// P-saturated (see `PlacementMode`). Eligibility (viability, pressure
+    /// gates, the P-headroom gate) is UNCHANGED in both modes — only the
+    /// winner-ranking differs.
+    ///
+    /// Default: `CacheAffinityFirst` (no behavior change when omitted). This is
+    /// NOT a dark-counter feature flag but a first-class alternative POLICY
+    /// whose correctness is workload-dependent: defaulting `CpuIdleFirst` on
+    /// would deterministically regress the known-dominant fetch-bound / mixed
+    /// workload. The operator selects `CpuIdleFirst` per-scheduler (or per build
+    /// phase) for a CPU-bound-labeled worker pool; selection = exercise (see the
+    /// design §7 reconciliation).
+    #[serde(default)]
+    pub placement_mode: PlacementMode,
+
+    /// (#sched-cpu-first §3) Synthetic P-load percentage points ADDED per
+    /// assigned-but-not-yet-reported action when ranking under `CpuIdleFirst`.
+    /// Bridges the report lag (`p_core_load_pct` trails assignment by up to the
+    /// ~2.5s keepalive report interval): a just-assigned worker ranks WORSE
+    /// until its next load report resets the snapshot, so a dispatch burst
+    /// spreads across the fleet instead of piling on the one worker that still
+    /// reports idle. Consulted ONLY in `CpuIdleFirst`.
+    ///
+    /// Default: 25 (≈ one P-core's worth at p_core_count = 4). Fixed for now;
+    /// eventually driven by the per-task historical CPU from the profile map
+    /// (Track-B). Soak-tunable — a too-large value over-suppresses a lightly-
+    /// loaded worker (design F2); the effective value is clamped so total
+    /// effective P-load never exceeds 100.
+    #[serde(
+        default = "default_cpu_first_synthetic_pct_per_task",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub cpu_first_synthetic_pct_per_task: u32,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -502,8 +565,22 @@ impl Default for SimpleSpec {
             // OFF (observability-only; an operator turns it ON briefly to diagnose
             // a placement question, then OFF).
             scheduler_decision_trace_enabled: false,
+            // #[serde(default)] → PlacementMode::default() = CacheAffinityFirst
+            // (byte-identical to today until an operator selects CpuIdleFirst).
+            placement_mode: PlacementMode::default(),
+            // #[serde(default = "default_cpu_first_synthetic_pct_per_task")] → 25.
+            cpu_first_synthetic_pct_per_task: default_cpu_first_synthetic_pct_per_task(),
         }
     }
+}
+
+/// (#sched-cpu-first §3) Default synthetic P-load per assigned-but-unreported
+/// action under `CpuIdleFirst` (25 pct ≈ one P-core at p_core_count = 4). Named
+/// default fn (not a bare `#[serde(default)]` u32 0, which would disable the
+/// anti-pile synthetic bridge entirely). `pub` so any no-config constructor
+/// path sources the SAME value (single source of truth — no drift).
+pub const fn default_cpu_first_synthetic_pct_per_task() -> u32 {
+    25
 }
 
 /// Serde default of `true` for scheduler feature flags that are ON by default.

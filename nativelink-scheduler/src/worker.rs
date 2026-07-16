@@ -170,6 +170,20 @@ pub struct Worker {
     /// Set to `true` (never back to `false`) the first time the worker reports.
     pub has_reported_load: bool,
 
+    /// (#sched-cpu-first §3) Snapshot of `running_action_infos.len()` taken at
+    /// the last load report (`update_worker_load`). Under `CpuIdleFirst`
+    /// placement the ranker adds SYNTHETIC P-load for the actions assigned SINCE
+    /// that snapshot (`running_action_infos.len() - running_at_last_load_report`,
+    /// `saturating_sub`) to bridge the ~2.5s report lag, so a dispatch burst does
+    /// not pile onto the one worker still reporting idle. Reset to the current
+    /// in-flight count on every load report (the report has "caught up"); a
+    /// completion-draining worker decays to synthetic 0 via `saturating_sub`.
+    /// `0` at construction and until the first report (no synthetic bias yet).
+    /// Read/written ONLY under the worker-pool write lock. Inert under
+    /// `CacheAffinityFirst` (the default) — no ranker consults it there.
+    #[metric(help = "running_action_infos.len() snapshot at the last load report (CpuIdleFirst synthetic-load base).")]
+    pub running_at_last_load_report: usize,
+
     /// Performance-core CPU utilization (0-100). 0 means unknown.
     #[metric(help = "P-core load percentage reported by the worker.")]
     pub p_core_load_pct: u32,
@@ -379,6 +393,8 @@ impl Worker {
             // cold-construct latency; never a scheduling input.
             construct_latency_ms_p95: 0,
             has_reported_load: false,
+            // (#sched-cpu-first §3) No load report yet → no synthetic base.
+            running_at_last_load_report: 0,
             p_core_count,
             e_core_count,
             indefinite_pin_saturated: false,

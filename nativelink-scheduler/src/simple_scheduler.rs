@@ -2659,6 +2659,14 @@ impl SimpleScheduler {
         // `set_exec_clock` one-shot wiring above.
         worker_scheduler.set_decision_trace_enabled(spec.scheduler_decision_trace_enabled);
 
+        // (#sched-cpu-first §7) Wire the winner-ranking policy from config
+        // (default `CacheAffinityFirst` = byte-identical to today) + the
+        // synthetic-load pct-per-task for `CpuIdleFirst`. Mirrors the
+        // `set_decision_trace_enabled` one-shot wiring above (uncontended
+        // try_write on the freshly-built Arc). Selection-only.
+        worker_scheduler
+            .set_placement_mode(spec.placement_mode, spec.cpu_first_synthetic_pct_per_task);
+
         let worker_scheduler_clone = worker_scheduler.clone();
 
         let action_scheduler = Arc::new_cyclic(move |weak_self| -> Self {

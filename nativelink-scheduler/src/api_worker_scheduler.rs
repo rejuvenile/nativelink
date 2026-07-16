@@ -25,7 +25,7 @@ use async_lock::RwLock;
 use bytes::Bytes;
 use lru::LruCache;
 use opentelemetry::context::Context;
-use nativelink_config::schedulers::WorkerAllocationStrategy;
+use nativelink_config::schedulers::{PlacementMode, WorkerAllocationStrategy};
 use nativelink_config::stores::{ClientTlsConfig, GrpcEndpoint, GrpcSpec, Retry, StoreType};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
 use nativelink_metric::{
@@ -1310,6 +1310,82 @@ const fn is_e_spill_admit(running_before: u64, p_core_count: u32, e_core_count: 
         && running_before < p_core_count as u64 + e_core_count as u64
 }
 
+/// (#sched-cpu-first §5) Rounds a load percentage to the NEAREST decile
+/// {0,10,…,100}. Pure `const fn`, unit-testable (mirrors `is_e_spill_admit`).
+/// `(x + 5) / 10 * 10` gives round-half-up: 84→80, 85→90, 90→90, 95→100. The
+/// `.min(100)` clamp is defensive against a >100 wire glitch (`x <= 100` already
+/// yields at most `(105/10)*10 == 100`). Used by (a) the Regime-B fleet-wide
+/// P-saturation trigger (`round_decile(p_core_load_pct) >= 90`, i.e. raw
+/// `p_load >= 85`) and (b) the Regime-B total-CPU-load decile bucketing.
+const fn round_decile(x: u32) -> u32 {
+    // `saturating_add` guards the defensive >100 glitch path against a
+    // `u32::MAX + 5` debug overflow; real inputs are 0..=100.
+    let r = x.saturating_add(5) / 10 * 10;
+    if r > 100 { 100 } else { r }
+}
+
+/// (#sched-cpu-first §3) The report-lag compensated effective P-load used to
+/// RANK workers under `CpuIdleFirst`. Adds `pct_per_task` percentage points of
+/// synthetic load per assigned-but-not-yet-reported action (`synthetic_count`),
+/// CLAMPED to 100. Pure, unit-testable:
+///   - `synthetic_count == 0` ⇒ identity (returns `reported_p_load`, clamped).
+///   - a completion-draining worker (its `saturating_sub` snapshot delta hit 0)
+///     ⇒ `synthetic_count == 0` ⇒ back to the true reported load.
+///   - a large burst ⇒ saturates at 100 (drops the worker to the E-tier).
+/// The synthetic term is bounded: `synthetic_count` is a `saturating_sub` of two
+/// values each <= the eligibility-capped in-flight count, and the product is
+/// clamped to 100 — no runaway (design I3).
+fn effective_p_load(reported_p_load: u32, synthetic_count: usize, pct_per_task: u32) -> u32 {
+    let synthetic = (synthetic_count as u64).saturating_mul(u64::from(pct_per_task));
+    let total = u64::from(reported_p_load).saturating_add(synthetic);
+    u32::try_from(total.min(100)).unwrap_or(100)
+}
+
+/// (#sched-cpu-first §3) Actions assigned to `w` SINCE its last load report —
+/// the synthetic-load count fed to `effective_p_load`. `saturating_sub` so a
+/// worker whose completions outpaced its assignments between reports decays to
+/// 0 (never underflows). Reads only `running_action_infos.len()` (the fresh,
+/// synchronously-maintained count) and the `running_at_last_load_report`
+/// snapshot — both under the worker-pool write lock.
+fn synthetic_pending(w: &Worker) -> usize {
+    w.running_action_infos
+        .len()
+        .saturating_sub(w.running_at_last_load_report)
+}
+
+/// (#sched-cpu-first §2/§3) The `CpuIdleFirst` ranking score for one worker;
+/// LOWER is better (idle-P wins). REUSES `effective_load_score` verbatim (idle-P
+/// tier `[0,99]`, P-full/E tier `[100,199]`, aggregate-only in the P-tier,
+/// never-reported ⇒ `u64::MAX` worst) but feeds it the SYNTHETIC-compensated
+/// P-load (`effective_p_load`) instead of the raw reported one. So a P-full
+/// worker automatically drops to the `100 + e_load` E-tier (spill only when
+/// forced), and a just-assigned worker's synthetic load pushes it below a
+/// still-idle peer — the anti-pile behavior. `synth_pct_per_task` is the
+/// configured `cpu_first_synthetic_pct_per_task`.
+///
+/// NOTE (design-drift, reported in the impl report): the design §9/§8-F4 test
+/// note "never-reported ⇒ 0" conflates a REPORTED-idle worker (`has_reported_load
+/// == true`, all-zero ⇒ 0, best) with a NEVER-reported worker (`has_reported_load
+/// == false` ⇒ `u64::MAX`, worst — the `#sched-zeroload` contract this fn
+/// preserves by reusing `effective_load_score` verbatim). This fn keeps the
+/// verbatim reuse (the design's central §2 instruction); the never-reported case
+/// therefore scores `u64::MAX`, NOT 0.
+fn cpu_first_score(w: &Worker, synth_pct_per_task: u32) -> u64 {
+    let eff_p = effective_p_load(w.p_core_load_pct, synthetic_pending(w), synth_pct_per_task);
+    effective_load_score(eff_p, w.e_core_load_pct, w.cpu_load_pct, w.has_reported_load)
+}
+
+/// (#sched-cpu-first §4) Is worker `w` P-saturated for the fleet-wide Regime-B
+/// trigger? True iff it has REPORTED a load AND its raw `p_core_load_pct` rounds
+/// to decile >= 90 (i.e. raw `p_load >= 85`). A never-reported worker is NOT
+/// saturated (its load fields are the construction-default 0) — so a fresh
+/// worker keeps the fleet in Regime A (conservative: it means spare capacity).
+/// The fleet fold ANDs this across every VIABLE worker: Regime B iff ALL are
+/// P-saturated. Pure, unit-testable.
+fn worker_is_p_saturated(w: &Worker) -> bool {
+    w.has_reported_load && round_decile(w.p_core_load_pct) >= 90
+}
+
 #[derive(Debug)]
 struct Workers(LruCache<WorkerId, Worker>);
 
@@ -1381,6 +1457,17 @@ struct ApiWorkerSchedulerImpl {
     /// actions (design §3, I5_Bounded). Config
     /// (`SimpleSpec::p_headroom_override_factor`). Default 2.
     p_headroom_override_factor: u32,
+    /// (#sched-cpu-first §7) Winner-RANKING policy. `CacheAffinityFirst` (default)
+    /// is byte-identical to the pre-`#sched-cpu-first` matcher; `CpuIdleFirst`
+    /// swaps ONLY the winner-selection (eligibility unchanged) for P-core-idle-
+    /// first placement (design §2/§6). Read once per dispatch under the worker
+    /// write lock. Wired post-construction via `set_placement_mode` (mirrors
+    /// `set_decision_trace_enabled`), so no constructor call site changes.
+    placement_mode: PlacementMode,
+    /// (#sched-cpu-first §3) Synthetic P-load pct-per-unreported-action for the
+    /// `CpuIdleFirst` ranker (config `SimpleSpec::cpu_first_synthetic_pct_per_task`,
+    /// default 25). Consulted ONLY when `placement_mode == CpuIdleFirst`.
+    cpu_first_synthetic_pct_per_task: u32,
     /// (#sched-decision-trace) DIAGNOSTIC master switch (config
     /// `SimpleSpec::scheduler_decision_trace_enabled`, default false). When true,
     /// `inner_find_and_reserve_worker` emits the INFO `sched_decision_trace` dump
@@ -2541,9 +2628,23 @@ impl ApiWorkerSchedulerImpl {
         // CAPPED AT candidates.len(): one entry per viable-no-headroom candidate,
         // bounded by the platform-matched candidate set (fleet size); flag-ON,
         // dev/soak-only observability, dropped at end of dispatch.
+        // (#sched-cpu-first §2/§4) Read the placement mode once per dispatch. In
+        // `CacheAffinityFirst` (the default) every CpuIdleFirst branch below is
+        // skipped and the matcher is byte-identical to the pre-`#sched-cpu-first`
+        // path. `synth_pct` is only consulted by the CpuIdleFirst ranker.
+        let placement_mode = self.placement_mode;
+        let cpu_first = matches!(placement_mode, PlacementMode::CpuIdleFirst);
+        let synth_pct = self.cpu_first_synthetic_pct_per_task;
         let mut viable_count: usize = 0;
         let mut all_viable_saturated = true;
         let mut any_viable_has_p_headroom = false;
+        // (#sched-cpu-first §4) Regime-B (fleet-wide P-saturation) trigger, folded
+        // into this SAME pre-scan (no second pass/lock). `true` until a viable,
+        // load-reporting worker rounds < decile 90 (raw `p_load < 85`). A
+        // never-reported viable worker keeps the fleet in Regime A (conservative:
+        // a fresh worker means spare capacity). Only accumulated in CpuIdleFirst;
+        // inert (and meaningless — `viable_count > 0` gates its use) otherwise.
+        let mut all_viable_p_saturated = true;
         let mut p_gated_excluded: Vec<(WorkerId, usize, u32, u32)> = Vec::new();
         for wid in &candidates {
             if worker_is_viable(wid) {
@@ -2551,6 +2652,9 @@ impl ApiWorkerSchedulerImpl {
                 if let Some(w) = self.workers.0.peek(wid) {
                     if !cap_score(w).is_saturated() {
                         all_viable_saturated = false;
+                    }
+                    if cpu_first {
+                        all_viable_p_saturated &= worker_is_p_saturated(w);
                     }
                     if has_p_headroom(w) {
                         any_viable_has_p_headroom = true;
@@ -2579,6 +2683,59 @@ impl ApiWorkerSchedulerImpl {
         // existing LRU/MRU fallback (I2 no-wedge). OFF by default → `false` →
         // every tier's gated predicate below is identical to `worker_is_viable`.
         let p_gate_active = p_headroom_gate_enabled && any_viable_has_p_headroom;
+
+        // (#sched-cpu-first §4/§5) Regime selection under CpuIdleFirst.
+        //  * Regime B (saturated): every viable worker's p-load rounds >= 90 AND
+        //    at least one is viable → cache affinity returns, scoped to the
+        //    lowest total-CPU-load decile bucket (the tiebreak).
+        //  * Regime A (non-saturated): rank purely by `cpu_first_score` — NO
+        //    cache scoring.
+        // In CacheAffinityFirst both are `false`/`None` so nothing below changes.
+        let regime_b = cpu_first && viable_count > 0 && all_viable_p_saturated;
+        // (#sched-cpu-first §2/§5) Run the exact-root / subtree / locality cache
+        // cascade in CacheAffinityFirst (always) and in CpuIdleFirst ONLY in
+        // Regime B (scoped to the bucket, as the tiebreak). In Regime A the
+        // cascade is skipped entirely — cache affinity is abandoned while an idle
+        // P-core exists (R3).
+        let run_cascade = !cpu_first || regime_b;
+        // (#sched-cpu-first §5) The lowest total-CPU-load decile bucket, computed
+        // ONLY in Regime B over the same gated set the cascade uses
+        // (`worker_is_viable` AND, when the P-gate is active, `has_p_headroom`).
+        // `Some(members)` scopes the cache cascade AND the `cpu_first` ranker to
+        // that bucket; `None` (both other modes / Regime A) imposes no restriction
+        // → byte-identical eligibility. Two O(candidates) passes, Regime-B only.
+        // CAPPED AT candidates.len(): the bucket is a subset of the platform-
+        // matched candidate set (fleet-bounded), per-dispatch scratch, dropped at
+        // end of dispatch.
+        let cpu_first_bucket: Option<HashSet<WorkerId>> = if regime_b {
+            let mut min_decile = u32::MAX;
+            for wid in &candidates {
+                if worker_is_viable(wid) {
+                    if let Some(w) = self.workers.0.peek(wid) {
+                        if !p_gate_active || has_p_headroom(w) {
+                            min_decile = min_decile.min(round_decile(w.cpu_load_pct));
+                        }
+                    }
+                }
+            }
+            let mut bucket = HashSet::new();
+            if min_decile != u32::MAX {
+                for wid in &candidates {
+                    if worker_is_viable(wid) {
+                        if let Some(w) = self.workers.0.peek(wid) {
+                            if (!p_gate_active || has_p_headroom(w))
+                                && round_decile(w.cpu_load_pct) == min_decile
+                            {
+                                bucket.insert(wid.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Some(bucket)
+        } else {
+            None
+        };
 
         // (#sched M1 rebalance v2, §12.1) The ranking-preference key the cache
         // tiers apply as their PRIMARY sort key (the load term becomes
@@ -2612,6 +2769,15 @@ impl ApiWorkerSchedulerImpl {
         let worker_is_viable_gated = |worker_id: &WorkerId| -> bool {
             if !worker_is_viable(worker_id) {
                 return false;
+            }
+            // (#sched-cpu-first §5) In Regime B the cache cascade and the
+            // `cpu_first` ranker are scoped to the lowest total-CPU decile
+            // bucket. `None` (CacheAffinityFirst / Regime A) imposes no
+            // restriction — byte-identical eligibility.
+            if let Some(bucket) = &cpu_first_bucket {
+                if !bucket.contains(worker_id) {
+                    return false;
+                }
             }
             if !p_gate_active {
                 return true;
@@ -2687,7 +2853,7 @@ impl ApiWorkerSchedulerImpl {
         // magnet (invariant I6). When the gate is off/lifted, `pref ≡ 0` for all
         // holders, so the tuple reduces to min-`load_penalty` = the exact v1
         // (pre-v2) Tier-1 order.
-        let dir_cache_winner: Option<WorkerId> = if saturation_fall_through {
+        let dir_cache_winner: Option<WorkerId> = if saturation_fall_through || !run_cascade {
             None
         } else {
             // (id, (p_headroom_pref, load_penalty)) — tuple key, smaller wins.
@@ -2735,8 +2901,9 @@ impl ApiWorkerSchedulerImpl {
         const PER_FILE_WEIGHT: u64 = 100 * 1024; // 100KB per file
         let subtree_coverage_winner: Option<WorkerId> = if dir_cache_winner.is_some()
             || saturation_fall_through
+            || !run_cascade
         {
-            None // exact match found, OR all viable saturated → fall through
+            None // exact match found, OR all viable saturated, OR CpuIdleFirst Regime A → fall through
         } else if let Some(tree) = resolved_tree {
             let total_bytes: u64 = tree.subtree_bytes.get(&input_root_digest).copied().unwrap_or(0);
             let total_files: u64 = tree.subtree_files.get(&input_root_digest).copied().unwrap_or(0);
@@ -2850,7 +3017,7 @@ impl ApiWorkerSchedulerImpl {
         // candidate is saturated, Tier 2 also declines so the cascade falls
         // through to the LRU/MRU path rather than piling onto the
         // warmest-locality worker (§4.4).
-        let locality_winner = if saturation_fall_through {
+        let locality_winner = if saturation_fall_through || !run_cascade {
             None
         } else if let Some(ep_scores) = endpoint_scores {
             let scores = endpoint_scores_to_worker_scores(
@@ -2910,6 +3077,46 @@ impl ApiWorkerSchedulerImpl {
             None
         };
 
+        // ── (#sched-cpu-first §2/§5) CpuIdleFirst winner (P-core-idle-first) ──
+        // Rank the `worker_is_viable_gated` set (bucket-scoped in Regime B) by
+        // `cpu_first_score` ASCENDING; min wins. `None` when that set is empty
+        // (e.g. every viable worker is pressure-gated → viable_count == 0 →
+        // Regime B not entered, Regime A ranks over an empty set) — in that case
+        // the winner resolution below FALLS THROUGH to `inner_find_worker_for_
+        // action` (the #37/F4 fleet fail-open), NOT a terminal `None`, so the
+        // capability class does not wedge under fleet-wide pressure (distsys
+        // BLOCK #1). Used ONLY after the cache cascade declines: in Regime A the
+        // cascade is skipped entirely (`run_cascade == false`); in Regime B this
+        // is the within-bucket fallback when no bucket member has a cache hit.
+        // `min_by_key`-style first-min ⇒ ties fall to `&candidates` iteration
+        // order. Guarded by `cpu_first` so CacheAffinityFirst pays nothing.
+        let cpu_first_winner: Option<WorkerId> = if cpu_first {
+            let mut best: Option<(WorkerId, u64)> = None;
+            for wid in &candidates {
+                if let Some(w) = self.workers.0.peek(wid) {
+                    if worker_is_viable_gated(wid) {
+                        let score = cpu_first_score(w, synth_pct);
+                        let dominated = best.as_ref().is_some_and(|(_, best_score)| score >= *best_score);
+                        if !dominated {
+                            best = Some((wid.clone(), score));
+                        }
+                    }
+                }
+            }
+            if let Some((ref wid, score)) = best {
+                debug!(
+                    ?wid,
+                    cpu_first_score = score,
+                    regime = if regime_b { "B" } else { "A" },
+                    %input_root_digest,
+                    "cpu-idle-first winner — lowest (synthetic-compensated) P-load"
+                );
+            }
+            best.map(|(wid, _)| wid)
+        } else {
+            None
+        };
+
         // ── (#specprefetch-rebind Stage B v3, §2.3-v3) Temporal hold-vs-rebind gate ──
         // Runs UNDER the `self.inner.write()` held at the reserve call site and
         // BEFORE any winner LRU promotion below, so a HOLD is the EXISTING no-match
@@ -2951,7 +3158,11 @@ impl ApiWorkerSchedulerImpl {
         // winner exists), under the same `self.inner.write()` — no new lock, no
         // `.await`, no alloc. `t_wait >= T_SETUP` is counted FIRST (ahead of
         // `overdue`) so the soak learns whether the threshold conjunct is the binder.
-        if self.enable_speculative_hold && p_gate_active {
+        // (#sched-cpu-first O3) The speculative-hold gate is DISABLED under
+        // CpuIdleFirst: it is a cache-locality-rebind optimization (holds a cold
+        // op for a P-saturated CACHE HOLDER), meaningless for a mode that does
+        // not chase locality in Regime A and spreads-under-saturation in Regime B.
+        if !cpu_first && self.enable_speculative_hold && p_gate_active {
             self.metrics
                 .c1_hold_gate_considered
                 .fetch_add(1, Ordering::Relaxed);
@@ -3063,8 +3274,21 @@ impl ApiWorkerSchedulerImpl {
             // Blob-level locality scoring.
             self.workers.get_mut(&wid);
             wid
+        } else if let Some(wid) = cpu_first_winner {
+            // (#sched-cpu-first §2/§5) CpuIdleFirst winner: Regime A ranks the
+            // whole gated set by cpu_first_score; Regime B ranks the lowest-decile
+            // bucket after its cache cascade declined. `Some` here ⇒ a viable
+            // worker exists → reserve it. (Only ever `Some` when `cpu_first`.)
+            self.workers.get_mut(&wid);
+            wid
         } else {
             // ── Fallback: existing LRU/MRU strategy ──
+            // (#sched-cpu-first distsys BLOCK #1) Reached under CpuIdleFirst when
+            // the gated (Regime A) / bucket (Regime B) set is EMPTY — e.g. every
+            // viable worker is swap/disk-pressured (viable_count == 0). Routing the
+            // empty result through `inner_find_worker_for_action` inherits the
+            // #37/F4 fleet fail-open (least-pressured placement), so the capability
+            // class does NOT wedge under fleet-wide pressure.
             match self.inner_find_worker_for_action(platform_properties, full_worker_logging) {
                 Some(wid) => wid,
                 None => {
@@ -4689,6 +4913,16 @@ impl ApiWorkerScheduler {
                 p_headroom_gate_enabled,
                 p_idle_threshold_pct,
                 p_headroom_override_factor,
+                // (#sched-cpu-first §7) Placement mode defaults to the byte-
+                // identical CacheAffinityFirst; the production wiring
+                // (`SimpleScheduler::new`) injects the configured mode +
+                // synthetic-pct via `set_placement_mode` (mirrors
+                // `set_decision_trace_enabled`), so no constructor call site
+                // changes. The synthetic-pct default is sourced from the SAME
+                // config default fn (single source of truth).
+                placement_mode: PlacementMode::CacheAffinityFirst,
+                cpu_first_synthetic_pct_per_task:
+                    nativelink_config::schedulers::default_cpu_first_synthetic_pct_per_task(),
                 // (#sched-decision-trace) Diagnostic decision-trace OFF until the
                 // operator enables it via config (wired post-construction by
                 // `set_decision_trace_enabled`, mirroring `set_exec_clock`);
@@ -4828,6 +5062,23 @@ impl ApiWorkerScheduler {
                  before any task holds the inner lock",
             )
             .decision_trace_enabled = enabled;
+    }
+
+    /// (#sched-cpu-first §7) Select the winner-ranking policy (+ the synthetic
+    /// P-load pct-per-task for `CpuIdleFirst`). Wired ONCE by
+    /// `SimpleScheduler::new` right after construction from
+    /// `SimpleSpec::{placement_mode, cpu_first_synthetic_pct_per_task}`, mirroring
+    /// `set_decision_trace_enabled`. SYNCHRONOUS one-shot wiring on the freshly-
+    /// returned `Arc<Self>` before any task can hold `inner`, so `try_write()` is
+    /// uncontended. Tests call it to select `CpuIdleFirst` before driving a
+    /// dispatch. Selection-only: no data-plane, ack, pin, or memory-gate effect.
+    pub fn set_placement_mode(&self, placement_mode: PlacementMode, synthetic_pct_per_task: u32) {
+        let mut inner = self.inner.try_write().expect(
+            "set_placement_mode must be called during one-shot wiring, before any \
+             task holds the inner lock",
+        );
+        inner.placement_mode = placement_mode;
+        inner.cpu_first_synthetic_pct_per_task = synthetic_pct_per_task;
     }
 
     /// (#specprefetch-rebind Stage B/C v3) `T_wait_W`: the worker's expected time to
@@ -9353,6 +9604,15 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // the construction-default `(0,0,0)`. Never reset to `false`.
         let previously_unreported = !worker.has_reported_load;
         worker.has_reported_load = true;
+        // (#sched-cpu-first §3) Snapshot the current in-flight count: this load
+        // report has now "caught up" to the actions running when it was sampled,
+        // so the `CpuIdleFirst` ranker adds synthetic P-load ONLY for assignments
+        // made AFTER this point (`running_action_infos.len() -
+        // running_at_last_load_report`). Reset here (under the same write lock)
+        // decays a just-reported worker's synthetic bias to 0. Inert under
+        // CacheAffinityFirst (no ranker reads the field). MUST stay after the
+        // load-field stores above so the snapshot pairs with the reported load.
+        worker.running_at_last_load_report = worker.running_action_infos.len();
         drop(inner);
         // (#sched-zeroload) Decrement the gauge on the first-ever load report:
         // the worker is no longer in the "never-reported" category.
@@ -9696,6 +9956,164 @@ mod tests {
         assert!(idle_p < saturated_p, "idle P-cores should beat saturated P-cores");
         assert!(aggregate < saturated_p, "aggregate-only in P-tier should beat E-core-only");
         assert!(saturated_p < unknown, "known load should beat unknown");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (#sched-cpu-first) Pure selector unit tests — table-tested per design §9.
+    // Call the PRIVATE free fns `round_decile` / `effective_p_load` /
+    // `cpu_first_score` directly.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// (§9) `round_decile` nearest-decile rounding table (round-half-up).
+    #[test]
+    fn test_round_decile_table() {
+        assert_eq!(round_decile(0), 0, "0 → 0");
+        assert_eq!(round_decile(4), 0, "4 rounds down to 0");
+        assert_eq!(round_decile(5), 10, "5 rounds up to 10 (half-up)");
+        assert_eq!(round_decile(84), 80, "84 → 80");
+        assert_eq!(round_decile(85), 90, "85 rounds up to 90 (the Regime-B cutoff)");
+        assert_eq!(round_decile(90), 90, "90 → 90");
+        assert_eq!(round_decile(95), 100, "95 rounds up to 100");
+        assert_eq!(round_decile(100), 100, "100 → 100");
+        assert_eq!(round_decile(u32::MAX), 100, "defensive clamp: >100 glitch → 100");
+    }
+
+    /// (§9) `round_decile(x) >= 90 ⟺ x >= 85` — the exact Regime-B P-saturation
+    /// boundary the fleet-wide fold uses. Pins the 85/90 seam.
+    #[test]
+    fn test_round_decile_regime_b_boundary_is_85() {
+        assert!(round_decile(84) < 90, "raw p_load 84 is NOT p-saturated (decile 80)");
+        assert!(round_decile(85) >= 90, "raw p_load 85 IS p-saturated (decile 90)");
+    }
+
+    /// (§9) `effective_p_load`: identity at synthetic 0, clamp at 100, drain
+    /// back to reported, large burst saturates.
+    #[test]
+    fn test_effective_p_load_table() {
+        // synthetic_count 0 ⇒ identity (returns reported, clamped).
+        assert_eq!(effective_p_load(0, 0, 25), 0, "idle + no synthetic → 0");
+        assert_eq!(effective_p_load(30, 0, 25), 30, "synthetic 0 → identity");
+        // synthetic term added, below clamp.
+        assert_eq!(effective_p_load(30, 2, 25), 80, "30 + 2*25 = 80");
+        // clamp to 100.
+        assert_eq!(effective_p_load(30, 4, 25), 100, "30 + 4*25 = 130 → clamp 100");
+        assert_eq!(effective_p_load(0, 100, 25), 100, "large burst saturates at 100");
+        // drain: saturating_sub already produced synthetic_count 0 ⇒ reported.
+        assert_eq!(
+            effective_p_load(40, 0, 25),
+            40,
+            "completion-drained (synthetic_count 0) → back to true reported load"
+        );
+    }
+
+    /// (§9) `cpu_first_score` ordering: idle-P < P-full/E-idle < P-full/E-full,
+    /// and a NEVER-reported worker sorts WORST (`u64::MAX`) via the verbatim-
+    /// reused `effective_load_score` (#sched-zeroload contract). NOTE this is the
+    /// design-drift documented on `cpu_first_score`: §9's "never-reported ⇒ 0"
+    /// conflates reported-idle (→0) with never-reported (→MAX); the verbatim
+    /// reuse the design mandates in §2 gives MAX.
+    #[test]
+    fn test_cpu_first_score_ordering() {
+        // idle-P: p_load 20, no synthetic → score 20 (P-tier).
+        let mut idle_p = worker_with_running("IDLE_P", 4, 20, 0);
+        idle_p.e_core_load_pct = 10;
+        idle_p.cpu_load_pct = 20;
+        // P-full / E-idle: p_load 100, e_load 10 → 100 + 10 = 110 (E-tier).
+        let mut pfull_eidle = worker_with_running("PFULL_EIDLE", 4, 100, 0);
+        pfull_eidle.e_core_load_pct = 10;
+        pfull_eidle.cpu_load_pct = 90;
+        // P-full / E-full: p_load 100, e_load 90 → 100 + 90 = 190 (worst reporter).
+        let mut pfull_efull = worker_with_running("PFULL_EFULL", 4, 100, 0);
+        pfull_efull.e_core_load_pct = 90;
+        pfull_efull.cpu_load_pct = 100;
+        // never-reported: has_reported_load == false.
+        let mut never = worker_with_running("NEVER", 4, 0, 0);
+        never.has_reported_load = false;
+        never.e_core_load_pct = 0;
+        never.cpu_load_pct = 0;
+
+        let s_idle = cpu_first_score(&idle_p, 25);
+        let s_pfe = cpu_first_score(&pfull_eidle, 25);
+        let s_pff = cpu_first_score(&pfull_efull, 25);
+        let s_never = cpu_first_score(&never, 25);
+
+        assert_eq!(s_idle, 20, "idle-P ranks by its P-load (P-tier [0,99])");
+        assert_eq!(s_pfe, 110, "P-full/E-idle jumps to the E-tier (100 + e_load)");
+        assert_eq!(s_pff, 190, "P-full/E-full is the worst among reporters");
+        assert!(s_idle < s_pfe, "idle-P beats P-full/E-idle");
+        assert!(s_pfe < s_pff, "P-full/E-idle beats P-full/E-full (spill last)");
+        assert_eq!(
+            s_never,
+            u64::MAX,
+            "never-reported sorts WORST (verbatim effective_load_score reuse; \
+             #sched-zeroload contract — NOT 0 as §9's mislabel says)"
+        );
+    }
+
+    /// (§9) `cpu_first_score` synthetic compensation: a just-assigned worker
+    /// ranks WORSE than an equally-reported idle peer until its report resets
+    /// the snapshot. Two workers with IDENTICAL reported load (0); one has 1
+    /// unreported assignment (running 1, snapshot 0 ⇒ synthetic 1).
+    #[test]
+    fn test_cpu_first_score_synthetic_penalizes_unreported_assignment() {
+        // Reported-idle, no pending: score 0.
+        let mut idle = worker_with_running("IDLE", 4, 0, 0);
+        idle.running_at_last_load_report = 0; // snapshot 0, running 0 → synthetic 0
+        idle.e_core_load_pct = 0;
+        idle.cpu_load_pct = 0;
+        // Reported-idle but 1 unreported assignment: running 1, snapshot 0 →
+        // synthetic 1 → effective_p_load 0 + 25 = 25.
+        let mut just_assigned = worker_with_running("JUST", 4, 0, 1);
+        just_assigned.running_at_last_load_report = 0;
+        just_assigned.e_core_load_pct = 0;
+        just_assigned.cpu_load_pct = 0;
+
+        let s_idle = cpu_first_score(&idle, 25);
+        let s_just = cpu_first_score(&just_assigned, 25);
+        assert_eq!(s_idle, 0, "genuinely-idle reported worker scores 0 (best)");
+        assert_eq!(s_just, 25, "1 unreported assignment adds 25 synthetic P-load");
+        assert!(
+            s_idle < s_just,
+            "synthetic compensation makes the just-assigned worker rank WORSE, \
+             so a burst spreads instead of piling on it"
+        );
+
+        // Drain: the report caught up (snapshot == running == 1) → synthetic 0 →
+        // back to reported idle (0). Re-concentrates on the truly-idle one.
+        let mut reported = just_assigned;
+        reported.running_at_last_load_report = 1; // snapshot now matches running
+        assert_eq!(
+            cpu_first_score(&reported, 25),
+            0,
+            "after the load report resets the snapshot, synthetic decays to 0"
+        );
+    }
+
+    /// (§9) `worker_is_p_saturated` fold predicate: reported p_load >= 85 is
+    /// saturated (→ Regime B contribution), < 85 is not (→ Regime A), and a
+    /// never-reported worker is NOT saturated (→ Regime A, conservative).
+    #[test]
+    fn test_worker_is_p_saturated_predicate() {
+        // Reported, p_load 85 → saturated.
+        let mut sat = worker_with_running("SAT", 4, 85, 0);
+        sat.has_reported_load = true;
+        assert!(worker_is_p_saturated(&sat), "reported p_load 85 (decile 90) is saturated");
+
+        // Reported, p_load 84 → NOT saturated (decile 80) → keeps fleet in A.
+        let mut nonsat = worker_with_running("NONSAT", 4, 84, 0);
+        nonsat.has_reported_load = true;
+        assert!(
+            !worker_is_p_saturated(&nonsat),
+            "reported p_load 84 (decile 80) is NOT saturated → one such worker keeps Regime A"
+        );
+
+        // Never-reported (loads default 0) → NOT saturated → conservative Regime A.
+        let mut never = worker_with_running("NEVER", 4, 0, 0);
+        never.has_reported_load = false;
+        assert!(
+            !worker_is_p_saturated(&never),
+            "never-reported worker is NOT saturated (spare capacity) → conservative Regime A"
+        );
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -16100,6 +16518,229 @@ mod b1_lock_decouple_tests {
                 w.running_action_infos.len(),
                 running,
                 "fixture must set exactly `running` in-flight actions"
+            );
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // (#sched-cpu-first) CpuIdleFirst PRODUCTION-composition harness tests.
+        // Drive `find_and_reserve_worker` (`select`) with `set_placement_mode
+        // (CpuIdleFirst, 25)`. Cover: default parity, Regime-A burst spread +
+        // reset re-concentration, the distsys-BLOCK fleet fail-open no-wedge,
+        // and Regime-B decile bucketing + cache tiebreak.
+        // ════════════════════════════════════════════════════════════════
+
+        /// Register a NON-cache-holding pool worker with the given counts + load
+        /// (mirrors `add_tier1_worker` but WITHOUT `update_cached_directories`,
+        /// so it competes purely on load). `update_worker_load` marks it
+        /// reported and resets its synthetic-load snapshot.
+        async fn add_pool_worker_loaded(
+            scheduler: &Arc<ApiWorkerScheduler>,
+            name: &str,
+            p_count: u32,
+            e_count: u32,
+            cpu_load: u32,
+            p_load: u32,
+            e_load: u32,
+        ) {
+            let _rx = add_worker_in_pool(scheduler, name).await;
+            scheduler
+                .set_worker_core_counts(&WorkerId(name.to_string()), p_count, e_count)
+                .await
+                .expect("set core counts");
+            scheduler
+                .update_worker_load(&WorkerId(name.to_string()), cpu_load, p_load, e_load)
+                .await
+                .expect("set load");
+        }
+
+        /// (§9 parity + mode-divergence) A busy CACHE HOLDER vs an IDLE
+        /// non-holder. `CacheAffinityFirst` (the default) steers to the holder
+        /// (byte-identical to HEAD); `CpuIdleFirst` Regime-A abandons cache and
+        /// picks the idle worker (lowest P-load). ONE scenario proves BOTH the
+        /// safe default AND the mode switch.
+        ///
+        /// MUTATION: force `run_cascade = false` (or the mode branch) so the
+        /// default no longer runs the cascade → CacheAffinityFirst would pick the
+        /// idle worker → the parity assertion red-fails.
+        #[nativelink_test]
+        async fn cpu_first_parity_default_cache_first_mode_switches() {
+            use nativelink_config::schedulers::PlacementMode;
+
+            // ── CacheAffinityFirst (default): the cache holder wins. ──
+            let sched_default = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 4);
+            // HOLDER: caches input_root, moderately busy (p_load 50, not saturated).
+            add_tier1_worker(&sched_default, "HOLDER", 4, 6, 50, 50, 20).await;
+            // IDLE: non-holder, reported idle.
+            add_pool_worker_loaded(&sched_default, "IDLE", 4, 6, 0, 0, 0).await;
+            assert_eq!(
+                select(&sched_default).await,
+                Some(WorkerId("HOLDER".to_string())),
+                "CacheAffinityFirst (default) MUST steer to the cache holder — \
+                 byte-identical to HEAD (parity)"
+            );
+
+            // ── CpuIdleFirst: same fleet, the idle non-holder wins. ──
+            let sched_cpu = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 4);
+            sched_cpu.set_placement_mode(PlacementMode::CpuIdleFirst, 25);
+            add_tier1_worker(&sched_cpu, "HOLDER", 4, 6, 50, 50, 20).await;
+            add_pool_worker_loaded(&sched_cpu, "IDLE", 4, 6, 0, 0, 0).await;
+            assert_eq!(
+                select(&sched_cpu).await,
+                Some(WorkerId("IDLE".to_string())),
+                "CpuIdleFirst Regime-A MUST pick the lowest-P-load worker (IDLE), \
+                 abandoning the cache holder — the mode switch works"
+            );
+        }
+
+        /// (§9 burst spread + reset) Regime-A synthetic load SPREADS a burst of
+        /// assignments across an idle fleet, then a load report re-concentrates
+        /// on the truly-idle worker. Three reported-idle non-holders; three
+        /// `select`s must land on THREE DISTINCT workers (each assignment adds
+        /// synthetic P-load pushing that worker below its peers).
+        ///
+        /// MUTATION: comment the synthetic term in `effective_p_load` (return the
+        /// reported load only) → every worker stays score 0 → `min_by_key` returns
+        /// the SAME first worker every time → the burst piles on ONE worker → the
+        /// distinct-count assertion red-fails.
+        #[nativelink_test]
+        async fn cpu_first_regime_a_burst_spreads_then_reset_reconcentrates() {
+            use std::collections::HashSet as StdHashSet;
+
+            use nativelink_config::schedulers::PlacementMode;
+
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 4);
+            scheduler.set_placement_mode(PlacementMode::CpuIdleFirst, 25);
+            for name in ["W1", "W2", "W3"] {
+                add_pool_worker_loaded(&scheduler, name, 4, 6, 0, 0, 0).await;
+            }
+
+            let mut chosen = StdHashSet::new();
+            for _ in 0..3 {
+                let w = select(&scheduler).await.expect("burst assignment must place");
+                chosen.insert(w);
+            }
+            assert_eq!(
+                chosen.len(),
+                3,
+                "synthetic load must SPREAD the 3-assignment burst across all 3 \
+                 idle workers (not pile on one); got {chosen:?}"
+            );
+
+            // Reset one worker's report → its snapshot catches up to its running
+            // count → synthetic decays to 0 → it re-becomes the best (score 0)
+            // while the others still carry synthetic 1 (score 25). The next
+            // assignment must re-concentrate on it.
+            scheduler
+                .update_worker_load(&WorkerId("W1".to_string()), 0, 0, 0)
+                .await
+                .expect("reset W1 load report");
+            assert_eq!(
+                select(&scheduler).await,
+                Some(WorkerId("W1".to_string())),
+                "after W1's load report resets its synthetic snapshot, the next \
+                 assignment re-concentrates on the now-truly-idle W1"
+            );
+        }
+
+        /// (distsys BLOCK #1 — fleet fail-open no-wedge) Under CpuIdleFirst, when
+        /// EVERY viable worker is swap-pressured the gated (Regime A) set is empty
+        /// → `cpu_first_winner` is `None` → the winner resolution FALLS THROUGH to
+        /// `inner_find_worker_for_action`'s #37/F4 fleet fail-open, which places on
+        /// the least-pressured worker. The capability class must NOT wedge.
+        ///
+        /// MUTATION: replace the final `else` arm's `inner_find_worker_for_action`
+        /// call with `return None` → the empty gated set terminates in `None` →
+        /// this test red-fails (nothing placed = wedge).
+        #[nativelink_test]
+        async fn cpu_first_all_swap_pressured_still_places_no_wedge() {
+            use nativelink_config::schedulers::PlacementMode;
+
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 4);
+            scheduler.set_placement_mode(PlacementMode::CpuIdleFirst, 25);
+            add_pool_worker_loaded(&scheduler, "P1", 4, 6, 0, 0, 0).await;
+            add_pool_worker_loaded(&scheduler, "P2", 4, 6, 0, 0, 0).await;
+            // Both workers swap-pressured → excluded from viability → empty gated set.
+            scheduler
+                .update_worker_swap_pressure(&WorkerId("P1".to_string()), true, 50_000)
+                .await
+                .expect("mark P1 pressured");
+            scheduler
+                .update_worker_swap_pressure(&WorkerId("P2".to_string()), true, 10_000)
+                .await
+                .expect("mark P2 pressured");
+
+            let chosen = select(&scheduler).await;
+            assert!(
+                chosen.is_some(),
+                "CpuIdleFirst with EVERY viable worker swap-pressured MUST still \
+                 place via the fleet fail-open fall-through (distsys BLOCK #1) — a \
+                 terminal None here would wedge the capability class"
+            );
+            assert_eq!(
+                chosen,
+                Some(WorkerId("P2".to_string())),
+                "the fleet fail-open ranks by least swap shortfall → P2 (10k) beats \
+                 P1 (50k)"
+            );
+        }
+
+        /// (§9 Regime-B) On a fully P-saturated fleet, cache affinity returns ONLY
+        /// as a tiebreak WITHIN the least-loaded total-CPU decile bucket. A
+        /// lower-cpu-decile NON-holder beats a higher-cpu-decile CACHE HOLDER.
+        ///
+        /// MUTATION: comment the `cpu_first_bucket` membership check in
+        /// `worker_is_viable_gated` → the higher-decile holder becomes eligible for
+        /// the cascade → the cache holder wins → this test red-fails.
+        #[nativelink_test]
+        async fn cpu_first_regime_b_lower_decile_beats_cache_holder() {
+            use nativelink_config::schedulers::PlacementMode;
+
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 4);
+            scheduler.set_placement_mode(PlacementMode::CpuIdleFirst, 25);
+            // HIGH_BUCKET: cache holder, p-saturated (p_load 90), cpu_load 90 (decile 90).
+            add_tier1_worker(&scheduler, "HIGH_BUCKET", 4, 6, 90, 90, 20).await;
+            // LOW_BUCKET: non-holder, p-saturated (p_load 90), cpu_load 60 (decile 60).
+            add_pool_worker_loaded(&scheduler, "LOW_BUCKET", 4, 6, 60, 90, 20).await;
+
+            assert_eq!(
+                select(&scheduler).await,
+                Some(WorkerId("LOW_BUCKET".to_string())),
+                "Regime-B: the lowest total-CPU decile bucket (LOW_BUCKET, decile 60) \
+                 wins EVEN THOUGH the higher-decile HIGH_BUCKET holds the input-root \
+                 cache — the bucket scoping excludes it before the cache tiebreak"
+            );
+        }
+
+        /// (§9 Regime-B tiebreak) Within the SAME cpu decile, the cache holder
+        /// wins the tiebreak. Two p-saturated workers both at cpu_load 60 (decile
+        /// 60); the one holding the input-root cache wins.
+        ///
+        /// MUTATION: force `run_cascade = false` for Regime B (drop the
+        /// `|| regime_b`) → no cache tier runs → the winner falls to
+        /// `cpu_first_score`, which ranks LOW_NONHOLDER (p_load 90) ABOVE the
+        /// holder (p_load 95) → LOW_NONHOLDER wins → this test red-fails.
+        /// (The p_load asymmetry makes the mutation DETERMINISTIC: only the cache
+        /// tiebreak, not iteration order, elevates the busier holder.)
+        #[nativelink_test]
+        async fn cpu_first_regime_b_same_decile_cache_tiebreak_wins() {
+            use nativelink_config::schedulers::PlacementMode;
+
+            let scheduler = build_scheduler_gate_on(BarrierWorkerStateManager::new(), 50, 4);
+            scheduler.set_placement_mode(PlacementMode::CpuIdleFirst, 25);
+            // Both p-saturated (p_load decile 90/100 >= 90), both cpu_load 60 (same
+            // decile 60) → same bucket. LOW_HOLDER holds the cache but is BUSIER on
+            // P (p_load 95) so without the cache tiebreak it would LOSE the
+            // cpu_first_score race to LOW_NONHOLDER (p_load 90) — the cache tiebreak
+            // is what elevates it.
+            add_tier1_worker(&scheduler, "LOW_HOLDER", 4, 6, 60, 95, 20).await;
+            add_pool_worker_loaded(&scheduler, "LOW_NONHOLDER", 4, 6, 60, 90, 20).await;
+
+            assert_eq!(
+                select(&scheduler).await,
+                Some(WorkerId("LOW_HOLDER".to_string())),
+                "Regime-B: within the same total-CPU decile bucket, the input-root \
+                 cache holder wins the tiebreak (even though its higher p_load would \
+                 lose the raw cpu_first_score race)"
             );
         }
 
