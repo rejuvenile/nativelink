@@ -365,6 +365,21 @@ pub struct SchedulerMetrics {
     )]
     pub total_running_actions: AtomicU64,
 
+    /// (#sched-work-conservation observability) Cumulative count of E-spill
+    /// admits: actions reserved onto a worker whose P-slots were already full,
+    /// landing in the `[p_core_count, p_core_count + e_core_count)` band purely
+    /// because the Track-A total-core term kept the worker eligible. Answers "how
+    /// much queued work is the E-spill actually recruiting onto E-cores" — the
+    /// live counterpart to the `p_headroom_gate_exclusion` log (which shows only
+    /// the denied side). Incremented `Relaxed` at the single reserve point
+    /// (`prepare_worker_run_action`); surfaced on `emit_speculative_hold_counters_log`
+    /// because the `SchedulerMetrics` tree is DARK on `/metrics`.
+    #[metric(
+        help = "cumulative E-spill admits (actions placed on E-cores of a \
+                P-full worker via the total-core term)"
+    )]
+    pub e_spill_admits_total: AtomicU64,
+
     // ── (#p1p2) Phase-1 tree-resolution telemetry ──
     // TELEMETRY-ONLY. These answer two open questions with production
     // data: (1) is Phase-1 tree resolution a scheduling-latency
@@ -733,6 +748,11 @@ pub fn emit_speculative_hold_counters_log(metrics: &SchedulerMetrics) {
         prefetch_no_target = metrics
             .speculative_prefetch_no_target
             .load(Ordering::Relaxed),
+        // (#sched-work-conservation) Cumulative E-spill admits — the live measure
+        // of how much queued work the Track-A total-core term recruits onto the
+        // E-cores of P-full workers (rides this periodic emit because the
+        // SchedulerMetrics tree is dark on /metrics).
+        e_spill_admits_total = metrics.e_spill_admits_total.load(Ordering::Relaxed),
         "stage A/B decision counters"
     );
 }
@@ -1263,6 +1283,23 @@ fn p_headroom_pref(
     }
     // No headroom (only reachable on the soft, never-filtering fallback path).
     u64::MAX
+}
+
+/// (#sched-work-conservation observability) Was an admit an **E-spill** admit —
+/// i.e. is `running_before` (the worker's in-flight count BEFORE this action was
+/// reserved) inside the E-spill band `[p_core_count, p_core_count + e_core_count)`?
+/// True means the worker's P-slots were already full and this action is being
+/// placed onto an idle E-core purely because the Track-A total-core term kept the
+/// worker eligible. Counting these at the single reserve point
+/// (`prepare_worker_run_action`) is the observability the Track-A fix was missing:
+/// it makes the work the E-spill actually recruits READABLE (the sibling
+/// `p_headroom_gate_exclusion` log shows only the DENIED side). `p_core_count == 0`
+/// (A5 legacy/Linux/Intel) has no E-spill band → always false. Pure + total; the
+/// caller increments a `Relaxed` counter, so this changes no scheduling decision.
+const fn is_e_spill_admit(running_before: u64, p_core_count: u32, e_core_count: u32) -> bool {
+    p_core_count != 0
+        && running_before >= p_core_count as u64
+        && running_before < p_core_count as u64 + e_core_count as u64
 }
 
 #[derive(Debug)]
@@ -2604,8 +2641,9 @@ impl ApiWorkerSchedulerImpl {
                     p_load,
                     %input_root_digest,
                     "p-headroom gate excluded worker from cache tiers \
-                     (at dispatch-count P limit); p_load shows whether \
-                     its P cores are truly full or it is I/O-bound"
+                     (no headroom: running >= p+e total-core band AND the idle-P \
+                     override is dead/at its ceiling); p_load shows whether its P \
+                     cores are truly full or it is I/O-bound"
                 );
             }
         }
@@ -3457,6 +3495,20 @@ impl ApiWorkerSchedulerImpl {
         // from being re-queued when the worker is removed.
         if worker.running_action_infos.contains_key(operation_id) {
             return None;
+        }
+
+        // (#sched-work-conservation observability) Count this admit if it lands in
+        // the E-spill band — the worker's P-slots are already full and it stays
+        // eligible only via the Track-A total-core term. Read the in-flight count
+        // BEFORE the insert below. Relaxed telemetry; no decision changes.
+        if is_e_spill_admit(
+            worker.running_action_infos.len() as u64,
+            worker.p_core_count,
+            worker.e_core_count,
+        ) {
+            self.metrics
+                .e_spill_admits_total
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         // Perform the state mutation that run_action would do:
@@ -10153,6 +10205,125 @@ mod tests {
             "idle-P override (p_load 10 < threshold 50): ceiling 4*4=16 → last \
              admitting running is 15 (deny at 16) — the I/O-bound ceiling is \
              UNCHANGED (no regression); the total-core term only lifts CPU-bound"
+        );
+    }
+
+    /// (#sched-work-conservation observability) `is_e_spill_admit` classifies an
+    /// admit by the worker's PRE-reserve in-flight count against the E-spill band
+    /// `[p_core_count, p_core_count + e_core_count)` — exactly what the
+    /// `e_spill_admits_total` counter reads at the single reserve point.
+    #[test]
+    fn test_is_e_spill_admit_band() {
+        // Prod shape: 4 P + 6 E → E-spill band is [4, 10).
+        // Below the band = a genuine free P slot → NOT an E-spill admit.
+        for running in 0..4 {
+            assert!(
+                !is_e_spill_admit(running, 4, 6),
+                "running={running} < p_core_count(4): a free P slot, not E-spill"
+            );
+        }
+        // Inside [4, 10): P-slots full, this admit spills to an idle E-core.
+        for running in 4..10 {
+            assert!(
+                is_e_spill_admit(running, 4, 6),
+                "running={running} in [4,10): P full → admit spills to an E-core"
+            );
+        }
+        // At/above p+e = 10: band exhausted (equilibrium); an admit here is via the
+        // idle-P override, NOT E-spill.
+        for running in 10..14 {
+            assert!(
+                !is_e_spill_admit(running, 4, 6),
+                "running={running} >= p+e(10): past the E-spill band (override)"
+            );
+        }
+        // A5 (p_core_count == 0, legacy/Linux/Intel): no E-spill band → never true.
+        assert!(!is_e_spill_admit(0, 0, 6), "p_core_count==0 has no E-spill band");
+        assert!(!is_e_spill_admit(5, 0, 6), "p_core_count==0: never an E-spill admit");
+        // Zero E-cores: empty band [4,4) → a P-full worker is at equilibrium at once.
+        assert!(
+            !is_e_spill_admit(4, 4, 0),
+            "e_core_count==0: empty E-spill band [4,4) → no E-spill admit"
+        );
+    }
+
+    /// (#sched-work-conservation, TLA+ Phase2NoLift) NO-WEDGE regression: the
+    /// Track-A total-core term must never convert the SOFT p-headroom gate into a
+    /// HARD filter. When EVERY viable worker is saturated at the E-spill
+    /// equilibrium (`running == p+e`, CPU-bound), `worker_has_p_headroom` is false
+    /// for all → the fleet aggregate `any_viable_has_p_headroom` is false →
+    /// `p_gate_active` LIFTS → `p_headroom_pref` returns 0 (eligible) for EVERY
+    /// worker, so nobody is hard-excluded and the fallback still dispatches. Were
+    /// the gate a hard filter instead, all-saturated → all-`u64::MAX` → the queue
+    /// WEDGES (the exact TLC Phase2NoLift violation the fix guards against).
+    ///
+    /// MUTATION NOTE: commenting the `if !p_gate_active { return 0; }` early-return
+    /// in `p_headroom_pref` makes each saturated worker return `u64::MAX` under the
+    /// lifted gate → the "pref == 0 for all under a lifted gate" assertion
+    /// RED-fails, proving this test guards the no-wedge (soft-gate) invariant.
+    #[test]
+    fn test_e_spill_gate_lifts_no_wedge_when_all_saturated() {
+        let gate_enabled = true;
+        // Fleet: every worker CPU-bound (p_load 98 kills the idle-P override) and
+        // saturated at the E-spill equilibrium running == p+e = 10.
+        let fleet: Vec<Worker> = (0..10)
+            .map(|i| {
+                let mut w = worker_with_running(&format!("SAT{i}"), 4, 98, 10);
+                w.set_core_counts(4, 6);
+                w
+            })
+            .collect();
+
+        for w in &fleet {
+            assert!(
+                !worker_has_p_headroom(w, 50, 4),
+                "saturated worker (running==p+e==10, p_load 98) has no headroom"
+            );
+        }
+        // Fleet aggregate → the Phase-2 lift condition.
+        let any_viable_has_p_headroom = fleet.iter().any(|w| worker_has_p_headroom(w, 50, 4));
+        assert!(
+            !any_viable_has_p_headroom,
+            "all workers saturated → no viable worker has headroom (lift condition)"
+        );
+        let p_gate_active = gate_enabled && any_viable_has_p_headroom;
+        assert!(
+            !p_gate_active,
+            "p_gate_active = enabled && any_viable_has_p_headroom → LIFTS when all \
+             saturated (Phase-2 lift)"
+        );
+
+        // NO-WEDGE: under the lifted gate every saturated worker ranks 0 (eligible)
+        // — a ranking penalty, never a hard filter — so dispatch proceeds via the
+        // fallback rather than wedging the queue.
+        for w in &fleet {
+            assert_eq!(
+                p_headroom_pref(w, p_gate_active, 50, 4),
+                0,
+                "lifted gate: a saturated worker stays eligible (pref 0), not \
+                 hard-excluded — no wedge (Phase2NoLift)"
+            );
+        }
+
+        // CONTRAST: give ONE worker a free E-slot (running 9 < p+e 10). The
+        // aggregate is now true → the gate STAYS ACTIVE and steers, but it is still
+        // SOFT: the free-slot worker ranks in the finite E-spill zone (dispatchable),
+        // so work still lands — active-gate steering, never a wedge.
+        let mut mixed = fleet;
+        mixed[0] = {
+            let mut w = worker_with_running("FREE", 4, 98, 9);
+            w.set_core_counts(4, 6);
+            w
+        };
+        let any_mixed = mixed.iter().any(|w| worker_has_p_headroom(w, 50, 4));
+        assert!(any_mixed, "one worker with a free E-slot → gate stays active");
+        let gate_mixed = gate_enabled && any_mixed;
+        assert!(gate_mixed);
+        assert_eq!(
+            p_headroom_pref(&mixed[0], gate_mixed, 50, 4),
+            1 + (9 - 4),
+            "the free-E-slot worker (running 9) ranks in the E-spill zone (finite \
+             decay pref) → dispatchable under the active gate"
         );
     }
 
