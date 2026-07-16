@@ -365,18 +365,25 @@ pub struct SchedulerMetrics {
     )]
     pub total_running_actions: AtomicU64,
 
-    /// (#sched-work-conservation observability) Cumulative count of E-spill
-    /// admits: actions reserved onto a worker whose P-slots were already full,
-    /// landing in the `[p_core_count, p_core_count + e_core_count)` band purely
-    /// because the Track-A total-core term kept the worker eligible. Answers "how
-    /// much queued work is the E-spill actually recruiting onto E-cores" — the
-    /// live counterpart to the `p_headroom_gate_exclusion` log (which shows only
-    /// the denied side). Incremented `Relaxed` at the single reserve point
-    /// (`prepare_worker_run_action`); surfaced on `emit_speculative_hold_counters_log`
-    /// because the `SchedulerMetrics` tree is DARK on `/metrics`.
+    /// (#sched-work-conservation observability) Cumulative count of admits whose
+    /// per-worker in-flight DISPATCH-COUNT lands in the `[p_core_count,
+    /// p_core_count + e_core_count)` band at reserve time — the P-slots are full
+    /// BY COUNT and the action is placed onto the E-core count-band. Read it as
+    /// "work landing on the E-core count-band," NOT as the marginal work the
+    /// Track-A total-core term alone recruited: it counts EVERY such admit
+    /// regardless of which selection path chose the worker (the total-core term,
+    /// the idle-P override, OR the ungated LRU/MRU fallback), and it is a COUNT
+    /// proxy — NOT a physical p-core-idle measurement (a CPU-idle but deeply
+    /// I/O-queued worker is also in-band, the same dispatch-count-vs-p_load gap
+    /// the `p_headroom_gate_exclusion` log acknowledges). A rough live counterpart
+    /// to that exclusion log (which shows the denied side). Incremented `Relaxed`
+    /// at the single reserve point (`prepare_worker_run_action`); surfaced on
+    /// `emit_speculative_hold_counters_log` because the `SchedulerMetrics` tree is
+    /// DARK on `/metrics`.
     #[metric(
-        help = "cumulative E-spill admits (actions placed on E-cores of a \
-                P-full worker via the total-core term)"
+        help = "cumulative admits whose in-flight dispatch-count lands in the \
+                [p_core_count, p_core_count+e_core_count) E-core band (count \
+                proxy; any selection path, not only the total-core term)"
     )]
     pub e_spill_admits_total: AtomicU64,
 
@@ -1285,17 +1292,18 @@ fn p_headroom_pref(
     u64::MAX
 }
 
-/// (#sched-work-conservation observability) Was an admit an **E-spill** admit —
-/// i.e. is `running_before` (the worker's in-flight count BEFORE this action was
-/// reserved) inside the E-spill band `[p_core_count, p_core_count + e_core_count)`?
-/// True means the worker's P-slots were already full and this action is being
-/// placed onto an idle E-core purely because the Track-A total-core term kept the
-/// worker eligible. Counting these at the single reserve point
-/// (`prepare_worker_run_action`) is the observability the Track-A fix was missing:
-/// it makes the work the E-spill actually recruits READABLE (the sibling
-/// `p_headroom_gate_exclusion` log shows only the DENIED side). `p_core_count == 0`
-/// (A5 legacy/Linux/Intel) has no E-spill band → always false. Pure + total; the
-/// caller increments a `Relaxed` counter, so this changes no scheduling decision.
+/// (#sched-work-conservation observability) Is `running_before` (the worker's
+/// in-flight dispatch-COUNT BEFORE this action was reserved) inside the E-core
+/// count-band `[p_core_count, p_core_count + e_core_count)`? True means the P-slots
+/// are full BY COUNT and this action lands on the E-core count-band. NOTE this is
+/// a COUNT proxy, not a causal attribution: it does NOT distinguish which selection
+/// path (the total-core term, the idle-P override, or the ungated LRU/MRU fallback)
+/// placed the worker, nor whether the P-cores are physically busy (a low-`p_load`
+/// I/O-queued worker is also in-band). Counting these at the single reserve point
+/// (`prepare_worker_run_action`) gives the live counterpart to the DENIED-side
+/// `p_headroom_gate_exclusion` log. `p_core_count == 0` (A5 legacy/Linux/Intel) has
+/// no band → always false. Pure + total; the caller increments a `Relaxed` counter,
+/// so this changes no scheduling decision.
 const fn is_e_spill_admit(running_before: u64, p_core_count: u32, e_core_count: u32) -> bool {
     p_core_count != 0
         && running_before >= p_core_count as u64
@@ -3497,10 +3505,10 @@ impl ApiWorkerSchedulerImpl {
             return None;
         }
 
-        // (#sched-work-conservation observability) Count this admit if it lands in
-        // the E-spill band — the worker's P-slots are already full and it stays
-        // eligible only via the Track-A total-core term. Read the in-flight count
-        // BEFORE the insert below. Relaxed telemetry; no decision changes.
+        // (#sched-work-conservation observability) Count this admit if its
+        // in-flight dispatch-count lands in the E-core band [p, p+e) — a count
+        // proxy across ALL selection paths (not only the total-core term). Read the
+        // in-flight count BEFORE the insert below. Relaxed telemetry; no decision changes.
         if is_e_spill_admit(
             worker.running_action_infos.len() as u64,
             worker.p_core_count,
@@ -10256,6 +10264,14 @@ mod tests {
     /// worker, so nobody is hard-excluded and the fallback still dispatches. Were
     /// the gate a hard filter instead, all-saturated → all-`u64::MAX` → the queue
     /// WEDGES (the exact TLC Phase2NoLift violation the fix guards against).
+    ///
+    /// SCOPE: this proves the `p_headroom_pref` soft-vs-hard contract (returns 0
+    /// under a lifted gate — the load-bearing half). The full loop-level no-wedge
+    /// ALSO rests on `worker_is_viable_gated` collapsing to `worker_is_viable` when
+    /// `!p_gate_active` and the LRU/MRU fallback then selecting a worker; this test
+    /// MODELS that composition with a hand-rolled aggregate rather than driving
+    /// `do_try_match`, so it does not by itself cover a regression in the
+    /// gated→fallback wiring (an integration test would). (pair-a A1#2 / pair-b czar)
     ///
     /// MUTATION NOTE: commenting the `if !p_gate_active { return 0; }` early-return
     /// in `p_headroom_pref` makes each saturated worker return `u64::MAX` under the
