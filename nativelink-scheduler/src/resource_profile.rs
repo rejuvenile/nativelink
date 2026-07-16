@@ -334,8 +334,10 @@ impl ProfileKey {
     }
 
     /// (#task-resource-profile hierarchical-key) Derive the COARSE key
-    /// `(instance_name, "", action_mnemonic)` — the fallback tier that blends ALL
-    /// targets sharing a mnemonic, or `None` when the mnemonic is absent.
+    /// `(instance_name, "", action_mnemonic)` — the fallback tier that blends all
+    /// target-bearing samples sharing a mnemonic (an empty-target sample derives no
+    /// fine key and so is skipped from BOTH tiers by `resource_profile_keys`), or
+    /// `None` when the mnemonic is absent.
     ///
     /// The coarse key is keyed with an EMPTY `target_id`, which is the coarse
     /// MARKER: [`from_parts`](Self::from_parts) REQUIRES a non-empty `target_id`,
@@ -365,7 +367,7 @@ impl ProfileKey {
 
 /// (#task-resource-profile hierarchical-key) Which tier of the hierarchical
 /// `(instance, target, mnemonic)` → `(instance, mnemonic)` key a lookup resolved
-/// to. A COARSE hit blends all targets of a mnemonic → higher variance /
+/// to. A COARSE hit blends all target-bearing samples of a mnemonic → higher variance /
 /// over-reservation risk, so a downstream consumer (the eventual Phase-3
 /// DOWN-override) must NOT trust a coarse tail; it is carried through so the
 /// fine-vs-coarse coverage is visible and gate-able.

@@ -723,8 +723,8 @@ pub struct SchedulerMetrics {
     /// below `K`, coarse `>= K`). This is the K-starvation defeat in action — a
     /// climbing value while `inject_observe_would_raise`/accuracy counters (formerly
     /// dark at 0) now fire proves the coarse fallback gave immediate coverage. A
-    /// coarse profile blends all targets of a mnemonic (higher variance), so the
-    /// eventual Phase-3 down-override must treat these conservatively.
+    /// coarse profile blends all target-bearing samples of a mnemonic (higher
+    /// variance), so the eventual Phase-3 down-override must treat these conservatively.
     #[metric(
         help = "(#task-resource-profile) reserved dispatches whose hierarchical lookup fell back to the COARSE (instance,mnemonic) tier (fine < K, coarse >= K)"
     )]
@@ -753,6 +753,29 @@ pub struct SchedulerMetrics {
     )]
     pub accuracy_predicted_covered: AtomicU64,
 
+    /// (#task-resource-profile hierarchical-key) COUNTER: the FINE-tier subset of
+    /// `accuracy_predicted_covered` — covers whose dispatch tail came from a trusted
+    /// FINE `(instance,target,mnemonic)` key. With `_coarse` it partitions the total
+    /// (`accuracy_predicted_covered_fine + accuracy_predicted_covered_coarse ==
+    /// accuracy_predicted_covered`) so an operator reading `accuracy_predicted_under ≈ 0`
+    /// can tell whether the coverage came from trustworthy FINE profiles or the
+    /// higher-variance COARSE blend — the exact tier signal Phase-3 enforce-readiness
+    /// must read before trusting a down-override.
+    #[metric(
+        help = "(#task-resource-profile hierarchical-key) FINE-tier subset of accuracy_predicted_covered (dispatch tail came from a trusted fine (instance,target,mnemonic) key)"
+    )]
+    pub accuracy_predicted_covered_fine: AtomicU64,
+
+    /// (#task-resource-profile hierarchical-key) COUNTER: the COARSE-tier subset of
+    /// `accuracy_predicted_covered` — covers whose dispatch tail came from the fallback
+    /// COARSE `(instance,mnemonic)` key (fine below `K`). A high coarse share means the
+    /// coverage rests on a blended (higher-variance) tail Phase-3 must NOT trust; see
+    /// `accuracy_predicted_covered_fine` for the partition identity.
+    #[metric(
+        help = "(#task-resource-profile hierarchical-key) COARSE-tier subset of accuracy_predicted_covered (dispatch tail came from the fallback coarse (instance,mnemonic) blend)"
+    )]
+    pub accuracy_predicted_covered_coarse: AtomicU64,
+
     /// (#task-resource-profile Phase-2c) COUNTER — a Phase-3 FALSIFIER (NOT a
     /// sufficiency gate): folded samples whose TRUE DISPATCH-TIME leave-one-out tail
     /// UNDER-predicted the action's actual peak (`tail_at_dispatch < peak_memory_kb`) →
@@ -773,6 +796,27 @@ pub struct SchedulerMetrics {
         help = "(#task-resource-profile Phase-2c) FALSIFIER: folded samples whose dispatch-time leave-one-out tail under-predicted the actual peak (tail < actual → enforce would under-reserve → OOM risk). Firing DISPROVES safety; ≈0 is necessary-not-sufficient (decays to 0 by construction)"
     )]
     pub accuracy_predicted_under: AtomicU64,
+
+    /// (#task-resource-profile hierarchical-key) COUNTER: the FINE-tier subset of
+    /// `accuracy_predicted_under` — unders whose dispatch tail came from a trusted FINE
+    /// key. With `_coarse` it partitions the total (`accuracy_predicted_under_fine +
+    /// accuracy_predicted_under_coarse == accuracy_predicted_under`). A FINE under is the
+    /// STRONGER falsifier: the per-target profile itself under-predicted, so it is not an
+    /// artifact of coarse blending.
+    #[metric(
+        help = "(#task-resource-profile hierarchical-key) FINE-tier subset of accuracy_predicted_under (dispatch tail came from a trusted fine (instance,target,mnemonic) key)"
+    )]
+    pub accuracy_predicted_under_fine: AtomicU64,
+
+    /// (#task-resource-profile hierarchical-key) COUNTER: the COARSE-tier subset of
+    /// `accuracy_predicted_under` — unders whose dispatch tail came from the fallback
+    /// COARSE blend (fine below `K`). A coarse under may be a blending artifact (a cheap
+    /// target's low peak dragging the blend below an expensive action's), so it is a
+    /// weaker falsifier than a fine under; see `accuracy_predicted_under_fine`.
+    #[metric(
+        help = "(#task-resource-profile hierarchical-key) COARSE-tier subset of accuracy_predicted_under (dispatch tail came from the fallback coarse (instance,mnemonic) blend)"
+    )]
+    pub accuracy_predicted_under_coarse: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples that HAD a
     /// dispatch-time profile but with `< K` prior samples (the tail was not yet
@@ -1037,11 +1081,31 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
 /// `accuracy_predicted_covered + accuracy_predicted_under + accuracy_skipped_low_sample
 ///  + accuracy_skipped_no_dispatch == profile_samples_total` (every folded sample is
 /// classified into exactly one bucket). `accuracy_over_samples` is a SUBSET of covered.
+/// The tier split further partitions each total EXACTLY:
+/// `accuracy_predicted_covered_fine + accuracy_predicted_covered_coarse ==
+/// accuracy_predicted_covered` and likewise for the two `_under_*` counters.
 pub fn emit_prediction_accuracy_counters_log(metrics: &SchedulerMetrics) {
     info!(
         tag = "resource_profile_accuracy",
         accuracy_predicted_covered = metrics.accuracy_predicted_covered.load(Ordering::Relaxed),
+        // (#task-resource-profile hierarchical-key) tier split of covered: fine + coarse
+        // == accuracy_predicted_covered. Lets an operator see whether the coverage rests
+        // on trustworthy FINE profiles or the higher-variance COARSE blend (Phase-3 signal).
+        accuracy_predicted_covered_fine = metrics
+            .accuracy_predicted_covered_fine
+            .load(Ordering::Relaxed),
+        accuracy_predicted_covered_coarse = metrics
+            .accuracy_predicted_covered_coarse
+            .load(Ordering::Relaxed),
         accuracy_predicted_under = metrics.accuracy_predicted_under.load(Ordering::Relaxed),
+        // Tier split of under: fine + coarse == accuracy_predicted_under. A FINE under is
+        // the stronger falsifier (per-target profile itself under-predicted).
+        accuracy_predicted_under_fine = metrics
+            .accuracy_predicted_under_fine
+            .load(Ordering::Relaxed),
+        accuracy_predicted_under_coarse = metrics
+            .accuracy_predicted_under_coarse
+            .load(Ordering::Relaxed),
         accuracy_skipped_low_sample = metrics
             .accuracy_skipped_low_sample
             .load(Ordering::Relaxed),
@@ -1513,8 +1577,8 @@ enum PredictionAccuracy {
     /// `None` when `tail == actual` (an exact, waste-free cover).
     Covered {
         /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch tail came
-        /// from. A `Coarse` cover blends all targets of a mnemonic (higher variance), so
-        /// the eventual Phase-3 down-override must NOT trust it — carried so that gate has
+        /// from. A `Coarse` cover blends all target-bearing samples of a mnemonic (higher
+        /// variance), so the eventual Phase-3 down-override must NOT trust it — carried so that gate has
         /// the signal. OBSERVE-ONLY here.
         tier: ProfileTier,
         over_ratio_x100: Option<u64>,
@@ -1554,8 +1618,11 @@ fn classify_prediction_accuracy(
         None => PredictionAccuracy::SkippedNoDispatch,
         // Prediction present but below K at dispatch: the tail was not yet trustworthy
         // (pair-a MINOR / red-team A1b), so no prediction stood — skip rather than score
-        // a spurious cover/under. (Defensive: the hierarchical lookup only stashes a
-        // Trusted tier as ≥K, but a direct-fold caller can pass a low-sample tuple.)
+        // a spurious cover/under. LOAD-BEARING on the PRODUCTION path: the stash arm in
+        // `find_and_reserve_worker` stashes `TieredTail::LowSample { samples < K }` tuples
+        // (fine/coarse present but neither ≥K — the ~2.5-samples/key early-deploy regime),
+        // so this recheck is what turns such a low-sample dispatch into SkippedLowSample
+        // instead of a spurious Covered/Under.
         Some((_, _, prior_samples)) if prior_samples < PROFILE_MIN_SAMPLES => {
             PredictionAccuracy::SkippedLowSample
         }
@@ -5783,15 +5850,31 @@ impl ApiWorkerScheduler {
         // profile_samples_total` (the dark-detector invariant the periodic accuracy
         // emit surfaces); `accuracy_over_samples` is a SUBSET of covered.
         match accuracy {
-            // `tier` is carried for the eventual Phase-3 down-override (which must not
-            // trust a coarse cover); OBSERVE-ONLY here, so it does not gate a counter.
+            // `tier` selects the per-tier telemetry split below (still OBSERVE-ONLY — it
+            // gates NO scheduling decision); it is also carried for the eventual Phase-3
+            // down-override, which must not trust a coarse cover.
             PredictionAccuracy::Covered {
-                tier: _,
+                tier,
                 over_ratio_x100,
             } => {
                 self.metrics
                     .accuracy_predicted_covered
                     .fetch_add(1, Ordering::Relaxed);
+                // (#task-resource-profile hierarchical-key) Split the covered total by the
+                // dispatch tail's tier so an operator reading `accuracy_predicted_under ≈ 0`
+                // can tell trustworthy FINE coverage from the higher-variance COARSE blend
+                // (the Phase-3 enforce-readiness signal). Partitions the total exactly:
+                // covered_fine + covered_coarse == accuracy_predicted_covered.
+                match tier {
+                    ProfileTier::Fine => self
+                        .metrics
+                        .accuracy_predicted_covered_fine
+                        .fetch_add(1, Ordering::Relaxed),
+                    ProfileTier::Coarse => self
+                        .metrics
+                        .accuracy_predicted_covered_coarse
+                        .fetch_add(1, Ordering::Relaxed),
+                };
                 // (Upgrade 2) Over-reservation waste: when the dispatch tail STRICTLY
                 // exceeds the actual peak, record max + saturating-sum + count so an
                 // operator reads TYPICAL (sum/count) vs WORST (max) — a max-only gauge
@@ -5814,12 +5897,26 @@ impl ApiWorkerScheduler {
                 }
             }
             PredictionAccuracy::Under {
-                tier: _,
+                tier,
                 ratio_x100,
             } => {
                 self.metrics
                     .accuracy_predicted_under
                     .fetch_add(1, Ordering::Relaxed);
+                // (#task-resource-profile hierarchical-key) Split the under total by tier:
+                // a FINE under (per-target profile itself under-predicted) is the stronger
+                // falsifier; a COARSE under may be a blending artifact. Partitions exactly:
+                // under_fine + under_coarse == accuracy_predicted_under.
+                match tier {
+                    ProfileTier::Fine => self
+                        .metrics
+                        .accuracy_predicted_under_fine
+                        .fetch_add(1, Ordering::Relaxed),
+                    ProfileTier::Coarse => self
+                        .metrics
+                        .accuracy_predicted_under_coarse
+                        .fetch_add(1, Ordering::Relaxed),
+                };
                 // Residual magnitude: keep the WORST (max) under-prediction ratio.
                 // A single bounded `fetch_max` gauge — no new per-sample state.
                 self.metrics
@@ -15858,6 +15955,14 @@ mod tests {
         scheduler.metrics.c1_blocked_no_saturated_holder.fetch_add(221, Ordering::Relaxed);
         scheduler.metrics.c1_blocked_t_wait_ge_t_setup.fetch_add(222, Ordering::Relaxed);
         scheduler.metrics.c1_blocked_overdue.fetch_add(223, Ordering::Relaxed);
+        // (#task-resource-profile hierarchical-key) the four per-tier accuracy split
+        // counters — dark fields here re-open the exact Phase-3 blind spot they close
+        // (an operator could not tell FINE coverage from the COARSE blend). Distinctive
+        // values double as a wrong-field guard.
+        scheduler.metrics.accuracy_predicted_covered_fine.fetch_add(231, Ordering::Relaxed);
+        scheduler.metrics.accuracy_predicted_covered_coarse.fetch_add(232, Ordering::Relaxed);
+        scheduler.metrics.accuracy_predicted_under_fine.fetch_add(233, Ordering::Relaxed);
+        scheduler.metrics.accuracy_predicted_under_coarse.fetch_add(234, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -16018,6 +16123,13 @@ mod tests {
             ("c1_blocked_no_saturated_holder", 221),
             ("c1_blocked_t_wait_ge_t_setup", 222),
             ("c1_blocked_overdue", 223),
+            // (#task-resource-profile hierarchical-key) per-tier accuracy split — the
+            // literal metric names must render so the fine-vs-coarse coverage the
+            // Phase-3 enforce gate reads is not dark on /metrics.
+            ("accuracy_predicted_covered_fine", 231),
+            ("accuracy_predicted_covered_coarse", 232),
+            ("accuracy_predicted_under_fine", 233),
+            ("accuracy_predicted_under_coarse", 234),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),
@@ -17250,6 +17362,243 @@ mod b1_lock_decouple_tests {
                 ratio_x100: 200,
             },
             "a fine-sourced under-prediction must classify Under with tier=Fine"
+        );
+    }
+
+    /// (#task-resource-profile hierarchical-key, PRODUCTION-COMPOSITION) The per-tier
+    /// COVERED counters split `accuracy_predicted_covered` by the dispatch tail's tier so
+    /// an operator reading `accuracy_predicted_under ≈ 0` can tell whether the coverage
+    /// rests on trustworthy FINE profiles or the higher-variance COARSE blend — the exact
+    /// Phase-3 enforce-readiness signal. Drives the FULL reserve→complete path on TWO
+    /// schedulers: coarse-only ≥K (fine absent → COARSE dispatch tail) and fine ≥K (FINE
+    /// dispatch tail), each landing Covered (actual peak 4096 <= tail 65536).
+    ///
+    /// MUTATION: restore `tier: _` in the `Covered` arm of `record_action_resource_usage`
+    /// and delete the per-tier `fetch_add` → both `_fine` and `_coarse` stay 0 → this
+    /// red-fails with its bespoke message.
+    #[nativelink_test]
+    async fn accuracy_tier_split_covered_by_dispatch_tier() {
+        use crate::resource_profile::ProfileKey;
+
+        // ── COARSE dispatch tail (fine absent, coarse ≥K) → covered_coarse ──
+        let sched_c = build_scheduler(BarrierWorkerStateManager::new());
+        let _rx_c = add_worker_with_memory(&sched_c, "W", 500_000.0).await;
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_c.resource_profile_record_sample(coarse.clone(), mem_only_sample(50_000));
+        }
+        let op_c = OperationId::default();
+        let action_c = action_with_memory_and_baggage("W", 0xc1, 4096.0);
+        let (reserved_c, _tx_c, _msg_c) = sched_c
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op_c, &action_c, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved_c, WorkerId("W".to_string()));
+        // Complete: actual peak 4096 <= coarse dispatch tail 65_536 → COVERED via coarse.
+        sched_c
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op_c, usage_mem(4096))
+            .await
+            .expect("record_action_resource_usage must return Ok");
+        assert_eq!(
+            sched_c.metrics.accuracy_predicted_covered_coarse.load(Ordering::Relaxed),
+            1,
+            "a COARSE-sourced dispatch tail that covered the actual peak must advance \
+             accuracy_predicted_covered_coarse (the tier must NOT be discarded)"
+        );
+        assert_eq!(
+            sched_c.metrics.accuracy_predicted_covered_fine.load(Ordering::Relaxed),
+            0,
+            "a coarse-sourced cover must NOT advance the FINE per-tier counter"
+        );
+        // Tier split partitions the total EXACTLY.
+        assert_eq!(
+            sched_c.metrics.accuracy_predicted_covered_fine.load(Ordering::Relaxed)
+                + sched_c.metrics.accuracy_predicted_covered_coarse.load(Ordering::Relaxed),
+            sched_c.metrics.accuracy_predicted_covered.load(Ordering::Relaxed),
+            "covered_fine + covered_coarse must partition accuracy_predicted_covered exactly"
+        );
+
+        // ── FINE dispatch tail (fine ≥K) → covered_fine ──
+        let sched_f = build_scheduler(BarrierWorkerStateManager::new());
+        let _rx_f = add_worker_with_memory(&sched_f, "W", 500_000.0).await;
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_f.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        let op_f = OperationId::default();
+        let action_f = action_with_memory_and_baggage("W", 0xc2, 4096.0);
+        let (reserved_f, _tx_f, _msg_f) = sched_f
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op_f, &action_f, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved_f, WorkerId("W".to_string()));
+        sched_f
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op_f, usage_mem(4096))
+            .await
+            .expect("record_action_resource_usage must return Ok");
+        assert_eq!(
+            sched_f.metrics.accuracy_predicted_covered_fine.load(Ordering::Relaxed),
+            1,
+            "a FINE-sourced dispatch tail that covered the actual peak must advance \
+             accuracy_predicted_covered_fine"
+        );
+        assert_eq!(
+            sched_f.metrics.accuracy_predicted_covered_coarse.load(Ordering::Relaxed),
+            0,
+            "a fine-sourced cover must NOT advance the COARSE per-tier counter"
+        );
+    }
+
+    /// (#task-resource-profile hierarchical-key, PRODUCTION-COMPOSITION) The per-tier
+    /// UNDER counters split `accuracy_predicted_under` by the dispatch tail's tier: a FINE
+    /// under (the per-target profile itself under-predicted) is the stronger falsifier; a
+    /// COARSE under may be a blending artifact. Drives the FULL reserve→complete path on
+    /// TWO schedulers, each landing Under (actual peak 131_072 > tail 65_536).
+    ///
+    /// MUTATION: restore `tier: _` in the `Under` arm of `record_action_resource_usage`
+    /// and delete the per-tier `fetch_add` → both `_fine` and `_coarse` stay 0 → red-fails.
+    #[nativelink_test]
+    async fn accuracy_tier_split_under_by_dispatch_tier() {
+        use crate::resource_profile::ProfileKey;
+
+        // ── COARSE dispatch tail → under_coarse ──
+        let sched_c = build_scheduler(BarrierWorkerStateManager::new());
+        let _rx_c = add_worker_with_memory(&sched_c, "W", 500_000.0).await;
+        let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_c.resource_profile_record_sample(coarse.clone(), mem_only_sample(50_000));
+        }
+        let op_c = OperationId::default();
+        let action_c = action_with_memory_and_baggage("W", 0xc3, 4096.0);
+        sched_c
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op_c, &action_c, false)
+            .await
+            .expect("op must reserve worker W");
+        // actual peak 131_072 > coarse dispatch tail 65_536 → UNDER via coarse.
+        sched_c
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op_c, usage_mem(131_072))
+            .await
+            .expect("record_action_resource_usage must return Ok");
+        assert_eq!(
+            sched_c.metrics.accuracy_predicted_under_coarse.load(Ordering::Relaxed),
+            1,
+            "a COARSE-sourced dispatch tail that UNDER-predicted the actual peak must \
+             advance accuracy_predicted_under_coarse (the tier must NOT be discarded)"
+        );
+        assert_eq!(
+            sched_c.metrics.accuracy_predicted_under_fine.load(Ordering::Relaxed),
+            0,
+            "a coarse-sourced under must NOT advance the FINE per-tier counter"
+        );
+        assert_eq!(
+            sched_c.metrics.accuracy_predicted_under_fine.load(Ordering::Relaxed)
+                + sched_c.metrics.accuracy_predicted_under_coarse.load(Ordering::Relaxed),
+            sched_c.metrics.accuracy_predicted_under.load(Ordering::Relaxed),
+            "under_fine + under_coarse must partition accuracy_predicted_under exactly"
+        );
+
+        // ── FINE dispatch tail → under_fine ──
+        let sched_f = build_scheduler(BarrierWorkerStateManager::new());
+        let _rx_f = add_worker_with_memory(&sched_f, "W", 500_000.0).await;
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_f.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        let op_f = OperationId::default();
+        let action_f = action_with_memory_and_baggage("W", 0xc4, 4096.0);
+        sched_f
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op_f, &action_f, false)
+            .await
+            .expect("op must reserve worker W");
+        sched_f
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op_f, usage_mem(131_072))
+            .await
+            .expect("record_action_resource_usage must return Ok");
+        assert_eq!(
+            sched_f.metrics.accuracy_predicted_under_fine.load(Ordering::Relaxed),
+            1,
+            "a FINE-sourced dispatch tail that UNDER-predicted must advance \
+             accuracy_predicted_under_fine (the stronger falsifier)"
+        );
+        assert_eq!(
+            sched_f.metrics.accuracy_predicted_under_coarse.load(Ordering::Relaxed),
+            0,
+            "a fine-sourced under must NOT advance the COARSE per-tier counter"
+        );
+    }
+
+    /// (#task-resource-profile hierarchical-key, PRODUCTION-COMPOSITION) The PRODUCTION
+    /// LowSample-stash arm: `find_and_reserve_worker` reserves with a profile PRESENT at a
+    /// tier but `< K` samples → `lookup_tiered` returns `TieredTail::LowSample` → the stash
+    /// arm stashes `Some((tier, tail, <K samples))` → completion's
+    /// `classify_prediction_accuracy` K-recheck reclassifies it to `SkippedLowSample`
+    /// (NOT a spurious Covered/Under). Without this coverage, narrowing the stash arm to
+    /// `Trusted`-only would silently reclassify these as `SkippedNoDispatch` and no test
+    /// would fail.
+    ///
+    /// MUTATION: remove the `| TieredTail::LowSample { .. }` from the stash `match` in
+    /// `find_and_reserve_worker` (narrow to `Trusted`-only) → the low-sample dispatch
+    /// stashes nothing → completion classifies `SkippedNoDispatch` → this red-fails
+    /// (skipped_low stays 0, skipped_no_dispatch becomes 1).
+    #[nativelink_test]
+    async fn lowsample_stash_production_path_classifies_skipped_low_sample() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+
+        // Present-but-`< K`: fine key has 5 samples (< K=20), coarse absent → the lookup
+        // returns TieredTail::LowSample { tier: Fine, .., samples: 5 }.
+        const LOW: u64 = 5;
+        assert!(
+            LOW < crate::resource_profile::PROFILE_MIN_SAMPLES,
+            "the profile must be present-but-below-K for the LowSample stash arm"
+        );
+        for _ in 0..LOW {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd7, 4096.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        // The stash carries the present-but-`< K` tuple (tail 65_536, 5 samples).
+        assert_eq!(
+            scheduler
+                .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
+                .await,
+            Some(Some((ProfileTier::Fine, 65_536, LOW))),
+            "the production stash arm must stash the present-but-<K LowSample tuple \
+             (tier Fine, tail 65536, 5 samples), not drop it"
+        );
+
+        // Completion: the K-recheck reclassifies the < K stash to SkippedLowSample.
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage_mem(200_000))
+            .await
+            .expect("record_action_resource_usage must return Ok");
+
+        let skipped_low = scheduler.metrics.accuracy_skipped_low_sample.load(Ordering::Relaxed);
+        let skipped_nd = scheduler.metrics.accuracy_skipped_no_dispatch.load(Ordering::Relaxed);
+        let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
+        let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
+        assert_eq!(
+            skipped_low, 1,
+            "a stashed present-but-<K dispatch prediction must classify SkippedLowSample \
+             at completion (the K-recheck is load-bearing on the production stash path), \
+             got {skipped_low}"
+        );
+        assert_eq!(
+            skipped_nd, 0,
+            "a prediction WAS stashed (the LowSample arm) → this is a low-sample skip, NOT \
+             a no-dispatch skip; got skipped_no_dispatch={skipped_nd} (narrowing the stash \
+             arm to Trusted-only would wrongly read SkippedNoDispatch)"
+        );
+        assert_eq!(
+            covered + under,
+            0,
+            "the < K tail must NOT be scored as a cover/under (tail 65536 vs actual 200000 \
+             WOULD read Under, suppressed by the K-gate), got covered={covered} under={under}"
         );
     }
 
