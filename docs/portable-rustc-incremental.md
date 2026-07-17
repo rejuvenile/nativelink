@@ -190,6 +190,38 @@ incremental logic + POSIX hardlink semantics (a hardlink is a real dirent, no re
 generalizes with high confidence — but a macOS/APFS spot-confirm on a worker (off-hours) is the final gate
 before the process_wrapper L–XL work.
 
+### 11a. CROSS-MACHINE experiment — DONE, CONFIRMED WARM on macOS (2026-07-17)
+
+The cadre's #1 blocking gate (red-team A1.1: cross-machine reuse unproven — every prior test was
+single-machine). Ran ci-mac-3 (**Mac16,13 / Apple M4**) → ci-mac-1 (**Mac14,14 / Apple M2 Ultra**), both user
+`user`, HOME `/Users/user`, using the IDENTICAL rustup toolchain present on both
+(`nightly-2026-01-29-aarch64-apple-darwin`, commit `de6d33c0`), a GENERIC target (no `-Ctarget-cpu=native`),
+same crate, compiled at the identical physical path `/Users/user/nlincr-xm/tk`:
+
+| Step | LLVM_passes |
+|------|-------------|
+| ci-mac-3 M4 seed (cold, first build) | 0.398 s |
+| ci-mac-3 M4 same-machine warm (sanity) | 0.000 s |
+| **ci-mac-1 M2 reusing ci-mac-3's M4-produced `-incr` (transported, identical path)** | **0.001 s (WARM)** |
+| ci-mac-1 M2 cold control (fresh incr) | 0.665 s |
+
+**Verdict: cross-machine AND cross-MODEL reuse WORKS (~600× vs cold).** The incr session dir name matched
+across machines (`lib-1r0c958v6rq7u`) and `find_cgu_reuse` + `codegen_to_LLVM_IR 0.000` confirm codegen units
+were reused, not regenerated. red-team A1.1 (sysroot/build-hash/machine-id invalidates cross-machine) is
+**REFUTED** for the case of an identical toolchain (same rustc version + same sysroot ABSOLUTE path) at an
+identical compile path with a fixed target. Production uses the bazel-hermetic (content-addressed) toolchain →
+identical version + path on every machine by construction, so this holds even more strongly than the rustup test.
+
+**One binding caveat → a design requirement:** the test used a GENERIC target. With `-Ctarget-cpu=native`,
+M4-native ≠ M2-native → different target features baked into the seed → cold across models. So the design MUST
+mandate a FIXED `target-cpu` (never `native`) for the allowlisted actions — which is the norm for cacheable
+builds anyway (`target-cpu=native` is inherently anti-cacheable). Worker-to-worker is unaffected regardless
+(fleet is homogeneous M4); only the local-build-mac↔worker path under dynamic (an M2 build agent + an M4
+worker) would break with `native`. FOLLOW-UP: verify FL's rust build does not pass `-Ctarget-cpu=native`
+(check `.bazelrc`/rules_rust rustc flags). Remaining gate: experiment #2 (macOS getcwd-firmlink + cross-volume
+EXDEV) — the symlink sub-experiment already showed rustc realpaths cwd/source/incr paths, so the design's
+real-physical-path requirement (not symlink) is confirmed necessary.
+
 ## 12. Interaction with the local `-incr` materialization cost (F)
 
 With dynamic REQUIRED (not remote-only), the local branch runs locally and **still needs the `-incr` seed
