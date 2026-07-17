@@ -583,6 +583,42 @@ pub struct SimpleSpec {
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub resource_profile_persist_max_age_secs: u64,
+
+    /// (#dag-criticality) Kill-switch for the DAG-from-history critical-path
+    /// prioritization: reconstruct a target-level build DAG from persisted edge
+    /// history and use a longest-path criticality score as a WITHIN-priority-band
+    /// tie-break in the already-priority-sorted pending set. ADVISORY,
+    /// correctness-neutral (a non-confident/absent node degrades to today's FIFO),
+    /// and inert unless a backlog exists. Default `true` (shipped ON per the
+    /// anti-dark-counter rule; the flag is an operational KILL-SWITCH — set `false`
+    /// to disable without a redeploy). When off, the sort key is byte-identical to
+    /// the pre-feature `[priority | inverted_insert_ts]` and no edge/producer/
+    /// duration state is accumulated.
+    #[serde(default = "default_true")]
+    pub dag_critical_path_enabled: bool,
+
+    /// (#dag-criticality) Filesystem path for persisting the DAG edge store (stable-key
+    /// edges + per-node duration histograms) across restarts, so the criticality
+    /// substrate survives a bounce. `None` (default) = persistence OFF (re-accumulates
+    /// each boot). SELF-CONTAINED — a SIBLING file with its OWN versioned header (magic
+    /// "NLDG"), NOT the resource-profile snapshot. The data is ADVISORY and
+    /// re-accumulates: writes are atomic (tmp + rename) but NEVER fsync'd (ZFS
+    /// `sync=disabled`; the no-fsync hard rule). A missing / corrupt / version-mismatch
+    /// file logs a `warn` and starts FRESH — never panics or crashes startup.
+    #[serde(default)]
+    pub dag_edge_store_persist_path: Option<String>,
+
+    /// (#dag-criticality) Seconds between background recomputes of the criticality
+    /// snapshot (Tarjan SCC + reverse-topo longest-path, O(V+E), sub-ms) and, when
+    /// `dag_edge_store_persist_path` is set, the edge-store snapshot write. Default 300
+    /// (5 min). The recompute snapshots edges + node weights under the strict-LEAF
+    /// `parking_lot` lock, RELEASES the lock, then runs the DP + serializes + writes off
+    /// the lock — no lock or I/O is ever held across `.await`.
+    #[serde(
+        default = "default_dag_recompute_interval_secs",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub dag_recompute_interval_secs: u64,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -685,8 +721,23 @@ impl Default for SimpleSpec {
             // #[serde(default = "...")] → 604800s (7d).
             resource_profile_persist_max_age_secs:
                 default_resource_profile_persist_max_age_secs(),
+            // (#dag-criticality) #[serde(default = "default_true")] → true (shipped ON,
+            // kill-switch via config `false`; advisory + correctness-neutral).
+            dag_critical_path_enabled: true,
+            // (#dag-criticality) #[serde(default)] → Option default (None) = edge-store
+            // persistence OFF (re-accumulates each boot).
+            dag_edge_store_persist_path: None,
+            // (#dag-criticality) #[serde(default = "...")] → 300s.
+            dag_recompute_interval_secs: default_dag_recompute_interval_secs(),
         }
     }
+}
+
+/// (#dag-criticality) Default background recompute/persist interval (300s = 5 min). MUST
+/// be a named default fn (a bare `#[serde(default)]` u64 0 would spin the recompute task
+/// with no delay). Numeric-constant rule: this literal is authoritative.
+pub const fn default_dag_recompute_interval_secs() -> u64 {
+    300
 }
 
 /// (#task-resource-profile Phase-3 §12) Default background-snapshot interval (300s =
