@@ -94,13 +94,28 @@ when the index overwrites), NOT relying on the general CAS LRU. Sized against th
 `(pin_high_water + incr_content_reservation + working_set) ≤ physical`. Without this, reuse is best-effort-until-
 evicted — state which if the pin is deferred.
 
-### 6.6 Publish authority (NEW — security HIGH)
-The index is fleet-global, keyed by a DERIVABLE `hash(targetkey)`, last-writer-wins → an AC-poisoning surface.
-NativeLink's AC write path has only read_only-vs-writable (no worker-only-writable mode; `x-nativelink-worker` is
-NOT an auth boundary). **PRECONDITION to assert + verify before code:** action subprocesses have NO network egress
-to the CAS/AC listener port → the publish surface closes under the trusted-worker model. If actions CAN reach the
-port, a worker-only-writable control on the `incr_seed_index` endpoint is REQUIRED (BLOCK-hinge). Content integrity
-is free (CAS content-addressed); the INDEX write-authority is the surface.
+### 6.6 Publish authority — GATE RESOLVED 2026-07-17: PRECONDITION FALSE → BLOCK (operator decision)
+Investigation (`.claude/reviews/design-portable-rustc-incremental-v3/gate66-publish-authority.md`): the precondition
+does NOT hold on the live fleet, and the naive control is insufficient. Evidence:
+- AC is on 3 mTLS listeners (`:50051` public, `:50071` worker_cas, `:50072` quic), ALL writable (no `read_only`);
+  `read_only` is BINARY — no worker-only-writable mode (`ac_server.rs:362-367`).
+- **Build actions run as the SAME uid as the worker** (`uid=501 user`, no `setuid`/sandbox uid-drop in
+  `running_actions_manager.rs`); worker mTLS key `/Users/user/Work/nativelink/tls/worker.key` is `0600 user` →
+  the action IS the owner → can read it; macOS has NO mount namespace → reachable by absolute path from the action cwd.
+- Egress OPEN: a process as `user` on a worker TCP-connects to buildcache `:50051`/`:50071` (verified). `x-nativelink-worker`
+  is a self-asserted client header (`grpc_store.rs:1915`), NOT an authz boundary.
+→ An action can read the worker key, connect to `:50071`, and `UpdateActionResult(hash(targetkey), …)` — a
+fleet-global AC-poisoning write under a DERIVABLE key.
+**BROADER (pre-existing) FINDING:** build actions can ALREADY poison the existing CAS/AC today (same credentials +
+egress) — the index is NOT a fundamentally new capability, BUT its derivable `hash(targetkey)` key lowers the bar for
+TARGETED seed poisoning (vs a content-derived Action digest), and a poisoned seed → adversarial rustc reuse → wrong
+`.rlib` (security MED-1 adversarial case). **OPERATOR DECISION required:** (a) ACCEPT the existing trust posture
+(actions are trusted; the index is no worse than the already-writable AC/CAS) → ship + document the assumption; OR
+(b) invest in ACTION ISOLATION as net-new fleet infra — run build actions under a separate non-privileged uid
+(`sandbox-exec` / a dedicated `_nljob` account) that can't read the worker index-write key AND is denied egress to
+the index port via a pf anchor, PLUS a distinct `incr_seed_index` AC instance read-only on `:50051` / writable only
+on the worker listener with a worker-uid-only key. (b) also closes the pre-existing AC/CAS poisoning hole (a broader
+fleet hardening). Content integrity is free (CAS content-addressed); the INDEX write-authority is the surface.
 
 ## 7. Wipe — worker-local `-incr` is a store-backed cache
 Full content-empty wipe each build for all NON-`-incr` state (`create_dir:8602/:5076` → ensure-exists-then-empty;
