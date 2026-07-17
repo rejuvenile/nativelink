@@ -31,12 +31,18 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     batch_update_blobs_response, chunking_function, compressor, digest_function,
 };
 use nativelink_proto::google::rpc::Status as GrpcStatus;
-use nativelink_service::cas_server::CasServer;
+use nativelink_service::cas_server::{
+    CasServer, ChunkingMetrics, register_chunking_metrics,
+};
 use nativelink_store::ac_utils::serialize_and_upload_message;
 use nativelink_store::default_store_factory::store_factory;
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
+use nativelink_store::worker_proxy_store::WorkerProxyStore;
+use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use pretty_assertions::assert_eq;
 use prost::Message;
@@ -1318,7 +1324,9 @@ fn make_chunking_cas_server_with_avg(
     store_manager: &StoreManager,
     avg_chunk_size_bytes: u64,
 ) -> Result<CasServer, Error> {
-    CasServer::new(
+    // Fresh per-server ChunkingMetrics so counter assertions are isolated
+    // from the process-wide singleton (and from other tests in this binary).
+    CasServer::new_with_chunking_metrics(
         &[WithInstanceName {
             instance_name: INSTANCE_NAME.to_string(),
             config: nativelink_config::cas_server::CasStoreConfig {
@@ -1332,6 +1340,7 @@ fn make_chunking_cas_server_with_avg(
         }],
         store_manager,
         None,
+        Arc::new(ChunkingMetrics::default()),
     )
 }
 
@@ -2011,4 +2020,363 @@ async fn chunking_infers_blake3_when_digest_function_unset()
         .into_inner();
     assert_eq!(split_response.chunk_digests, vec![other_digest]);
     Ok(())
+}
+
+/// Reusable grpc CAS store spec pointing at an unreachable backend, so a
+/// forwarded RPC fails with a connection error (never `Unimplemented`).
+fn grpc_cas_spec() -> StoreSpec {
+    StoreSpec::Grpc(nativelink_config::stores::GrpcSpec {
+        instance_name: "backend".to_string(),
+        endpoints: vec![nativelink_config::stores::GrpcEndpoint {
+            address: "http://localhost:1".to_string(),
+            tls_config: None,
+            concurrency_limit: None,
+            connect_timeout_s: 0,
+            tcp_keepalive_s: 0,
+            http2_keepalive_interval_s: 0,
+            http2_keepalive_timeout_s: 0,
+            tcp_nodelay: true,
+            use_http3: false,
+        }],
+        store_type: nativelink_config::stores::StoreType::Cas,
+        retry: nativelink_config::stores::Retry::default(),
+        max_concurrent_requests: 0,
+        connections_per_endpoint: 0,
+        rpc_timeout_s: 1,
+        batch_update_threshold_bytes: 0,
+        max_concurrent_batch_rpcs: 8,
+        parallel_chunk_read_threshold: 0,
+        parallel_chunk_count: 0,
+        dual_transport: false,
+        zstd_compression: false,
+        connection_acquire_timeout_ms: None,
+        chunked_writes_enabled: false,
+        use_legacy_resource_names: false,
+    })
+}
+
+// #2497 D2: a grpc-backed CAS instance that did NOT opt into
+// experimental_chunking must NOT forward SplitBlob/SpliceBlob to the backend.
+// It returns Unimplemented — matching its advertised split/splice = false —
+// rather than forwarding an RPC the operator never enabled.
+//
+// (The positive "forwards when opted in" path is not exercised here: it would
+// attempt a real connection to the unreachable backend and block on retry.
+// The mutation that proves this test bites — reverting the gate — makes the
+// no-chunking server forward instead, yielding a NON-Unimplemented code.)
+#[nativelink_test]
+async fn grpc_forward_gated_on_chunking_config() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store(
+        "grpc_cas",
+        store_factory(&grpc_cas_spec(), &store_manager, None).await?,
+    );
+
+    let split_request = || {
+        Request::new(SplitBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(Digest {
+                hash: HASH1.to_string(),
+                size_bytes: 4,
+            }),
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        })
+    };
+
+    // Chunking UNSET: no forward -> Unimplemented.
+    let no_chunk_server = CasServer::new(
+        &[WithInstanceName {
+            instance_name: INSTANCE_NAME.to_string(),
+            config: nativelink_config::cas_server::CasStoreConfig {
+                cas_store: "grpc_cas".to_string(),
+                experimental_chunking: None,
+            },
+        }],
+        &store_manager,
+        None,
+    )?;
+    let status = no_chunk_server
+        .split_blob(split_request())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::Unimplemented,
+        "grpc instance WITHOUT chunking must not forward split_blob; got: {} / {}",
+        status.code(),
+        status.message()
+    );
+    let status = no_chunk_server
+        .splice_blob(Request::new(SpliceBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(Digest {
+                hash: HASH1.to_string(),
+                size_bytes: 4,
+            }),
+            chunk_digests: vec![Digest {
+                hash: HASH2.to_string(),
+                size_bytes: 4,
+            }],
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status.code(),
+        Code::Unimplemented,
+        "grpc instance WITHOUT chunking must not forward splice_blob; got: {} / {}",
+        status.code(),
+        status.message()
+    );
+
+    // Sanity: the with-chunking config (no index_store on a grpc store) is
+    // accepted by CasServer::new — it is the config that DOES forward.
+    CasServer::new(
+        &[WithInstanceName {
+            instance_name: INSTANCE_NAME.to_string(),
+            config: nativelink_config::cas_server::CasStoreConfig {
+                cas_store: "grpc_cas".to_string(),
+                experimental_chunking: Some(nativelink_config::cas_server::CasChunkingConfig {
+                    index_store: None,
+                    avg_chunk_size_bytes: 0,
+                    max_chunk_count: 0,
+                }),
+            },
+        }],
+        &store_manager,
+        None,
+    )?;
+    Ok(())
+}
+
+// #2497 D1: experimental_chunking on a WorkerProxyStore-wrapped cas_store (the
+// production cas_STORE topology) is rejected at CasServer::new — SpliceBlob's
+// server-originated reassembly is unvalidated against the FL-688 ack-gate,
+// which was designed for worker mirror uploads only.
+#[nativelink_test]
+async fn chunking_on_worker_proxy_store_rejected() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = Arc::new(StoreManager::new());
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let proxy = WorkerProxyStore::new(inner, new_shared_blob_locality_map());
+    store_manager.add_store("wps_cas", Store::new(proxy));
+    store_manager.add_store(
+        "chunk_index",
+        store_factory(&StoreSpec::Memory(MemorySpec::default()), &store_manager, None).await?,
+    );
+
+    let error = CasServer::new(
+        &[WithInstanceName {
+            instance_name: INSTANCE_NAME.to_string(),
+            config: nativelink_config::cas_server::CasStoreConfig {
+                cas_store: "wps_cas".to_string(),
+                experimental_chunking: Some(nativelink_config::cas_server::CasChunkingConfig {
+                    index_store: Some("chunk_index".to_string()),
+                    avg_chunk_size_bytes: 0,
+                    max_chunk_count: 0,
+                }),
+            },
+        }],
+        &store_manager,
+        None,
+    )
+    .err()
+    .expect("expected chunking on a WorkerProxyStore-wrapped cas_store to be rejected");
+    assert!(
+        error.to_string().contains("WorkerProxyStore-wrapped"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+// #2497 D4: on-demand split of an over-cap blob must SHORT-CIRCUIT the chunk
+// stream — it must NOT chunk the whole blob and write every chunk to the CAS
+// before noticing the cap (which left orphan chunks + O(blob_size) waste).
+// Verified by comparing CAS entry counts: a capped split writes strictly
+// fewer chunks than an identical uncapped split of the same blob.
+#[nativelink_test]
+async fn split_over_cap_blob_short_circuits_without_writing_all_chunks()
+-> Result<(), Box<dyn core::error::Error>> {
+    const AVG_CHUNK_SIZE: u64 = 1024;
+    const BLOB_SIZE: usize = 16 * 1024;
+    const CAP: u64 = 2;
+
+    // Deterministic pseudo-random blob so FastCDC produces many (> CAP) chunks.
+    let mut state = 0x9e37_79b9_u32;
+    let data: Vec<u8> = (0..BLOB_SIZE)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let blob_digest = Digest {
+        hash: HASH1.to_string(),
+        size_bytes: BLOB_SIZE as i64,
+    };
+
+    let make_server = |store_manager: &StoreManager, max_chunk_count: u64| {
+        CasServer::new_with_chunking_metrics(
+            &[WithInstanceName {
+                instance_name: INSTANCE_NAME.to_string(),
+                config: nativelink_config::cas_server::CasStoreConfig {
+                    cas_store: "main_cas".to_string(),
+                    experimental_chunking: Some(
+                        nativelink_config::cas_server::CasChunkingConfig {
+                            index_store: Some("chunk_index".to_string()),
+                            avg_chunk_size_bytes: AVG_CHUNK_SIZE,
+                            max_chunk_count,
+                        },
+                    ),
+                },
+            }],
+            store_manager,
+            None,
+            Arc::new(ChunkingMetrics::default()),
+        )
+    };
+
+    let cas_len = |store: &Store| {
+        let store = store.clone();
+        async move {
+            store
+                .downcast_ref::<MemoryStore>(None)
+                .expect("main_cas is a MemoryStore")
+                .len_for_test()
+                .await
+        }
+    };
+
+    // Reference: an uncapped split writes the FULL chunk set.
+    let sm_full = make_chunking_store_manager().await?;
+    let full_server = make_server(&sm_full, 100_000)?;
+    let full_store = sm_full.get_store("main_cas").unwrap();
+    full_store
+        .update_oneshot(
+            DigestInfo::try_from(blob_digest.clone())?,
+            bytes::Bytes::from(data.clone()),
+        )
+        .await?;
+    full_server
+        .split_blob(Request::new(SplitBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(blob_digest.clone()),
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await?;
+    let full_chunk_count = cas_len(&full_store).await - 1; // minus the blob itself.
+    assert!(
+        full_chunk_count > CAP as usize,
+        "test blob only produced {full_chunk_count} chunks, not > cap {CAP}; \
+         adjust BLOB_SIZE/AVG so it exceeds the cap"
+    );
+
+    // Capped: the split refuses AND must not have written the full set.
+    let sm_capped = make_chunking_store_manager().await?;
+    let capped_server = make_server(&sm_capped, CAP)?;
+    let capped_store = sm_capped.get_store("main_cas").unwrap();
+    capped_store
+        .update_oneshot(
+            DigestInfo::try_from(blob_digest.clone())?,
+            bytes::Bytes::from(data),
+        )
+        .await?;
+    let status = capped_server
+        .split_blob(Request::new(SplitBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(blob_digest),
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::NotFound);
+    assert!(
+        status.message().contains("max_chunk_count"),
+        "unexpected message: {}",
+        status.message()
+    );
+
+    let capped_chunk_count = cas_len(&capped_store).await - 1;
+    // The short-circuit stores at most `CAP` chunks (indices 0..CAP-1) before
+    // aborting; every later chunk hits the guard before its store call. It
+    // MUST be strictly fewer than the full set — reverting the fix (checking
+    // the cap only after try_collect) writes all `full_chunk_count`.
+    assert!(
+        capped_chunk_count < full_chunk_count,
+        "over-cap split wrote {capped_chunk_count} chunks (full set is \
+         {full_chunk_count}); expected the stream to short-circuit and write \
+         strictly fewer — the cap check ran AFTER writing all chunks"
+    );
+    assert!(
+        capped_chunk_count <= CAP as usize,
+        "over-cap split wrote {capped_chunk_count} chunks; expected at most \
+         the cap ({CAP}) before the stream aborted"
+    );
+    Ok(())
+}
+
+// #2497 D3: the ChunkingMetrics counters (including
+// `cas_splice_verification_failures`, the CAS-poisoning-rejection signal)
+// must render on the REAL /metrics path — MetricsRegistry::register (via the
+// production `register_chunking_metrics`) + render_prometheus. Before this
+// fix the per-instance ChunkingMetrics tree was never registered — DARK on
+// /metrics (the worker-metrics-exposure trap). Mutation: gut
+// `register_chunking_metrics` (or comment a publish! block) -> the pinned
+// line vanishes -> this test red-fails.
+#[test]
+fn chunking_metrics_render_prometheus_exposes_names() {
+    let registry = MetricsRegistry::new();
+    register_chunking_metrics(&registry);
+    let body = render_prometheus(&registry);
+    for name in [
+        "cas_splice_requests_total",
+        "cas_splice_already_exists",
+        "cas_splice_verification_failures",
+        "cas_splice_bytes_total",
+        "cas_split_requests_total",
+        "cas_split_hits",
+        "cas_split_misses",
+        "cas_split_chunked_on_demand",
+        "cas_split_bytes_total",
+    ] {
+        assert!(
+            body.contains(&format!("\n{name} ")),
+            "#2497 D3 dark on /metrics: chunking metric `{name}` ABSENT from the \
+             render_prometheus walk — the CAS-poisoning-rejection signal (and its \
+             siblings) would be invisible to operators. body=\n{body}"
+        );
+    }
+    // Doubled-prefix trap guard (the register key + an inner group!()
+    // concatenating).
+    assert!(
+        !body.contains("cas_cas_"),
+        "#2497 D3 doubled metric-name prefix in rendered chunking metrics. body=\n{body}"
+    );
+}
+
+// #2497 D3: pin exact rendered VALUES on the /metrics path so a mis-wired
+// field (right name, wrong source atomic) is caught, not just an absent line.
+// Local Arc (not the process singleton) to avoid cross-test value pollution.
+#[test]
+fn chunking_metrics_render_prometheus_pins_values() {
+    let counters = Arc::new(ChunkingMetrics::default());
+    counters
+        .splice_verification_failures
+        .fetch_add(5, Ordering::Relaxed);
+    counters.split_hits.fetch_add(9, Ordering::Relaxed);
+    let registry = MetricsRegistry::new();
+    registry.register("cas", counters);
+    let body = render_prometheus(&registry);
+    assert!(
+        body.contains("\ncas_splice_verification_failures 5\n"),
+        "#2497 D3: expected `cas_splice_verification_failures 5` on the /metrics \
+         render, absent or wrong value. body=\n{body}"
+    );
+    assert!(
+        body.contains("\ncas_split_hits 9\n"),
+        "#2497 D3: expected `cas_split_hits 9` on the /metrics render, absent or \
+         wrong value. body=\n{body}"
+    );
 }

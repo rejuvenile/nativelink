@@ -11,12 +11,26 @@
   stores: [
     {
       name: "CAS_MAIN_STORE",
-      filesystem: {
-        content_path: "/tmp/nativelink/data/content_path-cas",
-        temp_path: "/tmp/nativelink/data/tmp_path-cas",
-        eviction_policy: {
-          // 10gb.
-          max_bytes: 10000000000,
+      // A VerifyStore hash- and size-checks every blob written through the
+      // normal ByteStream/BatchUpdateBlobs path before it reaches the
+      // filesystem. This is REQUIRED for a safe chunking composition: without
+      // it, SpliceBlob's verify-before-EOF would be the ONLY integrity gate in
+      // the CAS, and blobs uploaded the normal way (which is still the majority
+      // of traffic) would land unverified. A poisoned blob uploaded directly
+      // could then be served — and even chunked/re-served — as if it were
+      // valid. Keep verify_hash/verify_size = true for any CAS store.
+      verify: {
+        verify_size: true,
+        verify_hash: true,
+        backend: {
+          filesystem: {
+            content_path: "/tmp/nativelink/data/content_path-cas",
+            temp_path: "/tmp/nativelink/data/tmp_path-cas",
+            eviction_policy: {
+              // 10gb.
+              max_bytes: 10000000000,
+            },
+          },
         },
       },
     },
