@@ -2868,3 +2868,103 @@ async fn unref_does_not_orphan_content_file_when_temp_dir_missing() -> Result<()
 
     Ok(())
 }
+
+// -----------------------------------------------------------------------------
+// Ported from upstream v1.6.1 `filesystem_store_test.rs` (dropped during the
+// fork's v1.6.1 merge, which kept the fork's diverged version). Adapted to the
+// fork: sharded on-disk layout via `digest_content_path`, and the fork's own
+// map/disk-divergence log message.
+// -----------------------------------------------------------------------------
+
+// NOTE: `deferred_write_error_does_not_emplace_truncated_file` lives in its own
+// binary (`filesystem_store_deferred_write_test.rs`) because it lowers the
+// PROCESS-WIDE `RLIMIT_FSIZE`; the fork runs a test file's tests concurrently,
+// so a shared-binary sibling that writes >1 MiB would fail with `EFBIG` during
+// this test's window.
+
+/// Map/disk divergence (map says present, file is gone) must surface as a
+/// recoverable warn and remove the stale entry — not a fatal error.
+#[nativelink_test]
+async fn get_part_on_map_disk_divergence_warns_and_removes_entry() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let content_path = make_temp_path("content_path");
+    let store = Box::pin(
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: make_temp_path("temp_path"),
+            eviction_policy: None,
+            ..Default::default()
+        })
+        .await?,
+    );
+    store.update_oneshot(digest, VALUE1.into()).await?;
+
+    // Delete the backing file out from under the still-present map entry.
+    let content_file = digest_content_path(&content_path, &digest);
+    fs::remove_file(&content_file).await?;
+
+    let err = store
+        .get_part_unchunked(digest, 0, None)
+        .await
+        .expect_err("divergent read must fail");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "divergent read must surface NotFound"
+    );
+
+    // Fork message (diverged from upstream's "Filesystem store map/disk
+    // divergence"): the fork logs a recoverable "Stale filesystem cache entry"
+    // warn and removes the entry rather than emitting a fatal-sounding message.
+    assert!(
+        logs_contain("Stale filesystem cache entry: file not found on disk"),
+        "divergence must be logged as a recoverable warn"
+    );
+    assert!(
+        !logs_contain("process probably need restarted"),
+        "no fatal-sounding restart message may appear"
+    );
+    assert_eq!(
+        store.has(digest).await?,
+        None,
+        "stale entry must be removed from the map"
+    );
+
+    Ok(())
+}
+
+/// unref must be idempotent when the file is already gone: the entry is marked
+/// Temp so a second unref early-returns instead of racing the vanished path
+/// again.
+#[nativelink_test]
+async fn unref_is_idempotent_when_file_already_gone() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let content_path = make_temp_path("content_path");
+    let store = Box::pin(
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: make_temp_path("temp_path"),
+            eviction_policy: None,
+            ..Default::default()
+        })
+        .await?,
+    );
+    store.update_oneshot(digest, VALUE1.into()).await?;
+    let file_entry = store.get_file_entry_for_digest(&digest).await?;
+
+    let content_file = digest_content_path(&content_path, &digest);
+    fs::remove_file(&content_file).await?;
+
+    // First unref: rename hits ENOENT with a vanished source (benign) and flips
+    // the entry to Temp. Second unref: must hit the Temp early-return, proving
+    // the flip stuck.
+    file_entry.unref().await;
+    file_entry.unref().await;
+
+    assert!(
+        logs_contain("File is already a temp file"),
+        "second unref should early-return as a Temp file (idempotent)"
+    );
+
+    Ok(())
+}
