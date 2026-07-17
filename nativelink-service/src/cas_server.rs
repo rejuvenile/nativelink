@@ -1716,6 +1716,17 @@ impl CasServer {
             None => Self::infer_blob_hasher_func(store, blob_digest).await?,
         };
 
+        // Set by the in-stream cap guard below when it aborts an over-cap
+        // blob. A genuinely over-cap blob is usually larger than the buf
+        // channel, so the guard drops `rx` while the store read is still in
+        // flight; that read then fails with `Code::Internal`. `Error::merge`
+        // prefers the read's code, so without this flag the RPC would return
+        // `Internal` instead of the REAPI-correct `NotFound`. After the join
+        // we consult the flag and force `NotFound` regardless of the merged
+        // code (see below). Mirrors the `verification_failed` pattern in
+        // `inner_splice_blob`.
+        let over_cap = AtomicBool::new(false);
+        let over_cap_ref = &over_cap;
         let (tx, rx) = make_buf_channel_pair();
         let read_store = store.clone();
         // `tx` is moved into the future so that when the read finishes or
@@ -1753,6 +1764,7 @@ impl CasServer {
                     // `buffered` may have started a few later chunks
                     // concurrently; they hit this same guard and store nothing.
                     if chunk_index >= max_chunk_count {
+                        over_cap_ref.store(true, Ordering::Relaxed);
                         return Err(make_err!(
                             Code::NotFound,
                             "Blob {blob_digest} exceeds the configured max_chunk_count of {max_chunk_count}; no split information available"
@@ -1791,10 +1803,21 @@ impl CasServer {
             Ok::<Vec<Digest>, Error>(chunk_digests)
         };
         let (read_res, chunk_res) = futures::join!(read_fut, chunk_fut);
-        // Prefer the read error (the chunker error is usually a consequence
-        // of it); merge keeps both messages when both fail.
-        // The over-cap guard now lives INSIDE the chunk stream (#2497 D4);
-        // by the time we get here the collected set is within the cap.
+        // #2497 D4: over-cap outcome must be deterministically `NotFound`.
+        // When the guard fired it aborted the read mid-stream, so `read_res`
+        // is `Err(Internal)` and `Error::merge` below would surface that code
+        // instead of the guard's `NotFound`. Force `NotFound` here regardless
+        // of which future's error `merge` prefers — the observable contract
+        // (over-cap -> NotFound, "no split information available") holds for
+        // large streaming-store blobs too, not only buffer-fitting ones.
+        if over_cap.load(Ordering::Relaxed) {
+            return Err(make_err!(
+                Code::NotFound,
+                "Blob {blob_digest} exceeds the configured max_chunk_count of {max_chunk_count}; no split information available"
+            ));
+        }
+        // Not over-cap: prefer the read error (the chunker error is usually a
+        // consequence of it); merge keeps both messages when both fail.
         let chunk_digests = read_res
             .merge(chunk_res)
             .err_tip(|| "Failed to chunk blob in chunk_blob_on_demand")?;

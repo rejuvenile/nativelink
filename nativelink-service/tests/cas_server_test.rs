@@ -40,10 +40,11 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
+use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
-use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
 use pretty_assertions::assert_eq;
 use prost::Message;
 use prost_types::Timestamp;
@@ -2313,6 +2314,258 @@ async fn split_over_cap_blob_short_circuits_without_writing_all_chunks()
         capped_chunk_count <= CAP as usize,
         "over-cap split wrote {capped_chunk_count} chunks; expected at most \
          the cap ({CAP}) before the stream aborted"
+    );
+    Ok(())
+}
+
+// #2497 D4: over-cap error-code DETERMINISM for large streaming blobs. When
+// the on-demand split of an over-cap blob is served from a store that streams
+// the read (rather than a single-send oneshot), the blob is larger than the
+// buf channel, so the in-stream cap guard drops `rx` while the read is still
+// in flight — that read fails with `Code::Internal`, and `Error::merge`
+// prefers the read's code. Without the post-join `over_cap` override in
+// `chunk_blob_on_demand`, the RPC returns `Internal` instead of the
+// REAPI-correct `NotFound`, so an operator alerting on the `NotFound` rate for
+// absent-blob splits would go dark and clients would see opaque errors. This
+// test feeds the MemoryStore the blob as thousands of small chunks (far more
+// than the ~1024-slot buf channel), so `get_part` genuinely blocks mid-stream,
+// then asserts the returned Code is `NotFound`. The 16 KiB single-send test
+// above cannot catch this: a oneshot blob is delivered in ONE send that fits
+// one slot, so the read completes `Ok` and `NotFound` survives the merge
+// trivially. Mutation: delete the `over_cap` override -> this red-fails with
+// `Internal`.
+#[nativelink_test]
+async fn split_over_cap_large_streaming_blob_returns_not_found()
+-> Result<(), Box<dyn core::error::Error>> {
+    const AVG_CHUNK_SIZE: u64 = 1024;
+    const CAP: u64 = 4;
+    const SEND_SIZE: usize = 64;
+    // 2048 sends of 64 bytes = 128 KiB, far more than the ~1024-slot buf
+    // channel, so the store read is still streaming when the guard fires at
+    // chunk index CAP (~14 KiB consumed with CHUNK_CONCURRENCY=10 lookahead).
+    const NUM_SENDS: usize = 2048;
+    const BLOB_SIZE: usize = NUM_SENDS * SEND_SIZE;
+
+    // Deterministic pseudo-random blob so FastCDC produces many (> CAP) chunks.
+    let mut state = 0x9e37_79b9_u32;
+    let data: Vec<u8> = (0..BLOB_SIZE)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let blob_digest = Digest {
+        hash: HASH1.to_string(),
+        size_bytes: BLOB_SIZE as i64,
+    };
+
+    let make_server = |store_manager: &StoreManager, max_chunk_count: u64| {
+        CasServer::new_with_chunking_metrics(
+            &[WithInstanceName {
+                instance_name: INSTANCE_NAME.to_string(),
+                config: nativelink_config::cas_server::CasStoreConfig {
+                    cas_store: "main_cas".to_string(),
+                    experimental_chunking: Some(
+                        nativelink_config::cas_server::CasChunkingConfig {
+                            index_store: Some("chunk_index".to_string()),
+                            avg_chunk_size_bytes: AVG_CHUNK_SIZE,
+                            max_chunk_count,
+                        },
+                    ),
+                },
+            }],
+            store_manager,
+            None,
+            Arc::new(ChunkingMetrics::default()),
+        )
+    };
+
+    let cas_len = |store: &Store| {
+        let store = store.clone();
+        async move {
+            store
+                .downcast_ref::<MemoryStore>(None)
+                .expect("main_cas is a MemoryStore")
+                .len_for_test()
+                .await
+        }
+    };
+
+    // Reference: an uncapped split of the same content writes the FULL set.
+    let sm_full = make_chunking_store_manager().await?;
+    let full_server = make_server(&sm_full, 100_000)?;
+    let full_store = sm_full.get_store("main_cas").unwrap();
+    full_store
+        .update_oneshot(
+            DigestInfo::try_from(blob_digest.clone())?,
+            bytes::Bytes::from(data.clone()),
+        )
+        .await?;
+    full_server
+        .split_blob(Request::new(SplitBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(blob_digest.clone()),
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await?;
+    let full_chunk_count = cas_len(&full_store).await - 1; // minus the blob.
+    assert!(
+        full_chunk_count > CAP as usize,
+        "test blob only produced {full_chunk_count} chunks, not > cap {CAP}; \
+         adjust BLOB_SIZE/AVG so it exceeds the cap"
+    );
+
+    // Capped: feed the blob to the MemoryStore as a STREAM of NUM_SENDS small
+    // chunks. MemoryStore preserves each send as its own scatter-gather chunk,
+    // so the subsequent split read (`get_part`) replays them one send at a
+    // time and blocks once the buf channel fills — the read is therefore still
+    // in flight (and will abort with `Code::Internal`) when the cap guard fires.
+    let sm_capped = make_chunking_store_manager().await?;
+    let capped_server = make_server(&sm_capped, CAP)?;
+    let capped_store = sm_capped.get_store("main_cas").unwrap();
+    let (mut tx, rx) = make_buf_channel_pair();
+    let feed = async move {
+        for piece in data.chunks(SEND_SIZE) {
+            tx.send(bytes::Bytes::copy_from_slice(piece)).await?;
+        }
+        tx.send_eof()?;
+        Ok::<(), Error>(())
+    };
+    let store_update = capped_store.update(
+        DigestInfo::try_from(blob_digest.clone())?,
+        rx,
+        UploadSizeInfo::ExactSize(BLOB_SIZE as u64),
+    );
+    let (feed_res, update_res) = futures::join!(feed, store_update);
+    feed_res?;
+    update_res?;
+
+    let status = capped_server
+        .split_blob(Request::new(SplitBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(blob_digest),
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await
+        .unwrap_err();
+    // Load-bearing: over-cap MUST be NotFound even though the in-flight read
+    // was aborted mid-stream with Code::Internal.
+    assert_eq!(
+        status.code(),
+        Code::NotFound,
+        "over-cap split of a large streaming blob returned {:?}, expected \
+         NotFound — the aborted mid-stream read's Internal code must not win \
+         the Error::merge. message: {}",
+        status.code(),
+        status.message()
+    );
+    assert!(
+        status.message().contains("max_chunk_count"),
+        "unexpected message: {}",
+        status.message()
+    );
+
+    // And it must still short-circuit: strictly fewer than the full chunk set
+    // written, at most the cap.
+    let capped_chunk_count = cas_len(&capped_store).await - 1;
+    assert!(
+        capped_chunk_count < full_chunk_count,
+        "over-cap split wrote {capped_chunk_count} chunks (full set is \
+         {full_chunk_count}); expected strictly fewer — the stream must \
+         short-circuit at the cap"
+    );
+    assert!(
+        capped_chunk_count <= CAP as usize,
+        "over-cap split wrote {capped_chunk_count} chunks; expected at most \
+         the cap ({CAP}) before the stream aborted"
+    );
+    Ok(())
+}
+
+// #2497 D3: singleton-aliasing E2E. The dark-counter trap is that the
+// production PRODUCER (every CAS instance's `chunking_metrics`) must be the
+// SAME Arc that `register_chunking_metrics` publishes on `/metrics`. The
+// `_pins_values` test below hand-sets a LOCAL Arc, and the handler tests build
+// via `new_with_chunking_metrics` with a fresh Arc — so a regression pointing
+// `CasServer::new` at a per-server Arc (re-introducing the exact dark-counter
+// trap D3 fixes) would ship GREEN. This test closes that gap: it builds the
+// server via the PRODUCTION `CasServer::new` (which wires the process-wide
+// singleton), drives a REAL `splice_blob` that bumps
+// `splice_verification_failures` through the handler, then asserts the value
+// renders NON-ZERO on the actual `register_chunking_metrics` + render_prometheus
+// path. Mutation: point `CasServer::new` at `Arc::new(ChunkingMetrics::default())`
+// instead of `chunking_metrics_singleton()` -> the handler bumps a throwaway
+// Arc, the registered singleton stays 0, and this test red-fails. (No other
+// test in this binary bumps the singleton's `splice_verification_failures`, so
+// the mutated render is deterministically 0.)
+#[nativelink_test]
+async fn chunking_metrics_singleton_renders_production_producer_counter()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_chunking_store_manager().await?;
+    // PRODUCTION path: `new` (not `new_with_chunking_metrics`) wires the
+    // instance's counters to the process-wide singleton.
+    let cas_server = CasServer::new(
+        &[WithInstanceName {
+            instance_name: INSTANCE_NAME.to_string(),
+            config: nativelink_config::cas_server::CasStoreConfig {
+                cas_store: "main_cas".to_string(),
+                experimental_chunking: Some(nativelink_config::cas_server::CasChunkingConfig {
+                    index_store: Some("chunk_index".to_string()),
+                    avg_chunk_size_bytes: 0,
+                    max_chunk_count: 0,
+                }),
+            },
+        }],
+        &store_manager,
+        None,
+    )?;
+
+    // Drive a real splice that fails verification (declared blob size does not
+    // match the summed chunk sizes) -> the handler bumps
+    // `splice_verification_failures` on whatever Arc the producer holds.
+    let status = cas_server
+        .splice_blob(Request::new(SpliceBlobRequest {
+            instance_name: INSTANCE_NAME.to_string(),
+            blob_digest: Some(Digest {
+                hash: HASH1.to_string(),
+                size_bytes: 100,
+            }),
+            chunk_digests: vec![Digest {
+                hash: HASH2.to_string(),
+                size_bytes: 1,
+            }],
+            digest_function: digest_function::Value::Sha256.into(),
+            chunking_function: chunking_function::Value::FastCdc2020.into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument);
+
+    // Register + render the PROCESS SINGLETON (the production `/metrics` path).
+    // The producer above must have incremented THIS Arc, so the rendered value
+    // is >= 1. Under the mutation (producer -> fresh Arc) it renders 0.
+    let registry = MetricsRegistry::new();
+    register_chunking_metrics(&registry);
+    let body = render_prometheus(&registry);
+    let rendered = body
+        .lines()
+        .find_map(|line| line.strip_prefix("cas_splice_verification_failures "))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "#2497 D3: `cas_splice_verification_failures` absent from the \
+                 render_prometheus walk — the singleton is not registered. body=\n{body}"
+            )
+        });
+    assert!(
+        rendered >= 1,
+        "#2497 D3 dark-counter: the production `CasServer::new` producer bumped \
+         a counter that did NOT reach the registered singleton — \
+         `cas_splice_verification_failures` rendered {rendered}, expected >= 1. \
+         `CasServer::new` must wire the process-wide chunking_metrics_singleton, \
+         not a per-server Arc. body=\n{body}"
     );
     Ok(())
 }
