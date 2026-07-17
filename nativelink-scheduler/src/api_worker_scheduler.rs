@@ -2931,14 +2931,14 @@ impl ApiWorkerSchedulerImpl {
         // pager reclaims), then least swap shortfall, then most disk headroom.
         // This DEGENERATES to the prior swap-only behavior when no worker is
         // disk-pressured (all keys share `disk_pressured=false` → ranks purely
-        // by `swap_pressure_rate_per_sec`), and to most-free-bytes when all are
+        // by `mem_pressure_churn_scalar`), and to most-free-bytes when all are
         // disk-pressured (shared `swap=0` → ranks by `Reverse(free)`).
         if worker_id.is_none() {
             let workers_iter = self.workers.iter();
             let rank_key = |w: &Worker| {
                 (
                     w.disk_pressured,
-                    w.swap_pressure_rate_per_sec,
+                    w.mem_pressure_churn_scalar,
                     core::cmp::Reverse(w.available_disk_bytes),
                 )
             };
@@ -3226,8 +3226,8 @@ impl ApiWorkerSchedulerImpl {
     }
 
     /// (#task-memgate-twosignal) Fleet-representative compressor-CHURN scalar: the
-    /// MAX `swap_pressure_rate_per_sec` (the re-keyed wire field — now the churn
-    /// EWMA, not a rate) reported across all workers, or `0` when none report.
+    /// MAX `mem_pressure_churn_scalar` (wire field 20 — the churn EWMA) reported
+    /// across all workers, or `0` when none report.
     ///
     /// DESIGN NOTE (drift flagged for the Tier-3 cadre): the task specifies "the
     /// CANDIDATE worker's churn scalar at dispatch", but the DOWN reservation is
@@ -3245,7 +3245,7 @@ impl ApiWorkerSchedulerImpl {
     fn fleet_max_churn_scalar(&self) -> u32 {
         self.workers
             .iter()
-            .map(|(_, w)| w.swap_pressure_rate_per_sec)
+            .map(|(_, w)| w.mem_pressure_churn_scalar)
             .max()
             .unwrap_or(0)
     }
@@ -3346,10 +3346,19 @@ impl ApiWorkerSchedulerImpl {
             // (#task-memgate-twosignal) Reactive churn-throttle: back the effective
             // overcommit factor off toward 1.0 as the fleet's compressor-churn scalar
             // rises. OFF (default) → effective_factor == the static max factor →
-            // byte-identical to the pre-throttle DOWN path.
+            // byte-identical to the pre-throttle DOWN path. Skip the O(workers)
+            // `fleet_max_churn_scalar` scan entirely when the throttle is OFF: the
+            // factor fn early-returns on `!enabled` before reading the churn arg, so
+            // the scan is pure cost with no effect — passing 0 keeps the default-config
+            // DOWN path byte-identical in COST as well as result.
+            let fleet_churn = if self.phase3_overcommit_churn_throttle_enabled {
+                self.fleet_max_churn_scalar()
+            } else {
+                0
+            };
             let effective_factor = phase3_churn_throttled_factor(
                 self.phase3_overcommit_max_factor,
-                self.fleet_max_churn_scalar(),
+                fleet_churn,
                 self.phase3_overcommit_churn_throttle_low,
                 self.phase3_overcommit_churn_throttle_high,
                 self.phase3_overcommit_churn_throttle_enabled,
@@ -11219,7 +11228,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
         &self,
         worker_id: &WorkerId,
         swap_pressured: bool,
-        swap_pressure_rate_per_sec: u32,
+        mem_pressure_churn_scalar: u32,
     ) -> Result<(), Error> {
         // peek_mut to avoid LRU promotion — a pressure report is telemetry,
         // not work assignment, and must not reorder scheduling (mirrors
@@ -11237,12 +11246,12 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 debug!(
                     %worker_id,
                     swap_pressured,
-                    swap_pressure_rate_per_sec,
+                    mem_pressure_churn_scalar,
                     "worker swap pressure changed"
                 );
             }
             worker.swap_pressured = swap_pressured;
-            worker.swap_pressure_rate_per_sec = swap_pressure_rate_per_sec;
+            worker.mem_pressure_churn_scalar = mem_pressure_churn_scalar;
         }
         // A transition to NOT-pressured re-opens this worker to the matcher;
         // wake the matcher so a queued action can be assigned without waiting

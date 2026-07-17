@@ -107,20 +107,21 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     }
 
     /// (#37 swap-pressure gate) Updates whether the worker reported
-    /// sustained host swap pressure, plus its current pressure RATE.
+    /// sustained host memory pressure, plus its current compressor-churn scalar.
     /// Carried on every `BlobsAvailable` (both the periodic heartbeat AND
     /// the one-shot post-action delta), like `indefinite_pin_saturated`,
     /// so the flag is not clobbered to `false` the instant an action
     /// completes. When `swap_pressured` is `true`, the matcher PROACTIVELY
     /// skips this worker for new actions (advisory — the worker-local NAK
-    /// is the authoritative gate); the rate is used only to rank the
-    /// least-pressured worker in the fleet fail-open. Default impl is a
+    /// is the authoritative gate); the churn scalar is used only to rank the
+    /// least-pressured worker in the fleet fail-open and to feed the
+    /// reactive overcommit churn-throttle. Default impl is a
     /// no-op so schedulers without a worker pool need not implement it.
     async fn update_worker_swap_pressure(
         &self,
         _worker_id: &WorkerId,
         _swap_pressured: bool,
-        _swap_pressure_rate_per_sec: u32,
+        _mem_pressure_churn_scalar: u32,
     ) -> Result<(), Error> {
         Ok(())
     }

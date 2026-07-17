@@ -1089,12 +1089,13 @@ const FREE_FLOOR_HYSTERESIS: u64 = 256 << 20; // 256 MiB
 /// (#task-memgate-twosignal) OOM hard-gate threshold: the SWAPIN rate
 /// (Δswapins/Δt, events/sec) at/above which a sampler tick counts toward the
 /// sustained-swapin OOM trip. `Swapins` = working set overflowed RAM+compressor
-/// to DISK = OOM-adjacent. The baseline is genuinely 0 (measured: 0 swapins
-/// across a full `--config=dbg` build), so a sustained swapin needs NO
-/// calibration — the default `100/s` sits far above the 0 baseline yet trips on
-/// any genuine, non-trivial disk spill. A ONE-OFF spike (a single tick touching
-/// ancient swapped pages) does NOT trip: the trip also requires
-/// `SWAPIN_CONFIRM_WINDOW_TICKS` CONSECUTIVE ticks at/above this rate.
+/// to DISK = OOM-adjacent. Safety rests on swapin SEMANTICS (a disk spill is
+/// strictly deeper pressure than compression) plus the sustained window, NOT on
+/// the threshold number: the measured `0` baseline came from a `--config=dbg`
+/// build on an IDLE fleet, so the busy-worker baseline is UNMEASURED and
+/// `nak_swapin` must be watched through a busy soak after enabling. A ONE-OFF
+/// spike (a single tick touching ancient swapped pages) does NOT trip: the trip
+/// also requires `SWAPIN_CONFIRM_WINDOW_TICKS` CONSECUTIVE ticks at/above this rate.
 ///
 /// Config-sourced (like `MEMORY_GATE_ENABLED`): set ONCE at worker startup from
 /// `LocalWorkerConfig::memory_gate_swapin_confirm_rate` (default `100`). Relaxed
@@ -1386,8 +1387,9 @@ impl SwapSamplerState {
 /// (#task-memgate-twosignal) Two-signal trip logic:
 /// - OOM boolean `MEMORY_PRESSURED` = free-floor fail-safe breached OR SWAPIN
 ///   rate sustained above `SWAPIN_CONFIRM_RATE` for `SWAPIN_CONFIRM_WINDOW_TICKS`
-///   consecutive ticks. Swapins are the OOM-adjacent disk-spill signal
-///   (baseline 0, so calibration-free).
+///   consecutive ticks. Swapins are the OOM-adjacent disk-spill signal — safe by
+///   SEMANTICS (deeper than compression) + the sustained window, not by the
+///   threshold value; the busy-worker baseline is unmeasured (watch nak_swapin).
 /// - GRADED churn scalar `MEMORY_PRESSURE_LEVEL` = `min(compress_ewma,
 ///   decompress_ewma)` — high only when the compressor is thrashing. Perf, not
 ///   OOM: it NEVER hard-NAKs; it feeds the scheduler ranking + throttle.
@@ -5800,18 +5802,32 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         MEMORY_GATE_TRIP_FREE_FLOOR.load(Ordering::Relaxed);
                                     let trip_swapin =
                                         MEMORY_GATE_TRIP_SWAPIN.load(Ordering::Relaxed);
+                                    let gate_counters =
+                                        ::nativelink_util::o11_probes::memory_gate_counters();
                                     if trip_free_floor {
-                                        ::nativelink_util::o11_probes::memory_gate_counters()
+                                        gate_counters
                                             .nak_free_floor
                                             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
                                     }
                                     if trip_swapin {
-                                        ::nativelink_util::o11_probes::memory_gate_counters()
+                                        gate_counters
                                             .nak_swapin
                                             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
                                     }
+                                    // Log the trip-cause magnitudes (NOT the churn perf
+                                    // scalar `memory_pressure_level`): the free-floor
+                                    // shortfall and the last sampled swapin rate are what
+                                    // drive this NAK, so the inline magnitude an operator
+                                    // reads matches trip_free_floor / trip_swapin.
+                                    let free_shortfall_mib = gate_counters
+                                        .pressure_level_mib
+                                        .load(::core::sync::atomic::Ordering::Relaxed);
+                                    let swapin_rate = gate_counters
+                                        .swapin_rate_last
+                                        .load(::core::sync::atomic::Ordering::Relaxed);
                                     warn!(
-                                        memory_pressure_level = get_memory_pressure_level(),
+                                        free_shortfall_mib,
+                                        swapin_rate,
                                         in_flight,
                                         trip_free_floor,
                                         trip_swapin,
@@ -8032,7 +8048,7 @@ pub struct Metrics {
     /// (#37 re-enable follow-up) NAKs issued to the scheduler because the
     /// available-memory free-floor PRIMARY was breached (available
     /// free+inactive+purgeable < `FREE_FLOOR_BYTES = 1 GiB`). Monotonic.
-    // NOTE: memory_gate_nak_free_floor_total and memory_gate_nak_refault_total
+    // NOTE: memory_gate_nak_free_floor_total and memory_gate_nak_swapin_total
     // were previously here as per-instance Counter fields. They have been moved
     // to the process-singleton `nativelink_util::o11_probes::memory_gate_counters()`
     // and registered in nativelink.rs so they are visible on /metrics. The NAK
@@ -9186,12 +9202,13 @@ mod tests {
             "FREE_FLOOR_HYSTERESIS must be 256 MiB (256 << 20)"
         );
         // (#task-memgate-twosignal) The SWAPIN OOM threshold + window static
-        // inits. Swapin baseline is 0, so 100/s is calibration-free; 10 ticks
-        // ≈ 1 s at the 100 ms cadence rejects one-off spikes.
+        // inits. 100/s is safe by swapin semantics + the sustained window (the
+        // busy-worker baseline is unmeasured); 10 ticks ≈ 1 s at the 100 ms
+        // cadence rejects one-off spikes.
         assert_eq!(
             SWAPIN_CONFIRM_RATE.load(Ordering::Relaxed), 100,
-            "SWAPIN_CONFIRM_RATE static init must be 100/s (calibration-free OOM \
-             threshold — swapin baseline is 0)"
+            "SWAPIN_CONFIRM_RATE static init must be 100/s (OOM threshold; safety \
+             from swapin semantics + sustained window, busy-worker baseline unmeasured)"
         );
         assert_eq!(
             SWAPIN_CONFIRM_WINDOW_TICKS.load(Ordering::Relaxed), 10,
@@ -9728,6 +9745,16 @@ mod tests {
              (compress low) yields a LOW churn, filtering the working-set-shift \
              confound"
         );
+        // Pin the OTHER direction so a `min → compress_ewma` mutation cannot
+        // escape: compress HIGH, decompress low ⇒ still LOW churn (proactive
+        // cold-page reclaim confound filtered). Without this, returning
+        // compress_ewma alone would survive the assertion above.
+        assert!(
+            (churn_scalar(40_000.0, 3.0) - 3.0).abs() < 1e-9,
+            "churn_scalar must be min(compress, decompress) — compress-alone \
+             (decompress low) yields a LOW churn, filtering the proactive \
+             cold-page-reclaim confound"
+        );
         // Enable the gate so a spurious NAK would show up in MEMORY_PRESSURED.
         MEMORY_GATE_ENABLED.store(true, Ordering::Relaxed);
         // On this (non-macOS/non-linux) build `read_memory_signals` returns None,
@@ -9774,8 +9801,8 @@ mod tests {
         );
         assert_eq!(
             cfg.memory_gate_swapin_confirm_rate.get(), 100,
-            "swapin_confirm_rate config default must be 100/s (calibration-free — \
-             swapin baseline is 0). \
+            "swapin_confirm_rate config default must be 100/s (safety from swapin \
+             semantics + sustained window; busy-worker baseline unmeasured). \
              Mutation target: change default_memory_gate_swapin_confirm_rate"
         );
         assert_eq!(
@@ -9809,8 +9836,8 @@ mod tests {
 
     /// (#task-memgate-twosignal) The swapin OOM config fields reject `0`
     /// (`NonZeroU32`): a `0` rate would count every tick (rate >= 0 always) and a
-    /// `0` window would trip on the first tick — both defeat the calibration-free
-    /// sustained-window design (the #64 storm class, self-inflicted).
+    /// `0` window would trip on the first tick — both defeat the sustained-window
+    /// design (the #64 storm class, self-inflicted).
     ///
     /// Mutation (CLAUDE.md TDD #5): revert either field type from `NonZeroU32` to
     /// `u32` → serde accepts `0` → this test's `is_err()` assertion fires.
@@ -9912,6 +9939,77 @@ mod tests {
         SWAPIN_CONFIRM_RATE.store(orig_rate, Ordering::Relaxed);
         SWAPIN_CONFIRM_WINDOW_TICKS.store(orig_window, Ordering::Relaxed);
         MEMORY_GATE_ENABLED.store(orig_gate, Ordering::Relaxed);
+    }
+
+    /// (#task-memgate-twosignal, pair-a fix-up) A REALISTIC swapin rate, computed
+    /// by the PRODUCTION `compute_swap_pressure_rate`, must trip the sustained
+    /// window at the PRODUCTION defaults (100 pages/s × 10 ticks) — and a
+    /// sub-threshold rate must NOT. The sibling latch test uses a degenerate
+    /// threshold=0 / window=1 (it proves the latch is WIRED); this proves a real
+    /// rate actually crosses the rate-computation → window path with the shipped
+    /// constants, and that benign non-spilling swapin stays quiet. Pure functions,
+    /// so no atomics/`#[serial]`/platform gate needed.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): change `swapin_sustained_step`'s `>= window`
+    /// to `>= 1` → the "must NOT trip before 10 ticks" assertion red-fails; make
+    /// `compute_swap_pressure_rate` ignore `elapsed_secs` → the 150/s and 50/s
+    /// rate assertions red-fail.
+    #[test]
+    fn realistic_swapin_rate_trips_sustained_window_via_rate_computation() {
+        let threshold = 100; // production SWAPIN_CONFIRM_RATE default
+        let window = 10; // production SWAPIN_CONFIRM_WINDOW_TICKS default
+
+        // A legit sustained spill: 150 swapins over a real 1.0 s interval → the
+        // production rate-computation yields 150 pages/s (>= threshold).
+        let hot_rate = compute_swap_pressure_rate(1_000_000, 1_000_150, 1.0);
+        assert_eq!(
+            hot_rate, 150,
+            "compute_swap_pressure_rate must read 150 swapins over 1.0 s as 150/s \
+             (the production Δcount/Δt the sampler feeds swapin_sustained_step)"
+        );
+        // The trip requires the FULL window of consecutive at/above-threshold
+        // ticks — not fewer.
+        let mut ticks = 0;
+        for tick in 1..=window {
+            let (next, tripped) = swapin_sustained_step(ticks, hot_rate, threshold, window);
+            ticks = next;
+            if tick < window {
+                assert!(
+                    !tripped,
+                    "a sustained {hot_rate}/s swapin must NOT trip before {window} \
+                     consecutive ticks (tripped at tick {tick})"
+                );
+            } else {
+                assert!(
+                    tripped,
+                    "a sustained {hot_rate}/s swapin (>= {threshold}/s) MUST trip once \
+                     {window} consecutive ticks accumulate"
+                );
+            }
+        }
+
+        // A sub-threshold rate (50/s < 100/s) must NEVER trip, no matter how long
+        // it is sustained — the OOM gate stays quiet on benign, non-spilling churn.
+        let cold_rate = compute_swap_pressure_rate(1_000_000, 1_000_050, 1.0);
+        assert_eq!(
+            cold_rate, 50,
+            "50 swapins over 1.0 s must read as 50/s (sub-threshold control)"
+        );
+        let mut cold_ticks = 0;
+        for _ in 0..(window * 3) {
+            let (next, tripped) = swapin_sustained_step(cold_ticks, cold_rate, threshold, window);
+            cold_ticks = next;
+            assert!(
+                !tripped,
+                "a sub-threshold {cold_rate}/s swapin must NEVER trip the sustained \
+                 OOM window (threshold {threshold}/s)"
+            );
+        }
+        assert_eq!(
+            cold_ticks, 0,
+            "a sub-threshold swapin rate must RESET the consecutive-tick run each \
+             tick (no slow accumulation toward a spurious trip)"
+        );
     }
 
     /// (#37) The gate MUST fail OPEN when the sampler is wedged/dead: a
@@ -10577,7 +10675,7 @@ mod tests {
     /// and `memory_gate_counters_arc()` must observe the same underlying `AtomicU64`
     /// state, and `MemoryGateCountersHandle::publish` must emit the literal metric
     /// names operators alert on: `memory_gate_nak_free_floor_total` and
-    /// `memory_gate_nak_refault_total`.
+    /// `memory_gate_nak_swapin_total`.
     ///
     /// The counters were previously per-instance `Metrics` fields (never registered
     /// with `MetricsRegistry` — the worker-metrics-exposure trap) and are now a

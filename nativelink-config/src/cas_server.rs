@@ -1377,13 +1377,15 @@ pub struct LocalWorkerConfig {
     ///
     /// The swapin RATE (Δswapins/Δt) at/above which a sampler tick counts toward
     /// the sustained-swapin OOM trip. `Swapins` = the working set overflowed
-    /// RAM+compressor to DISK = OOM-adjacent. The baseline is genuinely 0 (a full
-    /// `--config=dbg` build measured 0 swapins on all 10 workers), so this
-    /// threshold needs NO calibration — the default `100/s` sits far above the 0
-    /// baseline yet trips on any genuine, non-trivial disk spill. The trip ALSO
-    /// requires `memory_gate_swapin_confirm_window_ticks` consecutive at/above
-    /// ticks, so a one-off spike (a lone tick touching ancient swapped pages)
-    /// never trips.
+    /// RAM+compressor to DISK = OOM-adjacent. Its safety rests on swapin
+    /// SEMANTICS (a disk spill is strictly deeper pressure than compression, which
+    /// macOS hides) plus the sustained WINDOW below, NOT on the threshold number:
+    /// `memory_gate_swapin_confirm_window_ticks` consecutive at/above ticks are
+    /// required, so a one-off spike (a lone tick touching ancient swapped pages)
+    /// never trips. The `100/s` default was picked against a measured baseline of
+    /// 0, but that 0 came from a `--config=dbg` build on an IDLE fleet — the
+    /// busy-worker baseline is UNMEASURED, so `nak_swapin` must be watched through
+    /// a busy soak after enabling (a legit heavy phase could sustain ≥100/s).
     ///
     /// `0` is rejected at deserialization (`NonZeroU32`): a zero threshold would
     /// count EVERY tick (rate >= 0 always) toward the window → a sustained NAK
@@ -1521,10 +1523,12 @@ fn default_memory_gate_refault_confirm_rate() -> NonZeroU32 {
     NonZeroU32::new(10_000).unwrap()
 }
 
-/// (#task-memgate-twosignal) Default SWAPIN OOM threshold: 100 pages/s. The
-/// measured swapin baseline is 0 (0 swapins across a full dbg build), so 100
-/// sits far above baseline yet trips on any genuine disk spill. Numeric-constant
-/// rule: this literal is the authoritative ship default.
+/// (#task-memgate-twosignal) Default SWAPIN OOM threshold: 100 pages/s. Safety
+/// comes from swapin semantics (disk spill is strictly deeper than compression)
+/// plus the sustained window, not from this number: the measured `0` baseline was
+/// a dbg build on an idle fleet, so the busy-worker baseline is UNMEASURED — watch
+/// `nak_swapin` post-enable. Numeric-constant rule: this literal is the
+/// authoritative ship default.
 fn default_memory_gate_swapin_confirm_rate() -> NonZeroU32 {
     // SAFETY: 100 != 0.
     NonZeroU32::new(100).unwrap()

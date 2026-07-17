@@ -3497,10 +3497,10 @@ impl WorkerScheduler for SimpleScheduler {
         &self,
         worker_id: &WorkerId,
         swap_pressured: bool,
-        swap_pressure_rate_per_sec: u32,
+        mem_pressure_churn_scalar: u32,
     ) -> Result<(), Error> {
         self.worker_scheduler
-            .update_worker_swap_pressure(worker_id, swap_pressured, swap_pressure_rate_per_sec)
+            .update_worker_swap_pressure(worker_id, swap_pressured, mem_pressure_churn_scalar)
             .await
     }
 

@@ -299,14 +299,19 @@ pub struct Worker {
     #[metric(help = "If the worker reported sustained host memory pressure.")]
     pub swap_pressured: bool,
 
-    /// (#37 rev-4) The worker's last-reported memory-pressure LEVEL (MiB
-    /// below the free-floor), used ONLY to rank the least-pressured worker
-    /// in the fleet fail-open (when all candidates are memory-gated).
-    /// Observability + tie-break; NOT a gate input on its own. `0` =
-    /// unknown / no pressure reported. Higher = more pressured, so the
-    /// `min_by_key` fail-open ranking selects the least-pressured worker.
-    #[metric(help = "Worker-reported memory-pressure level (MiB below free-floor).")]
-    pub swap_pressure_rate_per_sec: u32,
+    /// (#task-memgate-twosignal) The worker's last-reported compressor-CHURN
+    /// scalar — `min(compress_ewma, decompress_ewma)` in events/sec (the
+    /// re-keyed wire field 20; it FORMERLY carried MiB-below-the-free-floor,
+    /// hence the historical proto comment). Used ONLY to rank the
+    /// least-pressured worker in the fleet fail-open (when all candidates are
+    /// memory-gated) and to feed the reactive overcommit churn-throttle.
+    /// Observability + tie-break; NOT a gate input on its own. `0` = unknown /
+    /// no pressure reported. Higher = more thrashing, so the `min_by_key`
+    /// fail-open ranking selects the least-thrashing worker.
+    #[metric(
+        help = "Worker-reported compressor-churn scalar (min(compress,decompress) EWMA, events/sec)."
+    )]
+    pub mem_pressure_churn_scalar: u32,
 
     /// (F4) Whether the worker reported physical disk pressure on its
     /// CAS/work_directory volume in its last `BlobsAvailable` heartbeat (free
@@ -439,7 +444,7 @@ impl Worker {
             total_memory_kb,
             indefinite_pin_saturated: false,
             swap_pressured: false,
-            swap_pressure_rate_per_sec: 0,
+            mem_pressure_churn_scalar: 0,
             disk_pressured: false,
             available_disk_bytes: 0,
             cached_directory_digests: HashSet::new(),
