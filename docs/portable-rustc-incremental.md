@@ -159,14 +159,28 @@ warm-start, and munges outputs).
 5. Enable for ONE high-value crate (large asan/tsan); measure warm-hit rate local AND remote under dynamic.
 6. Scheduler target-affinity to raise the hit rate; then widen the allowlist.
 
-## 11. The one remaining experiment (cheap, before code)
+## 11. The one remaining experiment — DONE, CONFIRMED WARM (2026-07-17)
 
-The real-dir `chdir` moots the getcwd-resolution question, but ONE variation is untested vs the proven
-premise: **hardlinked inputs + real per-target-dir chdir reuse** (the local branch's setup). ~20-min
-extension of the existing raw-rustc test: hardlink a crate's inputs + prior `-incr` into a fresh
-`<PREFIX>/<key>`, `chdir`, compile, edit one file, recompile — confirm LLVM_passes warm. If a rustc
-input-path canonicalization defeats hardlinks, fall back to materializing real copies (costlier) or a
-per-target bindfs on macOS (FUSE cost). Do this FIRST; everything hinges on it.
+Ran the A/B/C/D raw-rustc test (nightly 1.98.0, 900-fn crate, `--emit=obj -Copt-level=2 -Ztime-passes`,
+`/tmp/nlincr-exp.sh`, log `/tmp/nlincr-exp-run.log`). LLVM_passes seconds:
+
+| Condition | LLVM_passes |
+|-----------|-------------|
+| seed (cold first build) | 1.441 |
+| **A: real-copy inputs at `<PREFIX>/tk1` + seed incr (control)** | **0.001 (warm)** |
+| **B: HARDLINK inputs at `<PREFIX>/tk1` + seed incr (the test)** | **0.001 (warm)** |
+| C: fresh incr, real files | 1.415 (cold) |
+| D: seed incr copied to a DIFFERENT path `tk2` | 1.402 (COLD) |
+
+**Verdict: hardlinked inputs reuse codegen IDENTICALLY to real copies (0.001 s, ~1400× vs cold).** The
+hardlink shared the source inode (link count 2, same inode) and rustc still reused — no input-path
+canonicalization defeats it. D independently re-confirms Step-0 path-binding (same `-incr`, different path
+→ cold). The local branch's cheap hardlink path is validated.
+
+**Caveat (open item §14):** run on Linux/ZFS, not macOS/APFS. The mechanism is platform-independent rustc
+incremental logic + POSIX hardlink semantics (a hardlink is a real dirent, no resolution), so it
+generalizes with high confidence — but a macOS/APFS spot-confirm on a worker (off-hours) is the final gate
+before the process_wrapper L–XL work.
 
 ## 12. Interaction with the local `-incr` materialization cost (F)
 
