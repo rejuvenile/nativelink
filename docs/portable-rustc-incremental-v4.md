@@ -66,14 +66,18 @@ local+remote of the same action = different machines → no collision.
   viable). ACCEPTED: reuse is best-effort under concurrent multi-version load; the §12 counters
   (`seed_present_but_cold` climbing) diagnose it; expect a reduced-but-nonzero CI hit-rate floor.
 
-### 6.3 Fetch wiring — WORKER OUT-OF-BAND (default, per distsys gate)
+### 6.3 Fetch wiring — WORKER OUT-OF-BAND (REQUIRED — experiment-confirmed)
 The NativeLink **worker fetches from the index out-of-band and injects the seed at the pinned path before rustc** —
 the seed is NEVER a Bazel action input, so it cannot enter the remote `.rlib` REAPI key. Cache-HIT → rustc never
 runs (seed irrelevant); MISS → rustc reads the injected seed → output identical → no poisoning. The LOCAL branch's
 `RustcIncrSeed` fetches from the same index instead of the local `prev_incr_dir` (`rustc.bzl:2227`, the v2-broken
-read). **[Potential simplification, gated:** a single Bazel-declared `unused_inputs_list`-excluded seed for BOTH
-branches — ONLY if the two-machine experiment proves the seed does not churn the remote key; distsys's strong prior
-is that it does, so out-of-band is the committed default.]
+read). **The Bazel-declared alternative (a single `unused_inputs_list`-excluded seed input for both branches) is
+RULED OUT — the two-machine experiment (2026-07-17) CONFIRMED it churns the remote key:** two builds with
+byte-identical source differing ONLY in `incr_seed` content produced DIFFERENT REAPI Action digests (`df7bff88`
+vs `ff08968c`; seed content the sole cause — `unused_inputs_list` prunes the seed only on subsequent NON-executing
+rebuilds, so a machine's first execution embeds its seed in the key). This loses cross-machine `.rlib` sharing on
+exactly the LARGE crates this effort targets (the seed populates only above `incremental_seed_threshold_mb`, default
+20 MB, `.bazelrc:747`; small crates keep an empty seed → same digest → still shareable). Out-of-band is mandatory.
 
 ### 6.4 Correctness boundary
 rustc per-query fingerprint re-validation = the correctness floor (stale/wrong/torn seed → COLD, never wrong).
@@ -162,4 +166,6 @@ cold` for the multi-version-LWW + content-eviction floors that only surface at f
 ## 14. Pre-code gates (architecture already signed off)
 1. §6.6 publish-authority: confirm actions have no egress to the CAS/AC port (else add worker-only-writable control).
 2. §6.5 CAS-content-pin sizing proof vs the FL-688 pin budget.
-3. Two-machine remote-`.rlib`-cache experiment — can only *simplify* §6.3 (default = out-of-band).
+3. ~~Two-machine remote-`.rlib`-cache experiment~~ **DONE 2026-07-17: CONFIRMED the Bazel-declared seed churns the
+   remote key (`df7bff88`≠`ff08968c`, seed-content sole cause) → §6.3 out-of-band is REQUIRED, not optional
+   (regression scoped to >20 MB-incr crates = the target set).**
