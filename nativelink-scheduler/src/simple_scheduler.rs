@@ -3229,9 +3229,55 @@ impl SimpleScheduler {
                             drop(ws);
                             continue; // feature toggled off
                         };
+                        // (#dag-criticality §6c observability) Grab the render-reachable
+                        // metrics sink BEFORE dropping `ws` so the recompute telemetry lands
+                        // on `SchedulerMetrics` (the only registered, process-singleton tree).
+                        let metrics = ws.get_metrics().clone();
                         drop(ws);
                         // Publish a fresh criticality snapshot (off the leaf lock).
                         dag_state.recompute();
+
+                        // (#dag-criticality §6c) Surface the kill/keep ratio + confident-node
+                        // telemetry the ON default depends on (anti-dark-counter). Copy the
+                        // shared `DagState` tallies into the render-reachable gauges AND emit an
+                        // INFO log (the `SchedulerMetrics` tree is DARK on `/metrics` in prod).
+                        let confident_nodes = dag_state.snapshot().confident_nodes() as u64;
+                        let edge_count = dag_state.edge_count() as u64;
+                        let duration_count = dag_state.duration_count() as u64;
+                        let eviction_count = dag_state.eviction_count();
+                        let band_applied = dag_state.band_applied_count();
+                        let band_fallback = dag_state.band_fallback_count();
+                        let setter_skips = dag_state.setter_skip_count();
+                        metrics
+                            .dag_confident_nodes
+                            .store(confident_nodes, Ordering::Relaxed);
+                        metrics.dag_edge_count.store(edge_count, Ordering::Relaxed);
+                        metrics
+                            .dag_duration_count
+                            .store(duration_count, Ordering::Relaxed);
+                        metrics
+                            .dag_eviction_count
+                            .store(eviction_count, Ordering::Relaxed);
+                        metrics
+                            .dag_band_applied_total
+                            .store(band_applied, Ordering::Relaxed);
+                        metrics
+                            .dag_band_fallback_total
+                            .store(band_fallback, Ordering::Relaxed);
+                        metrics
+                            .dag_setter_skips_total
+                            .store(setter_skips, Ordering::Relaxed);
+                        info!(
+                            tag = "dag_recompute",
+                            confident_nodes,
+                            edge_count,
+                            duration_count,
+                            eviction_count,
+                            band_applied,
+                            band_fallback,
+                            setter_skips,
+                            "recomputed DAG criticality snapshot (kill/keep = band_applied vs band_fallback)"
+                        );
                         // Best-effort persist when configured.
                         if let Some(path) = persist_path.as_ref() {
                             let data = dag_state.persist_snapshot();

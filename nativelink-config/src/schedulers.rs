@@ -591,9 +591,14 @@ pub struct SimpleSpec {
     /// correctness-neutral (a non-confident/absent node degrades to today's FIFO),
     /// and inert unless a backlog exists. Default `true` (shipped ON per the
     /// anti-dark-counter rule; the flag is an operational KILL-SWITCH — set `false`
-    /// to disable without a redeploy). When off, the sort key is byte-identical to
-    /// the pre-feature `[priority | inverted_insert_ts]` and no edge/producer/
-    /// duration state is accumulated.
+    /// to disable without a redeploy). When off, the sort key is band-0 and its
+    /// ordering is ORDER-EQUIVALENT to the pre-feature `[priority | inverted_insert_ts]`
+    /// within a ~194-day insert window, and no edge/producer/duration state is
+    /// accumulated. NOTE: the kill-switch restores the pre-feature ORDER, not the
+    /// pre-feature BYTES — `new_with_criticality` unconditionally narrows the inverted
+    /// insert timestamp from 32 to 24 bits (band 0 folded into the freed high 8 bits),
+    /// so a band-0 key differs BYTE-wise from the old 32-bit-timestamp key while
+    /// sorting identically until the (inverted) seconds wrap past 2^24 (~194 days).
     #[serde(default = "default_true")]
     pub dag_critical_path_enabled: bool,
 

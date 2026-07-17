@@ -16,10 +16,11 @@
 //!
 //! Reconstructs a target-level build DAG from persisted history — stable-key edges
 //! inferred from the input↔output blob-digest linkage the server ALREADY resolves for
-//! P2P locality — derives a longest-path criticality score per node in the background,
-//! and publishes a quantized band per node so the scheduler can use it as a
-//! WITHIN-priority-band tie-break in the already-priority-sorted pending set. Advisory,
-//! correctness-neutral, flag-gated. See
+//! P2P locality — derives a criticality score per node in the background (the LONGEST PATH
+//! THROUGH the node: the node's own p50 duration plus the deepest downstream chain — NOT
+//! merely "what it unblocks", since a node's own weight counts too), and publishes a
+//! quantized band per node so the scheduler can use it as a WITHIN-priority-band tie-break
+//! in the already-priority-sorted pending set. Advisory, correctness-neutral, flag-gated. See
 //! `.claude/audits/scheduler-critical-path-dag-history-design-2026-07-16-v2.md`.
 //!
 //! # Node identity (v2 fix 8)
@@ -40,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lru::LruCache;
 use nativelink_error::{Code, Error, ResultExt, make_err};
@@ -91,11 +93,16 @@ pub const DAG_MIN_EDGE_OBS: u32 = 2;
 pub const DAG_UBIQUITOUS_FANIN_MAX: u32 = 256;
 
 /// (#dag-criticality) Milliseconds of longest-path criticality per quantization band.
-/// The raw longest-path value (summed wall durations along the deepest downstream chain,
-/// in ms) is divided by this and clamped into `[0, 255]` (8 bits, [`DAG_CRITICALITY_BITS`]).
-/// A sink (unblocks nothing → criticality 0) lands in band 0, identical to an
-/// absent/non-confident node — both fall back to FIFO. Monotone + deterministic; the
-/// exact step is a tuning detail (correctness needs only monotonicity + sink→0).
+/// The raw criticality of a node is the LONGEST PATH THROUGH the node — the summed wall
+/// durations along the deepest chain that starts AT the node (including the node's OWN
+/// p50 duration) and runs through its downstream successors. That value (ms) is divided
+/// by this and clamped into `[0, 255]` (8 bits, [`DAG_CRITICALITY_BITS`]). A sink is NOT
+/// criticality 0: `crit(sink) = weight(sink) + max(succ) = weight(sink)` (it has no
+/// successors), so a sink whose own p50 duration is `>= DAG_CRITICALITY_QUANT_MS` lands in
+/// band `>= 1` (see the `criticality_linear_chain_orders_by_downstream_work` test: a
+/// 1000ms sink → band 1). Only a node whose longest-path value is below one quant step
+/// (or an absent/non-confident node) reads band 0 → FIFO fallback. Monotone +
+/// deterministic; the exact step is a tuning detail (correctness needs only monotonicity).
 pub const DAG_CRITICALITY_QUANT_MS: u64 = 1000;
 
 /// (#dag-criticality, v2 fix 4) Bits of quantized criticality folded into the SECONDARY
@@ -357,7 +364,8 @@ impl CriticalitySnapshot {
 // ── the pure criticality computation (Tarjan SCC + reverse-topo longest path) ─
 
 /// Quantize a raw longest-path criticality value (ms) into a band `[0, DAG_MAX_BAND]`.
-/// Monotone non-decreasing; a sink (crit `0`) → band `0`.
+/// Monotone non-decreasing; a crit value of `0` → band `0` (NOTE: a sink is not crit 0 —
+/// its criticality is its own p50 duration; see [`DAG_CRITICALITY_QUANT_MS`]).
 #[inline]
 fn quantize_criticality(crit_ms: u64) -> u8 {
     let band = crit_ms / DAG_CRITICALITY_QUANT_MS;
@@ -539,6 +547,20 @@ pub struct DagState {
     producer_map: tokio::sync::Mutex<LruCache<DigestInfo, ProducerEntry>>,
     store: Mutex<EdgeStore>,
     snapshot: RwLock<Arc<CriticalitySnapshot>>,
+    // (#dag-criticality observability) The §6c kill/keep telemetry. Lock-free monotonic
+    // tallies read once per recompute interval (surfaced in the `dag_recompute` INFO log +
+    // copied into the render-reachable `SchedulerMetrics` gauges); the anti-dark-counter
+    // rule requires an ON feature to be OBSERVABLE. No cap needed (three u64 counters).
+    /// Enqueues that folded a CONFIDENT band > 0 into the sort key (the "keep" side of the
+    /// kill/keep ratio — a criticality tie-break was actually applied).
+    band_applied: AtomicU64,
+    /// Enqueues that fell back to band 0 (FIFO — absent / non-confident node, or no
+    /// published snapshot yet). The "kill" side of the ratio.
+    band_fallback: AtomicU64,
+    /// Times `set_dag_criticality` skipped its one-shot `try_lock` under contention (a
+    /// dark-risk: a skip would leave the db's `dag_state` None → the feature silently OFF).
+    /// Expected to stay 0; a non-zero value means the feature failed to wire and is dark.
+    setter_skips: AtomicU64,
 }
 
 impl DagState {
@@ -550,6 +572,9 @@ impl DagState {
             )),
             store: Mutex::new(EdgeStore::new()),
             snapshot: RwLock::new(Arc::new(CriticalitySnapshot::default())),
+            band_applied: AtomicU64::new(0),
+            band_fallback: AtomicU64::new(0),
+            setter_skips: AtomicU64::new(0),
         }
     }
 
@@ -731,6 +756,41 @@ impl DagState {
 
     pub fn eviction_count(&self) -> u64 {
         self.store.lock().evictions
+    }
+
+    // ── §6c kill/keep telemetry (observability; anti-dark-counter) ────────────
+
+    /// Record that an enqueue folded a confident band > 0 into the sort key ("keep").
+    #[inline]
+    pub fn note_band_applied(&self) {
+        self.band_applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an enqueue fell back to band 0 ("kill" / FIFO).
+    #[inline]
+    pub fn note_band_fallback(&self) {
+        self.band_fallback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that `set_dag_criticality` skipped its one-shot `try_lock` (dark-risk).
+    #[inline]
+    pub fn note_setter_skip(&self) {
+        self.setter_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative count of enqueues that applied a confident band > 0 (kill/keep "keep").
+    pub fn band_applied_count(&self) -> u64 {
+        self.band_applied.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of enqueues that fell back to band 0 (kill/keep "kill" / FIFO).
+    pub fn band_fallback_count(&self) -> u64 {
+        self.band_fallback.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of `set_dag_criticality` `try_lock` skips (should stay 0).
+    pub fn setter_skip_count(&self) -> u64 {
+        self.setter_skips.load(Ordering::Relaxed)
     }
 }
 

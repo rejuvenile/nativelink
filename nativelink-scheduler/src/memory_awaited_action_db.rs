@@ -36,7 +36,7 @@ use nativelink_util::metrics::{
 use nativelink_util::spawn;
 use nativelink_util::task::JoinHandleDropGuard;
 use tokio::sync::{Notify, mpsc, watch};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::awaited_action_db::{
     AwaitedAction, AwaitedActionDb, AwaitedActionSubscriber, CLIENT_KEEPALIVE_DURATION,
@@ -905,6 +905,19 @@ impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync> AwaitedActionDbI
         );
         let sort_key = awaited_action.sort_key();
 
+        // (#dag-criticality observability, §6c kill/keep ratio) Attribute this enqueue to
+        // the "keep" (a confident band > 0 was folded) or "kill"/FIFO (band 0 fallback)
+        // side WITHOUT re-deriving the node key — the band is already committed to the sort
+        // key. Only counts when the feature is on (`dag_state` present); the anti-dark-
+        // counter rule requires the ON default to surface whether the fold is doing anything.
+        if let Some(dag_state) = self.dag_state.as_ref() {
+            if sort_key.criticality_band() > 0 {
+                dag_state.note_band_applied();
+            } else {
+                dag_state.note_band_fallback();
+            }
+        }
+
         let (client_awaited_action, rx) =
             self.make_client_awaited_action(&operation_id.clone(), awaited_action);
 
@@ -1205,9 +1218,166 @@ impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync + 'static> Awaite
     fn set_dag_criticality(&self, dag_state: Option<Arc<DagState>>) {
         // One-shot wiring BEFORE the db serves — the `async_lock::Mutex` is uncontended so
         // `try_lock` succeeds. If somehow contended, skip (the feature simply stays band-0
-        // = FIFO — never a hang or a blocking `.await` in this sync setter).
+        // = FIFO — never a hang or a blocking `.await` in this sync setter). A skip is NOT
+        // swallowed silently (anti-dark-counter): it means the feature failed to wire and
+        // is DARK, so record it on the shared `DagState` (visible in the recompute telemetry
+        // + `SchedulerMetrics.dag_setter_skips_total`) AND warn.
         if let Some(mut inner) = self.inner.try_lock() {
             inner.dag_state = dag_state;
+        } else {
+            if let Some(dag_state) = dag_state.as_ref() {
+                dag_state.note_setter_skip();
+            }
+            warn!(
+                tag = "dag_set_criticality_skip",
+                "set_dag_criticality try_lock contended — DAG criticality wiring SKIPPED; the \
+                 feature stays band-0/FIFO (dark). This is not expected during one-shot wiring."
+            );
         }
+    }
+}
+
+/// (#dag-criticality §6c / T1) Counter-wiring test through the REAL `add_action` enqueue
+/// entry: with a confident DAG snapshot injected via `set_dag_criticality`, an enqueue whose
+/// OTel baggage key matches the confident node increments the kill/keep "keep"
+/// (`band_applied`) tally; an enqueue with no derivable key increments "kill"
+/// (`band_fallback`). This closes the anti-dark-counter gap the cadre flagged: the setter's
+/// `try_lock` skip and the enqueue fold were both un-instrumented.
+#[cfg(test)]
+mod dag_counter_tests {
+    use nativelink_macro::nativelink_test;
+    use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_to_baggage};
+    use opentelemetry::baggage::BaggageExt;
+    use opentelemetry::context::FutureExt as OtelFutureExt;
+    use opentelemetry::{Context, KeyValue};
+
+    use super::*;
+    use crate::resource_profile::ProfileKey;
+
+    const INSTANCE: &str = "main";
+    const TARGET: &str = "//pkg:lib";
+    const MNEMONIC: &str = "CppCompile";
+
+    fn dig(b: u8) -> DigestInfo {
+        DigestInfo::new([b; 32], u64::from(b) + 1)
+    }
+
+    fn action_info(digest_byte: u8) -> Arc<ActionInfo> {
+        Arc::new(ActionInfo {
+            command_digest: DigestInfo::new([0u8; 32], 0),
+            input_root_digest: DigestInfo::new([0u8; 32], 0),
+            timeout: Duration::MAX,
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: std::time::UNIX_EPOCH,
+            insert_timestamp: std::time::UNIX_EPOCH
+                .checked_add(Duration::from_secs(1_700_000_000))
+                .unwrap(),
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                instance_name: INSTANCE.to_string(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest: DigestInfo::new([digest_byte; 32], u64::from(digest_byte)),
+            }),
+        })
+    }
+
+    fn baggage_ctx(target: &str, mnemonic: &str) -> Context {
+        let md = RequestMetadata {
+            target_id: target.to_string(),
+            action_mnemonic: mnemonic.to_string(),
+            ..Default::default()
+        };
+        Context::current_with_baggage(vec![KeyValue::new(
+            BAZEL_METADATA_KEY,
+            request_metadata_to_baggage(&md),
+        )])
+    }
+
+    #[nativelink_test]
+    async fn add_action_counts_band_applied_vs_fallback() {
+        // Populate a confident node K = (INSTANCE, TARGET, MNEMONIC) the production way:
+        // duration weight + a mature (>= DAG_MIN_EDGE_OBS) K→consumer edge, then recompute.
+        let dag = Arc::new(DagState::new());
+        let k = ProfileKey::from_parts(INSTANCE, TARGET, MNEMONIC).expect("key");
+        let consumer = ProfileKey::from_parts(INSTANCE, "//pkg:consumer", MNEMONIC).expect("key");
+        dag.record_duration(k.clone(), 4000);
+        dag.record_duration(consumer.clone(), 1000);
+        dag.record_producer(dig(1), k.clone()).await;
+        dag.infer_edges(&consumer, &[dig(1)]).await;
+        dag.infer_edges(&consumer, &[dig(1)]).await;
+        dag.recompute();
+        assert!(
+            dag.snapshot().band(&k) > 0,
+            "test setup: K must be a confident band>0 node after recompute"
+        );
+
+        let db = MemoryAwaitedActionDb::new(
+            &EvictionPolicy::default(),
+            Arc::new(Notify::new()),
+            MockInstantWrapped::default,
+        );
+        db.set_dag_criticality(Some(dag.clone()));
+
+        // (keep) An enqueue whose baggage key matches K folds band>0 → band_applied++.
+        db.add_action(OperationId::default(), action_info(1), Duration::MAX)
+            .with_context(baggage_ctx(TARGET, MNEMONIC))
+            .await
+            .expect("add_action (matching baggage) must succeed");
+        assert_eq!(
+            dag.band_applied_count(),
+            1,
+            "an enqueue whose baggage key matches a confident node must count as band-applied \
+             (kill/keep 'keep'); got {}",
+            dag.band_applied_count()
+        );
+        assert_eq!(
+            dag.band_fallback_count(),
+            0,
+            "the matching enqueue must NOT count as fallback; got {}",
+            dag.band_fallback_count()
+        );
+
+        // (kill) An enqueue with NO baggage (no derivable key) → band 0 → band_fallback++.
+        // A distinct digest so it is a fresh add, not a subscribe-to-existing.
+        db.add_action(OperationId::default(), action_info(2), Duration::MAX)
+            .await
+            .expect("add_action (no baggage) must succeed");
+        assert_eq!(
+            dag.band_fallback_count(),
+            1,
+            "a keyless enqueue must count as band-fallback (kill/keep 'kill' / FIFO); got {}",
+            dag.band_fallback_count()
+        );
+        assert_eq!(
+            dag.band_applied_count(),
+            1,
+            "the keyless enqueue must NOT bump band_applied; got {}",
+            dag.band_applied_count()
+        );
+    }
+
+    #[nativelink_test]
+    async fn set_dag_criticality_skip_is_counted_not_swallowed() {
+        // Hold the db `inner` lock so the setter's one-shot `try_lock` FAILS; the skip must
+        // be recorded on the shared DagState (anti-dark-counter), not silently swallowed.
+        let db = MemoryAwaitedActionDb::new(
+            &EvictionPolicy::default(),
+            Arc::new(Notify::new()),
+            MockInstantWrapped::default,
+        );
+        let dag = Arc::new(DagState::new());
+        let _held = db.inner.lock().await; // force try_lock contention
+        db.set_dag_criticality(Some(dag.clone()));
+        assert_eq!(
+            dag.setter_skip_count(),
+            1,
+            "a contended set_dag_criticality try_lock must INCREMENT the skip counter (the \
+             feature would otherwise be silently dark); got {}",
+            dag.setter_skip_count()
+        );
     }
 }

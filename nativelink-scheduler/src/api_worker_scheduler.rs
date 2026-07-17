@@ -943,6 +943,54 @@ pub struct SchedulerMetrics {
         help = "(#task-resource-profile Phase-3) COARSE-tier subset of down_opportunity_samples (trusted coarse (instance,mnemonic) blend)"
     )]
     pub down_opportunity_coarse_samples: AtomicU64,
+
+    // ── (#dag-criticality §6c) kill/keep + confident-node telemetry ──
+    // The DAG feature ships ON under the anti-dark-counter rule ("ON + counters
+    // surface bugs"). These render-reachable copies of the shared `DagState`
+    // tallies make the fold OBSERVABLE. Copied once per recompute interval from
+    // the `DagState` atomics in the `simple_scheduler_dag_recompute` task (the
+    // enqueue/recompute paths are the live producers; these are the query seam).
+    // The same values are ALSO emitted in the `dag_recompute` INFO log because
+    // the `SchedulerMetrics` tree is DARK on `/metrics` in prod.
+    /// (#dag-criticality) Kill/keep "keep": cumulative enqueues that folded a
+    /// confident band > 0 into the sort key (a criticality tie-break was applied).
+    #[metric(
+        help = "(#dag-criticality §6c) cumulative enqueues that folded a confident criticality band > 0 into the sort key (kill/keep 'keep')"
+    )]
+    pub dag_band_applied_total: AtomicU64,
+    /// (#dag-criticality) Kill/keep "kill": cumulative enqueues that fell back to
+    /// band 0 (FIFO — absent / non-confident node, or no published snapshot yet).
+    #[metric(
+        help = "(#dag-criticality §6c) cumulative enqueues that fell back to band 0 / FIFO (kill/keep 'kill')"
+    )]
+    pub dag_band_fallback_total: AtomicU64,
+    /// (#dag-criticality) GAUGE: confident nodes in the most recently published
+    /// criticality snapshot (nodes with a mature edge + singleton SCC → a band).
+    #[metric(
+        help = "(#dag-criticality §6c) confident nodes in the last published criticality snapshot (gauge)"
+    )]
+    pub dag_confident_nodes: AtomicU64,
+    /// (#dag-criticality) GAUGE: resident stable-key edges in the bounded edge store.
+    #[metric(
+        help = "(#dag-criticality) resident stable-key edges in the bounded edge store (gauge)"
+    )]
+    pub dag_edge_count: AtomicU64,
+    /// (#dag-criticality) GAUGE: resident per-node duration histograms.
+    #[metric(
+        help = "(#dag-criticality) resident per-node duration histograms in the bounded duration store (gauge)"
+    )]
+    pub dag_duration_count: AtomicU64,
+    /// (#dag-criticality) COUNTER: cumulative edge-store LRU evictions.
+    #[metric(
+        help = "(#dag-criticality) cumulative edge-store LRU evictions (recency window turnover)"
+    )]
+    pub dag_eviction_count: AtomicU64,
+    /// (#dag-criticality) COUNTER: `set_dag_criticality` `try_lock` skips (dark-risk;
+    /// should stay 0 — a non-zero value means the feature failed to wire and is dark).
+    #[metric(
+        help = "(#dag-criticality §6c) set_dag_criticality try_lock skips; non-zero means the feature failed to wire and is dark"
+    )]
+    pub dag_setter_skips_total: AtomicU64,
 }
 
 impl SchedulerMetrics {
@@ -16466,6 +16514,18 @@ mod tests {
         scheduler.metrics.accuracy_predicted_covered_coarse.fetch_add(232, Ordering::Relaxed);
         scheduler.metrics.accuracy_predicted_under_fine.fetch_add(233, Ordering::Relaxed);
         scheduler.metrics.accuracy_predicted_under_coarse.fetch_add(234, Ordering::Relaxed);
+        // (#dag-criticality §6c) distinctive values on the seven DAG kill/keep +
+        // confident-node telemetry fields — the feature ships ON under the anti-dark-
+        // counter rule, so a DARK field here re-opens the exact blind spot the fix-up
+        // closes (working+zero-load indistinguishable from broken). Distinctive values
+        // double as a wrong-field/mis-route guard.
+        scheduler.metrics.dag_band_applied_total.fetch_add(241, Ordering::Relaxed);
+        scheduler.metrics.dag_band_fallback_total.fetch_add(242, Ordering::Relaxed);
+        scheduler.metrics.dag_confident_nodes.store(243, Ordering::Relaxed);
+        scheduler.metrics.dag_edge_count.store(244, Ordering::Relaxed);
+        scheduler.metrics.dag_duration_count.store(245, Ordering::Relaxed);
+        scheduler.metrics.dag_eviction_count.fetch_add(246, Ordering::Relaxed);
+        scheduler.metrics.dag_setter_skips_total.fetch_add(247, Ordering::Relaxed);
 
         // Register exactly as production does: upcast the scheduler
         // (RootMetricsComponent: MetricsComponent) to the erased trait
@@ -16680,6 +16740,39 @@ mod tests {
              (expected the registered worker id \"wmetric\") — group/field \
              routing into ApiWorkerSchedulerImpl.workers is wrong. body=\n{body}"
         );
+
+        // (#dag-criticality §6c) The seven DAG kill/keep + confident-node telemetry
+        // fields must render on /metrics with their set values. The feature ships ON
+        // under the anti-dark-counter rule ("ON + counters surface bugs"); a DARK
+        // field here defeats the fix-up (a criticality fold doing nothing would be
+        // invisible). Each literal name is pinned (a rename in the field or the
+        // #[metric] annotation red-fails here) and the distinctive value guards
+        // against a mis-routed group/field.
+        for (field, value) in [
+            ("dag_band_applied_total", 241u64),
+            ("dag_band_fallback_total", 242),
+            ("dag_confident_nodes", 243),
+            ("dag_edge_count", 244),
+            ("dag_duration_count", 245),
+            ("dag_eviction_count", 246),
+            ("dag_setter_skips_total", 247),
+        ] {
+            let leaf = format!("scheduler_metrics_{field}");
+            assert!(
+                body.contains(&leaf),
+                "#dag-criticality §6c: SchedulerMetrics.{field} dark on /metrics — the \
+                 ON-by-default DAG feature's kill/keep telemetry does not render, so a \
+                 criticality fold doing nothing is invisible (anti-dark-counter). body=\n{body}"
+            );
+            let line = format!(
+                "\nscheduler_testsched_worker_scheduler_metrics_{field} {value}\n"
+            );
+            assert!(
+                body.contains(&line),
+                "#dag-criticality §6c: {field} rendered the wrong value (expected {value}) — \
+                 group/field routing into the DAG telemetry is wrong. body=\n{body}"
+            );
+        }
     }
 
     /// (#mapgap) Render-test through the FULL `ApiWorkerScheduler`

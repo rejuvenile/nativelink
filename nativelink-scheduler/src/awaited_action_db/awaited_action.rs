@@ -99,8 +99,13 @@ pub struct AwaitedAction {
 
 impl AwaitedAction {
     pub fn new(operation_id: OperationId, action_info: Arc<ActionInfo>, now: SystemTime) -> Self {
-        // No DAG snapshot → criticality band 0 → the sort key is byte-identical to the
-        // pre-feature `[priority | inverted_insert_ts]` (flag-OFF path).
+        // No DAG snapshot → criticality band 0 → the sort key is ORDER-EQUIVALENT to the
+        // pre-feature `[priority | inverted_insert_ts]` within a ~194-day insert window
+        // (flag-OFF path). It is NOT byte-identical: `new_with_criticality` unconditionally
+        // narrows the inverted timestamp from 32 to 24 bits (the freed high 8 bits hold the
+        // band, which is 0 here), so a band-0 key differs BYTE-wise from the old key while
+        // sorting identically until the inverted seconds wrap past 2^24. The kill-switch
+        // restores the pre-feature ORDER, not the pre-feature BYTES.
         Self::new_with_criticality(operation_id, action_info, now, None)
     }
 
@@ -352,6 +357,15 @@ impl AwaitedActionSortKey {
     pub(crate) const fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// (#dag-criticality) The criticality band folded into this sort key — bits 24..32 of
+    /// the low 32-bit region (`[priority:32 | criticality:8 | inv_ts:24]`). `0` means the
+    /// FIFO-fallback band (absent / non-confident node, or an enqueue with no DAG snapshot).
+    /// Read at enqueue to attribute the kill/keep ratio (band>0-applied vs band-0-fallback)
+    /// WITHOUT re-deriving the node key — the band is already committed to the key.
+    pub(crate) const fn criticality_band(self) -> u8 {
+        ((self.0 >> 24) & 0xFF) as u8
+    }
 }
 
 // Ensure the size of the sort key is the same as a `u64`.
@@ -483,6 +497,144 @@ mod sort_key_tests {
         assert!(
             same_crit_early > same_crit_late,
             "equal-criticality peers tie-break by FIFO (earlier ts first)"
+        );
+    }
+}
+
+/// (#dag-criticality T1) End-to-end enqueue-fold test: an action whose OTel baggage
+/// `(instance, target, mnemonic)` key matches a CONFIDENT snapshot node must carry that
+/// node's band>0 in its `AwaitedActionSortKey`; a keyless (no-baggage) action stays band 0
+/// (FIFO). This is the THIRD key-derivation site (`new_with_criticality`) — the fold that
+/// the pre-fix cadre flagged as having ONLY a silent-FIFO failure mode with no test. It
+/// pins the baggage→ProfileKey→snapshot.band chain against the same-shaped key the DAG
+/// stores (built here via the production `compute_criticality` path).
+#[cfg(test)]
+mod dag_enqueue_tests {
+    use core::time::Duration;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use nativelink_macro::nativelink_test;
+    use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
+    use nativelink_util::action_messages::{ActionInfo, ActionUniqueKey, ActionUniqueQualifier};
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::origin_event::{BAZEL_METADATA_KEY, request_metadata_to_baggage};
+    use opentelemetry::{Context, KeyValue};
+
+    use super::*;
+    use crate::dag_criticality::{DAG_MIN_EDGE_OBS, DagNodeKey, compute_criticality};
+
+    const INSTANCE: &str = "main";
+    const TARGET: &str = "//pkg:lib";
+    const MNEMONIC: &str = "CppCompile";
+
+    fn action_info(instance: &str) -> Arc<ActionInfo> {
+        Arc::new(ActionInfo {
+            command_digest: DigestInfo::new([0u8; 32], 0),
+            input_root_digest: DigestInfo::new([0u8; 32], 0),
+            timeout: Duration::MAX,
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: UNIX_EPOCH,
+            insert_timestamp: UNIX_EPOCH
+                .checked_add(Duration::from_secs(1_700_000_000))
+                .unwrap(),
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                instance_name: instance.to_string(),
+                digest_function: DigestHasherFunc::Sha256,
+                digest: DigestInfo::new([1u8; 32], 1),
+            }),
+        })
+    }
+
+    fn key(instance: &str, target: &str, mnemonic: &str) -> DagNodeKey {
+        ProfileKey::from_parts(instance, target, mnemonic).expect("non-empty parts")
+    }
+
+    fn baggage_ctx(target: &str, mnemonic: &str) -> Context {
+        let md = RequestMetadata {
+            target_id: target.to_string(),
+            action_mnemonic: mnemonic.to_string(),
+            ..Default::default()
+        };
+        Context::current_with_baggage(vec![KeyValue::new(
+            BAZEL_METADATA_KEY,
+            request_metadata_to_baggage(&md),
+        )])
+    }
+
+    #[nativelink_test]
+    async fn dag_criticality_baggage_to_enqueue_band_applied() {
+        // Build a CONFIDENT snapshot the production way: the node K = (INSTANCE, TARGET,
+        // MNEMONIC) sits upstream of a sink over a MATURE edge (count == DAG_MIN_EDGE_OBS),
+        // so K is a singleton-SCC confident node with band = quantize(w(K) + w(sink)) > 0.
+        let k = key(INSTANCE, TARGET, MNEMONIC);
+        let sink = key(INSTANCE, "//pkg:bin", MNEMONIC);
+        let mut weights: HashMap<DagNodeKey, u32> = HashMap::new();
+        weights.insert(k.clone(), 4000);
+        weights.insert(sink.clone(), 1000);
+        let snap = compute_criticality(&[(k.clone(), sink.clone(), 2)], &weights, DAG_MIN_EDGE_OBS);
+        let expected_band = snap.band(&k);
+        assert!(
+            expected_band > 0,
+            "test setup: node K must be a confident band>0 node, got {expected_band}"
+        );
+
+        // (1) An action whose baggage carries K's target+mnemonic + whose instance == K's
+        // instance must fold K's band into the sort key.
+        let applied_band = {
+            let _guard = baggage_ctx(TARGET, MNEMONIC).attach();
+            AwaitedAction::new_with_criticality(
+                OperationId::default(),
+                action_info(INSTANCE),
+                SystemTime::now(),
+                Some(&snap),
+            )
+            .sort_key()
+            .criticality_band()
+        };
+        assert_eq!(
+            applied_band, expected_band,
+            "the baggage-derived key (instance,target,mnemonic) must match the confident \
+             snapshot node → its band {expected_band} folded into the sort key; got \
+             {applied_band}. A mismatch here is the 3-site key-derivation drift the cadre \
+             flagged (silent FIFO)."
+        );
+
+        // (2) A keyless action (no baggage at all → no derivable node key) stays band 0 →
+        // today's FIFO fallback.
+        let keyless_band = AwaitedAction::new_with_criticality(
+            OperationId::default(),
+            action_info(INSTANCE),
+            SystemTime::now(),
+            Some(&snap),
+        )
+        .sort_key()
+        .criticality_band();
+        assert_eq!(
+            keyless_band, 0,
+            "an action with no OTel baggage has no derivable node key → band 0 (FIFO); got \
+             {keyless_band}"
+        );
+
+        // (3) A baggage key that does NOT match any confident node (different target) also
+        // stays band 0 — the confidence gate, not a spurious fold.
+        let nonmatch_band = {
+            let _guard = baggage_ctx("//pkg:unknown", MNEMONIC).attach();
+            AwaitedAction::new_with_criticality(
+                OperationId::default(),
+                action_info(INSTANCE),
+                SystemTime::now(),
+                Some(&snap),
+            )
+            .sort_key()
+            .criticality_band()
+        };
+        assert_eq!(
+            nonmatch_band, 0,
+            "an action whose baggage key is absent from the snapshot must read band 0 \
+             (confidence gate → FIFO), not a spurious band; got {nonmatch_band}"
         );
     }
 }
