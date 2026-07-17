@@ -195,6 +195,25 @@ impl LogHistogram {
         }
         0
     }
+
+    /// (#task-resource-profile Phase-3 §12) The bucket counts as a plain `Vec<u32>`
+    /// for a persistence snapshot (fixed length [`HIST_BUCKETS`]).
+    fn buckets_vec(&self) -> Vec<u32> {
+        self.buckets.to_vec()
+    }
+
+    /// (#task-resource-profile Phase-3 §12) Reconstruct a sketch from a snapshot's
+    /// bucket vector. `None` when the length is not exactly [`HIST_BUCKETS`] (a corrupt
+    /// / version-mismatched entry) — the caller drops the entry and starts fresh for
+    /// that key, never panicking.
+    fn from_buckets_vec(v: &[u32]) -> Option<Self> {
+        if v.len() != HIST_BUCKETS {
+            return None;
+        }
+        let mut buckets = [0u32; HIST_BUCKETS];
+        buckets.copy_from_slice(v);
+        Some(Self { buckets })
+    }
 }
 
 /// One completed action's worker-reported resource usage, normalized for the
@@ -218,6 +237,17 @@ pub struct Agg {
     disk_bytes: LogHistogram,
     net_bytes: LogHistogram,
     sample_count: u64,
+    /// (#task-resource-profile Phase-3 §12 staleness) `true` iff this agg was
+    /// reconstructed from a persisted snapshot (vs folded live this run). A live key
+    /// (`false`) is always DOWN-trusted; a loaded key is DOWN-trusted for LOWERING only
+    /// after a FRESH sample folds ([`Self::fresh_since_load`]) AND the snapshot age is
+    /// within `resource_profile_persist_max_age_secs`. Default `false` (live).
+    loaded: bool,
+    /// (#task-resource-profile Phase-3 §12 staleness) `true` once a FRESH sample has
+    /// folded into this agg since load. Only meaningful when [`Self::loaded`] — a shifted
+    /// distribution's fresh samples raise variance (widening the DOWN margin) AND flip
+    /// this, so DOWN begins trusting the key for lowering. Default `false`.
+    fresh_since_load: bool,
 }
 
 impl Agg {
@@ -228,6 +258,22 @@ impl Agg {
         self.disk_bytes.record(sample.disk_bytes);
         self.net_bytes.record(sample.net_bytes);
         self.sample_count = self.sample_count.saturating_add(1);
+        // (#task-resource-profile Phase-3 §12) A fresh sample makes a loaded agg
+        // DOWN-trustworthy (harmless no-op flag for a live agg).
+        self.fresh_since_load = true;
+    }
+
+    /// (#task-resource-profile Phase-3 §12 staleness) Whether the DOWN-overcommit
+    /// direction may trust THIS agg for LOWERING a reservation, given the loaded
+    /// snapshot's age and the configured max age. A LIVE key (never loaded) is always
+    /// trusted; a LOADED key requires (a) the snapshot age `< max_age_secs` AND (b) a
+    /// fresh sample folded since load. RAISE + OBSERVE ignore this (stale ⇒ over-reserve
+    /// at worst, never OOM — only LOWERING carries stale-OOM risk).
+    fn down_lowering_trusted(&self, loaded_age_secs: Option<u64>, max_age_secs: u64) -> bool {
+        if !self.loaded {
+            return true;
+        }
+        self.fresh_since_load && loaded_age_secs.is_none_or(|age| age < max_age_secs)
     }
 
     #[inline]
@@ -283,6 +329,69 @@ impl Agg {
         }
         p95.saturating_mul(100) / p50
     }
+
+    /// (#task-resource-profile Phase-3 §12) Build a plain-data snapshot of this agg's
+    /// four dimension sketches + sample count for persistence. The staleness flags are
+    /// NOT persisted — they are a per-RUN property (a reloaded agg is `loaded=true,
+    /// fresh_since_load=false` by construction).
+    fn to_hist_dims(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
+        (
+            self.memory_kb.buckets_vec(),
+            self.cpu_ns.buckets_vec(),
+            self.disk_bytes.buckets_vec(),
+            self.net_bytes.buckets_vec(),
+            self.sample_count,
+        )
+    }
+
+    /// (#task-resource-profile Phase-3 §12) Reconstruct a LOADED agg from a snapshot's
+    /// dimension vectors. `None` when any histogram length is wrong OR the sample count
+    /// is implausible vs the folded bucket totals (a corrupt entry — dropped, never
+    /// panics). The reconstructed agg is marked `loaded` + not-yet-`fresh_since_load`.
+    fn from_hist_dims(
+        mem: &[u32],
+        cpu: &[u32],
+        disk: &[u32],
+        net: &[u32],
+        sample_count: u64,
+    ) -> Option<Self> {
+        let memory_kb = LogHistogram::from_buckets_vec(mem)?;
+        let cpu_ns = LogHistogram::from_buckets_vec(cpu)?;
+        let disk_bytes = LogHistogram::from_buckets_vec(disk)?;
+        let net_bytes = LogHistogram::from_buckets_vec(net)?;
+        // Validation: the memory sketch's bucket total must not EXCEED the sample count
+        // (saturating fold means it can be <= when counts saturated). A total that
+        // exceeds the declared count is a corrupt entry.
+        let mem_total: u64 = memory_kb.buckets.iter().map(|&c| u64::from(c)).sum();
+        if sample_count == 0 || mem_total > sample_count {
+            return None;
+        }
+        Some(Self {
+            memory_kb,
+            cpu_ns,
+            disk_bytes,
+            net_bytes,
+            sample_count,
+            loaded: true,
+            fresh_since_load: false,
+        })
+    }
+}
+
+/// (#task-resource-profile Phase-3 §12) Plain-data snapshot of one profile-map entry
+/// (key parts + the four dimension histograms + sample count) for persistence. Pure
+/// data — the persist layer maps this to/from the versioned wincode blob. The staleness
+/// flags are per-run and NOT part of the snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileEntrySnapshot {
+    pub instance_name: String,
+    pub target_id: String,
+    pub action_mnemonic: String,
+    pub memory_hist: Vec<u32>,
+    pub cpu_hist: Vec<u32>,
+    pub disk_hist: Vec<u32>,
+    pub net_hist: Vec<u32>,
+    pub sample_count: u64,
 }
 
 /// Coarse per-action identity for the resource profile map.
@@ -475,6 +584,11 @@ pub struct ProfileMap {
     min_samples: u64,
     /// High-variance threshold, memory p95/p50 ×100.
     high_variance_ratio_x100: u64,
+    /// (#task-resource-profile Phase-3 §12 staleness) Age (seconds) of the persisted
+    /// snapshot at the moment it was loaded, or `None` when this map was never loaded
+    /// (fresh start). The DOWN direction refuses to trust a LOADED key for lowering once
+    /// this exceeds `resource_profile_persist_max_age_secs`.
+    loaded_snapshot_age_secs: Option<u64>,
 }
 
 impl ProfileMap {
@@ -485,6 +599,7 @@ impl ProfileMap {
             high_variance_keys: 0,
             min_samples,
             high_variance_ratio_x100,
+            loaded_snapshot_age_secs: None,
         }
     }
 
@@ -677,6 +792,101 @@ impl ProfileMap {
     pub const fn high_variance_key_count(&self) -> usize {
         self.high_variance_keys
     }
+
+    /// (#task-resource-profile Phase-3 §12) Plain-data snapshot of EVERY resident entry
+    /// for persistence. `iter()` does NOT bump LRU recency (unlike `get`), so snapshotting
+    /// never perturbs eviction order. The caller CLONES this out from under the lock, then
+    /// serializes + writes off the lock (no I/O held across the map lock).
+    pub fn snapshot_entries(&self) -> Vec<ProfileEntrySnapshot> {
+        self.cache
+            .iter()
+            .map(|(key, agg)| {
+                let (memory_hist, cpu_hist, disk_hist, net_hist, sample_count) = agg.to_hist_dims();
+                ProfileEntrySnapshot {
+                    instance_name: key.instance_name.clone(),
+                    target_id: key.target_id.clone(),
+                    action_mnemonic: key.action_mnemonic.clone(),
+                    memory_hist,
+                    cpu_hist,
+                    disk_hist,
+                    net_hist,
+                    sample_count,
+                }
+            })
+            .collect()
+    }
+
+    /// (#task-resource-profile Phase-3 §12) Populate the map from a loaded snapshot BEFORE
+    /// the scheduler serves. `loaded_age_secs` is the snapshot's age at load (now −
+    /// snapshot wall-time), stamped so the DOWN direction can refuse a too-old snapshot.
+    /// Each entry is VALIDATED (valid key via the constructors, correct histogram lengths,
+    /// plausible sample count); an invalid entry is SKIPPED (never panics). Loaded aggs are
+    /// marked `loaded` (DOWN-untrusted for lowering until a fresh sample folds). Returns the
+    /// number of entries actually loaded. Existing high-variance keys are counted.
+    pub fn load_entries(&mut self, entries: Vec<ProfileEntrySnapshot>, loaded_age_secs: u64) -> usize {
+        self.loaded_snapshot_age_secs = Some(loaded_age_secs);
+        let mut loaded = 0usize;
+        for e in entries {
+            // Reconstruct the EXACT key (coarse = empty target marker) via the validating
+            // constructors — an invalid key (empty mnemonic, etc.) is skipped.
+            let key = if e.target_id.is_empty() {
+                ProfileKey::coarse(&e.instance_name, &e.action_mnemonic)
+            } else {
+                ProfileKey::from_parts(&e.instance_name, &e.target_id, &e.action_mnemonic)
+            };
+            let Some(key) = key else {
+                continue;
+            };
+            let Some(agg) = Agg::from_hist_dims(
+                &e.memory_hist,
+                &e.cpu_hist,
+                &e.disk_hist,
+                &e.net_hist,
+                e.sample_count,
+            ) else {
+                continue;
+            };
+            let high = self.is_high_variance(&agg);
+            // push returns Some((evicted_key, evicted_agg)) if the cache was at capacity.
+            if let Some((_ek, evicted)) = self.cache.push(key, agg) {
+                if self.is_high_variance(&evicted) {
+                    self.high_variance_keys = self.high_variance_keys.saturating_sub(1);
+                }
+            }
+            if high {
+                self.high_variance_keys += 1;
+            }
+            loaded += 1;
+        }
+        loaded
+    }
+
+    /// (#task-resource-profile Phase-3 §12 staleness) Whether the DOWN-overcommit
+    /// direction may trust the tier `lookup_tiered` would resolve to for LOWERING the
+    /// reservation. Determines the chosen tier (fine ≥K, else coarse ≥K, else `false` —
+    /// DOWN needs a trusted profile), then applies that agg's staleness gate against the
+    /// loaded-snapshot age + `max_age_secs`. A LIVE key (never loaded) always passes;
+    /// RAISE + OBSERVE never call this (stale ⇒ over-reserve, never OOM).
+    pub fn down_lowering_trusted(
+        &self,
+        fine: &ProfileKey,
+        coarse: &ProfileKey,
+        max_age_secs: u64,
+    ) -> bool {
+        let chosen = self
+            .cache
+            .peek(fine)
+            .filter(|agg| agg.sample_count() >= self.min_samples)
+            .or_else(|| {
+                self.cache
+                    .peek(coarse)
+                    .filter(|agg| agg.sample_count() >= self.min_samples)
+            });
+        match chosen {
+            Some(agg) => agg.down_lowering_trusted(self.loaded_snapshot_age_secs, max_age_secs),
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -774,10 +984,18 @@ mod tests {
     #[test]
     fn estimator_is_fixed_size_regardless_of_sample_count() {
         // A compact sketch's size does not grow with samples. Fold many; the
-        // struct is Copy-of-arrays-sized (no heap sample buffer).
-        assert_eq!(
-            size_of::<Agg>(),
-            4 * (HIST_BUCKETS * size_of::<u32>()) + size_of::<u64>()
+        // struct is Copy-of-arrays-sized (no heap sample buffer). The four fixed
+        // histograms + the u64 count dominate; the two Phase-3 §12 staleness bools
+        // (`loaded`, `fresh_since_load`) add only a fixed, alignment-padded byte or two
+        // — the invariant that matters is "no per-sample growth", so assert the size is
+        // the histograms + count + a small bounded fixed overhead (<= one u64 word).
+        let hist_and_count = 4 * (HIST_BUCKETS * size_of::<u32>()) + size_of::<u64>();
+        let sz = size_of::<Agg>();
+        assert!(
+            sz >= hist_and_count && sz <= hist_and_count + size_of::<u64>(),
+            "Agg must be histograms + count + a small fixed (bool flags) overhead with NO \
+             per-sample growth: got {sz}, expected in [{hist_and_count}, {}]",
+            hist_and_count + size_of::<u64>()
         );
     }
 
@@ -1223,5 +1441,117 @@ mod tests {
         // A short label is untouched (no accidental truncation of real labels).
         let short = ProfileKey::from_parts("main", "//foo:bar", "CppCompile").unwrap();
         assert_eq!(short.target_id, "//foo:bar");
+    }
+
+    // ── (#task-resource-profile Phase-3 §12) persistence snapshot + staleness ──
+
+    /// Round-trip: `snapshot_entries` → `load_entries` reconstructs a ≥K key WITHOUT
+    /// re-collecting samples — the whole point of persistence (no re-warm tax). The
+    /// loaded key's tail/p50/count match the source, and it is immediately Trusted.
+    ///
+    /// MUTATION: make `Agg::from_hist_dims` drop the sample_count (set 0) → the loaded
+    /// key falls below K → `lookup_tiered` no longer Trusted → this red-fails.
+    #[test]
+    fn snapshot_entries_and_load_round_trip_preserves_trusted_key() {
+        let mut src = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..3 {
+            src.record(fine.clone(), mem_sample(50_000)); // bucket16 → tail 2^16, p50 49152
+        }
+        let entries = src.snapshot_entries();
+        assert_eq!(entries.len(), 1, "one resident key must snapshot to one entry");
+
+        let mut dst = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let loaded = dst.load_entries(entries, 100);
+        assert_eq!(loaded, 1, "the snapshot entry must load back into the fresh map");
+        assert_eq!(
+            dst.lookup_tiered(&fine, &coarse),
+            TieredTail::Trusted {
+                tier: ProfileTier::Fine,
+                tail_kb: 1 << 16,
+                p50_kb: 49_152,
+                variance_ratio_x100: 100,
+                samples: 3,
+            },
+            "the loaded key must be immediately Trusted (>=K) with the SAME tail/p50/count \
+             — profiles survive restart with NO re-collection (the no-re-warm-tax goal)"
+        );
+    }
+
+    /// (§12 staleness) A LOADED key is NOT DOWN-trusted for lowering until (a) a FRESH
+    /// sample folds AND (b) the snapshot age is within `max_age`. A LIVE key is always
+    /// trusted.
+    ///
+    /// MUTATION: in `Agg::down_lowering_trusted`, return `true` unconditionally →
+    /// the "loaded, no fresh sample" assert red-fails (a stale profile would be trusted).
+    #[test]
+    fn loaded_key_down_untrusted_until_fresh_sample_and_within_max_age() {
+        let mut src = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..3 {
+            src.record(fine.clone(), mem_sample(50_000));
+        }
+        let entries = src.snapshot_entries();
+
+        let mut dst = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        dst.load_entries(entries, 100); // snapshot age 100s at load
+
+        assert!(
+            !dst.down_lowering_trusted(&fine, &coarse, 1000),
+            "a LOADED key with NO fresh sample must NOT be trusted for DOWN-lowering \
+             (stale distribution → over-reserve, never a stale-OOM)"
+        );
+
+        // Fold a fresh sample → now trusted (age 100 < max_age 1000).
+        dst.record(fine.clone(), mem_sample(50_000));
+        assert!(
+            dst.down_lowering_trusted(&fine, &coarse, 1000),
+            "after a FRESH sample folds AND age (100) < max_age (1000) the loaded key \
+             becomes DOWN-trusted for lowering"
+        );
+
+        // Age gate: even WITH a fresh sample, a snapshot older than max_age is refused.
+        assert!(
+            !dst.down_lowering_trusted(&fine, &coarse, 50),
+            "a snapshot age (100) >= max_age (50) must refuse DOWN-lowering even with a \
+             fresh sample — the age gate is the second staleness guard"
+        );
+    }
+
+    /// A LIVE key (never loaded) is always DOWN-trusted (no snapshot in play).
+    #[test]
+    fn live_key_is_always_down_trusted() {
+        let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        for _ in 0..3 {
+            map.record(fine.clone(), mem_sample(50_000));
+        }
+        assert!(
+            map.down_lowering_trusted(&fine, &coarse, 1),
+            "a live (never-loaded) key is always DOWN-trusted regardless of max_age — \
+             only LOADED keys carry stale-OOM risk"
+        );
+    }
+
+    /// A corrupt entry (wrong histogram length) is SKIPPED on load, never panics.
+    #[test]
+    fn load_entries_skips_corrupt_entry() {
+        let mut dst = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
+        let bad = ProfileEntrySnapshot {
+            instance_name: "main".to_string(),
+            target_id: "//a".to_string(),
+            action_mnemonic: "M".to_string(),
+            memory_hist: vec![0u32; 10], // WRONG length (not 64)
+            cpu_hist: vec![0u32; 64],
+            disk_hist: vec![0u32; 64],
+            net_hist: vec![0u32; 64],
+            sample_count: 5,
+        };
+        let loaded = dst.load_entries(vec![bad], 100);
+        assert_eq!(
+            loaded, 0,
+            "an entry with a wrong-length histogram must be SKIPPED (corrupt), not loaded \
+             and not a panic"
+        );
     }
 }

@@ -1335,7 +1335,8 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::resource_profile::{
-    PROFILE_MIN_SAMPLES, ProfileKey, ProfileMap, ProfileTier, ResourceSample, TieredTail,
+    PROFILE_MIN_SAMPLES, ProfileEntrySnapshot, ProfileKey, ProfileMap, ProfileTier, ResourceSample,
+    TieredTail,
 };
 use crate::simple_scheduler::{
     BatchSchedAction, BatchSchedGain, BatchSchedGateCfg, BatchSchedWorker, compute_batch_sched_gain,
@@ -2215,6 +2216,13 @@ struct ApiWorkerSchedulerImpl {
     /// bound (`SimpleSpec::phase3_overcommit_max_factor`, default 1.0 = DOWN inert).
     /// The DOWN reserve floors at `declared / max(1.0, this)`; also the DOWN kill-dial.
     phase3_overcommit_max_factor: f64,
+
+    /// (#task-resource-profile Phase-3 §12 staleness) Max loaded-snapshot age (seconds)
+    /// the DOWN direction trusts for LOWERING a reservation
+    /// (`SimpleSpec::resource_profile_persist_max_age_secs`, default 604800 = 7d). A
+    /// LOADED profile older than this is not trusted for lowering (over-reserve at worst,
+    /// never OOM); live keys are unaffected. Only consulted on the DOWN path.
+    phase3_persist_max_age_secs: u64,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -3187,6 +3195,19 @@ impl ApiWorkerSchedulerImpl {
             // floored at `declared / overcommit_max_factor`, so more actions pack per
             // worker. The physical backstop is the EXISTING worker `memory_gate` NAK
             // (re-queue on real pressure) — this design adds NO new backstop.
+            //
+            // §12 STALENESS: a profile LOADED from a persisted snapshot is NOT trusted
+            // for LOWERING until a FRESH sample has folded AND the snapshot age is within
+            // `phase3_persist_max_age_secs` (live keys always pass). A stale loaded key
+            // keeps its declared reservation (over-reserve, never a stale-OOM). Re-lock is
+            // cheap; the DOWN path is not hot.
+            if !resource_profile_map.lock().down_lowering_trusted(
+                &fine_key,
+                &coarse_key,
+                self.phase3_persist_max_age_secs,
+            ) {
+                return None;
+            }
             phase3_down_effective_kb(
                 declared_kb,
                 p50_kb,
@@ -5727,6 +5748,8 @@ impl ApiWorkerScheduler {
                 phase3_down_overcommit_enabled: false,
                 phase3_overcommit_max_factor:
                     nativelink_config::schedulers::default_phase3_overcommit_max_factor(),
+                phase3_persist_max_age_secs:
+                    nativelink_config::schedulers::default_resource_profile_persist_max_age_secs(),
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -5869,6 +5892,7 @@ impl ApiWorkerScheduler {
         raise_enabled: bool,
         down_overcommit_enabled: bool,
         overcommit_max_factor: f64,
+        persist_max_age_secs: u64,
     ) {
         let mut inner = self.inner.try_write().expect(
             "set_phase3_enforcement must be called during one-shot wiring, before any \
@@ -5877,6 +5901,7 @@ impl ApiWorkerScheduler {
         inner.phase3_raise_enabled = raise_enabled;
         inner.phase3_down_overcommit_enabled = down_overcommit_enabled;
         inner.phase3_overcommit_max_factor = overcommit_max_factor;
+        inner.phase3_persist_max_age_secs = persist_max_age_secs;
     }
 
     /// (#specprefetch-rebind Stage B/C v3) `T_wait_W`: the worker's expected time to
@@ -6256,6 +6281,28 @@ impl ApiWorkerScheduler {
         self.metrics
             .profile_high_variance_keys
             .store(coarse_outcome.high_variance_keys, Ordering::Relaxed);
+    }
+
+    /// (#task-resource-profile Phase-3 §12) Plain-data snapshot of the resource-profile
+    /// map for persistence. Locks the map ONLY to clone the resident entries out — NO
+    /// I/O and NO `.await` under the lock (the never-block-a-worker rule); the caller
+    /// serializes + writes the returned owned `Vec` off the lock.
+    pub fn resource_profile_snapshot_entries(&self) -> Vec<ProfileEntrySnapshot> {
+        self.resource_profile_map.lock().snapshot_entries()
+    }
+
+    /// (#task-resource-profile Phase-3 §12) Populate the resource-profile map from a
+    /// loaded snapshot BEFORE the scheduler serves. `loaded_age_secs` is the snapshot's
+    /// age (now − snapshot wall-time) at load, stamped for the DOWN staleness gate.
+    /// Returns the number of entries actually loaded (invalid entries are skipped).
+    pub fn resource_profile_load_entries(
+        &self,
+        entries: Vec<ProfileEntrySnapshot>,
+        loaded_age_secs: u64,
+    ) -> usize {
+        self.resource_profile_map
+            .lock()
+            .load_entries(entries, loaded_age_secs)
     }
 
     /// (#task-resource-profile Phase-2b) OBSERVE-ONLY inject counterfactual. Called
@@ -17545,7 +17592,7 @@ mod b1_lock_decouple_tests {
     async fn raise_reserves_the_tail_via_store_once_ledger() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0); // RAISE on
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800); // RAISE on
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
 
         // Trusted (≥K) profile: 50_000 KiB → bucket 16 → tail 2^16 = 65_536 ≫ declared 4096.
@@ -17585,7 +17632,7 @@ mod b1_lock_decouple_tests {
     async fn raise_reduce_restore_symmetric_under_midaction_map_mutation() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0);
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800);
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
 
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
@@ -17651,7 +17698,7 @@ mod b1_lock_decouple_tests {
     async fn raise_clamps_to_max_worker_total_not_strand() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0);
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800);
         // Worker total RAM 8_000_000; advertises 8_000_000 remaining.
         let _rx_w =
             add_worker_with_memory_and_total(&scheduler, "W", 8_000_000.0, 8_000_000).await;
@@ -17755,7 +17802,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_floor_respected_at_max_factor() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 2.0); // DOWN on, factor 2.0
+        scheduler.set_phase3_enforcement(false, true, 2.0, 604_800); // DOWN on, factor 2.0
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         // Over-declared key: 500 KiB samples → bucket 9 → p50 rep 384, tail 512 <=
@@ -17791,7 +17838,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_lowers_reservation_below_declared() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 4.0);
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800);
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         // 50_000 KiB → bucket 16 rep 49_152 (p50), tail 65_536 <= declared 100_000.
@@ -17821,7 +17868,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_inert_at_factor_one() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 1.0); // enabled but factor 1.0
+        scheduler.set_phase3_enforcement(false, true, 1.0, 604_800); // enabled but factor 1.0
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {

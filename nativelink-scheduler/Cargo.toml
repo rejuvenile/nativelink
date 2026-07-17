@@ -54,6 +54,12 @@ uuid = { version = "1.16.0", default-features = false, features = [
   "serde",
   "v4",
 ] }
+# (#task-resource-profile Phase-3 §12) Versioned snapshot (de)serialization for the
+# persisted resource-profile map — the SAME serializer used by nativelink-store.
+wincode = { version = "0.5.4", default-features = false, features = [
+  "alloc",
+  "derive",
+] }
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }

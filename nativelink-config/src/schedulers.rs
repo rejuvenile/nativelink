@@ -533,6 +533,43 @@ pub struct SimpleSpec {
     /// declaration, not from this doc-comment. The literal there is the ship default.
     #[serde(default = "default_phase3_overcommit_max_factor")]
     pub phase3_overcommit_max_factor: f64,
+
+    /// (#task-resource-profile Phase-3 §12) Filesystem path for persisting the
+    /// resource-profile map (per-key sample-count histograms) across server restarts,
+    /// so learned profiles survive a bounce without a re-warm tax. `None` (the default)
+    /// = persistence OFF (the map starts empty and re-accumulates each boot). The data
+    /// is ADVISORY and re-accumulates, so durability is NOT required: writes are atomic
+    /// (tmp + rename) but NEVER fsync'd (ZFS `sync=disabled`; the no-fsync hard rule).
+    ///
+    /// The snapshot is a versioned wincode blob; a missing / corrupt / version-mismatch
+    /// file logs a `warn` and starts FRESH — it NEVER panics or crashes startup.
+    #[serde(default)]
+    pub resource_profile_persist_path: Option<String>,
+
+    /// (#task-resource-profile Phase-3 §12) Seconds between background snapshots of the
+    /// resource-profile map when `resource_profile_persist_path` is set. Default 300
+    /// (5 min). The snapshot CLONES the map under the `parking_lot` lock, RELEASES the
+    /// lock, THEN serializes + writes off the lock — no I/O or `.await` is ever held
+    /// across the map lock (the never-block-a-worker rule). A best-effort flush also
+    /// fires on graceful shutdown.
+    #[serde(
+        default = "default_resource_profile_persist_interval_secs",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub resource_profile_persist_interval_secs: u64,
+
+    /// (#task-resource-profile Phase-3 §12 staleness) Maximum age (seconds) of a LOADED
+    /// snapshot for which the DOWN-overcommit direction will trust a loaded profile for
+    /// LOWERING a reservation. Default 604800 (7 days). OBSERVE + RAISE use loaded
+    /// profiles freely (stale ⇒ over-reserve at worst, never OOM); DOWN additionally
+    /// requires (a) the snapshot age < this AND (b) >=1 FRESH sample folded since load —
+    /// so a shifted distribution raises variance and widens the DOWN margin
+    /// automatically. Scopes the OOM risk of stale data to the lowering direction.
+    #[serde(
+        default = "default_resource_profile_persist_max_age_secs",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub resource_profile_persist_max_age_secs: u64,
 }
 
 /// Manual `Default` that mirrors the serde defaults EXACTLY.
@@ -627,8 +664,31 @@ impl Default for SimpleSpec {
             // DOWN inert (floor == declared). NOT the f64 type default (0.0), which
             // would make the floor `declared/0` = +inf and invert the clamp.
             phase3_overcommit_max_factor: default_phase3_overcommit_max_factor(),
+            // #[serde(default)] → Option default (None) = profile persistence OFF.
+            resource_profile_persist_path: None,
+            // #[serde(default = "...")] → 300s.
+            resource_profile_persist_interval_secs:
+                default_resource_profile_persist_interval_secs(),
+            // #[serde(default = "...")] → 604800s (7d).
+            resource_profile_persist_max_age_secs:
+                default_resource_profile_persist_max_age_secs(),
         }
     }
+}
+
+/// (#task-resource-profile Phase-3 §12) Default background-snapshot interval (300s =
+/// 5 min). MUST be a named default fn (a bare `#[serde(default)]` u64 0 would spin the
+/// snapshot task with no delay). `pub` for the single-source-of-truth reason. Numeric-
+/// constant rule: this literal is authoritative.
+pub const fn default_resource_profile_persist_interval_secs() -> u64 {
+    300
+}
+
+/// (#task-resource-profile Phase-3 §12) Default max loaded-snapshot age the DOWN
+/// direction will trust for lowering (604800s = 7 days). `pub` single-source-of-truth.
+/// Numeric-constant rule: this literal is authoritative.
+pub const fn default_resource_profile_persist_max_age_secs() -> u64 {
+    604_800
 }
 
 /// (#task-resource-profile Phase-3 §6) Default profile-independent overcommit

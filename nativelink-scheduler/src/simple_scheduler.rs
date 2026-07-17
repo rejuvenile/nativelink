@@ -15,7 +15,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::{Future, StreamExt, future};
@@ -58,6 +58,7 @@ use crate::api_worker_scheduler::{
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
 use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::platform_property_manager::PlatformPropertyManager;
+use crate::resource_profile_persist;
 use crate::simple_scheduler_state_manager::SimpleSchedulerStateManager;
 use crate::worker::{ActionInfoWithProps, Worker, WorkerTimestamp};
 use crate::worker_registry::WorkerRegistry;
@@ -1524,6 +1525,15 @@ pub struct SimpleScheduler {
     /// per-worker gossip `Relaxed`; changes NO scheduling decision.
     task_hold_counters_log_spawn: JoinHandleDropGuard<()>,
 
+    /// (#task-resource-profile Phase-3 §12) Background task that periodically snapshots
+    /// the resource-profile map to `resource_profile_persist_path` (interval
+    /// `resource_profile_persist_interval_secs`). `None` when persistence is OFF (no
+    /// path configured). Holds a `Weak<ApiWorkerScheduler>` so it exits when the
+    /// scheduler drops; dropping this guard cancels it. The snapshot clones the map
+    /// under the `parking_lot` lock then serializes + writes OFF the lock (no lock/await
+    /// overlap); writes are atomic (tmp + rename) and NEVER fsync'd (advisory data).
+    task_resource_profile_persist_spawn: Option<JoinHandleDropGuard<()>>,
+
     /// Every duration, do logging of worker matching
     /// e.g. "worker busy", "can't find any worker"
     /// Set to None to disable. This is quite noisy, so we limit it
@@ -2678,7 +2688,55 @@ impl SimpleScheduler {
             spec.phase3_raise_enabled,
             spec.phase3_down_overcommit_enabled,
             spec.phase3_overcommit_max_factor,
+            spec.resource_profile_persist_max_age_secs,
         );
+
+        // (#task-resource-profile Phase-3 §12) Load the persisted resource-profile map
+        // BEFORE the scheduler serves any action (this runs in the sync constructor,
+        // before the returned scheduler is wired to accept work). A one-time bounded
+        // startup read (std::fs) — NOT a hot/serving path, so it is not the
+        // never-block-a-worker case. A missing / corrupt / version-mismatched file logs
+        // a `warn` and starts FRESH (never panics). Loaded aggs are stamped with the
+        // snapshot AGE so the DOWN direction can refuse a too-old snapshot (§12 staleness).
+        if let Some(path) = spec.resource_profile_persist_path.as_deref() {
+            match std::fs::read(path) {
+                Ok(bytes) => match resource_profile_persist::deserialize_snapshot(&bytes) {
+                    Ok((snapshot_unix_secs, entries)) => {
+                        let now_unix = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let age_secs = now_unix.saturating_sub(snapshot_unix_secs);
+                        let n = worker_scheduler.resource_profile_load_entries(entries, age_secs);
+                        info!(
+                            tag = "resource_profile_persist_load",
+                            path,
+                            loaded_entries = n,
+                            snapshot_age_secs = age_secs,
+                            "loaded persisted resource-profile snapshot"
+                        );
+                    }
+                    Err(err) => warn!(
+                        tag = "resource_profile_persist_load",
+                        path,
+                        %err,
+                        "resource-profile snapshot corrupt / version-mismatch — starting fresh"
+                    ),
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    info!(
+                        tag = "resource_profile_persist_load",
+                        path, "no prior resource-profile snapshot — starting fresh"
+                    );
+                }
+                Err(err) => warn!(
+                    tag = "resource_profile_persist_load",
+                    path,
+                    %err,
+                    "resource-profile snapshot unreadable — starting fresh"
+                ),
+            }
+        }
 
         let worker_scheduler_clone = worker_scheduler.clone();
 
@@ -3016,6 +3074,73 @@ impl SimpleScheduler {
                     // Unreachable.
                 });
 
+            // (#task-resource-profile Phase-3 §12) Background snapshot task — periodic
+            // persist of the resource-profile map. Spawned ONLY when a path is
+            // configured. Holds a `Weak<ApiWorkerScheduler>` (exits on scheduler drop).
+            // Each tick: snapshot (clone under the map lock, release), then serialize +
+            // atomically write (tmp + rename) OFF the lock via `tokio::fs` — NO fsync,
+            // NO lock held across `.await`. A failed write is logged, not fatal.
+            let task_resource_profile_persist_spawn = spec
+                .resource_profile_persist_path
+                .as_ref()
+                .map(|persist_path| {
+                    let persist_path = std::path::PathBuf::from(persist_path);
+                    let interval_secs = spec.resource_profile_persist_interval_secs.max(1);
+                    let weak_ws = Arc::downgrade(&worker_scheduler);
+                    spawn!("simple_scheduler_resource_profile_persist", async move {
+                        let mut interval =
+                            tokio::time::interval(Duration::from_secs(interval_secs));
+                        interval.tick().await; // skip the immediate first tick (empty map)
+                        loop {
+                            interval.tick().await;
+                            let Some(ws) = weak_ws.upgrade() else {
+                                return; // scheduler dropped
+                            };
+                            // Clone the resident entries out from under the map lock, then
+                            // DROP the Arc before any await (do not hold it across I/O).
+                            let entries = ws.resource_profile_snapshot_entries();
+                            drop(ws);
+                            if entries.is_empty() {
+                                continue;
+                            }
+                            let now_unix = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let count = entries.len();
+                            match resource_profile_persist::serialize_snapshot(entries, now_unix) {
+                                Ok(bytes) => {
+                                    if let Err(err) = resource_profile_persist::write_snapshot_bytes(
+                                        &persist_path,
+                                        &bytes,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            tag = "resource_profile_persist_write",
+                                            path = %persist_path.display(),
+                                            %err,
+                                            "resource-profile snapshot write failed (advisory; will retry next interval)"
+                                        );
+                                    } else {
+                                        debug!(
+                                            tag = "resource_profile_persist_write",
+                                            path = %persist_path.display(),
+                                            entries = count,
+                                            "persisted resource-profile snapshot"
+                                        );
+                                    }
+                                }
+                                Err(err) => warn!(
+                                    tag = "resource_profile_persist_write",
+                                    %err,
+                                    "resource-profile snapshot serialize failed"
+                                ),
+                            }
+                        }
+                    })
+                });
+
             let worker_match_logging_interval = match spec.worker_match_logging_interval_s {
                 // -1 or 0 means disabled (0 used to cause expensive logging on every call)
                 -1 | 0 => None,
@@ -3039,6 +3164,7 @@ impl SimpleScheduler {
                 maybe_origin_event_tx,
                 task_worker_matching_spawn,
                 task_hold_counters_log_spawn,
+                task_resource_profile_persist_spawn,
                 worker_match_logging_interval,
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
                 batch_affinity_metrics: BatchAffinityMetrics::default(),

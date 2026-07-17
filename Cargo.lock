@@ -3636,6 +3636,7 @@ dependencies = [
  "tracing",
  "tracing-test",
  "uuid",
+ "wincode",
 ]
 
 [[package]]

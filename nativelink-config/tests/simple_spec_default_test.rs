@@ -171,6 +171,20 @@ fn simple_spec_default_matches_deserialize_empty() {
          (default_phase3_overcommit_max_factor = DOWN inert); a bare #[serde(default)] \
          would yield 0.0 → floor declared/0 = +inf and break the clamp"
     );
+    assert_eq!(
+        derived.resource_profile_persist_path, deserialized.resource_profile_persist_path,
+        "resource_profile_persist_path default drift (both should be None = persistence OFF)"
+    );
+    assert_eq!(
+        derived.resource_profile_persist_interval_secs,
+        deserialized.resource_profile_persist_interval_secs,
+        "resource_profile_persist_interval_secs default drift (serde default 300)"
+    );
+    assert_eq!(
+        derived.resource_profile_persist_max_age_secs,
+        deserialized.resource_profile_persist_max_age_secs,
+        "resource_profile_persist_max_age_secs default drift (serde default 604800)"
+    );
 }
 
 /// Direct assertions on the concrete default values, so the intent is legible
@@ -262,5 +276,21 @@ fn simple_spec_default_concrete_values() {
         "phase3_overcommit_max_factor default must be 1.0 \
          (default_phase3_overcommit_max_factor) — floor == declared → DOWN inert even \
          if enabled; NOT the f64 type default 0.0, which would make the floor +inf"
+    );
+    assert!(
+        spec.resource_profile_persist_path.is_none(),
+        "resource_profile_persist_path default must be None — profile persistence is OFF \
+         until an operator sets a path"
+    );
+    assert_eq!(
+        spec.resource_profile_persist_interval_secs, 300,
+        "resource_profile_persist_interval_secs default must be 300 \
+         (default_resource_profile_persist_interval_secs); a bare #[serde(default)] u64 0 \
+         would spin the snapshot task"
+    );
+    assert_eq!(
+        spec.resource_profile_persist_max_age_secs, 604_800,
+        "resource_profile_persist_max_age_secs default must be 604800 = 7d \
+         (default_resource_profile_persist_max_age_secs)"
     );
 }
