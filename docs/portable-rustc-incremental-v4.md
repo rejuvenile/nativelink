@@ -1,12 +1,14 @@
 # Portable rustc incremental via byte-identical execroot — DESIGN v4 (FL-1383)
 
-**Status:** implementation-ready. **Architectural / wiped-dir sign-off GRANTED** by the v3 distsys review
-(`.claude/reviews/design-portable-rustc-incremental-v3/`). v4 addresses the v3 FIXES-REQUIRED bundle (5/5 cadre).
-Supersedes v1–v3. **Date:** 2026-07-17. Tracking bug: **FL-1383.**
+**Status:** implementation-ready — **ALL PRE-CODE GATES CLEARED 2026-07-17.** **Architectural / wiped-dir sign-off
+GRANTED** by the v3 distsys review (`.claude/reviews/design-portable-rustc-incremental-v3/`). v4 addresses the v3
+FIXES-REQUIRED bundle (5/5 cadre). Supersedes v1–v3. **Date:** 2026-07-17. Tracking bug: **FL-1383.**
 
-Two pre-CODE gates remain (neither reopens the architecture): (i) the publish-authority **network precondition**
-(§6.6); (ii) a two-machine remote-`.rlib`-cache experiment that can only *simplify* §6.3 (default is already the
-safe branch).
+Both pre-CODE gates are now resolved (neither reopened the architecture): (i) §6.6 publish-authority CLEARED by the
+operator's trusted-worker decision; (ii) §6.5 CAS-content-pin sizing CLEARED by a proof that holds at full-fleet-widen
+scale, with a disjoint seed pin-class as the mechanism. The two-machine experiment (§14-3) already confirmed §6.3
+out-of-band is required. **Stage 1 (rules_rust seed-fetch action + the `incr_seed_index` store, behind a flag, one
+apple-a14 crate) can begin.**
 
 ## 1. Goal
 Portable rustc **incremental** reuse under Bazel `--spawn_strategy=dynamic`: a fleet-shared `-incr` seed
@@ -85,7 +87,28 @@ On-disk seed persistence as the AUTHORITY is forbidden (store is authoritative; 
 (the floor). **Adversarially-forged** self-consistent seed → out-of-scope BY the trusted-ACTION assumption, NOT
 caught by rustc — see §6.6.
 
-### 6.5 CAS-content durability (NEW — FL-688 class, red-team's strongest)
+### 6.5 CAS-content durability — GATE RESOLVED 2026-07-17 (sizing proof HOLDS; mechanism = disjoint seed pin-class)
+Investigation (`.claude/reviews/design-portable-rustc-incremental-v3/gate65-content-pin-sizing.md`):
+- **Pinning is ADDITIVE to `max_bytes`, not carved from it** (verified: `moka_evicting_map.rs:1668-1692` inserts into
+  a separate `pinned` DashMap + invalidates the moka entry; `weighted_size` excludes pinned). So worker physical =
+  working_set (≤40 GB) + pinned (≤20 GiB pin_cap). Cap is **20 GiB** (FL-681 50%, not the stale 10 GB).
+- **Measured:** `-incr` seeds ~200 MB avg / 400 MB tail (large crates; medium crates <20 MB → never seeded). Current
+  FL-688 pin high-water 64 MB / 215 pins (~300× under cap).
+- **SIZING PROOF HOLDS** at one-crate (0.46 GB) AND full-CI-widen worst-case (27×400 MB = 10.9 GB) ≤ 20 GiB pin budget
+  (≥9 GiB headroom); physical: all carve-outs saturated ~135 GB ≤ 228 GiB (~90 GiB headroom). No bigger disk / no
+  max-targetkey cap needed. Binding constraint = CO-TENANCY (worst-case widen = 54% of the shared 20 GiB pin budget →
+  would halve FL-688 durability headroom) → must be ISOLATED.
+- **MECHANISM: a DISJOINT `seed_pinned_bytes`/`seed_pin_cap` pin-class (static carve-out, e.g. 4 GiB), EXCLUDED from the
+  FL-688 indefinite admission check** — mirrors the in-tree `speculative_pinned_bytes`/`speculative_pin_cap` precedent
+  (`moka_evicting_map.rs:247-262`). NOT folded into the FL-688 pool (mutual starvation), NOT a new store. Indefinite
+  lifetime, released on index overwrite (§6.2), over-cap = backpressure-refuse → the crate's seed stays LRU-evictable
+  → cold-but-correct. Composition: CAS moka 40 + 20-pin{seed 4 ⊕ FL-688 ≤14 ⊕ spec 2} + DirCache 40+10 + root 13 =
+  113 GB ≤ 228 GiB — no unified authority needed.
+- **CAVEAT (add to design):** the worker pin guarantees durability only if the §6.3 out-of-band fetch is PEER-ROUTED to
+  the pinning producer (via the §10 residency affinity hook); a fetch that falls through to the server CAS (/srv/bulk, its
+  own eviction) can be cold. So §6.5 durability depends on §10 routing, not just the pin existing.
+
+The v3 framing below is retained; the reservation is the disjoint seed pin-class above.
 The `-incr` content is LARGE (asan/tsan), churned every build, single-use from LRU's view → the ideal CAS eviction
 victim under exactly the sustained load where reuse matters; the index would then point at an evicted digest → cold
 (the FL-688 incident class). **The publish MUST pin/retain the `-incr` content the index authority references** — a
@@ -94,7 +117,12 @@ when the index overwrites), NOT relying on the general CAS LRU. Sized against th
 `(pin_high_water + incr_content_reservation + working_set) ≤ physical`. Without this, reuse is best-effort-until-
 evicted — state which if the pin is deferred.
 
-### 6.6 Publish authority — GATE RESOLVED 2026-07-17: PRECONDITION FALSE → BLOCK (operator decision)
+### 6.6 Publish authority — GATE CLEARED 2026-07-17 (operator: workers implicitly trusted)
+**OPERATOR DECISION (2026-07-17): workers are IMPLICITLY TRUSTED → the trusted-ACTION assumption holds (an action on
+a trusted worker is trusted). The derivable-key index poisoning surface is ACCEPTED — it is no worse than the
+already-writable AC/CAS the same actions can already write under the same trust model. §6.6 gate CLEARED; NO
+action-isolation infra required. Documented as the trusted-action assumption (security F5).** The investigation
+below is retained for the record; its "net-new action-isolation infra" is NOT pursued.
 Investigation (`.claude/reviews/design-portable-rustc-incremental-v3/gate66-publish-authority.md`): the precondition
 does NOT hold on the live fleet, and the naive control is insufficient. Evidence:
 - AC is on 3 mTLS listeners (`:50051` public, `:50071` worker_cas, `:50072` quic), ALL writable (no `read_only`);
@@ -178,9 +206,15 @@ FIXED_PREFIX per-machine on the execroot volume + §12 asserts + the §6.6 egres
 apple-a14 crate under dynamic; measure the three-state + store + pin counters. (6) widen — WATCH `seed_present_but_
 cold` for the multi-version-LWW + content-eviction floors that only surface at fleet scale (§6.2/§6.5).
 
-## 14. Pre-code gates (architecture already signed off)
-1. §6.6 publish-authority: confirm actions have no egress to the CAS/AC port (else add worker-only-writable control).
-2. §6.5 CAS-content-pin sizing proof vs the FL-688 pin budget.
+## 14. Pre-code gates (architecture already signed off) — ALL CLEARED 2026-07-17
+1. ~~§6.6 publish-authority~~ **CLEARED 2026-07-17 (operator: workers implicitly trusted → trusted-action assumption
+   holds; the derivable-key index poisoning surface is ACCEPTED, no worse than the already-writable AC/CAS; NO
+   action-isolation infra required).**
+2. ~~§6.5 CAS-content-pin sizing proof~~ **CLEARED 2026-07-17: proof HOLDS at one-crate AND full-CI-widen worst-case
+   (10.9 GB ≤ 20 GiB pin budget; ~135 GB ≤ 228 GiB physical). Mechanism = a DISJOINT `seed_pin_class` (4 GiB
+   carve-out, excluded from the FL-688 admission check, mirroring `speculative_pin`). See
+   `.claude/reviews/design-portable-rustc-incremental-v3/gate65-content-pin-sizing.md`. Durability depends on §10
+   peer-routing (caveat in §6.5).**
 3. ~~Two-machine remote-`.rlib`-cache experiment~~ **DONE 2026-07-17: CONFIRMED the Bazel-declared seed churns the
    remote key (`df7bff88`≠`ff08968c`, seed-content sole cause) → §6.3 out-of-band is REQUIRED, not optional
    (regression scoped to >20 MB-incr crates = the target set).**
