@@ -1,7 +1,15 @@
 # Portable rustc incremental via byte-identical execroot (dynamic-execution)
 
-**Status:** DRAFT for Tier-3 design cadre. **Date:** 2026-07-17.
-**Scope:** two tracks — Bazel/rules_rust (local dynamic branch) + NativeLink (remote worker).
+**Status:** DRAFT v1 — Tier-3 cadre 5/5 returned **FIXES-REQUIRED / NOT SIGNED OFF** (2026-07-17). See
+`.claude/reviews/design-portable-rustc-incremental/DECISION.md`. **A v2 is required before implementation**,
+gated on TWO blocking experiments the single-machine §11 test did NOT cover: (1) **cross-machine** seed
+transfer (mac A → different-model mac B — rustc also keys on sysroot abs path + compiler build-hash +
+target-cpu; divergence collapses the design); (2) **macOS/APFS** getcwd-after-firmlink + cross-volume `link()`
+(EXDEV). Headline must-fixes: **§6/§7 chdir to DIFFERENT strings (`<PREFIX>/<tk>` vs `.../work`) → the
+non-producing branch goes cold**; **`-incr` must be a HIDDEN CAS side-input that does NOT enter the `.rlib`
+action key (NOT "drop no-remote")**. Treat the v1 remote-track path derivation, §6.2 seed mechanism, and §6/§7
+cwd symmetry as SUPERSEDED-PENDING-v2.
+**Date:** 2026-07-17. **Scope:** two tracks — Bazel/rules_rust (local dynamic branch) + NativeLink (remote worker).
 **Architectural sign-off REQUIRED before implementation** (changes the wiped-dir execution-buffer
 invariant — see `.claude/rules/architectural-changes.md`).
 
@@ -40,7 +48,7 @@ the local branch too.
 Both the invoking build machines (local dynamic branch, worktree-pool macs) and the 10 execution workers
 are **macOS (Apple Silicon)**. macOS has **no mount namespaces**. Therefore the reclient-style
 "one fixed root `/b/f/w`, isolate concurrent actions with a per-action namespace view" model is **not
-available** — the single `cas_server.rs:1428` mount-namespace hook is Linux-gated and unused on this fleet.
+available** — the mount-namespace machinery is `nativelink-worker/src/namespace_utils.rs:92,96` (`CLONE_NEWNS` / `libc::unshare`, `#[cfg(target_os="linux")]`) behind the config field `nativelink-config/src/cas_server.rs:1434` `use_mount_namespace` ("only on Linux") — Linux-gated and unused on this fleet. [corrected: an earlier draft cited a non-existent `cas_server.rs:1428` hook.]
 `/b/f/w` is a reclient/RBE-server convention, not a Bazel client flag (Bazel 9.2.0 / FL fork 9.1.0 expose
 no fixed-input-root flag). This rules out the shared-single-root scheme and forces the **per-target real
 fixed path** scheme below, which needs no namespaces.
