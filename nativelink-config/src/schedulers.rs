@@ -500,6 +500,12 @@ pub struct SimpleSpec {
     /// profiles are K-mature and accurate. When OFF the reservation is byte-identical
     /// to today's declared-only ledger (the observe metric still emits). The flag is
     /// the operational KILL-SWITCH, not a permanent resting state.
+    ///
+    /// ENABLE PRECONDITION (operator gate): deploy THIS binary to ALL workers before
+    /// enabling. RAISE's starvation clamp is inert while a worker reports
+    /// `total_memory_kb=0` (an un-upgraded worker), so a mixed fleet can reserve the
+    /// profiled tail against a worker that never advertises capacity. Roll the binary
+    /// fleet-wide first, then flip this per-workload.
     #[serde(default)]
     pub phase3_raise_enabled: bool,
 
@@ -515,6 +521,14 @@ pub struct SimpleSpec {
     /// pins the reserve at declared). HARD-OFF until a future workload + the observe
     /// metric show real DOWN headroom and the backstop is proven. When OFF the
     /// reservation is byte-identical to today.
+    ///
+    /// ENABLE PRECONDITION (operator gate — hard): DOWN-overcommit's ONLY OOM backstop
+    /// is the worker `memory_gate` NAK (re-queue on real pressure). That gate is
+    /// DEFAULT-OFF and is currently DISABLED fleet-wide (#64: false-tripped). Do NOT set
+    /// `phase3_overcommit_max_factor > 1.0` until the `memory_gate` is re-enabled AND
+    /// soak-proven fleet-wide. Also deploy this binary to ALL workers first (see
+    /// `phase3_raise_enabled`). With no backstop, overcommit reserves BELOW declared with
+    /// nothing to catch a wrong-low prediction → OOM.
     #[serde(default)]
     pub phase3_down_overcommit_enabled: bool,
 
@@ -550,8 +564,7 @@ pub struct SimpleSpec {
     /// resource-profile map when `resource_profile_persist_path` is set. Default 300
     /// (5 min). The snapshot CLONES the map under the `parking_lot` lock, RELEASES the
     /// lock, THEN serializes + writes off the lock — no I/O or `.await` is ever held
-    /// across the map lock (the never-block-a-worker rule). A best-effort flush also
-    /// fires on graceful shutdown.
+    /// across the map lock (the never-block-a-worker rule).
     #[serde(
         default = "default_resource_profile_persist_interval_secs",
         deserialize_with = "convert_numeric_with_shellexpand"

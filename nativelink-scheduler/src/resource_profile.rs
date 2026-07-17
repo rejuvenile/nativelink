@@ -38,6 +38,7 @@
 use core::num::NonZeroUsize;
 
 use lru::LruCache;
+use wincode::{SchemaRead, SchemaWrite};
 
 /// Number of log2 buckets per dimension in the compact histogram sketch.
 ///
@@ -380,9 +381,9 @@ impl Agg {
 
 /// (#task-resource-profile Phase-3 §12) Plain-data snapshot of one profile-map entry
 /// (key parts + the four dimension histograms + sample count) for persistence. Pure
-/// data — the persist layer maps this to/from the versioned wincode blob. The staleness
-/// flags are per-run and NOT part of the snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// data — the persist layer serializes this directly as the versioned wincode blob's
+/// entry form. The staleness flags are per-run and NOT part of the snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
 pub struct ProfileEntrySnapshot {
     pub instance_name: String,
     pub target_id: String,
@@ -525,15 +526,13 @@ pub enum TieredTail {
         samples: u64,
     },
     /// A profile existed at >= 1 tier but NEITHER reached `K` samples (untrusted
-    /// tail). Carries the consulted tier's data (fine preferred) so a dispatch-time
-    /// stash can represent "present-but-untrusted" for the leave-one-out check.
-    /// `p50_kb`/`variance_ratio_x100` are carried for symmetry with `Trusted` but
-    /// are NOT trustworthy below `K` (the caller gates on `samples >= K`).
+    /// tail). Carries the consulted tier's tail + sample count (fine preferred) so a
+    /// dispatch-time stash can represent "present-but-untrusted" for the leave-one-out
+    /// check. `p50_kb`/`variance_ratio_x100` are NOT carried: they are trustworthy only
+    /// at `>= K` samples (the caller gates on `samples >= K`), so only `Trusted` holds them.
     LowSample {
         tier: ProfileTier,
         tail_kb: u64,
-        p50_kb: u64,
-        variance_ratio_x100: u64,
         samples: u64,
     },
     /// No profile at either tier (map warming / absent baggage).
@@ -747,15 +746,11 @@ impl ProfileMap {
             (Some(s), _) => TieredTail::LowSample {
                 tier: ProfileTier::Fine,
                 tail_kb: s.tail_kb,
-                p50_kb: s.p50_kb,
-                variance_ratio_x100: s.variance_ratio_x100,
                 samples: s.samples,
             },
             (None, Some(s)) => TieredTail::LowSample {
                 tier: ProfileTier::Coarse,
                 tail_kb: s.tail_kb,
-                p50_kb: s.p50_kb,
-                variance_ratio_x100: s.variance_ratio_x100,
                 samples: s.samples,
             },
             (None, None) => TieredTail::NoProfile,
@@ -1385,12 +1380,9 @@ mod tests {
             TieredTail::LowSample {
                 tier: ProfileTier::Fine,
                 tail_kb: 1 << 10,
-                // 1000 → bucket 10 [512,1024) → p50 rep 768; tight → ratio 100.
-                p50_kb: 768,
-                variance_ratio_x100: 100,
                 samples: 2,
             },
-            "neither tier reaching K → LowSample carrying the fine (preferred) tier's data"
+            "neither tier reaching K → LowSample carrying the fine (preferred) tier's tail"
         );
     }
 

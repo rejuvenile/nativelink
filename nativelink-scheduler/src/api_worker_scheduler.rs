@@ -860,7 +860,7 @@ pub struct SchedulerMetrics {
     /// BOTH operands are MEASURED peaks (`tail` = predicted profile tail, `actual` =
     /// `usage.peak_memory_kb`) — declared is NOT in the ratio. This is the residual
     /// RAISE-side waste (reserving the tail is `N×` the actual), NOT the DOWN
-    /// opportunity (that is `down_opportunity_*` = declared/p50). This is the
+    /// opportunity (that is `down_opportunity_*` = declared/p50). What this
     /// counter is blind to: the coarse `(instance,target,mnemonic)` key blends cheap and
     /// expensive actions, so enforce would reserve the blend-MAX tail for EVERY action —
     /// a cheap action whose real peak is far under the tail is over-reserved by this
@@ -869,7 +869,7 @@ pub struct SchedulerMetrics {
     /// from pervasive waste. `0` while no over-reservation has fired; a degenerate
     /// `actual==0` sample inflates it to `tail*100` (guarded finite via `actual.max(1)`).
     #[metric(
-        help = "(#task-resource-profile Phase-2c) worst observed over-reservation ratio tail*100/actual (×100), max over covered samples where tail>actual (gauge)"
+        help = "(#task-resource-profile Phase-3 §4) worst observed predicted-tail-over-actual ratio tail*100/actual (×100), max over covered samples where tail>actual (gauge)"
     )]
     pub predicted_tail_over_actual_max_x100: AtomicU64,
 
@@ -880,7 +880,7 @@ pub struct SchedulerMetrics {
     /// gap the cadre flagged for the under gauge, not repeated here. Saturating so the
     /// degenerate `actual==0` (ratio up to `u64::MAX`) can never wrap the running total.
     #[metric(
-        help = "(#task-resource-profile Phase-2c) saturating sum of over-reservation ratios tail*100/actual (×100) over counted over samples; mean = sum/predicted_tail_over_actual_samples"
+        help = "(#task-resource-profile Phase-3 §4) saturating sum of predicted-tail-over-actual ratios tail*100/actual (×100) over counted samples; mean = sum/predicted_tail_over_actual_samples"
     )]
     pub predicted_tail_over_actual_sum_x100: AtomicU64,
 

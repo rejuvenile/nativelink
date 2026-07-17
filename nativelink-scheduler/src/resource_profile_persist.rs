@@ -28,11 +28,9 @@
 //! * **Never panic on load.** A missing file / deserialize error / version or magic
 //!   mismatch logs a `warn` and starts FRESH (returns an empty profile set).
 
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use nativelink_error::{Code, Error, ResultExt, make_err};
-use tracing::warn;
 use wincode::{SchemaRead, SchemaWrite};
 
 use crate::resource_profile::ProfileEntrySnapshot;
@@ -78,55 +76,13 @@ struct PersistHeader {
     snapshot_unix_secs: u64,
 }
 
-/// One persisted profile entry (mirrors [`ProfileEntrySnapshot`], the wincode-derived
-/// wire form).
-#[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
-struct PersistEntry {
-    instance_name: String,
-    target_id: String,
-    action_mnemonic: String,
-    memory_hist: Vec<u32>,
-    cpu_hist: Vec<u32>,
-    disk_hist: Vec<u32>,
-    net_hist: Vec<u32>,
-    sample_count: u64,
-}
-
-/// The full snapshot blob.
+/// The full snapshot blob. [`ProfileEntrySnapshot`] is itself the wincode-derived entry
+/// wire form (it carries `SchemaRead`/`SchemaWrite`), so it is serialized directly — no
+/// separate on-disk entry type.
 #[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
 struct PersistSnapshot {
     header: PersistHeader,
-    entries: Vec<PersistEntry>,
-}
-
-impl From<ProfileEntrySnapshot> for PersistEntry {
-    fn from(e: ProfileEntrySnapshot) -> Self {
-        Self {
-            instance_name: e.instance_name,
-            target_id: e.target_id,
-            action_mnemonic: e.action_mnemonic,
-            memory_hist: e.memory_hist,
-            cpu_hist: e.cpu_hist,
-            disk_hist: e.disk_hist,
-            net_hist: e.net_hist,
-            sample_count: e.sample_count,
-        }
-    }
-}
-
-impl From<PersistEntry> for ProfileEntrySnapshot {
-    fn from(e: PersistEntry) -> Self {
-        Self {
-            instance_name: e.instance_name,
-            target_id: e.target_id,
-            action_mnemonic: e.action_mnemonic,
-            memory_hist: e.memory_hist,
-            cpu_hist: e.cpu_hist,
-            disk_hist: e.disk_hist,
-            net_hist: e.net_hist,
-            sample_count: e.sample_count,
-        }
-    }
+    entries: Vec<ProfileEntrySnapshot>,
 }
 
 /// Serialize a snapshot (versioned header + entries) to bytes.
@@ -143,7 +99,7 @@ pub fn serialize_snapshot(
             version: SNAPSHOT_VERSION,
             snapshot_unix_secs,
         },
-        entries: entries.into_iter().map(PersistEntry::from).collect(),
+        entries,
     };
     wincode::config::serialize(&snapshot, WincodeConfig::new())
         .map_err(|e| make_err!(Code::Internal, "resource-profile snapshot serialize failed: {e:?}"))
@@ -176,14 +132,7 @@ pub fn deserialize_snapshot(bytes: &[u8]) -> Result<(u64, Vec<ProfileEntrySnapsh
             snapshot.header.version
         ));
     }
-    Ok((
-        snapshot.header.snapshot_unix_secs,
-        snapshot
-            .entries
-            .into_iter()
-            .map(ProfileEntrySnapshot::from)
-            .collect(),
-    ))
+    Ok((snapshot.header.snapshot_unix_secs, snapshot.entries))
 }
 
 /// The sibling temp path for an atomic write (`<path>.tmp`).
@@ -211,41 +160,6 @@ pub async fn write_snapshot_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error
         .await
         .err_tip(|| format!("renaming resource-profile snapshot into place {}", path.display()))?;
     Ok(())
-}
-
-/// Load + parse a snapshot from `path`. On a MISSING file returns `Ok(None)` (fresh
-/// start, not an error). On a corrupt / version-mismatched file logs a `warn` and returns
-/// `Ok(None)` — NEVER an `Err` that could crash startup. Returns `Ok(Some((unix_secs,
-/// entries)))` on success.
-pub async fn load_snapshot(path: &Path) -> Option<(u64, Vec<ProfileEntrySnapshot>)> {
-    let bytes = match tokio::fs::read(path).await {
-        Ok(b) => b,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // No prior snapshot — the expected first-boot case, not a fault.
-            return None;
-        }
-        Err(e) => {
-            warn!(
-                tag = "resource_profile_persist_load",
-                path = %path.display(),
-                error = %e,
-                "resource-profile snapshot unreadable — starting fresh"
-            );
-            return None;
-        }
-    };
-    match deserialize_snapshot(&bytes) {
-        Ok(parsed) => Some(parsed),
-        Err(e) => {
-            warn!(
-                tag = "resource_profile_persist_load",
-                path = %path.display(),
-                error = %e,
-                "resource-profile snapshot corrupt / version-mismatch — starting fresh (NO panic)"
-            );
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -287,6 +201,52 @@ mod tests {
         assert!(
             deserialize_snapshot(&garbage).is_err(),
             "a corrupt blob must return Err (→ caller warns + starts fresh), never panic"
+        );
+    }
+
+    /// A VALID header followed by an OVERSIZED `entries` length prefix must fail as a
+    /// graceful `Err`, NOT a capacity-overflow abort. This is the load-bearing assertion
+    /// for [`SNAPSHOT_PREALLOC_LIMIT`]: wincode reads the length and runs its preallocation
+    /// check (`len * size_of::<entry>() > limit`) BEFORE allocating the `Vec`, so a hostile
+    /// `1 << 40` count fails the cap instead of driving a multi-terabyte `Vec` allocation
+    /// that aborts the process (which would VIOLATE the "never panic on load" rule). The
+    /// random-bytes test above never reaches this path — the length there is not a valid
+    /// oversized count over a valid header.
+    ///
+    /// MUTATION: change `SNAPSHOT_PREALLOC_LIMIT` to `usize::MAX`
+    /// (`wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED`) → the prealloc guard returns
+    /// `None` (no check) → wincode allocates `1 << 40` entries → allocation failure →
+    /// `handle_alloc_error` abort → this test can no longer observe a graceful `Err` (the
+    /// test binary aborts instead of returning).
+    #[test]
+    fn oversized_entries_length_deserializes_to_err_not_panic() {
+        // Serialize a VALID snapshot with an EMPTY entries vec so the magic + version are
+        // correct and the only hostile field is the trailing length prefix. BincodeLen
+        // encodes a Vec length as a u64 (FixInt LE), so for an empty vec the final 8 bytes
+        // ARE that length prefix (== 0). Overwrite them with an absurd count.
+        let valid = PersistSnapshot {
+            header: PersistHeader {
+                magic: SNAPSHOT_MAGIC,
+                version: SNAPSHOT_VERSION,
+                snapshot_unix_secs: 1_700_000_000,
+            },
+            entries: vec![],
+        };
+        let mut bytes = wincode::config::serialize(&valid, WincodeConfig::new()).expect("serialize");
+        let n = bytes.len();
+        assert!(n >= 8, "an empty snapshot still carries the 8-byte length prefix");
+        // 1 << 40 entries × the per-entry size vastly exceeds the 64 MiB cap → the
+        // preallocation check must fire and return Err before any allocation.
+        let oversized: u64 = 1 << 40;
+        bytes[n - 8..].copy_from_slice(&oversized.to_le_bytes());
+
+        let err = deserialize_snapshot(&bytes)
+            .expect_err("an oversized entries length must fail gracefully, never abort/panic");
+        assert_eq!(
+            err.code,
+            Code::Internal,
+            "the oversized-length decode must surface as a wincode Internal decode Err (the \
+             SNAPSHOT_PREALLOC_LIMIT guard tripping), never a capacity-overflow process abort"
         );
     }
 
