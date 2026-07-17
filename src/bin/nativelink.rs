@@ -756,6 +756,18 @@ async fn inner_main(
         nativelink_util::o11_probes::memory_gate_counters_arc(),
     );
 
+    // #2497 D3: register the process-wide CAS chunking counters so the
+    // `cas_split_*` / `cas_splice_*` metrics render on /metrics — in
+    // particular `cas_splice_verification_failures`, the CAS-poisoning-
+    // rejection signal. Previously the `ChunkingMetrics` tree lived only on
+    // the `CasServer` instance (never registered) — dark on /metrics (the
+    // worker-metrics-exposure trap). `CasServer::new` wires every CAS
+    // instance's counters to the SAME process-wide singleton this registers,
+    // so the rendered values are live. Registered ONCE (process-global);
+    // reads 0 while `experimental_chunking` is unset (the current prod
+    // state), safe on every process.
+    nativelink_service::cas_server::register_chunking_metrics(&metrics_registry);
+
     // #FL-688 (log-miscalibration fix): register the reconcile-pin counters
     // singleton so the worker's UploadMissingBlobs backfill signals appear on
     // /metrics, split by durability severity: `reconcile_pin_refused_total`

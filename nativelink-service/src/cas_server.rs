@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -52,6 +52,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, make_ctx_for_hash_func};
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::log_utils::throughput_mbps;
+use nativelink_util::metrics_publisher::MetricsRegistry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::stall_detector::StallGuard;
 use nativelink_util::store_trait::{
@@ -294,6 +295,40 @@ impl MetricsComponent for ChunkingMetrics {
     }
 }
 
+/// Prometheus root prefix for the chunking counters. Rendered names are
+/// `cas_<field>` (e.g. `cas_splice_verification_failures`) — the
+/// `ChunkingMetrics::publish` `group!` receives an empty root name from the
+/// registry render path, so no segment is doubled.
+const CHUNKING_METRICS_PREFIX: &str = "cas";
+
+/// Process-wide `ChunkingMetrics` singleton. Production `CasServer::new`
+/// wires every CAS instance's counters to THIS Arc (via
+/// [`chunking_metrics_singleton`]) and [`register_chunking_metrics`]
+/// registers the SAME Arc with the process metrics registry — so the
+/// `splice_verification_failures` (CAS-poisoning-rejection) signal and its
+/// siblings are reachable on `/metrics` rather than dark on a per-instance
+/// tree the binary never sees (the worker-metrics-exposure trap). Tests
+/// inject a fresh per-server Arc via
+/// [`CasServer::new_with_chunking_metrics`] for isolation.
+static CHUNKING_METRICS: OnceLock<Arc<ChunkingMetrics>> = OnceLock::new();
+
+/// Returns a clone of the process-wide [`ChunkingMetrics`] Arc. All calls
+/// within the process observe the same atomic state.
+#[must_use]
+pub fn chunking_metrics_singleton() -> Arc<ChunkingMetrics> {
+    Arc::clone(CHUNKING_METRICS.get_or_init(|| Arc::new(ChunkingMetrics::default())))
+}
+
+/// Register the process-wide chunking counters with `registry` so the
+/// `cas_split_*` / `cas_splice_*` metrics (including
+/// `cas_splice_verification_failures`, the CAS-poisoning-attempt signal)
+/// render on `/metrics`. Call ONCE at binary startup — the counters are
+/// process-global; double-registration would publish duplicate lines. The
+/// registered Arc is the SAME one production `CasServer::new` increments.
+pub fn register_chunking_metrics(registry: &MetricsRegistry) {
+    registry.register(CHUNKING_METRICS_PREFIX, chunking_metrics_singleton());
+}
+
 /// Per-instance state for the experimental chunking RPCs.
 #[derive(Debug, Clone)]
 struct ChunkingInstance {
@@ -341,8 +376,16 @@ pub struct CasServer {
     /// when no instance enables chunking, in which case the handlers return
     /// `Unimplemented` and behavior is unchanged.
     chunking_instances: HashMap<String, ChunkingInstance>,
-    /// Counters for the experimental chunking RPCs.
-    chunking_metrics: ChunkingMetrics,
+    /// Names of grpc-store-backed instances that opted into
+    /// `experimental_chunking`. Only these forward SplitBlob/SpliceBlob to
+    /// the backend; a grpc-backed instance that did NOT opt in returns
+    /// `Unimplemented` (matching its advertised `split/splice = false`)
+    /// rather than forwarding an RPC the operator never enabled.
+    grpc_chunking_instances: HashSet<String>,
+    /// Counters for the experimental chunking RPCs. Shared with the process
+    /// metrics registry in production (see [`chunking_metrics_singleton`]);
+    /// a fresh per-server Arc in tests.
+    chunking_metrics: Arc<ChunkingMetrics>,
     /// Cache of GetTree results keyed by root digest. CAS trees are
     /// immutable (content-addressed), so a cache hit avoids re-running
     /// the full BFS traversal. Bounded by size and TTL.
@@ -379,13 +422,34 @@ pub struct CasServer {
 type GetTreeStream = Pin<Box<dyn Stream<Item = Result<GetTreeResponse, Status>> + Send + 'static>>;
 
 impl CasServer {
+    /// Production entry point. Wires every CAS instance's chunking counters
+    /// to the process-wide [`chunking_metrics_singleton`] so they render on
+    /// `/metrics` once [`register_chunking_metrics`] runs at startup.
     pub fn new(
         configs: &[WithInstanceName<CasStoreConfig>],
         store_manager: &StoreManager,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<Self, Error> {
+        Self::new_with_chunking_metrics(
+            configs,
+            store_manager,
+            small_blob_dispatcher,
+            chunking_metrics_singleton(),
+        )
+    }
+
+    /// Like [`Self::new`] but takes the [`ChunkingMetrics`] Arc explicitly.
+    /// Production passes the process-wide singleton (so `/metrics` reflects
+    /// live counters); tests pass a fresh Arc for per-server isolation.
+    pub fn new_with_chunking_metrics(
+        configs: &[WithInstanceName<CasStoreConfig>],
+        store_manager: &StoreManager,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
+        chunking_metrics: Arc<ChunkingMetrics>,
+    ) -> Result<Self, Error> {
         let mut stores = HashMap::with_capacity(configs.len());
         let mut chunking_instances = HashMap::new();
+        let mut grpc_chunking_instances = HashSet::new();
         for config in configs {
             let store = store_manager.get_store(&config.cas_store).ok_or_else(|| {
                 make_input_err!("'cas_store': '{}' does not exist", config.cas_store)
@@ -399,6 +463,27 @@ impl CasServer {
                             config.instance_name
                         )
                     })?;
+                // #2497 D1: SpliceBlob performs a SERVER-ORIGINATED
+                // `store.update` reassembly. On a `WorkerProxyStore`-wrapped
+                // CAS (the production `cas_STORE` topology) that write flows
+                // through the FL-688 ack-gate, which was designed and tested
+                // ONLY for WORKER mirror uploads (local_worker → mirror_blobs
+                // → BIS ack), never for server-originated streams — an
+                // unvalidated interaction. Fail fast at startup rather than
+                // splice through an untested path, mirroring the same-store
+                // and grpc-index foot-gun rejections below. Detection: the
+                // WorkerProxyStore is the OUTERMOST driver in the prod chain,
+                // reached via `as_store_driver().as_any()` (NOT
+                // `Store::downcast_ref`, which steps INTO `inner_store`).
+                error_if!(
+                    store
+                        .as_store_driver()
+                        .as_any()
+                        .downcast_ref::<WorkerProxyStore>()
+                        .is_some(),
+                    "'experimental_chunking' of instance '{}' is not supported on a WorkerProxyStore-wrapped 'cas_store': SpliceBlob's server-originated reassembly is unvalidated against the FL-688 ack-gate (designed for worker mirror uploads only). Restrict chunking to a non-WorkerProxyStore CAS instance.",
+                    config.instance_name
+                );
                 if store.downcast_ref::<GrpcStore>(None).is_some() {
                     // SplitBlob/SpliceBlob for grpc-store-backed instances
                     // are forwarded to the backend, which owns the chunk
@@ -408,8 +493,11 @@ impl CasServer {
                         "'experimental_chunking.index_store' of instance '{}' must not be set when 'cas_store' is a grpc store: SplitBlob/SpliceBlob are forwarded to the backend",
                         config.instance_name
                     );
-                    // No ChunkingInstance: the forwarding shortcut in the
-                    // handlers takes over before local chunking is reached.
+                    // Record that THIS grpc instance opted in; only opted-in
+                    // grpc instances forward (D2). No ChunkingInstance: the
+                    // forwarding shortcut in the handlers takes over before
+                    // local chunking is reached.
+                    grpc_chunking_instances.insert(config.instance_name.to_string());
                 } else {
                     let index_store_name =
                         chunking_config.index_store.as_ref().ok_or_else(|| {
@@ -474,7 +562,8 @@ impl CasServer {
         Ok(Self {
             stores,
             chunking_instances,
-            chunking_metrics: ChunkingMetrics::default(),
+            grpc_chunking_instances,
+            chunking_metrics,
             tree_cache,
             subtree_cache,
             tree_inflight: parking_lot::Mutex::new(HashMap::new()),
@@ -486,7 +575,7 @@ impl CasServer {
     }
 
     /// Metrics for the experimental `SplitBlob`/`SpliceBlob` RPCs.
-    pub const fn chunking_metrics(&self) -> &ChunkingMetrics {
+    pub fn chunking_metrics(&self) -> &ChunkingMetrics {
         &self.chunking_metrics
     }
 
@@ -1393,8 +1482,16 @@ impl CasServer {
     }
 
     /// Returns the backend `GrpcStore` when the instance's CAS is a grpc
-    /// proxy store, in which case chunking RPCs are forwarded verbatim.
+    /// proxy store AND the instance opted into `experimental_chunking`, in
+    /// which case chunking RPCs are forwarded verbatim. A grpc-backed
+    /// instance that did NOT opt in returns `None` here so the caller falls
+    /// through to `chunking_instance()` and answers `Unimplemented` (#2497
+    /// D2) — matching its advertised `split/splice = false`, rather than
+    /// forwarding an RPC the operator never enabled.
     fn grpc_store_for_instance(&self, instance_name: &str) -> Option<&GrpcStore> {
+        if !self.grpc_chunking_instances.contains(instance_name) {
+            return None;
+        }
         self.stores
             .get(instance_name)
             .and_then(|instance| instance.store.downcast_ref::<GrpcStore>(None))
@@ -1610,6 +1707,7 @@ impl CasServer {
     ) -> Result<SplitBlobResponse, Error> {
         let avg_size = chunking_instance.avg_chunk_size_bytes;
         let (min_size, max_size) = (avg_size / 4, avg_size * 4);
+        let max_chunk_count = chunking_instance.max_chunk_count;
         // Chunk digests MUST use the blob's digest function. When the client
         // leaves the field unset it has to be inferred from the blob content
         // (an extra read pass) since the hash length alone is ambiguous.
@@ -1618,6 +1716,17 @@ impl CasServer {
             None => Self::infer_blob_hasher_func(store, blob_digest).await?,
         };
 
+        // Set by the in-stream cap guard below when it aborts an over-cap
+        // blob. A genuinely over-cap blob is usually larger than the buf
+        // channel, so the guard drops `rx` while the store read is still in
+        // flight; that read then fails with `Code::Internal`. `Error::merge`
+        // prefers the read's code, so without this flag the RPC would return
+        // `Internal` instead of the REAPI-correct `NotFound`. After the join
+        // we consult the flag and force `NotFound` regardless of the merged
+        // code (see below). Mirrors the `verification_failed` pattern in
+        // `inner_splice_blob`.
+        let over_cap = AtomicBool::new(false);
+        let over_cap_ref = &over_cap;
         let (tx, rx) = make_buf_channel_pair();
         let read_store = store.clone();
         // `tx` is moved into the future so that when the read finishes or
@@ -1643,7 +1752,24 @@ impl CasServer {
             // Chunks are hashed and stored CHUNK_CONCURRENCY at a time while
             // the blob keeps streaming; `buffered` preserves chunk order.
             let chunk_digests: Vec<Digest> = pin!(cdc.as_stream())
-                .map(|chunk_result| async {
+                .enumerate()
+                .map(|(chunk_index, chunk_result)| async move {
+                    // #2497 D4: refuse ONCE the cap is exceeded, BEFORE
+                    // hashing or storing this chunk. Bounds work at
+                    // ~max_chunk_count chunks instead of chunking AND writing
+                    // the entire over-cap blob and leaving orphan chunks
+                    // (the previous post-`try_collect` check did both). The
+                    // early `Err` aborts the stream, which drops `rx` and
+                    // cancels the in-flight blob read (O(blob_size) saved).
+                    // `buffered` may have started a few later chunks
+                    // concurrently; they hit this same guard and store nothing.
+                    if chunk_index >= max_chunk_count {
+                        over_cap_ref.store(true, Ordering::Relaxed);
+                        return Err(make_err!(
+                            Code::NotFound,
+                            "Blob {blob_digest} exceeds the configured max_chunk_count of {max_chunk_count}; no split information available"
+                        ));
+                    }
                     let chunk = chunk_result
                         .map_err(|e| make_err!(Code::Internal, "Failed to chunk blob: {e:?}"))
                         .err_tip(|| "In chunk_blob_on_demand")?;
@@ -1677,19 +1803,24 @@ impl CasServer {
             Ok::<Vec<Digest>, Error>(chunk_digests)
         };
         let (read_res, chunk_res) = futures::join!(read_fut, chunk_fut);
-        // Prefer the read error (the chunker error is usually a consequence
-        // of it); merge keeps both messages when both fail.
+        // #2497 D4: over-cap outcome must be deterministically `NotFound`.
+        // When the guard fired it aborted the read mid-stream, so `read_res`
+        // is `Err(Internal)` and `Error::merge` below would surface that code
+        // instead of the guard's `NotFound`. Force `NotFound` here regardless
+        // of which future's error `merge` prefers — the observable contract
+        // (over-cap -> NotFound, "no split information available") holds for
+        // large streaming-store blobs too, not only buffer-fitting ones.
+        if over_cap.load(Ordering::Relaxed) {
+            return Err(make_err!(
+                Code::NotFound,
+                "Blob {blob_digest} exceeds the configured max_chunk_count of {max_chunk_count}; no split information available"
+            ));
+        }
+        // Not over-cap: prefer the read error (the chunker error is usually a
+        // consequence of it); merge keeps both messages when both fail.
         let chunk_digests = read_res
             .merge(chunk_res)
             .err_tip(|| "Failed to chunk blob in chunk_blob_on_demand")?;
-        if chunk_digests.len() > chunking_instance.max_chunk_count {
-            return Err(make_err!(
-                Code::NotFound,
-                "Blob {blob_digest} produced {} chunks, exceeding the configured max_chunk_count of {}; no split information available",
-                chunk_digests.len(),
-                chunking_instance.max_chunk_count
-            ));
-        }
 
         let split_response = SplitBlobResponse {
             chunk_digests,
