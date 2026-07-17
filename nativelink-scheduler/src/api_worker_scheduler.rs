@@ -1735,6 +1735,47 @@ fn phase3_down_effective_kb(
     reserve.clamp(floor, declared_kb)
 }
 
+/// (#task-memgate-twosignal) The reactive DOWN churn-throttle: reduce the
+/// overcommit factor toward `1.0` (no overcommit) as the fleet's compressor-CHURN
+/// scalar rises, so the scheduler backs off packing onto a thrashing fleet before
+/// piling on. Damped by construction: the churn scalar it reads is already the
+/// worker-side fast-attack/slow-release EWMA (`min(compress_ewma, decompress_ewma)`),
+/// so this consumes a SMOOTHED value, not an instantaneous spike.
+///
+/// - `enabled == false` → returns `base_factor` UNCHANGED (byte-identical to the
+///   static-factor DOWN path — deliverable (d)).
+/// - `base_factor <= 1.0` → returns `base_factor` (DOWN already inert; nothing to
+///   throttle).
+/// - degenerate band (`high <= low`) → returns `base_factor` (misconfig guard: an
+///   inverted/empty band must not silently zero overcommit).
+/// - `churn <= low` → full `base_factor`; `churn >= high` → `1.0`; between → linear.
+///
+/// Pure (no lock, no I/O) → unit-testable in isolation. Fleet-representative churn
+/// (the CALLER passes the max churn among viable workers) is used, not a single
+/// candidate's — see the call site for the store-once/pre-selection rationale.
+/// Mutating the interpolation to ignore `churn` keeps the factor at `base_factor`
+/// → the high-churn test red-fails (deliverable (c)).
+fn phase3_churn_throttled_factor(
+    base_factor: f64,
+    churn_scalar: u32,
+    low: u32,
+    high: u32,
+    enabled: bool,
+) -> f64 {
+    if !enabled || base_factor <= 1.0 || high <= low {
+        return base_factor;
+    }
+    if churn_scalar <= low {
+        base_factor
+    } else if churn_scalar >= high {
+        1.0
+    } else {
+        // Linear interpolate base_factor (at `low`) → 1.0 (at `high`).
+        let frac = f64::from(churn_scalar - low) / f64::from(high - low);
+        base_factor - frac * (base_factor - 1.0)
+    }
+}
+
 /// (#task-resource-profile Phase-2c) TRUE DISPATCH-TIME leave-one-out classification
 /// of one folded sample: did the tail-aware statistic the enforce phase (Phase-3)
 /// WOULD have stood at THIS action's dispatch — stashed on the running action when it
@@ -2272,6 +2313,26 @@ struct ApiWorkerSchedulerImpl {
     /// LOADED profile older than this is not trusted for lowering (over-reserve at worst,
     /// never OOM); live keys are unaffected. Only consulted on the DOWN path.
     phase3_persist_max_age_secs: u64,
+
+    /// (#task-memgate-twosignal) NET-NEW reactive DOWN churn-throttle
+    /// (`SimpleSpec::phase3_overcommit_churn_throttle_enabled`, default OFF). When
+    /// ON, the effective overcommit factor backs off toward 1.0 as the fleet's
+    /// compressor-churn scalar rises. Read once per reserve under the `inner` write
+    /// lock. OFF → the effective factor equals the static
+    /// `phase3_overcommit_max_factor` (byte-identical). Independent of
+    /// `phase3_down_overcommit_enabled` so it can be killed without losing the
+    /// swapin hard-gate.
+    phase3_overcommit_churn_throttle_enabled: bool,
+
+    /// (#task-memgate-twosignal) Churn scalar (events/sec) at/below which the full
+    /// overcommit factor applies (`SimpleSpec::phase3_overcommit_churn_throttle_low`,
+    /// default 2000). Only consulted on the DOWN path when the throttle is enabled.
+    phase3_overcommit_churn_throttle_low: u32,
+
+    /// (#task-memgate-twosignal) Churn scalar (events/sec) at/above which the factor
+    /// clamps to 1.0 (`SimpleSpec::phase3_overcommit_churn_throttle_high`, default
+    /// 20000). Only consulted on the DOWN path when the throttle is enabled.
+    phase3_overcommit_churn_throttle_high: u32,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -3164,6 +3225,31 @@ impl ApiWorkerSchedulerImpl {
             .unwrap_or(0)
     }
 
+    /// (#task-memgate-twosignal) Fleet-representative compressor-CHURN scalar: the
+    /// MAX `swap_pressure_rate_per_sec` (the re-keyed wire field — now the churn
+    /// EWMA, not a rate) reported across all workers, or `0` when none report.
+    ///
+    /// DESIGN NOTE (drift flagged for the Tier-3 cadre): the task specifies "the
+    /// CANDIDATE worker's churn scalar at dispatch", but the DOWN reservation is
+    /// STORE-ONCE computed PRE-SELECTION (`phase3_compute_effective_action_info`
+    /// runs before `inner_find_and_reserve_worker`, and the gate `is_satisfied_by`
+    /// depends on the reservation) — so no single candidate is known yet, and
+    /// making the value per-candidate would require threading a variable
+    /// reservation through every selection tier (cache-affinity / LRU / cpu-first)
+    /// and breaks the store-once ledger symmetry (the 2026-05-08 trap). The
+    /// fleet-MAX is the CONSERVATIVE, store-once-safe approximation: it errs toward
+    /// LESS overcommit (a higher reservation) whenever ANY worker is churning,
+    /// which is the OOM-safe direction; and churn is fleet-correlated under load
+    /// (the bursty-correlated-pressure case the task flags), so a fleet backoff is
+    /// reasonable. O(workers), under the write lock already held.
+    fn fleet_max_churn_scalar(&self) -> u32 {
+        self.workers
+            .iter()
+            .map(|(_, w)| w.swap_pressure_rate_per_sec)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// (#task-resource-profile Phase-3 §5 STORE-ONCE LEDGER) Compute the effective
     /// `memory_kb` reservation ONCE at admission. When it differs from the declared
     /// value, return an `ActionInfoWithProps` clone with that value written into its
@@ -3257,12 +3343,23 @@ impl ApiWorkerSchedulerImpl {
             ) {
                 return None;
             }
+            // (#task-memgate-twosignal) Reactive churn-throttle: back the effective
+            // overcommit factor off toward 1.0 as the fleet's compressor-churn scalar
+            // rises. OFF (default) → effective_factor == the static max factor →
+            // byte-identical to the pre-throttle DOWN path.
+            let effective_factor = phase3_churn_throttled_factor(
+                self.phase3_overcommit_max_factor,
+                self.fleet_max_churn_scalar(),
+                self.phase3_overcommit_churn_throttle_low,
+                self.phase3_overcommit_churn_throttle_high,
+                self.phase3_overcommit_churn_throttle_enabled,
+            );
             phase3_down_effective_kb(
                 declared_kb,
                 p50_kb,
                 variance_ratio_x100,
                 tier,
-                self.phase3_overcommit_max_factor,
+                effective_factor,
             )
         } else {
             declared_kb
@@ -5810,6 +5907,14 @@ impl ApiWorkerScheduler {
                     nativelink_config::schedulers::default_phase3_overcommit_max_factor(),
                 phase3_persist_max_age_secs:
                     nativelink_config::schedulers::default_resource_profile_persist_max_age_secs(),
+                // (#task-memgate-twosignal) Churn throttle defaults OFF / band
+                // sourced from the SAME config default fns (single source of
+                // truth). Wired via set_phase3_enforcement post-construction.
+                phase3_overcommit_churn_throttle_enabled: false,
+                phase3_overcommit_churn_throttle_low:
+                    nativelink_config::schedulers::default_phase3_overcommit_churn_throttle_low(),
+                phase3_overcommit_churn_throttle_high:
+                    nativelink_config::schedulers::default_phase3_overcommit_churn_throttle_high(),
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -5957,6 +6062,9 @@ impl ApiWorkerScheduler {
         down_overcommit_enabled: bool,
         overcommit_max_factor: f64,
         persist_max_age_secs: u64,
+        churn_throttle_enabled: bool,
+        churn_throttle_low: u32,
+        churn_throttle_high: u32,
     ) {
         let mut inner = self.inner.try_write().expect(
             "set_phase3_enforcement must be called during one-shot wiring, before any \
@@ -5966,6 +6074,9 @@ impl ApiWorkerScheduler {
         inner.phase3_down_overcommit_enabled = down_overcommit_enabled;
         inner.phase3_overcommit_max_factor = overcommit_max_factor;
         inner.phase3_persist_max_age_secs = persist_max_age_secs;
+        inner.phase3_overcommit_churn_throttle_enabled = churn_throttle_enabled;
+        inner.phase3_overcommit_churn_throttle_low = churn_throttle_low;
+        inner.phase3_overcommit_churn_throttle_high = churn_throttle_high;
     }
 
     /// (#dag-criticality) Inject (or clear) the shared DAG state during one-shot wiring
@@ -16920,7 +17031,10 @@ mod b1_lock_decouple_tests {
     use parking_lot::Mutex as ParkingMutex;
     use tokio::sync::{Notify, mpsc};
 
-    use super::{ApiWorkerScheduler, UpdateForWorker, Worker, phase3_down_effective_kb};
+    use super::{
+        ApiWorkerScheduler, UpdateForWorker, Worker, phase3_churn_throttled_factor,
+        phase3_down_effective_kb,
+    };
     use crate::platform_property_manager::PlatformPropertyManager;
     use crate::resource_profile::ProfileTier;
     use crate::worker::ActionInfoWithProps;
@@ -17801,7 +17915,7 @@ mod b1_lock_decouple_tests {
     async fn raise_reserves_the_tail_via_store_once_ledger() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800); // RAISE on
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000); // RAISE on
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
 
         // Trusted (≥K) profile: 50_000 KiB → bucket 16 → tail 2^16 = 65_536 ≫ declared 4096.
@@ -17841,7 +17955,7 @@ mod b1_lock_decouple_tests {
     async fn raise_reduce_restore_symmetric_under_midaction_map_mutation() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800);
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000);
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
 
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
@@ -17907,7 +18021,7 @@ mod b1_lock_decouple_tests {
     async fn raise_clamps_to_max_worker_total_not_strand() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800);
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000);
         // Worker total RAM 8_000_000; advertises 8_000_000 remaining.
         let _rx_w =
             add_worker_with_memory_and_total(&scheduler, "W", 8_000_000.0, 8_000_000).await;
@@ -17999,6 +18113,103 @@ mod b1_lock_decouple_tests {
         );
     }
 
+    /// (#task-memgate-twosignal, deliverable (c)) The reactive churn-throttle:
+    /// a HIGH candidate/fleet churn scalar drives the effective factor toward 1.0
+    /// (no overcommit); a LOW churn keeps the full factor; the band interpolates.
+    /// Composed with `phase3_down_effective_kb` to show the end effect: high churn
+    /// → effective reservation == declared (no overcommit).
+    ///
+    /// MUTATION (CLAUDE.md TDD #5): make `phase3_churn_throttled_factor` IGNORE the
+    /// churn (e.g. always `return base_factor`) → the high-churn assertion red-fails
+    /// with its bespoke message (factor stays 2.0 → overcommit not backed off).
+    #[test]
+    fn churn_throttle_backs_off_overcommit_at_high_churn() {
+        use crate::resource_profile::ProfileTier;
+
+        let (low, high) = (2_000u32, 20_000u32);
+        // Below the band → FULL factor.
+        assert!(
+            (phase3_churn_throttled_factor(2.0, 0, low, high, true) - 2.0).abs() < 1e-9,
+            "churn at/below `low` must keep the FULL overcommit factor"
+        );
+        assert!(
+            (phase3_churn_throttled_factor(2.0, low, low, high, true) - 2.0).abs() < 1e-9,
+            "churn exactly at `low` still keeps the FULL factor"
+        );
+        // At/above the band → 1.0 (no overcommit).
+        let hi_factor = phase3_churn_throttled_factor(2.0, high, low, high, true);
+        assert!(
+            (hi_factor - 1.0).abs() < 1e-9,
+            "a HIGH churn ({high}) must back the effective factor down to 1.0 (no \
+             overcommit): got {hi_factor}. If this reads 2.0, the throttle ignored \
+             the churn scalar (deliverable c)"
+        );
+        assert!(
+            (phase3_churn_throttled_factor(2.0, 100_000, low, high, true) - 1.0).abs() < 1e-9,
+            "churn above `high` clamps to 1.0"
+        );
+        // Midpoint → halfway (2.0 → 1.0 at churn = (low+high)/2 = 11000 → 1.5).
+        let mid = phase3_churn_throttled_factor(2.0, 11_000, low, high, true);
+        assert!(
+            (mid - 1.5).abs() < 1e-9,
+            "the band interpolates LINEARLY: churn at the midpoint yields the \
+             midpoint factor (2.0→1.0 ⇒ 1.5); got {mid}"
+        );
+
+        // End effect through the reservation: at HIGH churn the effective factor is
+        // 1.0 → the DOWN floor == declared → NO overcommit (reserve == declared).
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 384, 100, ProfileTier::Fine, hi_factor),
+            100_000,
+            "with the factor throttled to 1.0 by high churn, the DOWN reserve equals \
+             declared (100_000) — overcommit is fully backed off on a thrashing fleet"
+        );
+        // At LOW churn the full factor (2.0) floors at declared/2 = 50_000.
+        assert_eq!(
+            phase3_down_effective_kb(
+                100_000,
+                384,
+                100,
+                ProfileTier::Fine,
+                phase3_churn_throttled_factor(2.0, 0, low, high, true),
+            ),
+            50_000,
+            "with low churn the full factor (2.0) still overcommits down to \
+             declared/2 = 50_000"
+        );
+    }
+
+    /// (#task-memgate-twosignal, deliverable (d)) Throttle flag OFF → the effective
+    /// factor equals the static `phase3_overcommit_max_factor`, BYTE-IDENTICAL to
+    /// the pre-throttle DOWN path, regardless of how high the churn is.
+    ///
+    /// MUTATION (CLAUDE.md TDD #5): make `phase3_churn_throttled_factor` ignore the
+    /// `enabled` flag (drop the `!enabled` guard) → with a huge churn the returned
+    /// factor collapses to 1.0 ≠ 2.0 → this test red-fails.
+    #[test]
+    fn churn_throttle_off_is_byte_identical_static_factor() {
+        // Even a churn far above the band leaves the factor at the static 2.0 when
+        // the throttle is DISABLED.
+        for churn in [0u32, 2_000, 20_000, u32::MAX] {
+            let f = phase3_churn_throttled_factor(2.0, churn, 2_000, 20_000, false);
+            assert!(
+                (f - 2.0).abs() < 1e-9,
+                "throttle OFF must return the STATIC factor 2.0 unchanged (churn={churn}), \
+                 byte-identical to the pre-throttle path; got {f}. If this differs, the \
+                 `!enabled` early-return was dropped (deliverable d)"
+            );
+        }
+        // The degenerate-band + factor<=1.0 guards also return base unchanged.
+        assert!(
+            (phase3_churn_throttled_factor(2.0, 50_000, 20_000, 2_000, true) - 2.0).abs() < 1e-9,
+            "an inverted band (high <= low) must not silently zero overcommit — return base"
+        );
+        assert!(
+            (phase3_churn_throttled_factor(1.0, u32::MAX, 2_000, 20_000, true) - 1.0).abs() < 1e-9,
+            "factor 1.0 (DOWN inert) is unaffected by the throttle"
+        );
+    }
+
     /// (§3 integration, requirement c: DOWN floor respected) With DOWN enabled and an
     /// over-declared key (tiny p50 384, tail 512 <= declared 100_000), the reservation
     /// is floored at `declared / overcommit_max_factor` (100_000/2 = 50_000), NOT the
@@ -18011,7 +18222,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_floor_respected_at_max_factor() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 2.0, 604_800); // DOWN on, factor 2.0
+        scheduler.set_phase3_enforcement(false, true, 2.0, 604_800, false, 2000, 20000); // DOWN on, factor 2.0
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         // Over-declared key: 500 KiB samples → bucket 9 → p50 rep 384, tail 512 <=
@@ -18047,7 +18258,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_lowers_reservation_below_declared() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800);
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000);
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         // 50_000 KiB → bucket 16 rep 49_152 (p50), tail 65_536 <= declared 100_000.
@@ -18077,7 +18288,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_inert_at_factor_one() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 1.0, 604_800); // enabled but factor 1.0
+        scheduler.set_phase3_enforcement(false, true, 1.0, 604_800, false, 2000, 20000); // enabled but factor 1.0
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {

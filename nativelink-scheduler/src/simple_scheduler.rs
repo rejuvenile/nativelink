@@ -2709,6 +2709,9 @@ impl SimpleScheduler {
             spec.phase3_down_overcommit_enabled,
             spec.phase3_overcommit_max_factor,
             spec.resource_profile_persist_max_age_secs,
+            spec.phase3_overcommit_churn_throttle_enabled,
+            spec.phase3_overcommit_churn_throttle_low,
+            spec.phase3_overcommit_churn_throttle_high,
         );
 
         // (#task-resource-profile Phase-3 §12) Load the persisted resource-profile map

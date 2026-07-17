@@ -548,6 +548,37 @@ pub struct SimpleSpec {
     #[serde(default = "default_phase3_overcommit_max_factor")]
     pub phase3_overcommit_max_factor: f64,
 
+    /// (#task-memgate-twosignal) Master gate for the NET-NEW reactive DOWN
+    /// churn-throttle: as a candidate worker's compressor-CHURN scalar
+    /// (`memory_pressure_level`, the graded perf signal) rises, back the effective
+    /// overcommit factor OFF toward 1.0 (no overcommit) so the scheduler stops
+    /// piling onto a thrashing worker. Default OFF (byte-identical to the static
+    /// `phase3_overcommit_max_factor` path). Kept SEPARATE from
+    /// `phase3_down_overcommit_enabled` so the throttle can be disabled
+    /// independently WITHOUT losing the SWAPIN hard-gate: the decompress/churn
+    /// calibration is the UNCERTAIN part (we have no compression-rate soak data),
+    /// so this is the dial to kill if the band mis-fires.
+    #[serde(default)]
+    pub phase3_overcommit_churn_throttle_enabled: bool,
+
+    /// (#task-memgate-twosignal) Churn scalar (events/sec) at/below which the FULL
+    /// `phase3_overcommit_max_factor` applies (no backoff). Between `low` and
+    /// `high` the effective factor interpolates linearly toward 1.0. Default 2000.
+    /// UNCALIBRATED: derived from the measured dbg-build decompress tail (~37k) as
+    /// a starting band; the real threshold needs the compression-rate soak the
+    /// worker now logs. Must be `< phase3_overcommit_churn_throttle_high` (a
+    /// degenerate band `high <= low` disables the throttle at use). Numeric-constant
+    /// rule: verify at `default_phase3_overcommit_churn_throttle_low`.
+    #[serde(default = "default_phase3_overcommit_churn_throttle_low")]
+    pub phase3_overcommit_churn_throttle_low: u32,
+
+    /// (#task-memgate-twosignal) Churn scalar (events/sec) at/above which the
+    /// effective factor is clamped to 1.0 (NO overcommit — full backoff). Default
+    /// 20000. UNCALIBRATED (see `_low`). Numeric-constant rule: verify at
+    /// `default_phase3_overcommit_churn_throttle_high`.
+    #[serde(default = "default_phase3_overcommit_churn_throttle_high")]
+    pub phase3_overcommit_churn_throttle_high: u32,
+
     /// (#task-resource-profile Phase-3 §12) Filesystem path for persisting the
     /// resource-profile map (per-key sample-count histograms) across server restarts,
     /// so learned profiles survive a bounce without a re-warm tax. `None` (the default)
@@ -718,6 +749,15 @@ impl Default for SimpleSpec {
             // DOWN inert (floor == declared). NOT the f64 type default (0.0), which
             // would make the floor `declared/0` = +inf and invert the clamp.
             phase3_overcommit_max_factor: default_phase3_overcommit_max_factor(),
+            // (#task-memgate-twosignal) #[serde(default)] → bool false = churn
+            // throttle OFF (byte-identical to the static-factor DOWN path).
+            phase3_overcommit_churn_throttle_enabled: false,
+            // #[serde(default = "...")] → 2000 / 20000 (the UNCALIBRATED starting
+            // band; inert while the throttle flag is off).
+            phase3_overcommit_churn_throttle_low:
+                default_phase3_overcommit_churn_throttle_low(),
+            phase3_overcommit_churn_throttle_high:
+                default_phase3_overcommit_churn_throttle_high(),
             // #[serde(default)] → Option default (None) = profile persistence OFF.
             resource_profile_persist_path: None,
             // #[serde(default = "...")] → 300s.
@@ -771,6 +811,21 @@ pub const fn default_resource_profile_persist_max_age_secs() -> u64 {
 /// Numeric-constant rule: the literal below is the authoritative ship default.
 pub fn default_phase3_overcommit_max_factor() -> f64 {
     1.0
+}
+
+/// (#task-memgate-twosignal) Default LOW edge of the churn-throttle band (2000
+/// events/sec): at/below this churn the FULL overcommit factor applies. UNCALIBRATED
+/// starting value (the throttle is default-OFF; the compression-rate soak the worker
+/// now logs will refine it). Numeric-constant rule: this literal is authoritative.
+pub const fn default_phase3_overcommit_churn_throttle_low() -> u32 {
+    2_000
+}
+
+/// (#task-memgate-twosignal) Default HIGH edge of the churn-throttle band (20000
+/// events/sec): at/above this churn the effective factor is clamped to 1.0 (no
+/// overcommit). UNCALIBRATED (see `_low`). Numeric-constant rule: authoritative.
+pub const fn default_phase3_overcommit_churn_throttle_high() -> u32 {
+    20_000
 }
 
 /// (#sched-cpu-first §3) Default synthetic P-load per assigned-but-unreported
