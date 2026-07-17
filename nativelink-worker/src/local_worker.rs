@@ -3269,14 +3269,18 @@ pub fn handle_blobs_in_stable_storage_for_store(
             cas_fss.remove_mirror_blobs(&acked_digests);
             let removed = before - cas_fss.mirror_blob_count();
             if removed > 0 {
-                info!(
+                // Per-chunk BIS-unpin firehose (~245 chunks/s live);
+                // trace! so prod release builds compile it out.
+                trace!(
                     removed,
                     remaining = cas_fss.mirror_blob_count(),
                     "BlobsInStableStorage CAS: removed mirror blobs from memory"
                 );
             }
         }
-        info!(
+        // Per-chunk BIS-unpin firehose (~245 chunks/s live); trace! so
+        // prod release builds compile it out.
+        trace!(
             unpinned = decoded,
             failed,
             digest_count,
@@ -3311,7 +3315,11 @@ pub fn handle_blobs_in_stable_storage_for_store(
                     .collect()
             };
             for (digest, ack_delay_ms) in acked_with_delays {
-                info!(
+                // Per-DIGEST BIS-ack firehose (~1,470 events/s live);
+                // trace! so prod release builds compile it out. The
+                // worker_bis_ack_received counter below is the durable
+                // signal and is unaffected.
+                trace!(
                     ?digest,
                     ack_delay_ms,
                     store_id,
@@ -3319,7 +3327,9 @@ pub fn handle_blobs_in_stable_storage_for_store(
                 );
                 target.metrics.worker_bis_ack_received.inc();
             }
-            info!(
+            // Per-chunk BIS-unpin firehose; trace! so prod release
+            // builds compile it out.
+            trace!(
                 unpinned = decoded,
                 failed, digest_count, store_id, "BlobsInStableStorage AC: dropped local AC pins"
             );
@@ -5199,13 +5209,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         }
                         Update::BlobsInStableStorage(blobs) => {
                             let digest_count = blobs.digests.len();
-                            info!(
+                            // Per-broadcast BIS receive-arm firehose;
+                            // trace! so prod release builds compile it out.
+                            trace!(
                                 target: "nativelink::stable_storage_received",
                                 digest_count,
                                 "BlobsInStableStorage: arm entered (BEFORE any gate)"
                             );
                             if let Some(ref state) = self.blobs_available_state {
-                                info!(
+                                trace!(
                                     target: "nativelink::stable_storage_gate",
                                     digest_count,
                                     "blobs_available_state present, processing"
@@ -5256,7 +5268,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     let digest_count = chunk.digests.len();
                                     let broadcast_id = chunk.broadcast_id;
                                     let sequence = chunk.sequence;
-                                    info!(
+                                    // Per-chunk BIS receive-arm firehose
+                                    // (~245 chunks/s live); trace! so prod
+                                    // release builds compile it out.
+                                    trace!(
                                         target: "nativelink::stable_storage_chunked_received",
                                         broadcast_id,
                                         sequence,
