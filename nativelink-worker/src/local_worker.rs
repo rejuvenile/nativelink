@@ -449,27 +449,51 @@ pub(super) fn split_pe_ticks(
     }
 }
 
-/// (#37 rev-4) One sampler-tick read of the two memory-pressure signals.
-/// `free_bytes` is the PRIMARY (leading) available-memory floor — reclaimable
-/// host RAM (free+inactive+purgeable pages on macOS); the gate trips when
-/// this falls below `FREE_FLOOR_BYTES`. `refault_cumulative` is the
-/// CORROBORATION (a monotonic counter the sampler turns into a per-second
-/// rate via the existing delta/elapsed → EWMA pipeline) — pages faulting
-/// BACK in (macOS `decompressions+swapins`) / cumulative memory-stall µs
-/// (Linux PSI `full total=`). Both come from a SINGLE platform read so the
-/// two signals are coherent for one tick (design §0-rev4.2/.3/.4).
+/// (#task-memgate-twosignal) One sampler-tick read of the memory-pressure
+/// signals — SPLIT into the three demand/supply counters the two-signal gate
+/// keys off, PLUS the free-floor fail-safe. All come from a SINGLE platform
+/// read so the signals are coherent for one tick.
+///
+/// The signal model (web-verified 2026-07-16): macOS decompresses ONLY on
+/// page fault (demand-driven), so `decompressions` and `swapins` are RELIABLE
+/// demand signals; `compressions` is a SUPPLY/proactive signal. They measure
+/// different depths — `swapins` (RAM+compressor overflowed to DISK) is the
+/// OOM-adjacent HARD signal; `decompressions` (working-set > uncompressed RAM)
+/// is a per-fault LATENCY signal. `compressions` alone is confounded (proactive
+/// cold-page reclaim), but `min(compressions, decompressions)` is high ONLY
+/// when the compressor is CHURNING (pages compressed to reclaim AND immediately
+/// faulted back = working set exceeds uncompressed RAM = genuine pressure) —
+/// the graded perf scalar (operator insight, 2026-07-16).
 #[derive(Clone, Copy)]
 pub(super) struct MemorySignals {
-    /// Reclaimable host RAM in bytes (the free-floor PRIMARY): on macOS this
+    /// Reclaimable host RAM in bytes (the free-floor FAIL-SAFE): on macOS this
     /// is `(free_count + inactive_count + purgeable_count) * page_size` — the
     /// full pool of pages the kernel can reclaim without swapping. The old
     /// raw-`free_count` floor false-tripped fleet-wide (#64 incident
     /// `5132d6c9`): busy raw-free is normally 200-900 MiB even when 7+ GiB
     /// are available. Speculative pages are already counted in `free_count`
-    /// (XNU vm_statistics.h:158-163) and are NOT added separately.
+    /// (XNU vm_statistics.h:158-163) and are NOT added separately. macOS keeps
+    /// `available` up BY compressing, so this floor is BLIND to
+    /// compression-hidden overcommit (fires only near-exhaustion) — it is the
+    /// last-ditch fail-safe, no longer the primary.
     pub(super) free_bytes: u64,
-    /// Monotonic re-fault / memory-stall counter (the CORROBORATION).
-    pub(super) refault_cumulative: u64,
+    /// Monotonic macOS `compressions` counter (Linux: PSI `full total=` µs, the
+    /// same demand/stall analogue used for `decompressions`). SUPPLY/proactive
+    /// on its own; folded with `decompressions` into the compressor-CHURN scalar
+    /// (`min(compress_rate, decompress_rate)` is high only when BOTH are high).
+    pub(super) compressions_cumulative: u64,
+    /// Monotonic macOS `decompressions` counter (Linux: PSI `full total=` µs) —
+    /// pages faulting BACK in from the compressor. The DEMAND/latency signal;
+    /// half of the compressor-churn scalar. Does NOT hard-NAK (it is perf, not
+    /// OOM).
+    pub(super) decompressions_cumulative: u64,
+    /// Monotonic macOS `swapins` counter (Linux: `/proc/vmstat` `pswpin`, real
+    /// disk swap-in pages) — the OOM-adjacent HARD signal. Baseline is 0 (a full
+    /// dbg build measured 0 swapins), so a SUSTAINED swapin rate needs no
+    /// calibration: any sustained swapin = working set overflowed RAM+compressor
+    /// to disk. Drives the OOM `MEMORY_PRESSURED` boolean (with the free-floor
+    /// fail-safe).
+    pub(super) swapins_cumulative: u64,
 }
 
 /// Compute available memory bytes from raw page counts and page size.
@@ -554,16 +578,29 @@ mod mem_impl {
             }
         }
         let free_bytes = avail_kib?.saturating_mul(1024);
-        // PSI is best-effort: a kernel without CONFIG_PSI has no file, in
-        // which case the corroboration is 0 (the free-floor primary still
-        // gates). `full … total=<µs>` is the cumulative stall counter.
-        let refault_cumulative = std::fs::read_to_string("/proc/pressure/memory")
+        // (#task-memgate-twosignal) Linux analogues of the macOS three-counter
+        // split. The production fleet is macOS; Linux is a fallback (dev/tests
+        // read the pure fns, not this platform impl), so the mapping is a sane
+        // approximation, not a calibrated port:
+        // - swapins = `/proc/vmstat` `pswpin` (pages swapped IN from disk) — the
+        //   direct analogue of macOS `Swapins` (real disk-spill demand).
+        // - compressions == decompressions == PSI `full total=<µs>` (cumulative
+        //   memory-stall). Stock Linux has no compressor-churn counter, so the
+        //   churn scalar `min(comp, decomp)` collapses to the PSI stall rate — a
+        //   reasonable "how pressured" analogue. Absent PSI (no CONFIG_PSI) ⇒ 0.
+        let psi_stall = std::fs::read_to_string("/proc/pressure/memory")
             .ok()
             .and_then(|psi| read_psi_full_total(&psi))
             .unwrap_or(0);
+        let swapins_cumulative = std::fs::read_to_string("/proc/vmstat")
+            .ok()
+            .and_then(|vmstat| read_vmstat_counter(&vmstat, "pswpin"))
+            .unwrap_or(0);
         Some(MemorySignals {
             free_bytes,
-            refault_cumulative,
+            compressions_cumulative: psi_stall,
+            decompressions_cumulative: psi_stall,
+            swapins_cumulative,
         })
     }
 
@@ -578,6 +615,18 @@ mod mem_impl {
                         return val.parse().ok();
                     }
                 }
+            }
+        }
+        None
+    }
+
+    /// (#task-memgate-twosignal) Parse a named single-value counter (e.g.
+    /// `pswpin <n>`) from `/proc/vmstat`. Returns `None` if the key is absent
+    /// or unparsable (caller treats as 0).
+    fn read_vmstat_counter(vmstat: &str, key: &str) -> Option<u64> {
+        for line in vmstat.lines() {
+            if let Some(rest) = line.strip_prefix(key) {
+                return rest.split_whitespace().next().and_then(|v| v.parse().ok());
             }
         }
         None
@@ -755,12 +804,19 @@ mod mem_impl {
         // in free_count (XNU vm_statistics.h:158-163), do NOT add it again.
         let inactive_count = u64::from(stats.inactive_count);
         let purgeable_count = u64::from(stats.purgeable_count);
+        // (#task-memgate-twosignal) The three counters are now published
+        // SEPARATELY (they were summed into a single `refault_cumulative` before):
+        // `swapins` drives the OOM hard-gate; `compressions`+`decompressions` feed
+        // the compressor-churn perf scalar.
+        let compressions = stats.compressions;
         let decompressions = stats.decompressions;
         let swapins = stats.swapins;
         let page_size = read_page_size()?;
         Some(MemorySignals {
             free_bytes: super::compute_available_bytes(free_count, inactive_count, purgeable_count, page_size),
-            refault_cumulative: decompressions.saturating_add(swapins),
+            compressions_cumulative: compressions,
+            decompressions_cumulative: decompressions,
+            swapins_cumulative: swapins,
         })
     }
 }
@@ -786,17 +842,20 @@ static E_CORE_PCT: AtomicU32 = AtomicU32::new(0);
 /// gate keys off the free-floor PRIMARY below, not this lingering LEVEL
 /// gauge (swap occupancy can stay high long after pressure subsides).
 static SWAP_USED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// (#37 rev-4, re-enable follow-up) Worker memory-pressure LEVEL: how far
-/// the available-memory headroom (free+inactive+purgeable on macOS) has
-/// fallen below the gate's `FREE_FLOOR_BYTES`, expressed in MiB-below-floor
-/// (`0` whenever available is at or above the floor, which is the normal
-/// state on a healthy worker — 7-8 GiB available vs 1 GiB floor). Refreshed
-/// by the sampler thread every 100 ms; carried on the wire (field 20) for
-/// observability AND for the server's least-pressured fail-open ranking
-/// (`min_by_key` — lower = less pressured). This is the PRIMARY-signal
-/// magnitude, NOT the old re-fault rate. The gate verdict itself is the
-/// boolean `MEMORY_PRESSURED` below; this scalar is the "how pressured"
-/// gauge behind it.
+/// (#task-memgate-twosignal) Worker GRADED perf scalar: the compressor-CHURN
+/// EWMA (`min(compress_rate_ewma, decompress_rate_ewma)`, events/sec, saturating
+/// `u32`). RE-KEYED from the old MiB-below-floor magnitude: this scalar is now
+/// the "how pressured (perf)" signal the scheduler consumes — the least-pressured
+/// `min_by_key` fail-open ranking (lower = less pressured) AND the NET-NEW DOWN
+/// overcommit churn-throttle (a churning candidate backs off overcommit). Refreshed
+/// by the sampler thread every 100 ms; carried on the wire (field 20). High ONLY
+/// when compression AND decompression are BOTH high (the compressor is thrashing);
+/// proactive cold-page reclaim (compress-high, decompress-low) and one-time
+/// working-set shifts (decompress-high, compress-low) both yield a LOW `min` →
+/// no false pressure. Does NOT hard-NAK (perf, not OOM — the OOM boolean
+/// `MEMORY_PRESSURED` keys off SWAPINS + the free-floor). The scalar is published
+/// unconditionally (regardless of `MEMORY_GATE_ENABLED`) so the scheduler ranking
+/// + throttle see it even when the OOM gate is off.
 static MEMORY_PRESSURE_LEVEL: AtomicU32 = AtomicU32::new(0);
 /// (#37) Monotonic nanoseconds (since `PROCESS_START`) at which the
 /// memory sampler last published a value. The worker-local gate reads this
@@ -806,25 +865,28 @@ static MEMORY_PRESSURE_LEVEL: AtomicU32 = AtomicU32::new(0);
 /// no age atomic to inherit. Monotonic source so an NTP step cannot
 /// spuriously trip or suppress the fail-open. `0` = never sampled yet.
 static LAST_SAMPLE_INSTANT: AtomicU64 = AtomicU64::new(0);
-/// (#37 rev-4) Coarse 1-bit gate verdict published by the sampler: `true`
-/// when the free-page FLOOR is breached (PRIMARY) OR the re-fault-rate
-/// EWMA crosses `REFAULT_CONFIRM_RATE` (CORROBORATION), AND the sample is
-/// fresh (design §0-rev4 AND/OR logic). Mirrors `indefinite_pin_saturated`:
-/// the heartbeat carries it (advisory matcher hint) and the worker-local
-/// StartAction NAK reads it (authoritative gate — the local atomic, never
-/// the wire boolean, is the safety-critical decision). `false` when
-/// fresh-and-healthy, stale (fail-open), or sampler-unavailable.
+/// (#task-memgate-twosignal) Coarse 1-bit OOM gate verdict published by the
+/// sampler: `true` when the free-page FLOOR is breached (fail-safe) OR the
+/// SWAPIN rate has stayed above `SWAPIN_CONFIRM_RATE` for `SWAPIN_CONFIRM_WINDOW_TICKS`
+/// consecutive ticks (the sustained-window OOM signal — a one-off spike touching
+/// ancient swapped pages does NOT trip), AND the sample is fresh (OR logic).
+/// The compressor-churn perf scalar does NOT participate here — it is perf, not
+/// OOM. Mirrors `indefinite_pin_saturated`: the heartbeat carries it (advisory
+/// matcher hint) and the worker-local StartAction NAK reads it (authoritative
+/// gate — the local atomic, never the wire boolean, is the safety-critical
+/// decision). `false` when fresh-and-healthy, stale (fail-open), or
+/// sampler-unavailable.
 static MEMORY_PRESSURED: AtomicBool = AtomicBool::new(false);
-/// (#37 re-enable follow-up) Per-trip-source latch set by the sampler on
+/// (#task-memgate-twosignal) Per-trip-source latch set by the sampler on
 /// every tick where the gate is enabled AND pressured; cleared when not
 /// pressured, when the gate is disabled, or when the signal read fails
 /// (unreadable tick). Lets the StartAction NAK warn log WHICH signal tripped
-/// so canary soak data distinguishes a free-floor NAK from a refault NAK
+/// so soak data distinguishes a free-floor NAK from a swapin NAK
 /// unambiguously. Both are published independently — either or both can be
 /// set when `MEMORY_PRESSURED` is true.
 static MEMORY_GATE_TRIP_FREE_FLOOR: AtomicBool = AtomicBool::new(false);
-/// See `MEMORY_GATE_TRIP_FREE_FLOOR` — refault-path trip source latch.
-static MEMORY_GATE_TRIP_REFAULT: AtomicBool = AtomicBool::new(false);
+/// See `MEMORY_GATE_TRIP_FREE_FLOOR` — sustained-SWAPIN OOM-path trip source latch.
+static MEMORY_GATE_TRIP_SWAPIN: AtomicBool = AtomicBool::new(false);
 static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// (F4) Physical free bytes on the worker's CAS/work_directory volume, refreshed
@@ -1010,9 +1072,10 @@ static PROCESS_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(In
 /// safe-enable value PENDING a busy-worker soak that refines it (the soak
 /// optimizes LEAD-TIME; it does NOT gate enablement, given the 100×
 /// separation makes a false-trip on a healthy worker structurally
-/// implausible at this margin). The companion re-fault CORROBORATION
-/// (`REFAULT_CONFIRM_RATE`) catches any pathology where free reads
-/// non-floor but the box is actively thrashing. See design §0-rev4.2/.8.
+/// implausible at this margin). The companion sustained-SWAPIN OOM signal
+/// (`SWAPIN_CONFIRM_RATE`) catches the compression-hidden overcommit case
+/// where free reads non-floor (macOS keeps `available` up by compressing)
+/// but the box has spilled to disk swap. See design §0-rev4.2/.8.
 const FREE_FLOOR_BYTES: u64 = 1 << 30; // 1 GiB
 
 /// (#37 rev-4) Hysteresis band above `FREE_FLOOR_BYTES` for CLEARING the
@@ -1023,25 +1086,36 @@ const FREE_FLOOR_BYTES: u64 = 1 << 30; // 1 GiB
 /// MiB = a quarter of the floor.
 const FREE_FLOOR_HYSTERESIS: u64 = 256 << 20; // 256 MiB
 
-/// (#37 rev-4 / #64 canary-soak addendum) CORROBORATION threshold: the re-fault-rate
-/// EWMA (events/sec) above which the gate trips on the secondary signal even if the
-/// free-floor is not breached (the "already over the edge / actively thrashing" confirm
-/// — design §0-rev4.3/.4). CONSERVATIVE default: 10000/s, the former compile-time const.
-/// The idle probe showed thrash at 44K–297K re-faults/s with a non-thrash max of ~1503/s,
-/// so 10000/s sits with wide margin above any non-thrash baseline and well below genuine
-/// thrash. NOT soak-validated — pending the busy-worker soak that characterizes the
-/// baseline re-fault rate under normal multi-action load.
+/// (#task-memgate-twosignal) OOM hard-gate threshold: the SWAPIN rate
+/// (Δswapins/Δt, events/sec) at/above which a sampler tick counts toward the
+/// sustained-swapin OOM trip. `Swapins` = working set overflowed RAM+compressor
+/// to DISK = OOM-adjacent. The baseline is genuinely 0 (measured: 0 swapins
+/// across a full `--config=dbg` build), so a sustained swapin needs NO
+/// calibration — the default `100/s` sits far above the 0 baseline yet trips on
+/// any genuine, non-trivial disk spill. A ONE-OFF spike (a single tick touching
+/// ancient swapped pages) does NOT trip: the trip also requires
+/// `SWAPIN_CONFIRM_WINDOW_TICKS` CONSECUTIVE ticks at/above this rate.
 ///
-/// Now config-sourced (like `MEMORY_GATE_ENABLED`): set ONCE at worker startup from
-/// `LocalWorkerConfig::memory_gate_refault_confirm_rate` (default `10000`). Relaxed
-/// ordering is sufficient — the startup store happens-before the sampler-thread spawn
-/// (same justification as `MEMORY_GATE_ENABLED`). A very high value (e.g. `u32::MAX`)
-/// disables the refault path (free-floor-only soak); re-calibrate downward after the
-/// soak characterises the busy-worker refault baseline.
+/// Config-sourced (like `MEMORY_GATE_ENABLED`): set ONCE at worker startup from
+/// `LocalWorkerConfig::memory_gate_swapin_confirm_rate` (default `100`). Relaxed
+/// ordering is sufficient — the startup store happens-before the sampler-thread
+/// spawn (same justification as `MEMORY_GATE_ENABLED`). `NonZeroU32` in config
+/// (0 would trip on every tick = self-inflicted NAK storm, the #64 failure mode).
+static SWAPIN_CONFIRM_RATE: AtomicU32 = AtomicU32::new(100);
+
+/// (#task-memgate-twosignal) OOM hard-gate SUSTAINED WINDOW: the number of
+/// CONSECUTIVE sampler ticks the swapin rate must stay at/above
+/// `SWAPIN_CONFIRM_RATE` before the OOM boolean trips. At the 100 ms sampler
+/// cadence, the default `10` ticks ≈ 1 s of sustained disk spill — enough to
+/// reject a one-off spike (a lone tick touching ancient swapped pages resets the
+/// consecutive-tick count to 0) while still leading a real OOM by ~1 s. The
+/// count resets to 0 whenever a tick reads below the rate.
 ///
-/// The free-floor PRIMARY is the load-bearing trip; this confirm strengthens but is
-/// not required for the gate to fire.
-static REFAULT_CONFIRM_RATE: AtomicU32 = AtomicU32::new(10_000);
+/// Config-sourced: set ONCE at worker startup from
+/// `LocalWorkerConfig::memory_gate_swapin_confirm_window_ticks` (default `10`).
+/// `NonZeroU32` in config (0 = no window = trip on the first tick = one-off
+/// spikes trip, defeating the whole point).
+static SWAPIN_CONFIRM_WINDOW_TICKS: AtomicU32 = AtomicU32::new(10);
 
 /// (#37 re-enable follow-up) Master enable for the worker-local memory-pressure
 /// admission gate and its proactive heartbeat boolean. Set ONCE at worker
@@ -1051,11 +1125,12 @@ static REFAULT_CONFIRM_RATE: AtomicU32 = AtomicU32::new(10_000);
 /// `worker.json5`; flip the rest only after the soak passes.
 ///
 /// When enabled: the gate NAKs new `StartAction`s under sustained pressure
-/// (available below `FREE_FLOOR_BYTES` OR re-fault EWMA above
-/// `REFAULT_CONFIRM_RATE`) and the matcher proactively skips a pressured
-/// worker; the §3a sampler-dead fail-open and the §5 fleet fail-open keep a
-/// dead sampler or an all-pressured fleet from wedging. The sampler always
-/// publishes the level + swap-used for observability regardless of this flag.
+/// (available below `FREE_FLOOR_BYTES` OR SWAPIN rate sustained above
+/// `SWAPIN_CONFIRM_RATE` for `SWAPIN_CONFIRM_WINDOW_TICKS` ticks) and the
+/// matcher proactively skips a pressured worker; the §3a sampler-dead fail-open
+/// and the §5 fleet fail-open keep a dead sampler or an all-pressured fleet from
+/// wedging. The sampler always publishes the churn scalar + swap-used for
+/// observability regardless of this flag.
 ///
 /// DEFAULT: `false` — DISABLED, zero production behavior change. The #64
 /// incident (`5132d6c9`, 2026-06-24) disabled the gate because the old raw
@@ -1218,28 +1293,72 @@ fn memory_pressure_level_mib(free_bytes: u64) -> u32 {
     u32::try_from(shortfall >> 20).unwrap_or(u32::MAX)
 }
 
-/// (#37 rev-4) The combined gate verdict the sampler publishes: pressured
-/// when the gate is ENABLED and EITHER the free-floor PRIMARY is breached OR
-/// the re-fault CORROBORATION confirms thrash (design §0-rev4.4 OR logic).
+/// (#task-memgate-twosignal) The OOM gate verdict the sampler publishes:
+/// pressured when the gate is ENABLED and EITHER the free-floor fail-safe is
+/// breached OR the SUSTAINED-SWAPIN OOM signal confirms disk spill (OR logic).
+/// The compressor-churn perf scalar does NOT participate — it is perf, not OOM.
 /// Held `false` entirely while `enabled` is `false` so the proactive matcher
 /// skip never fires on an unproven threshold. Pure function of the three
 /// inputs so the OR logic is unit-testable AND so the production sampler and
 /// the test bind to the SAME expression (a mutation deleting either disjunct
 /// red-fails the test).
-const fn memory_gate_verdict(enabled: bool, free_tripped: bool, refault_confirmed: bool) -> bool {
-    enabled && (free_tripped || refault_confirmed)
+const fn memory_gate_verdict(enabled: bool, free_tripped: bool, swapin_sustained: bool) -> bool {
+    enabled && (free_tripped || swapin_sustained)
 }
 
-/// Per-tick memory-sampler state threaded through the sampler loop. `prev`
-/// is the last cumulative re-fault counter + the `Instant` it was read (so
-/// the rate uses the REAL elapsed interval, robust to sampler jitter, not
-/// an assumed 100 ms). `ewma` is the running fast-attack/slow-release
-/// estimate of the re-fault rate (the CORROBORATION). `free_tripped` holds
-/// the free-floor (PRIMARY) hysteresis-band verdict across ticks.
+/// (#task-memgate-twosignal) The SUSTAINED-WINDOW step for the SWAPIN OOM
+/// signal. Returns `(new_consecutive_ticks, tripped)`:
+/// - `new_consecutive_ticks` = `prev_ticks + 1` (saturating) when this tick's
+///   swapin `rate >= threshold`, else `0` (a lone sub-threshold tick RESETS the
+///   run — so a one-off spike touching ancient swapped pages never accumulates).
+/// - `tripped` = the OOM signal fires ONLY when the run reaches `window`
+///   consecutive at/above-threshold ticks. `window == 0` is guarded upstream
+///   (config `NonZeroU32`), so `>= window` is never trivially true.
+///
+/// Pure → the sustained-window contract is unit-testable without the sampler's
+/// atomics/`Instant`. Mutating `>= window` to `>= 1` (fire on the first tick)
+/// makes a one-off spike trip → the sustained-window test red-fails.
+const fn swapin_sustained_step(
+    prev_ticks: u32,
+    rate: u32,
+    threshold: u32,
+    window: u32,
+) -> (u32, bool) {
+    let ticks = if rate >= threshold {
+        prev_ticks.saturating_add(1)
+    } else {
+        0
+    };
+    (ticks, ticks >= window)
+}
+
+/// (#task-memgate-twosignal, operator insight) The compressor-CHURN perf scalar:
+/// `min(compress_rate_ewma, decompress_rate_ewma)`. High ONLY when compression
+/// AND decompression are BOTH high (the compressor is thrashing: pages compressed
+/// to reclaim RAM AND immediately faulted back = working set exceeds uncompressed
+/// RAM = genuine pressure). It FILTERS the two confounds decompression-alone
+/// can't: proactive cold-page reclaim (compress-high, decompress-low → low `min`)
+/// and a one-time working-set shift (decompress-high, compress-low → low `min`).
+/// Both EWMAs are already smoothed (fast-attack/slow-release), so the scalar is
+/// damped, not a spike. Pure → unit-testable.
+fn churn_scalar(compress_ewma: f64, decompress_ewma: f64) -> f64 {
+    compress_ewma.min(decompress_ewma)
+}
+
+/// Per-tick memory-sampler state threaded through the sampler loop. `prev` is
+/// the last cumulative `(compressions, decompressions, swapins)` counters + the
+/// `Instant` they were read (so each rate uses the REAL elapsed interval, robust
+/// to sampler jitter, not an assumed 100 ms). `compress_ewma` / `decompress_ewma`
+/// are the running fast-attack/slow-release estimates whose `min` is the graded
+/// churn scalar. `swapin_sustained_ticks` counts consecutive at/above-threshold
+/// swapin ticks for the OOM sustained-window. `free_tripped` holds the free-floor
+/// fail-safe hysteresis-band verdict across ticks.
 #[derive(Clone, Copy)]
 struct SwapSamplerState {
-    prev: Option<(u64, Instant)>,
-    ewma: f64,
+    prev: Option<(u64, u64, u64, Instant)>,
+    compress_ewma: f64,
+    decompress_ewma: f64,
+    swapin_sustained_ticks: u32,
     free_tripped: bool,
 }
 
@@ -1247,7 +1366,9 @@ impl SwapSamplerState {
     const fn new() -> Self {
         Self {
             prev: None,
-            ewma: 0.0,
+            compress_ewma: 0.0,
+            decompress_ewma: 0.0,
+            swapin_sustained_ticks: 0,
             free_tripped: false,
         }
     }
@@ -1256,16 +1377,24 @@ impl SwapSamplerState {
 /// Sample host memory pressure on the sampler thread's fixed cadence and
 /// publish into the atomics the heartbeat + the worker-local gate read.
 /// Updates: `SWAP_USED_BYTES` (level gauge, observability),
-/// `MEMORY_PRESSURE_LEVEL` (MiB below the free-floor, wire/observability +
-/// fail-open ranking), `LAST_SAMPLE_INSTANT` (sample-age liveness for the
-/// fail-open), and `MEMORY_PRESSURED` (the rev-4 free-floor-OR-re-fault gate
-/// verdict). Returns the new `SwapSamplerState` to thread into the next
-/// tick.
+/// `MEMORY_PRESSURE_LEVEL` (the compressor-CHURN perf scalar, wire/observability
+/// + the scheduler's least-pressured ranking + DOWN churn-throttle),
+/// `LAST_SAMPLE_INSTANT` (sample-age liveness for the fail-open), and
+/// `MEMORY_PRESSURED` (the two-signal OOM verdict). Returns the new
+/// `SwapSamplerState` to thread into the next tick.
 ///
-/// rev-4 trip logic (design §0-rev4.4): the gate is pressured when the
-/// free-page FLOOR is breached (PRIMARY, a LEVEL with a hysteresis band) OR
-/// the re-fault-rate EWMA crosses `REFAULT_CONFIRM_RATE` (CORROBORATION, a
-/// RATE on the existing fast-attack/slow-release pipeline).
+/// (#task-memgate-twosignal) Two-signal trip logic:
+/// - OOM boolean `MEMORY_PRESSURED` = free-floor fail-safe breached OR SWAPIN
+///   rate sustained above `SWAPIN_CONFIRM_RATE` for `SWAPIN_CONFIRM_WINDOW_TICKS`
+///   consecutive ticks. Swapins are the OOM-adjacent disk-spill signal
+///   (baseline 0, so calibration-free).
+/// - GRADED churn scalar `MEMORY_PRESSURE_LEVEL` = `min(compress_ewma,
+///   decompress_ewma)` — high only when the compressor is thrashing. Perf, not
+///   OOM: it NEVER hard-NAKs; it feeds the scheduler ranking + throttle.
+///
+/// All three raw rates (compress/decompress/swapin) are mirrored to the
+/// /metrics singleton for calibration (we have no compression-rate soak data
+/// yet — this logging is what will let us set the churn-throttle band later).
 fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     // swap-used is an absolute gauge — publish whatever we read (0 if
     // unavailable), no prev-state needed. Observability only.
@@ -1301,75 +1430,110 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
         // entirely trips the age fail-open.)
         MEMORY_PRESSURE_LEVEL.store(0, Ordering::Relaxed);
         // (#64 dark-signals) Signals unreadable → no pressure; mirror 0 so the
-        // gauge reads 0 on the unreadable path (consistent with the static).
-        nativelink_util::o11_probes::memory_gate_counters()
-            .pressure_level_mib
-            .store(0, Ordering::Relaxed);
+        // gauges read 0 on the unreadable path (consistent with the statics).
+        let counters = nativelink_util::o11_probes::memory_gate_counters();
+        counters.pressure_level_mib.store(0, Ordering::Relaxed);
+        counters.churn_ewma.store(0, Ordering::Relaxed);
+        counters.compress_rate_last.store(0, Ordering::Relaxed);
+        counters.decompress_rate_last.store(0, Ordering::Relaxed);
+        counters.swapin_rate_last.store(0, Ordering::Relaxed);
         MEMORY_PRESSURED.store(false, Ordering::Relaxed);
         // Clear per-source trip latches for consistency: an unreadable tick
         // is not a tripped tick, and the NAK-path structured log would be
         // misleading if a previous trip's latch remained set.
         MEMORY_GATE_TRIP_FREE_FLOOR.store(false, Ordering::Relaxed);
-        MEMORY_GATE_TRIP_REFAULT.store(false, Ordering::Relaxed);
+        MEMORY_GATE_TRIP_SWAPIN.store(false, Ordering::Relaxed);
+        // Drop the prev anchor (rate gap) and RESET the sustained-swapin run (an
+        // unreadable tick breaks the consecutive-window streak). Keep the EWMAs
+        // (they decay on the next readable tick).
         return SwapSamplerState {
             prev: None,
-            ewma: state.ewma,
+            compress_ewma: state.compress_ewma,
+            decompress_ewma: state.decompress_ewma,
+            swapin_sustained_ticks: 0,
             free_tripped: false,
         };
     };
 
-    // PRIMARY (leading): free-page floor, a LEVEL with a hysteresis band.
+    // FAIL-SAFE (leading, last-ditch): free-page floor, a LEVEL with a
+    // hysteresis band. macOS keeps `available` up by compressing, so this is
+    // BLIND to compression-hidden overcommit — the swapin OOM signal is the
+    // primary; this is the belt-and-braces backstop.
     let free_tripped = free_floor_breached(signals.free_bytes, state.free_tripped);
-    // Publish the "how pressured" magnitude (MiB below the floor) for
-    // observability + the server's least-pressured fail-open ranking.
+    // Publish the free-floor shortfall magnitude for observability (NO LONGER the
+    // wire scalar — the churn scalar below is; kept as a diagnostic gauge).
     let pressure_level = memory_pressure_level_mib(signals.free_bytes);
-    MEMORY_PRESSURE_LEVEL.store(pressure_level, Ordering::Relaxed);
-    // (#64 dark-signals) Mirror to the /metrics singleton. Cost: 1 extra
-    // AtomicStore(Relaxed) per ~100ms sampler tick, off the request path.
-    nativelink_util::o11_probes::memory_gate_counters()
-        .pressure_level_mib
-        .store(pressure_level, Ordering::Relaxed);
-
-    // CORROBORATION (secondary): re-fault rate → fast-attack/slow-release
-    // EWMA, on the existing delta/elapsed pipeline.
-    let rate = if let Some((prev_count, prev_at)) = state.prev {
-        let elapsed = now.duration_since(prev_at).as_secs_f64();
-        compute_swap_pressure_rate(prev_count, signals.refault_cumulative, elapsed)
-    } else {
-        // First sample: no interval to rate against yet.
-        0
-    };
-    let ewma = update_swap_ewma(state.ewma, f64::from(rate));
-    let refault_confirmed = ewma >= f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed));
-
-    // (#64 canary-soak) Publish EWMA + raw rate to the process-singleton so
-    // they appear on /metrics unconditionally (NOT gated on MEMORY_GATE_ENABLED).
-    // The sampler runs regardless of gate state (start_cpu_sampler is called
-    // unconditionally in new_local_worker), so these gauges populate on ALL
-    // workers and characterise the fleet baseline during the soak.
-    // `ewma.round()` → i64 → saturating u32. Both saturation cases are
-    // unreachable from real load: the EWMA folds non-negative `u32` samples with
-    // non-negative weights, so it never goes negative (a negative would map to
-    // u32::MAX via unwrap_or, not 0) and never exceeds u32::MAX. Observability
-    // only; a degenerate fp value would merely misreport, not affect the gate.
-    let ewma_rounded = u32::try_from(ewma.round() as i64).unwrap_or(u32::MAX);
     let counters = nativelink_util::o11_probes::memory_gate_counters();
-    counters.refault_ewma.store(ewma_rounded, Ordering::Relaxed);
-    counters.refault_rate_last.store(rate, Ordering::Relaxed);
+    counters.pressure_level_mib.store(pressure_level, Ordering::Relaxed);
 
-    // Trip when the free-floor PRIMARY is breached OR the re-fault
-    // CORROBORATION confirms thrash (design §0-rev4.4 OR logic).
+    // Compute the three per-second rates from the cumulative counters over the
+    // REAL elapsed interval (first sample: no interval → 0).
+    let (compress_rate, decompress_rate, swapin_rate) = if let Some((
+        prev_comp,
+        prev_decomp,
+        prev_swapin,
+        prev_at,
+    )) = state.prev
+    {
+        let elapsed = now.duration_since(prev_at).as_secs_f64();
+        (
+            compute_swap_pressure_rate(prev_comp, signals.compressions_cumulative, elapsed),
+            compute_swap_pressure_rate(prev_decomp, signals.decompressions_cumulative, elapsed),
+            compute_swap_pressure_rate(prev_swapin, signals.swapins_cumulative, elapsed),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    // GRADED perf scalar: fold compression + decompression through the existing
+    // fast-attack/slow-release EWMA (damping/hysteresis), then take the `min`
+    // (compressor-churn — high only when BOTH are high).
+    let compress_ewma = update_swap_ewma(state.compress_ewma, f64::from(compress_rate));
+    let decompress_ewma = update_swap_ewma(state.decompress_ewma, f64::from(decompress_rate));
+    let churn = churn_scalar(compress_ewma, decompress_ewma);
+    // `churn.round()` → i64 → saturating u32. Non-negative EWMAs of non-negative
+    // rates → the value is in [0, u32::MAX]; observability + ranking only.
+    let churn_rounded = u32::try_from(churn.round() as i64).unwrap_or(u32::MAX);
+    MEMORY_PRESSURE_LEVEL.store(churn_rounded, Ordering::Relaxed);
+
+    // (#64 dark-signals / #task-memgate-twosignal) Publish the churn scalar + all
+    // three raw rates to the process-singleton so they appear on /metrics
+    // unconditionally (NOT gated on MEMORY_GATE_ENABLED). The sampler runs
+    // regardless of gate state, so these gauges populate on ALL workers and give
+    // the calibration data for the churn-throttle band.
+    counters.churn_ewma.store(churn_rounded, Ordering::Relaxed);
+    counters.compress_rate_last.store(compress_rate, Ordering::Relaxed);
+    counters.decompress_rate_last.store(decompress_rate, Ordering::Relaxed);
+    counters.swapin_rate_last.store(swapin_rate, Ordering::Relaxed);
+
+    // OOM SUSTAINED-SWAPIN signal: require the swapin rate to stay at/above the
+    // threshold for a consecutive-tick window (rejects one-off spikes).
+    let (swapin_ticks, swapin_sustained) = swapin_sustained_step(
+        state.swapin_sustained_ticks,
+        swapin_rate,
+        SWAPIN_CONFIRM_RATE.load(Ordering::Relaxed),
+        SWAPIN_CONFIRM_WINDOW_TICKS.load(Ordering::Relaxed),
+    );
+
+    // OOM verdict: free-floor fail-safe OR sustained swapins (the churn scalar
+    // does NOT participate — perf, not OOM).
     let gate_enabled = MEMORY_GATE_ENABLED.load(Ordering::Relaxed);
-    let pressured = memory_gate_verdict(gate_enabled, free_tripped, refault_confirmed);
+    let pressured = memory_gate_verdict(gate_enabled, free_tripped, swapin_sustained);
     MEMORY_PRESSURED.store(pressured, Ordering::Relaxed);
-    // Publish per-source trip latches for NAK-path structured logging so the
-    // canary soak can distinguish a free-floor NAK from a refault NAK.
+    // Publish per-source trip latches for NAK-path structured logging so soak
+    // data can distinguish a free-floor NAK from a swapin NAK.
     MEMORY_GATE_TRIP_FREE_FLOOR.store(gate_enabled && free_tripped, Ordering::Relaxed);
-    MEMORY_GATE_TRIP_REFAULT.store(gate_enabled && refault_confirmed, Ordering::Relaxed);
+    MEMORY_GATE_TRIP_SWAPIN.store(gate_enabled && swapin_sustained, Ordering::Relaxed);
 
     SwapSamplerState {
-        prev: Some((signals.refault_cumulative, now)),
-        ewma,
+        prev: Some((
+            signals.compressions_cumulative,
+            signals.decompressions_cumulative,
+            signals.swapins_cumulative,
+            now,
+        )),
+        compress_ewma,
+        decompress_ewma,
+        swapin_sustained_ticks: swapin_ticks,
         free_tripped,
     }
 }
@@ -1509,13 +1673,14 @@ fn get_swap_used_bytes() -> u64 {
     SWAP_USED_BYTES.load(Ordering::Relaxed)
 }
 
-/// (#37 rev-4) Returns the worker memory-pressure LEVEL (MiB below the
-/// free-floor), refreshed by the sampler thread. `0` ⇒ free headroom is at
-/// or above `FREE_FLOOR_BYTES` (healthy) OR sampler unavailable; higher ⇒
-/// deeper below the floor. This is the wire-field-20 scalar carried for
-/// observability + the server's least-pressured fail-open ranking; the GATE
-/// verdict itself is [`swap_gate_pressured`] (free-floor OR re-fault, with
-/// a sample-age fail-open).
+/// (#task-memgate-twosignal) Returns the worker GRADED perf scalar — the
+/// compressor-CHURN EWMA (`min(compress_rate_ewma, decompress_rate_ewma)`,
+/// events/sec), refreshed by the sampler thread. `0` ⇒ the compressor is not
+/// thrashing (healthy) OR sampler unavailable; higher ⇒ deeper churn. This is
+/// the wire-field-20 scalar carried for observability + the server's
+/// least-pressured fail-open ranking + the DOWN churn-throttle; the OOM GATE
+/// verdict is [`swap_gate_pressured`] (free-floor OR sustained swapins, with a
+/// sample-age fail-open) — the churn scalar does NOT hard-NAK.
 fn get_memory_pressure_level() -> u32 {
     MEMORY_PRESSURE_LEVEL.load(Ordering::Relaxed)
 }
@@ -5629,27 +5794,27 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         // idle-gated NAK.
                                         swap_first_idle_gated_at = Some(now);
                                     }
-                                    // Log per-source trip signal so canary soak data
-                                    // distinguishes a free-floor NAK from a refault NAK.
+                                    // Log per-source trip signal so soak data
+                                    // distinguishes a free-floor NAK from a swapin NAK.
                                     let trip_free_floor =
                                         MEMORY_GATE_TRIP_FREE_FLOOR.load(Ordering::Relaxed);
-                                    let trip_refault =
-                                        MEMORY_GATE_TRIP_REFAULT.load(Ordering::Relaxed);
+                                    let trip_swapin =
+                                        MEMORY_GATE_TRIP_SWAPIN.load(Ordering::Relaxed);
                                     if trip_free_floor {
                                         ::nativelink_util::o11_probes::memory_gate_counters()
                                             .nak_free_floor
                                             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
                                     }
-                                    if trip_refault {
+                                    if trip_swapin {
                                         ::nativelink_util::o11_probes::memory_gate_counters()
-                                            .nak_refault
+                                            .nak_swapin
                                             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
                                     }
                                     warn!(
                                         memory_pressure_level = get_memory_pressure_level(),
                                         in_flight,
                                         trip_free_floor,
-                                        trip_refault,
+                                        trip_swapin,
                                         "worker NAKing action: sustained host memory pressure (additive backstop to memory_kb admission)"
                                     );
                                     if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
@@ -6730,11 +6895,18 @@ pub async fn new_local_worker(
     // and the spawned thread's `Relaxed` reads are ordered after the spawn
     // (happens-before via the thread spawn). Default false = DISABLED.
     MEMORY_GATE_ENABLED.store(config.memory_gate_enabled, Ordering::Relaxed);
-    // (#64 canary-soak addendum) Set the refault confirm threshold from config ONCE,
-    // also before the sampler starts. Same Relaxed justification as MEMORY_GATE_ENABLED
-    // above: startup store happens-before the sampler-thread spawn. Default 10000 =
-    // the old compile-time const, so zero behavior change when the field is absent.
-    REFAULT_CONFIRM_RATE.store(config.memory_gate_refault_confirm_rate.get(), Ordering::Relaxed);
+    // (#task-memgate-twosignal) Set the sustained-swapin OOM threshold + window
+    // from config ONCE, also before the sampler starts. Same Relaxed
+    // justification as MEMORY_GATE_ENABLED above: startup store happens-before the
+    // sampler-thread spawn. Defaults 100/s + 10 ticks (see the statics). The
+    // deprecated `memory_gate_refault_confirm_rate` config field is accepted for
+    // back-compat (deny_unknown_fields) but is NO LONGER wired — the decompress
+    // signal now feeds only the graded churn scalar, never a NAK.
+    SWAPIN_CONFIRM_RATE.store(config.memory_gate_swapin_confirm_rate.get(), Ordering::Relaxed);
+    SWAPIN_CONFIRM_WINDOW_TICKS.store(
+        config.memory_gate_swapin_confirm_window_ticks.get(),
+        Ordering::Relaxed,
+    );
 
     // (F4) Pass work_directory so the disk-free sampler statvfs's the
     // CAS/work_directory volume (shared physical disk by config invariant).
@@ -8908,10 +9080,11 @@ mod tests {
         );
     }
 
-    /// (#37 rev-4) The wire/observability LEVEL scalar (field 20): MiB
-    /// below the free-floor, `0` when at/above it. Higher = more pressured,
-    /// so the server's `min_by_key` least-pressured fail-open ranking stays
-    /// correct.
+    /// (#task-memgate-twosignal) The free-floor shortfall DIAGNOSTIC gauge
+    /// (`pressure_level_mib`): MiB below the free-floor, `0` when at/above it.
+    /// NO LONGER the wire scalar (the compressor-churn EWMA is) — kept as a
+    /// standalone observability gauge for the free-floor fail-safe. Higher =
+    /// deeper shortfall.
     #[test]
     fn memory_pressure_level_is_mib_below_floor() {
         // 256 MiB below the floor ⇒ level 256.
@@ -8989,10 +9162,11 @@ mod tests {
     /// is unchanged at 1 GiB; the formula that computes what is measured
     /// against it has changed.
     ///
-    /// `#[serial(swap_sampler_atomics)]`: this test reads `REFAULT_CONFIRM_RATE`
-    /// and `MEMORY_GATE_ENABLED` — process-global statics mutated by
-    /// `refault_confirm_rate_high_suppresses_refault_path`. Serialized to prevent
-    /// a concurrent `store(u32::MAX)` racing this test's load+assert.
+    /// `#[serial(swap_sampler_atomics)]`: this test reads `SWAPIN_CONFIRM_RATE`,
+    /// `SWAPIN_CONFIRM_WINDOW_TICKS`, and `MEMORY_GATE_ENABLED` — process-global
+    /// statics mutated by `decompress_churn_does_not_hard_nak` /
+    /// `sustained_swapin_trips_gate`. Serialized to prevent a concurrent store
+    /// racing this test's load+assert.
     #[test]
     #[serial(swap_sampler_atomics)]
     fn free_floor_bytes_is_conservative_one_gib() {
@@ -9011,15 +9185,18 @@ mod tests {
             268_435_456,
             "FREE_FLOOR_HYSTERESIS must be 256 MiB (256 << 20)"
         );
-        // The corroboration confirm threshold is the conservative re-fault
-        // rate well above any non-thrash baseline (~1503/s) and below
-        // genuine thrash (44K-297K/s). NOT yet soak-validated under
-        // multi-action build load — the canary soak must characterize the
-        // busy-worker decompression baseline.
+        // (#task-memgate-twosignal) The SWAPIN OOM threshold + window static
+        // inits. Swapin baseline is 0, so 100/s is calibration-free; 10 ticks
+        // ≈ 1 s at the 100 ms cadence rejects one-off spikes.
         assert_eq!(
-            REFAULT_CONFIRM_RATE.load(Ordering::Relaxed), 10_000,
-            "REFAULT_CONFIRM_RATE static init must be 10000/s (conservative re-fault \
-             confirm threshold — default matches old compile-time const)"
+            SWAPIN_CONFIRM_RATE.load(Ordering::Relaxed), 100,
+            "SWAPIN_CONFIRM_RATE static init must be 100/s (calibration-free OOM \
+             threshold — swapin baseline is 0)"
+        );
+        assert_eq!(
+            SWAPIN_CONFIRM_WINDOW_TICKS.load(Ordering::Relaxed), 10,
+            "SWAPIN_CONFIRM_WINDOW_TICKS static init must be 10 ticks (≈1 s at the \
+             100 ms sampler cadence — the sustained-window that rejects spikes)"
         );
         // The gate is config-driven and DEFAULTS OFF. The `MEMORY_GATE_ENABLED`
         // static is set from `LocalWorkerConfig::memory_gate_enabled` at startup
@@ -9445,36 +9622,30 @@ mod tests {
         );
     }
 
-    /// (#37 re-enable follow-up, deliverable (d)) The re-fault CORROBORATION: even when
-    /// the free-floor is NOT breached, a re-fault confirm trips the gate
-    /// (the design's OR logic — §0-rev4.4). This binds to the SAME pure
-    /// `memory_gate_verdict` the production sampler calls, so it proves the
-    /// secondary signal is wired into the real verdict, not decorative.
+    /// (#task-memgate-twosignal) The sustained-SWAPIN OOM disjunct: even when
+    /// the free-floor is NOT breached, a sustained-swapin confirm trips the OOM
+    /// gate (the OR logic). Binds to the SAME pure `memory_gate_verdict` the
+    /// production sampler calls, proving the swapin signal is wired into the real
+    /// verdict, not decorative.
     ///
     /// Mutation step (CLAUDE.md TDD #5): in `memory_gate_verdict`, drop the
-    /// `|| refault_confirmed` disjunct (free-floor only). The thrash-confirm
-    /// assertion below red-fails — and because `sample_mem_pressure` calls
-    /// the same function, that mutation also breaks production.
-    ///
-    /// `#[serial(swap_sampler_atomics)]`: reads `REFAULT_CONFIRM_RATE` three
-    /// times in the inline EWMA check — a process-global static mutated by
-    /// `refault_confirm_rate_high_suppresses_refault_path`. Serialized to
-    /// prevent a concurrent `store(u32::MAX)` racing those reads.
+    /// `|| swapin_sustained` disjunct (free-floor only). The swapin-confirm
+    /// assertion below red-fails — and because `sample_mem_pressure` calls the
+    /// same function, that mutation also breaks production.
     #[test]
-    #[serial(swap_sampler_atomics)]
-    fn refault_corroboration_trips_gate_without_free_floor() {
-        // Free-floor healthy, but re-fault confirmed (active thrash) ⇒ trip.
+    fn swapin_sustained_trips_gate_without_free_floor() {
+        // Free-floor healthy, but sustained swapins (disk spill) ⇒ trip.
         assert!(
             memory_gate_verdict(true, false, true),
-            "re-fault corroboration must trip the gate even when the \
-             free-floor is healthy: the OR logic catches a box that reads \
-             non-floor free but is actively thrashing (design §0-rev4.4)"
+            "sustained swapins must trip the OOM gate even when the free-floor \
+             is healthy: the OR logic catches the compression-hidden overcommit \
+             case (macOS keeps `available` up by compressing) once it spills to disk"
         );
-        // Free-floor breached, re-fault healthy ⇒ trip (the PRIMARY alone).
+        // Free-floor breached, swapins healthy ⇒ trip (the fail-safe alone).
         assert!(
             memory_gate_verdict(true, true, false),
-            "the free-floor PRIMARY must trip the gate on its own (re-fault \
-             is silent at the RAM wall — the whole point of the redesign)"
+            "the free-floor fail-safe must trip the gate on its own (the belt+braces \
+             last-ditch backstop)"
         );
         // Neither signal ⇒ no trip.
         assert!(
@@ -9486,39 +9657,112 @@ mod tests {
             !memory_gate_verdict(false, true, true),
             "a disabled gate must never trip even with both signals active"
         );
+    }
 
-        // And a re-fault EWMA at 2x the confirm threshold IS confirmed (the
-        // rate→confirm wiring `sample_mem_pressure` does before calling the
-        // verdict).
-        let refault_confirmed = update_swap_ewma(
-            f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed)) * 2.0,
-            f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed)) * 2.0,
-        ) >= f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed));
+    /// (#task-memgate-twosignal, deliverable (a)) The SUSTAINED-WINDOW contract:
+    /// a ONE-OFF swapin spike does NOT trip; only `window` CONSECUTIVE at/above-
+    /// threshold ticks trip. Binds to the pure `swapin_sustained_step` the
+    /// production sampler threads.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): in `swapin_sustained_step`, change
+    /// `ticks >= window` to `ticks >= 1` (fire on the first tick / remove the
+    /// window). The one-off-spike assertion below red-fails with its bespoke
+    /// message — proving the sustained window is load-bearing.
+    #[test]
+    fn sustained_window_rejects_one_off_swapin_spike() {
+        let threshold = 100u32;
+        let window = 10u32;
+        // A single tick above threshold from a cold run: NOT tripped (1 < 10).
+        let (ticks_after_spike, tripped_after_spike) =
+            swapin_sustained_step(0, 5_000, threshold, window);
+        assert_eq!(ticks_after_spike, 1, "one above-threshold tick counts as 1");
         assert!(
-            refault_confirmed,
-            "a re-fault EWMA at 2x the confirm threshold must be confirmed"
+            !tripped_after_spike,
+            "a ONE-OFF swapin spike (1 tick above threshold, window=10) must NOT \
+             trip the OOM gate — the sustained-window requirement rejects a lone \
+             spike touching ancient swapped pages. If this trips, the window check \
+             `ticks >= window` was weakened to `ticks >= 1`"
+        );
+        // A sub-threshold tick RESETS the run to 0 (breaks the streak).
+        let (reset_ticks, reset_tripped) = swapin_sustained_step(9, 0, threshold, window);
+        assert_eq!(reset_ticks, 0, "a sub-threshold tick resets the consecutive run");
+        assert!(!reset_tripped, "a reset run cannot be tripped");
+        // `window` consecutive at/above-threshold ticks DO trip on the last one.
+        let mut ticks = 0u32;
+        let mut tripped = false;
+        for _ in 0..window {
+            let step = swapin_sustained_step(ticks, threshold, threshold, window);
+            ticks = step.0;
+            tripped = step.1;
+        }
+        assert_eq!(ticks, window, "the run should reach exactly `window` ticks");
+        assert!(
+            tripped,
+            "{window} CONSECUTIVE at/above-threshold ticks MUST trip the sustained \
+             swapin OOM gate"
         );
     }
 
-    /// (#64 canary-soak addendum) Config-default for `memory_gate_refault_confirm_rate`:
-    /// an absent field must leave `REFAULT_CONFIRM_RATE` at its init value of 10000 (the
-    /// current conservative threshold) — zero behavior change relative to the old const.
+    /// (#task-memgate-twosignal, deliverable (b)) The compressor-churn perf
+    /// scalar does NOT hard-NAK: a high-decompress / zero-swapin worker stays
+    /// schedulable (the OOM boolean keys off SWAPINS + free-floor, never the
+    /// churn scalar). Drives the REAL `sample_mem_pressure` through TWO ticks so
+    /// the decompress rate is non-zero, then asserts `MEMORY_PRESSURED` is false
+    /// (no swapins, free-floor healthy). Also proves `churn_scalar` is a `min`
+    /// (decompress-only → low `min`).
     ///
-    /// Mutation (CLAUDE.md TDD #5):
-    /// - Change `default_memory_gate_refault_confirm_rate` to return a different value (e.g.
-    ///   `NonZeroU32::new(9999).unwrap()`) → the `assert_eq!` fires with "refault_confirm_rate
-    ///   config default must be 10000 — matches old const, zero behavior change".
-    /// - Change `AtomicU32::new(10_000)` to `AtomicU32::new(9_999)` → the static-value
-    ///   assert fires with "REFAULT_CONFIRM_RATE static init must be 10000".
+    /// Mutation step: make `memory_gate_verdict`'s 3rd disjunct read the churn
+    /// scalar instead of `swapin_sustained` → this test red-fails (churn would
+    /// NAK).
     ///
-    /// `#[serial(swap_sampler_atomics)]`: reads `REFAULT_CONFIRM_RATE` — a process-global
-    /// static mutated by `refault_confirm_rate_high_suppresses_refault_path`. Serialized
-    /// to prevent a concurrent `store(u32::MAX)` racing this test's load+assert.
+    /// `#[serial(swap_sampler_atomics)]`: drives `sample_mem_pressure`, which
+    /// stores the process-global sampler atomics.
     #[test]
     #[serial(swap_sampler_atomics)]
-    fn refault_confirm_rate_config_default_is_10000() {
+    fn decompress_churn_does_not_hard_nak() {
+        // The `min` filters decompress-only pressure: compress low, decompress
+        // high ⇒ churn low.
+        assert!(
+            (churn_scalar(3.0, 40_000.0) - 3.0).abs() < 1e-9,
+            "churn_scalar must be min(compress, decompress) — decompress-alone \
+             (compress low) yields a LOW churn, filtering the working-set-shift \
+             confound"
+        );
+        // Enable the gate so a spurious NAK would show up in MEMORY_PRESSURED.
+        MEMORY_GATE_ENABLED.store(true, Ordering::Relaxed);
+        // On this (non-macOS/non-linux) build `read_memory_signals` returns None,
+        // so drive the verdict through the pure path: high decompress, zero
+        // swapin, healthy free-floor ⇒ NOT pressured.
+        let (_ticks, swapin_sustained) = swapin_sustained_step(
+            0,
+            0, // zero swapin rate
+            SWAPIN_CONFIRM_RATE.load(Ordering::Relaxed),
+            SWAPIN_CONFIRM_WINDOW_TICKS.load(Ordering::Relaxed),
+        );
+        let free_tripped = free_floor_breached(8 << 30, false); // 8 GiB healthy
+        assert!(
+            !memory_gate_verdict(true, free_tripped, swapin_sustained),
+            "a high-decompress / zero-swapin worker must NOT be gated: decompress \
+             is a PERF signal (the graded churn scalar), never a hard NAK. Only \
+             sustained swapins or the free-floor gate the OOM boolean"
+        );
+        MEMORY_GATE_ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    /// (#task-memgate-twosignal, deliverable (g)) Config defaults: the NEW swapin
+    /// OOM fields default to 100/s + 10 ticks and match the static inits; the
+    /// DEPRECATED `memory_gate_refault_confirm_rate` field still defaults to 10000
+    /// (retained for back-compat so a deployed config carrying it deserializes).
+    ///
+    /// Mutation (CLAUDE.md TDD #5):
+    /// - Change `default_memory_gate_swapin_confirm_rate` to return a different value
+    ///   → the `assert_eq!` fires with "swapin_confirm_rate config default must be 100".
+    /// - Change `AtomicU32::new(100)` to a different value → the static-value assert fires.
+    #[test]
+    #[serial(swap_sampler_atomics)]
+    fn swapin_confirm_config_defaults_match_statics() {
         use nativelink_config::cas_server::LocalWorkerConfig;
-        // Minimal JSON5 — no memory_gate_refault_confirm_rate field.
+        // Minimal JSON5 — no memory_gate_* fields.
         let json5 = r#"{
             worker_api_endpoint: {uri: "grpc://localhost:50061"},
             cas_fast_slow_store: "cas_fast_slow",
@@ -9529,65 +9773,82 @@ mod tests {
             "config parse must succeed for a valid minimal LocalWorkerConfig",
         );
         assert_eq!(
-            cfg.memory_gate_refault_confirm_rate.get(), 10_000,
-            "refault_confirm_rate config default must be 10000 — matches old const, \
-             zero behavior change. \
-             Mutation target: change default_memory_gate_refault_confirm_rate to return \
-             something other than 10000"
+            cfg.memory_gate_swapin_confirm_rate.get(), 100,
+            "swapin_confirm_rate config default must be 100/s (calibration-free — \
+             swapin baseline is 0). \
+             Mutation target: change default_memory_gate_swapin_confirm_rate"
         );
-        // Verify the static init is also 10000 (fresh process; new_local_worker not called).
-        // This guards against a mismatch between the config default and the static init.
         assert_eq!(
-            REFAULT_CONFIRM_RATE.load(Ordering::Relaxed),
-            10_000,
-            "REFAULT_CONFIRM_RATE static init must be 10000 — the runtime static \
-             default must match the config serde default so an absent config field \
-             and a fresh process both behave identically. \
-             Mutation target: change AtomicU32::new(10_000) to a different value"
+            cfg.memory_gate_swapin_confirm_window_ticks.get(), 10,
+            "swapin_confirm_window_ticks config default must be 10 (≈1 s). \
+             Mutation target: change default_memory_gate_swapin_confirm_window_ticks"
+        );
+        // The DEPRECATED refault field is retained for config back-compat (a
+        // deployed worker.json5 still carries it); its default is unchanged.
+        assert_eq!(
+            cfg.memory_gate_refault_confirm_rate.get(), 10_000,
+            "the DEPRECATED memory_gate_refault_confirm_rate must still default to \
+             10000 so a deployed config carrying it deserializes (no-op, back-compat)"
+        );
+        // The runtime statics must match the config defaults (fresh process;
+        // new_local_worker not called).
+        assert_eq!(
+            SWAPIN_CONFIRM_RATE.load(Ordering::Relaxed),
+            100,
+            "SWAPIN_CONFIRM_RATE static init must be 100 — must match the config \
+             serde default so an absent field and a fresh process behave identically. \
+             Mutation target: change AtomicU32::new(100)"
+        );
+        assert_eq!(
+            SWAPIN_CONFIRM_WINDOW_TICKS.load(Ordering::Relaxed),
+            10,
+            "SWAPIN_CONFIRM_WINDOW_TICKS static init must be 10 — must match the \
+             config serde default. Mutation target: change AtomicU32::new(10)"
         );
     }
 
-    /// (#64 canary-soak addendum, FIX-2) `memory_gate_refault_confirm_rate: 0` MUST
-    /// be rejected at deserialization. A zero threshold makes `ewma >= 0.0` always
-    /// true — refault trips on every tick, NAKing all actions regardless of actual
-    /// memory state. `NonZeroU32` provides structural prevention at the serde layer.
+    /// (#task-memgate-twosignal) The swapin OOM config fields reject `0`
+    /// (`NonZeroU32`): a `0` rate would count every tick (rate >= 0 always) and a
+    /// `0` window would trip on the first tick — both defeat the calibration-free
+    /// sustained-window design (the #64 storm class, self-inflicted).
     ///
-    /// Mutation (CLAUDE.md TDD #5): revert the field type from `NonZeroU32` back to
-    /// `u32` in `LocalWorkerConfig`. Serde now accepts `0` → this test's
-    /// `expect("rate=0 must be rejected…")` fires because `from_str` succeeds
-    /// instead of returning Err.
-    ///
-    /// `#[serial(swap_sampler_atomics)]`: stateless test (no atomics read/written),
-    /// but grouped with the other config-field tests to maintain serial ordering.
+    /// Mutation (CLAUDE.md TDD #5): revert either field type from `NonZeroU32` to
+    /// `u32` → serde accepts `0` → this test's `is_err()` assertion fires.
     #[test]
-    #[serial(swap_sampler_atomics)]
-    fn refault_confirm_rate_zero_rejected_by_serde() {
+    fn swapin_confirm_zero_rejected_by_serde() {
         use nativelink_config::cas_server::LocalWorkerConfig;
-        let json5 = r#"{
+        let rate_zero = r#"{
             worker_api_endpoint: {uri: "grpc://localhost:50061"},
             cas_fast_slow_store: "cas_fast_slow",
             work_directory: "/tmp/work",
             platform_properties: {},
-            memory_gate_refault_confirm_rate: 0
+            memory_gate_swapin_confirm_rate: 0
         }"#;
-        let result: Result<LocalWorkerConfig, _> = serde_json5::from_str(json5);
         assert!(
-            result.is_err(),
-            "memory_gate_refault_confirm_rate: 0 must be rejected at deserialization \
-             (NonZeroU32 — a zero threshold makes ewma >= 0.0 always true, causing \
-             a NAK storm identical to incident 5132d6c9). \
-             If this fires: the field type was reverted from NonZeroU32 to u32."
+            serde_json5::from_str::<LocalWorkerConfig>(rate_zero).is_err(),
+            "memory_gate_swapin_confirm_rate: 0 must be rejected (NonZeroU32) — a \
+             zero threshold counts every tick toward the window → a NAK storm."
+        );
+        let window_zero = r#"{
+            worker_api_endpoint: {uri: "grpc://localhost:50061"},
+            cas_fast_slow_store: "cas_fast_slow",
+            work_directory: "/tmp/work",
+            platform_properties: {},
+            memory_gate_swapin_confirm_window_ticks: 0
+        }"#;
+        assert!(
+            serde_json5::from_str::<LocalWorkerConfig>(window_zero).is_err(),
+            "memory_gate_swapin_confirm_window_ticks: 0 must be rejected (NonZeroU32) \
+             — a zero window trips on the first tick, defeating spike rejection."
         );
     }
 
-    /// (#64 canary-soak addendum, FIX-2) `memory_gate_refault_confirm_rate: 4294967295`
-    /// (u32::MAX, the refault-suppression sentinel) MUST deserialize successfully.
-    /// `NonZeroU32::new(u32::MAX)` is valid — the suppression pattern still works.
-    ///
-    /// `#[serial(swap_sampler_atomics)]`: grouped with config-field tests.
+    /// (#task-memgate-twosignal) Back-compat: a deployed config carrying the
+    /// DEPRECATED `memory_gate_refault_confirm_rate` (the live fleet sets it to
+    /// `4294967295`) still deserializes under `deny_unknown_fields`. If it were
+    /// removed, the new binary would REJECT the live config → deploy break.
     #[test]
-    #[serial(swap_sampler_atomics)]
-    fn refault_confirm_rate_max_u32_accepted_by_serde() {
+    fn deprecated_refault_field_still_deserializes() {
         use nativelink_config::cas_server::LocalWorkerConfig;
         let json5 = r#"{
             worker_api_endpoint: {uri: "grpc://localhost:50061"},
@@ -9597,79 +9858,59 @@ mod tests {
             memory_gate_refault_confirm_rate: 4294967295
         }"#;
         let cfg: LocalWorkerConfig = serde_json5::from_str(json5).expect(
-            "memory_gate_refault_confirm_rate: 4294967295 (u32::MAX, the free-floor-only \
-             canary sentinel) must deserialize successfully — NonZeroU32::new(u32::MAX) is valid"
+            "the deployed config carrying the deprecated memory_gate_refault_confirm_rate \
+             must still deserialize (retained field, deny_unknown_fields back-compat)",
         );
         assert_eq!(
             cfg.memory_gate_refault_confirm_rate.get(),
             u32::MAX,
-            "u32::MAX must round-trip through serde as u32::MAX (4294967295)"
+            "the deprecated field round-trips (accepted, but no longer wired to any NAK)"
         );
     }
 
-    /// (#64 canary-soak addendum) Free-floor-only suppression: setting
-    /// `memory_gate_refault_confirm_rate` to `u32::MAX` causes the PRODUCTION
-    /// `sample_mem_pressure` function to NOT confirm refault even when the EWMA
-    /// would trip at the default 10000 threshold. Verified by calling the REAL
-    /// production function (not an inline formula re-implementation) and reading
-    /// the `MEMORY_GATE_TRIP_REFAULT` atomic it publishes.
+    /// (#task-memgate-twosignal, deliverable (a) integration) The PRODUCTION
+    /// `sample_mem_pressure` publishes `MEMORY_GATE_TRIP_SWAPIN` from the
+    /// sustained-swapin step — proving the swapin latch is wired to the real
+    /// verdict, not decorative. Uses a degenerate threshold=0 / window=1 (stored
+    /// DIRECTLY to the atomics, bypassing the config `NonZeroU32` guard) so a
+    /// quiescent test box (real swapin rate ≈ 0) still exercises the sustained
+    /// trip deterministically.
     ///
-    /// Setup: `SwapSamplerState` with `ewma = 20_000.0` (above the 10000 default
-    /// threshold). On the first tick (no prev anchor), `rate = 0`, so the EWMA
-    /// decays via `update_swap_ewma(20_000.0, 0.0)` ≈ 19_000 — still above 10000,
-    /// but below `u32::MAX = 4_294_967_295`. With `REFAULT_CONFIRM_RATE = u32::MAX`,
-    /// `refault_confirmed = 19_000 >= 4_294_967_295.0 = false`. With gate enabled,
-    /// `MEMORY_GATE_TRIP_REFAULT` stores `gate_enabled && refault_confirmed = false`.
+    /// `#[cfg(any(linux, macos))]`: only there does `read_memory_signals` return
+    /// `Some` (the readable path that reaches the swapin step); the no-op fallback
+    /// early-returns.
     ///
-    /// Mutation (CLAUDE.md TDD #5): change `local_worker.rs:1206`
-    /// `ewma >= f64::from(REFAULT_CONFIRM_RATE.load(Ordering::Relaxed))`
-    /// to `ewma >= 10_000_f64` (ignore the atomic). The decayed EWMA ≈ 19_000
-    /// satisfies `19_000 >= 10_000 = true`. With gate enabled, TRIP_REFAULT
-    /// stores true → the assertion below red-fails with its bespoke message.
-    ///
-    /// `#[serial(swap_sampler_atomics)]`: this test stores `u32::MAX` to
-    /// `REFAULT_CONFIRM_RATE` and `true` to `MEMORY_GATE_ENABLED` — both
-    /// process-global statics also read by `free_floor_bytes_is_conservative_one_gib`
-    /// and `refault_confirm_rate_config_default_is_10000`. Serialized with those
-    /// tests to prevent cross-test races under the default parallel runner.
+    /// Mutation (CLAUDE.md TDD #5): hard-code `MEMORY_GATE_TRIP_SWAPIN.store(false,…)`
+    /// in `sample_mem_pressure` (or drop the `|| swapin_sustained` disjunct) → the
+    /// assertion below red-fails.
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[serial(swap_sampler_atomics)]
-    fn refault_confirm_rate_high_suppresses_refault_path() {
-        // Save and restore both statics so this test cannot leak state.
-        let orig_rate = REFAULT_CONFIRM_RATE.load(Ordering::Relaxed);
+    fn sustained_swapin_publishes_trip_latch_through_production_sampler() {
+        let orig_rate = SWAPIN_CONFIRM_RATE.load(Ordering::Relaxed);
+        let orig_window = SWAPIN_CONFIRM_WINDOW_TICKS.load(Ordering::Relaxed);
         let orig_gate = MEMORY_GATE_ENABLED.load(Ordering::Relaxed);
 
-        // Simulate canary-soak config: refault threshold = u32::MAX (suppressed),
-        // gate enabled so MEMORY_GATE_TRIP_REFAULT reflects refault_confirmed.
-        REFAULT_CONFIRM_RATE.store(u32::MAX, Ordering::Relaxed);
+        // Degenerate direct-atomic config: threshold 0 (every tick qualifies),
+        // window 1 (one tick trips) — forces a deterministic sustained trip on a
+        // quiescent box. Gate enabled so the latch reflects the verdict.
+        SWAPIN_CONFIRM_RATE.store(0, Ordering::Relaxed);
+        SWAPIN_CONFIRM_WINDOW_TICKS.store(1, Ordering::Relaxed);
         MEMORY_GATE_ENABLED.store(true, Ordering::Relaxed);
 
-        // Craft a SwapSamplerState whose EWMA (20_000) WOULD confirm at the
-        // default 10000 threshold. First tick (prev=None) → rate=0 → EWMA decays
-        // to ~19_000 via the slow-release path — still well above 10000 but far
-        // below u32::MAX.
-        let primed = SwapSamplerState {
-            prev: None,
-            ewma: 20_000.0,
-            free_tripped: false,
-        };
+        let _ = sample_mem_pressure(SwapSamplerState::new());
 
-        // Call the REAL production function. It reads REFAULT_CONFIRM_RATE at
-        // local_worker.rs:1206 and publishes MEMORY_GATE_TRIP_REFAULT.
-        let _ = sample_mem_pressure(primed);
-
-        let tripped = MEMORY_GATE_TRIP_REFAULT.load(Ordering::Relaxed);
         assert!(
-            !tripped,
-            "sample_mem_pressure must NOT set MEMORY_GATE_TRIP_REFAULT when \
-             REFAULT_CONFIRM_RATE=u32::MAX (free-floor-only suppression): \
-             the production verdict site at local_worker.rs:1206 must read \
-             REFAULT_CONFIRM_RATE from the atomic, not a hardcoded 10000 literal. \
-             If this fires: the verdict site was mutated to ignore the config."
+            MEMORY_GATE_TRIP_SWAPIN.load(Ordering::Relaxed),
+            "sample_mem_pressure must set MEMORY_GATE_TRIP_SWAPIN when the swapin \
+             rate stays at/above threshold for the window: the production verdict \
+             must thread swapin_sustained_step + publish the latch. If this fires, \
+             the sampler ignores the swapin step or hard-codes the latch false."
         );
 
-        // Restore statics.
-        REFAULT_CONFIRM_RATE.store(orig_rate, Ordering::Relaxed);
+        // Restore.
+        SWAPIN_CONFIRM_RATE.store(orig_rate, Ordering::Relaxed);
+        SWAPIN_CONFIRM_WINDOW_TICKS.store(orig_window, Ordering::Relaxed);
         MEMORY_GATE_ENABLED.store(orig_gate, Ordering::Relaxed);
     }
 
@@ -10349,8 +10590,14 @@ mod tests {
     /// Mutation (CLAUDE.md TDD #5): comment out the `publish!(\"nak_free_floor_total\", ...)`
     /// call in `MemoryGateCounters::publish` → the `unwrap_or_else` panic fires with
     /// "expected metric memory_gate_nak_free_floor_total to be published — canary soak
-    /// cannot read trip-source signal". Same for `nak_refault_total`.
+    /// cannot read trip-source signal". Same for `nak_swapin_total`.
+    ///
+    /// `#[serial(swap_sampler_atomics)]`: reads back the process-global
+    /// `memory_gate_counters()` singleton (swap_used_bytes / pressure_level_mib
+    /// sentinels). The sampler-driving tests (`sample_mem_pressure`) unconditionally
+    /// overwrite that singleton, so this must serialize with them.
     #[test]
+    #[serial(swap_sampler_atomics)]
     fn memory_gate_nak_counters_visible_in_metric_tree() {
         use std::sync::Mutex;
 
@@ -10417,8 +10664,8 @@ mod tests {
         let before_free_floor = memory_gate_counters()
             .nak_free_floor
             .load(::core::sync::atomic::Ordering::Relaxed);
-        let before_refault = memory_gate_counters()
-            .nak_refault
+        let before_swapin = memory_gate_counters()
+            .nak_swapin
             .load(::core::sync::atomic::Ordering::Relaxed);
 
         // Drive one NAK on each trip-source via the PRODUCTION singleton path.
@@ -10426,7 +10673,7 @@ mod tests {
             .nak_free_floor
             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
         memory_gate_counters()
-            .nak_refault
+            .nak_swapin
             .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
 
         // (#64 dark-signals) Drive the two new gauge fields through the SAME
@@ -10487,27 +10734,27 @@ mod tests {
              memory_gate_counters_arc() are not observing the same AtomicU64."
         );
 
-        let refault_metric = events
+        let swapin_metric = events
             .iter()
-            .find(|m| m.name == "nak_refault_total")
+            .find(|m| m.name == "nak_swapin_total")
             .unwrap_or_else(|| {
                 panic!(
-                    "expected metric `nak_refault_total` to be published by \
-                     MemoryGateCountersHandle — canary soak cannot read refault trip \
+                    "expected metric `nak_swapin_total` to be published by \
+                     MemoryGateCountersHandle — soak cannot read the swapin trip \
                      signal. Captured events: {events:#?}. \
-                     Mutation target: comment out publish!(\"nak_refault_total\", ...) \
-                     in MemoryGateCounters::publish (#37 re-enable follow-up)"
+                     Mutation target: comment out publish!(\"nak_swapin_total\", ...) \
+                     in MemoryGateCounters::publish (#task-memgate-twosignal)"
                 )
             });
-        let published_refault: u64 = refault_metric
+        let published_swapin: u64 = swapin_metric
             .value
             .parse()
-            .expect("nak_refault_total value must be numeric");
+            .expect("nak_swapin_total value must be numeric");
         assert_eq!(
-            published_refault,
-            before_refault + 1,
-            "nak_refault_total must equal baseline+1 after one fetch_add — \
-             got {published_refault} (baseline was {before_refault}). \
+            published_swapin,
+            before_swapin + 1,
+            "nak_swapin_total must equal baseline+1 after one fetch_add — \
+             got {published_swapin} (baseline was {before_swapin}). \
              Singleton aliasing broken: memory_gate_counters() and \
              memory_gate_counters_arc() are not observing the same AtomicU64."
         );

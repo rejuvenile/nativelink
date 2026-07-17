@@ -1357,35 +1357,59 @@ pub struct LocalWorkerConfig {
     #[serde(default)]
     pub memory_gate_enabled: bool,
 
-    /// (#64 canary-soak addendum) Re-fault EWMA confirm threshold (events/sec).
+    /// DEPRECATED (#task-memgate-twosignal) — accepted for config back-compat but
+    /// NO LONGER WIRED to any gate. The old refault (decompressions+swapins) NAK
+    /// path is REPLACED by the sustained-SWAPIN OOM gate
+    /// (`memory_gate_swapin_confirm_rate`); the decompress signal now feeds ONLY
+    /// the graded compressor-churn perf scalar, never a NAK. This field is
+    /// retained (rather than removed) so a deployed worker.json5 still carrying
+    /// it — the live fleet sets `memory_gate_refault_confirm_rate: 4294967295` —
+    /// continues to deserialize under `deny_unknown_fields`. Setting it has no
+    /// runtime effect. Remove it from configs at leisure.
     ///
-    /// The refault-rate EWMA must reach or exceed this value for the refault
-    /// corroboration path to confirm memory pressure (design §0-rev4.3/.4). A
-    /// VERY HIGH value (e.g. `4294967295` = `u32::MAX`) effectively disables the
-    /// refault path so that only the free-floor PRIMARY can trip the gate —
-    /// enabling a free-floor-only canary soak without a rebuild.
+    /// `0` is still rejected at deserialization (`NonZeroU32`).
     ///
-    /// `0` is rejected at deserialization (`NonZeroU32`). A zero threshold would
-    /// make the EWMA comparison always true, NAKing every action regardless of
-    /// actual memory state — the same NAK storm as incident `5132d6c9`, but
-    /// self-inflicted. Use `u32::MAX` (`4294967295`) to suppress the refault
-    /// path entirely.
-    ///
-    /// After the soak characterises the busy-worker refault baseline, this can
-    /// be re-calibrated downward from config to re-enable refault corroboration.
-    ///
-    /// Default: `10000` (the former compile-time const — zero behavior change;
-    /// an absent field behaves identically to the previous binary).
-    ///
-    /// ROLLOUT: deploy the new binary fleet-wide FIRST (this field absent from
-    /// all configs → gate uses default 10000). THEN add
-    /// `memory_gate_refault_confirm_rate: 4294967295` to the canary worker's
-    /// INDIVIDUALIZED config. Do NOT add this field to the shared canonical
-    /// config until all workers run the new binary (`deny_unknown_fields` causes
-    /// old binaries to reject configs containing this field — deploy-ops §13
-    /// two-phase sequence).
+    /// Default: `10000` (unchanged; absent field behaves identically).
     #[serde(default = "default_memory_gate_refault_confirm_rate")]
     pub memory_gate_refault_confirm_rate: NonZeroU32,
+
+    /// (#task-memgate-twosignal) SWAPIN OOM hard-gate threshold (pages/sec).
+    ///
+    /// The swapin RATE (Δswapins/Δt) at/above which a sampler tick counts toward
+    /// the sustained-swapin OOM trip. `Swapins` = the working set overflowed
+    /// RAM+compressor to DISK = OOM-adjacent. The baseline is genuinely 0 (a full
+    /// `--config=dbg` build measured 0 swapins on all 10 workers), so this
+    /// threshold needs NO calibration — the default `100/s` sits far above the 0
+    /// baseline yet trips on any genuine, non-trivial disk spill. The trip ALSO
+    /// requires `memory_gate_swapin_confirm_window_ticks` consecutive at/above
+    /// ticks, so a one-off spike (a lone tick touching ancient swapped pages)
+    /// never trips.
+    ///
+    /// `0` is rejected at deserialization (`NonZeroU32`): a zero threshold would
+    /// count EVERY tick (rate >= 0 always) toward the window → a sustained NAK
+    /// once the window fills, regardless of actual swap state (the #64 storm
+    /// class, self-inflicted).
+    ///
+    /// Default: `100` (conservative safe-enable; the free-floor + swapin gate
+    /// only NAK when `memory_gate_enabled` is true — default false).
+    #[serde(default = "default_memory_gate_swapin_confirm_rate")]
+    pub memory_gate_swapin_confirm_rate: NonZeroU32,
+
+    /// (#task-memgate-twosignal) SWAPIN OOM sustained WINDOW (consecutive ticks).
+    ///
+    /// The number of CONSECUTIVE sampler ticks the swapin rate must stay at/above
+    /// `memory_gate_swapin_confirm_rate` before the OOM boolean trips. At the
+    /// 100 ms sampler cadence, the default `10` ticks ≈ 1 s of sustained disk
+    /// spill — enough to reject a one-off spike (a lone sub-threshold tick resets
+    /// the consecutive count to 0) while leading a real OOM by ~1 s.
+    ///
+    /// `0` is rejected at deserialization (`NonZeroU32`): a zero window = no
+    /// sustained requirement = trip on the FIRST tick above threshold, which
+    /// defeats the spike-rejection the window exists for.
+    ///
+    /// Default: `10` (≈1 s at the 100 ms cadence).
+    #[serde(default = "default_memory_gate_swapin_confirm_window_ticks")]
+    pub memory_gate_swapin_confirm_window_ticks: NonZeroU32,
 
     /// Whether to use namespaces to isolate the execution.  This is only available
     /// on Linux.  It is highly recommended as it avoids a number of issues with
@@ -1435,10 +1459,12 @@ impl Default for LocalWorkerConfig {
             bis_ack_timeout_secs: Default::default(),
             deferred_output_uploads_enabled: Default::default(),
             memory_gate_enabled: Default::default(),
-            // NonZeroU32 has no Default; use the serde default (10000 = the
-            // former compile-time const). This matches what serde produces for
-            // an absent field and is not a valid operator value (0 is rejected).
+            // NonZeroU32 has no Default; use the serde defaults. These match what
+            // serde produces for an absent field (0 is rejected as an operator value).
             memory_gate_refault_confirm_rate: default_memory_gate_refault_confirm_rate(),
+            memory_gate_swapin_confirm_rate: default_memory_gate_swapin_confirm_rate(),
+            memory_gate_swapin_confirm_window_ticks:
+                default_memory_gate_swapin_confirm_window_ticks(),
             use_namespaces: Default::default(),
             use_mount_namespace: Default::default(),
         }
@@ -1493,6 +1519,23 @@ pub struct DirectoryCacheConfig {
 fn default_memory_gate_refault_confirm_rate() -> NonZeroU32 {
     // SAFETY: 10_000 != 0.
     NonZeroU32::new(10_000).unwrap()
+}
+
+/// (#task-memgate-twosignal) Default SWAPIN OOM threshold: 100 pages/s. The
+/// measured swapin baseline is 0 (0 swapins across a full dbg build), so 100
+/// sits far above baseline yet trips on any genuine disk spill. Numeric-constant
+/// rule: this literal is the authoritative ship default.
+fn default_memory_gate_swapin_confirm_rate() -> NonZeroU32 {
+    // SAFETY: 100 != 0.
+    NonZeroU32::new(100).unwrap()
+}
+
+/// (#task-memgate-twosignal) Default SWAPIN sustained window: 10 consecutive
+/// ticks ≈ 1 s at the 100 ms sampler cadence. Numeric-constant rule: this literal
+/// is the authoritative ship default.
+fn default_memory_gate_swapin_confirm_window_ticks() -> NonZeroU32 {
+    // SAFETY: 10 != 0.
+    NonZeroU32::new(10).unwrap()
 }
 
 const fn default_direct_use_mode() -> bool {

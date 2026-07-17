@@ -746,7 +746,7 @@ async fn inner_main(
     // worker-metrics-exposure trap; same class as #86 symlink_fix and #DC3
     // dir_cache). Prefix is "memory_gate"; the rendered Prometheus names the
     // operators/the canary soak alert on are the BARE
-    // `memory_gate_nak_free_floor_total` and `memory_gate_nak_refault_total`
+    // `memory_gate_nak_free_floor_total` and `memory_gate_nak_swapin_total`
     // (no `_counter` suffix — empirically pinned by
     // `memory_gate_render_prometheus_exposes_nak_counters` in o11_probes.rs).
     // Registered unconditionally (gate DEFAULT OFF; the counters read 0 when the

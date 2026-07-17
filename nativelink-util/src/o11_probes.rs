@@ -1726,40 +1726,41 @@ impl MetricsComponent for DirCacheCountersHandle {
 // #37 re-enable follow-up — memory gate NAK counters
 // =====================================================================
 
-/// (#37 re-enable follow-up) Process-wide memory gate NAK counters.
-/// Two monotonic counters, one per trip source (free-floor PRIMARY and
-/// refault CORROBORATION). Backed by `static`s so `const fn new()` suffices;
-/// incremented from the StartAction NAK path in `local_worker.rs`.
+/// (#task-memgate-twosignal) Process-wide memory gate counters + gauges.
+/// Two monotonic NAK counters, one per OOM trip source (free-floor FAIL-SAFE
+/// and sustained-SWAPIN), plus the observability gauges. Backed by `static`s
+/// so `const fn new()` suffices; incremented/stored from `local_worker.rs`.
 ///
 /// These were originally fields on `LocalWorker.metrics` (a per-instance
 /// struct that is never registered with `MetricsRegistry` — the
 /// worker-metrics-exposure trap). Moving them to a process singleton makes
 /// them visible on `/metrics` without adding per-instance registration.
 ///
-/// (#64 dark-signals) `swap_used_bytes` and `pressure_level_mib` are
-/// additionally added here alongside the refault EWMA gauges: both were
-/// already computed and stored to process statics (`SWAP_USED_BYTES` /
-/// `MEMORY_PRESSURE_LEVEL`) every sampler tick but had no `/metrics` publish
-/// path. Mirrored here using the same pattern as `refault_ewma`.
+/// The three RAW rate gauges (`compress_rate_last`, `decompress_rate_last`,
+/// `swapin_rate_last`) exist for CALIBRATION: we have no compression-rate soak
+/// data yet, so logging all three is what will let the churn-throttle band be
+/// set later. `churn_ewma` is the published graded scalar.
 #[derive(Debug)]
 pub struct MemoryGateCounters {
     /// StartAction NAKs from free-floor trip (available < FREE_FLOOR_BYTES).
     pub nak_free_floor: AtomicU64,
-    /// StartAction NAKs from refault EWMA CORROBORATION trip.
-    pub nak_refault: AtomicU64,
-    /// (#64 canary-soak) Current fast-attack/slow-release EWMA of the
-    /// refault rate, rounded to events/sec. Published as a gauge
-    /// (goes up AND down — NOT monotonic). Compare against
-    /// `memory_gate_refault_confirm_rate` (default 10000/s) to understand
-    /// how close the fleet baseline is to the trip threshold. Updated
-    /// unconditionally every sampler tick (~100 ms) regardless of gate-enable
-    /// state, so this gauge is observable on ALL workers.
-    pub refault_ewma: AtomicU32,
-    /// (#64 canary-soak) Raw per-second refault rate from the LAST sampler
-    /// tick (decompressions + swapins delta / elapsed). Published as a gauge
-    /// (non-monotonic). The EWMA `refault_ewma` smooths this; this raw field
-    /// lets operators see the instantaneous signal without the decay lag.
-    pub refault_rate_last: AtomicU32,
+    /// StartAction NAKs from the sustained-SWAPIN OOM trip.
+    pub nak_swapin: AtomicU64,
+    /// (#task-memgate-twosignal) Current compressor-CHURN EWMA
+    /// (`min(compress_rate_ewma, decompress_rate_ewma)`, events/sec) — the
+    /// graded perf scalar published on the wire + consumed by the scheduler
+    /// ranking/throttle. Gauge (non-monotonic). Updated every sampler tick
+    /// (~100 ms) regardless of gate-enable state → observable on ALL workers.
+    pub churn_ewma: AtomicU32,
+    /// (#task-memgate-twosignal) Raw per-second COMPRESSION rate from the LAST
+    /// sampler tick. Gauge. Calibration signal (the SUPPLY half of churn).
+    pub compress_rate_last: AtomicU32,
+    /// (#task-memgate-twosignal) Raw per-second DECOMPRESSION rate from the LAST
+    /// sampler tick. Gauge. Calibration signal (the DEMAND half of churn).
+    pub decompress_rate_last: AtomicU32,
+    /// (#task-memgate-twosignal) Raw per-second SWAPIN rate from the LAST sampler
+    /// tick — the OOM-adjacent disk-spill signal (baseline 0). Gauge.
+    pub swapin_rate_last: AtomicU32,
     /// (#64 dark-signals) host swap bytes in use (macOS `vm.swapusage` /
     /// Linux `/proc/meminfo`), published as a gauge. Updated unconditionally
     /// every sampler tick (~100 ms) before the signal-read early-return —
@@ -1768,11 +1769,10 @@ pub struct MemoryGateCounters {
     /// have no worker). Non-monotonic.
     pub swap_used_bytes: AtomicU64,
     /// (#64 dark-signals) MiB below the free-floor (0 = at or above the
-    /// floor; positive = pressured). The magnitude the memory gate's
-    /// least-pressured fail-open ranks on. Updated every sampler tick:
-    /// set to 0 on the unreadable-signals early-return path (no pressure
-    /// can be inferred), set to the computed level on the readable path.
-    /// Non-monotonic gauge.
+    /// floor; positive = pressured). The FAIL-SAFE magnitude (NO LONGER the
+    /// wire scalar — the churn EWMA is; kept as a diagnostic gauge). Updated
+    /// every sampler tick: set to 0 on the unreadable-signals early-return path,
+    /// set to the computed level on the readable path. Non-monotonic gauge.
     pub pressure_level_mib: AtomicU32,
 }
 
@@ -1780,9 +1780,11 @@ impl MemoryGateCounters {
     const fn new() -> Self {
         Self {
             nak_free_floor: AtomicU64::new(0),
-            nak_refault: AtomicU64::new(0),
-            refault_ewma: AtomicU32::new(0),
-            refault_rate_last: AtomicU32::new(0),
+            nak_swapin: AtomicU64::new(0),
+            churn_ewma: AtomicU32::new(0),
+            compress_rate_last: AtomicU32::new(0),
+            decompress_rate_last: AtomicU32::new(0),
+            swapin_rate_last: AtomicU32::new(0),
             swap_used_bytes: AtomicU64::new(0),
             pressure_level_mib: AtomicU32::new(0),
         }
@@ -1807,48 +1809,63 @@ impl MetricsComponent for MemoryGateCounters {
              FREE_FLOOR_BYTES=1GiB); monotonic — alert on rate; zero = gate \
              disabled or floor healthy."
         );
-        let v = self.nak_refault.load(Ordering::Relaxed);
+        let v = self.nak_swapin.load(Ordering::Relaxed);
         publish!(
-            "nak_refault_total",
+            "nak_swapin_total",
             &v,
             MetricKind::Counter,
-            "StartAction NAKs from memory gate refault CORROBORATION \
-             (ewma >= memory_gate_refault_confirm_rate; default 10000/s, \
-             operator-tunable per worker — a canary may set u32::MAX to suppress \
-             refault); monotonic — non-zero + floor-zero = refault-only trip, \
-             check busy baseline."
+            "StartAction NAKs from the memory gate sustained-SWAPIN OOM trip \
+             (swapin rate >= memory_gate_swapin_confirm_rate for \
+             memory_gate_swapin_confirm_window_ticks consecutive ticks); \
+             monotonic — non-zero = genuine disk spill (swapin baseline is 0)."
         );
-        // (#64 canary-soak gauges) Published with MetricKind::Default, which the
-        // metrics library renders as Prometheus `# TYPE ... counter` (there is no
-        // gauge kind). These values are NON-MONOTONIC (the EWMA decays), so read
-        // the INSTANT value — do NOT apply `rate()` (decay reads as a counter
-        // reset). No `_total` suffix — name them as the gauges they semantically
-        // are, despite the `counter` TYPE line.
-        let v = self.refault_ewma.load(Ordering::Relaxed);
+        // (#task-memgate-twosignal gauges) Published with MetricKind::Default, which
+        // the metrics library renders as Prometheus `# TYPE ... counter` (there is
+        // no gauge kind). These values are NON-MONOTONIC (EWMA decays / raw rates
+        // rise and fall), so read the INSTANT value — do NOT apply `rate()`. No
+        // `_total` suffix — name them as the gauges they semantically are.
+        let v = self.churn_ewma.load(Ordering::Relaxed);
         publish!(
-            "refault_ewma",
+            "churn_ewma",
             &v,
             MetricKind::Default,
-            "Current fast-attack/slow-release EWMA of the refault rate \
-             (decompressions + swapins, events/sec). Gauge — not monotonic. \
-             Compare against memory_gate_refault_confirm_rate (default 10000/s) \
-             to gauge trip-threshold proximity. Updated every sampler tick (~100 ms) \
-             unconditionally — visible on all workers regardless of gate state."
+            "Compressor-churn perf scalar: min(compress_rate_ewma, \
+             decompress_rate_ewma), events/sec — the graded 'how pressured' signal \
+             on the wire + the scheduler ranking/throttle. Gauge — not monotonic. \
+             High only when compression AND decompression are both high (thrash). \
+             Updated every sampler tick (~100 ms) unconditionally — all workers."
         );
-        let v = self.refault_rate_last.load(Ordering::Relaxed);
+        let v = self.compress_rate_last.load(Ordering::Relaxed);
         publish!(
-            "refault_rate_last",
+            "compress_rate_last",
             &v,
             MetricKind::Default,
-            "Raw per-second refault rate from the last sampler tick \
-             (decompressions + swapins delta / elapsed, events/sec). Gauge — not \
-             monotonic. The EWMA (refault_ewma) smooths this; this field exposes \
-             the instantaneous signal without decay lag."
+            "Raw per-second COMPRESSION rate from the last sampler tick \
+             (compressions delta / elapsed). Gauge. Calibration signal (supply \
+             half of the churn scalar) — no compression-rate soak data existed yet."
+        );
+        let v = self.decompress_rate_last.load(Ordering::Relaxed);
+        publish!(
+            "decompress_rate_last",
+            &v,
+            MetricKind::Default,
+            "Raw per-second DECOMPRESSION rate from the last sampler tick \
+             (decompressions delta / elapsed). Gauge. Calibration signal (demand \
+             half of the churn scalar)."
+        );
+        let v = self.swapin_rate_last.load(Ordering::Relaxed);
+        publish!(
+            "swapin_rate_last",
+            &v,
+            MetricKind::Default,
+            "Raw per-second SWAPIN rate from the last sampler tick (swapins delta / \
+             elapsed) — the OOM-adjacent disk-spill signal (baseline 0). Gauge. \
+             The sustained-window OOM gate keys off this."
         );
         // (#64 dark-signals) Two previously-dark sampler signals now exposed as
-        // gauges, same convention as the `refault_ewma` gauge above. These render
-        // as `# TYPE ... counter` (verified live: `# TYPE memory_gate_refault_ewma
-        // counter`): the `publish!` macro resolves a numeric MetricKind::Default
+        // gauges, same convention as the `churn_ewma` gauge above. These render
+        // as `# TYPE ... counter` (the `publish!` macro resolves a numeric
+        // MetricKind::Default
         // to Counter at publish time (`u64::publish` -> `into_known_kind(Counter)`
         // -> the macro emits `__type = Counter`), so every renderer (prod collector
         // AND the test-only render_prometheus/format_prometheus) sees Counter — the
@@ -2978,7 +2995,7 @@ mod tests {
         // `MemoryGateCounters::publish` — the same path the registered handle uses.
         let counters = Arc::new(MemoryGateCounters::new());
         counters.nak_free_floor.fetch_add(7, Ordering::Relaxed);
-        counters.nak_refault.fetch_add(3, Ordering::Relaxed);
+        counters.nak_swapin.fetch_add(3, Ordering::Relaxed);
 
         let registry = MetricsRegistry::new();
         // Prefix "memory_gate" — the exact key production nativelink.rs registers.
@@ -2987,7 +3004,7 @@ mod tests {
 
         for (name, value) in [
             ("memory_gate_nak_free_floor_total", 7u64),
-            ("memory_gate_nak_refault_total", 3),
+            ("memory_gate_nak_swapin_total", 3),
         ] {
             let needle = format!("\n{name} {value}\n");
             assert!(
@@ -3836,39 +3853,43 @@ mod tests {
         );
     }
 
-    /// (#64 canary-soak) The refault EWMA gauges must render on the real `/metrics`
-    /// path. This test pins the EXACT rendered names:
-    /// `memory_gate_refault_ewma` and `memory_gate_refault_rate_last` — NO
-    /// `_total` / `_counter` suffix (these are gauges, not counters; verified
-    /// empirically below; do not assume suffixes from other metrics' output).
-    /// Stops the soak runbook from alerting on names that do not exist on the wire.
+    /// (#task-memgate-twosignal) The churn scalar + three raw-rate calibration
+    /// gauges must render on the real `/metrics` path. This test pins the EXACT
+    /// rendered names: `memory_gate_churn_ewma`, `memory_gate_compress_rate_last`,
+    /// `memory_gate_decompress_rate_last`, `memory_gate_swapin_rate_last` — NO
+    /// `_total` / `_counter` suffix (gauges, not counters). Stops the soak runbook
+    /// from alerting on names that do not exist on the wire.
     ///
     /// Mutation: drop one of the `publish!` calls in `MemoryGateCounters::publish`
-    /// (or rename its key) → test red-fails with "#64 refault gauge dark on
+    /// (or rename its key) → test red-fails with "churn/rate gauge dark on
     /// /metrics: expected exact line…".
     #[test]
-    fn memory_gate_render_prometheus_exposes_refault_ewma_gauges() {
+    fn memory_gate_render_prometheus_exposes_churn_gauges() {
         use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
 
         let counters = Arc::new(MemoryGateCounters::new());
         // Sentinel values distinguishable from 0 and from each other.
-        counters.refault_ewma.store(42, Ordering::Relaxed);
-        counters.refault_rate_last.store(137, Ordering::Relaxed);
+        counters.churn_ewma.store(42, Ordering::Relaxed);
+        counters.compress_rate_last.store(137, Ordering::Relaxed);
+        counters.decompress_rate_last.store(211, Ordering::Relaxed);
+        counters.swapin_rate_last.store(313, Ordering::Relaxed);
 
         let registry = MetricsRegistry::new();
         registry.register("memory_gate", counters);
         let body = render_prometheus(&registry);
 
         for (name, value) in [
-            ("memory_gate_refault_ewma", 42u64),
-            ("memory_gate_refault_rate_last", 137),
+            ("memory_gate_churn_ewma", 42u64),
+            ("memory_gate_compress_rate_last", 137),
+            ("memory_gate_decompress_rate_last", 211),
+            ("memory_gate_swapin_rate_last", 313),
         ] {
             let needle = format!("\n{name} {value}\n");
             assert!(
                 body.contains(&needle),
-                "#64 refault gauge dark on /metrics: expected exact line `{name} {value}` from \
-                 the render_prometheus walk, but it is ABSENT — the canary soak will be unable to \
-                 observe the refault EWMA signal. body=\n{body}"
+                "churn/rate gauge dark on /metrics: expected exact line `{name} {value}` from \
+                 the render_prometheus walk, but it is ABSENT — the soak will be unable to \
+                 observe the compressor-churn calibration signals. body=\n{body}"
             );
         }
         // Guard the doubled-prefix trap.
@@ -4027,34 +4048,35 @@ mod tests {
         );
     }
 
-    /// (#64 canary-soak) Storing a value into `refault_ewma` / `refault_rate_last`
-    /// must flow through to the rendered output (not silently published as 0).
+    /// (#task-memgate-twosignal) Storing a value into `churn_ewma` /
+    /// `swapin_rate_last` must flow through to the rendered output (not silently
+    /// published as 0).
     ///
     /// Mutation: in `MemoryGateCounters::publish`, hard-code the published value
     /// to `0u32` instead of loading the atomic → test red-fails with
-    /// "#64 publish-value: refault_ewma published 0 not sentinel 99".
+    /// "publish-value: churn_ewma published 0 not sentinel 99".
     #[test]
-    fn memory_gate_refault_gauge_publish_emits_stored_value() {
+    fn memory_gate_churn_gauge_publish_emits_stored_value() {
         use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
 
         let counters = Arc::new(MemoryGateCounters::new());
-        counters.refault_ewma.store(99, Ordering::Relaxed);
-        counters.refault_rate_last.store(7, Ordering::Relaxed);
+        counters.churn_ewma.store(99, Ordering::Relaxed);
+        counters.swapin_rate_last.store(7, Ordering::Relaxed);
 
         let registry = MetricsRegistry::new();
         registry.register("memory_gate", counters);
         let body = render_prometheus(&registry);
 
-        let ewma_line = format!("\nmemory_gate_refault_ewma 99\n");
+        let ewma_line = "\nmemory_gate_churn_ewma 99\n".to_string();
         assert!(
             body.contains(&ewma_line),
-            "#64 publish-value: refault_ewma published 0 not sentinel 99 — \
+            "publish-value: churn_ewma published 0 not sentinel 99 — \
              the atomic store is not flowing through publish(). body=\n{body}"
         );
-        let rate_line = format!("\nmemory_gate_refault_rate_last 7\n");
+        let rate_line = "\nmemory_gate_swapin_rate_last 7\n".to_string();
         assert!(
             body.contains(&rate_line),
-            "#64 publish-value: refault_rate_last published 0 not sentinel 7 — \
+            "publish-value: swapin_rate_last published 0 not sentinel 7 — \
              the atomic store is not flowing through publish(). body=\n{body}"
         );
     }
