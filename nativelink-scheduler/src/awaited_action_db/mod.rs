@@ -188,4 +188,11 @@ pub trait AwaitedActionDb: Send + Sync + MetricsComponent + Unpin + 'static {
         action_info: Arc<ActionInfo>,
         no_event_action_timeout: Duration,
     ) -> impl Future<Output = Result<Self::Subscriber, Error>> + Send;
+
+    /// (#dag-criticality) Inject the shared DAG state whose published criticality snapshot
+    /// is folded into the sort key at enqueue (a WITHIN-priority-band, correctness-neutral
+    /// tie-break). Default NO-OP — a backend that does not support the tie-break ignores
+    /// it (the sort key stays FIFO). Called ONCE during `SimpleScheduler::new` wiring,
+    /// before the db serves any action.
+    fn set_dag_criticality(&self, _dag_state: Option<Arc<crate::dag_criticality::DagState>>) {}
 }

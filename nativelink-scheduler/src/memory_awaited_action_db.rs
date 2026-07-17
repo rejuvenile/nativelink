@@ -42,6 +42,7 @@ use crate::awaited_action_db::{
     AwaitedAction, AwaitedActionDb, AwaitedActionSubscriber, CLIENT_KEEPALIVE_DURATION,
     SortedAwaitedAction, SortedAwaitedActionState,
 };
+use crate::dag_criticality::DagState;
 
 /// Number of events to process per cycle.
 const MAX_ACTION_EVENTS_RX_PER_CYCLE: usize = 1024;
@@ -434,6 +435,12 @@ pub struct AwaitedActionDbImpl<I: InstantWrapper, NowFn: Fn() -> I> {
 
     /// The function to get the current time.
     now_fn: NowFn,
+
+    /// (#dag-criticality) Shared DAG state whose published criticality snapshot is folded
+    /// into the (immutable) sort key at enqueue. `None` when `dag_critical_path_enabled`
+    /// is off. Set once during `SimpleScheduler::new` wiring via
+    /// [`MemoryAwaitedActionDb::set_dag_criticality`]; read-only thereafter.
+    dag_state: Option<Arc<DagState>>,
 }
 
 impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync> AwaitedActionDbImpl<I, NowFn> {
@@ -882,10 +889,15 @@ impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync> AwaitedActionDbI
             ActionUniqueQualifier::Uncacheable(_unique_key) => None,
         };
         let operation_id = OperationId::default();
-        let awaited_action = AwaitedAction::new(
+        // (#dag-criticality, v2 fix 4d) Fold the confidence-gated criticality band into the
+        // sort key AT ENQUEUE from the currently published snapshot. `None` snapshot / off
+        // feature / non-confident node → band 0 → today's FIFO ordering.
+        let dag_snapshot = self.dag_state.as_ref().map(|s| s.snapshot());
+        let awaited_action = AwaitedAction::new_with_criticality(
             operation_id.clone(),
             action_info.clone(),
             (self.now_fn)().now(),
+            dag_snapshot.as_deref(),
         );
         debug_assert!(
             ActionStage::Queued == awaited_action.state().stage,
@@ -1045,6 +1057,8 @@ impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync + 'static>
             connected_clients_for_operation_id: HashMap::new(),
             action_event_tx,
             now_fn,
+            // (#dag-criticality) OFF until `set_dag_criticality` injects the shared state.
+            dag_state: None,
         }));
         let weak_inner = Arc::downgrade(&inner);
         Self {
@@ -1186,5 +1200,14 @@ impl<I: InstantWrapper, NowFn: Fn() -> I + Clone + Send + Sync + 'static> Awaite
             .await?;
         self.tasks_change_notify.notify_one();
         Ok(subscriber)
+    }
+
+    fn set_dag_criticality(&self, dag_state: Option<Arc<DagState>>) {
+        // One-shot wiring BEFORE the db serves — the `async_lock::Mutex` is uncontended so
+        // `try_lock` succeeds. If somehow contended, skip (the feature simply stays band-0
+        // = FIFO — never a hang or a blocking `.await` in this sync setter).
+        if let Some(mut inner) = self.inner.try_lock() {
+            inner.dag_state = dag_state;
+        }
     }
 }

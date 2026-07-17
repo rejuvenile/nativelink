@@ -2617,6 +2617,19 @@ impl SimpleScheduler {
         // Create shared worker registry for single heartbeat per worker.
         let worker_registry = Arc::new(WorkerRegistry::new());
 
+        // (#dag-criticality) Create the shared DAG state (kill-switch) BEFORE the awaited-
+        // action-db is moved into the state manager, and inject it so the db folds the
+        // published criticality snapshot into the sort key at enqueue. The SAME `Arc` is
+        // also handed to the worker scheduler below (producer/consumer/duration recording +
+        // the background recompute that publishes the snapshot). Off => `None` everywhere
+        // (no accumulation; sort key byte-identical to the pre-feature key).
+        let dag_state: Option<Arc<DagState>> = if spec.dag_critical_path_enabled {
+            Some(Arc::new(DagState::new()))
+        } else {
+            None
+        };
+        awaited_action_db.set_dag_criticality(dag_state.clone());
+
         let state_manager = SimpleSchedulerStateManager::new(
             max_job_retries,
             Duration::from_secs(worker_timeout_s),
@@ -2745,16 +2758,10 @@ impl SimpleScheduler {
             }
         }
 
-        // (#dag-criticality) Create + wire the DAG-from-history state when the kill-switch
-        // is on. The SAME `Arc<DagState>` lives on the worker scheduler (producer/consumer/
-        // duration recording on the completion + dispatch paths; the published criticality
-        // snapshot is read at enqueue). Mirrors `set_phase3_enforcement`. Off => `None` (no
-        // accumulation; the sort key stays byte-identical to the pre-feature key).
-        let dag_state: Option<Arc<DagState>> = if spec.dag_critical_path_enabled {
-            Some(Arc::new(DagState::new()))
-        } else {
-            None
-        };
+        // (#dag-criticality) Hand the SAME shared DAG state (created above, already injected
+        // into the awaited-action-db) to the worker scheduler for producer/consumer/duration
+        // recording on the completion + dispatch paths + the background recompute that
+        // publishes the criticality snapshot. Mirrors `set_phase3_enforcement`.
         worker_scheduler.set_dag_state(dag_state.clone());
 
         // (#dag-criticality) Load the persisted edge store BEFORE serving — a SELF-CONTAINED
