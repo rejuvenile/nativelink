@@ -1,7 +1,10 @@
 # Portable rustc incremental via byte-identical execroot (dynamic-execution)
 
-**Status:** DRAFT v1 — Tier-3 cadre 5/5 returned **FIXES-REQUIRED / NOT SIGNED OFF** (2026-07-17). See
-`.claude/reviews/design-portable-rustc-incremental/DECISION.md`. **A v2 is required before implementation**,
+**Status:** v1 — **SUPERSEDED by `portable-rustc-incremental-v2.md`** (2026-07-17). The Tier-3 cadre 5/5
+returned FIXES-REQUIRED; v2 folds in every convergent finding + all validating experiments (both blocking
+experiments PASSED: cross-machine M4→M2-Ultra reuse, and macOS getcwd/hardlink/EXDEV; target-cpu confirmed
+fixed `apple-a14`). Read v2 for the implementation-ready design; this v1 is retained for the cadre trail.
+See `.claude/reviews/design-portable-rustc-incremental/DECISION.md`. **A v2 is required before implementation**,
 gated on TWO blocking experiments the single-machine §11 test did NOT cover: (1) **cross-machine** seed
 transfer (mac A → different-model mac B — rustc also keys on sysroot abs path + compiler build-hash +
 target-cpu; divergence collapses the design); (2) **macOS/APFS** getcwd-after-firmlink + cross-volume `link()`
