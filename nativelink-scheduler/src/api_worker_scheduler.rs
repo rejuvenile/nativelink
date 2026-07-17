@@ -1334,6 +1334,7 @@ pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 100_000;
 pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
+use crate::dag_criticality::{CriticalitySnapshot, DagNodeKey, DagState};
 use crate::resource_profile::{
     PROFILE_MIN_SAMPLES, ProfileEntrySnapshot, ProfileKey, ProfileMap, ProfileTier, ResourceSample,
     TieredTail,
@@ -4903,6 +4904,17 @@ pub struct ApiWorkerScheduler {
     /// `None` until the first sample. Throttles to at most one line per
     /// `INJECT_OBSERVE_SAMPLE_MIN_INTERVAL`.
     inject_observe_sample_at: ParkingMutex<Option<Instant>>,
+
+    /// (#dag-criticality) The DAG-from-history critical-path state, or `None` when
+    /// `dag_critical_path_enabled` is off (the kill-switch) — set once during
+    /// `SimpleScheduler::new` wiring via [`Self::set_dag_state`], mirroring
+    /// `set_phase3_enforcement`. The SAME `Arc<DagState>` is also handed to the
+    /// awaited-action-db layer so the enqueue path reads its published criticality
+    /// snapshot. Held behind a brief `parking_lot::Mutex` (read = clone the
+    /// `Option<Arc>`, O(1), never across `.await`); the `Arc<DagState>` itself carries
+    /// the async producer-map mutex + the strict-leaf edge-store mutex + the snapshot
+    /// `RwLock`.
+    dag_state: ParkingMutex<Option<Arc<DagState>>>,
 }
 
 /// Probe a CAS store chain to find the SizePartitioningStore threshold.
@@ -5812,6 +5824,10 @@ impl ApiWorkerScheduler {
             // and must not be dark; see the field doc). See PROFILE_MAP_MAX_KEYS.
             resource_profile_map: ParkingMutex::new(ProfileMap::with_default_tuning()),
             inject_observe_sample_at: ParkingMutex::new(None),
+            // (#dag-criticality) DAG state OFF by default; the production wiring
+            // (`SimpleScheduler::new`) injects `Some(Arc<DagState>)` via `set_dag_state`
+            // when `dag_critical_path_enabled` is true (mirrors `set_phase3_enforcement`).
+            dag_state: ParkingMutex::new(None),
         })
     }
 
@@ -5902,6 +5918,29 @@ impl ApiWorkerScheduler {
         inner.phase3_down_overcommit_enabled = down_overcommit_enabled;
         inner.phase3_overcommit_max_factor = overcommit_max_factor;
         inner.phase3_persist_max_age_secs = persist_max_age_secs;
+    }
+
+    /// (#dag-criticality) Inject (or clear) the shared DAG state during one-shot wiring
+    /// (`SimpleScheduler::new`). `None` = the kill-switch off state (no accumulation, no
+    /// sort-key effect). The SAME `Arc<DagState>` is shared with the awaited-action-db
+    /// enqueue path.
+    pub fn set_dag_state(&self, state: Option<Arc<DagState>>) {
+        *self.dag_state.lock() = state;
+    }
+
+    /// (#dag-criticality) The shared DAG state, or `None` when the feature is off. A brief
+    /// lock cloning the `Option<Arc>` — never held across `.await`.
+    #[must_use]
+    pub fn dag_state(&self) -> Option<Arc<DagState>> {
+        self.dag_state.lock().clone()
+    }
+
+    /// (#dag-criticality) The currently published criticality snapshot, or `None` when the
+    /// feature is off. Read by the awaited-action-db enqueue path to fold a confidence-
+    /// gated band into the (immutable) sort key.
+    #[must_use]
+    pub fn dag_criticality_snapshot(&self) -> Option<Arc<CriticalitySnapshot>> {
+        self.dag_state.lock().as_ref().map(|s| s.snapshot())
     }
 
     /// (#specprefetch-rebind Stage B/C v3) `T_wait_W`: the worker's expected time to
@@ -6923,6 +6962,24 @@ impl ApiWorkerScheduler {
         // profile-map mutex and changes NOTHING about the reservation just made.
         if let Some((reserved_worker_id, _, _)) = result.as_ref() {
             self.observe_inject_counterfactual(action_info, reserved_worker_id);
+
+            // (#dag-criticality, v2 fix 2b/11) Infer stable-key edges for THIS dispatched
+            // consumer from its resolved input file digests intersected against the
+            // producer map — ONCE per reserved dispatch (not per do_try_match cycle), so
+            // an edge's observation count is a genuine cross-build tally. Detached: the
+            // intersection drains the async producer map to an owned Vec, releases it, then
+            // takes the strict-leaf edge-store lock — never on the dispatch critical path.
+            if let (Some(dag_state), Some(consumer_key), Some(tree)) = (
+                self.dag_state(),
+                dag_node_key_of(action_info),
+                resolved_tree.as_ref(),
+            ) {
+                let file_digests: Vec<DigestInfo> =
+                    tree.file_digests.iter().map(|(d, _size)| *d).collect();
+                background_spawn!("dag_edge_infer", async move {
+                    dag_state.infer_edges(&consumer_key, &file_digests).await;
+                });
+            }
         }
 
         // ── Phase 2.5 deferred: inject pre-resolved tree into StartExecute ──
@@ -9644,6 +9701,30 @@ fn output_file_digests_of_completion(update: &UpdateOperationType) -> Vec<(Diges
     }
 }
 
+/// (#dag-criticality, v2 fix 3) PURE: the wall EXECUTION interval (ms) of a completion —
+/// `worker_completed_timestamp - worker_start_timestamp` from the `ActionResult`'s
+/// `execution_metadata` (NOT the queue-inclusive interval; excludes queue wait per §11.7).
+/// `None` for a non-`Completed` update or a non-monotone timestamp pair.
+fn completion_wall_duration_ms(update: &UpdateOperationType) -> Option<u64> {
+    match update {
+        UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(action_result)) => {
+            let meta = &action_result.execution_metadata;
+            meta.worker_completed_timestamp
+                .duration_since(meta.worker_start_timestamp)
+                .ok()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        }
+        _ => None,
+    }
+}
+
+/// (#dag-criticality, v2 fix 8) The stable DAG node key `(instance, target, mnemonic)` for
+/// an action — the FINE `ProfileKey` derived IDENTICALLY to the completion fold + the
+/// enqueue sort-key site. `None` when baggage is absent (no derivable key).
+fn dag_node_key_of(action_info: &ActionInfoWithProps) -> Option<DagNodeKey> {
+    resource_profile_keys(action_info).map(|(fine, _coarse)| fine)
+}
+
 /// (#output-locality-probe) PURE: extract the constituent `Directory` digests
 /// (root + every child) of a decoded output `Tree`, computing each digest by
 /// hashing the `Directory`'s serialized proto with `digest_function` — the SAME
@@ -10575,6 +10656,23 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // recovered from the output Tree's FileNodes on that recorder's decode.
         let output_file_digests = output_file_digests_of_completion(&update);
 
+        // (#dag-criticality, v2 fix 2/3) Capture the producer's stable node key + wall
+        // duration BEFORE `update_operation` consumes `update` and removes the op — the
+        // exact `running_action_info` join pattern `record_action_resource_usage` uses.
+        // Gated on the feature + a `Completed` update carrying output files (the only
+        // shape that can seed producer→consumer edges). Race (op already gone) → `None`.
+        let dag_state = self.dag_state();
+        let (dag_producer_key, dag_duration_ms) =
+            if dag_state.is_some() && !output_file_digests.is_empty() {
+                let key = self
+                    .running_action_info(worker_id, operation_id)
+                    .await
+                    .and_then(|info| dag_node_key_of(&info));
+                (key, completion_wall_duration_ms(&update))
+            } else {
+                (None, None)
+            };
+
         // ── lock-free await — (b) operation-state update; retries/sleeps
         //    here with NO worker-pool lock held ──
         worker_state_manager
@@ -10590,6 +10688,24 @@ impl WorkerScheduler for ApiWorkerScheduler {
                 );
                 err
             })?;
+
+        // (#dag-criticality, v2 fix 2/11) Record the producer node for each top-level
+        // output blob + the node's wall duration, off the completion RPC's critical path
+        // (detached, like the output-producer recorder). Cheap top-level file digests only
+        // — no CAS decode. Lands producer-tag + duration TOGETHER (dead-letter guard).
+        if let (Some(dag_state), Some(producer_key)) = (dag_state, dag_producer_key) {
+            let file_digests: Vec<DigestInfo> =
+                output_file_digests.iter().map(|(d, _size)| *d).collect();
+            let dur_ms = dag_duration_ms;
+            background_spawn!("dag_producer_recorder", async move {
+                for d in file_digests {
+                    dag_state.record_producer(d, producer_key.clone()).await;
+                }
+                if let Some(ms) = dur_ms {
+                    dag_state.record_duration(producer_key, ms);
+                }
+            });
+        }
 
         // (#output-locality-probe) The op-state commit SUCCEEDED for a `Completed`
         // update carrying outputs → record the producer(s) off the critical path.

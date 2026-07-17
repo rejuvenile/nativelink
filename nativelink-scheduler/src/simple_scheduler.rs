@@ -56,6 +56,7 @@ use crate::api_worker_scheduler::{
     emit_speculative_hold_counters_log,
 };
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
+use crate::dag_criticality::{self, DagState};
 use crate::known_platform_property_provider::KnownPlatformPropertyProvider;
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::resource_profile_persist;
@@ -1534,6 +1535,12 @@ pub struct SimpleScheduler {
     /// overlap); writes are atomic (tmp + rename) and NEVER fsync'd (advisory data).
     task_resource_profile_persist_spawn: Option<JoinHandleDropGuard<()>>,
 
+    /// (#dag-criticality) Background task that periodically recomputes the DAG criticality
+    /// snapshot (SCC + longest-path) and, when `dag_edge_store_persist_path` is set,
+    /// persists the edge store. `None` when `dag_critical_path_enabled` is off. The
+    /// `JoinHandleDropGuard` cancels it on scheduler drop.
+    task_dag_recompute_spawn: Option<JoinHandleDropGuard<()>>,
+
     /// Every duration, do logging of worker matching
     /// e.g. "worker busy", "can't find any worker"
     /// Set to None to disable. This is quite noisy, so we limit it
@@ -2738,6 +2745,57 @@ impl SimpleScheduler {
             }
         }
 
+        // (#dag-criticality) Create + wire the DAG-from-history state when the kill-switch
+        // is on. The SAME `Arc<DagState>` lives on the worker scheduler (producer/consumer/
+        // duration recording on the completion + dispatch paths; the published criticality
+        // snapshot is read at enqueue). Mirrors `set_phase3_enforcement`. Off => `None` (no
+        // accumulation; the sort key stays byte-identical to the pre-feature key).
+        let dag_state: Option<Arc<DagState>> = if spec.dag_critical_path_enabled {
+            Some(Arc::new(DagState::new()))
+        } else {
+            None
+        };
+        worker_scheduler.set_dag_state(dag_state.clone());
+
+        // (#dag-criticality) Load the persisted edge store BEFORE serving — a SELF-CONTAINED
+        // sibling file (own "NLDG" versioned header), NOT the resource-profile snapshot. A
+        // one-time bounded startup read (std::fs, not a serving path). Missing / corrupt /
+        // version-mismatch => `warn` + start fresh (never panics). An initial `recompute`
+        // publishes a snapshot from the loaded edges so criticality is live immediately.
+        if let (Some(dag_state), Some(path)) = (
+            dag_state.as_ref(),
+            spec.dag_edge_store_persist_path.as_deref(),
+        ) {
+            match std::fs::read(path) {
+                Ok(bytes) => match dag_criticality::deserialize_dag_snapshot(&bytes) {
+                    Ok((_snapshot_unix_secs, data)) => {
+                        let (loaded_edges, loaded_nodes) = dag_state.load_persist(data);
+                        dag_state.recompute();
+                        info!(
+                            tag = "dag_edge_store_load",
+                            path, loaded_edges, loaded_nodes, "loaded persisted DAG edge store"
+                        );
+                    }
+                    Err(err) => warn!(
+                        tag = "dag_edge_store_load",
+                        path,
+                        %err,
+                        "DAG edge store corrupt / version-mismatch — starting fresh"
+                    ),
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => info!(
+                    tag = "dag_edge_store_load",
+                    path, "no prior DAG edge store — starting fresh"
+                ),
+                Err(err) => warn!(
+                    tag = "dag_edge_store_load",
+                    path,
+                    %err,
+                    "DAG edge store unreadable — starting fresh"
+                ),
+            }
+        }
+
         let worker_scheduler_clone = worker_scheduler.clone();
 
         let action_scheduler = Arc::new_cyclic(move |weak_self| -> Self {
@@ -3141,6 +3199,68 @@ impl SimpleScheduler {
                     })
                 });
 
+            // (#dag-criticality) Background recompute + (optional) persist. Recompute
+            // publishes the criticality snapshot (Tarjan SCC + reverse-topo longest-path,
+            // O(V+E)) off the strict-leaf lock; when a persist path is set, the edge store
+            // is serialized (off the lock) + written atomically (tmp+rename, NO fsync).
+            let task_dag_recompute_spawn = if spec.dag_critical_path_enabled {
+                let interval_secs = spec.dag_recompute_interval_secs.max(1);
+                let persist_path = spec
+                    .dag_edge_store_persist_path
+                    .as_ref()
+                    .map(std::path::PathBuf::from);
+                let weak_ws = Arc::downgrade(&worker_scheduler);
+                Some(spawn!("simple_scheduler_dag_recompute", async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                    interval.tick().await; // skip the immediate first tick (empty store)
+                    loop {
+                        interval.tick().await;
+                        let Some(ws) = weak_ws.upgrade() else {
+                            return; // scheduler dropped
+                        };
+                        let Some(dag_state) = ws.dag_state() else {
+                            drop(ws);
+                            continue; // feature toggled off
+                        };
+                        drop(ws);
+                        // Publish a fresh criticality snapshot (off the leaf lock).
+                        dag_state.recompute();
+                        // Best-effort persist when configured.
+                        if let Some(path) = persist_path.as_ref() {
+                            let data = dag_state.persist_snapshot();
+                            if data.edges.is_empty() && data.durations.is_empty() {
+                                continue;
+                            }
+                            let now_unix = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            match dag_criticality::serialize_dag_snapshot(data, now_unix) {
+                                Ok(bytes) => {
+                                    if let Err(err) =
+                                        dag_criticality::write_dag_snapshot_bytes(path, &bytes).await
+                                    {
+                                        warn!(
+                                            tag = "dag_edge_store_write",
+                                            path = %path.display(),
+                                            %err,
+                                            "DAG edge store write failed (advisory; will retry next interval)"
+                                        );
+                                    }
+                                }
+                                Err(err) => warn!(
+                                    tag = "dag_edge_store_write",
+                                    %err,
+                                    "DAG edge store serialize failed"
+                                ),
+                            }
+                        }
+                    }
+                }))
+            } else {
+                None
+            };
+
             let worker_match_logging_interval = match spec.worker_match_logging_interval_s {
                 // -1 or 0 means disabled (0 used to cause expensive logging on every call)
                 -1 | 0 => None,
@@ -3165,6 +3285,7 @@ impl SimpleScheduler {
                 task_worker_matching_spawn,
                 task_hold_counters_log_spawn,
                 task_resource_profile_persist_spawn,
+                task_dag_recompute_spawn,
                 worker_match_logging_interval,
                 max_matches_per_client_per_cycle: spec.max_matches_per_client_per_cycle,
                 batch_affinity_metrics: BatchAffinityMetrics::default(),
