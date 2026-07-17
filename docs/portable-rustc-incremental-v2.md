@@ -1,9 +1,15 @@
 # Portable rustc incremental via byte-identical execroot — DESIGN v2
 
-**Status:** implementation-ready design, **pending re-cadre** (design-only). Supersedes v1
-(`portable-rustc-incremental.md`, which the 5/5 cadre returned FIXES-REQUIRED). This v2 folds in every
-convergent cadre finding + the results of all validating experiments. **Architectural sign-off still REQUIRED**
-before implementation (wiped-dir execution-buffer invariant). **Date:** 2026-07-17.
+**Status:** v2 — re-cadre 5/5 returned **NOT SIGNED OFF (2026-07-17)**; distsys WITHHELD the wiped-dir sign-off.
+See `.claude/reviews/design-portable-rustc-incremental-v2/DECISION.md`. **The §6 seed-TRANSPORT needs a Rethink
++ a gating experiment before v3.** Resolved by the cadre: (1) `-incr` does NOT churn the `.rlib` key —
+`unused_inputs_list` already handles that (my "invent a side-input" framing was wrong); BUT (2) the seed CAPTURE
+is broken for remote-won builds under the LIVE `--remote_download_outputs=toplevel` (`.*-incr` download regex
+removed, FL-681) → `RustcIncrSeed` (no-remote, local `prev_incr_dir`) reads an empty seed → cold; self-limiting.
+(3) cross-machine `.rlib` cache-hit non-regression is UNPROVEN → gate on a two-machine remote-cache experiment.
+Everything else (§4/§5/§7/§8-with-real-authority/§9/§10-OptionB/§11) is sound + landable; both physics experiments
+passed. **Do NOT implement until §6 seed-capture is redesigned + the gating experiment is run.**
+Supersedes v1. **Architectural sign-off still REQUIRED** (wiped-dir invariant). **Date:** 2026-07-17.
 
 ## 0. What changed from v1 (the cadre + experiments)
 
@@ -37,8 +43,13 @@ fires. Must work on BOTH branches (remote-only was rejected by the operator).
 **Two residual platform constraints (measured, addressable):**
 - **EXDEV:** `/Volumes/CrowAgent` (dev 16777240) is a *different* APFS volume from the Data volume (16777233).
   Hardlinks require FIXED_PREFIX and the execroot on the **same volume** → §9.
-- The cross-machine result used an identical toolchain at an identical sysroot path; production's **hermetic,
-  content-addressed** rules_rust toolchain gives that by construction on every machine (stronger than the test).
+- The cross-machine result used an identical toolchain at an identical sysroot path. [CORRECTED per re-cadre:
+  this is NOT "content-addressed, by construction." The rustc sysroot flag is execroot-RELATIVE
+  (`toolchain.bzl:647`); the identical ABSOLUTE path comes from §10 hardlinking the toolchain under the pinned
+  cwd PLUS a HOST-PROVISIONING invariant — every worker uniformly has `/Users/user/.rustup` (`.bazelrc:512-513`;
+  FL-721 salts host rustup content into the action key). exp#1 passed because both macs had that path. §11 MUST
+  assert the resolved sysroot absolute path is byte-identical on both branches at startup; the local branch must
+  NOT reach sysroot via an `output_base` symlink (rustc realpaths it → cold).]
 
 ## 3. Path-key scheme
 
