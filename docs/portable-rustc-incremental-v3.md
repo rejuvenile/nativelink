@@ -1,6 +1,6 @@
 # Portable rustc incremental via byte-identical execroot — DESIGN v3
 
-**Status:** design-only, for review cadre. Supersedes v2 (whose 5/5 re-cadre found the v2 seed-CAPTURE path
+**Status:** SUPERSEDED by `portable-rustc-incremental-v4.md` (2026-07-17) — v3's 5/5 cadre GRANTED architectural sign-off + returned a FIXES-REQUIRED bundle, all folded into v4 (FL-1383). Read v4. Supersedes v2 (whose 5/5 re-cadre found the v2 seed-CAPTURE path
 broken for remote-won builds). **Date:** 2026-07-17. **Architectural sign-off REQUIRED** before implementation
 (wiped-dir execution-buffer invariant). One sub-decision (§6 fetch-wiring) is **conditional on an in-flight
 two-machine remote-`.rlib`-cache experiment** — flagged inline.
