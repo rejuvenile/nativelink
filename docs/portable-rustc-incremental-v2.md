@@ -9,6 +9,9 @@ removed, FL-681) → `RustcIncrSeed` (no-remote, local `prev_incr_dir`) reads an
 (3) cross-machine `.rlib` cache-hit non-regression is UNPROVEN → gate on a two-machine remote-cache experiment.
 Everything else (§4/§5/§7/§8-with-real-authority/§9/§10-OptionB/§11) is sound + landable; both physics experiments
 passed. **Do NOT implement until §6 seed-capture is redesigned + the gating experiment is run.**
+**SUPERSEDED by `portable-rustc-incremental-v3.md`** (2026-07-17) — v3 replaces the broken seed-capture with a
+fleet-shared `targetkey→-incr` store (Option 3: CAS content + AC-index-by-hash(targetkey)), reframes §10 as
+`-incr`-residency-in-the-existing-affinity-scorer, and relaxes §7 to worker-local-`-incr`-as-store-cache. Read v3.
 Supersedes v1. **Architectural sign-off still REQUIRED** (wiped-dir invariant). **Date:** 2026-07-17.
 
 ## 0. What changed from v1 (the cadre + experiments)
