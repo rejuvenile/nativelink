@@ -5,10 +5,12 @@ GRANTED** by the v3 distsys review (`.claude/reviews/design-portable-rustc-incre
 FIXES-REQUIRED bundle (5/5 cadre). Supersedes v1–v3. **Date:** 2026-07-17. Tracking bug: **FL-1383.**
 
 Both pre-CODE gates are now resolved (neither reopened the architecture): (i) §6.6 publish-authority CLEARED by the
-operator's trusted-worker decision; (ii) §6.5 CAS-content-pin sizing CLEARED by a proof that holds at full-fleet-widen
-scale, with a disjoint seed pin-class as the mechanism. The two-machine experiment (§14-3) already confirmed §6.3
-out-of-band is required. **Stage 1 (rules_rust seed-fetch action + the `incr_seed_index` store, behind a flag, one
-apple-a14 crate) can begin.**
+operator's trusted-worker decision; (ii) §6.5 CAS-content-pin sizing CLEARED — the proof HOLDS at full-fleet-widen
+scale (IF we pin, it fits, via a disjoint seed pin-class), but the pin itself is **optional-pending-measurement**: a
+missing seed is already safe (§6.1 CompletenessChecking + §6.4 cold-fallback), so the pin is a hit-rate optimization,
+NOT a correctness requirement — **Stage 1 ships WITHOUT it** and measures the real reuse hit-rate under production CAS
+pressure. The two-machine experiment (§14-3) already confirmed §6.3 out-of-band is required. **Stage 1 (rules_rust
+seed-fetch action + the `incr_seed_index` store, behind a flag, one apple-a14 crate) can begin.**
 
 ## 1. Goal
 Portable rustc **incremental** reuse under Bazel `--spawn_strategy=dynamic`: a fleet-shared `-incr` seed
@@ -56,8 +58,10 @@ local+remote of the same action = different machines → no collision.
   live-digest-to-nowhere.
 
 ### 6.2 Convergence loop + consistency
-- **Publish (after a CLEAN compile only — never the dynamic loser's torn seed):** `-incr` content → CAS + **pin**
-  (§6.5); then `update_oneshot(hash(targetkey), ActionResult→incr digest)`.
+- **Publish (after a CLEAN compile only — never the dynamic loser's torn seed):** `-incr` content → CAS (relying on
+  normal CAS retention); then `update_oneshot(hash(targetkey), ActionResult→incr digest)`. An OPTIONAL retention step
+  (pin / LRU-priority) is DEFERRED pending measured hit-rate — see §6.5 (missing seed is already safe, so retention is
+  a hit-rate optimization, not a Stage-1 requirement).
 - **Fetch (before build, BEST-EFFORT + bounded fallback):** `GetActionResult(hash(targetkey))` → CAS digest →
   materialize at the pinned path. `GrpcStore` has timeout=0 (invariant #10) → a slow/absent index MUST NOT stall the
   build: bounded timeout → **cold-start on miss/timeout**, `incr_index_fetch_{hit,miss,timeout,error}` counters.
@@ -87,7 +91,21 @@ On-disk seed persistence as the AUTHORITY is forbidden (store is authoritative; 
 (the floor). **Adversarially-forged** self-consistent seed → out-of-scope BY the trusted-ACTION assumption, NOT
 caught by rustc — see §6.6.
 
-### 6.5 CAS-content durability — GATE RESOLVED 2026-07-17 (sizing proof HOLDS; mechanism = disjoint seed pin-class)
+### 6.5 CAS-content retention — pin is OPTIONAL-PENDING-MEASUREMENT (sizing proof HOLDS as the fallback IF we pin)
+**Pinning is NOT required for correctness.** The index + CompletenessCheckingStore + cold-fallback (§6.1/§6.4) make a
+missing/evicted seed SAFE: a dangling index resolves to CAS-NotFound → cold build, never a wrong `.rlib`. The pin is
+purely a hit-rate/retention optimization. Nor is the seed truly single-use from LRU's view — it is read at the start of
+EVERY incremental build of that target, so a genuinely-reused seed is frequently-accessed and plain LRU already tends to
+retain it; whether plain LRU evicts a seed during the inter-build window before reuse is an UNMEASURED empirical question
+(CAS size vs inter-build churn).
+**PLAN — Stage 1 ships WITHOUT the pin**, relying on normal CAS LRU, and MEASURES the real reuse hit-rate under
+production CAS pressure via the §12 counters: `incr_index_fetch_hit` climbing while `incr_seed_materialized` /
+`incr_reuse_fired` stay flat, or `seed_present_but_cold` climbing, = the index resolves but the content was evicted (a
+retention miss). ONLY IF the measured hit-rate is too low do we add retention — and even then prefer the LIGHTER tool:
+an LRU eviction-PRIORITY/weight (seeds evict LAST) over a hard pin, which needlessly borrows from the 20 GiB budget
+FL-688 durability shares and drags in the whole `seed_pin_class` co-tenancy-isolation apparatus below.
+
+**FALLBACK MECHANISM (IF retention is later proven necessary — the sized hard-pin design, NOT the Stage-1 default).**
 Investigation (`.claude/reviews/design-portable-rustc-incremental-v3/gate65-content-pin-sizing.md`):
 - **Pinning is ADDITIVE to `max_bytes`, not carved from it** (verified: `moka_evicting_map.rs:1668-1692` inserts into
   a separate `pinned` DashMap + invalidates the moka entry; `weighted_size` excludes pinned). So worker physical =
@@ -108,14 +126,15 @@ Investigation (`.claude/reviews/design-portable-rustc-incremental-v3/gate65-cont
   the pinning producer (via the §10 residency affinity hook); a fetch that falls through to the server CAS (/srv/bulk, its
   own eviction) can be cold. So §6.5 durability depends on §10 routing, not just the pin existing.
 
-The v3 framing below is retained; the reservation is the disjoint seed pin-class above.
-The `-incr` content is LARGE (asan/tsan), churned every build, single-use from LRU's view → the ideal CAS eviction
-victim under exactly the sustained load where reuse matters; the index would then point at an evicted digest → cold
-(the FL-688 incident class). **The publish MUST pin/retain the `-incr` content the index authority references** — a
-bounded retention on the seed content (e.g. indefinite-pin the current `-incr` blob per live `targetkey`, released
-when the index overwrites), NOT relying on the general CAS LRU. Sized against the FL-688 pin budget with a proof
-`(pin_high_water + incr_content_reservation + working_set) ≤ physical`. Without this, reuse is best-effort-until-
-evicted — state which if the pin is deferred.
+The v3 framing below is retained as the fallback rationale; the reservation is the disjoint seed pin-class above.
+The `-incr` content is LARGE (asan/tsan) and churned every build → a plausible CAS eviction victim under sustained
+load; if evicted, the index points at an evicted digest → cold (the FL-688 incident class, but here output-correct by
+§6.4 — merely a lost reuse). The v3 framing asserted "the publish MUST pin/retain the `-incr` content" via a bounded
+per-`targetkey` retention released on index overwrite, sized against the FL-688 pin budget with a proof
+`(pin_high_water + incr_content_reservation + working_set) ≤ physical`. That MUST is now DOWNGRADED to
+optional-pending-measurement: **the pin IS deferred** in Stage 1 → reuse is best-effort-until-evicted, which is
+exactly the hit-rate the §12 counters measure. Add retention (prefer LRU-priority over hard pin) only if the
+measurement shows eviction is costing reuse.
 
 ### 6.6 Publish authority — GATE CLEARED 2026-07-17 (operator: workers implicitly trusted)
 **OPERATOR DECISION (2026-07-17): workers are IMPLICITLY TRUSTED → the trusted-ACTION assumption holds (an action on
@@ -188,7 +207,7 @@ targeted eviction). Publish-authority precondition per §6.6.
   design rests on; and the local seed materialization at the pinned path.
 - NativeLink: `targetkey` via Option-B at ingestion (Command fetched `inner_prepare_action:5049`, `output_paths` by
   `:5183`); `make_action_directory:8601` → `<FIXED_PREFIX>/<targetkey>`; chdir `:5263` (no `/work`); wipe/guard
-  §7/§9; RAII lease §5; the §6.2 publish (gated-on-success, pin §6.5) + worker out-of-band fetch §6.3; the index
+  §7/§9; RAII lease §5; the §6.2 publish (gated-on-success; seed retention DEFERRED per §6.5) + worker out-of-band fetch §6.3; the index
   store instance behind CompletenessChecking §6.1; the §10 ActionInfo-targetkey + residency-gossip hook.
 
 ## 12. Observability
@@ -200,21 +219,25 @@ volume. (`seed_present_but_cold` climbing = LWW-clobber or CAS-eviction diagnost
 
 ## 13. Effort + rollout (XL, dynamic from the start)
 (1) rules_rust seed-fetch-from-index (stage-1 net-new) + the `incr_seed_index` store instance behind
-CompletenessChecking + the §6.5 content-pin. (2) NativeLink stable-path + lease + §6.2 publish/fetch + §10
-ActionInfo-targetkey + residency-gossip hook + §8 pool budget. (3) worker out-of-band injection §6.3. (4) provision
+CompletenessChecking (NO content-pin — deferred per §6.5). (2) NativeLink stable-path + lease + §6.2 publish/fetch +
+§10 ActionInfo-targetkey + residency-gossip hook + §8 pool budget. (3) worker out-of-band injection §6.3. (4) provision
 FIXED_PREFIX per-machine on the execroot volume + §12 asserts + the §6.6 egress precondition check. (5) ONE
-apple-a14 crate under dynamic; measure the three-state + store + pin counters. (6) widen — WATCH `seed_present_but_
-cold` for the multi-version-LWW + content-eviction floors that only surface at fleet scale (§6.2/§6.5).
+apple-a14 crate under dynamic; measure the three-state + store counters — including the reuse HIT-RATE (§6.5) so we
+know whether normal CAS LRU retains the seed. (6) widen — WATCH `seed_present_but_cold` for the multi-version-LWW +
+content-eviction floors that only surface at fleet scale (§6.2/§6.5); add seed retention (prefer LRU-priority over a
+hard pin, §6.5) ONLY IF the measured hit-rate shows eviction is costing reuse.
 
 ## 14. Pre-code gates (architecture already signed off) — ALL CLEARED 2026-07-17
 1. ~~§6.6 publish-authority~~ **CLEARED 2026-07-17 (operator: workers implicitly trusted → trusted-action assumption
    holds; the derivable-key index poisoning surface is ACCEPTED, no worse than the already-writable AC/CAS; NO
    action-isolation infra required).**
-2. ~~§6.5 CAS-content-pin sizing proof~~ **CLEARED 2026-07-17: proof HOLDS at one-crate AND full-CI-widen worst-case
-   (10.9 GB ≤ 20 GiB pin budget; ~135 GB ≤ 228 GiB physical). Mechanism = a DISJOINT `seed_pin_class` (4 GiB
+2. ~~§6.5 CAS-content-pin sizing proof~~ **CLEARED 2026-07-17: sizing proof HOLDS at one-crate AND full-CI-widen
+   worst-case (10.9 GB ≤ 20 GiB pin budget; ~135 GB ≤ 228 GiB physical) via a DISJOINT `seed_pin_class` (4 GiB
    carve-out, excluded from the FL-688 admission check, mirroring `speculative_pin`). See
-   `.claude/reviews/design-portable-rustc-incremental-v3/gate65-content-pin-sizing.md`. Durability depends on §10
-   peer-routing (caveat in §6.5).**
+   `.claude/reviews/design-portable-rustc-incremental-v3/gate65-content-pin-sizing.md`. The pin is now
+   OPTIONAL-PENDING-MEASUREMENT (§6.5): the proof means IF we pin it fits — Stage 1 ships WITHOUT it (a missing seed is
+   safe via §6.1/§6.4), measures the reuse hit-rate, and adds retention only if eviction is costing reuse. Durability
+   (if retention is later added) depends on §10 peer-routing (caveat in §6.5).**
 3. ~~Two-machine remote-`.rlib`-cache experiment~~ **DONE 2026-07-17: CONFIRMED the Bazel-declared seed churns the
    remote key (`df7bff88`≠`ff08968c`, seed-content sole cause) → §6.3 out-of-band is REQUIRED, not optional
    (regression scoped to >20 MB-incr crates = the target set).**
