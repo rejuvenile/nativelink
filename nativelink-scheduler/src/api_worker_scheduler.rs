@@ -1633,6 +1633,58 @@ fn action_declared_memory_kb(props: &PlatformProperties) -> u64 {
     }
 }
 
+/// (#task-resource-profile Phase-3 §8) Tier penalty MULTIPLIER applied to the DOWN
+/// margin when the trusted profile came from the COARSE `(instance, mnemonic)` blend
+/// rather than a FINE `(instance, target, mnemonic)` key. A coarse blend mixes cheap
+/// and expensive targets → higher true variance than the p95/p50 of any single target
+/// captures, so its margin is WIDENED (reserve closer to declared) to stay safe. `2.0`
+/// = a coarse key reserves with twice the fine margin for the same measured spread.
+/// FINE keys use penalty `1.0` (the base margin). Numeric-constant rule: this literal
+/// is authoritative.
+const PHASE3_COARSE_MARGIN_PENALTY: f64 = 2.0;
+
+/// (#task-resource-profile Phase-3 §3/§8) DOWN-overcommit effective reserve (KiB) for
+/// an OVER-declared key. `effective = clamp(p50 × (1 + margin), floor, declared)` where:
+/// * `floor = ceil(declared / max(1.0, overcommit_max_factor))` — the profile-INDEPENDENT
+///   bound (§6): a single wrong-low prediction can under-reserve by at most `max_factor`.
+///   `max_factor <= 1.0` → `floor == declared` → the clamp pins `effective == declared`
+///   (DOWN inert; the default 1.0 is the kill-dial, and a factor below 1 must not RAISE
+///   above declared — that is the RAISE direction's job).
+/// * `margin = base_margin × tier_penalty`, `base_margin = max(0, (variance_ratio_x100
+///   − 100) / 100)` — CONTINUOUS in the measured p95/p50 spread (NOT a p95 pass/fail
+///   gate): a tight key (ratio 100) reserves p50; a 2× key reserves p50×(1+penalty),
+///   i.e. near/above its own p95. `tier_penalty` = `1.0` (FINE) or
+///   [`PHASE3_COARSE_MARGIN_PENALTY`] (COARSE blend).
+///
+/// Pure (no lock, no I/O) so it is unit-testable in isolation. The tail risk of a
+/// wrong-low reserve is carried by the worker `memory_gate` NAK backstop, NOT this
+/// prediction.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn phase3_down_effective_kb(
+    declared_kb: u64,
+    p50_kb: u64,
+    variance_ratio_x100: u64,
+    tier: ProfileTier,
+    overcommit_max_factor: f64,
+) -> u64 {
+    let factor = overcommit_max_factor.max(1.0);
+    // ceil so the floor never rounds BELOW declared/factor (the bound must hold).
+    let floor = (declared_kb as f64 / factor).ceil() as u64;
+    let base_margin = if variance_ratio_x100 > 100 {
+        (variance_ratio_x100 - 100) as f64 / 100.0
+    } else {
+        0.0
+    };
+    let tier_penalty = match tier {
+        ProfileTier::Fine => 1.0,
+        ProfileTier::Coarse => PHASE3_COARSE_MARGIN_PENALTY,
+    };
+    let margin = base_margin * tier_penalty;
+    let reserve = (p50_kb as f64 * (1.0 + margin)) as u64;
+    // clamp is safe: floor <= declared always (factor >= 1.0).
+    reserve.clamp(floor, declared_kb)
+}
+
 /// (#task-resource-profile Phase-2c) TRUE DISPATCH-TIME leave-one-out classification
 /// of one folded sample: did the tail-aware statistic the enforce phase (Phase-3)
 /// WOULD have stood at THIS action's dispatch — stashed on the running action when it
@@ -3096,7 +3148,11 @@ impl ApiWorkerSchedulerImpl {
         // Only a TRUSTED (>=K) profile may MOVE a reservation — an untrusted tail is
         // statistically meaningless (same K-gate as the observe path).
         let TieredTail::Trusted {
-            tail_kb, ..
+            tier,
+            tail_kb,
+            p50_kb,
+            variance_ratio_x100,
+            ..
         } = resource_profile_map.lock().lookup_tiered(&fine_key, &coarse_key)
         else {
             return None;
@@ -3125,9 +3181,20 @@ impl ApiWorkerSchedulerImpl {
             } else {
                 raised
             }
+        } else if self.phase3_down_overcommit_enabled && tail_kb <= declared_kb {
+            // DOWN-overcommit (§3): the client OVER-declared (its measured tail sits
+            // at/under declared) → reserve a central estimate `p50 × (1 + margin)`
+            // floored at `declared / overcommit_max_factor`, so more actions pack per
+            // worker. The physical backstop is the EXISTING worker `memory_gate` NAK
+            // (re-queue on real pressure) — this design adds NO new backstop.
+            phase3_down_effective_kb(
+                declared_kb,
+                p50_kb,
+                variance_ratio_x100,
+                tier,
+                self.phase3_overcommit_max_factor,
+            )
         } else {
-            // DOWN-overcommit (§3) fills the `tail_kb <= declared_kb` branch in Stage 3;
-            // until then an over-declared key keeps its declared reservation (no-op).
             declared_kb
         };
 
@@ -16597,7 +16664,7 @@ mod b1_lock_decouple_tests {
     use parking_lot::Mutex as ParkingMutex;
     use tokio::sync::{Notify, mpsc};
 
-    use super::{ApiWorkerScheduler, UpdateForWorker, Worker};
+    use super::{ApiWorkerScheduler, UpdateForWorker, Worker, phase3_down_effective_kb};
     use crate::platform_property_manager::PlatformPropertyManager;
     use crate::resource_profile::ProfileTier;
     use crate::worker::ActionInfoWithProps;
@@ -17614,6 +17681,165 @@ mod b1_lock_decouple_tests {
             scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
             Some(0.0),
             "the clamped effective (8_000_000) must be reserved in full → remaining 0"
+        );
+    }
+
+    // ── (#task-resource-profile Phase-3 §3) DOWN-overcommit ──
+
+    /// (§3/§8 pure) The DOWN reserve function: continuous margin in variance, tier
+    /// penalty, and the profile-independent floor clamp.
+    #[test]
+    fn phase3_down_effective_kb_margin_tier_and_floor() {
+        use crate::resource_profile::ProfileTier;
+
+        // Tight (variance 100 → margin 0): reserve p50, above the floor.
+        // declared 100_000, p50 50_000, factor 4 → floor 25_000 → reserve 50_000.
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 50_000, 100, ProfileTier::Fine, 4.0),
+            50_000,
+            "a tight (variance=100) key reserves its p50 (50_000), well above the \
+             floor (declared/4 = 25_000)"
+        );
+
+        // FLOOR RESPECTED: a tiny p50 (384) must NOT drive the reserve below the
+        // profile-independent floor. factor 2 → floor 50_000 → clamp up to 50_000.
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 384, 100, ProfileTier::Fine, 2.0),
+            50_000,
+            "the floor declared/max_factor (100_000/2 = 50_000) must bound a wrong-low \
+             reserve: p50 384 is clamped UP to 50_000, so a single bad prediction \
+             under-reserves by at most the factor"
+        );
+
+        // High variance widens the margin (continuous, not a gate). variance 300 →
+        // base_margin 2.0 → reserve p50×3. p50 10_000, factor 10 (floor 10_000) → 30_000.
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 10_000, 300, ProfileTier::Fine, 10.0),
+            30_000,
+            "a 3× (variance=300) key reserves p50×(1+2.0)=30_000 — the margin scales \
+             CONTINUOUSLY with the measured spread, tracking a high percentile"
+        );
+
+        // COARSE penalty: same spread reserves MORE than FINE (safer for the blend).
+        // variance 200 → base_margin 1.0; Fine → p50×2, Coarse → p50×3.
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 10_000, 200, ProfileTier::Fine, 10.0),
+            20_000,
+            "FINE 2× key: p50×(1+1.0)=20_000"
+        );
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 10_000, 200, ProfileTier::Coarse, 10.0),
+            30_000,
+            "COARSE 2× key: the coarse penalty (2.0) widens the margin → p50×(1+2.0)=30_000 \
+             — a blended (higher-variance) tier reserves closer to declared"
+        );
+
+        // INERT at factor 1.0: floor == declared → clamp pins effective at declared.
+        assert_eq!(
+            phase3_down_effective_kb(100_000, 384, 100, ProfileTier::Fine, 1.0),
+            100_000,
+            "factor 1.0 (the default kill-dial) makes the floor == declared → DOWN is \
+             INERT (reserves the declared value, no overcommit)"
+        );
+    }
+
+    /// (§3 integration, requirement c: DOWN floor respected) With DOWN enabled and an
+    /// over-declared key (tiny p50 384, tail 512 <= declared 100_000), the reservation
+    /// is floored at `declared / overcommit_max_factor` (100_000/2 = 50_000), NOT the
+    /// tiny p50 — so the worker's remaining memory drops by exactly 50_000.
+    ///
+    /// MUTATION: change the clamp in `phase3_down_effective_kb` from
+    /// `reserve.clamp(floor, declared_kb)` to `reserve.min(declared_kb)` (drop the
+    /// floor) → effective becomes 384 → remaining reads 199_616 → this red-fails.
+    #[nativelink_test]
+    async fn down_overcommit_floor_respected_at_max_factor() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        scheduler.set_phase3_enforcement(false, true, 2.0); // DOWN on, factor 2.0
+        let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
+
+        // Over-declared key: 500 KiB samples → bucket 9 → p50 rep 384, tail 512 <=
+        // declared 100_000 (so the DOWN branch fires), tight variance → margin 0.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(500));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd7, 100_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("DOWN-reserved op must land on worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(200_000.0 - 50_000.0),
+            "DOWN must FLOOR the reserve at declared/max_factor (100_000/2 = 50_000), NOT \
+             collapse to the tiny p50 (384) — the worker's remaining must be 200_000−50_000 \
+             = 150_000, the single-wrong-low bound the overcommit factor guarantees"
+        );
+    }
+
+    /// (§3) DOWN packs: a low-variance over-declared key reserves its p50-based central
+    /// estimate BELOW declared, freeing capacity. p50 49_152 (50_000 samples), declared
+    /// 100_000, factor 4 (floor 25_000), tight → reserve 49_152 < declared 100_000.
+    ///
+    /// MUTATION: in the effective-compute, replace the DOWN branch result with
+    /// `declared_kb` → remaining reads 100_000 (no packing) → this red-fails.
+    #[nativelink_test]
+    async fn down_overcommit_lowers_reservation_below_declared() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        scheduler.set_phase3_enforcement(false, true, 4.0);
+        let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
+
+        // 50_000 KiB → bucket 16 rep 49_152 (p50), tail 65_536 <= declared 100_000.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd8, 100_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("DOWN-reserved op must land on worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(200_000.0 - 49_152.0),
+            "DOWN must reserve the p50 central estimate (49_152) BELOW declared (100_000) → \
+             remaining 200_000−49_152=150_848 — this is where the packing comes from"
+        );
+    }
+
+    /// (§3) DOWN is INERT at the default `overcommit_max_factor == 1.0`: the floor equals
+    /// declared, so the reservation is byte-identical to the declared-only ledger even
+    /// with the flag ON. Proves the kill-dial default.
+    #[nativelink_test]
+    async fn down_overcommit_inert_at_factor_one() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        scheduler.set_phase3_enforcement(false, true, 1.0); // enabled but factor 1.0
+        let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
+
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xd9, 100_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(200_000.0 - 100_000.0),
+            "factor 1.0 → floor == declared → DOWN reserves the DECLARED 100_000 (byte-\
+             identical), so remaining is 200_000−100_000=100_000"
         );
     }
 
