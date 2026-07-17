@@ -91,6 +91,7 @@ fn make_action_info(input_root: DigestInfo, action_disc: u8, ts_offset: u64) -> 
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::new([action_disc; 32], 0),
         }),
+        targetkey: None,
     })
 }
 
@@ -271,6 +272,7 @@ async fn batch_affinity_sampled_ops_saturates_at_cap_render() -> Result<(), Erro
                 digest_function: DigestHasherFunc::Sha256,
                 digest: DigestInfo::new(action_hash, 0),
             }),
+            targetkey: None,
         });
         scheduler
             .add_action(OperationId::default(), action_info)

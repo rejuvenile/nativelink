@@ -43,6 +43,7 @@ use uuid::Uuid;
 
 use crate::common::{DigestInfo, HashMapExt, VecExt};
 use crate::digest_hasher::DigestHasherFunc;
+use crate::targetkey::TargetKey;
 
 /// Default priority remote execution jobs will get when not provided.
 pub const DEFAULT_EXECUTION_PRIORITY: i32 = 0;
@@ -303,6 +304,17 @@ pub struct ActionInfo {
     /// This is primarily used to join actions/operations together using this key.
     #[metric(help = "Info used to uniquely identify this ActionInfo and if it is cacheable.")]
     pub unique_qualifier: ActionUniqueQualifier,
+    /// FL-1383 portable rustc-incremental key (design §3/§10). Derived ONCE at
+    /// ingestion from the `Command.output_paths` (which are already fetched to
+    /// build this struct) so the scheduler has it FREE at match with no store
+    /// round-trip on the `do_try_match` hot path. `None` unless the
+    /// `portable_incr` feature is enabled AND the action is allowlisted — so it
+    /// is `None` on the current fleet and this field is inert by construction.
+    ///
+    /// TODO(#FL-1383): the §10 residency-gossip / affinity scorer consumes this
+    /// (a later chunk); stage-1 only plumbs it.
+    #[serde(default)]
+    pub targetkey: Option<TargetKey>,
 }
 
 impl ActionInfo {
@@ -369,6 +381,9 @@ impl ActionInfo {
             load_timestamp,
             insert_timestamp: queued_timestamp,
             unique_qualifier,
+            // FL-1383: this constructor has no Command/output_paths in scope;
+            // the ingestion path (execution_server) is the derivation site.
+            targetkey: None,
         })
     }
 }

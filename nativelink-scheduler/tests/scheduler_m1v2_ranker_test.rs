@@ -118,6 +118,7 @@ fn make_action_info(action_digest: DigestInfo, insert_timestamp: SystemTime) -> 
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        targetkey: None,
     })
 }
 

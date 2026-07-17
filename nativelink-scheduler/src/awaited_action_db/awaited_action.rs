@@ -545,6 +545,7 @@ mod dag_enqueue_tests {
                 digest_function: DigestHasherFunc::Sha256,
                 digest: DigestInfo::new([1u8; 32], 1),
             }),
+            targetkey: None,
         })
     }
 

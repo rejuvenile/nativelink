@@ -275,6 +275,51 @@ pub struct CapabilitiesConfig {
     pub remote_cache_compression: bool,
 }
 
+/// FL-1383 portable rustc-incremental gating (design §13). Default: the whole
+/// feature is INERT — no `targetkey` derivation, no extra CAS fetch at
+/// ingestion, and therefore no runtime behavior change on the current fleet.
+/// Stage-1 (this chunk) uses this only to gate the ingestion-side `targetkey`
+/// derivation threaded through `ActionInfo` (§10 first bullet); the worker
+/// execution-path pinning (§4/§7) is a later chunk.
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct PortableIncrConfig {
+    /// Master switch for portable rustc-incremental. Default `false` → the
+    /// feature is fully inert. This flag is an operational KILL-SWITCH; even
+    /// when `true`, an action opts in only by matching `action_output_allowlist`
+    /// (fail-closed), so enabling the switch alone changes nothing until an
+    /// allowlist entry matches.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Allowlist of `Command.output_paths` PREFIXES that opt an action into
+    /// portable rustc-incremental (design §13: allowlisted actions only). An
+    /// action is eligible iff `enabled` is `true` AND its primary
+    /// (sorted-first) output path starts with one of these prefixes. Empty
+    /// (default) → NO action is eligible even when `enabled` is `true`.
+    ///
+    /// DoS note (design §9): the derivable-`targetkey` write surface is bounded
+    /// by the `incr_seed_index` store's own eviction cap; this allowlist
+    /// further narrows the surface to explicitly-opted output trees (e.g. the
+    /// single stage-1 apple-a14 crate).
+    #[serde(default)]
+    pub action_output_allowlist: Vec<String>,
+}
+
+impl PortableIncrConfig {
+    /// Whether an action whose primary (sorted-first) `Command.output_paths`
+    /// entry is `primary_output` is allowlisted into portable rustc-incremental.
+    /// True iff `primary_output` starts with any allowlist prefix. An empty
+    /// allowlist (the default) always returns `false` — fail-closed.
+    #[must_use]
+    pub fn is_allowlisted(&self, primary_output: &str) -> bool {
+        self.action_output_allowlist
+            .iter()
+            .any(|prefix| primary_output.starts_with(prefix.as_str()))
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
@@ -288,6 +333,11 @@ pub struct ExecutionConfig {
     /// The scheduler name referenced in the `schedulers` map in the main config.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub scheduler: SchedulerRefName,
+
+    /// FL-1383 portable rustc-incremental gating (design §13). Default:
+    /// disabled → the feature is inert (see [`PortableIncrConfig`]).
+    #[serde(default)]
+    pub portable_incr: PortableIncrConfig,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -1837,5 +1887,51 @@ mod tests {
         let config: CapabilitiesConfig = serde_json5::from_str("{}").unwrap();
 
         assert!(!config.remote_cache_compression);
+    }
+
+    // FL-1383 (§13): the portable-incr allowlist is fail-closed — an empty
+    // allowlist matches nothing, so the master switch alone opts nothing in.
+    #[test]
+    fn portable_incr_empty_allowlist_matches_nothing() {
+        let config = PortableIncrConfig {
+            enabled: true,
+            action_output_allowlist: vec![],
+        };
+        assert!(
+            !config.is_allowlisted("bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib"),
+            "empty allowlist must match nothing (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn portable_incr_allowlist_prefix_match() {
+        let config = PortableIncrConfig {
+            enabled: true,
+            action_output_allowlist: vec!["bazel-out/darwin_arm64-".to_string()],
+        };
+        assert!(
+            config.is_allowlisted("bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib"),
+            "a matching prefix must allowlist the primary output"
+        );
+        assert!(
+            !config.is_allowlisted("bazel-out/k8-fastbuild/bin/pkg/libfoo.rlib"),
+            "a non-matching prefix must not allowlist"
+        );
+    }
+
+    // FL-1383: ExecutionConfig without `portable_incr` deserializes to the inert
+    // default (disabled, empty allowlist) — chunk 1 lands dark-but-wired.
+    #[test]
+    fn execution_config_portable_incr_defaults_inert() {
+        let config: ExecutionConfig =
+            serde_json5::from_str(r#"{"cas_store": "cas", "scheduler": "sched"}"#).unwrap();
+        assert!(
+            !config.portable_incr.enabled,
+            "portable_incr must default to disabled"
+        );
+        assert!(
+            config.portable_incr.action_output_allowlist.is_empty(),
+            "portable_incr allowlist must default to empty"
+        );
     }
 }

@@ -111,6 +111,7 @@ fn make_awaited_action(operation_id: &str) -> AwaitedAction {
                 digest_function: DigestHasherFunc::Sha256,
                 digest: DigestInfo::zero_digest(),
             }),
+            targetkey: None,
         }),
         MockSystemTime::now().into(),
     )
@@ -239,6 +240,7 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::zero_digest(),
         }),
+        targetkey: None,
     });
 
     // Use FakeRedisBackend which handles all Redis commands dynamically
@@ -542,6 +544,7 @@ async fn add_action_attaches_ttl_to_cid_mapping() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::zero_digest(),
         }),
+        targetkey: None,
     });
 
     let fake_redis_backend: FakeRedisBackend<RedisSubscriptionManager> = FakeRedisBackend::new();

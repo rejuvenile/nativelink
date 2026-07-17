@@ -124,6 +124,7 @@ fn make_action_info(seed: u8, priority: i32) -> Arc<ActionInfo> {
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::new(hash, 1),
         }),
+        targetkey: None,
     })
 }
 
@@ -146,6 +147,7 @@ fn make_action_info_ts(seed: u8, priority: i32, insert_timestamp: SystemTime) ->
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::new(hash, 1),
         }),
+        targetkey: None,
     })
 }
 

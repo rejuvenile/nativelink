@@ -84,6 +84,7 @@ fn make_action_info(input_root: DigestInfo, action_disc: u64, ts_offset: u64) ->
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::new(action_hash, 0),
         }),
+        targetkey: None,
     })
 }
 

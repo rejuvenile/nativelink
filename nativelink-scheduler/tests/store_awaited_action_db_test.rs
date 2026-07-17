@@ -131,6 +131,7 @@ async fn test_inner_update_awaited_action() -> Result<(), Error> {
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        targetkey: None,
     };
 
     let awaited_action = AwaitedAction::new(
@@ -171,6 +172,7 @@ fn make_cacheable_action_info() -> Arc<ActionInfo> {
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::zero_digest(),
         }),
+        targetkey: None,
     })
 }
 

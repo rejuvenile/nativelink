@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use futures::stream;
-use nativelink_config::cas_server::{ExecutionConfig, WithInstanceName};
+use nativelink_config::cas_server::{ExecutionConfig, PortableIncrConfig, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
@@ -41,6 +41,7 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::{ActionStateResult, ActionStateResultStream};
 use nativelink_util::origin_event::OriginMetadata;
+use nativelink_util::targetkey::TargetKey;
 use tonic::Request;
 
 const INSTANCE_NAME: &str = "instance_name";
@@ -62,6 +63,13 @@ async fn make_store_manager() -> Result<Arc<StoreManager>, Error> {
 fn make_execution_server(
     store_manager: &StoreManager,
 ) -> Result<(ExecutionServer, Arc<MockActionScheduler>), Error> {
+    make_execution_server_with(store_manager, PortableIncrConfig::default())
+}
+
+fn make_execution_server_with(
+    store_manager: &StoreManager,
+    portable_incr: PortableIncrConfig,
+) -> Result<(ExecutionServer, Arc<MockActionScheduler>), Error> {
     let mock_scheduler = Arc::new(MockActionScheduler::new());
     let mut action_schedulers: HashMap<String, Arc<dyn KnownPlatformPropertyProvider>> =
         HashMap::new();
@@ -72,6 +80,7 @@ fn make_execution_server(
             config: ExecutionConfig {
                 cas_store: "main_cas".to_string(),
                 scheduler: "main_scheduler".to_string(),
+                portable_incr,
             },
         }],
         &action_schedulers,
@@ -724,5 +733,163 @@ async fn wait_operation_timeout_does_not_cancel() -> Result<(), Box<dyn core::er
          guard fires on legitimate poll-then-drop"
     );
 
+    Ok(())
+}
+
+/// FL-1383 (§10) ingestion-threading shared harness: uploads a Command with the
+/// given `output_paths`, an Action referencing it, drives `execute()` through
+/// the mock scheduler, and returns the `ActionInfo` the scheduler received so a
+/// caller can inspect its derived `targetkey`.
+async fn drive_execute_and_capture_action_info(
+    output_paths: Vec<String>,
+    portable_incr: PortableIncrConfig,
+) -> Result<ActionInfo, Box<dyn core::error::Error>> {
+    use nativelink_proto::build::bazel::remote::execution::v2::execution_server::Execution;
+    use nativelink_proto::build::bazel::remote::execution::v2::{Action, Command, Directory};
+    use nativelink_store::ac_utils::serialize_and_upload_message;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::store_trait::StoreLike;
+
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) =
+        make_execution_server_with(&store_manager, portable_incr)?;
+
+    let cas_store = store_manager
+        .get_store("main_cas")
+        .expect("main_cas registered");
+    let command_digest = serialize_and_upload_message(
+        &Command {
+            arguments: vec!["true".to_string()],
+            output_paths,
+            working_directory: ".".to_string(),
+            ..Default::default()
+        },
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+    let input_root_digest = serialize_and_upload_message(
+        &Directory::default(),
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+    let action = Action {
+        command_digest: Some(command_digest.into()),
+        input_root_digest: Some(input_root_digest.into()),
+        ..Default::default()
+    };
+    let action_digest = serialize_and_upload_message(
+        &action,
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+
+    let action_state = Arc::new(ActionState {
+        client_operation_id: OperationId::from("targetkey_probe_op"),
+        stage: ActionStage::Queued,
+        action_digest: DigestInfo::new([0u8; 32], 0),
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+    let mock_action_state_result = MockActionStateResult {
+        states: vec![action_state],
+    };
+
+    let request_fut = execution_server.execute(Request::new(ExecuteRequest {
+        instance_name: INSTANCE_NAME.to_string(),
+        digest_function: digest_function::Value::Sha256.into(),
+        skip_cache_lookup: true,
+        action_digest: Some(action_digest.into()),
+        execution_policy: None,
+        results_cache_policy: None,
+    }));
+
+    let (response, add_action_call) = tokio::join!(
+        request_fut,
+        mock_scheduler.expect_add_action(Ok(Box::new(mock_action_state_result))),
+    );
+    // Drop the response stream (Queued is not finished; nothing else to drive).
+    drop(response.expect("execute must succeed"));
+
+    let (_operation_id, action_info) = add_action_call;
+    Ok(action_info)
+}
+
+/// FL-1383 (§10): when the feature is ENABLED and the action's primary output
+/// is allowlisted, the `targetkey` is derived at ingestion (from the Command's
+/// `output_paths`) and threaded through `ActionInfo` — no store round-trip is
+/// needed later at match. Mutation: comment out the `targetkey = TargetKey::
+/// derive(...)` assignment in `execution_server::build_action_info` — this test
+/// must red-fail with "targetkey must be derived at ingestion when enabled".
+#[nativelink_test]
+async fn targetkey_derived_at_ingestion_when_enabled_and_allowlisted()
+-> Result<(), Box<dyn core::error::Error>> {
+    let output_paths = vec![
+        "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib.d".to_string(),
+        "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib".to_string(),
+    ];
+    let portable_incr = PortableIncrConfig {
+        enabled: true,
+        action_output_allowlist: vec!["bazel-out/".to_string()],
+    };
+
+    let action_info =
+        drive_execute_and_capture_action_info(output_paths.clone(), portable_incr).await?;
+
+    let expected = TargetKey::derive(&output_paths).expect("derive from non-empty output_paths");
+    assert_eq!(
+        action_info.targetkey.as_ref().map(TargetKey::key),
+        Some(expected.key()),
+        "targetkey must be derived at ingestion when enabled + allowlisted"
+    );
+    assert_eq!(
+        action_info.targetkey.as_ref().map(TargetKey::primary_output),
+        Some("bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib"),
+        "primary output must be the sorted-first path"
+    );
+    Ok(())
+}
+
+/// FL-1383 inert-by-default: with the feature DISABLED (the fleet default), no
+/// `targetkey` is derived at ingestion — `ActionInfo.targetkey` stays `None`,
+/// so chunk 1 changes no runtime behavior. Mutation: force `enabled = true`
+/// here — the assertion must red-fail, proving the disabled path is what keeps
+/// it inert.
+#[nativelink_test]
+async fn targetkey_absent_when_feature_disabled() -> Result<(), Box<dyn core::error::Error>> {
+    let output_paths = vec!["bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib".to_string()];
+
+    let action_info =
+        drive_execute_and_capture_action_info(output_paths, PortableIncrConfig::default()).await?;
+
+    assert_eq!(
+        action_info.targetkey, None,
+        "targetkey must be absent when the portable_incr feature is disabled (inert default)"
+    );
+    Ok(())
+}
+
+/// FL-1383 fail-closed allowlist (§13): with the feature ENABLED but the
+/// action's primary output NOT matching any allowlist prefix, no `targetkey` is
+/// threaded — enabling the master switch alone opts nothing in. Mutation: make
+/// the allowlist match (e.g. `vec!["bazel-out/".into()]`) — the assertion must
+/// red-fail.
+#[nativelink_test]
+async fn targetkey_absent_when_enabled_but_not_allowlisted()
+-> Result<(), Box<dyn core::error::Error>> {
+    let output_paths = vec!["bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib".to_string()];
+    let portable_incr = PortableIncrConfig {
+        enabled: true,
+        // Prefix that does NOT match the output path above.
+        action_output_allowlist: vec!["bazel-out/some-other-config/".to_string()],
+    };
+
+    let action_info = drive_execute_and_capture_action_info(output_paths, portable_incr).await?;
+
+    assert_eq!(
+        action_info.targetkey, None,
+        "targetkey must stay None when enabled but the primary output is not allowlisted"
+    );
     Ok(())
 }

@@ -180,6 +180,7 @@ async fn stream_drop_routes_kill_to_assigned_worker_via_real_apiworkerscheduler(
             config: ExecutionConfig {
                 cas_store: "cas".to_string(),
                 scheduler: "main_scheduler".to_string(),
+                portable_incr: Default::default(),
             },
         }],
         &scheduler_map,

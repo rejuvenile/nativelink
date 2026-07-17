@@ -54,6 +54,7 @@ pub mod spawn_rate_probe;
 pub mod stall_detector;
 pub mod store_trait;
 pub mod streaming_blob;
+pub mod targetkey;
 pub mod task;
 pub mod telemetry;
 pub mod tls_utils;

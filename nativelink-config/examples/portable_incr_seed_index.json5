@@ -1,0 +1,164 @@
+// FL-1383 portable rustc-incremental — Stage-1 `incr_seed_index` composition
+// (see docs/portable-rustc-incremental-v4.md §6.1, §6.3, §9, §13).
+//
+// This example is a MINIMAL illustration of the store + service wiring the
+// design requires. It is NOT a live/deployed config (do not point production
+// at it). Chunk 1 needs NO new store code: the `-incr` CONTENT reuses the
+// existing CAS; the INDEX is an AC-shaped MUTABLE store keyed by
+// `hash(targetkey)` in a DISTINCT `instance_name = "incr_seed_index"`, sitting
+// BEHIND a `completeness_checking` store so a dangling index entry (its
+// `-incr` content evicted from CAS) resolves to CAS-NotFound => cold build,
+// never a live-digest-to-nowhere.
+//
+// What is DEMONSTRATED here (chunk 1 scope):
+//   - the `INCR_SEED_INDEX_STORE` store (completeness_checking wrapping an
+//     AC-shaped mutable backend), §6.1;
+//   - the AC service `instance_name: "incr_seed_index"` that fronts it —
+//     the AC path accepts a synthetic non-Action key via `update_oneshot`
+//     overwrite (VERIFIED: ac_server.rs:414-432, AC entries are NOT
+//     content-addressed), so no code change is needed to store an
+//     ActionResult under `hash(targetkey)`, §6.1;
+//   - the `portable_incr` gate on the execution service (§13), OFF by
+//     default so the feature is inert until an operator opts specific
+//     actions in via the allowlist.
+//
+// What is OUT OF SCOPE here (later chunks): the worker out-of-band fetch/inject
+// (§6.3), the execroot path-pinning (§4/§7), and the residency-gossip affinity
+// hook (§10). Chunk 1 only derives+threads the `targetkey` and wires this
+// store/service so the index has a home.
+{
+  stores: [
+    // The shared CAS. `-incr` seed CONTENT lives here, unchanged (already a
+    // content-addressed `incr_tree` output; dedup is free). §6.1/§6.5.
+    {
+      name: "CAS_MAIN_STORE",
+      filesystem: {
+        content_path: "/tmp/nativelink/portable-incr/content_path-cas",
+        temp_path: "/tmp/nativelink/portable-incr/tmp_path-cas",
+        eviction_policy: {
+          // 40gb working set (illustrative).
+          max_bytes: 40000000000,
+        },
+      },
+    },
+
+    // The `targetkey -> current -incr digest` INDEX. Value = an ActionResult
+    // whose `output_directories[0].tree_digest` references the current `-incr`
+    // Directory in CAS_MAIN_STORE. Keyed by `hash(targetkey)`.
+    //
+    // REQUIRED composition (§6.1): the index sits BEHIND completeness_checking
+    // with `cas_store` pointed at the SAME CAS that holds the `-incr` content,
+    // so a `GetActionResult(hash(targetkey))` whose referenced `-incr` tree has
+    // been evicted returns NotFound => the worker cold-starts (never fetches a
+    // live-digest-to-nowhere).
+    {
+      name: "INCR_SEED_INDEX_STORE",
+      completeness_checking: {
+        // The mutable AC-shaped backend that actually holds the index entries.
+        backend: {
+          memory: {
+            // DoS cap (§9): the `targetkey` is DERIVABLE by any trusted build
+            // action, so a flood of derivable keys must be bounded by THIS
+            // store's own eviction — it does not share (and cannot starve) the
+            // FL-688 CAS pin budget. Over-cap entries are LRU-evicted =>
+            // cold-but-correct (the index is best-effort; §6.2). Sized small:
+            // each entry is one serialized ActionResult (a few hundred bytes),
+            // so this is a targetkey-count ceiling, not a content pool.
+            eviction_policy: {
+              // ~64mb ceiling on index entries (illustrative DoS cap).
+              max_bytes: 64000000,
+              // Also bound the number of distinct derivable targetkeys.
+              max_count: 200000,
+            },
+          },
+        },
+        // Verify referenced `-incr` content is still resident before serving a
+        // hit. Dangling => NotFound => cold. §6.1.
+        cas_store: {
+          ref_store: {
+            name: "CAS_MAIN_STORE",
+          },
+        },
+      },
+    },
+  ],
+
+  schedulers: [
+    {
+      name: "MAIN_SCHEDULER",
+      simple: {
+        supported_platform_properties: {
+          cpu_count: "minimum",
+          OSFamily: "priority",
+          "container-image": "priority",
+        },
+        cas_store: "CAS_MAIN_STORE",
+      },
+    },
+  ],
+
+  servers: [
+    {
+      name: "public",
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:50051",
+        },
+      },
+      services: {
+        cas: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+          },
+        ],
+        ac: [
+          // The portable-incr INDEX, fronted as a DISTINCT AC instance. The
+          // worker publishes with `update_oneshot(hash(targetkey), ...)` and
+          // fetches with `GetActionResult(hash(targetkey))` against this
+          // instance (§6.1/§6.2). Kept on a separate `instance_name` so it
+          // never collides with real Action results.
+          {
+            instance_name: "incr_seed_index",
+            ac_store: "INCR_SEED_INDEX_STORE",
+          },
+        ],
+        execution: [
+          {
+            instance_name: "main",
+            cas_store: "CAS_MAIN_STORE",
+            scheduler: "MAIN_SCHEDULER",
+            // FL-1383 §13: gate the feature. OFF by default => inert. When an
+            // operator enables it, only actions whose primary (sorted-first)
+            // `Command.output_paths` entry matches an allowlist prefix opt in
+            // (fail-closed): the scheduler then derives the `targetkey` ONCE at
+            // ingestion and threads it through `ActionInfo` for match-time
+            // residency scoring (a later chunk consumes it).
+            portable_incr: {
+              enabled: false,
+              action_output_allowlist: [
+                // Example: opt in a single stage-1 apple-a14 crate's output
+                // tree. Empty (or unmatched) => nothing opts in.
+                "bazel-out/darwin_arm64-fastbuild/bin/third_party/rust/apple_a14/",
+              ],
+            },
+          },
+        ],
+      },
+    },
+    {
+      name: "private_workers_servers",
+      listener: {
+        http: {
+          socket_address: "0.0.0.0:50061",
+        },
+      },
+      services: {
+        worker_api: {
+          scheduler: "MAIN_SCHEDULER",
+        },
+        health: {},
+      },
+    },
+  ],
+}

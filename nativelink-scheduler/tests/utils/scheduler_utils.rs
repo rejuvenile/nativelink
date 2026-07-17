@@ -53,6 +53,7 @@ pub(crate) fn make_base_action_info(
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        targetkey: None,
     })
 }
 

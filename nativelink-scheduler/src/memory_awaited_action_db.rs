@@ -1282,6 +1282,7 @@ mod dag_counter_tests {
                 digest_function: DigestHasherFunc::Sha256,
                 digest: DigestInfo::new([digest_byte; 32], u64::from(digest_byte)),
             }),
+            targetkey: None,
         })
     }
 

@@ -85,6 +85,7 @@ fn make_action_info(digest: DigestInfo, ts_offset: u64) -> Arc<ActionInfo> {
             digest_function: DigestHasherFunc::Sha256,
             digest,
         }),
+        targetkey: None,
     })
 }
 

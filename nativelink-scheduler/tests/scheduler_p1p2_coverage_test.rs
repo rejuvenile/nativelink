@@ -102,6 +102,7 @@ fn make_action_info(
             digest_function: DigestHasherFunc::Sha256,
             digest: DigestInfo::new([seed; 32], 512),
         }),
+        targetkey: None,
     })
 }
 

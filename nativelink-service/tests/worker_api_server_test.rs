@@ -524,6 +524,7 @@ pub async fn execution_response_success_test() -> Result<(), Box<dyn core::error
         load_timestamp: make_system_time(0),
         insert_timestamp: make_system_time(0),
         unique_qualifier,
+        targetkey: None,
     });
     let expected_operation_id = OperationId::default();
 
@@ -692,6 +693,7 @@ pub async fn workers_only_allow_max_tasks() -> Result<(), Box<dyn core::error::E
         load_timestamp: make_system_time(0),
         insert_timestamp: make_system_time(0),
         unique_qualifier,
+        targetkey: None,
     });
 
     let platform_properties = test_context
