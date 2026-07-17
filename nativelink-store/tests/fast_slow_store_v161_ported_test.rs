@@ -1102,10 +1102,12 @@ async fn has_sees_in_flight_slow_writes() -> Result<(), Error> {
     Ok(())
 }
 
-/// `has()` consults the fast store after the slow store reports `NotFound`.
-/// This is asserted indirectly above by `fast_store_only_value_is_reported_by_has`;
-/// here we additionally assert that when the slow store DOES have the blob,
-/// the fast store is NOT consulted (avoiding the extra round trip).
+/// In this fork, FSS `has()` NEVER consults the fast store — `has_with_results`
+/// reads only the slow store (and the in-flight-slow-write map). This test pins
+/// that contract: with the blob present in the slow store, the fast store's
+/// `has` is not called (no extra round trip). (Upstream consulted the fast store
+/// on a slow miss; the fork's `fast_store_only_value_is_reported_by_has` covers
+/// the fast-tier visibility path separately.)
 #[nativelink_test]
 async fn has_does_not_consult_fast_store_when_slow_store_hits() -> Result<(), Error> {
     #[derive(MetricsComponent)]
