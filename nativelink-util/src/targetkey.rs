@@ -52,12 +52,15 @@ pub const CARRIER_PRIMARY_OUTPUT_PROPERTY: &str = "nl_incr_primary_output";
 /// - **config-discriminating (best-effort)**: config-discrimination comes from
 ///   the config-salt hash embedded in a `.rlib` filename, NOT from a
 ///   `bazel-out/<config>` path segment. Under the FL build's
-///   `--experimental_output_paths=strip` + `supports-path-mapping`, the
-///   `Command.output_paths` (and thus the carrier's `primary_output`) are
-///   config-STRIPPED, so the path carries no `bazel-out/<config>` segment. When
-///   the bytewise-smallest output is a `<label>-incr` tree dir (which carries no
-///   config-salt hash), the key is CONFIG-SHARED across configs; a cross-config
-///   seed is then cold-not-wrong (safe, within the §6.4 correctness floor).
+///   `--experimental_output_paths=strip` + `supports-path-mapping`, Bazel's
+///   `StrippingPathMapper` REPLACES the config mnemonic with the literal `cfg`
+///   (it does NOT drop it), so `Command.output_paths` (and thus the carrier's
+///   `primary_output`) are of the form `bazel-out/cfg/bin/...` — no per-config
+///   mnemonic segment. When the bytewise-smallest output is a `<label>-incr`
+///   tree dir (which carries no config-salt hash), the key is CONFIG-SHARED
+///   across configs; a cross-config seed is then cold-not-wrong (safe, within
+///   the §6.4 correctness floor). Allowlist prefixes MUST use the `bazel-out/cfg/`
+///   form to match.
 /// - **deterministic + order-independent**: the sort makes the key independent
 ///   of the input order; identical input always yields an identical key.
 ///
