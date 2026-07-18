@@ -602,8 +602,17 @@ enum FileMaterializeError {
 /// `cleanup_or_err` returns `Err` INSTEAD of the cold `SeedOutcome`, and a
 /// half-written temp dir LEAKS on disk). Draining lets every in-flight write
 /// quiesce before the caller wipes the tree, so the cold-wipe-no-partial-dir
-/// contract holds deterministically. This mirrors the `.collect().await`
-/// parallel-BFS pattern in `running_actions_manager`. The memory bound is
+/// contract holds deterministically ON THE INTERNAL FIRST-ERROR PATH (the
+/// [`materialize_tree`] cold/`Err` arms that follow this function's return). It
+/// does NOT extend to the outer [`fetch_and_materialize_seed`] deadline: if the
+/// overall `tokio::time::timeout` fires MID-DRAIN it drops this future and can
+/// re-orphan the ≤`PARALLEL_MATERIALIZE_CONCURRENCY` in-flight writes against the
+/// timeout handler's own wipe — a known residual (low-severity: `dest` is never
+/// touched on the timeout path, so the worst case is a leaked
+/// `.<name>.incrtmp.PID.NANOS` sibling, self-healed by the §7 full-empty execroot
+/// wipe on the next action; tracked as a follow-up). This mirrors the
+/// `.collect().await` parallel-BFS pattern in `running_actions_manager`. The
+/// memory bound is
 /// unchanged: `buffer_unordered` caps in-flight fetches at
 /// `PARALLEL_MATERIALIZE_CONCURRENCY` throughout the drain, and every blob is
 /// dropped after its write.
@@ -1266,6 +1275,14 @@ mod tests {
     // — so NO partial dir survives and `dest` never appears. This is the
     // parallel-specific risk the single-file
     // `file_digest_mismatch_is_cold_no_partial_dir` cannot exercise.
+    //
+    // TIMING NOTE: this exercises the PHYSICAL orphan-write→leftover contract, but
+    // with in-memory stores each write completes in ~µs, so the orphan-lands-after-
+    // wipe window is tiny and a buggy abort would MOSTLY also pass here — this test
+    // is NOT a reliable drain-vs-abort discriminator on its own. The deterministic,
+    // race-free discriminator is
+    // `parallel_drain_awaits_inflight_not_abort_on_first_error` below; this test
+    // remains as the end-to-end physical-contract check.
     #[nativelink_test]
     async fn parallel_one_bad_file_among_many_is_cold_no_partial_dir() {
         let index = new_store();
@@ -1332,6 +1349,125 @@ mod tests {
             leftovers.is_empty(),
             "no partial temp dir may survive a parallel first-failure abort (the \
              successfully-written siblings must be wiped too); found: {leftovers:?}"
+        );
+    }
+
+    // DETERMINISTIC drain-vs-abort discriminator (red-team fb4e4d4d blind-spot 2).
+    //
+    // `parallel_one_bad_file_among_many_is_cold_no_partial_dir` above exercises the
+    // physical orphan-write→leftover contract, but with in-memory stores every
+    // write completes in ~µs, so the orphan-lands-after-wipe window is tiny and a
+    // BUGGY abort would MOSTLY also pass it (timing-flaky green) — not a reliable
+    // regression guard. This test removes the timing dependence entirely.
+    //
+    // Mechanism the drain fix provides: `materialize_files_parallel` returns ONLY
+    // after every in-flight buffered future has resolved (each future resolves only
+    // after its `write_file_nofollow` `spawn_blocking` JoinHandle awaits), so no
+    // uncancellable in-flight write can be orphaned to race the caller's wipe. The
+    // buggy abort abandons that guarantee by RETURNING on the first error, dropping
+    // the still-in-flight futures.
+    //
+    // Discriminator (race-free): one BAD file (immediate digest mismatch → the
+    // first-and-only error) among GOOD files whose `get_part` HANGS FOREVER
+    // (`SelectiveStore` `hang_on`). The good fetches never resolve, so:
+    //   * the correct DRAIN awaits those in-flight futures and can therefore only
+    //     leave the drain via the caller's OUTER deadline → `SeedOutcome::TimedOut`;
+    //   * the buggy ABORT returns `SeedOutcome::NoSeed` the instant the bad file
+    //     errors, abandoning the in-flight fetches.
+    // Because the good fetches hang unconditionally, the outcome is fixed by which
+    // code path runs — NOT by any write/wipe timing — so the mutation fails RED on
+    // EVERY run. (The hung stage is the fetch rather than the uncancellable write —
+    // which a CAS-store wrapper cannot gate — but the drain-loop `await`-all-futures
+    // structure this pins is identical for a future stuck in fetch or in write, so
+    // it is a faithful, deterministic proxy for the write-orphan guarantee.)
+    #[nativelink_test]
+    async fn parallel_drain_awaits_inflight_not_abort_on_first_error() {
+        let inner = MemoryStore::new(&MemorySpec::default());
+        let populate = Store::new(inner.clone());
+        let tk = targetkey();
+
+        // One bad file (wrong bytes under its claimed digest) + several good files
+        // whose real blobs are uploaded but whose reads will be hung.
+        let mut file_nodes = Vec::new();
+        let mut hang_on = Vec::new();
+
+        let bad_claimed = blake3_digest(b"bad-claimed");
+        put(&populate, bad_claimed, Bytes::from_static(b"WRONG-bytes-mismatch")).await;
+        file_nodes.push(FileNode {
+            name: "bad.bin".to_string(),
+            digest: Some(Digest::from(&bad_claimed)),
+            is_executable: false,
+            node_properties: None,
+        });
+
+        for i in 0..3u32 {
+            let name = format!("good{i}.bin");
+            let content = format!("good-content-{i}").into_bytes();
+            let digest = blake3_digest(&content);
+            put(&populate, digest, Bytes::from(content)).await;
+            hang_on.push(digest);
+            file_nodes.push(FileNode {
+                name,
+                digest: Some(Digest::from(&digest)),
+                is_executable: false,
+                node_properties: None,
+            });
+        }
+
+        let tree = Tree {
+            root: Some(Directory {
+                files: file_nodes,
+                directories: vec![],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            children: vec![],
+        };
+        let tree_bytes = tree.encode_to_vec();
+        let tree_digest = blake3_digest(&tree_bytes);
+        put(&populate, tree_digest, Bytes::from(tree_bytes)).await;
+
+        // The CAS serves the Tree and the bad blob, but HANGS every good blob read.
+        let cas = SelectiveStore::new_store(inner, hang_on);
+        let index = new_store();
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        // Outer deadlock-detector: a correct drain exits via the 300ms overall
+        // deadline; the buggy abort exits immediately with NoSeed. The 5s bound
+        // catches a hypothetical regression that neither drains nor times out.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_millis(300)),
+        )
+        .await
+        .expect("drain-awaits test must settle within 5s")
+        .expect("a hung in-flight fetch must degrade to cold, not error");
+
+        assert_eq!(
+            outcome,
+            SeedOutcome::TimedOut,
+            "drain MUST await in-flight fetches before returning (the uncancellable-write \
+             quiesce guarantee): with one bad file among gated-hung in-flight fetches, the \
+             correct drain blocks until the outer deadline (TimedOut); an abort that drops the \
+             stream on the first error returns NoSeed early, abandoning in-flight ops -> \
+             orphan-write race"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must never appear on the drain-to-deadline cold path"
+        );
+        // The deadline handler must have wiped the partial temp skeleton.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no partial temp dir may survive the drain-to-deadline path, found: {leftovers:?}"
         );
     }
 
