@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Derived from the action's REAPI `Command.output_paths`: the paths are
 /// **sorted** (so the key is independent of the order Bazel emitted them), the
-/// lexicographically smallest ("primary") path is hashed with blake3 (the
-/// fleet's `default_digest_hash_function`; blake3 is 256-bit, above the §3
-/// 128-bit floor), and the full primary-output string is retained beside the
+/// lexicographically smallest ("primary") path is hashed with blake3 (fixed,
+/// independent of the action's digest function, ≥128-bit per §3), and the full
+/// primary-output string is retained beside the
 /// hash so a blake3 **collision** (equal `key`, differing `primary_output`) is
 /// detectable at the seed-fetch site and falls back to a cold build.
 ///

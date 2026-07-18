@@ -312,6 +312,11 @@ impl PortableIncrConfig {
     /// entry is `primary_output` is allowlisted into portable rustc-incremental.
     /// True iff `primary_output` starts with any allowlist prefix. An empty
     /// allowlist (the default) always returns `false` — fail-closed.
+    ///
+    /// NOTE: the match is a raw prefix (`starts_with`), NOT a path-segment
+    /// boundary — an entry SHOULD end with `/` to avoid over-matching sibling
+    /// trees (e.g. `apple_a14` also matches `apple_a14_evil/…`, but
+    /// `apple_a14/` does not).
     #[must_use]
     pub fn is_allowlisted(&self, primary_output: &str) -> bool {
         self.action_output_allowlist

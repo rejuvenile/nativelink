@@ -305,11 +305,15 @@ pub struct ActionInfo {
     #[metric(help = "Info used to uniquely identify this ActionInfo and if it is cacheable.")]
     pub unique_qualifier: ActionUniqueQualifier,
     /// FL-1383 portable rustc-incremental key (design §3/§10). Derived ONCE at
-    /// ingestion from the `Command.output_paths` (which are already fetched to
-    /// build this struct) so the scheduler has it FREE at match with no store
-    /// round-trip on the `do_try_match` hot path. `None` unless the
-    /// `portable_incr` feature is enabled AND the action is allowlisted — so it
-    /// is `None` on the current fleet and this field is inert by construction.
+    /// ingestion from the `Command.output_paths`, so the scheduler has it at
+    /// match with no store round-trip on the `do_try_match` hot path. On the
+    /// modern Bazel path the platform lives in `Action.platform`, so the
+    /// `Command` is NOT otherwise fetched at ingestion — enabling the feature
+    /// adds one synchronous `Command` fetch per action (the fetch is free only
+    /// on the Goma path, where the `Command` is fetched for its platform
+    /// regardless). `None` unless the `portable_incr` feature is enabled AND the
+    /// action is allowlisted — so it is `None` on the current fleet and this
+    /// field is inert by construction.
     ///
     /// TODO(#FL-1383): the §10 residency-gossip / affinity scorer consumes this
     /// (a later chunk); stage-1 only plumbs it.

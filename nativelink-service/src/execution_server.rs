@@ -48,7 +48,6 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, DEFAULT_EXECUTION_PRIORITY, OperationId,
 };
-use nativelink_util::targetkey::TargetKey;
 use nativelink_util::background_spawn;
 use nativelink_util::common::{self, DigestInfo};
 use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
@@ -56,6 +55,7 @@ use nativelink_util::operation_state_manager::{
     ActionStateResult, ClientStateManager, OperationFilter,
 };
 use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::targetkey::TargetKey;
 use opentelemetry::context::FutureExt;
 use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
@@ -234,9 +234,7 @@ impl InstanceInfo {
             let command =
                 get_and_decode_digest::<Command>(&self.cas_store, command_digest.into()).await?;
             // Goma puts the properties in the Command.
-            if need_command_for_platform
-                && let Some(platform) = command.platform
-            {
+            if need_command_for_platform && let Some(platform) = command.platform {
                 for property in platform.properties {
                     platform_properties.insert(property.name, property.value);
                 }
