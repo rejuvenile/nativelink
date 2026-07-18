@@ -147,3 +147,64 @@ async fn targetkey_none_when_no_output_paths() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// The exact primary-output string the shared cross-repo KAT hashes, config-
+/// stripped as the FL build emits it under `--experimental_output_paths=strip`.
+const KAT_PRIMARY_OUTPUT: &str = "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib";
+/// The byte-verified blake3 hex of [`KAT_PRIMARY_OUTPUT`]. Shared across repos:
+/// the Bazel client, the FL `incr_seed_index` tool, and this server MUST all
+/// produce this exact value or the fleet-shared seed key diverges.
+const KAT_KEY: &str = "a17b9c22c639c19f2951ad4d0cb28df41dbd33113bbe7ead51ac0dd577998567";
+
+/// SHARED CROSS-REPO KNOWN-ANSWER TEST (§3). Locks our `derive` byte-identical
+/// to the Bazel client + the FL `incr_seed_index` tool. If this value drifts,
+/// server and client key the SAME target under DIFFERENT keys and no seed is
+/// ever shared — a silent portable-incr outage. Mutation on the hash algorithm
+/// (e.g. swapping blake3 for another) must red-fail here.
+#[nativelink_test]
+async fn targetkey_kat_locks_blake3_byte_identical_across_repos() -> Result<(), Error> {
+    assert_eq!(
+        TargetKey::derive(&[KAT_PRIMARY_OUTPUT.to_string()])
+            .expect("derive must yield a targetkey from non-empty output_paths")
+            .key(),
+        KAT_KEY,
+        "targetkey blake3 KAT drifted — server key no longer matches the Bazel client / incr_seed_index"
+    );
+    Ok(())
+}
+
+/// `from_carrier` accepts a matching (key, primary_output) pair: the recomputed
+/// `blake3(primary_output)` equals the client-supplied key, so the carrier is
+/// trusted verbatim (no CAS fetch). Mutation: return `None` unconditionally in
+/// `from_carrier` — this must red-fail.
+#[nativelink_test]
+async fn targetkey_from_carrier_accepts_matching_pair() -> Result<(), Error> {
+    let tk = TargetKey::from_carrier(KAT_KEY.to_string(), KAT_PRIMARY_OUTPUT.to_string())
+        .expect("from_carrier must accept a key that matches blake3(primary_output)");
+    assert_eq!(
+        tk.key(),
+        KAT_KEY,
+        "from_carrier must retain the client-supplied key verbatim"
+    );
+    assert_eq!(
+        tk.primary_output(),
+        KAT_PRIMARY_OUTPUT,
+        "from_carrier must retain the client-supplied primary_output verbatim"
+    );
+    Ok(())
+}
+
+/// `from_carrier` REJECTS a mismatched key: if the client-supplied key does not
+/// equal `blake3(primary_output)`, that is client/contract drift and must fall
+/// back to cold (`None`), never seed against a wrong key. Mutation: drop the
+/// `!= key` guard in `from_carrier` — this must red-fail.
+#[nativelink_test]
+async fn targetkey_from_carrier_rejects_mismatched_key() -> Result<(), Error> {
+    // A key that is NOT blake3(KAT_PRIMARY_OUTPUT).
+    let wrong_key = "0".repeat(64);
+    assert!(
+        TargetKey::from_carrier(wrong_key, KAT_PRIMARY_OUTPUT.to_string()).is_none(),
+        "from_carrier must reject a key that does not match blake3(primary_output) → cold fallback"
+    );
+    Ok(())
+}

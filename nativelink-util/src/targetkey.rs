@@ -24,6 +24,17 @@
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 
+/// Action Platform property name carrying the client-derived `targetkey` (§10).
+/// The Bazel client attaches this for allowlisted rustc actions; its PRESENCE is
+/// the client's allowlist decision. The server reads it straight from
+/// `Action.platform` at ingestion — no Command fetch.
+pub const CARRIER_TARGETKEY_PROPERTY: &str = "nl_incr_targetkey";
+
+/// Action Platform property name carrying the exact primary-output string the
+/// client hashed to produce [`CARRIER_TARGETKEY_PROPERTY`] (§10). Config-STRIPPED
+/// under `--experimental_output_paths=strip` (no `bazel-out/<config>` segment).
+pub const CARRIER_PRIMARY_OUTPUT_PROPERTY: &str = "nl_incr_primary_output";
+
 /// A portable identity key for an action's primary output (design §3).
 ///
 /// Derived from the action's REAPI `Command.output_paths`: the paths are
@@ -38,8 +49,15 @@ use serde::{Deserialize, Serialize};
 /// `nativelink-util/tests/targetkey_test.rs`:
 /// - **edit-invariant**: `output_paths` do not change on source edits of the
 ///   same target, so edit N's `-incr` seed can seed edit N+1.
-/// - **config-discriminating**: the output path embeds the `bazel-out/<config>`
-///   segment, so a different build config yields a different key.
+/// - **config-discriminating (best-effort)**: config-discrimination comes from
+///   the config-salt hash embedded in a `.rlib` filename, NOT from a
+///   `bazel-out/<config>` path segment. Under the FL build's
+///   `--experimental_output_paths=strip` + `supports-path-mapping`, the
+///   `Command.output_paths` (and thus the carrier's `primary_output`) are
+///   config-STRIPPED, so the path carries no `bazel-out/<config>` segment. When
+///   the bytewise-smallest output is a `<label>-incr` tree dir (which carries no
+///   config-salt hash), the key is CONFIG-SHARED across configs; a cross-config
+///   seed is then cold-not-wrong (safe, within the §6.4 correctness floor).
 /// - **deterministic + order-independent**: the sort makes the key independent
 ///   of the input order; identical input always yields an identical key.
 ///
@@ -77,6 +95,31 @@ impl TargetKey {
         sorted.sort_unstable();
         let primary_output = sorted[0].to_string();
         let key = Self::hash_primary_output(&primary_output);
+        Some(Self {
+            key,
+            primary_output,
+        })
+    }
+
+    /// Construct a [`TargetKey`] from the two client-supplied carrier strings
+    /// (§10): `nl_incr_targetkey` and `nl_incr_primary_output`, read verbatim
+    /// from the Action's Platform properties.
+    ///
+    /// As a CHEAP integrity guard — a short-string blake3 hash, NO CAS fetch —
+    /// this recomputes `blake3(primary_output)` and returns `None` if it does
+    /// NOT equal the client-supplied `key`. A mismatch means client/contract
+    /// drift (the client's key algorithm diverged, or the two properties were
+    /// mispaired); it is treated as no-targetkey → the action falls back to a
+    /// cold build (safe: cold-not-wrong, never seeds against a wrong key).
+    ///
+    /// This is the same reference algorithm as [`Self::derive`]; the KAT in
+    /// `nativelink-util/tests/targetkey_test.rs` locks both byte-identical to
+    /// the Bazel client and the FL `incr_seed_index` tool.
+    #[must_use]
+    pub fn from_carrier(key: String, primary_output: String) -> Option<Self> {
+        if Self::hash_primary_output(&primary_output) != key {
+            return None;
+        }
         Some(Self {
             key,
             primary_output,

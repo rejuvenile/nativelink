@@ -55,7 +55,9 @@ use nativelink_util::operation_state_manager::{
     ActionStateResult, ClientStateManager, OperationFilter,
 };
 use nativelink_util::store_trait::{Store, StoreLike};
-use nativelink_util::targetkey::TargetKey;
+use nativelink_util::targetkey::{
+    CARRIER_PRIMARY_OUTPUT_PROPERTY, CARRIER_TARGETKEY_PROPERTY, TargetKey,
+};
 use opentelemetry::context::FutureExt;
 use prost::Message as _;
 use tonic::{Code, Request, Response, Status};
@@ -172,9 +174,12 @@ impl fmt::Display for NativelinkOperationId {
 struct InstanceInfo {
     scheduler: Arc<dyn KnownPlatformPropertyProvider>,
     cas_store: Store,
-    /// FL-1383 portable rustc-incremental gating (design §13). When disabled
-    /// (the default), no `targetkey` is derived and no extra Command fetch is
-    /// performed — the feature is inert.
+    /// FL-1383 portable rustc-incremental gating (design §13). When enabled, the
+    /// `targetkey` is read from the client-supplied Action Platform carrier
+    /// (`nl_incr_targetkey` + `nl_incr_primary_output`) — NEVER derived from a
+    /// fetched Command, so the portable_incr path costs ZERO extra CAS round-trip
+    /// at ingestion. When disabled (the default) no carrier is read at all — the
+    /// feature is inert.
     portable_incr: PortableIncrConfig,
 }
 
@@ -221,30 +226,44 @@ impl InstanceInfo {
             }
         }
 
-        // FL-1383 (§10): the portable rustc-incremental `targetkey` is derived
-        // ONCE here at ingestion from `Command.output_paths`, so the scheduler
-        // has it FREE at match (no store round-trip on the `do_try_match` hot
-        // path). The Command is fetched only when the feature is enabled OR when
-        // the platform properties must be sourced from it (Goma) — so the
-        // default, feature-disabled path performs NO extra CAS round-trip and
-        // this whole block is inert.
+        // FL-1383 (§10): the portable rustc-incremental `targetkey` arrives from
+        // the CLIENT as two Action Platform properties (`nl_incr_targetkey` +
+        // `nl_incr_primary_output`), which the Bazel client attaches ONLY for
+        // allowlisted rustc actions. They are already in `platform_properties`
+        // above (built from `Action.platform`) WITHOUT any Command fetch — so the
+        // portable_incr path performs ZERO extra CAS round-trip. The Command is
+        // fetched ONLY for the Goma platform-source path (when the action carries
+        // no inline platform properties), which is unchanged.
         let need_command_for_platform = platform_properties.is_empty();
         let mut targetkey = None;
-        if need_command_for_platform || self.portable_incr.enabled {
+        if need_command_for_platform {
             let command =
                 get_and_decode_digest::<Command>(&self.cas_store, command_digest.into()).await?;
             // Goma puts the properties in the Command.
-            if need_command_for_platform && let Some(platform) = command.platform {
+            if let Some(platform) = command.platform {
                 for property in platform.properties {
                     platform_properties.insert(property.name, property.value);
                 }
             }
-            if self.portable_incr.enabled {
-                // Allowlisted actions only (§13): derive the candidate key, then
-                // keep it only if its primary output opts in. A non-allowlisted
-                // action stays `None` → fully inert downstream.
-                targetkey = TargetKey::derive(&command.output_paths)
-                    .filter(|tk| self.portable_incr.is_allowlisted(tk.primary_output()));
+        }
+        if self.portable_incr.enabled
+            && let (Some(key), Some(primary_output)) = (
+                platform_properties
+                    .get(CARRIER_TARGETKEY_PROPERTY)
+                    .cloned(),
+                platform_properties
+                    .get(CARRIER_PRIMARY_OUTPUT_PROPERTY)
+                    .cloned(),
+            )
+        {
+            // DEFENSE-IN-DEPTH (§13): the client only attaches the carrier for
+            // allowlisted actions, but re-check server-side against the
+            // carrier-supplied primary output — a non-allowlisted primary output
+            // stays `None` → fully inert downstream. `from_carrier` additionally
+            // re-hashes `primary_output` (cheap short-string blake3, NO CAS
+            // fetch) and rejects a mismatched key as client/contract drift.
+            if self.portable_incr.is_allowlisted(&primary_output) {
+                targetkey = TargetKey::from_carrier(key, primary_output);
             }
         }
 

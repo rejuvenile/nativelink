@@ -736,16 +736,36 @@ async fn wait_operation_timeout_does_not_cancel() -> Result<(), Box<dyn core::er
     Ok(())
 }
 
-/// FL-1383 (§10) ingestion-threading shared harness: uploads a Command with the
-/// given `output_paths`, an Action referencing it, drives `execute()` through
-/// the mock scheduler, and returns the `ActionInfo` the scheduler received so a
-/// caller can inspect its derived `targetkey`.
+/// A distinctive Goma-path marker placed on the uploaded `Command.platform`. It
+/// lands in the resulting `ActionInfo.platform_properties` ONLY if ingestion
+/// fetched+merged the Command (the Goma path, taken only when the Action carries
+/// no inline platform properties). Its ABSENCE is how the carrier-path tests
+/// prove the portable_incr path performed ZERO `Command` fetch.
+const GOMA_PROBE_PROPERTY: &str = "nl_goma_probe";
+const GOMA_PROBE_VALUE: &str = "from_command";
+
+/// The exact primary-output the shared cross-repo KAT hashes (config-stripped as
+/// the FL build emits it), and its byte-verified blake3 key. The Bazel client
+/// attaches these two as the `nl_incr_targetkey` / `nl_incr_primary_output`
+/// Action Platform carrier for allowlisted rustc actions.
+const KAT_PRIMARY_OUTPUT: &str = "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib";
+const KAT_KEY: &str = "a17b9c22c639c19f2951ad4d0cb28df41dbd33113bbe7ead51ac0dd577998567";
+
+/// FL-1383 (§10) ingestion-threading shared harness: uploads a Command (bearing
+/// the Goma probe marker on its platform) plus an Action whose
+/// `platform.properties` carry `action_platform_properties` (the client carrier
+/// lives here), drives `execute()` through the mock scheduler, and returns the
+/// `ActionInfo` the scheduler received — so a caller can inspect `targetkey` and
+/// (via the probe marker) whether the Command was fetched.
 async fn drive_execute_and_capture_action_info(
-    output_paths: Vec<String>,
+    action_platform_properties: Vec<(String, String)>,
     portable_incr: PortableIncrConfig,
 ) -> Result<ActionInfo, Box<dyn core::error::Error>> {
     use nativelink_proto::build::bazel::remote::execution::v2::execution_server::Execution;
-    use nativelink_proto::build::bazel::remote::execution::v2::{Action, Command, Directory};
+    use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
+    use nativelink_proto::build::bazel::remote::execution::v2::{
+        Action, Command, Directory, Platform,
+    };
     use nativelink_store::ac_utils::serialize_and_upload_message;
     use nativelink_util::digest_hasher::DigestHasherFunc;
     use nativelink_util::store_trait::StoreLike;
@@ -757,11 +777,19 @@ async fn drive_execute_and_capture_action_info(
     let cas_store = store_manager
         .get_store("main_cas")
         .expect("main_cas registered");
+    // The Command carries the Goma probe on its platform. If ingestion fetches +
+    // merges the Command, the probe leaks into ActionInfo.platform_properties;
+    // if not (the carrier path), it does not — the ZERO-fetch discriminator.
     let command_digest = serialize_and_upload_message(
         &Command {
             arguments: vec!["true".to_string()],
-            output_paths,
             working_directory: ".".to_string(),
+            platform: Some(Platform {
+                properties: vec![Property {
+                    name: GOMA_PROBE_PROPERTY.to_string(),
+                    value: GOMA_PROBE_VALUE.to_string(),
+                }],
+            }),
             ..Default::default()
         },
         cas_store.as_pin(),
@@ -774,9 +802,20 @@ async fn drive_execute_and_capture_action_info(
         &mut DigestHasherFunc::Sha256.hasher(),
     )
     .await?;
+    let platform = if action_platform_properties.is_empty() {
+        None
+    } else {
+        Some(Platform {
+            properties: action_platform_properties
+                .into_iter()
+                .map(|(name, value)| Property { name, value })
+                .collect(),
+        })
+    };
     let action = Action {
         command_digest: Some(command_digest.into()),
         input_root_digest: Some(input_root_digest.into()),
+        platform,
         ..Default::default()
     };
     let action_digest = serialize_and_upload_message(
@@ -816,52 +855,70 @@ async fn drive_execute_and_capture_action_info(
     Ok(action_info)
 }
 
-/// FL-1383 (§10): when the feature is ENABLED and the action's primary output
-/// is allowlisted, the `targetkey` is derived at ingestion (from the Command's
-/// `output_paths`) and threaded through `ActionInfo` — no store round-trip is
-/// needed later at match. Mutation: comment out the `targetkey = TargetKey::
-/// derive(...)` assignment in `execution_server::build_action_info` — this test
-/// must red-fail with "targetkey must be derived at ingestion when enabled".
+/// Build the client carrier as it lands on `Action.platform.properties`:
+/// `nl_incr_targetkey` = `key`, `nl_incr_primary_output` = `primary_output`.
+fn carrier(key: &str, primary_output: &str) -> Vec<(String, String)> {
+    vec![
+        ("nl_incr_targetkey".to_string(), key.to_string()),
+        (
+            "nl_incr_primary_output".to_string(),
+            primary_output.to_string(),
+        ),
+    ]
+}
+
+/// FL-1383 (§10) BLOCK fix: when the feature is ENABLED and the client carrier
+/// is present + allowlisted, the `targetkey` is READ from the Action Platform
+/// carrier (NOT derived) and threaded through `ActionInfo` — and the portable_
+/// incr path performs ZERO `Command` fetch (the Goma probe on the Command MUST
+/// NOT appear in `platform_properties`, proving no fetch+merge occurred).
+/// Mutation: comment out the `targetkey = TargetKey::from_carrier(...)`
+/// assignment in `execution_server::build_action_info` — the targetkey assertion
+/// must red-fail.
 #[nativelink_test]
-async fn targetkey_derived_at_ingestion_when_enabled_and_allowlisted()
+async fn targetkey_from_carrier_populated_and_zero_command_fetch()
 -> Result<(), Box<dyn core::error::Error>> {
-    let output_paths = vec![
-        "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib.d".to_string(),
-        "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib".to_string(),
-    ];
     let portable_incr = PortableIncrConfig {
         enabled: true,
         action_output_allowlist: vec!["bazel-out/".to_string()],
     };
 
     let action_info =
-        drive_execute_and_capture_action_info(output_paths.clone(), portable_incr).await?;
+        drive_execute_and_capture_action_info(carrier(KAT_KEY, KAT_PRIMARY_OUTPUT), portable_incr)
+            .await?;
 
-    let expected = TargetKey::derive(&output_paths).expect("derive from non-empty output_paths");
     assert_eq!(
         action_info.targetkey.as_ref().map(TargetKey::key),
-        Some(expected.key()),
-        "targetkey must be derived at ingestion when enabled + allowlisted"
+        Some(KAT_KEY),
+        "targetkey must be read from the carrier when enabled + allowlisted"
     );
     assert_eq!(
         action_info.targetkey.as_ref().map(TargetKey::primary_output),
-        Some("bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib"),
-        "primary output must be the sorted-first path"
+        Some(KAT_PRIMARY_OUTPUT),
+        "primary output must be the carrier-supplied string"
+    );
+    // ZERO Command fetch: the Goma probe embedded on the (present-but-unfetched)
+    // Command must NOT have leaked into platform_properties.
+    assert!(
+        !action_info
+            .platform_properties
+            .contains_key(GOMA_PROBE_PROPERTY),
+        "portable_incr path must NOT fetch the Command — the Goma probe leaked, so a Command fetch+merge occurred"
     );
     Ok(())
 }
 
-/// FL-1383 inert-by-default: with the feature DISABLED (the fleet default), no
-/// `targetkey` is derived at ingestion — `ActionInfo.targetkey` stays `None`,
-/// so chunk 1 changes no runtime behavior. Mutation: force `enabled = true`
-/// here — the assertion must red-fail, proving the disabled path is what keeps
-/// it inert.
+/// FL-1383 inert-by-default: with the feature DISABLED (the fleet default), the
+/// carrier is not read even when present — `ActionInfo.targetkey` stays `None`.
+/// Mutation: force `enabled = true` here — the assertion must red-fail, proving
+/// the disabled flag is what keeps it inert.
 #[nativelink_test]
 async fn targetkey_absent_when_feature_disabled() -> Result<(), Box<dyn core::error::Error>> {
-    let output_paths = vec!["bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib".to_string()];
-
-    let action_info =
-        drive_execute_and_capture_action_info(output_paths, PortableIncrConfig::default()).await?;
+    let action_info = drive_execute_and_capture_action_info(
+        carrier(KAT_KEY, KAT_PRIMARY_OUTPUT),
+        PortableIncrConfig::default(),
+    )
+    .await?;
 
     assert_eq!(
         action_info.targetkey, None,
@@ -870,26 +927,85 @@ async fn targetkey_absent_when_feature_disabled() -> Result<(), Box<dyn core::er
     Ok(())
 }
 
-/// FL-1383 fail-closed allowlist (§13): with the feature ENABLED but the
-/// action's primary output NOT matching any allowlist prefix, no `targetkey` is
-/// threaded — enabling the master switch alone opts nothing in. Mutation: make
-/// the allowlist match (e.g. `vec!["bazel-out/".into()]`) — the assertion must
-/// red-fail.
+/// FL-1383 defense-in-depth (§13): the client only attaches the carrier for
+/// allowlisted actions, but the server RE-CHECKS the carrier-supplied primary
+/// output server-side. With the feature ENABLED, a carrier present, but the
+/// primary output NOT matching any allowlist prefix, no `targetkey` is threaded.
+/// Mutation: make the allowlist match (e.g. `vec!["bazel-out/".into()]`) — the
+/// assertion must red-fail.
 #[nativelink_test]
 async fn targetkey_absent_when_enabled_but_not_allowlisted()
 -> Result<(), Box<dyn core::error::Error>> {
-    let output_paths = vec!["bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib".to_string()];
     let portable_incr = PortableIncrConfig {
         enabled: true,
-        // Prefix that does NOT match the output path above.
+        // Prefix that does NOT match KAT_PRIMARY_OUTPUT.
         action_output_allowlist: vec!["bazel-out/some-other-config/".to_string()],
     };
 
-    let action_info = drive_execute_and_capture_action_info(output_paths, portable_incr).await?;
+    let action_info = drive_execute_and_capture_action_info(
+        carrier(KAT_KEY, KAT_PRIMARY_OUTPUT),
+        portable_incr,
+    )
+    .await?;
 
     assert_eq!(
         action_info.targetkey, None,
-        "targetkey must stay None when enabled but the primary output is not allowlisted"
+        "targetkey must stay None when enabled but the carrier primary output is not allowlisted"
+    );
+    Ok(())
+}
+
+/// FL-1383: with the feature ENABLED + allowlist set but NO carrier on the
+/// action (a non-rustc / non-allowlisted action the client left un-tagged),
+/// no `targetkey` is threaded. A non-carrier platform property is present so the
+/// Goma fetch is not forced — the carrier-absence alone yields `None`. Mutation:
+/// read a hardcoded key instead of the carrier in `build_action_info` — this
+/// must red-fail.
+#[nativelink_test]
+async fn targetkey_absent_when_carrier_missing() -> Result<(), Box<dyn core::error::Error>> {
+    let portable_incr = PortableIncrConfig {
+        enabled: true,
+        action_output_allowlist: vec!["bazel-out/".to_string()],
+    };
+
+    // A benign inline platform property, but NO nl_incr_* carrier.
+    let action_info = drive_execute_and_capture_action_info(
+        vec![("OSFamily".to_string(), "linux".to_string())],
+        portable_incr,
+    )
+    .await?;
+
+    assert_eq!(
+        action_info.targetkey, None,
+        "targetkey must be absent when the client carrier is not present on the action"
+    );
+    Ok(())
+}
+
+/// FL-1383 cheap integrity guard (§10): a carrier whose key does NOT equal
+/// `blake3(primary_output)` is client/contract drift and must fall back to cold
+/// (`None`) — never seed against a wrong key. The recompute is a short-string
+/// hash, NO CAS fetch. Mutation: drop the `!= key` guard in
+/// `TargetKey::from_carrier` — this must red-fail.
+#[nativelink_test]
+async fn targetkey_absent_when_carrier_key_mismatched()
+-> Result<(), Box<dyn core::error::Error>> {
+    let portable_incr = PortableIncrConfig {
+        enabled: true,
+        action_output_allowlist: vec!["bazel-out/".to_string()],
+    };
+
+    // Allowlisted primary output, but a key that is NOT blake3(primary_output).
+    let wrong_key = "0".repeat(64);
+    let action_info = drive_execute_and_capture_action_info(
+        carrier(&wrong_key, KAT_PRIMARY_OUTPUT),
+        portable_incr,
+    )
+    .await?;
+
+    assert_eq!(
+        action_info.targetkey, None,
+        "targetkey must be absent (cold) when the carrier key does not match blake3(primary_output)"
     );
     Ok(())
 }
