@@ -1,6 +1,8 @@
 # FL-688 never-BIS-acked durability pin-leak — event-driven fix (design)
 
-Status: **RECONSIDER-PREMISE (design cadre 2026-07-17, `.claude/reviews/e546af44/`). DO NOT IMPLEMENT — rework required.**
+Status: **DESIGN COMPLETE + IMPLEMENTED — advertise-on-pin (`8c67b2e4`), invariant CONFIRMED + TLA+-proven (`specs/MarkStableAdvertiseOnPinV3.tla`), Tier-3 code cadre LANDABLE (`.claude/reviews/8c67b2e4/`, both pairs APPROVE/LANDABLE, no RECONSIDER/BLOCK).** See the "F2 REFUTED — DESIGN COMPLETE" + "IMPLEMENTATION SCOPE" bullets in the running log below for the resolution. The first-cadre RECONSIDER block immediately below is SUPERSEDED (kept for history) — the durability-event seam was resolved to the worker-side `ItemCallback`→`BlobsAvailable` wire (arch axis signed off), the spec was re-done with the async BIS-delivery gap split out (no re-fusion), and the invariant re-verify proved the durable-after-pin case is free via the GLOBAL BIS so advertise-on-pin (fire-once) is complete.
+
+--- SUPERSEDED (first design cadre, 2026-07-17, `.claude/reviews/e546af44/`) ---
 Two convergent BLOCKs: (1) the durability-event seam crosses a CAS-data-plane ↔ WorkerApi/scheduler entry boundary
 that has NO wire today, and the design commits to neither side (worker→server per-digest signal [=Stage-A-removed
 re-advertise, must prove bounded fan-out] vs a new server-side CAS-entry→scheduler-locality dependency) — ARCHITECTURAL,
