@@ -36,9 +36,9 @@
 //! caller wipes non-`-incr` state and preserves `-incr`; this function's job is
 //! only to (re)materialize the `-incr` dir at the pinned path, and to map the
 //! returned [`SeedOutcome`] into the registered worker metrics
-//! (`incr_seed_materialized` / `incr_reuse_fired` / `incr_seed_present_but_cold`,
-//! and the `incr_index_fetch_{hit,miss,timeout,error}` family — see the
-//! `emit_counter` markers below).
+//! (`incr_seed_materialized` / `incr_reuse_fired` / `incr_seed_present_but_cold`
+//! / `incr_seed_collision`, and the `incr_index_fetch_{hit,miss,timeout,error}`
+//! family — see the `emit_counter` markers below).
 
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
@@ -98,8 +98,13 @@ pub enum SeedOutcome {
 /// - `dest_incr_dir`: where the `-incr` directory tree is materialized. On
 ///   success it is atomically replaced (tmp-then-rename); on any failure it is
 ///   left untouched and no partial temp directory survives.
-/// - `timeout`: bounds *only* the index `GetActionResult` (§6.2) — a slow or
-///   absent index resolves to [`SeedOutcome::TimedOut`] rather than stalling.
+/// - `timeout`: bounds the *entire* operation (§6.2/§6.5) — the index
+///   `GetActionResult`, the main-CAS `Tree` read, and every file-blob read +
+///   write are all covered by this ONE deadline. `GrpcStore` internal RPCs carry
+///   `timeout=0` (invariant #10), so a server-CAS fall-through (§6.5) on the Tree
+///   or any blob read would otherwise stall the pre-rustc execution path
+///   unboundedly. On deadline expiry the operation degrades to a cold
+///   [`SeedOutcome::TimedOut`] rather than stalling the build.
 ///
 /// Errors are reserved for genuinely unexpected internal failures (a blocking
 /// join failure, or an inability to clean up a partial temp directory — which
@@ -113,32 +118,71 @@ pub async fn fetch_and_materialize_seed(
     dest_incr_dir: &Path,
     timeout: Duration,
 ) -> Result<SeedOutcome, Error> {
-    let index_digest = index_action_digest(targetkey);
-
-    // §6.2: bound ONLY the index fetch. `GrpcStore` has timeout=0 (internal-RPC
-    // policy, invariant #10), so a slow/absent index would otherwise stall the
-    // build. A NotFound / decode-error / timeout is a cold outcome, never an
-    // error.
-    let action_result = match tokio::time::timeout(
+    // D1: bound the WHOLE operation (index + Tree + all blob reads + writes)
+    // under one overall deadline. The inner future records any temp directory it
+    // creates into `temp_dir_slot`; on deadline expiry we best-effort wipe it so
+    // the tmp-then-rename / no-partial-dir guarantee holds on the timeout path
+    // too. `dest_incr_dir` itself is only ever touched by the final atomic rename
+    // inside `swap_into_place`, so a cancelled materialize can never leave `dest`
+    // partial (`!dest.exists()` is preserved).
+    let mut temp_dir_slot: Option<PathBuf> = None;
+    match tokio::time::timeout(
         timeout,
-        get_and_decode_digest::<ActionResult>(index_store, StoreKey::Digest(index_digest)),
+        fetch_and_materialize_seed_inner(
+            index_store,
+            cas_store,
+            targetkey,
+            dest_incr_dir,
+            &mut temp_dir_slot,
+        ),
     )
     .await
     {
+        Ok(result) => result,
         Err(_elapsed) => {
+            if let Some(temp_dir) = temp_dir_slot {
+                // remove_dir_all tolerates absence, so wiping a not-yet-created
+                // or already-cleaned temp dir is a safe no-op.
+                let _unused_cleanup = remove_dir_all(temp_dir).await;
+            }
             emit_counter("incr_index_fetch_timeout");
             debug!(
                 targetkey = targetkey.key(),
-                "incr seed index fetch timed out"
+                "incr seed fetch/materialize deadline exceeded; treating as cold"
             );
-            return Ok(SeedOutcome::TimedOut);
+            Ok(SeedOutcome::TimedOut)
         }
-        Ok(Err(err)) if err.code == Code::NotFound => {
+    }
+}
+
+/// The unbounded body of [`fetch_and_materialize_seed`]. The caller wraps this in
+/// the overall deadline; this function performs NO per-step timeout of its own
+/// (internal-RPC policy, invariant #10). `temp_dir_slot` is set to the temp
+/// directory once materialization creates one, so the caller can clean it up if
+/// the deadline cancels this future mid-flight.
+async fn fetch_and_materialize_seed_inner(
+    index_store: &Store,
+    cas_store: &Store,
+    targetkey: &TargetKey,
+    dest_incr_dir: &Path,
+    temp_dir_slot: &mut Option<PathBuf>,
+) -> Result<SeedOutcome, Error> {
+    let index_digest = index_action_digest(targetkey);
+
+    // A NotFound / decode-error is a cold outcome, never an error. (A stalled
+    // index cannot hang here: the caller's overall deadline covers this read.)
+    let action_result = match get_and_decode_digest::<ActionResult>(
+        index_store,
+        StoreKey::Digest(index_digest),
+    )
+    .await
+    {
+        Err(err) if err.code == Code::NotFound => {
             emit_counter("incr_index_fetch_miss");
             debug!(targetkey = targetkey.key(), "incr seed index miss");
             return Ok(SeedOutcome::NoSeed);
         }
-        Ok(Err(err)) => {
+        Err(err) => {
             emit_counter("incr_index_fetch_error");
             warn!(
                 targetkey = targetkey.key(),
@@ -147,7 +191,7 @@ pub async fn fetch_and_materialize_seed(
             );
             return Ok(SeedOutcome::NoSeed);
         }
-        Ok(Ok(action_result)) => {
+        Ok(action_result) => {
             emit_counter("incr_index_fetch_hit");
             action_result
         }
@@ -195,7 +239,7 @@ pub async fn fetch_and_materialize_seed(
         }
     };
 
-    materialize_tree(cas_store, targetkey, &tree_digest, dest_incr_dir).await
+    materialize_tree(cas_store, targetkey, &tree_digest, dest_incr_dir, temp_dir_slot).await
 }
 
 /// Derive the index-AC [`DigestInfo`] for `targetkey` (design §3b).
@@ -221,6 +265,7 @@ async fn materialize_tree(
     targetkey: &TargetKey,
     tree_digest: &DigestInfo,
     dest_incr_dir: &Path,
+    temp_dir_slot: &mut Option<PathBuf>,
 ) -> Result<SeedOutcome, Error> {
     // Read the Tree proto from the main CAS. An evicted/dangling Tree (the
     // §6.1 CompletenessChecking / §6.5 eviction case) surfaces here as
@@ -274,6 +319,11 @@ async fn materialize_tree(
             return Ok(SeedOutcome::NoSeed);
         }
     };
+    // Record the temp dir so the overall-deadline handler in the caller can wipe
+    // it if this future is cancelled mid-materialize (D1). All of this function's
+    // own cold/error paths clean it up directly; this slot covers only the
+    // cancellation gap.
+    *temp_dir_slot = Some(temp_dir.clone());
 
     // Create the temp root + the full directory skeleton in one blocking hop.
     if let Err(err) = create_skeleton(temp_dir.clone(), plan.dirs.clone()).await {
@@ -341,7 +391,9 @@ struct PlannedFile {
 /// The in-memory materialization plan: directories to create (parents first)
 /// and files to fetch+write.
 struct MaterializePlan {
+    // CAPPED AT ~10MB proto (MAX_ACTION_MSG_SIZE bounds node count)
     dirs: Vec<PathBuf>,
+    // CAPPED AT ~10MB proto (MAX_ACTION_MSG_SIZE bounds node count)
     files: Vec<PlannedFile>,
 }
 
@@ -358,6 +410,7 @@ fn build_materialize_plan(
     children: &[Directory],
 ) -> Result<MaterializePlan, &'static str> {
     // Map each child directory by its content digest (blake3 of encoded proto).
+    // CAPPED AT ~10MB proto (MAX_ACTION_MSG_SIZE bounds node count)
     let mut by_digest: HashMap<DigestInfo, &Directory> = HashMap::with_capacity(children.len());
     for child in children {
         let mut hasher = DigestHasherFunc::Blake3.hasher();
@@ -365,6 +418,19 @@ fn build_materialize_plan(
         by_digest.insert(hasher.finalize_digest(), child);
     }
 
+    traverse_into_plan(root, &by_digest)
+}
+
+/// Walk the directory graph rooted at `root`, resolving `DirectoryNode`s through
+/// `by_digest`, into a flat [`MaterializePlan`]. Split out from
+/// [`build_materialize_plan`] so the cycle guard — which honest content-addressing
+/// can never trigger (a self/ancestor reference is a hash fixpoint), but a hash
+/// collision or in-memory corruption could — is directly exercisable in tests via
+/// an adversarial `by_digest`.
+fn traverse_into_plan(
+    root: &Directory,
+    by_digest: &HashMap<DigestInfo, &Directory>,
+) -> Result<MaterializePlan, &'static str> {
     let mut plan = MaterializePlan {
         dirs: Vec::new(),
         files: Vec::new(),
@@ -496,6 +562,7 @@ async fn fetch_and_write_file(
     temp_dir: &Path,
     file: &PlannedFile,
 ) -> Result<(), FileMaterializeError> {
+    // UNBOUNDED-OK: one trusted rustc -incr blob resident at a time; declared-size mismatch fails the post-read blake3+size verify → cold
     let bytes = match cas_store
         .get_part_unchunked(
             StoreKey::Digest(file.digest),
@@ -623,11 +690,13 @@ fn emit_counter(counter: &'static str) {
 mod tests {
     use core::time::Duration;
 
+    use std::collections::HashMap;
+
     use bytes::Bytes;
     use nativelink_config::stores::MemorySpec;
     use nativelink_macro::nativelink_test;
     use nativelink_proto::build::bazel::remote::execution::v2::{
-        ActionResult, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, Tree,
+        ActionResult, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, SymlinkNode, Tree,
     };
     use nativelink_store::memory_store::MemoryStore;
     use nativelink_util::common::DigestInfo;
@@ -636,7 +705,10 @@ mod tests {
     use nativelink_util::targetkey::TargetKey;
     use prost::Message;
 
-    use super::{SeedOutcome, fetch_and_materialize_seed, index_action_digest};
+    use super::{
+        SeedOutcome, build_materialize_plan, fetch_and_materialize_seed, index_action_digest,
+        traverse_into_plan, validate_component,
+    };
 
     const PRIMARY: &str = "bazel-out/cfg/bin/third_party/rust/apple_a14/libfoo.rlib";
 
@@ -903,8 +975,237 @@ mod tests {
         assert!(!dest.exists());
     }
 
+    // FIX 1 (D1): the overall deadline — not just the index fetch — must bound a
+    // stalled main-CAS Tree read (§6.5 server-CAS fall-through, GrpcStore
+    // timeout=0). Index hit, but the CAS never resolves the Tree read.
+    #[nativelink_test]
+    async fn stalled_cas_tree_read_times_out_bounded() {
+        let index = new_store();
+        let cas = SlowStore::new_store();
+        let tk = targetkey();
+        // A valid index entry pointing at a Tree the (stalled) CAS would serve.
+        let tree_digest = blake3_digest(b"unreachable-tree");
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        // Outer deadlock-detector: if the overall deadline is removed, the Tree
+        // read hangs forever and this 5s bound trips instead.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_millis(50)),
+        )
+        .await
+        .expect("overall deadline must bound a stalled CAS Tree read; the call must return within 5s")
+        .expect("stalled CAS Tree read must degrade to cold, not error");
+
+        assert_eq!(outcome, SeedOutcome::TimedOut);
+        assert!(
+            !dest.exists(),
+            "dest must not exist after a deadline-triggered cold fallback"
+        );
+    }
+
+    // FIX 1 (D1): the overall deadline must bound a stalled blob read that occurs
+    // AFTER the temp skeleton is created, and the deadline handler must wipe the
+    // partial temp dir (no partial directory survives a timeout).
+    #[nativelink_test]
+    async fn stalled_cas_blob_read_times_out_and_wipes_temp() {
+        let inner = MemoryStore::new(&MemorySpec::default());
+        let populate = Store::new(inner.clone());
+
+        // A one-file flat tree: upload the blob and the Tree into `inner`.
+        let content = b"incr-blob";
+        let file_digest = blake3_digest(content);
+        put(&populate, file_digest, Bytes::from_static(content)).await;
+        let tree = Tree {
+            root: Some(Directory {
+                files: vec![FileNode {
+                    name: "a.bin".to_string(),
+                    digest: Some(Digest::from(&file_digest)),
+                    is_executable: false,
+                    node_properties: None,
+                }],
+                directories: vec![],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            children: vec![],
+        };
+        let tree_bytes = tree.encode_to_vec();
+        let tree_digest = blake3_digest(&tree_bytes);
+        put(&populate, tree_digest, Bytes::from(tree_bytes)).await;
+
+        // The CAS serves the Tree but hangs ONLY on the file-blob read.
+        let cas = SelectiveStore::new_store(inner, [file_digest]);
+        let index = new_store();
+        let tk = targetkey();
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_millis(100)),
+        )
+        .await
+        .expect("overall deadline must bound a stalled CAS blob read; the call must return within 5s")
+        .expect("stalled CAS blob read must degrade to cold, not error");
+
+        assert_eq!(outcome, SeedOutcome::TimedOut);
+        assert!(
+            !dest.exists(),
+            "dest must not exist after a deadline-triggered cold fallback"
+        );
+        // The deadline handler must have wiped the partial temp skeleton.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no partial temp dir should survive a deadline, found: {leftovers:?}"
+        );
+    }
+
+    // FIX 5 T1: an adversarial `by_digest` where a child references the digest it
+    // is stored under — a cycle honest content-addressing can never build (hash
+    // fixpoint) but a collision/corruption could. Without the guard the DFS loops
+    // forever; the guard rejects it with its bespoke reason.
+    #[nativelink_test]
+    async fn directory_cycle_is_rejected() {
+        let anchor = blake3_digest(b"cycle-anchor");
+        let looping = Directory {
+            files: vec![],
+            directories: vec![DirectoryNode {
+                name: "self".to_string(),
+                digest: Some(Digest::from(&anchor)),
+            }],
+            symlinks: vec![],
+            node_properties: None,
+        };
+        let mut by_digest: HashMap<DigestInfo, &Directory> = HashMap::new();
+        by_digest.insert(anchor, &looping);
+        let root = Directory {
+            files: vec![],
+            directories: vec![DirectoryNode {
+                name: "a".to_string(),
+                digest: Some(Digest::from(&anchor)),
+            }],
+            symlinks: vec![],
+            node_properties: None,
+        };
+
+        assert_eq!(
+            traverse_into_plan(&root, &by_digest).err(),
+            Some("tree contains a directory cycle"),
+        );
+    }
+
+    // FIX 5 T1: a legitimate diamond — two parents referencing an identical child
+    // — must be materialized at BOTH locations, NOT rejected as a cycle (the guard
+    // is path-scoped via `ancestors.remove`, not global-visited).
+    #[nativelink_test]
+    async fn diamond_shared_child_materialized_per_location() {
+        let shared = Directory {
+            files: vec![FileNode {
+                name: "leaf.bin".to_string(),
+                digest: Some(Digest::from(&blake3_digest(b"leaf"))),
+                is_executable: false,
+                node_properties: None,
+            }],
+            directories: vec![],
+            symlinks: vec![],
+            node_properties: None,
+        };
+        let shared_digest = blake3_digest(&shared.encode_to_vec());
+        let root = Directory {
+            files: vec![],
+            directories: vec![
+                DirectoryNode {
+                    name: "left".to_string(),
+                    digest: Some(Digest::from(&shared_digest)),
+                },
+                DirectoryNode {
+                    name: "right".to_string(),
+                    digest: Some(Digest::from(&shared_digest)),
+                },
+            ],
+            symlinks: vec![],
+            node_properties: None,
+        };
+
+        let plan = build_materialize_plan(&root, &[shared])
+            .expect("diamond must be accepted, not rejected as a cycle");
+
+        let dirs: Vec<String> = plan.dirs.iter().map(|p| p.display().to_string()).collect();
+        assert!(dirs.contains(&"left".to_string()), "left dir missing: {dirs:?}");
+        assert!(dirs.contains(&"right".to_string()), "right dir missing: {dirs:?}");
+        let files: Vec<String> = plan
+            .files
+            .iter()
+            .map(|f| f.rel_path.display().to_string())
+            .collect();
+        assert!(
+            files.contains(&"left/leaf.bin".to_string()),
+            "left/leaf.bin missing: {files:?}"
+        );
+        assert!(
+            files.contains(&"right/leaf.bin".to_string()),
+            "right/leaf.bin missing: {files:?}"
+        );
+    }
+
+    // FIX 5 T2: an in-tree symlink must be rejected (no symlink-injection surface,
+    // §9).
+    #[nativelink_test]
+    async fn in_tree_symlink_is_rejected() {
+        let root = Directory {
+            files: vec![],
+            directories: vec![],
+            symlinks: vec![SymlinkNode {
+                name: "link".to_string(),
+                target: "elsewhere".to_string(),
+                node_properties: None,
+            }],
+            node_properties: None,
+        };
+
+        assert_eq!(
+            build_materialize_plan(&root, &[]).err(),
+            Some("tree contains symlinks"),
+        );
+    }
+
+    // FIX 5 T3: `validate_component` rejects `..`, path separators, and NUL, and
+    // accepts a plain name.
+    #[nativelink_test]
+    async fn validate_component_rejects_traversal_separator_nul() {
+        assert_eq!(validate_component(".."), Err("invalid path component"));
+        assert_eq!(
+            validate_component("a/b"),
+            Err("path component contains a separator or NUL")
+        );
+        assert_eq!(
+            validate_component("/"),
+            Err("path component contains a separator or NUL")
+        );
+        assert_eq!(
+            validate_component("a\0b"),
+            Err("path component contains a separator or NUL")
+        );
+        assert_eq!(validate_component("libfoo.rlib"), Ok(()));
+    }
+
     // A Store whose reads never resolve, to prove the bounded index timeout.
     use slow_store::SlowStore;
+    // A Store that delegates to an inner MemoryStore but hangs `get_part` for a
+    // configured digest set, to prove the overall deadline bounds a stalled blob
+    // read mid-materialize.
+    use selective_store::SelectiveStore;
     mod slow_store {
         use core::pin::Pin;
         use std::sync::Arc;
@@ -1018,5 +1319,142 @@ mod tests {
         }
 
         default_health_status_indicator!(SlowStore);
+    }
+
+    mod selective_store {
+        use core::pin::Pin;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use futures::future::pending;
+        use nativelink_error::Error;
+        use nativelink_metric::{
+            MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+        };
+        use nativelink_store::memory_store::MemoryStore;
+        use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+        use nativelink_util::common::DigestInfo;
+        use nativelink_util::health_utils::{
+            HealthStatusIndicator, default_health_status_indicator,
+        };
+        use nativelink_util::store_trait::{
+            DurableDelegation, ItemCallback, MarkStableDelegation, PinDelegation,
+            StableDigestDelegation, Store, StoreDriver, StoreKey, UploadSizeInfo,
+        };
+
+        /// Wraps an inner [`MemoryStore`], delegating everything EXCEPT it hangs
+        /// `get_part` forever for any digest in `hang_on`. Lets a test serve the
+        /// Tree read but stall a specific blob read mid-materialize.
+        #[derive(Debug)]
+        pub(super) struct SelectiveStore {
+            inner: Arc<MemoryStore>,
+            hang_on: HashSet<DigestInfo>,
+        }
+
+        impl MetricsComponent for SelectiveStore {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+
+        impl SelectiveStore {
+            pub(super) fn new_store(
+                inner: Arc<MemoryStore>,
+                hang_on: impl IntoIterator<Item = DigestInfo>,
+            ) -> Store {
+                Store::new(Arc::new(Self {
+                    inner,
+                    hang_on: hang_on.into_iter().collect(),
+                }))
+            }
+        }
+
+        #[async_trait]
+        impl StoreDriver for SelectiveStore {
+            async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn has_with_results(
+                self: Pin<&Self>,
+                keys: &[StoreKey<'_>],
+                results: &mut [Option<u64>],
+            ) -> Result<(), Error> {
+                Pin::new(self.inner.as_ref())
+                    .has_with_results(keys, results)
+                    .await
+            }
+
+            async fn update(
+                self: Pin<&Self>,
+                key: StoreKey<'_>,
+                reader: DropCloserReadHalf,
+                size_info: UploadSizeInfo,
+            ) -> Result<u64, Error> {
+                Pin::new(self.inner.as_ref())
+                    .update(key, reader, size_info)
+                    .await
+            }
+
+            async fn get_part(
+                self: Pin<&Self>,
+                key: StoreKey<'_>,
+                writer: &mut DropCloserWriteHalf,
+                offset: u64,
+                length: Option<u64>,
+            ) -> Result<(), Error> {
+                if let StoreKey::Digest(digest) = &key {
+                    if self.hang_on.contains(digest) {
+                        // Never resolves: only the caller's overall deadline ends it.
+                        return pending().await;
+                    }
+                }
+                Pin::new(self.inner.as_ref())
+                    .get_part(key, writer, offset, length)
+                    .await
+            }
+
+            fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
+                self
+            }
+
+            fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+                self
+            }
+
+            fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+                self
+            }
+
+            fn register_item_callback(
+                self: Arc<Self>,
+                _callback: Arc<dyn ItemCallback>,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+                StableDigestDelegation::Leaf
+            }
+
+            fn pin_delegation(&self) -> PinDelegation<'_> {
+                PinDelegation::Leaf
+            }
+
+            fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+                MarkStableDelegation::Leaf
+            }
+
+            fn durable_delegation(&self) -> DurableDelegation<'_> {
+                DurableDelegation::Leaf
+            }
+        }
+
+        default_health_status_indicator!(SelectiveStore);
     }
 }
