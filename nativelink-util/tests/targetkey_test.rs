@@ -268,6 +268,45 @@ async fn targetkey_incr_exclusion_is_basename_scoped() -> Result<(), Error> {
     Ok(())
 }
 
+/// EDGE CASE (§2, pair-a/red-team): a LEGITIMATE crate literally named `foo-incr`
+/// emits real outputs whose BASENAME contains the `-incr` substring
+/// (`libfoo-incr-<hash>.rlib` + `.rmeta`) — NOT the pipelined `-incr` seed dir.
+/// The worker's `basename.contains("-incr")` exclusion drops EVERY such output, so
+/// after the filter the candidate set is empty → `derive` returns `None` → the
+/// action is not seeded → COLD build.
+///
+/// This is cold-not-wrong — but ONLY IF the client applies the BYTE-IDENTICAL
+/// `contains("-incr")` predicate, so the client ALSO excludes these outputs and
+/// derives the SAME (empty → no-seed) result. A client using `ends_with("-incr")`
+/// / a regex / segment inspection would NOT exclude `libfoo-incr-<hash>.rlib`,
+/// derive a NON-empty key on it, and diverge from the worker → the §11
+/// `verify_against_command_outputs` mismatch fails LOUD with a hard
+/// `FailedPrecondition` (not cold). This test pins the WORKER side of that
+/// contract edge; the client predicate is pinned as exactly
+/// `basename.contains("-incr")` in the Bazel-side handoff.
+///
+/// Mutation: remove the `-incr` exclusion filter in `derive` → the two
+/// `-incr`-containing outputs survive → `derive` returns `Some` → the `is_none()`
+/// assertion below red-fails.
+#[nativelink_test]
+async fn targetkey_crate_literally_named_incr_all_outputs_excluded_yields_none()
+-> Result<(), Error> {
+    // A crate named `foo-incr`: its rustc outputs are `libfoo-incr-<hash>.rlib`
+    // and `.rmeta`, whose basenames both CONTAIN `-incr`.
+    let outputs = paths(&[
+        "bazel-out/cfg/bin/pkg/libfoo-incr-a1b2c3.rlib",
+        "bazel-out/cfg/bin/pkg/libfoo-incr-a1b2c3.rmeta",
+    ]);
+    assert!(
+        TargetKey::derive(&outputs).is_none(),
+        "a crate literally named foo-incr — every output basename contains -incr — must be \
+         FULLY excluded → None (cold, safe on the WORKER side); this is cold-not-wrong only \
+         if the client applies the byte-identical contains(\"-incr\") predicate (an ends_with \
+         client would derive a key here and diverge → hard FailedPrecondition at verify)"
+    );
+    Ok(())
+}
+
 /// `from_carrier` accepts a matching (key, primary_output) pair: the recomputed
 /// `blake3(primary_output)` equals the client-supplied key, so the carrier is
 /// trusted verbatim (no CAS fetch). Mutation: return `None` unconditionally in

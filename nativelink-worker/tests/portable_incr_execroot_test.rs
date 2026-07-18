@@ -1274,7 +1274,10 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
     // The execroot IS the byte-identical work dir; the fetch materializes the
     // seed at the DECLARED NESTED `-incr` output joined onto the execroot.
     let execroot = action.get_work_directory().to_string();
-    let dest = seed_dest_dir(Path::new(&execroot), &output_paths)
+    // The command's working_directory is "." (collapses in the join); pass it so
+    // the test computes the dest with the same formula the production call-site
+    // now uses (`seed_dest_dir` is working_directory-aware, pair-a #2).
+    let dest = seed_dest_dir(Path::new(&execroot), ".", &output_paths)
         .expect("seed dest from the declared nested -incr output");
     assert_eq!(
         dest,
@@ -1299,6 +1302,99 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
         fs::read(dest.join("dep-graph.bin")).expect("materialized seed file"),
         file_content,
         "the materialized seed content MUST be the blake3-verified CAS blob"
+    );
+
+    action.cleanup().await.expect("cleanup");
+}
+
+/// (c) INERTNESS BY ASSERTION (pair-b): a NON-portable action (no carrier props →
+/// `portable_execroot == None` → `portable_targetkey` never stashed, stays `None`)
+/// on a portable-ENABLED manager with an index store installed AND a matching
+/// pre-seeded index entry MUST NOT fetch/materialize the seed — the
+/// `if let (Some(index_store), Some(targetkey))` gate is skipped because
+/// `portable_targetkey` is `None`. This is the exact A/B partner of the (b) test
+/// above (identical pre-seed + output_paths); (b) proves a portable action
+/// MATERIALIZES the seed, this proves the non-portable action does NOT — so the
+/// non-materialization is the gate's inertness, not a vacuous miss.
+#[nativelink_test]
+async fn non_portable_action_leaves_targetkey_none_and_skips_seed_fetch() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["inert-wire/"]);
+    let index_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager, cas) = setup_portable_manager_with_index(ctx, index_store.clone()).await;
+
+    let primary = "inert-wire/aaa.rlib";
+    let incr_output = "inert-wire/aaa-incr";
+    let output_paths = vec![primary.to_string(), incr_output.to_string()];
+    let tk = TargetKey::derive(&output_paths).expect("targetkey derives");
+
+    // Pre-seed CAS + index EXACTLY as the (b) test does, so the ONLY difference
+    // between materialize-vs-not is the action's portability.
+    let cas_store = Store::new(cas.clone());
+    let file_content: &[u8] = b"incremental-artifact";
+    let file_digest = blake3_digest(file_content);
+    put_blob(&cas_store, file_digest, file_content.to_vec()).await;
+    let tree = Tree {
+        root: Some(Directory {
+            files: vec![FileNode {
+                name: "dep-graph.bin".to_string(),
+                digest: Some(Digest::from(&file_digest)),
+                is_executable: false,
+                node_properties: None,
+            }],
+            directories: vec![],
+            symlinks: vec![],
+            node_properties: None,
+        }),
+        children: Vec::<Directory>::new(),
+    };
+    let tree_bytes = tree.encode_to_vec();
+    let tree_digest = blake3_digest(&tree_bytes);
+    put_blob(&cas_store, tree_digest, tree_bytes).await;
+    let seeded = plan_seed_publish(&tk, 0, false, std::iter::once(("z-incr", tree_digest)))
+        .expect("seed index value");
+    index_store
+        .update_oneshot(StoreKey::Digest(seeded.index_digest), seeded.encoded)
+        .await
+        .expect("pre-seed index");
+
+    // NON-portable: an EMPTY platform carries no `nl_incr_*` carrier props, so
+    // `plan_portable_execroot` returns None ⇒ portable_execroot None ⇒ the [B1]
+    // derive-and-stash block never runs ⇒ portable_targetkey stays None.
+    let command = Command {
+        arguments: vec!["true".to_string()],
+        output_paths: output_paths.clone(),
+        working_directory: ".".to_string(),
+        environment_variables: vec![EnvironmentVariable {
+            name: "PATH".to_string(),
+            value: std::env::var("PATH").unwrap_or_default(),
+        }],
+        ..Default::default()
+    };
+    let start_execute = upload_start_execute(&cas, &command, Platform::default()).await;
+
+    let action = manager
+        .create_and_add_action("test-worker".to_string(), start_execute)
+        .await
+        .expect("non-portable action admitted");
+    let work_dir = action.get_work_directory().to_string();
+
+    action
+        .clone()
+        .prepare_action()
+        .await
+        .expect("prepare_action");
+
+    // The seed's would-be destination (same formula the fetch uses). For a
+    // non-portable action the fetch gate is skipped, so nothing materializes here.
+    let dest = seed_dest_dir(Path::new(&work_dir), ".", &output_paths)
+        .expect("seed dest resolves from the declared nested -incr output");
+    assert!(
+        !dest.join("dep-graph.bin").exists(),
+        "a NON-portable action (portable_targetkey None) MUST NOT fetch/materialize the \
+         pre-seeded `-incr` tree — the fetch gate `if let (Some(index_store), Some(targetkey))` \
+         must be skipped; a materialized {} means the gate fired without a portable execroot",
+        dest.join("dep-graph.bin").display(),
     );
 
     action.cleanup().await.expect("cleanup");

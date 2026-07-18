@@ -5401,9 +5401,11 @@ impl RunningActionImpl {
             self.running_actions_manager.incr_seed_index_store.as_ref(),
             portable_targetkey.as_ref(),
         ) {
-            if let Some(dest) =
-                seed_dest_dir(std::path::Path::new(&self.work_directory), &command.output_paths)
-            {
+            if let Some(dest) = seed_dest_dir(
+                std::path::Path::new(&self.work_directory),
+                &command.working_directory,
+                &command.output_paths,
+            ) {
                 let cas = Store::new(self.running_actions_manager.cas_store.clone());
                 match fetch_and_materialize_seed(
                     index_store,

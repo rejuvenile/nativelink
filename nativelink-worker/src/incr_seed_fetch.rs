@@ -788,10 +788,21 @@ fn path_is_incr_seed_dir(path: &str) -> bool {
 /// The on-disk destination for the fetched `-incr` seed (design §6.3/§7, FL-1383
 /// §3): the current action's OWN declared `-incr` output path — a NESTED,
 /// label-named `Command.output_paths` entry (`bazel-out/cfg/bin/<pkg>/<label>-incr`,
-/// where `rustc -Cincremental` points) — joined onto the byte-identical execroot.
-/// Returns the FIRST `output_paths` entry whose basename ends in `-incr` (the
-/// singular seed dir, per [`path_is_incr_seed_dir`]); `None` if the action
-/// declares no such output → cold, no fetch.
+/// where `rustc -Cincremental` points) — joined onto the execroot, HONORING
+/// `Command.working_directory`. Returns the FIRST `output_paths` entry whose
+/// basename ends in `-incr` (the singular seed dir, per [`path_is_incr_seed_dir`]);
+/// `None` if the action declares no such output → cold, no fetch.
+///
+/// `working_directory`-awareness (FL-1383 §3, pair-a #2): REAPI `output_paths` are
+/// relative to `Command.working_directory`, so the dest MUST be computed with the
+/// SAME formula [`prepare_output_directory`] uses when it creates the seed's parent
+/// dir — `{execroot}/{working_directory}/{output_path}` (or `{execroot}/{output_path}`
+/// when `working_directory` is empty). This is the single source of truth: any
+/// divergence lands the seed where `prepare_output_directory` did NOT create a
+/// parent (cold-not-wrong: fetch fails, or materializes where rustc — cwd
+/// `execroot/working_directory` — never reads `-Cincremental` → dark reuse-collapse).
+/// `working_directory ∈ {"", "."}` collapses in the join (the `.` component
+/// normalizes away against the absolute execroot).
 ///
 /// This is OPTION A (locked with the Bazel/rules_rust side): the seed CONTENT
 /// comes from the index `tree_digest`; the DESTINATION is derived from THIS
@@ -804,8 +815,14 @@ fn path_is_incr_seed_dir(path: &str) -> bool {
 /// Defense-in-depth (§9): a REAPI declared output path is execroot-relative and
 /// Bazel-normalized; an absolute path or a `..` component is refused (`None` →
 /// cold), so the join can never materialize outside the execroot.
+///
+/// [`prepare_output_directory`]: crate::running_actions_manager::prepare_output_directory
 #[must_use]
-pub fn seed_dest_dir(execroot: &Path, output_paths: &[String]) -> Option<PathBuf> {
+pub fn seed_dest_dir(
+    execroot: &Path,
+    working_directory: &str,
+    output_paths: &[String],
+) -> Option<PathBuf> {
     let incr = output_paths
         .iter()
         .map(String::as_str)
@@ -818,7 +835,16 @@ pub fn seed_dest_dir(execroot: &Path, output_paths: &[String]) -> Option<PathBuf
     {
         return None;
     }
-    Some(execroot.join(incr_path))
+    // Single source of truth with `prepare_output_directory`, which builds the
+    // parent as `{execroot}/{working_directory}/{output_path}` (empty
+    // working_directory ⇒ no middle segment). Joining the same way keeps the
+    // seed at exactly the path whose parent that function created.
+    let base = if working_directory.is_empty() {
+        execroot.to_path_buf()
+    } else {
+        execroot.join(working_directory)
+    };
+    Some(base.join(incr_path))
 }
 
 /// A planned seed-index publish (design §6.2): the AC-shaped index KEY under
@@ -1412,6 +1438,7 @@ mod tests {
     #[nativelink_test]
     async fn seed_dest_dir_uses_declared_nested_incr_output() {
         let execroot = std::path::Path::new("/Volumes/CrowAgent/fl-incr-execroots/deadbeef");
+        // Empty working_directory: output_paths are execroot-relative as declared.
         let outputs = vec![
             "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rlib".to_string(),
             "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rmeta".to_string(),
@@ -1421,25 +1448,66 @@ mod tests {
         // The seed materializes at the NESTED declared -incr output joined onto
         // the execroot — NOT a top-level `<stem>-incr` child.
         assert_eq!(
-            seed_dest_dir(execroot, &outputs),
+            seed_dest_dir(execroot, "", &outputs),
             Some(execroot.join("bazel-out/cfg/bin/pkg/foo-incr")),
             "seed dest must be the declared nested -incr output joined onto the execroot"
         );
+        // `working_directory == "."` collapses in the join (the `.` component
+        // normalizes away against the absolute execroot), matching the empty case
+        // and `prepare_output_directory`'s `{execroot}/./{output}` parent.
+        assert_eq!(
+            seed_dest_dir(execroot, ".", &outputs),
+            Some(execroot.join("bazel-out/cfg/bin/pkg/foo-incr")),
+            "working_directory == \".\" must collapse to the same dest as empty"
+        );
         // No -incr output declared -> None (cold, no fetch).
         assert_eq!(
-            seed_dest_dir(execroot, &["bazel-out/cfg/bin/pkg/libfoo.rlib".to_string()]),
-            None
+            seed_dest_dir(execroot, "", &["bazel-out/cfg/bin/pkg/libfoo.rlib".to_string()]),
+            None,
+            "no -incr output must yield None (cold, no fetch)"
         );
         // `-incr-metadata` alone is the pipelined tree, NOT the singular seed dir.
         assert_eq!(
-            seed_dest_dir(execroot, &["pkg/foo-incr-metadata".to_string()]),
-            None
+            seed_dest_dir(execroot, "", &["pkg/foo-incr-metadata".to_string()]),
+            None,
+            "-incr-metadata alone is the pipelined tree, not the singular seed dir"
         );
         // Path-traversal defense (§9): absolute / `..` -incr entries are refused.
-        assert_eq!(seed_dest_dir(execroot, &["/etc/evil-incr".to_string()]), None);
         assert_eq!(
-            seed_dest_dir(execroot, &["../../escape-incr".to_string()]),
-            None
+            seed_dest_dir(execroot, "", &["/etc/evil-incr".to_string()]),
+            None,
+            "an absolute -incr output_path must be refused (execroot-escape guard)"
+        );
+        assert_eq!(
+            seed_dest_dir(execroot, "", &["../../escape-incr".to_string()]),
+            None,
+            "a `..` -incr output_path must be refused (execroot-escape guard)"
+        );
+    }
+
+    // -- FL-1383 §3 seed_dest_dir: HONORS Command.working_directory (pair-a #2) --
+    //
+    // REAPI `output_paths` are relative to `Command.working_directory`;
+    // `prepare_output_directory` creates the seed's parent at
+    // `{execroot}/{working_directory}/{output_path}`. `seed_dest_dir` MUST use the
+    // SAME formula — otherwise the seed lands where no parent was created (cold) or
+    // where rustc (cwd `execroot/working_directory`) never reads `-Cincremental`
+    // (dark reuse-collapse: `incr_index_fetch_hit` climbs, `incr_reuse_fired` flat).
+    #[nativelink_test]
+    async fn seed_dest_dir_honors_non_empty_working_directory() {
+        let execroot = std::path::Path::new("/Volumes/CrowAgent/fl-incr-execroots/deadbeef");
+        let working_directory = "k8-fastbuild/bin";
+        // output_paths are RELATIVE to working_directory (the REAPI contract).
+        let outputs = vec![
+            "pkg/libfoo-a1b2c3.rlib".to_string(),
+            "pkg/foo-incr".to_string(),
+        ];
+        assert_eq!(
+            seed_dest_dir(execroot, working_directory, &outputs),
+            Some(execroot.join("k8-fastbuild/bin/pkg/foo-incr")),
+            "seed dest must honor Command.working_directory (join it before the declared \
+             -incr output), matching where prepare_output_directory creates the parent; \
+             an execroot-only join DROPS working_directory and darkens reuse"
         );
     }
 
