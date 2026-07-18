@@ -9078,7 +9078,14 @@ mod tests {
         // Case 2 (equal stamp LOSES — proves the fresh mint is load-bearing):
         // a prior evict ABSENT@(1,7); an advertise-on-pin fired at the SAME
         // stamp (1,7) — as a frozen insert stamp would be — loses the ABSENT
-        // tie and is suppressed. This is the mutation guard for `next_stamp`.
+        // tie and is suppressed. Falsifier this case guards: making `apply`'s
+        // stamp comparison NON-STRICT (`Stamp::gt` -> `ge`, i.e. a PRESENT that
+        // merely TIES the stored ABSENT is allowed to win). Under a non-strict
+        // compare the equal-stamp PRESENT@(1,7) would overturn ABSENT@(1,7) and
+        // this assert would fail — which is exactly why `fire_on_pin` must mint
+        // a STRICTLY-higher fresh stamp rather than reuse the value's frozen
+        // insert stamp. (Zeroing `tie_absent_wins` does NOT falsify this case —
+        // wrong branch: incoming is PRESENT vs stored ABSENT, not the reverse.)
         let d2 = DigestInfo::new([6u8; 32], 100);
         rt.block_on(tracker.callback(StoreKey::Digest(d2), 1, 7));
         tracker.on_pin(StoreKey::Digest(d2), 100, 1, 7);
@@ -9089,6 +9096,134 @@ mod tests {
              tie — this proves `fire_on_pin` must mint a strictly-higher fresh \
              stamp, not reuse the value's frozen insert stamp"
         );
+    }
+
+    // Test 4 (FIX 1 — convergent gap: pair-a B1 / pair-b T1). END-TO-END through
+    // the REAL moka pin fire path (`pin_key_indefinite` -> `fire_on_pin_callbacks`
+    // -> `ItemCallbackHolder` -> `tracker.on_pin`), NOT `tracker.on_pin` directly.
+    // Test 3 hand-feeds the stamp; the two existing integration tests use the real
+    // fire path but have NO prior ABSENT, so all three assert only PRESENT-
+    // membership and stay GREEN under a mutation that reuses a STALE/frozen stamp
+    // inside `fire_on_pin_callbacks` instead of minting `next_stamp()`. This test
+    // seeds a prior ABSENT at the value's FROZEN insert stamp and requires the
+    // moka-minted fresh pin stamp to STRICTLY out-rank it.
+    //
+    // Why the prior ABSENT is driven through `tracker.callback` (the exact
+    // `ItemCallback` method moka's eviction listener invokes) rather than a
+    // genuine moka LRU eviction: a real LRU eviction removes D from the cache, so
+    // the subsequent `pin_key_indefinite` would find nothing to pin — and a
+    // re-insert to make D pinnable again would mint a HIGHER insert stamp that
+    // both re-advertises PRESENT (masking the pin's stamp) and lifts the value's
+    // frozen stamp above the ABSENT (defeating the mutation probe). The ONLY state
+    // where D is simultaneously ABSENT-in-tracker and pinnable-in-moka at the
+    // value's frozen stamp is a STALE/DUPLICATE async evict callback for a
+    // still-resident digest — precisely the locality-map-drift reorder the Stamp
+    // LWW exists to survive. `tracker.callback` at the resident value's frozen
+    // stamp models exactly that, and it IS the real evict callback seam.
+    #[test]
+    fn advertise_on_pin_through_moka_outranks_prior_absent() {
+        use nativelink_util::evicting_map::LenEntry;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (evicting_map, tracker) = fl688_pin_map_and_tracker();
+            let d = DigestInfo::new([7u8; 32], 30);
+
+            // (a) Insert D. on_insert fires PRESENT through the real moka ->
+            //     holder -> tracker seam and FREEZES the minted counter into the
+            //     value. `v` shares the value's inner AtomicU64, so `v.stamp()`
+            //     always reflects the value's current frozen stamp.
+            let v = Fl688PinValue::new(30);
+            evicting_map
+                .insert(StoreKey::Digest(d).into(), v.clone())
+                .await;
+            // Drain the insert delta so only the pin advertisement is measured.
+            tracker.swap();
+            let insert_counter = v.stamp();
+
+            // (b) A stale/duplicate eviction callback for the STILL-RESIDENT value
+            //     of D arrives at the value's frozen insert stamp, recording D
+            //     ABSENT — the winner-so-far the pin advertisement must overturn.
+            //     boot_epoch is 0 (harness `with_anchor` default), matching the
+            //     epoch `fire_on_pin_callbacks` will report.
+            tracker
+                .callback(StoreKey::Digest(d), 0, insert_counter)
+                .await;
+
+            // (c) Pin D indefinitely THROUGH THE REAL moka pin path. The fresh
+            //     path mints `next_stamp()` (> insert_counter), re-stamps the
+            //     value, and fires on_pin PRESENT@fresh. A mutation reusing
+            //     `value.stamp()` (== insert_counter) would TIE the prior ABSENT
+            //     and lose the ABSENT-wins tie-break, leaving D dark.
+            assert!(
+                evicting_map.pin_key_indefinite(StoreKey::Digest(d).into()),
+                "indefinite pin should be admitted (max_bytes=0 => no cap)"
+            );
+
+            let (present, absent) = present_absent(tracker.swap());
+            assert!(
+                present.contains(&d) && !absent.contains(&d),
+                "FL-688 F5 end-to-end: advertise-on-pin through the REAL moka \
+                 fire path MUST mint a FRESH next_stamp strictly out-ranking a \
+                 prior ABSENT evict of the same digest; reusing the value's \
+                 frozen insert stamp ties the ABSENT and re-opens the durable-\
+                 before-pin leak (pinned F2 output stays dark, never BIS-released, \
+                 pinned forever until the reconnect full snapshot)"
+            );
+        });
+    }
+
+    // Test 5 (FIX 2 — pair-b T2: composite invariant (c), residual liveness
+    // window — DOCUMENTS behavior, is NOT a bug assertion). The advertise-on-pin
+    // re-stamps D PRESENT and FREEZES that fresh stamp into the value. A LATER
+    // genuine eviction of D therefore carries that SAME frozen stamp, so
+    // ABSENT@pin_stamp TIES PRESENT@pin_stamp and the ABSENT-wins tie-break
+    // resolves NET-ABSENT. That transient false-ABSENT on a still-pinned blob
+    // degrades to the pre-existing durable-before-pin leak for one window; it
+    // self-heals via the next BlobsAvailable advertisement / reconnect snapshot
+    // and the server's has_durably -> mark_stable -> BIS release. This test pins
+    // the documented degradation, it does not claim a defect.
+    #[test]
+    fn advertise_on_pin_then_equal_stamp_evict_resolves_absent() {
+        use nativelink_util::evicting_map::LenEntry;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (evicting_map, tracker) = fl688_pin_map_and_tracker();
+            let d = DigestInfo::new([4u8; 32], 30);
+
+            let v = Fl688PinValue::new(30);
+            evicting_map
+                .insert(StoreKey::Digest(d).into(), v.clone())
+                .await;
+            tracker.swap();
+
+            // Pin D through the real moka path: PRESENT@pin_stamp accumulates in
+            // the tracker and the fresh pin stamp is frozen into the value.
+            assert!(evicting_map.pin_key_indefinite(StoreKey::Digest(d).into()));
+            let pin_counter = v.stamp();
+
+            // A LATER genuine eviction of the re-stamped value carries that SAME
+            // frozen pin stamp (moka's eviction listener reports `value.stamp()`).
+            // It must LOSE nothing to the accumulated PRESENT — instead the equal-
+            // stamp ABSENT-wins tie-break resolves the window NET-ABSENT.
+            tracker
+                .callback(StoreKey::Digest(d), 0, pin_counter)
+                .await;
+
+            let (present, absent) = present_absent(tracker.swap());
+            assert!(
+                absent.contains(&d) && !present.contains(&d),
+                "FL-688 composite invariant (c): a later eviction carrying the \
+                 SAME frozen stamp as the advertise-on-pin re-stamp resolves \
+                 NET-ABSENT (equal-stamp ABSENT-wins tie-break) — the residual \
+                 liveness window that self-heals via the next advertisement/BIS"
+            );
+        });
     }
 
     #[test]
