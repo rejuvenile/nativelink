@@ -44,6 +44,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use nativelink_config::cas_server::PortableIncrConfig;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -551,6 +552,52 @@ impl PortableIncrContext {
             _lease: lease,
         })
     }
+
+    /// §8 STARTUP SWEEP: remove stale CONTENDER dirs
+    /// (`<FIXED_PREFIX>/<targetkey>.<uuid>`) orphaned by a prior worker run that
+    /// crashed before its [`PortableExecroot`] Drop cold-discarded them. Owner
+    /// warm dirs (`<FIXED_PREFIX>/<targetkey>`) are NEVER contenders and are
+    /// preserved. Returns the number of contender dirs removed.
+    ///
+    /// Call ONCE at worker startup, BEFORE any action plans an execroot (so no
+    /// contender is live) — the wiring agent invokes it from `local_worker`
+    /// startup after the `Some(PortableIncrContext)` is built. INERT (no-op,
+    /// returns `Ok(0)`) when the feature is disabled.
+    ///
+    /// BLOCKING (readdir/unlink syscalls) — call under `spawn_blocking`. No
+    /// `fsync`/sync-write primitive (CLAUDE.md hard rule).
+    pub fn sweep_stale_contender_dirs(&self) -> Result<usize, Error> {
+        if !self.config.enabled {
+            return Ok(0);
+        }
+        sweep_stale_contender_dirs_at(&self.fixed_prefix)
+    }
+
+    /// §8 WARM-DIR EVICTION: bound the on-disk materialized-`-incr` pool at
+    /// `<FIXED_PREFIX>` to `budget_bytes` by evicting least-recently-used warm
+    /// OWNER dirs (whole-dir removal — an evicted `targetkey` cold-starts +
+    /// re-fetches, design §8: safe). A dir currently LEASED by an in-flight
+    /// owner is NEVER evicted (respects the §5 lease via the same
+    /// [`EXECROOT_OWNERSHIP`] claim `plan` uses); if the pool is over budget but
+    /// every remaining candidate is leased, it REFUSES to evict a live dir and
+    /// returns `still_over_budget` (backpressure), never touching a live one.
+    ///
+    /// Call AFTER an action's cleanup (post-execution) — the wiring agent
+    /// invokes it from `running_actions_manager` cleanup, passing
+    /// [`DEFAULT_WARM_DIR_BUDGET_BYTES`] (or a future config value). INERT (no-op,
+    /// returns [`EvictionOutcome::default`]) when the feature is disabled.
+    ///
+    /// BLOCKING (readdir/lstat/unlink syscalls) — call under `spawn_blocking`.
+    /// No `fsync`/sync-write primitive (CLAUDE.md hard rule).
+    pub fn evict_warm_dirs_over_budget(
+        &self,
+        budget_bytes: u64,
+    ) -> Result<EvictionOutcome, Error> {
+        if !self.config.enabled {
+            return Ok(EvictionOutcome::default());
+        }
+        evict_warm_dirs_over_budget_at(&self.fixed_prefix, budget_bytes)
+    }
 }
 
 /// Whether this action is the warm OWNER of `<FIXED_PREFIX>/<targetkey>` or an
@@ -734,6 +781,242 @@ pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §8 disk budget: warm-dir eviction + contender-dir startup sweep (design §8).
+//
+// The materialized `-incr` dirs at `<FIXED_PREFIX>/<targetkey>` are the only
+// genuinely-NEW on-disk pool (the CAS-resident `-incr` CONTENT is handled by
+// §6.5). No shared disk-budget authority exists between the FilesystemStore and
+// DirectoryCache budgets, so the operator decision (design §8) is a STATIC
+// reservation carve-out bounded by this module's own LRU under a static cap.
+// ---------------------------------------------------------------------------
+
+// CAPPED AT 20 GiB: the design v4 §6.5 sizing proof bounds the materialized
+// warm-dir pool at the full-CI-widen worst case of 27×400 MB = 10.9 GB
+// (one-crate = 0.46 GB); a 20 GiB static reservation leaves ≥9 GiB headroom and
+// equals the FL-688 pin-budget ceiling the §8 carve-out is sized against.
+// Over-budget → LRU-evict cold (safe: an evicted `targetkey` cold-starts +
+// re-fetches, design §8), never grows unbounded at CI-widen. The wiring agent
+// passes this (or a future config value) to `evict_warm_dirs_over_budget`.
+/// Default static on-disk budget (bytes) for the materialized-`-incr` execroot
+/// pool at `<FIXED_PREFIX>` — the design v4 §8 static-reservation carve-out.
+pub const DEFAULT_WARM_DIR_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Outcome of one [`PortableIncrContext::evict_warm_dirs_over_budget`] pass. The
+/// wiring agent turns these into the design §12 counters; this module performs
+/// NO metric registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EvictionOutcome {
+    /// Number of warm owner dirs removed this pass.
+    pub dirs_evicted: usize,
+    /// Apparent bytes reclaimed by the evicted dirs.
+    pub bytes_freed: u64,
+    /// Apparent bytes still resident in the warm pool after this pass.
+    pub bytes_remaining: u64,
+    /// Over-budget candidates SKIPPED because they were LEASED by a live owner
+    /// (the §5 backpressure signal — a live warm dir is never evicted).
+    pub leased_skipped: usize,
+    /// `true` iff the pool is STILL over budget after evicting every non-leased
+    /// candidate (every remaining dir is leased → refuse, don't evict a live
+    /// one). A diagnostic for the operator: the static reservation is too small
+    /// for the concurrent live-owner working set.
+    pub still_over_budget: bool,
+}
+
+/// Whether `name` is a CONTENDER dir name `<64-hex-targetkey>.<32-hex-uuid>` (as
+/// minted by [`PortableIncrContext::plan`]: `format!("{targetkey}.{uuid}")` with
+/// `Uuid::simple()` = 32 lowercase hex). An OWNER warm dir is exactly 64 hex (no
+/// `.`) → not a contender; the `.fl1383_exdev_*` probe files start with `.` (empty
+/// key) → not a contender. This is the sole predicate that decides removal in the
+/// startup sweep, so it is deliberately strict.
+fn is_contender_dir_name(name: &str) -> bool {
+    match name.split_once('.') {
+        Some((key, suffix)) => {
+            is_hex64(key)
+                && suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        }
+        None => false,
+    }
+}
+
+/// Free-function form of [`PortableIncrContext::sweep_stale_contender_dirs`].
+/// BLOCKING — call under `spawn_blocking`.
+fn sweep_stale_contender_dirs_at(fixed_prefix: &Path) -> Result<usize, Error> {
+    let entries = std::fs::read_dir(fixed_prefix).map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "portable_incr: read FIXED_PREFIX {} for contender sweep: {e}",
+            fixed_prefix.display()
+        )
+    })?;
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "portable_incr: read FIXED_PREFIX entry in {}: {e}",
+                fixed_prefix.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Only contender-shaped dirs are stale orphans; owner warm dirs (and any
+        // `-incr` seed inside them) and probe files are PRESERVED.
+        if !is_contender_dir_name(&name_str) {
+            continue;
+        }
+        let path = entry.path();
+        // A contender-shaped NON-directory is left untouched (never expected).
+        let md = std::fs::symlink_metadata(&path).map_err(|e| {
+            make_err!(Code::Internal, "lstat sweep candidate {}: {e}", path.display())
+        })?;
+        if !md.file_type().is_dir() {
+            continue;
+        }
+        // Cold-discard the whole isolated contender dir (it holds no `-incr`
+        // seed to preserve), confined to a subtree of FIXED_PREFIX (§9).
+        discard_dir_tree_confined(&path, fixed_prefix)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Free-function form of [`PortableIncrContext::evict_warm_dirs_over_budget`].
+/// BLOCKING — call under `spawn_blocking`.
+fn evict_warm_dirs_over_budget_at(
+    fixed_prefix: &Path,
+    budget_bytes: u64,
+) -> Result<EvictionOutcome, Error> {
+    // Enumerate the warm OWNER dirs (exactly-64-hex names) and their sizes +
+    // recency. Contender dirs and probe files are NOT part of the persistent
+    // pool (contenders are per-action + cold-discarded/swept), so they are not
+    // eviction candidates here.
+    let entries = std::fs::read_dir(fixed_prefix).map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "portable_incr: read FIXED_PREFIX {} for eviction: {e}",
+            fixed_prefix.display()
+        )
+    })?;
+    // CAPPED AT (concurrent-portable-targetkey count on THIS machine): one entry
+    // per distinct warm `targetkey` dir on local disk — bounded by the
+    // allowlisted-crate set, not a network-driven buffer; holds only PathBufs,
+    // no owned payload bytes, off the durability/data path.
+    let mut candidates: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "portable_incr: read FIXED_PREFIX entry in {}: {e}",
+                fixed_prefix.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !is_hex64(&name_str) {
+            continue;
+        }
+        let path = entry.path();
+        let md = std::fs::symlink_metadata(&path).map_err(|e| {
+            make_err!(Code::Internal, "lstat warm dir {}: {e}", path.display())
+        })?;
+        if !md.file_type().is_dir() {
+            continue;
+        }
+        let size = dir_apparent_size_bytes(&path)?;
+        // The dir's own mtime is the LRU signal: the §7 wipe adds/removes direct
+        // children every build, so a recently-built warm dir has a recent mtime.
+        let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        total = total.saturating_add(size);
+        candidates.push((path, size, mtime));
+    }
+
+    let mut outcome = EvictionOutcome {
+        bytes_remaining: total,
+        ..EvictionOutcome::default()
+    };
+    if total <= budget_bytes {
+        return Ok(outcome);
+    }
+
+    // Least-recently-used first.
+    candidates.sort_by_key(|(_, _, mtime)| *mtime);
+    for (path, size, _mtime) in candidates {
+        if total <= budget_bytes {
+            break;
+        }
+        // Atomic claim via the §5 lease set: `insert` returns `true` only when
+        // the dir is NOT currently leased by a live owner. This closes the
+        // TOCTOU with `plan`: a concurrent same-`targetkey` action sees our
+        // sentinel and becomes an isolated CONTENDER (its own dir) rather than
+        // racing the delete of this warm dir.
+        let claimed = EXECROOT_OWNERSHIP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone());
+        if !claimed {
+            // Leased by a live owner — never evict a live warm dir (backpressure).
+            outcome.leased_skipped += 1;
+            continue;
+        }
+        // RAII: releases our delete-sentinel from the lease set on drop, even if
+        // `discard_dir_tree_confined` errors.
+        let _sentinel = OwnershipLeaseGuard {
+            owned: Some(path.clone()),
+        };
+        discard_dir_tree_confined(&path, fixed_prefix)?;
+        total = total.saturating_sub(size);
+        outcome.dirs_evicted += 1;
+        outcome.bytes_freed = outcome.bytes_freed.saturating_add(size);
+    }
+
+    outcome.bytes_remaining = total;
+    outcome.still_over_budget = total > budget_bytes;
+    Ok(outcome)
+}
+
+/// Recursively remove `path` after asserting it canonicalizes STRICTLY under
+/// `fixed_prefix` (§9 containment). Used by both the startup sweep (contender
+/// discard) and eviction (cold warm-dir removal). BLOCKING.
+fn discard_dir_tree_confined(path: &Path, fixed_prefix: &Path) -> Result<(), Error> {
+    assert_under_prefix(path, fixed_prefix)?;
+    std::fs::remove_dir_all(path).map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "portable_incr: discard dir tree {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// Apparent on-disk size (sum of regular-file lengths) of the tree rooted at
+/// `dir`, NOT following symlinks (a symlink child contributes its own small link
+/// length, never its target). Apparent size slightly OVER-counts hardlinked
+/// inputs vs physical blocks, so the budget errs toward evicting sooner — the
+/// conservative direction for a disk-growth guard. BLOCKING.
+fn dir_apparent_size_bytes(dir: &Path) -> Result<u64, Error> {
+    let mut total: u64 = 0;
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| make_err!(Code::Internal, "read dir {} for sizing: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| make_err!(Code::Internal, "read dir entry in {} for sizing: {e}", dir.display()))?;
+        let path = entry.path();
+        let md = std::fs::symlink_metadata(&path)
+            .map_err(|e| make_err!(Code::Internal, "lstat {} for sizing: {e}", path.display()))?;
+        if md.file_type().is_dir() {
+            total = total.saturating_add(dir_apparent_size_bytes(&path)?);
+        } else {
+            total = total.saturating_add(md.len());
+        }
+    }
+    Ok(total)
 }
 
 /// Create the execroot dir (mode 0755) if absent; a pre-existing dir (Owner

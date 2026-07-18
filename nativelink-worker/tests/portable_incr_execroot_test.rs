@@ -48,9 +48,9 @@ use nativelink_util::fs_util::hardlink_directory_tree;
 use nativelink_util::store_trait::Store;
 use nativelink_util::targetkey::TargetKey;
 use nativelink_worker::portable_incr::{
-    CARRIER_PRIMARY_OUTPUT_PROP, CARRIER_TARGETKEY_PROP, ExecrootRole, PortableExecroot,
-    PortableIncrContext, PortableIncrProvision, assert_under_prefix, ensure_and_wipe_execroot_at,
-    is_incr_seed_entry,
+    CARRIER_PRIMARY_OUTPUT_PROP, CARRIER_TARGETKEY_PROP, DEFAULT_WARM_DIR_BUDGET_BYTES,
+    EvictionOutcome, ExecrootRole, PortableExecroot, PortableIncrContext, PortableIncrProvision,
+    assert_under_prefix, ensure_and_wipe_execroot_at, is_incr_seed_entry,
 };
 use nativelink_worker::running_actions_manager::{
     ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManagerArgs,
@@ -687,5 +687,222 @@ async fn assert_under_prefix_rejects_prefix_itself_and_siblings() {
     assert!(
         assert_under_prefix(&sibling, &prefix).is_err(),
         "a string-prefix sibling (fp-evil) must NOT count as under fp"
+    );
+}
+
+// -- §8 warm-dir eviction + contender-dir startup sweep ----------------------
+//
+// These lock the required-before-flag-flip disk-growth guard (chunk-2 review
+// MAJOR-2/S2): every distinct `targetkey` leaves a persistent warm execroot dir
+// with no GC, so `<FIXED_PREFIX>` grows unbounded at CI-widen. The sweep reaps
+// crash-orphaned CONTENDER dirs at startup; the eviction bounds the warm-dir
+// pool to a static budget (design v4 §8), never evicting a LEASED (live) dir.
+
+/// A warm OWNER dir on disk at `<root>/<key>` holding a `filler` file of
+/// `filler_bytes` bytes (so its apparent size is deterministic).
+fn make_warm_dir(root: &Path, key: &str, filler_bytes: usize) {
+    let d = root.join(key);
+    fs::create_dir_all(&d).expect("mk warm dir");
+    fs::write(d.join("filler"), vec![0u8; filler_bytes]).expect("filler");
+}
+
+/// Set a directory's own mtime (the eviction LRU signal) deterministically.
+fn set_dir_mtime(dir: &Path, t: SystemTime) {
+    let f = fs::File::open(dir).expect("open dir for mtime");
+    f.set_modified(t).expect("set dir mtime");
+}
+
+fn epoch_plus(secs: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+#[nativelink_test]
+async fn startup_sweep_removes_contender_preserves_warm_incr_and_leased() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["sweep-test/"]);
+
+    // A warm OWNER dir carrying an `-incr` seed — must be PRESERVED.
+    let (key_warm, _) = carrier_props("sweep-test/uniq-warm/libfoo.rlib");
+    let warm_incr = root.join(&key_warm).join("libfoo-incr/dep-graph");
+    fs::create_dir_all(&warm_incr).expect("mk warm -incr");
+    fs::write(warm_incr.join("x"), b"seed").expect("seed");
+
+    // A leased OWNER dir (a live in-flight owner) — must be PRESERVED.
+    let (key_leased, props_leased) = carrier_props("sweep-test/uniq-leased/libbar.rlib");
+    fs::create_dir_all(root.join(&key_leased)).expect("mk leased dir");
+    let leased = ctx.plan(&props_leased).expect("owner lease");
+    assert_eq!(leased.execroot(), root.join(&key_leased));
+
+    // A crash-orphaned CONTENDER dir `<64hex>.<32hex>` — must be REMOVED.
+    let contender_name = format!("{}.{}", "a".repeat(64), "b".repeat(32));
+    let contender = root.join(&contender_name);
+    fs::create_dir_all(contender.join("junk")).expect("mk contender");
+    fs::write(contender.join("junk/stale"), b"orphan").expect("orphan file");
+
+    let removed = ctx
+        .sweep_stale_contender_dirs()
+        .expect("sweep must succeed");
+
+    assert_eq!(removed, 1, "exactly the one contender dir is reaped");
+    assert!(!contender.exists(), "stale contender orphan MUST be swept");
+    assert!(
+        warm_incr.join("x").exists(),
+        "warm owner dir + its -incr seed MUST survive the sweep"
+    );
+    assert!(
+        root.join(&key_leased).exists(),
+        "a leased (live) owner dir MUST survive the sweep"
+    );
+    drop(leased);
+}
+
+#[nativelink_test]
+async fn eviction_removes_lru_warm_dir_over_budget() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-test/"]);
+    let (key_a, _) = carrier_props("evict-test/uniq-a/libfoo.rlib");
+    let (key_b, _) = carrier_props("evict-test/uniq-b/libfoo.rlib");
+    let (key_c, _) = carrier_props("evict-test/uniq-c/libfoo.rlib");
+    for key in [&key_a, &key_b, &key_c] {
+        make_warm_dir(&root, key, 50);
+    }
+    // A oldest (LRU) → B → C newest.
+    set_dir_mtime(&root.join(&key_a), epoch_plus(100));
+    set_dir_mtime(&root.join(&key_b), epoch_plus(200));
+    set_dir_mtime(&root.join(&key_c), epoch_plus(300));
+
+    // total 150 > budget 120 → evict exactly one (the LRU): 150-50=100 ≤ 120.
+    let outcome = ctx
+        .evict_warm_dirs_over_budget(120)
+        .expect("eviction must succeed");
+
+    assert!(
+        !root.join(&key_a).exists(),
+        "the least-recently-used warm dir MUST be evicted first"
+    );
+    assert!(root.join(&key_b).exists(), "a newer dir stays under budget");
+    assert!(root.join(&key_c).exists(), "the newest dir stays under budget");
+    assert_eq!(outcome.dirs_evicted, 1, "exactly one dir evicted to fit budget");
+    assert_eq!(outcome.bytes_freed, 50);
+    assert_eq!(outcome.bytes_remaining, 100);
+    assert!(!outcome.still_over_budget, "pool now within budget");
+    assert_eq!(outcome.leased_skipped, 0);
+}
+
+#[nativelink_test]
+async fn eviction_skips_leased_dir_and_evicts_next_lru() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-lease/"]);
+    let (key_a, props_a) = carrier_props("evict-lease/uniq-a/libfoo.rlib");
+    let (key_b, _) = carrier_props("evict-lease/uniq-b/libfoo.rlib");
+    let (key_c, _) = carrier_props("evict-lease/uniq-c/libfoo.rlib");
+    for key in [&key_a, &key_b, &key_c] {
+        make_warm_dir(&root, key, 50);
+    }
+    // A is the LRU (oldest) AND leased by a live owner → must be SKIPPED.
+    set_dir_mtime(&root.join(&key_a), epoch_plus(100));
+    set_dir_mtime(&root.join(&key_b), epoch_plus(200));
+    set_dir_mtime(&root.join(&key_c), epoch_plus(300));
+    let leased_a = ctx.plan(&props_a).expect("owner lease on A");
+    assert_eq!(leased_a.execroot(), root.join(&key_a));
+
+    // total 150 > 120: A (LRU) is leased → skip; evict B (next LRU) → 100 ≤ 120.
+    let outcome = ctx
+        .evict_warm_dirs_over_budget(120)
+        .expect("eviction must succeed");
+
+    assert!(
+        root.join(&key_a).exists(),
+        "a LEASED (live) warm dir MUST NOT be evicted even as the LRU"
+    );
+    assert!(
+        !root.join(&key_b).exists(),
+        "the next-LRU UNLEASED dir is evicted instead"
+    );
+    assert!(root.join(&key_c).exists(), "newest dir retained");
+    assert_eq!(outcome.dirs_evicted, 1);
+    assert_eq!(outcome.leased_skipped, 1, "the leased LRU dir is counted as skipped");
+    assert!(!outcome.still_over_budget);
+    drop(leased_a);
+}
+
+#[nativelink_test]
+async fn eviction_all_leased_over_budget_refuses_backpressure() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-all-lease/"]);
+    let (key_a, props_a) = carrier_props("evict-all-lease/uniq-a/libfoo.rlib");
+    let (key_b, props_b) = carrier_props("evict-all-lease/uniq-b/libfoo.rlib");
+    for key in [&key_a, &key_b] {
+        make_warm_dir(&root, key, 50);
+    }
+    set_dir_mtime(&root.join(&key_a), epoch_plus(100));
+    set_dir_mtime(&root.join(&key_b), epoch_plus(200));
+    let leased_a = ctx.plan(&props_a).expect("lease A");
+    let leased_b = ctx.plan(&props_b).expect("lease B");
+
+    // total 100 > budget 40, but BOTH dirs are leased → refuse, evict nothing.
+    let outcome = ctx
+        .evict_warm_dirs_over_budget(40)
+        .expect("eviction must succeed (refusing, not erroring)");
+
+    assert!(root.join(&key_a).exists(), "leased dir A not evicted");
+    assert!(root.join(&key_b).exists(), "leased dir B not evicted");
+    assert_eq!(outcome.dirs_evicted, 0, "no live dir may be evicted");
+    assert_eq!(outcome.leased_skipped, 2);
+    assert!(
+        outcome.still_over_budget,
+        "over budget with all-leased ⇒ backpressure signal, never a live eviction"
+    );
+    assert_eq!(outcome.bytes_remaining, 100);
+    drop(leased_a);
+    drop(leased_b);
+}
+
+#[nativelink_test]
+async fn sweep_and_eviction_are_no_op_when_flag_off() {
+    let (_td, root) = canonical_tempdir();
+    // A provisioned-but-DISABLED context (the kill-switch state).
+    let provision = PortableIncrProvision {
+        fixed_prefix: root.clone(),
+    };
+    let config = PortableIncrConfig {
+        enabled: false,
+        action_output_allowlist: vec!["off-test/".to_string()],
+    };
+    let ctx =
+        PortableIncrContext::from_provision(Some(provision), config).expect("context builds");
+
+    // A contender orphan and an over-budget warm dir on disk.
+    let contender = root.join(format!("{}.{}", "c".repeat(64), "d".repeat(32)));
+    fs::create_dir_all(&contender).expect("mk contender");
+    let (key_w, _) = carrier_props("off-test/uniq-w/libfoo.rlib");
+    make_warm_dir(&root, &key_w, 5_000);
+
+    assert_eq!(
+        ctx.sweep_stale_contender_dirs().expect("sweep off"),
+        0,
+        "flag OFF ⇒ sweep is inert (removes nothing)"
+    );
+    assert_eq!(
+        ctx.evict_warm_dirs_over_budget(1).expect("evict off"),
+        EvictionOutcome::default(),
+        "flag OFF ⇒ eviction is inert (default outcome, no filesystem touch)"
+    );
+    assert!(contender.exists(), "flag OFF ⇒ contender orphan untouched");
+    assert!(
+        root.join(&key_w).exists(),
+        "flag OFF ⇒ over-budget warm dir untouched"
+    );
+}
+
+/// The static budget default equals the design v4 §8 carve-out ceiling (20 GiB)
+/// verified at the DECLARATION site — a doc-comment/metric could carry any
+/// number; only this literal is authoritative.
+#[nativelink_test]
+async fn default_warm_dir_budget_is_20_gib() {
+    assert_eq!(
+        DEFAULT_WARM_DIR_BUDGET_BYTES,
+        20 * 1024 * 1024 * 1024,
+        "design v4 §8 static reservation = 20 GiB (≥9 GiB over the 10.9 GB full-CI-widen worst case)"
     );
 }
