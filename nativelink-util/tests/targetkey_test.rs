@@ -148,8 +148,13 @@ async fn targetkey_none_when_no_output_paths() -> Result<(), Error> {
     Ok(())
 }
 
-/// The exact primary-output string the shared cross-repo KAT hashes, config-
-/// stripped as the FL build emits it under `--experimental_output_paths=strip`.
+/// An ILLUSTRATIVE cross-repo known-answer hashing sample: the string the shared
+/// KAT hashes to lock the blake3 algorithm byte-identical across repos. It is a
+/// hashing fixture only — NOT the config-stripped form the FL build actually
+/// emits (a real stripped path is `bazel-out/cfg/bin/...`, with the config
+/// mnemonic replaced by the literal `cfg`; this sample keeps the mnemonic purely
+/// to exercise the hash over a representative path). Only the (string, key) pair
+/// is load-bearing.
 const KAT_PRIMARY_OUTPUT: &str = "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib";
 /// The byte-verified blake3 hex of [`KAT_PRIMARY_OUTPUT`]. Shared across repos:
 /// the Bazel client, the FL `incr_seed_index` tool, and this server MUST all

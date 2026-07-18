@@ -744,10 +744,14 @@ async fn wait_operation_timeout_does_not_cancel() -> Result<(), Box<dyn core::er
 const GOMA_PROBE_PROPERTY: &str = "nl_goma_probe";
 const GOMA_PROBE_VALUE: &str = "from_command";
 
-/// The exact primary-output the shared cross-repo KAT hashes (config-stripped as
-/// the FL build emits it), and its byte-verified blake3 key. The Bazel client
-/// attaches these two as the `nl_incr_targetkey` / `nl_incr_primary_output`
-/// Action Platform carrier for allowlisted rustc actions.
+/// An ILLUSTRATIVE cross-repo known-answer hashing sample (string + its
+/// byte-verified blake3 key) that locks the algorithm across repos — NOT the
+/// config-stripped form the FL build actually emits (a real stripped path is
+/// `bazel-out/cfg/bin/...`, with the config mnemonic replaced by the literal
+/// `cfg`; this sample keeps the mnemonic purely as a representative hashing
+/// fixture). In production the Bazel client attaches the (key, primary_output)
+/// pair as the `nl_incr_targetkey` / `nl_incr_primary_output` Action Platform
+/// carrier for allowlisted rustc actions.
 const KAT_PRIMARY_OUTPUT: &str = "bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib";
 const KAT_KEY: &str = "a17b9c22c639c19f2951ad4d0cb28df41dbd33113bbe7ead51ac0dd577998567";
 
@@ -1007,5 +1011,77 @@ async fn targetkey_absent_when_carrier_key_mismatched()
         action_info.targetkey, None,
         "targetkey must be absent (cold) when the carrier key does not match blake3(primary_output)"
     );
+    Ok(())
+}
+
+/// FL-1383 (§10) BLOCK fix (convergent distsys#1 + red-team A1a): the two carrier
+/// properties are a server-internal transport channel and MUST be stripped from
+/// `platform_properties` before the ActionInfo reaches the scheduler. Otherwise
+/// the REAL `PlatformPropertyManager::make_platform_properties` — into which the
+/// deployed schedulers do NOT declare `nl_incr_*` — rejects the unknown keys with
+/// `Unknown platform property 'nl_incr_targetkey'`, which the simple scheduler
+/// turns into a TERMINAL `FailedPrecondition` (no retry, no cold fallback): merely
+/// flipping the feature on would FAIL every allowlisted build (the 2026-05-12
+/// `persistentWorkerProtocol` outage class). `MockActionScheduler` is structurally
+/// blind to this validation, so this test drives the REAL manager. Mutation:
+/// comment out the two carrier `remove()` calls in
+/// `execution_server::build_action_info` — the two strip assertions AND the
+/// make_platform_properties assertion must red-fail.
+#[nativelink_test]
+async fn carrier_props_stripped_before_scheduler_validation()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_config::schedulers::PropertyType;
+    use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
+    use nativelink_util::targetkey::{CARRIER_PRIMARY_OUTPUT_PROPERTY, CARRIER_TARGETKEY_PROPERTY};
+
+    let portable_incr = PortableIncrConfig {
+        enabled: true,
+        action_output_allowlist: vec!["bazel-out/".to_string()],
+    };
+
+    // Carrier + a legitimate scheduler property (OSFamily) so the downstream
+    // validation has real, KNOWN work — proving the strip is surgical, not a
+    // vacuous empty-map pass.
+    let mut props = carrier(KAT_KEY, KAT_PRIMARY_OUTPUT);
+    props.push(("OSFamily".to_string(), "linux".to_string()));
+
+    let action_info = drive_execute_and_capture_action_info(props, portable_incr).await?;
+
+    // The carrier was read into the typed field...
+    assert_eq!(
+        action_info.targetkey.as_ref().map(TargetKey::key),
+        Some(KAT_KEY),
+        "targetkey must be read from the carrier when enabled + allowlisted"
+    );
+    // ...and BOTH carrier props were stripped from platform_properties before the
+    // scheduler ever sees them.
+    assert!(
+        !action_info
+            .platform_properties
+            .contains_key(CARRIER_TARGETKEY_PROPERTY),
+        "carrier key nl_incr_targetkey must be stripped from platform_properties before the scheduler sees it"
+    );
+    assert!(
+        !action_info
+            .platform_properties
+            .contains_key(CARRIER_PRIMARY_OUTPUT_PROPERTY),
+        "carrier key nl_incr_primary_output must be stripped from platform_properties before the scheduler sees it"
+    );
+
+    // Drive the REAL scheduler-side validation with a manager that (like the
+    // deployed schedulers) knows OSFamily but NOT the nl_incr_* carrier keys. If a
+    // carrier key leaked, make_platform_properties rejects with
+    // `Unknown platform property` → terminal FailedPrecondition in production.
+    let known_properties = HashMap::from([("OSFamily".to_string(), PropertyType::Exact)]);
+    let manager = PlatformPropertyManager::new(known_properties);
+    manager
+        .make_platform_properties(action_info.platform_properties.clone())
+        .map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "carrier leaked into scheduler validation — make_platform_properties rejected the ActionInfo: {e:?}"
+            )
+        })?;
+
     Ok(())
 }

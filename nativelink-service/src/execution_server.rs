@@ -266,6 +266,20 @@ impl InstanceInfo {
                 targetkey = TargetKey::from_carrier(key, primary_output);
             }
         }
+        // FL-1383 (§10) BLOCK fix: the two carrier properties are a server-internal
+        // transport channel for the client-derived `targetkey`, NOT scheduler
+        // platform properties. Strip them UNCONDITIONALLY (regardless of
+        // `portable_incr.enabled`) before constructing `ActionInfo`, so they never
+        // reach `PlatformPropertyManager::make_platform_properties`, whose
+        // supported-property validation rejects any unknown key — the deployed
+        // schedulers do NOT declare `nl_incr_*` — turning the action into a TERMINAL
+        // `FailedPrecondition` (no retry, no cold fallback). Unconditional is
+        // required for the `enabled` flag to remain a safe kill-switch: a client
+        // that already attaches the carrier must not fail builds when an operator
+        // flips the feature OFF. `targetkey` (read above) carries everything
+        // downstream needs.
+        platform_properties.remove(CARRIER_TARGETKEY_PROPERTY);
+        platform_properties.remove(CARRIER_PRIMARY_OUTPUT_PROPERTY);
 
         let action_key = ActionUniqueKey {
             instance_name,
