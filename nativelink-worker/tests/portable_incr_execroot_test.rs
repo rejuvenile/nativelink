@@ -31,11 +31,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use prost::Message;
+
 use nativelink_config::cas_server::{
     PortableIncrConfig, UploadActionResultConfig, UploadCacheResultsStrategy,
 };
 use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::build::bazel::remote::execution::v2::command::EnvironmentVariable;
+use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    Action, ActionResult as ProtoActionResult, Command, Digest, Directory, ExecuteRequest,
+    FileNode, Platform, Tree,
+};
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::StartExecute;
+use nativelink_store::ac_utils::{get_and_decode_digest, serialize_and_upload_message};
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_store::memory_store::MemoryStore;
@@ -43,10 +53,11 @@ use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, ExecutionMetadata, OperationId,
 };
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::fs_util::hardlink_directory_tree;
-use nativelink_util::store_trait::Store;
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use nativelink_util::targetkey::TargetKey;
+use nativelink_worker::incr_seed_fetch::{incr_seed_metrics, plan_seed_publish, seed_dest_dir};
 use nativelink_worker::portable_incr::{
     CARRIER_PRIMARY_OUTPUT_PROP, CARRIER_TARGETKEY_PROP, DEFAULT_WARM_DIR_BUDGET_BYTES,
     EvictionOutcome, ExecrootRole, PortableExecroot, PortableIncrContext, PortableIncrProvision,
@@ -54,8 +65,8 @@ use nativelink_worker::portable_incr::{
 };
 use nativelink_worker::local_worker::portable_incr_startup_sweep;
 use nativelink_worker::running_actions_manager::{
-    ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManagerArgs,
-    RunningActionsManagerImpl,
+    ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
+    RunningActionsManagerArgs, RunningActionsManagerImpl,
 };
 
 /// Canonicalized temp root so the FIXED_PREFIX containment asserts are already
@@ -537,6 +548,14 @@ fn rand_temp(data: &str) -> String {
 }
 
 async fn setup_manager() -> Arc<RunningActionsManagerImpl> {
+    setup_manager_and_cas().await.0
+}
+
+/// Same as [`setup_manager`] but also returns the CAS `FastSlowStore` the manager
+/// reads Action/Command protos from. The seed-wiring integration tests below need
+/// this handle to upload the action protos (and pre-seed the `-incr` `Tree` +
+/// blobs) into the SAME store `create_and_add_action` will fetch from.
+async fn setup_manager_and_cas() -> (Arc<RunningActionsManagerImpl>, Arc<FastSlowStore>) {
     let fast_config = FilesystemSpec {
         content_path: rand_temp("content_path"),
         temp_path: rand_temp("temp_path"),
@@ -584,7 +603,7 @@ async fn setup_manager() -> Arc<RunningActionsManagerImpl> {
         deferred_output_uploads_enabled: false,
     })
     .expect("manager");
-    Arc::new(manager)
+    (Arc::new(manager), cas_store)
 }
 
 fn inert_action_info() -> ActionInfo {
@@ -1032,4 +1051,307 @@ async fn post_action_evict_wiring_is_inert_when_context_none() {
         root.join(&key_w).exists(),
         "context None (fleet default) ⇒ no eviction even for a portable action over budget"
     );
+}
+
+// -- §6.2/§6.3 WIRING: the fetch + publish call-sites this chunk adds ---------
+//
+// The building blocks (`plan_seed_publish`, `fetch_and_materialize_seed`) are
+// unit-tested in `incr_seed_fetch.rs`; the §8 eviction/sweep wiring is pinned
+// above. These two tests drive the REAL `RunningActionImpl` + manager
+// composition end-to-end (`create_and_add_action` → `prepare_action` → …) with
+// the feature ENABLED and an `incr_seed_index_store` installed — the exact
+// wiring `new_local_worker` performs — so a mutation to the publish gate
+// (`inner_upload_results`) or the fetch call (`inner_prepare_action`) is caught.
+
+/// A process-global `IncrSeedMetrics` counter read (design §12 singleton).
+fn incr_index_publish_count() -> u64 {
+    incr_seed_metrics()
+        .incr_index_publish
+        .load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Convert carrier platform properties into the REAPI `Platform` proto the
+/// scheduler attaches to the `Action` (round-tripped into
+/// `action_info.platform_properties`, which `plan_portable_execroot` reads).
+fn platform_from_props(props: &HashMap<String, String>) -> Platform {
+    Platform {
+        properties: props
+            .iter()
+            .map(|(name, value)| Property {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Blake3 `DigestInfo` for `bytes` — the seed path is blake3-keyed and blake3-
+/// verified, so the pre-seeded `Tree`/blobs must be keyed the same way.
+fn blake3_digest(bytes: &[u8]) -> DigestInfo {
+    let mut hasher = DigestHasherFunc::Blake3.hasher();
+    hasher.update(bytes);
+    hasher.finalize_digest()
+}
+
+async fn put_blob(cas: &Store, digest: DigestInfo, bytes: Vec<u8>) {
+    cas.update_oneshot(StoreKey::Digest(digest), bytes.into())
+        .await
+        .expect("cas blob write");
+}
+
+/// Install the portable context AND the seed index store on a freshly-built
+/// manager (the exact pair `new_local_worker` sets before `Arc`-wrapping), and
+/// return it alongside the CAS store the action protos must be uploaded to.
+async fn setup_portable_manager_with_index(
+    ctx: PortableIncrContext,
+    index_store: Store,
+) -> (Arc<RunningActionsManagerImpl>, Arc<FastSlowStore>) {
+    let (mut manager, cas) = setup_manager_and_cas().await;
+    {
+        let m = Arc::get_mut(&mut manager).expect("freshly-built manager is uniquely owned");
+        m.set_portable_incr(Some(ctx));
+        m.set_incr_seed_index_store(Some(index_store));
+    }
+    (manager, cas)
+}
+
+/// Upload `command` + an empty input root + a wrapping `Action` (carrying
+/// `platform`) into `cas`, returning the `StartExecute` the scheduler feeds to
+/// `create_and_add_action`.
+async fn upload_start_execute(
+    cas: &Arc<FastSlowStore>,
+    command: &Command,
+    platform: Platform,
+) -> StartExecute {
+    let command_digest =
+        serialize_and_upload_message(command, cas.as_pin(), &mut DigestHasherFunc::Sha256.hasher())
+            .await
+            .expect("upload command");
+    let input_root_digest = serialize_and_upload_message(
+        &Directory::default(),
+        cas.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await
+    .expect("upload input root");
+    let action = Action {
+        command_digest: Some(command_digest.into()),
+        input_root_digest: Some(input_root_digest.into()),
+        platform: Some(platform),
+        ..Default::default()
+    };
+    let action_digest =
+        serialize_and_upload_message(&action, cas.as_pin(), &mut DigestHasherFunc::Sha256.hasher())
+            .await
+            .expect("upload action");
+    StartExecute {
+        execute_request: Some(ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        }),
+        operation_id: OperationId::default().to_string(),
+        queued_timestamp: None,
+        platform: action.platform.clone(),
+        worker_id: "test-worker".to_string(),
+        resolved_directories: Vec::new(),
+        resolved_directory_digests: Vec::new(),
+        missing_digests: Vec::new(),
+        missing_digest_peers: Vec::new(),
+    }
+}
+
+/// (a) A SUCCESSFUL portable action drives the `inner_upload_results` publish
+/// gate: the index store gets an `update_oneshot` at `hash(targetkey)` AND the
+/// §12 `incr_index_publish` counter increments (via `note_index_published`).
+#[nativelink_test]
+async fn portable_action_success_publishes_seed_index_and_bumps_counter() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["publish-wire/"]);
+    let index_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager, cas) =
+        setup_portable_manager_with_index(ctx, index_store.clone()).await;
+
+    // The primary output must sort BEFORE the `-incr` output dir so the
+    // worker-side `TargetKey::derive` (sorted-first) agrees with the carrier — the
+    // §11 verify. (`aaa.rlib` < `zzz-incr`; note `-` < `.`, so a same-stem
+    // `<stem>-incr` sibling would sort FIRST and mis-derive — hence `zzz-incr`.)
+    let primary = "publish-wire/aaa.rlib";
+    let (_key, props) = carrier_props(primary);
+    let tk = TargetKey::derive(&[primary.to_string()]).expect("targetkey derives");
+
+    // A real action that SUCCEEDS and produces the primary output AND an `-incr`
+    // seed dir (the folder `plan_seed_publish` selects when deciding to publish).
+    let command = Command {
+        arguments: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "mkdir -p publish-wire && : > publish-wire/aaa.rlib && \
+             mkdir -p publish-wire/zzz-incr && printf seed > publish-wire/zzz-incr/dep-graph"
+                .to_string(),
+        ],
+        output_paths: vec![
+            "publish-wire/aaa.rlib".to_string(),
+            "publish-wire/zzz-incr".to_string(),
+        ],
+        working_directory: ".".to_string(),
+        environment_variables: vec![EnvironmentVariable {
+            name: "PATH".to_string(),
+            value: std::env::var("PATH").unwrap_or_default(),
+        }],
+        ..Default::default()
+    };
+    let start_execute = upload_start_execute(&cas, &command, platform_from_props(&props)).await;
+
+    // The index KEY is a pure function of the targetkey (independent of the
+    // `-incr` tree digest), so a throwaway `plan_seed_publish` yields the exact
+    // key the production publish site writes under — without the private
+    // `index_action_digest`.
+    let index_key = plan_seed_publish(
+        &tk,
+        0,
+        false,
+        std::iter::once(("x-incr", DigestInfo::new([7u8; 32], 1))),
+    )
+    .expect("plan yields the index key")
+    .index_digest;
+
+    let publish_before = incr_index_publish_count();
+
+    let action = manager
+        .create_and_add_action("test-worker".to_string(), start_execute)
+        .await
+        .expect("portable action admitted");
+    action
+        .clone()
+        .prepare_action()
+        .await
+        .expect("prepare_action")
+        .execute()
+        .await
+        .expect("execute")
+        .upload_results()
+        .await
+        .expect("upload_results");
+
+    // (a1) the REAL production publish site landed an index entry at hash(targetkey).
+    let stored =
+        get_and_decode_digest::<ProtoActionResult>(&index_store, StoreKey::Digest(index_key))
+            .await
+            .expect(
+                "inner_upload_results publish gate MUST update_oneshot the seed index at \
+                 hash(targetkey) after a successful portable action — no entry means the \
+                 `if let (Some(publish), Some(index_store))` wire never fired",
+            );
+    assert_eq!(
+        stored.output_directories.first().map(|d| d.path.as_str()),
+        Some(tk.primary_output()),
+        "published index value's output_directories[0].path MUST be the primary output \
+         (the chunk-3 fetch collision guard keys on it)"
+    );
+
+    // (a2) `note_index_published()` bumped the §12 publish counter by exactly 1.
+    let publish_after = incr_index_publish_count();
+    assert_eq!(
+        publish_after,
+        publish_before + 1,
+        "note_index_published() MUST increment incr_index_publish exactly once per successful \
+         portable publish — got delta {} (before {publish_before}, after {publish_after}); a \
+         dropped note_index_published leaves the publish DARK on /metrics",
+        publish_after.wrapping_sub(publish_before),
+    );
+
+    action.cleanup().await.expect("cleanup");
+}
+
+/// (b) A portable action whose targetkey has a PRE-SEEDED index entry drives the
+/// `inner_prepare_action` fetch block: the `-incr` seed is materialized at
+/// `<execroot>/<stem>-incr` (the fetch call actually fired).
+#[nativelink_test]
+async fn portable_action_with_seeded_index_fetches_and_materializes() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["fetch-wire/"]);
+    let index_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager, cas) =
+        setup_portable_manager_with_index(ctx, index_store.clone()).await;
+
+    let primary = "fetch-wire/aaa.rlib";
+    let (_key, props) = carrier_props(primary);
+    let tk = TargetKey::derive(&[primary.to_string()]).expect("targetkey derives");
+
+    // Pre-seed CAS with a flat `-incr` `Tree` (blake3-keyed, as the seed path
+    // verifies), then pre-seed the index to point `primary` at that Tree. Using
+    // `plan_seed_publish` to shape BOTH the index key and value keeps this on the
+    // public surface (no private `index_action_digest`).
+    let cas_store = Store::new(cas.clone());
+    let file_content: &[u8] = b"incremental-artifact";
+    let file_digest = blake3_digest(file_content);
+    put_blob(&cas_store, file_digest, file_content.to_vec()).await;
+    let tree = Tree {
+        root: Some(Directory {
+            files: vec![FileNode {
+                name: "dep-graph.bin".to_string(),
+                digest: Some(Digest::from(&file_digest)),
+                is_executable: false,
+                node_properties: None,
+            }],
+            directories: vec![],
+            symlinks: vec![],
+            node_properties: None,
+        }),
+        children: Vec::<Directory>::new(),
+    };
+    let tree_bytes = tree.encode_to_vec();
+    let tree_digest = blake3_digest(&tree_bytes);
+    put_blob(&cas_store, tree_digest, tree_bytes).await;
+
+    let seeded = plan_seed_publish(&tk, 0, false, std::iter::once(("z-incr", tree_digest)))
+        .expect("seed index value");
+    index_store
+        .update_oneshot(StoreKey::Digest(seeded.index_digest), seeded.encoded)
+        .await
+        .expect("pre-seed index");
+
+    // The action only needs to derive the same targetkey — a single output path.
+    let command = Command {
+        arguments: vec!["true".to_string()],
+        output_paths: vec![primary.to_string()],
+        working_directory: ".".to_string(),
+        environment_variables: vec![EnvironmentVariable {
+            name: "PATH".to_string(),
+            value: std::env::var("PATH").unwrap_or_default(),
+        }],
+        ..Default::default()
+    };
+    let start_execute = upload_start_execute(&cas, &command, platform_from_props(&props)).await;
+
+    let action = manager
+        .create_and_add_action("test-worker".to_string(), start_execute)
+        .await
+        .expect("portable action admitted");
+    // The execroot IS the byte-identical work dir; the fetch materializes the
+    // seed at `<execroot>/<stem>-incr`.
+    let execroot = action.get_work_directory().to_string();
+    let dest = seed_dest_dir(Path::new(&execroot), tk.primary_output())
+        .expect("seed dest for primary output");
+
+    action
+        .clone()
+        .prepare_action()
+        .await
+        .expect("prepare_action");
+
+    assert!(
+        dest.join("dep-graph.bin").exists(),
+        "inner_prepare_action MUST call fetch_and_materialize_seed after the wipe: a pre-seeded \
+         index hit should materialize the `-incr` tree into {} — its absence means the fetch \
+         call-site never fired",
+        dest.display(),
+    );
+    assert_eq!(
+        fs::read(dest.join("dep-graph.bin")).expect("materialized seed file"),
+        file_content,
+        "the materialized seed content MUST be the blake3-verified CAS blob"
+    );
+
+    action.cleanup().await.expect("cleanup");
 }

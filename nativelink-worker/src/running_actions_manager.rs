@@ -79,19 +79,6 @@ use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::targetkey::TargetKey;
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
 
-use crate::incr_seed_fetch::{
-    SeedPublish, fetch_and_materialize_seed, note_index_published, plan_seed_publish, seed_dest_dir,
-};
-
-/// FL-1383 (design §6.2): bounded ceiling for the WHOLE out-of-band seed
-/// fetch+materialize (index `GetActionResult` + `Tree` + every blob read/write).
-/// `GrpcStore` internal RPCs carry `timeout=0`, so without this a slow/absent
-/// index or a server-CAS fall-through (§6.5) would stall the pre-rustc path
-/// unboundedly. This is NOT an internal liveness RPC deadline (which the
-/// keepalive/concurrency-isolation policy forbids) — it is a best-effort cache
-/// fetch that degrades to a cold build. Provisional value; the §12
-/// `incr_index_fetch_timeout` counter tells the canary whether to tune it.
-const INCR_SEED_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 use parking_lot::Mutex;
 use prost::Message;
 use scopeguard::{ScopeGuard, guard};
@@ -105,6 +92,20 @@ use opentelemetry::context::Context;
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
+
+use crate::incr_seed_fetch::{
+    SeedPublish, fetch_and_materialize_seed, note_index_published, plan_seed_publish, seed_dest_dir,
+};
+
+/// FL-1383 (design §6.2): bounded ceiling for the WHOLE out-of-band seed
+/// fetch+materialize (index `GetActionResult` + `Tree` + every blob read/write).
+/// `GrpcStore` internal RPCs carry `timeout=0`, so without this a slow/absent
+/// index or a server-CAS fall-through (§6.5) would stall the pre-rustc path
+/// unboundedly. This is NOT an internal liveness RPC deadline (which the
+/// keepalive/concurrency-isolation policy forbids) — it is a best-effort cache
+/// fetch that degrades to a cold build. Provisional value; the §12
+/// `incr_index_fetch_timeout` counter tells the canary whether to tune it.
+const INCR_SEED_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 // =============================================================================
 // Scheduler-rebalance calibration probes (P-A action-shape, P-B input-staging).
