@@ -6988,6 +6988,30 @@ pub async fn new_local_worker(
     fs::create_dir_all(&config.work_directory)
         .await
         .err_tip(|| format!("Could not make work_directory : {}", config.work_directory))?;
+
+    // FL-1383 chunk 2a: worker-side portable rustc-incremental provisioning +
+    // §12 startup asserts. INERT when the gate is off (returns immediately with
+    // no filesystem touch). When on, this ONLY provisions FIXED_PREFIX + asserts
+    // the host-provisioning invariants and gates; on any assert failure it logs
+    // loudly and leaves the feature DISABLED (the worker is NOT panicked). The
+    // execution-path rewire (make_action_directory → <FIXED_PREFIX>/<targetkey>,
+    // chdir, wipe, lease) that CONSUMES this provision is chunk 2b —
+    // TODO(#FL-1383). Runs AFTER work_directory exists so the EXDEV probe can
+    // hardlink FIXED_PREFIX → execroot volume.
+    let _portable_incr_provision = crate::portable_incr::provision_and_assert(
+        config.portable_incr.enabled,
+        config
+            .portable_incr_fixed_prefix
+            .as_deref()
+            .map(std::path::Path::new),
+        config
+            .portable_incr_sysroot_path
+            .as_deref()
+            .map(std::path::Path::new),
+        std::path::Path::new(&config.work_directory),
+    )
+    .await;
+
     let entrypoint = if config.entrypoint.is_empty() {
         None
     } else {

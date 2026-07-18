@@ -23,6 +23,9 @@ pub mod local_worker;
 #[cfg(target_os = "linux")]
 pub mod namespace_utils;
 pub mod persistent_worker;
+// FL-1383 portable rustc-incremental — worker-side FIXED_PREFIX provisioning +
+// §12 startup asserts + O_EXCL/O_NOFOLLOW primitives (chunk 2a foundation).
+pub mod portable_incr;
 pub mod qos;
 pub mod running_actions_manager;
 pub mod worker_api_client_wrapper;

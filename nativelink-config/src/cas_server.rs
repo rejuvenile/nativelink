@@ -1487,6 +1487,56 @@ pub struct LocalWorkerConfig {
     /// error.
     /// Default: False.
     pub use_mount_namespace: Option<bool>,
+
+    /// FL-1383 portable rustc-incremental — WORKER-side gate (design §9/§12).
+    ///
+    /// This is the WORKER half of the split-brain-safe gate: the ingestion
+    /// half is `ExecutionConfig.portable_incr` (chunk 1). Both halves reuse the
+    /// SAME [`PortableIncrConfig`] policy struct so the `enabled` +
+    /// `action_output_allowlist` semantics are configured identically on both
+    /// sides — review-pair-a (chunk-1 MINOR) flagged that the two gates must
+    /// enable TOGETHER or the feature is split-brain.
+    ///
+    /// Default (absent): disabled → the whole worker-side feature is INERT (no
+    /// FIXED_PREFIX provisioning, no §12 startup asserts, no execution-path
+    /// change — byte-identical worker startup).
+    ///
+    /// NOTE (chunk 2a): even when `enabled`, this chunk ONLY provisions
+    /// FIXED_PREFIX + runs the §12 asserts + gates. The execution-path rewire
+    /// (`make_action_directory` → `<FIXED_PREFIX>/<targetkey>`, chdir, wipe,
+    /// lease) is chunk 2b — TODO(#FL-1383).
+    #[serde(default)]
+    pub portable_incr: PortableIncrConfig,
+
+    /// FL-1383 (design §9) — the machine-LOCAL `<FIXED_PREFIX>` root under which
+    /// the worker materializes `-incr` seed dirs at a byte-identical absolute
+    /// path. Provisioned at worker startup (owned by the worker uid, mode 0755,
+    /// on the EXECROOT volume) when `portable_incr.enabled` is `true`. This is
+    /// worker deployment TOPOLOGY (like [`work_directory`], its sibling on the
+    /// same physical volume), NOT shared policy — hence a `LocalWorkerConfig`
+    /// field, not part of the shared [`PortableIncrConfig`].
+    ///
+    /// Default (absent): `None`. When `portable_incr.enabled` is `true` but this
+    /// is unset, the §12 asserts fail-loud and the feature is left DISABLED (the
+    /// worker does NOT panic).
+    ///
+    /// [`work_directory`]: LocalWorkerConfig::work_directory
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub portable_incr_fixed_prefix: Option<String>,
+
+    /// FL-1383 (design §2/§12) — the absolute rustc sysroot path asserted
+    /// byte-identical at boot (§12 assert (b)). The fleet invariant is that the
+    /// sysroot resolves to the SAME absolute real path on every machine
+    /// (`/Users/user/.rustup`, execroot-relative) so rustc's realpath does not
+    /// diverge cross-machine. The worker-local check that stands in for the
+    /// fleet invariant: the path is absolute AND canonicalizes to ITSELF (it is
+    /// NOT reached via an `output_base` symlink). Worker host-provisioning
+    /// topology → a `LocalWorkerConfig` field.
+    ///
+    /// Default (absent): `None`. When `portable_incr.enabled` is `true` but this
+    /// is unset, the §12 asserts fail-loud and the feature is left DISABLED.
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub portable_incr_sysroot_path: Option<String>,
 }
 
 impl Default for LocalWorkerConfig {
@@ -1524,6 +1574,9 @@ impl Default for LocalWorkerConfig {
                 default_memory_gate_swapin_confirm_window_ticks(),
             use_namespaces: Default::default(),
             use_mount_namespace: Default::default(),
+            portable_incr: Default::default(),
+            portable_incr_fixed_prefix: Default::default(),
+            portable_incr_sysroot_path: Default::default(),
         }
     }
 }
@@ -1941,6 +1994,35 @@ mod tests {
         assert!(
             config.portable_incr.action_output_allowlist.is_empty(),
             "portable_incr allowlist must default to empty"
+        );
+    }
+
+    // FL-1383 chunk 2a: LocalWorkerConfig without the portable_incr worker gate
+    // deserializes to the fully-inert default — disabled gate, no FIXED_PREFIX,
+    // no sysroot path. This is the config-level half of the flag-off inertness
+    // contract (the provisioning-level half lives in
+    // `nativelink-worker/tests/portable_incr_test.rs`).
+    #[test]
+    fn local_worker_config_portable_incr_defaults_inert() {
+        let config: LocalWorkerConfig = serde_json5::from_str(
+            r#"{"worker_api_endpoint": {"uri": "grpc://s"}, "cas_fast_slow_store": "cas", "work_directory": "/w", "platform_properties": {}}"#,
+        )
+        .unwrap();
+        assert!(
+            !config.portable_incr.enabled,
+            "worker portable_incr gate must default to disabled"
+        );
+        assert!(
+            config.portable_incr.action_output_allowlist.is_empty(),
+            "worker portable_incr allowlist must default to empty"
+        );
+        assert!(
+            config.portable_incr_fixed_prefix.is_none(),
+            "portable_incr_fixed_prefix must default to None (inert)"
+        );
+        assert!(
+            config.portable_incr_sysroot_path.is_none(),
+            "portable_incr_sysroot_path must default to None (inert)"
         );
     }
 }
