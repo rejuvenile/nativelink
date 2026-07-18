@@ -1903,7 +1903,8 @@ mod tests {
             action_output_allowlist: vec![],
         };
         assert!(
-            !config.is_allowlisted("bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib"),
+            // path-mapped primary (StrippingPathMapper: mnemonic -> literal "cfg")
+            !config.is_allowlisted("bazel-out/cfg/bin/pkg/libfoo-abc123.rlib"),
             "empty allowlist must match nothing (fail-closed)"
         );
     }
@@ -1912,14 +1913,17 @@ mod tests {
     fn portable_incr_allowlist_prefix_match() {
         let config = PortableIncrConfig {
             enabled: true,
-            action_output_allowlist: vec!["bazel-out/darwin_arm64-".to_string()],
+            // path-mapped prefix: StrippingPathMapper replaces the mnemonic with "cfg".
+            action_output_allowlist: vec![
+                "bazel-out/cfg/bin/third_party/rust/apple_a14/".to_string(),
+            ],
         };
         assert!(
-            config.is_allowlisted("bazel-out/darwin_arm64-fastbuild/bin/pkg/libfoo.rlib"),
+            config.is_allowlisted("bazel-out/cfg/bin/third_party/rust/apple_a14/libfoo-abc123.rlib"),
             "a matching prefix must allowlist the primary output"
         );
         assert!(
-            !config.is_allowlisted("bazel-out/k8-fastbuild/bin/pkg/libfoo.rlib"),
+            !config.is_allowlisted("bazel-out/cfg/bin/pkg/other-xyz.rlib"),
             "a non-matching prefix must not allowlist"
         );
     }

@@ -139,7 +139,14 @@
               action_output_allowlist: [
                 // Example: opt in a single stage-1 apple-a14 crate's output
                 // tree. Empty (or unmatched) => nothing opts in.
-                "bazel-out/darwin_arm64-fastbuild/bin/third_party/rust/apple_a14/",
+                // NOTE: Bazel's StrippingPathMapper (--experimental_output_paths=strip
+                // + supports-path-mapping) REPLACES the config mnemonic with the
+                // literal "cfg" (FIXED_CONFIG_SEGMENT), it does NOT drop it — so the
+                // path-mapped primary is bazel-out/cfg/bin/... The prefix MUST match
+                // that stripped form on all three sides (server allowlist, Bazel
+                // client, rustc.bzl) or the carrier primary_output never matches.
+                // (Config-discrimination still holds via the -<hash> in the filename.)
+                "bazel-out/cfg/bin/third_party/rust/apple_a14/",
               ],
             },
           },
