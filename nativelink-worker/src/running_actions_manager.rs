@@ -94,7 +94,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::incr_seed_fetch::{
-    SeedPublish, fetch_and_materialize_seed, note_index_published, note_reuse_fired,
+    SeedOutcome, SeedPublish, fetch_and_materialize_seed, note_index_published, note_reuse_fired,
     plan_seed_publish, seed_dest_dir,
 };
 
@@ -107,6 +107,41 @@ use crate::incr_seed_fetch::{
 /// fetch that degrades to a cold build. Provisional value; the §12
 /// `incr_index_fetch_timeout` counter tells the canary whether to tune it.
 const INCR_SEED_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// FL-1383 ask #4 (Bazel-client contract): the worker-injected CHILD-process
+/// env vars that tell the in-action `process_wrapper` a genuine `-incr` seed
+/// was materialized on THIS remote execution, so it reliably skips its
+/// local-tool seed path (`setup()` early-return).
+///
+/// Emits the pair ONLY when the seed fetch resolved to
+/// [`SeedOutcome::Materialized`](crate::incr_seed_fetch::SeedOutcome::Materialized)
+/// (`seeded == true`) AND a portable `targetkey` is present:
+/// - `NL_PORTABLE_INCR_SEEDED=1` — presence is the sole "the seed is genuinely
+///   here" signal; `process_wrapper` reads ONLY presence, never a value other
+///   than `1`.
+/// - `NL_INCR_TARGETKEY=<64-hex>` — the blake3 target key ([`TargetKey::key`]),
+///   the same hex form the `incr_seed_index` uses.
+///
+/// A COLD outcome (`NoSeed`/`Collision`/`TimedOut`) or a non-portable action
+/// (no `targetkey`) yields an EMPTY vec. A false-positive on cold would make
+/// `process_wrapper` skip a seed that is NOT present → a wrong/cold-slow build;
+/// seed-presence alone cannot distinguish the branch, which is the whole reason
+/// this explicit signal exists. The caller applies these to the spawned child's
+/// env ONLY (after `env_clear` + the action-supplied env loop) — NEVER to the
+/// REAPI `Command`/`command_proto`, so they never enter the action digest / AC
+/// key. `rustc` does not read either var; only `process_wrapper` does.
+fn portable_incr_seed_child_env(
+    seeded: bool,
+    targetkey: Option<&TargetKey>,
+) -> Vec<(&'static str, String)> {
+    match (seeded, targetkey) {
+        (true, Some(targetkey)) => vec![
+            ("NL_PORTABLE_INCR_SEEDED", "1".to_string()),
+            ("NL_INCR_TARGETKEY", targetkey.key().to_string()),
+        ],
+        _ => Vec::new(),
+    }
+}
 
 // =============================================================================
 // Scheduler-rebalance calibration probes (P-A action-shape, P-B input-staging).
@@ -4787,6 +4822,15 @@ struct RunningActionImplState {
     /// for an enabled+allowlisted portable-incr action; `None` on the fleet
     /// (INERT) and for every non-portable action.
     portable_targetkey: Option<TargetKey>,
+    /// FL-1383 ask #4: `true` iff the out-of-band `-incr` seed fetch resolved to
+    /// [`SeedOutcome::Materialized`] for this action (a seed was actually placed
+    /// at the destination). Set at the seed-fetch site in `inner_prepare_action`
+    /// and read at the child-env build site in `inner_execute`, where it gates
+    /// the `NL_PORTABLE_INCR_SEEDED=1` carrier. `false` on the fleet (INERT), for
+    /// every non-portable action, and for any COLD outcome
+    /// (`NoSeed`/`Collision`/`TimedOut`) — a false positive would make
+    /// `process_wrapper` skip a seed that is not present.
+    portable_incr_seeded: bool,
 }
 
 #[derive(Debug)]
@@ -4969,6 +5013,8 @@ impl RunningActionImpl {
                 calib_output_bytes: None,
                 // FL-1383: populated at the seed-fetch site for a portable action.
                 portable_targetkey: None,
+                // FL-1383 ask #4: set true only on a Materialized seed fetch.
+                portable_incr_seeded: false,
             }),
             // Always need to ensure that we're removed from the manager on Drop.
             has_manager_entry: AtomicBool::new(true),
@@ -5417,12 +5463,21 @@ impl RunningActionImpl {
                 )
                 .await
                 {
-                    Ok(outcome) => info!(
-                        %operation_id,
-                        ?outcome,
-                        dest = %dest.display(),
-                        "inner_prepare_action: portable-incr seed fetch complete"
-                    ),
+                    Ok(outcome) => {
+                        // FL-1383 ask #4: retain ONLY a Materialized outcome so
+                        // `inner_execute` can inject the `NL_PORTABLE_INCR_SEEDED`
+                        // child-env carrier. A cold outcome leaves the flag false
+                        // (no seed present → process_wrapper must not skip).
+                        if matches!(outcome, SeedOutcome::Materialized { .. }) {
+                            self.state.lock().portable_incr_seeded = true;
+                        }
+                        info!(
+                            %operation_id,
+                            ?outcome,
+                            dest = %dest.display(),
+                            "inner_prepare_action: portable-incr seed fetch complete"
+                        );
+                    }
                     // Best-effort: an internal fetch error must NOT fail the
                     // build — proceed cold (the §12 counters record it).
                     Err(err) => warn!(
@@ -5464,7 +5519,7 @@ impl RunningActionImpl {
         // this file documents a Mutex/watch deadlock class). Includes self
         // (>= 1); worker-side view, NOT the scheduler dispatch-count.
         let calib_running_at_start = self.running_actions_manager.running_actions.lock().len();
-        let (command_proto, mut kill_channel_rx) = {
+        let (command_proto, mut kill_channel_rx, portable_incr_seeded, portable_targetkey) = {
             let mut state = self.state.lock();
             state.execution_metadata.execution_start_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
@@ -5480,6 +5535,11 @@ impl RunningActionImpl {
                     .err_tip(|| "Expected state to have kill_channel_rx in execute()")?
                     // This is important as we may be killed at any point.
                     .fuse(),
+                // FL-1383 ask #4: whether a `-incr` seed actually materialized,
+                // and the portable target key, both stashed during prepare —
+                // read here to build the worker-only child-env carrier below.
+                state.portable_incr_seeded,
+                state.portable_targetkey.clone(),
             )
         };
         if command_proto.arguments.is_empty() {
@@ -5583,6 +5643,20 @@ impl RunningActionImpl {
         };
         for environment_variable in envs {
             command_builder.env(&environment_variable.name, &environment_variable.value);
+        }
+
+        // FL-1383 ask #4 (Bazel-client contract): inject the worker-only
+        // `-incr`-seed carrier AFTER the action-supplied env loop (so nothing in
+        // the REAPI `Command` can clobber it) and BEFORE `spawn()`. These land in
+        // the SPAWNED CHILD's env ONLY — they are added to `command_builder`, NOT
+        // to `command_proto`/the REAPI `Command`, so they never enter the action
+        // digest / AC key (`env_clear()` ran above). Emitted only when a seed
+        // genuinely materialized (`SeedOutcome::Materialized`); a cold outcome
+        // injects nothing so `process_wrapper` does not skip a non-existent seed.
+        for (name, value) in
+            portable_incr_seed_child_env(portable_incr_seeded, portable_targetkey.as_ref())
+        {
+            command_builder.env(name, value);
         }
 
         let mut child_process = command_builder
@@ -12708,6 +12782,86 @@ mod calib_probe_tests {
             s.input_missing_bytes, s.input_payload_bytes,
             "missing bytes (fetch-only) and payload bytes (fetch+hardlink) are \
              distinct axes; a swap would collapse the §6 fetch-vs-hardlink split"
+        );
+    }
+}
+
+#[cfg(test)]
+mod portable_incr_seed_env_tests {
+    use nativelink_util::targetkey::TargetKey;
+
+    use super::portable_incr_seed_child_env;
+
+    /// A rustc `.rlib` output → a real 64-hex `TargetKey`. `-incr` artifacts are
+    /// excluded by `derive` (§2), so a plain `.rlib` yields `Some`.
+    fn targetkey() -> TargetKey {
+        TargetKey::derive(&["bazel-out/k8-fastbuild/bin/foo/libbar.rlib".to_string()])
+            .expect("a non-`-incr` output must derive a TargetKey")
+    }
+
+    #[test]
+    fn materialized_seed_injects_both_carrier_vars() {
+        let tk = targetkey();
+        let env = portable_incr_seed_child_env(true, Some(&tk));
+
+        let seeded = env
+            .iter()
+            .find(|(name, _)| *name == "NL_PORTABLE_INCR_SEEDED")
+            .expect(
+                "a materialized portable-incr seed MUST inject NL_PORTABLE_INCR_SEEDED so \
+                 process_wrapper skips its local-tool seed path",
+            );
+        assert_eq!(
+            seeded.1, "1",
+            "NL_PORTABLE_INCR_SEEDED must be exactly \"1\" — process_wrapper keys on presence \
+             of the =1 signal, not an arbitrary value"
+        );
+
+        let key_var = env
+            .iter()
+            .find(|(name, _)| *name == "NL_INCR_TARGETKEY")
+            .expect(
+                "a materialized portable-incr seed MUST inject NL_INCR_TARGETKEY carrying the \
+                 seed's target identity",
+            );
+        assert_eq!(
+            key_var.1,
+            tk.key(),
+            "NL_INCR_TARGETKEY must carry the blake3 hex target key (TargetKey::key()) — the \
+             same hex form the incr_seed_index uses"
+        );
+        assert_eq!(
+            key_var.1.len(),
+            64,
+            "NL_INCR_TARGETKEY must be the 64-hex blake3 key, not a truncated/other form"
+        );
+    }
+
+    #[test]
+    fn cold_seed_injects_nothing() {
+        // A COLD outcome (NoSeed/Collision/TimedOut) is modeled as seeded == false.
+        let tk = targetkey();
+        let env = portable_incr_seed_child_env(false, Some(&tk));
+        assert!(
+            !env.iter().any(|(name, _)| *name == "NL_PORTABLE_INCR_SEEDED"),
+            "a COLD outcome MUST NOT inject NL_PORTABLE_INCR_SEEDED — a false positive would \
+             make process_wrapper skip a seed that is not present → a wrong/cold-slow build"
+        );
+        assert!(
+            !env.iter().any(|(name, _)| *name == "NL_INCR_TARGETKEY"),
+            "a COLD outcome MUST NOT inject NL_INCR_TARGETKEY either"
+        );
+    }
+
+    #[test]
+    fn non_portable_action_injects_nothing() {
+        // A non-portable action has no targetkey (portable_targetkey == None),
+        // even if some `seeded` flag were spuriously set.
+        let env = portable_incr_seed_child_env(true, None);
+        assert!(
+            env.is_empty(),
+            "a non-portable action (no TargetKey) MUST inject no carrier vars — the signal is \
+             portable-incr-only"
         );
     }
 }
