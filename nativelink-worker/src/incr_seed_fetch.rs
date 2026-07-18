@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -69,6 +70,18 @@ use tracing::{debug, warn};
 /// to the preimage length (`22 + 64 = 86` for a v1 64-hex key). `v1:` is the
 /// rotation knob.
 const INDEX_KEY_PREFIX: &str = "fl-incr-seed-index:v1:";
+
+/// Bounded fan-out for the per-file fetch+verify+write in [`materialize_tree`].
+/// Up to this many `-incr` file blobs are fetched, blake3-verified, and written
+/// concurrently; the remaining files queue until an in-flight slot frees. Each
+/// blob is dropped after its write, so peak resident bytes are bounded by
+/// `PARALLEL_MATERIALIZE_CONCURRENCY × the largest single -incr file` (NOT the
+/// whole seed). `-incr` files are per-CGU rustc incremental artifacts
+/// (individually small); 16× the largest is acceptable worker memory for the
+/// wall-clock win of overlapping the (§6.5) main-CAS reads. Every per-file
+/// safety guard (blake3 verify, `O_NOFOLLOW|O_EXCL` byte-copy) runs unchanged
+/// inside each concurrent [`fetch_and_write_file`].
+const PARALLEL_MATERIALIZE_CONCURRENCY: usize = 16;
 
 /// The outcome of a seed fetch+materialize attempt.
 ///
@@ -344,24 +357,34 @@ async fn materialize_tree(
         return Ok(SeedOutcome::NoSeed);
     }
 
-    // Fetch + verify + write each file. One blob is resident at a time (memory
-    // bounded to the largest single file, not the whole seed). Any fetch error
-    // or digest mismatch → cold, after wiping the temp tree.
-    for file in &plan.files {
-        match fetch_and_write_file(cas_store, &temp_dir, file).await {
-            Ok(()) => {}
-            Err(FileMaterializeError::Cold(reason)) => {
+    // Fetch + verify + write each file with bounded fan-out
+    // (PARALLEL_MATERIALIZE_CONCURRENCY in flight). Up to that many blobs are
+    // resident at once (memory bounded to 16 × the largest single file, not the
+    // whole seed); each blob is dropped after its write. Every per-file guard —
+    // the blake3 verify and the `O_NOFOLLOW|O_EXCL` byte-copy — runs UNCHANGED
+    // inside each concurrent `fetch_and_write_file`; parallelization only overlaps
+    // the (§6.5) main-CAS reads. Short-circuit is preserved: on the FIRST file's
+    // cold/error the helper stops consuming, drops the stream to abort the
+    // remaining in-flight fetches, and returns it; we then wipe the temp tree and
+    // return cold — never a partial dir. (With `buffer_unordered`, "first" is
+    // first-to-fail, not plan order; the outcome — cold, wiped, no-partial-dir —
+    // is identical either way.)
+    if let Some((failure, rel_path)) =
+        materialize_files_parallel(cas_store, &temp_dir, &plan.files).await
+    {
+        match failure {
+            FileMaterializeError::Cold(reason) => {
                 cleanup_or_err(&temp_dir).await?;
                 emit_counter("incr_seed_present_but_cold");
                 warn!(
                     targetkey = targetkey.key(),
                     reason,
-                    rel_path = %file.rel_path.display(),
+                    rel_path = %rel_path.display(),
                     "incr seed file materialization cold; wiped partial temp dir"
                 );
                 return Ok(SeedOutcome::NoSeed);
             }
-            Err(FileMaterializeError::Internal(err)) => {
+            FileMaterializeError::Internal(err) => {
                 cleanup_or_err(&temp_dir).await?;
                 return Err(err).err_tip(|| "In incr_seed_fetch::materialize_tree");
             }
@@ -562,14 +585,68 @@ enum FileMaterializeError {
     Internal(Error),
 }
 
+/// Drive the per-file fetch+verify+write with bounded fan-out
+/// ([`PARALLEL_MATERIALIZE_CONCURRENCY`] futures in flight, via
+/// `buffer_unordered`). Returns `Some((error, rel_path))` for the FIRST file that
+/// fails (cold or internal) — after which the stream is dropped so every
+/// remaining in-flight fetch is aborted before the caller wipes the temp tree —
+/// or `None` when every file materialized. Each file's blake3 verify and
+/// `O_NOFOLLOW|O_EXCL` byte-copy run unchanged inside [`fetch_and_write_file`];
+/// this only overlaps the reads.
+///
+/// Driven over OWNED per-file items (rather than borrowing `&plan.files`): a
+/// borrowed stream item combined with the caller's `Send` bound (the worker's
+/// `inner_prepare_action` awaits this on a `Send` execution future) trips rustc's
+/// "implementation of `Send` is not general enough" HRTB inference. Owning each
+/// file's plan data — so the buffered futures capture only the Copy
+/// `cas_store`/`temp_dir` references (the proven parallel-BFS pattern in
+/// `running_actions_manager`) — keeps the future `Send`. The failing path returns
+/// an OWNED `PathBuf` for the same reason.
+async fn materialize_files_parallel(
+    cas_store: &Store,
+    temp_dir: &Path,
+    files: &[PlannedFile],
+) -> Option<(FileMaterializeError, PathBuf)> {
+    // Own each file's plan data up-front (the `files` borrow ends here), so no
+    // borrowed stream-item lifetime is captured by the buffered futures.
+    let owned: Vec<(DigestInfo, PathBuf, bool)> = files
+        .iter()
+        .map(|file| (file.digest, file.rel_path.clone(), file.is_executable))
+        .collect();
+
+    let mut writes = futures::stream::iter(owned.into_iter())
+        .map(|(digest, rel_path, is_executable)| async move {
+            let planned = PlannedFile {
+                rel_path,
+                digest,
+                is_executable,
+            };
+            fetch_and_write_file(cas_store, temp_dir, &planned)
+                .await
+                .map_err(|err| (err, planned.rel_path))
+        })
+        .buffer_unordered(PARALLEL_MATERIALIZE_CONCURRENCY);
+
+    while let Some(result) = writes.next().await {
+        if let Err(failure) = result {
+            // Returning here drops `writes`, aborting the remaining in-flight
+            // fetches; the caller wipes the temp tree.
+            return Some(failure);
+        }
+    }
+    None
+}
+
 /// Fetch a single blob, verify its blake3 digest, and write it under the temp
-/// root. The blob is resident only for this call (bounded memory).
+/// root. The blob is resident only for this call; the caller caps how many such
+/// calls run concurrently ([`PARALLEL_MATERIALIZE_CONCURRENCY`]), so aggregate
+/// residency is bounded by `16 × the largest -incr file`.
 async fn fetch_and_write_file(
     cas_store: &Store,
     temp_dir: &Path,
     file: &PlannedFile,
 ) -> Result<(), FileMaterializeError> {
-    // UNBOUNDED-OK: one trusted rustc -incr blob resident at a time; declared-size mismatch fails the post-read blake3+size verify → cold
+    // UNBOUNDED-OK: this call holds one trusted rustc -incr blob resident; the caller caps fan-out at PARALLEL_MATERIALIZE_CONCURRENCY (16), so peak residency is bounded by 16 × the largest -incr file; declared-size mismatch fails the post-read blake3+size verify → cold
     let bytes = match cas_store
         .get_part_unchunked(
             StoreKey::Digest(file.digest),
@@ -1107,6 +1184,59 @@ mod tests {
         assert_eq!(outcome, SeedOutcome::Materialized { tree_digest });
         assert_eq!(std::fs::read(dest.join("top.bin")).unwrap(), b"surface");
         assert_eq!(std::fs::read(dest.join("sub/nested.bin")).unwrap(), b"deep");
+    }
+
+    // Parallel materialize path: many files (> PARALLEL_MATERIALIZE_CONCURRENCY)
+    // must ALL land with correct content AND executable bit through the bounded
+    // fan-out. Exceeding the 16-in-flight window exercises the buffer_unordered
+    // drain (queued files resume as slots free), proving parallelization is
+    // outcome-transparent — same content, same modes, same Materialized outcome.
+    #[nativelink_test]
+    async fn hit_materializes_many_files_parallel() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+
+        // 40 distinct files, comfortably past the 16-wide concurrency window, so
+        // the stream must queue-and-drain rather than fit in one batch.
+        let contents: Vec<(String, Vec<u8>, bool)> = (0..40u32)
+            .map(|i| {
+                (
+                    format!("f{i:02}.bin"),
+                    format!("content-{i}").into_bytes(),
+                    i % 3 == 0,
+                )
+            })
+            .collect();
+        let specs: Vec<(&str, &[u8], bool)> = contents
+            .iter()
+            .map(|(name, body, exec)| (name.as_str(), body.as_slice(), *exec))
+            .collect();
+        let tree_digest = upload_flat_tree(&cas, &specs).await;
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(10))
+            .await
+            .expect("fetch should not error on a many-file hit");
+
+        assert_eq!(outcome, SeedOutcome::Materialized { tree_digest });
+        for (name, body, exec) in &contents {
+            let got = std::fs::read(dest.join(name))
+                .unwrap_or_else(|e| panic!("file {name} must materialize under parallel path: {e}"));
+            assert_eq!(&got, body, "content mismatch for {name}");
+            let mode = std::fs::metadata(dest.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let want = if *exec { 0o755 } else { 0o644 };
+            assert_eq!(mode, want, "mode mismatch for {name} (executable-bit guard)");
+        }
     }
 
     #[nativelink_test]
