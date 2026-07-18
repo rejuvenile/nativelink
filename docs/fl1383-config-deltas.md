@@ -84,6 +84,9 @@ Allowlist prefix (all sides): `bazel-out/cfg/bin/third_party/rust/apple_a14/`.
 
 ---
 
+## B'. WIRE-CONTRACT DEPENDENCY — digest function must stay blake3 (confirmed with the Bazel client 2026-07-18)
+The rules_rust client emits ByteStream resource names WITHOUT a digest-function segment: `{instance}/blobs/{hash}/{size}` and `{instance}/uploads/{uuid}/blobs/{hash}/{size}` (no `blake3/`). This resolves correctly ONLY because the server defaults an omitted segment to `default_digest_hash_function` = **`blake3`** (verified `prod-server.json5:635`). **CONTRACT:** the `main` CAS AND the new `incr_seed_index` instance MUST resolve omitted-digest-function → blake3. When adding the `incr_seed_index` store/service (A1/A2), do NOT set a per-instance digest override — it inherits the server-level blake3 default. If the server default ever changes to non-blake3, OR a different server fronts these instances, the client goes cold/errors on every FL-1383 action. (Hardening option, deferred: make it explicit — client adds `blake3/` to the resource name, server accepts the qualified form; two-sided change, not needed while the default holds.)
+
 ## C. Canary rollout (after apply)
 1. Confirm the Bazel side (naming contract) + apply A+B on **ONE** worker first (not the fleet) — a single `apple-a14` crate.
 2. Deploy (`just … deploy`), then WATCH the registered counters: `incr_index_publish` (worker publishing), `incr_index_fetch_hit`/`_miss`, `incr_seed_materialized`, and — once chunk-4 wires it — `incr_reuse_fired`. **A healthy canary = materialized climbing AND (post-chunk-4) reuse_fired climbing.** materialized-up-but-reuse-flat = the naming contract (§2/§3 of the handoff) diverged → dark; stop and reconcile.
