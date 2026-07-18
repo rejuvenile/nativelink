@@ -37,9 +37,10 @@ pub const CARRIER_PRIMARY_OUTPUT_PROPERTY: &str = "nl_incr_primary_output";
 
 /// A portable identity key for an action's primary output (design §3).
 ///
-/// Derived from the action's REAPI `Command.output_paths`: the paths are
-/// **sorted** (so the key is independent of the order Bazel emitted them), the
-/// lexicographically smallest ("primary") path is hashed with blake3 (fixed,
+/// Derived from the action's REAPI `Command.output_paths`: the `-incr`
+/// artifacts are **excluded** (§2 — see [`Self::derive`]), the remaining paths
+/// are **sorted** (so the key is independent of the order Bazel emitted them),
+/// the lexicographically smallest ("primary") path is hashed with blake3 (fixed,
 /// independent of the action's digest function, ≥128-bit per §3), and the full
 /// primary-output string is retained beside the
 /// hash so a blake3 **collision** (equal `key`, differing `primary_output`) is
@@ -81,20 +82,38 @@ pub struct TargetKey {
 impl TargetKey {
     /// Derive the [`TargetKey`] from an action's `Command.output_paths`.
     ///
-    /// Returns `None` when `output_paths` is empty — an action with no declared
-    /// outputs has nothing to key on and is not eligible for portable-incr
-    /// seeding.
+    /// Returns `None` when — after the `-incr` exclusion below — no candidate
+    /// output remains: an action with no declared (non-`-incr`) outputs has
+    /// nothing to key on and is not eligible for portable-incr seeding.
     ///
-    /// The derivation sorts a borrowed view of `output_paths` (the caller's
-    /// slice is not mutated) and hashes the lexicographically smallest entry;
-    /// the sort is what makes the result independent of the order Bazel listed
-    /// the outputs.
+    /// `-incr` EXCLUSION (§2, FL-1383 Bazel-handoff, locked cross-repo): a
+    /// rustc pipelined action declares its `<label>-incr` /
+    /// `<label>-incr-metadata` / `<label>-incr-unused-inputs.txt` incremental
+    /// artifacts alongside the real `.rlib`/`.rmeta`. Because `-` (0x2D) sorts
+    /// before `.` (0x2E), the raw bytewise-smallest entry would be the
+    /// `<label>-incr` dir — which carries no `-Cmetadata` config salt, so keying
+    /// on it is config-BLIND and diverges from the carrier + the KAT. So EVERY
+    /// entry whose **basename** (last `/`-segment) contains the substring
+    /// `"-incr"` is excluded BEFORE sorting (this substring catches all three
+    /// `-incr*` forms and no legitimate rustc output — `.rlib`/`.rmeta`/`.d`
+    /// never contain `-incr`). The lexicographically smallest of what REMAINS is
+    /// the primary output the key hashes. If ALL entries are `-incr` artifacts
+    /// the set empties → `None`. The exclusion is byte-identical to the Bazel
+    /// client + the FL `incr_seed_index` tool (KAT in the test module).
+    ///
+    /// The remaining candidates are sorted in a borrowed view (the caller's
+    /// slice is not mutated); the sort is what makes the result independent of
+    /// the order Bazel listed the outputs.
     #[must_use]
     pub fn derive(output_paths: &[String]) -> Option<Self> {
-        if output_paths.is_empty() {
+        let mut sorted: Vec<&str> = output_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !Self::basename_contains_incr(path))
+            .collect();
+        if sorted.is_empty() {
             return None;
         }
-        let mut sorted: Vec<&str> = output_paths.iter().map(String::as_str).collect();
         sorted.sort_unstable();
         let primary_output = sorted[0].to_string();
         let key = Self::hash_primary_output(&primary_output);
@@ -102,6 +121,15 @@ impl TargetKey {
             key,
             primary_output,
         })
+    }
+
+    /// Whether `path`'s **basename** (its last `/`-segment) contains the
+    /// substring `"-incr"` — the §2 exclusion predicate. Basename-scoped so a
+    /// legitimate output living under an `-incr`-named DIRECTORY is not dropped;
+    /// only the final component is inspected.
+    fn basename_contains_incr(path: &str) -> bool {
+        let basename = path.rsplit('/').next().unwrap_or(path);
+        basename.contains("-incr")
     }
 
     /// Construct a [`TargetKey`] from the two client-supplied carrier strings

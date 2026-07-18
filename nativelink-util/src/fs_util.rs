@@ -396,17 +396,12 @@ fn try_clonefile(src: &Path, dst: &Path) -> Result<(), Error> {
     // The work directory may have been pre-created (by [B1]) — remove it if empty.
     //
     // NON-RECURSIVE ON PURPOSE — DO NOT change this `remove_dir` to
-    // `remove_dir_all`. Two callers rely on the non-recursive clear:
-    //   1. O5 concurrency: [C] may have already populated dst (e.g. created
-    //      `dst/bazel-out/`); a recursive clear would destroy work [C] did.
-    //   2. FL-1383 portable-incr: dst is a WARM execroot whose preserved
-    //      `<label>-incr` seed tree survives ONLY because this clear is
-    //      non-recursive → it fails DirectoryNotEmpty → the caller falls back to
-    //      hardlink (which materializes INTO the seed-bearing dir). A recursive
-    //      clear would silently delete the rustc-incremental seed on EVERY
-    //      portable build — a DARK reuse-collapse (cold-not-wrong) regression.
-    //      Locked by `incr_seed_survives_wipe_then_materialize`
-    //      (nativelink-worker/tests/portable_incr_execroot_test.rs).
+    // `remove_dir_all`. O5 concurrency: [C] may have already populated dst (e.g.
+    // created `dst/bazel-out/`); a recursive clear would destroy work [C] did →
+    // it fails DirectoryNotEmpty and the caller falls back to hardlink. (FL-1383
+    // portable-incr full-empty wipes the execroot BEFORE [B2] and fetches its
+    // `-incr` seed AFTER inputs [C], so a portable execroot is EMPTY here →
+    // clonefile fires normally; the seed is never present at clone time.)
     // Post-[B1] the work_dir always exists, so clonefile into a genuinely-
     // absent dst is only valid when dst is truly empty.
     if dst.exists() {
@@ -414,21 +409,19 @@ fn try_clonefile(src: &Path, dst: &Path) -> Result<(), Error> {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                 // A non-empty dst is an EXPECTED precondition-miss, NOT a genuine
-                // failure: either the O5 [C]-pre-populates-work-dir race, or (when
-                // FL-1383 portable-incr is enabled) the PRESERVED `-incr` warm
-                // execroot seed. clonefile cannot proceed either way → signal the
-                // caller to use the hardlink path. Log at warn! (visible in release
-                // under release_max_level_info) so it can be quantified, without
-                // the error!-level alarm reserved for the perf-critical syscall
-                // failure below.
+                // failure: the O5 [C]-pre-populates-work-dir race. clonefile cannot
+                // proceed → signal the caller to use the hardlink path. Log at
+                // warn! (visible in release under release_max_level_info) so it can
+                // be quantified, without the error!-level alarm reserved for the
+                // perf-critical syscall failure below.
                 tracing::warn!(
                     src = %src.display(),
                     dst = %dst.display(),
-                    "clonefile dst non-empty (expected: output-dir prep pre-populated it, or a preserved FL-1383 -incr warm-execroot seed); falling back to (slow) hardlink"
+                    "clonefile dst non-empty (expected: output-dir prep pre-populated it); falling back to (slow) hardlink"
                 );
                 return Err(make_err!(
                     nativelink_error::Code::Internal,
-                    "clonefile {} → {}: dst non-empty (output-dir prep or preserved -incr seed); falling back to hardlink",
+                    "clonefile {} → {}: dst non-empty (output-dir prep); falling back to hardlink",
                     src.display(),
                     dst.display()
                 ));

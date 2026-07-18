@@ -178,6 +178,96 @@ async fn targetkey_kat_locks_blake3_byte_identical_across_repos() -> Result<(), 
     Ok(())
 }
 
+/// SHARED CROSS-REPO KNOWN-ANSWER TEST for the `-incr` EXCLUSION (§2, FL-1383
+/// Bazel-handoff). A rustc pipelined action declares FIVE `output_paths`, three
+/// of which are `-incr` artifacts (`<label>-incr`, `<label>-incr-metadata`,
+/// `<label>-incr-unused-inputs.txt`). Because `-` (0x2D) sorts before `.`
+/// (0x2E), the bytewise-smallest RAW entry is `foo-incr` — so WITHOUT the
+/// exclusion the key would land on the config-BLIND `-incr` dir, diverging from
+/// the carrier and the KAT. `derive` MUST exclude every entry whose basename
+/// contains `-incr` (catches all three) BEFORE choosing the smallest, so the key
+/// lands on the `.rlib`.
+///
+/// Byte-verified with `b3sum`:
+/// - `blake3("bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rlib")` = [`KAT_INCR_RLIB_KEY`]
+/// - `blake3("bazel-out/cfg/bin/pkg/foo-incr")`          = [`KAT_INCR_SEED_KEY`]
+///
+/// The NEGATIVE assertion (key != the `foo-incr` hash) is load-bearing: it proves
+/// the EXCLUSION is doing the work, not merely the sort. Mutation: remove the
+/// `-incr` filter in `derive` → the smallest becomes `foo-incr` → the key becomes
+/// [`KAT_INCR_SEED_KEY`] and BOTH assertions here red-fail.
+const KAT_INCR_OUTPUTS: &[&str] = &[
+    "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rlib",
+    "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rmeta",
+    "bazel-out/cfg/bin/pkg/foo-incr",
+    "bazel-out/cfg/bin/pkg/foo-incr-metadata",
+    "bazel-out/cfg/bin/pkg/foo-incr-unused-inputs.txt",
+];
+/// `blake3("bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rlib")` — the CORRECT key (the
+/// `.rlib`, smallest AFTER the `-incr` exclusion).
+const KAT_INCR_RLIB_KEY: &str =
+    "4334001da81eeeb0c01c96c5871ac7c11b6e89d562395abd290ea4e73b302dfc";
+/// `blake3("bazel-out/cfg/bin/pkg/foo-incr")` — the WRONG key the un-excluded
+/// bytewise-min would produce; the negative assertion forbids it.
+const KAT_INCR_SEED_KEY: &str =
+    "c37da9bbab7592b03677363b984c845b824a681a1d6c3ec0353d0b8c13555356";
+
+#[nativelink_test]
+async fn targetkey_kat_excludes_incr_and_keys_on_rlib() -> Result<(), Error> {
+    let outputs: Vec<String> = KAT_INCR_OUTPUTS.iter().map(|s| (*s).to_string()).collect();
+    let tk = TargetKey::derive(&outputs)
+        .expect("a 5-output rustc action must still derive a targetkey after -incr exclusion");
+    assert_eq!(
+        tk.primary_output(),
+        "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rlib",
+        "primary must be the .rlib (smallest after excluding every -incr basename), not foo-incr"
+    );
+    assert_eq!(
+        tk.key(),
+        KAT_INCR_RLIB_KEY,
+        "targetkey must key on the .rlib once the -incr artifacts are excluded"
+    );
+    assert_ne!(
+        tk.key(),
+        KAT_INCR_SEED_KEY,
+        "targetkey must NOT be blake3(foo-incr) — the exclusion, not just the sort, must drop -incr"
+    );
+    Ok(())
+}
+
+/// When EVERY output is an `-incr` artifact there is nothing left to key on after
+/// the exclusion → `None` (cold, never keys on an `-incr` dir).
+#[nativelink_test]
+async fn targetkey_all_incr_outputs_yield_none() -> Result<(), Error> {
+    let all_incr = paths(&[
+        "bazel-out/cfg/bin/pkg/foo-incr",
+        "bazel-out/cfg/bin/pkg/foo-incr-metadata",
+        "bazel-out/cfg/bin/pkg/foo-incr-unused-inputs.txt",
+    ]);
+    assert!(
+        TargetKey::derive(&all_incr).is_none(),
+        "all-incr output_paths must yield no key (exclusion empties the set → None)"
+    );
+    Ok(())
+}
+
+/// The exclusion is BASENAME-scoped: a non-`-incr` output living under a
+/// directory whose NAME contains `-incr` must still be eligible (only the last
+/// `/`-segment is inspected).
+#[nativelink_test]
+async fn targetkey_incr_exclusion_is_basename_scoped() -> Result<(), Error> {
+    let tk = TargetKey::derive(&paths(&[
+        "bazel-out/cfg/bin/some-incr-pkg/libfoo.rlib",
+    ]))
+    .expect("a .rlib under an -incr-named directory must remain eligible");
+    assert_eq!(
+        tk.primary_output(),
+        "bazel-out/cfg/bin/some-incr-pkg/libfoo.rlib",
+        "only the basename is checked for -incr; an -incr directory segment must not exclude it"
+    );
+    Ok(())
+}
+
 /// `from_carrier` accepts a matching (key, primary_output) pair: the recomputed
 /// `blake3(primary_output)` equals the client-supplied key, so the carrier is
 /// trusted verbatim (no CAS fetch). Mutation: return `None` unconditionally in

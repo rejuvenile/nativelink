@@ -31,11 +31,13 @@
 //! a stale/torn/wrong seed re-validates to a cold compile, never a wrong
 //! `.rlib`.
 //!
-//! TODO(#FL-1383): this function is wired into the execroot setup by chunk 2b /
-//! a follow-on — call it before rustc, after the non-`-incr` wipe (§7): the
-//! caller wipes non-`-incr` state and preserves `-incr`; this function's job is
-//! only to (re)materialize the `-incr` dir at the pinned path, and to map the
-//! returned [`SeedOutcome`] into the registered worker metrics
+//! This function is wired into the execroot setup (`running_actions_manager`):
+//! it runs before rustc, AFTER the full-empty execroot wipe (§7) AND after input
+//! materialization + output-dir creation, so the nested declared `-incr` path's
+//! parent exists. The full-empty wipe removes any prior `-incr`, so this function
+//! always (re)materializes the `-incr` dir fresh at the declared nested path
+//! ([`seed_dest_dir`]), and maps the returned [`SeedOutcome`] into the registered
+//! worker metrics
 //! (`incr_seed_materialized` / `incr_reuse_fired` / `incr_seed_present_but_cold`
 //! / `incr_seed_collision`, and the `incr_index_fetch_{hit,miss,timeout,error}`
 //! family — see the `emit_counter` markers below).
@@ -645,9 +647,10 @@ async fn write_file_nofollow(abs_path: PathBuf, bytes: Bytes, mode: u32) -> Resu
     .map_err(|e| make_err!(Code::Internal, "incr seed file write join failed: {e:?}"))?
 }
 
-/// Atomically install `temp_dir` at `dest`: remove any existing `dest`
-/// (the preserved-but-stale seed, §7), then rename. Same-filesystem rename is
-/// atomic; a torn rename is impossible.
+/// Atomically install `temp_dir` at `dest`: remove any existing `dest` (an empty
+/// output dir the [C] output-dir prep may have pre-created at the declared `-incr`
+/// path, or a leftover), then rename. Same-filesystem rename is atomic; a torn
+/// rename is impossible.
 async fn swap_into_place(temp_dir: PathBuf, dest: PathBuf) -> Result<(), Error> {
     tokio::task::spawn_blocking(move || {
         match std::fs::remove_dir_all(&dest) {
@@ -773,33 +776,49 @@ pub fn note_index_published() {
     emit_counter("incr_index_publish");
 }
 
-/// The on-disk destination for the fetched `-incr` seed (design §6.3/§7): a
-/// TOP-LEVEL child of the byte-identical execroot named `<stem>-incr`, where
-/// `<stem>` is the primary output's filename with its extension stripped
-/// (`bazel-out/cfg/bin/.../libfoo.rlib` → `<execroot>/libfoo-incr`). Returns
-/// `None` for a primary output with no usable filename stem.
+/// Whether `path`'s basename names the SINGULAR `-incr` seed dir. Stage-1 (§6.1)
+/// materializes/publishes the singular `<label>-incr`, NOT the pipelined
+/// `<label>-incr-metadata`; `ends_with("-incr")` already excludes both
+/// `-incr-metadata` and `-incr-unused-inputs.txt`.
+fn path_is_incr_seed_dir(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    basename.ends_with("-incr")
+}
+
+/// The on-disk destination for the fetched `-incr` seed (design §6.3/§7, FL-1383
+/// §3): the current action's OWN declared `-incr` output path — a NESTED,
+/// label-named `Command.output_paths` entry (`bazel-out/cfg/bin/<pkg>/<label>-incr`,
+/// where `rustc -Cincremental` points) — joined onto the byte-identical execroot.
+/// Returns the FIRST `output_paths` entry whose basename ends in `-incr` (the
+/// singular seed dir, per [`path_is_incr_seed_dir`]); `None` if the action
+/// declares no such output → cold, no fetch.
 ///
-/// CROSS-TEAM CONTRACT — REPORTED, confirm at joint e2e: the `<stem>-incr`
-/// seed-dir NAME is a rules_rust (chunk 4) output-naming convention. It is the
-/// TOP-LEVEL-child model the §7 wipe's `is_incr_seed_entry` preserves and the
-/// chunk-2 execroot tests assume (`libfoo.rlib` ↔ `libfoo-incr`). It is NOT
-/// pinned by the NativeLink-side design and NOT carried in the chunk-3 index
-/// (whose `OutputDirectory.path` is the primary output, reserved for the
-/// collision guard, so it cannot also carry the `-incr` path). If the real
-/// rules_rust name differs, the seed lands where rustc will not read it → COLD,
-/// never wrong (safe but a DARK reuse miss the §12 counters surface as
-/// `incr_index_fetch_hit` climbing while `incr_reuse_fired` stays flat).
+/// This is OPTION A (locked with the Bazel/rules_rust side): the seed CONTENT
+/// comes from the index `tree_digest`; the DESTINATION is derived from THIS
+/// action's declared `-incr` output, so the seed always lands where this action's
+/// rustc reads. The index `OutputDirectory.path` stays the `.rlib` (the collision
+/// guard, [`plan_seed_publish`]); it does NOT carry the `-incr` path. Contrast the
+/// prior (chunk-2) `<execroot>/<stem>-incr` TOP-LEVEL model, which put the seed
+/// where rustc never reads it → dark cold reuse.
+///
+/// Defense-in-depth (§9): a REAPI declared output path is execroot-relative and
+/// Bazel-normalized; an absolute path or a `..` component is refused (`None` →
+/// cold), so the join can never materialize outside the execroot.
 #[must_use]
-pub fn seed_dest_dir(execroot: &Path, primary_output: &str) -> Option<PathBuf> {
-    let file = primary_output.rsplit('/').next().unwrap_or(primary_output);
-    if file.is_empty() {
+pub fn seed_dest_dir(execroot: &Path, output_paths: &[String]) -> Option<PathBuf> {
+    let incr = output_paths
+        .iter()
+        .map(String::as_str)
+        .find(|path| path_is_incr_seed_dir(path))?;
+    let incr_path = Path::new(incr);
+    if incr_path.is_absolute()
+        || incr_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return None;
     }
-    let stem = file.rsplit_once('.').map_or(file, |(stem, _ext)| stem);
-    if stem.is_empty() {
-        return None;
-    }
-    Some(execroot.join(format!("{stem}-incr")))
+    Some(execroot.join(incr_path))
 }
 
 /// A planned seed-index publish (design §6.2): the AC-shaped index KEY under
@@ -869,10 +888,9 @@ pub fn plan_seed_publish<'folders>(
 fn select_incr_seed_folder<'folders>(
     output_folders: impl IntoIterator<Item = (&'folders str, DigestInfo)>,
 ) -> Option<DigestInfo> {
-    output_folders.into_iter().find_map(|(path, digest)| {
-        let last = path.rsplit('/').next().unwrap_or(path);
-        (last.ends_with("-incr") && !last.ends_with("-incr-metadata")).then_some(digest)
-    })
+    output_folders
+        .into_iter()
+        .find_map(|(path, digest)| path_is_incr_seed_dir(path).then_some(digest))
 }
 
 #[cfg(test)]
@@ -1390,23 +1408,39 @@ mod tests {
         assert_eq!(validate_component("libfoo.rlib"), Ok(()));
     }
 
-    // -- FL-1383 seed_dest_dir derivation (design §6.3/§7) --------------------
+    // -- FL-1383 §3 seed_dest_dir: the DECLARED NESTED -incr output -----------
     #[nativelink_test]
-    async fn seed_dest_dir_derives_stem_incr_top_level_child() {
+    async fn seed_dest_dir_uses_declared_nested_incr_output() {
         let execroot = std::path::Path::new("/Volumes/CrowAgent/fl-incr-execroots/deadbeef");
-        // primary .rlib stem -> <execroot>/<stem>-incr top-level child.
+        let outputs = vec![
+            "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rlib".to_string(),
+            "bazel-out/cfg/bin/pkg/libfoo-a1b2c3.rmeta".to_string(),
+            "bazel-out/cfg/bin/pkg/foo-incr".to_string(),
+            "bazel-out/cfg/bin/pkg/foo-incr-metadata".to_string(),
+        ];
+        // The seed materializes at the NESTED declared -incr output joined onto
+        // the execroot — NOT a top-level `<stem>-incr` child.
         assert_eq!(
-            seed_dest_dir(execroot, PRIMARY),
-            Some(execroot.join("libfoo-incr")),
+            seed_dest_dir(execroot, &outputs),
+            Some(execroot.join("bazel-out/cfg/bin/pkg/foo-incr")),
+            "seed dest must be the declared nested -incr output joined onto the execroot"
         );
-        // No extension -> the whole filename is the stem.
+        // No -incr output declared -> None (cold, no fetch).
         assert_eq!(
-            seed_dest_dir(execroot, "bazel-out/cfg/bin/pkg/thing"),
-            Some(execroot.join("thing-incr")),
+            seed_dest_dir(execroot, &["bazel-out/cfg/bin/pkg/libfoo.rlib".to_string()]),
+            None
         );
-        // No filename stem -> None (never a bare "-incr" that could escape).
-        assert_eq!(seed_dest_dir(execroot, ""), None);
-        assert_eq!(seed_dest_dir(execroot, "pkg/"), None);
+        // `-incr-metadata` alone is the pipelined tree, NOT the singular seed dir.
+        assert_eq!(
+            seed_dest_dir(execroot, &["pkg/foo-incr-metadata".to_string()]),
+            None
+        );
+        // Path-traversal defense (§9): absolute / `..` -incr entries are refused.
+        assert_eq!(seed_dest_dir(execroot, &["/etc/evil-incr".to_string()]), None);
+        assert_eq!(
+            seed_dest_dir(execroot, &["../../escape-incr".to_string()]),
+            None
+        );
     }
 
     // -- FL-1383 plan_seed_publish (design §6.2) ------------------------------

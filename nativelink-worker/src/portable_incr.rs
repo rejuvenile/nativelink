@@ -23,8 +23,10 @@
 //! - **Chunk 2b (execroot core):** [`PortableIncrContext`] +
 //!   [`PortableExecroot`] pick the byte-identical execroot
 //!   `<FIXED_PREFIX>/<targetkey>` for an enabled+allowlisted action (§4), hold
-//!   the machine-local §5 ownership lease (owner warm / contender isolated),
-//!   wipe-preserving-`-incr` (§7), and confine every delete to FIXED_PREFIX
+//!   the machine-local §5 ownership lease (owner reuses the byte-identical dir /
+//!   contender isolated), FULL-EMPTY wipe the execroot each build (§7 — the
+//!   `-incr` seed is re-fetched fresh AFTER inputs by the out-of-band fetch, so
+//!   nothing on-disk is preserved), and confine every delete to FIXED_PREFIX
 //!   (§9). The `running_actions_manager` execution path consumes these.
 //!
 //! INERT: everything is gated on a `Some` [`PortableIncrContext`], which is
@@ -431,17 +433,6 @@ pub const CARRIER_TARGETKEY_PROP: &str = "nl_incr_targetkey";
 /// the carrier.
 pub const CARRIER_PRIMARY_OUTPUT_PROP: &str = "nl_incr_primary_output";
 
-/// Whether a direct child entry of the execroot belongs to the rustc
-/// incremental SEED that the per-build wipe must PRESERVE (design §7): the
-/// `<label>-incr` compilation-incremental tree and the pipelined
-/// `<label>-incr-metadata` tree (`rules_rust` `rustc.bzl:2255-2274`). Every
-/// other entry is content-emptied each build. Note `-incr-metadata` does NOT
-/// end in `-incr`, so both suffixes are matched explicitly.
-#[must_use]
-pub fn is_incr_seed_entry(name: &str) -> bool {
-    name.ends_with("-incr") || name.ends_with("-incr-metadata")
-}
-
 /// A well-formed carrier `targetkey` is exactly 64 lowercase-hex characters
 /// (blake3-256). A malformed carrier is treated as non-portable (→ normal
 /// path), never as an execroot path segment — a path-traversal defense on the
@@ -604,8 +595,10 @@ impl PortableIncrContext {
 /// isolated CONTENDER (design §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecrootRole {
-    /// Owns the byte-identical warm dir; its `-incr` seed is preserved across
-    /// builds and NEVER deleted by cleanup.
+    /// Owns the byte-identical dir `<FIXED_PREFIX>/<targetkey>`, reused across
+    /// builds for path stability (rustc reuse is absolute-path-bound). The dir
+    /// is FULL-EMPTY wiped each build (§7) and its `-incr` seed re-fetched fresh;
+    /// it is NEVER deleted by cleanup (only by the §8 warm-dir budget eviction).
     Owner,
     /// Runs in an isolated per-process dir that is cold-discarded on cleanup.
     Contender,
@@ -655,7 +648,8 @@ impl PortableExecroot {
 
     /// The isolated dir a CONTENDER must cold-discard on cleanup (design §9),
     /// paired with FIXED_PREFIX for the containment gate. `None` for an Owner
-    /// (its warm dir is PRESERVED — never deleted by cleanup).
+    /// (its dir is kept for path reuse — never deleted by cleanup, only by §8
+    /// budget eviction).
     #[must_use]
     pub fn contender_discard_target(&self) -> Option<(PathBuf, PathBuf)> {
         match self.role {
@@ -702,20 +696,17 @@ impl PortableExecroot {
         Ok(())
     }
 
-    /// Ensure the execroot exists, then content-empty it PRESERVING the `-incr`
-    /// / `-incr-metadata` seed trees (design §7). The Owner's warm dir keeps its
-    /// seed across builds; a Contender's freshly-created isolated dir wipes to
-    /// empty (a no-op). ALL deletes are confined to a subtree of FIXED_PREFIX
-    /// (design §9): the function refuses if the execroot does not canonicalize
-    /// UNDER FIXED_PREFIX, so a wipe can never escape the machine-local prefix.
-    ///
-    /// SEED-SURVIVAL CONTRACT: after this wipe the execroot is NON-EMPTY (it
-    /// still holds `-incr`), and the subsequent input-materialize step must NOT
-    /// recursively clear it. `hardlink_directory_tree` relies on a NON-recursive
-    /// dst-clear (`fs_util::try_clonefile` `remove_dir`, NOT `remove_dir_all`) →
-    /// it fails on the seed-bearing dir and materializes INTO it via hardlink. A
-    /// refactor of that clear to a recursive delete silently destroys the seed on
-    /// every portable build. Locked by `incr_seed_survives_wipe_then_materialize`.
+    /// Ensure the execroot exists, then FULL-EMPTY content-wipe it (design §7):
+    /// EVERY direct child is removed, preserving NOTHING. The `-incr` seed is not
+    /// kept on disk — it is an evictable fetch-cache (design §7) re-materialized
+    /// fresh AFTER inputs by the out-of-band seed fetch (§6.3), so the Stage-1
+    /// model treats it as "evicted every build → re-fetch" (the warm same-worker
+    /// on-disk preserve is a deferred optimization, mirroring the §6.5 deferred
+    /// content-pin). A full-empty execroot also restores the macOS clonefile fast
+    /// path for input materialization (an empty dst). ALL deletes are confined to
+    /// a subtree of FIXED_PREFIX (design §9): the function refuses if the execroot
+    /// does not canonicalize UNDER FIXED_PREFIX, so a wipe can never escape the
+    /// machine-local prefix; symlink children are unlinked (never followed).
     ///
     /// BLOCKING (mkdir/readdir/unlink syscalls) — call under `spawn_blocking`.
     /// No `fsync`/sync-write primitive (CLAUDE.md hard rule).
@@ -730,7 +721,7 @@ impl PortableExecroot {
 /// BLOCKING — call under `spawn_blocking`.
 pub fn ensure_and_wipe_execroot_at(execroot: &Path, fixed_prefix: &Path) -> Result<(), Error> {
     ensure_execroot_dir(execroot, fixed_prefix)?;
-    wipe_contents_except(execroot, fixed_prefix, is_incr_seed_entry)
+    wipe_all_contents(execroot, fixed_prefix)
 }
 
 /// RAII §5 ownership lease. An Owner holds `Some(canonical execroot)` and, on
@@ -1056,15 +1047,11 @@ fn ensure_execroot_dir(execroot: &Path, fixed_prefix: &Path) -> Result<(), Error
     }
 }
 
-/// Content-empty `dir` in place, PRESERVING every direct child for which
-/// `preserve(name)` is true (design §7). The delete is confined to a subtree of
+/// FULL-EMPTY content-wipe `dir` in place, removing EVERY direct child (design
+/// §7 — nothing is preserved). The delete is confined to a subtree of
 /// `fixed_prefix` (design §9): `dir` MUST canonicalize under `fixed_prefix`.
 /// Symlink children are unlinked (never followed). BLOCKING.
-fn wipe_contents_except(
-    dir: &Path,
-    fixed_prefix: &Path,
-    preserve: impl Fn(&str) -> bool,
-) -> Result<(), Error> {
+fn wipe_all_contents(dir: &Path, fixed_prefix: &Path) -> Result<(), Error> {
     // Containment FIRST — never read/delete under a dir that escapes the prefix.
     assert_under_prefix(dir, fixed_prefix)?;
 
@@ -1073,11 +1060,6 @@ fn wipe_contents_except(
     for entry in entries {
         let entry = entry
             .map_err(|e| make_err!(Code::Internal, "read execroot entry in {}: {e}", dir.display()))?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if preserve(&name_str) {
-            continue;
-        }
         let path = entry.path();
         // `symlink_metadata` does NOT follow a final-component symlink, so a
         // symlink child is unlinked as a file (its target is never touched).

@@ -5231,10 +5231,11 @@ impl RunningActionImpl {
             //
             // FL-1383 chunk 2b: a portable-incr action's work_directory IS the
             // shared byte-identical execroot `<FIXED_PREFIX>/<targetkey>`, which
-            // PERSISTS across builds (its `-incr` seed is the whole point). So
-            // instead of `create_dir` (which would EEXIST on Owner reuse) we
-            // ensure-exists-then-content-empty it PRESERVING `-incr` /
-            // `-incr-metadata` (design §7), with the delete confined to a subtree
+            // PERSISTS across builds (path stability is the whole point — rustc
+            // reuse is absolute-path-bound). So instead of `create_dir` (which
+            // would EEXIST on Owner reuse) we ensure-exists-then FULL-EMPTY wipe
+            // it (design §7 — nothing preserved; the `-incr` seed is re-fetched
+            // fresh AFTER inputs, below), with the delete confined to a subtree
             // of FIXED_PREFIX (design §9). The Command was fetched above, so we
             // FIRST integrity-verify the worker-derived targetkey against the
             // carrier (design §11 item 1); a mismatch fails loud (the carrier
@@ -5246,7 +5247,7 @@ impl RunningActionImpl {
                 info!(
                     %operation_id,
                     execroot = %self.work_directory,
-                    "inner_prepare_action: portable-incr execroot ensure+wipe (preserve -incr) [B1]"
+                    "inner_prepare_action: portable-incr execroot full-empty ensure+wipe [B1]"
                 );
                 let execroot = PathBuf::from(&self.work_directory);
                 let fixed_prefix = plan.fixed_prefix().to_path_buf();
@@ -5257,54 +5258,14 @@ impl RunningActionImpl {
                 })
                 .await
                 .err_tip(|| "portable_incr execroot ensure+wipe task join")??;
-                // FL-1383 chunk 3 (design §6.3/§6.2): OUT-OF-BAND seed fetch,
-                // AFTER the wipe-preserving-`-incr` and BEFORE [B2] input
-                // materialise. Derive the TargetKey from the (already
-                // carrier-verified) Command outputs, stash it for the
-                // post-success publish, then — when a seed index store is
-                // configured — best-effort fetch+materialise the fleet-shared
-                // `-incr` seed at the execroot so the REMOTE/cold branch reuses.
-                // Any non-`Materialized` outcome (miss/collision/timeout/evicted)
-                // proceeds with a COLD build; the whole fetch is bounded (§6.2:
-                // GrpcStore `timeout=0`, so a slow/absent index must not stall).
-                let targetkey = TargetKey::derive(&cmd.output_paths);
-                if let Some(targetkey) = targetkey.as_ref() {
-                    self.state.lock().portable_targetkey = Some(targetkey.clone());
-                }
-                if let (Some(index_store), Some(targetkey)) = (
-                    self.running_actions_manager.incr_seed_index_store.as_ref(),
-                    targetkey.as_ref(),
-                ) {
-                    if let Some(dest) = seed_dest_dir(
-                        std::path::Path::new(&self.work_directory),
-                        targetkey.primary_output(),
-                    ) {
-                        let cas = Store::new(self.running_actions_manager.cas_store.clone());
-                        match fetch_and_materialize_seed(
-                            index_store,
-                            &cas,
-                            targetkey,
-                            &dest,
-                            INCR_SEED_FETCH_TIMEOUT,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => info!(
-                                %operation_id,
-                                ?outcome,
-                                dest = %dest.display(),
-                                "inner_prepare_action: portable-incr seed fetch complete"
-                            ),
-                            // Best-effort: an internal fetch error must NOT fail
-                            // the build — proceed cold (the §12 counters record it).
-                            Err(err) => warn!(
-                                %operation_id,
-                                ?err,
-                                "inner_prepare_action: portable-incr seed fetch errored; \
-                                 proceeding with a cold build"
-                            ),
-                        }
-                    }
+                // Derive the TargetKey from the (carrier-verified) Command outputs
+                // and stash it for BOTH the post-success publish (§6.2) and the
+                // out-of-band seed fetch (§6.3). The FETCH runs LATER — after the
+                // [B2] input materialise + [C] output-dir creation — so the nested
+                // declared `-incr` path's parent exists and [B2] clonefiles into
+                // the (now empty) execroot. See the fetch block after [C].
+                if let Some(targetkey) = TargetKey::derive(&cmd.output_paths) {
+                    self.state.lock().portable_targetkey = Some(targetkey);
                 }
             } else {
                 // Normal mode: create the (empty) work_directory. [B2]'s
@@ -5423,6 +5384,52 @@ impl RunningActionImpl {
                     command.output_paths.iter().map(prepare_output_directories),
                 ))
                 .await?;
+        }
+        // FL-1383 chunk 3 (design §6.3/§6.2): OUT-OF-BAND `-incr` seed fetch —
+        // runs AFTER the full-empty wipe [B1], the input materialise [B2], AND
+        // the output-dir creation [C], and BEFORE rustc. Placing it here means
+        // (a) the seed's DESTINATION — this action's own DECLARED NESTED `-incr`
+        // output (`seed_dest_dir`, option A) — has its parent dir already created
+        // by [C], and (b) [B2] materialised into an EMPTY execroot so the macOS
+        // clonefile fast path fired. The CONTENT comes from the fleet-shared
+        // index; any non-`Materialized` outcome (miss/collision/timeout/evicted)
+        // proceeds with a COLD build; the whole fetch is bounded (§6.2: GrpcStore
+        // `timeout=0`, so a slow/absent index must not stall). INERT on the fleet
+        // (portable_targetkey is `None` unless a portable execroot was planned).
+        let portable_targetkey = self.state.lock().portable_targetkey.clone();
+        if let (Some(index_store), Some(targetkey)) = (
+            self.running_actions_manager.incr_seed_index_store.as_ref(),
+            portable_targetkey.as_ref(),
+        ) {
+            if let Some(dest) =
+                seed_dest_dir(std::path::Path::new(&self.work_directory), &command.output_paths)
+            {
+                let cas = Store::new(self.running_actions_manager.cas_store.clone());
+                match fetch_and_materialize_seed(
+                    index_store,
+                    &cas,
+                    targetkey,
+                    &dest,
+                    INCR_SEED_FETCH_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(outcome) => info!(
+                        %operation_id,
+                        ?outcome,
+                        dest = %dest.display(),
+                        "inner_prepare_action: portable-incr seed fetch complete"
+                    ),
+                    // Best-effort: an internal fetch error must NOT fail the
+                    // build — proceed cold (the §12 counters record it).
+                    Err(err) => warn!(
+                        %operation_id,
+                        ?err,
+                        "inner_prepare_action: portable-incr seed fetch errored; \
+                         proceeding with a cold build"
+                    ),
+                }
+            }
         }
         // Log command args but NOT environment_variables — they may contain secrets.
         debug!(

@@ -19,7 +19,8 @@
 //!  - execroot path == `<FIXED_PREFIX>/<targetkey>` for an allowlisted action (§4);
 //!  - the machine-local RAII lease: OWNER warm, same-targetkey CONTENDER isolated,
 //!    release-on-drop → reuse (§5);
-//!  - the wipe PRESERVES `-incr` / `-incr-metadata` and CONFINES the delete to
+//!  - the FULL-EMPTY wipe removes ALL children (nothing preserved — the `-incr`
+//!    seed is re-fetched fresh after inputs) and CONFINES the delete to
 //!    FIXED_PREFIX (§7/§9);
 //!  - the worker-side targetkey integrity verify (§11 item 1);
 //!  - the contender cold-discard target + containment gate (§9).
@@ -54,14 +55,13 @@ use nativelink_util::action_messages::{
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-use nativelink_util::fs_util::hardlink_directory_tree;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use nativelink_util::targetkey::TargetKey;
 use nativelink_worker::incr_seed_fetch::{incr_seed_metrics, plan_seed_publish, seed_dest_dir};
 use nativelink_worker::portable_incr::{
     CARRIER_PRIMARY_OUTPUT_PROP, CARRIER_TARGETKEY_PROP, DEFAULT_WARM_DIR_BUDGET_BYTES,
     EvictionOutcome, ExecrootRole, PortableExecroot, PortableIncrContext, PortableIncrProvision,
-    assert_under_prefix, ensure_and_wipe_execroot_at, is_incr_seed_entry,
+    assert_under_prefix, ensure_and_wipe_execroot_at,
 };
 use nativelink_worker::local_worker::portable_incr_startup_sweep;
 use nativelink_worker::running_actions_manager::{
@@ -104,20 +104,6 @@ fn carrier_props(primary_output: &str) -> (String, HashMap<String, String>) {
         primary_output.to_string(),
     );
     (key, props)
-}
-
-// -- §7 preserve predicate ---------------------------------------------------
-
-#[nativelink_test]
-async fn is_incr_seed_entry_matches_incr_and_metadata_only() {
-    assert!(is_incr_seed_entry("libfoo-incr"), "-incr tree must be preserved");
-    assert!(
-        is_incr_seed_entry("libfoo-incr-metadata"),
-        "-incr-metadata tree must be preserved"
-    );
-    assert!(!is_incr_seed_entry("libfoo.rlib"), "outputs are not seed");
-    assert!(!is_incr_seed_entry("bazel-out"), "sources are not seed");
-    assert!(!is_incr_seed_entry("incr"), "bare 'incr' is not a seed dir");
 }
 
 // -- §4 execroot path + eligibility -----------------------------------------
@@ -390,41 +376,42 @@ async fn verify_rejects_forged_targetkey_with_matching_primary() {
     drop(plan);
 }
 
-// -- §7 wipe preserves -incr, empties the rest -------------------------------
+// -- §7 FULL-EMPTY wipe: EVERYTHING is removed, nothing preserved ------------
 
 #[nativelink_test]
-async fn wipe_preserves_incr_and_metadata_empties_rest() {
+async fn wipe_full_empty_removes_all_including_incr() {
     let (_td, root) = canonical_tempdir();
     let ctx = enabled_context(&root, &["wipe-test/"]);
     let (key, props) = carrier_props("wipe-test/uniq-w/libfoo.rlib");
     let plan = ctx.plan(&props).expect("owner");
     let execroot = root.join(&key);
 
-    // Simulate a prior build's residue in the warm execroot.
-    fs::create_dir_all(execroot.join("libfoo-incr/dep-graph")).expect("mk incr");
-    fs::write(execroot.join("libfoo-incr/dep-graph/x"), b"seed").expect("seed file");
-    fs::create_dir_all(execroot.join("libfoo-incr-metadata")).expect("mk incr-metadata");
-    fs::create_dir_all(execroot.join("bazel-out/bin")).expect("mk out");
-    fs::write(execroot.join("bazel-out/bin/libfoo.rlib"), b"stale").expect("stale output");
+    // Simulate a prior build's residue in the reused execroot — INCLUDING a
+    // nested `-incr` seed (the exact shape the chunk-2 top-level preserve missed).
+    fs::create_dir_all(execroot.join("bazel-out/cfg/bin/pkg/libfoo-incr/dep-graph"))
+        .expect("mk nested incr");
+    fs::write(
+        execroot.join("bazel-out/cfg/bin/pkg/libfoo-incr/dep-graph/x"),
+        b"seed",
+    )
+    .expect("seed file");
+    fs::create_dir_all(execroot.join("libfoo-incr")).expect("mk top-level incr");
     fs::write(execroot.join("stdout.txt"), b"junk").expect("junk file");
 
     plan.ensure_and_wipe_execroot().expect("wipe ok");
 
+    // FULL-EMPTY (§7): the execroot still exists but holds NOTHING — the `-incr`
+    // seed is NOT preserved (it is re-fetched fresh after inputs), a top-level
+    // `-incr` is gone, and every transient is gone.
+    assert!(execroot.is_dir(), "execroot itself must remain (ensured)");
+    let remaining: Vec<_> = fs::read_dir(&execroot)
+        .expect("read execroot")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
     assert!(
-        execroot.join("libfoo-incr/dep-graph/x").exists(),
-        "-incr seed tree (and its contents) MUST survive the wipe"
-    );
-    assert!(
-        execroot.join("libfoo-incr-metadata").exists(),
-        "-incr-metadata tree MUST survive the wipe"
-    );
-    assert!(
-        !execroot.join("bazel-out").exists(),
-        "non-incr output tree MUST be emptied"
-    );
-    assert!(
-        !execroot.join("stdout.txt").exists(),
-        "non-incr transient file MUST be emptied"
+        remaining.is_empty(),
+        "full-empty wipe must leave the execroot with NO children, found: {remaining:?}"
     );
     drop(plan);
 }
@@ -442,72 +429,12 @@ async fn wipe_creates_execroot_when_absent() {
     drop(plan);
 }
 
-// -- §7+B2 emergent property: -incr SURVIVES the wipe→materialize chain -------
-//
-// The whole warm-reuse benefit rests on an EMERGENT property (convergent
-// distsys MAJOR-1 / red-team A1a): after the §7 wipe leaves `-incr` in place,
-// the input-materialize step (`hardlink_directory_tree` → `try_clonefile` on
-// macOS / hardlink path on Linux) must NOT recursively clear the pre-populated
-// execroot, or it destroys the seed on EVERY build (a DARK perf regression —
-// cold-not-wrong). No test locked this chain; every other test exercises
-// `portable_incr` in isolation. This drives the REAL production materialize
-// primitive against a seed-bearing warm execroot and asserts the seed (and its
-// bytes) survive. A refactor of the materialize dst-clear to a RECURSIVE delete
-// (fs_util.rs `try_clonefile` remove_dir→remove_dir_all on macOS; the Linux
-// create_dir_all→destructive on this build box) turns this test RED.
-#[nativelink_test]
-async fn incr_seed_survives_wipe_then_materialize() {
-    let (_td, root) = canonical_tempdir();
-    let ctx = enabled_context(&root, &["materialize-test/"]);
-    let (key, props) = carrier_props("materialize-test/uniq-m/libfoo.rlib");
-    let plan = ctx.plan(&props).expect("owner");
-    let execroot = root.join(&key);
-
-    // A prior build's warm residue: a POPULATED `-incr` seed + stale outputs.
-    fs::create_dir_all(execroot.join("libfoo-incr/dep-graph")).expect("mk incr");
-    fs::write(execroot.join("libfoo-incr/dep-graph/x"), b"seed-bytes").expect("seed");
-    fs::create_dir_all(execroot.join("bazel-out/bin")).expect("mk stale out");
-    fs::write(execroot.join("bazel-out/bin/stale.rlib"), b"stale").expect("stale output");
-
-    // B1: the §7 wipe — preserves `-incr`, empties the rest. Precondition for B2:
-    // the execroot is now NON-EMPTY (it still holds `-incr`), which is exactly
-    // the state whose non-recursive dst-clear the materialize silently depends on.
-    plan.ensure_and_wipe_execroot().expect("wipe");
-    assert!(
-        execroot.join("libfoo-incr/dep-graph/x").exists(),
-        "wipe must preserve the -incr seed (B1 precondition for this test)"
-    );
-    assert!(
-        !execroot.join("bazel-out").exists(),
-        "wipe must empty the stale non-incr output tree"
-    );
-
-    // B2: materialize fresh inputs INTO the warm, seed-bearing execroot via the
-    // exact production primitive (`hardlink_directory_tree`).
-    let src = root.join("inputs-src");
-    fs::create_dir_all(src.join("bazel-out/bin")).expect("mk src");
-    fs::write(src.join("bazel-out/bin/main.rs"), b"fn main(){}").expect("input");
-    hardlink_directory_tree(&src, &execroot)
-        .await
-        .expect("materialize into the warm execroot");
-
-    // The seed AND its bytes must survive the materialize; the fresh input landed.
-    let seed = execroot.join("libfoo-incr/dep-graph/x");
-    assert!(
-        seed.exists(),
-        "-incr seed dir DESTROYED by the input materialize (dst-clear went recursive?)"
-    );
-    assert_eq!(
-        fs::read(&seed).expect("read seed"),
-        b"seed-bytes",
-        "-incr seed CONTENTS destroyed by the input materialize"
-    );
-    assert!(
-        execroot.join("bazel-out/bin/main.rs").exists(),
-        "fresh input must materialize into the warm execroot"
-    );
-    drop(plan);
-}
+// (Removed `incr_seed_survives_wipe_then_materialize`: with the FL-1383 §3
+// full-empty wipe, the `-incr` seed is fetched FRESH after input materialization
+// [B2]+[C], so the seed is never present on disk during the materialize — the
+// "survive the wipe→materialize chain" property is moot. The clonefile fast path
+// now fires on the empty execroot instead. See `wipe_full_empty_removes_all_*`
+// and `portable_action_with_seeded_index_fetches_and_materializes`.)
 
 // -- §9 delete-containment: a wipe target outside FIXED_PREFIX is refused -----
 
@@ -1171,27 +1098,29 @@ async fn portable_action_success_publishes_seed_index_and_bumps_counter() {
     let (manager, cas) =
         setup_portable_manager_with_index(ctx, index_store.clone()).await;
 
-    // The primary output must sort BEFORE the `-incr` output dir so the
-    // worker-side `TargetKey::derive` (sorted-first) agrees with the carrier — the
-    // §11 verify. (`aaa.rlib` < `zzz-incr`; note `-` < `.`, so a same-stem
-    // `<stem>-incr` sibling would sort FIRST and mis-derive — hence `zzz-incr`.)
+    // §2 exclusion at production composition: the `-incr` seed dir is a SAME-STEM
+    // sibling (`aaa-incr`) that — because `-` (0x2D) < `.` (0x2E) — would sort
+    // BEFORE `aaa.rlib` and mis-derive the key onto the config-blind `-incr` dir.
+    // The worker-side `TargetKey::derive` EXCLUDES it (basename contains `-incr`),
+    // so the derived key stays on `aaa.rlib` and agrees with the carrier — the §11
+    // verify. (Pre-fix, this required an artificially later name like `zzz-incr`.)
     let primary = "publish-wire/aaa.rlib";
     let (_key, props) = carrier_props(primary);
     let tk = TargetKey::derive(&[primary.to_string()]).expect("targetkey derives");
 
-    // A real action that SUCCEEDS and produces the primary output AND an `-incr`
+    // A real action that SUCCEEDS and produces the primary output AND its `-incr`
     // seed dir (the folder `plan_seed_publish` selects when deciding to publish).
     let command = Command {
         arguments: vec![
             "sh".to_string(),
             "-c".to_string(),
             "mkdir -p publish-wire && : > publish-wire/aaa.rlib && \
-             mkdir -p publish-wire/zzz-incr && printf seed > publish-wire/zzz-incr/dep-graph"
+             mkdir -p publish-wire/aaa-incr && printf seed > publish-wire/aaa-incr/dep-graph"
                 .to_string(),
         ],
         output_paths: vec![
             "publish-wire/aaa.rlib".to_string(),
-            "publish-wire/zzz-incr".to_string(),
+            "publish-wire/aaa-incr".to_string(),
         ],
         working_directory: ".".to_string(),
         environment_variables: vec![EnvironmentVariable {
@@ -1264,8 +1193,10 @@ async fn portable_action_success_publishes_seed_index_and_bumps_counter() {
 }
 
 /// (b) A portable action whose targetkey has a PRE-SEEDED index entry drives the
-/// `inner_prepare_action` fetch block: the `-incr` seed is materialized at
-/// `<execroot>/<stem>-incr` (the fetch call actually fired).
+/// `inner_prepare_action` fetch block: the `-incr` seed is materialized at the
+/// action's DECLARED NESTED `-incr` output path (§3 option A) — proving both that
+/// the fetch call actually fired AND that it lands at the nested declared path
+/// whose parent [C] output-dir prep created (not a top-level `<stem>-incr`).
 #[nativelink_test]
 async fn portable_action_with_seeded_index_fetches_and_materializes() {
     let (_td, root) = canonical_tempdir();
@@ -1275,8 +1206,18 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
         setup_portable_manager_with_index(ctx, index_store.clone()).await;
 
     let primary = "fetch-wire/aaa.rlib";
+    // The action's declared outputs: the `.rlib` AND its NESTED `-incr` seed dir
+    // (a sibling under the same package). `derive` excludes the `-incr` basename,
+    // so the targetkey still keys on the `.rlib` (matches `carrier_props`).
+    let incr_output = "fetch-wire/aaa-incr";
+    let output_paths = vec![primary.to_string(), incr_output.to_string()];
     let (_key, props) = carrier_props(primary);
-    let tk = TargetKey::derive(&[primary.to_string()]).expect("targetkey derives");
+    let tk = TargetKey::derive(&output_paths).expect("targetkey derives");
+    assert_eq!(
+        tk.primary_output(),
+        primary,
+        "targetkey must key on the .rlib after -incr exclusion, matching the carrier"
+    );
 
     // Pre-seed CAS with a flat `-incr` `Tree` (blake3-keyed, as the seed path
     // verifies), then pre-seed the index to point `primary` at that Tree. Using
@@ -1311,10 +1252,12 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
         .await
         .expect("pre-seed index");
 
-    // The action only needs to derive the same targetkey — a single output path.
+    // The action declares BOTH the `.rlib` and its nested `-incr` output, so the
+    // fetch's `seed_dest_dir` resolves the nested declared path and [C] creates
+    // its parent (`fetch-wire/`) before the fetch runs.
     let command = Command {
         arguments: vec!["true".to_string()],
-        output_paths: vec![primary.to_string()],
+        output_paths: output_paths.clone(),
         working_directory: ".".to_string(),
         environment_variables: vec![EnvironmentVariable {
             name: "PATH".to_string(),
@@ -1329,10 +1272,15 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
         .await
         .expect("portable action admitted");
     // The execroot IS the byte-identical work dir; the fetch materializes the
-    // seed at `<execroot>/<stem>-incr`.
+    // seed at the DECLARED NESTED `-incr` output joined onto the execroot.
     let execroot = action.get_work_directory().to_string();
-    let dest = seed_dest_dir(Path::new(&execroot), tk.primary_output())
-        .expect("seed dest for primary output");
+    let dest = seed_dest_dir(Path::new(&execroot), &output_paths)
+        .expect("seed dest from the declared nested -incr output");
+    assert_eq!(
+        dest,
+        Path::new(&execroot).join(incr_output),
+        "seed dest must be the nested declared -incr output, not a top-level <stem>-incr"
+    );
 
     action
         .clone()
@@ -1342,9 +1290,9 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
 
     assert!(
         dest.join("dep-graph.bin").exists(),
-        "inner_prepare_action MUST call fetch_and_materialize_seed after the wipe: a pre-seeded \
+        "inner_prepare_action MUST call fetch_and_materialize_seed after [B2]+[C]: a pre-seeded \
          index hit should materialize the `-incr` tree into {} — its absence means the fetch \
-         call-site never fired",
+         call-site never fired (or the nested parent was not created)",
         dest.display(),
     );
     assert_eq!(
