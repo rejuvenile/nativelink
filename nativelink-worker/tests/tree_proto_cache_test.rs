@@ -210,6 +210,7 @@ fn make_test_action(manager: Arc<RunningActionsManagerImpl>) -> Arc<RunningActio
         manager,
         None,
         None,
+        None, // FL-1383 chunk 2b: no portable execroot (normal path)
     ))
 }
 

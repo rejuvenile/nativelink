@@ -6994,11 +6994,12 @@ pub async fn new_local_worker(
     // no filesystem touch). When on, this ONLY provisions FIXED_PREFIX + asserts
     // the host-provisioning invariants and gates; on any assert failure it logs
     // loudly and leaves the feature DISABLED (the worker is NOT panicked). The
-    // execution-path rewire (make_action_directory → <FIXED_PREFIX>/<targetkey>,
-    // chdir, wipe, lease) that CONSUMES this provision is chunk 2b —
-    // TODO(#FL-1383). Runs AFTER work_directory exists so the EXDEV probe can
-    // hardlink FIXED_PREFIX → execroot volume.
-    let _portable_incr_provision = crate::portable_incr::provision_and_assert(
+    // execution-path rewire that CONSUMES this provision is chunk 2b: the
+    // returned provision is folded into a `PortableIncrContext` and installed on
+    // the RunningActionsManagerImpl via `set_portable_incr` below. Runs AFTER
+    // work_directory exists so the EXDEV probe can hardlink FIXED_PREFIX →
+    // execroot volume.
+    let portable_incr_provision = crate::portable_incr::provision_and_assert(
         config.portable_incr.enabled,
         config
             .portable_incr_fixed_prefix
@@ -7011,6 +7012,13 @@ pub async fn new_local_worker(
         std::path::Path::new(&config.work_directory),
     )
     .await;
+    // FL-1383 chunk 2b: `Some` ONLY when the feature is enabled AND every §12
+    // assert passed — `None` on the entire live fleet (the INERT gate). Installed
+    // on the manager below.
+    let portable_incr_context = crate::portable_incr::PortableIncrContext::from_provision(
+        portable_incr_provision,
+        config.portable_incr.clone(),
+    );
 
     let entrypoint = if config.entrypoint.is_empty() {
         None
@@ -7334,8 +7342,8 @@ pub async fn new_local_worker(
         .cas_server_port
         .map(|port| cas_advertised_endpoint(port, use_tls))
         .unwrap_or_default();
-    let running_actions_manager =
-        Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+    let mut running_actions_manager_impl =
+        RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: config.work_directory.clone(),
             execution_configuration: ExecutionConfiguration {
                 entrypoint,
@@ -7354,7 +7362,12 @@ pub async fn new_local_worker(
             metrics: Some(ac_publish_metrics.clone()),
             cas_endpoint: running_actions_cas_endpoint,
             deferred_output_uploads_enabled: config.deferred_output_uploads_enabled,
-        })?);
+        })?;
+    // FL-1383 chunk 2b: install the portable-incr context (INERT `None` on the
+    // fleet) BEFORE Arc-wrapping so the ~55 Args construction sites stay
+    // untouched. See `RunningActionsManagerImpl::set_portable_incr`.
+    running_actions_manager_impl.set_portable_incr(portable_incr_context);
+    let running_actions_manager = Arc::new(running_actions_manager_impl);
 
     // Set up BlobsAvailable reporting with drain-then-fire semantics.
     // The send loop wakes immediately on blob insert/eviction via Notify,

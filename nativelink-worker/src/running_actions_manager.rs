@@ -4522,6 +4522,12 @@ async fn do_cleanup(
     operation_id: &OperationId,
     action_directory: &str,
     direct_use_pin: Option<(DigestInfo, crate::directory_cache::DirectoryCachePinGuard)>,
+    // FL-1383 chunk 2b: a portable-incr CONTENDER's isolated execroot to
+    // cold-discard (design §9), paired with FIXED_PREFIX for the containment
+    // gate. `None` for a normal action AND for a portable OWNER (whose warm
+    // `<FIXED_PREFIX>/<targetkey>` is PRESERVED across builds — never deleted by
+    // cleanup). On the fleet this is always `None` → cleanup is unchanged.
+    portable_discard: Option<(PathBuf, PathBuf)>,
 ) -> Result<(), Error> {
     // Mark this operation as being cleaned up
     let Some(_cleaning_guard) = running_actions_manager.perform_cleanup(operation_id.clone())
@@ -4581,11 +4587,39 @@ async fn do_cleanup(
     // semantics. #57 §3 Choice A.
     drop(direct_use_pin);
 
+    // FL-1383 chunk 2b: cold-discard a CONTENDER's isolated execroot (design
+    // §9). Confined to a subtree of FIXED_PREFIX FIRST (`assert_under_prefix`),
+    // then deleted through the same bounded-delete throttle as the action
+    // directory (`CLEANUP_DELETE_INFLIGHT_CAP`) so it cannot escape the prefix
+    // nor saturate the blocking pool. `None` on the fleet → skipped entirely.
+    // An OWNER's warm dir is NEVER here, so it is never deleted.
+    let portable_discard_result = if let Some((isolated_dir, fixed_prefix)) = portable_discard {
+        match crate::portable_incr::assert_under_prefix(&isolated_dir, &fixed_prefix) {
+            Ok(()) => {
+                let dir_str = isolated_dir.to_string_lossy();
+                bounded_remove_dir_all(&dir_str).await.err_tip(|| {
+                    format!(
+                        "FL-1383 portable_incr contender discard {}",
+                        isolated_dir.display()
+                    )
+                })
+            }
+            Err(err) => Err(err).err_tip(|| "FL-1383 portable_incr contender discard containment"),
+        }
+    } else {
+        Ok(())
+    };
+
     if let Err(err) = running_actions_manager.cleanup_action(operation_id) {
         error!(%operation_id, ?err, "Error cleaning up action");
-        Result::<(), Error>::Err(err).merge(remove_dir_result)
+        Result::<(), Error>::Err(err)
+            .merge(remove_dir_result)
+            .merge(portable_discard_result)
     } else if let Err(err) = remove_dir_result {
         error!(%operation_id, ?err, "Error removing working directory");
+        Result::<(), Error>::Err(err).merge(portable_discard_result)
+    } else if let Err(err) = portable_discard_result {
+        error!(%operation_id, ?err, "FL-1383 portable_incr: error discarding contender execroot");
         Err(err)
     } else {
         Ok(())
@@ -4784,9 +4818,18 @@ pub struct RunningActionImpl {
     /// is dropped when `RunningActionImpl` drops — on success, error,
     /// cancel, or panic — so no process-wide leak class exists.
     tree_proto_cache: Mutex<HashMap<DigestInfo, ProtoTree>>,
+    /// FL-1383 chunk 2b: the byte-identical portable execroot plan for this
+    /// action (design §4/§5). `Some` ONLY for an enabled+allowlisted
+    /// portable-incr action (so `None` on the entire fleet — INERT). When
+    /// `Some`, `work_directory` is the execroot itself (NO `/work` segment) and
+    /// the input materialise wipes-preserving-`-incr` instead of `create_dir`.
+    /// Holds the §5 ownership lease (released on this action's Drop) and drives
+    /// the §9 contender cold-discard in `do_cleanup`.
+    portable_execroot: Option<crate::portable_incr::PortableExecroot>,
 }
 
 impl RunningActionImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_metadata: ExecutionMetadata,
         operation_id: OperationId,
@@ -4796,8 +4839,16 @@ impl RunningActionImpl {
         running_actions_manager: Arc<RunningActionsManagerImpl>,
         pre_resolved_tree: Option<HashMap<DigestInfo, ProtoDirectory>>,
         server_missing_digests: Option<HashSet<DigestInfo>>,
+        portable_execroot: Option<crate::portable_incr::PortableExecroot>,
     ) -> Self {
-        let work_directory = format!("{}/{}", action_directory, "work");
+        // FL-1383 chunk 2b: an allowlisted portable-incr action drops the
+        // `/work` segment — its build cwd IS the byte-identical execroot
+        // `<FIXED_PREFIX>/<targetkey>` (design §4). Every other action (the whole
+        // fleet) keeps the current `<action_directory>/work` work dir, unchanged.
+        let work_directory = match &portable_execroot {
+            Some(plan) => plan.execroot().to_string_lossy().into_owned(),
+            None => format!("{}/{}", action_directory, "work"),
+        };
         let (kill_channel_tx, kill_channel_rx) = oneshot::channel();
         Self {
             operation_id,
@@ -4837,6 +4888,9 @@ impl RunningActionImpl {
             // #O3/O13 per-action Tree-proto cache: lifetime = this action.
             // Drop fires on every termination path so no leak class exists.
             tree_proto_cache: Mutex::new(HashMap::new()),
+            // FL-1383 chunk 2b: `None` on the fleet (INERT); `Some` holds the
+            // §5 ownership lease for the action's lifetime.
+            portable_execroot,
         }
     }
 
@@ -4968,9 +5022,18 @@ impl RunningActionImpl {
         // work_directory is a symlink created by get_or_create_direct before [C]
         // runs. [C] is created in the shared post-block below in BOTH modes.
         let command_digest = self.action_info.command_digest;
-        let is_direct_use = self.running_actions_manager.directory_cache
-            .as_ref()
-            .map_or(false, |c| c.is_direct_use_mode());
+        // FL-1383 chunk 2b: an allowlisted portable-incr action must take the
+        // NORMAL (non-direct-use) path — direct-use symlinks `work_directory`
+        // into the DirectoryCache, but a portable action's `work_directory` IS
+        // the real byte-identical execroot that rustc realpaths (design §7:
+        // "direct_use OFF by construction for allowlisted actions"). `None` on
+        // the fleet → this conjunct is a no-op and `is_direct_use` is unchanged.
+        let is_direct_use = self.portable_execroot.is_none()
+            && self
+                .running_actions_manager
+                .directory_cache
+                .as_ref()
+                .map_or(false, |c| c.is_direct_use_mode());
 
         // Calibration probe P-A: sink for the staged input-tree bytes, written
         // by `download_to_directory` on the fallback path and carried into
@@ -5068,14 +5131,54 @@ impl RunningActionImpl {
             })
             .await?;
 
-            // [B1]: Create the (empty) work_directory before [B2] materialises
-            // into it. [B2]'s clonefile(2) fast path (macOS) removes this empty
-            // dir and re-creates it as the CoW clone root; a non-empty dir would
-            // preempt clonefile (see #clonefile-fallback note above).
-            info!(%operation_id, "inner_prepare_action: creating work_directory [B1]");
-            fs::create_dir(&self.work_directory)
+            // [B1]: Establish the (empty-of-transient-state) work_directory
+            // before [B2] materialises into it.
+            //
+            // FL-1383 chunk 2b: a portable-incr action's work_directory IS the
+            // shared byte-identical execroot `<FIXED_PREFIX>/<targetkey>`, which
+            // PERSISTS across builds (its `-incr` seed is the whole point). So
+            // instead of `create_dir` (which would EEXIST on Owner reuse) we
+            // ensure-exists-then-content-empty it PRESERVING `-incr` /
+            // `-incr-metadata` (design §7), with the delete confined to a subtree
+            // of FIXED_PREFIX (design §9). The Command was fetched above, so we
+            // FIRST integrity-verify the worker-derived targetkey against the
+            // carrier (design §11 item 1); a mismatch fails loud (the carrier
+            // does not describe this Command's outputs). `None` on the fleet →
+            // the plain `create_dir` path below, byte-for-byte unchanged.
+            if let Some(plan) = self.portable_execroot.as_ref() {
+                plan.verify_against_command_outputs(&cmd.output_paths)
+                    .err_tip(|| "FL-1383 portable_incr worker-side targetkey verify")?;
+                info!(
+                    %operation_id,
+                    execroot = %self.work_directory,
+                    "inner_prepare_action: portable-incr execroot ensure+wipe (preserve -incr) [B1]"
+                );
+                let execroot = PathBuf::from(&self.work_directory);
+                let fixed_prefix = plan.fixed_prefix().to_path_buf();
+                // Blocking mkdir/readdir/unlink → spawn_blocking so the tokio
+                // worker is never blocked (no fsync/sync-write anywhere).
+                tokio::task::spawn_blocking(move || {
+                    crate::portable_incr::ensure_and_wipe_execroot_at(&execroot, &fixed_prefix)
+                })
                 .await
-                .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
+                .err_tip(|| "portable_incr execroot ensure+wipe task join")??;
+                // TODO(#FL-1383): chunk 3 plugs the OUT-OF-BAND seed fetch in
+                // HERE — after the wipe-preserving-`-incr` and BEFORE [B2] input
+                // materialise: fetch the fleet-shared `-incr` seed from the
+                // `incr_seed_index` (design §6.3) and materialise it at the
+                // execroot so the REMOTE branch also reuses. 2b establishes the
+                // byte-identical path + the wipe-that-keeps-`-incr`; same-machine
+                // warm reuse already works from the preserved local seed.
+            } else {
+                // Normal mode: create the (empty) work_directory. [B2]'s
+                // clonefile(2) fast path (macOS) removes this empty dir and
+                // re-creates it as the CoW clone root; a non-empty dir would
+                // preempt clonefile (see #clonefile-fallback note above).
+                info!(%operation_id, "inner_prepare_action: creating work_directory [B1]");
+                fs::create_dir(&self.work_directory)
+                    .await
+                    .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
+            }
             // Mark cleanup needed once the directory exists.
             self.did_cleanup.store(false, Ordering::Release);
 
@@ -6449,9 +6552,17 @@ impl Drop for RunningActionImpl {
         // Take the direct_use_pin (digest + guard) from state so the guard's
         // sync Drop releases the cache ref_count when do_cleanup completes.
         let direct_use_pin = self.state.lock().direct_use_pin.take();
+        // FL-1383 chunk 2b: a portable-incr CONTENDER's isolated execroot to
+        // cold-discard (design §9); `None` for an OWNER (preserved) and on the
+        // whole fleet. The ownership lease itself releases when `self` (holding
+        // `portable_execroot`) finishes dropping.
+        let portable_discard = self
+            .portable_execroot
+            .as_ref()
+            .and_then(crate::portable_incr::PortableExecroot::contender_discard_target);
         background_spawn!("running_action_impl_drop", async move {
             let Err(err) =
-                do_cleanup(&running_actions_manager, &operation_id, &action_directory, direct_use_pin).await
+                do_cleanup(&running_actions_manager, &operation_id, &action_directory, direct_use_pin, portable_discard).await
             else {
                 return;
             };
@@ -6666,11 +6777,19 @@ impl RunningAction for RunningActionImpl {
             .cleanup
             .wrap(async move {
                 let direct_use_pin = self.state.lock().direct_use_pin.take();
+                // FL-1383 chunk 2b: cold-discard a CONTENDER's isolated execroot
+                // (design §9); `None` for an OWNER (warm dir preserved) and on
+                // the whole fleet.
+                let portable_discard = self
+                    .portable_execroot
+                    .as_ref()
+                    .and_then(crate::portable_incr::PortableExecroot::contender_discard_target);
                 let result = do_cleanup(
                     &self.running_actions_manager,
                     &self.operation_id,
                     &self.action_directory,
                     direct_use_pin,
+                    portable_discard,
                 )
                 .await;
                 self.has_manager_entry.store(false, Ordering::Release);
@@ -7490,6 +7609,13 @@ pub struct RunningActionsManagerImpl {
     /// local fast store only and defers the remote slow-store upload to
     /// `spawn_upload_to_remote`.  `false` = current synchronous behavior.
     deferred_output_uploads_enabled: bool,
+    /// FL-1383 chunk 2b: worker-side portable rustc-incremental context. `Some`
+    /// ONLY when the worker gate is enabled AND the chunk-2a §12 startup asserts
+    /// passed (set via [`Self::set_portable_incr`] from `new_local_worker`), so
+    /// it is `None` on the entire live fleet — the single INERT gate for the
+    /// execroot rewire. When `None`, `plan_portable_execroot` returns `None` and
+    /// every action takes the byte-identical current path.
+    portable_incr: Option<crate::portable_incr::PortableIncrContext>,
 }
 
 impl RunningActionsManagerImpl {
@@ -7556,7 +7682,38 @@ impl RunningActionsManagerImpl {
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
             deferred_output_uploads_enabled: args.deferred_output_uploads_enabled,
+            // INERT by default; the production path sets this via
+            // `set_portable_incr` before Arc-wrapping (so the ~55 Args
+            // construction sites — all in tests — stay untouched and remain
+            // INERT). See FL-1383 chunk 2b.
+            portable_incr: None,
         })
+    }
+
+    /// FL-1383 chunk 2b: install the worker-side portable rustc-incremental
+    /// context (design §4/§5/§7). Called once from `new_local_worker` BEFORE the
+    /// manager is `Arc`-wrapped. `ctx` is `Some` only when the feature is enabled
+    /// AND the chunk-2a §12 asserts passed; `None` (the fleet default) leaves the
+    /// execroot rewire fully INERT.
+    pub fn set_portable_incr(
+        &mut self,
+        ctx: Option<crate::portable_incr::PortableIncrContext>,
+    ) {
+        self.portable_incr = ctx;
+    }
+
+    /// FL-1383 chunk 2b: plan the byte-identical execroot for one action from
+    /// its carrier Platform properties (design §4/§5). Returns `None` — the
+    /// NORMAL path, byte-for-byte today's behavior — when the feature is INERT
+    /// (`portable_incr` is `None`, the whole fleet) or the action is not an
+    /// enabled+allowlisted portable-incr action. No filesystem work here.
+    fn plan_portable_execroot(
+        &self,
+        action_info: &ActionInfo,
+    ) -> Option<crate::portable_incr::PortableExecroot> {
+        self.portable_incr
+            .as_ref()?
+            .plan(&action_info.platform_properties)
     }
 
     pub fn new(args: RunningActionsManagerArgs<'_>) -> Result<Self, Error> {
@@ -8868,6 +9025,11 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                         self.max_action_timeout.as_secs_f32()
                     ));
                 }
+                // FL-1383 chunk 2b: plan the byte-identical execroot from the
+                // carrier Platform properties (available in `action_info` before
+                // the Command is fetched). `None` on the fleet → NORMAL path.
+                // Computed BEFORE `action_info` is moved into the action.
+                let portable_execroot = self.plan_portable_execroot(&action_info);
                 let running_action = Arc::new(RunningActionImpl::new(
                     execution_metadata,
                     operation_id.clone(),
@@ -8877,6 +9039,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                     self.clone(),
                     pre_resolved_tree,
                     server_missing_digests,
+                    portable_execroot,
                 ));
                 {
                     let mut running_actions = self.running_actions.lock();
