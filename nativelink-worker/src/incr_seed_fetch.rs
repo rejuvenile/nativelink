@@ -1,0 +1,1022 @@
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    See LICENSE file for details
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! FL-1383 portable rustc-incremental — worker out-of-band `-incr` seed fetch +
+//! materialize (design `docs/portable-rustc-incremental-v4.md` §6.3, §3b, §7).
+//!
+//! This is the pure fetch+materialize step: given a [`TargetKey`], look the
+//! current `-incr` seed up in the fleet-shared mutable **index** (an AC-shaped
+//! store on the `incr_seed_index` instance), verify it is not a blake3
+//! collision, read the referenced REAPI [`Tree`] from the **main CAS**, and
+//! materialize the `-incr` directory tree at a caller-supplied destination —
+//! verifying every file blob's digest as it is written, and never leaving a
+//! partial directory behind on any failure.
+//!
+//! Everything here is **best-effort with a bounded index timeout** (§6.2): a
+//! slow or absent index, an evicted seed, a collision, or a corrupt blob all
+//! resolve to a *cold* outcome ([`SeedOutcome::NoSeed`] / [`SeedOutcome::Collision`]
+//! / [`SeedOutcome::TimedOut`]) — never a wrong seed and never a build stall.
+//! rustc's per-query fingerprint re-validation is the correctness floor (§6.4):
+//! a stale/torn/wrong seed re-validates to a cold compile, never a wrong
+//! `.rlib`.
+//!
+//! TODO(#FL-1383): this function is wired into the execroot setup by chunk 2b /
+//! a follow-on — call it before rustc, after the non-`-incr` wipe (§7): the
+//! caller wipes non-`-incr` state and preserves `-incr`; this function's job is
+//! only to (re)materialize the `-incr` dir at the pinned path, and to map the
+//! returned [`SeedOutcome`] into the registered worker metrics
+//! (`incr_seed_materialized` / `incr_reuse_fired` / `incr_seed_present_but_cold`,
+//! and the `incr_index_fetch_{hit,miss,timeout,error}` family — see the
+//! `emit_counter` markers below).
+
+use core::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use bytes::Bytes;
+use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_proto::build::bazel::remote::execution::v2::{ActionResult, Directory, Tree};
+use nativelink_store::ac_utils::get_and_decode_digest;
+use nativelink_util::common::DigestInfo;
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+use nativelink_util::targetkey::TargetKey;
+use prost::Message;
+use tracing::{debug, warn};
+
+/// The index-AC key preimage prefix (design §3b, KAT-locked). The index digest
+/// is `blake3_hex(INDEX_KEY_PREFIX ++ targetkey.key())` with `size_bytes` equal
+/// to the preimage length (`22 + 64 = 86` for a v1 64-hex key). `v1:` is the
+/// rotation knob.
+const INDEX_KEY_PREFIX: &str = "fl-incr-seed-index:v1:";
+
+/// The outcome of a seed fetch+materialize attempt.
+///
+/// Every non-[`Materialized`](SeedOutcome::Materialized) variant is a *cold*
+/// build signal: correct, just without incremental reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeedOutcome {
+    /// The `-incr` directory was materialized at the destination and every file
+    /// blob's digest verified. Carries the REAPI `Tree` digest that was
+    /// materialized (for the §10 residency-gossip hook and observability).
+    Materialized {
+        /// The blake3 digest of the REAPI `Tree` proto that was materialized.
+        tree_digest: DigestInfo,
+    },
+    /// No usable seed: the index had no entry, the entry was malformed, the
+    /// referenced `Tree`/blob was evicted or corrupt, or a digest mismatch was
+    /// detected. Cold build; no partial directory left behind.
+    NoSeed,
+    /// The index entry's `OutputDirectory.path` did not match this action's
+    /// primary output — a blake3 key collision (§3b). Never reused; cold build.
+    Collision,
+    /// The bounded index fetch did not complete within the caller's timeout
+    /// (§6.2). Cold build; a slow/absent index must never stall.
+    TimedOut,
+}
+
+/// Fetch the current `-incr` seed for `targetkey` from the fleet-shared index
+/// and materialize it at `dest_incr_dir`.
+///
+/// - `index_store`: the AC-shaped mutable index (`incr_seed_index` instance).
+/// - `cas_store`: the main content-addressed CAS (`main` instance) holding the
+///   REAPI `Tree` and its file blobs.
+/// - `targetkey`: the portable target identity (design §3).
+/// - `dest_incr_dir`: where the `-incr` directory tree is materialized. On
+///   success it is atomically replaced (tmp-then-rename); on any failure it is
+///   left untouched and no partial temp directory survives.
+/// - `timeout`: bounds *only* the index `GetActionResult` (§6.2) — a slow or
+///   absent index resolves to [`SeedOutcome::TimedOut`] rather than stalling.
+///
+/// Errors are reserved for genuinely unexpected internal failures (a blocking
+/// join failure, or an inability to clean up a partial temp directory — which
+/// would leak disk). All *data* problems (missing/corrupt/collided seed) are
+/// reported as a cold [`SeedOutcome`], never an `Err`, so the caller can always
+/// proceed with a cold build.
+pub async fn fetch_and_materialize_seed(
+    index_store: &Store,
+    cas_store: &Store,
+    targetkey: &TargetKey,
+    dest_incr_dir: &Path,
+    timeout: Duration,
+) -> Result<SeedOutcome, Error> {
+    let index_digest = index_action_digest(targetkey);
+
+    // §6.2: bound ONLY the index fetch. `GrpcStore` has timeout=0 (internal-RPC
+    // policy, invariant #10), so a slow/absent index would otherwise stall the
+    // build. A NotFound / decode-error / timeout is a cold outcome, never an
+    // error.
+    let action_result = match tokio::time::timeout(
+        timeout,
+        get_and_decode_digest::<ActionResult>(index_store, StoreKey::Digest(index_digest)),
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            emit_counter("incr_index_fetch_timeout");
+            debug!(
+                targetkey = targetkey.key(),
+                "incr seed index fetch timed out"
+            );
+            return Ok(SeedOutcome::TimedOut);
+        }
+        Ok(Err(err)) if err.code == Code::NotFound => {
+            emit_counter("incr_index_fetch_miss");
+            debug!(targetkey = targetkey.key(), "incr seed index miss");
+            return Ok(SeedOutcome::NoSeed);
+        }
+        Ok(Err(err)) => {
+            emit_counter("incr_index_fetch_error");
+            warn!(
+                targetkey = targetkey.key(),
+                ?err,
+                "incr seed index fetch errored; treating as cold"
+            );
+            return Ok(SeedOutcome::NoSeed);
+        }
+        Ok(Ok(action_result)) => {
+            emit_counter("incr_index_fetch_hit");
+            action_result
+        }
+    };
+
+    // §3b: the index value is an ActionResult whose single output_directories[0]
+    // references the current `-incr` Tree. A malformed value is cold.
+    let Some(output_dir) = action_result.output_directories.into_iter().next() else {
+        warn!(
+            targetkey = targetkey.key(),
+            "incr seed index entry has no output_directories; treating as cold"
+        );
+        return Ok(SeedOutcome::NoSeed);
+    };
+
+    // §3b: blake3-collision guard — a different primary output under the same
+    // key MUST NOT be reused. Cold, never wrong.
+    if output_dir.path != targetkey.primary_output() {
+        emit_counter("incr_seed_collision");
+        warn!(
+            targetkey = targetkey.key(),
+            index_path = output_dir.path,
+            primary_output = targetkey.primary_output(),
+            "incr seed index path mismatch (blake3 collision); refusing reuse"
+        );
+        return Ok(SeedOutcome::Collision);
+    }
+
+    let Some(tree_digest_proto) = output_dir.tree_digest else {
+        warn!(
+            targetkey = targetkey.key(),
+            "incr seed index OutputDirectory missing tree_digest; treating as cold"
+        );
+        return Ok(SeedOutcome::NoSeed);
+    };
+    let tree_digest = match DigestInfo::try_from(&tree_digest_proto) {
+        Ok(digest) => digest,
+        Err(err) => {
+            warn!(
+                targetkey = targetkey.key(),
+                ?err,
+                "incr seed index tree_digest invalid; treating as cold"
+            );
+            return Ok(SeedOutcome::NoSeed);
+        }
+    };
+
+    materialize_tree(cas_store, targetkey, &tree_digest, dest_incr_dir).await
+}
+
+/// Derive the index-AC [`DigestInfo`] for `targetkey` (design §3b).
+///
+/// `hash = blake3(INDEX_KEY_PREFIX ++ targetkey.key())`, `size_bytes =
+/// len(preimage)`. Hashing the preimage bytes makes the hasher's tracked size
+/// equal to the preimage length, so the produced `DigestInfo` size is exactly
+/// the contract's `size_bytes`.
+fn index_action_digest(targetkey: &TargetKey) -> DigestInfo {
+    let mut preimage = String::with_capacity(INDEX_KEY_PREFIX.len() + targetkey.key().len());
+    preimage.push_str(INDEX_KEY_PREFIX);
+    preimage.push_str(targetkey.key());
+    let mut hasher = DigestHasherFunc::Blake3.hasher();
+    hasher.update(preimage.as_bytes());
+    hasher.finalize_digest()
+}
+
+/// Fetch the REAPI `Tree` and materialize it at `dest_incr_dir`, verifying each
+/// file blob's digest (§3b/§7). Any missing/corrupt content or digest mismatch
+/// resolves to a cold [`SeedOutcome::NoSeed`] with no partial directory left.
+async fn materialize_tree(
+    cas_store: &Store,
+    targetkey: &TargetKey,
+    tree_digest: &DigestInfo,
+    dest_incr_dir: &Path,
+) -> Result<SeedOutcome, Error> {
+    // Read the Tree proto from the main CAS. An evicted/dangling Tree (the
+    // §6.1 CompletenessChecking / §6.5 eviction case) surfaces here as
+    // NotFound → cold.
+    let tree: Tree =
+        match get_and_decode_digest::<Tree>(cas_store, StoreKey::Digest(*tree_digest)).await {
+            Ok(tree) => tree,
+            Err(err) => {
+                emit_counter("incr_seed_present_but_cold");
+                warn!(
+                    targetkey = targetkey.key(),
+                    ?tree_digest,
+                    ?err,
+                    "incr seed Tree unreadable (evicted/corrupt); treating as cold"
+                );
+                return Ok(SeedOutcome::NoSeed);
+            }
+        };
+
+    // Plan the tree structure entirely in memory (no store I/O): the directory
+    // creation order (parents before children) and the per-file blob digests.
+    // A structurally-broken or cyclic tree is cold.
+    let Some(root) = tree.root else {
+        warn!(
+            targetkey = targetkey.key(),
+            "incr seed Tree has no root; treating as cold"
+        );
+        return Ok(SeedOutcome::NoSeed);
+    };
+    let plan = match build_materialize_plan(&root, &tree.children) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            warn!(
+                targetkey = targetkey.key(),
+                reason, "incr seed Tree malformed; treating as cold"
+            );
+            return Ok(SeedOutcome::NoSeed);
+        }
+    };
+
+    // A unique sibling temp directory in dest's parent, so the final swap is an
+    // atomic same-filesystem rename and no partial dir is ever visible at dest.
+    let temp_dir = match sibling_temp_dir(dest_incr_dir) {
+        Some(temp_dir) => temp_dir,
+        None => {
+            warn!(
+                targetkey = targetkey.key(),
+                ?dest_incr_dir,
+                "incr seed dest has no parent directory; treating as cold"
+            );
+            return Ok(SeedOutcome::NoSeed);
+        }
+    };
+
+    // Create the temp root + the full directory skeleton in one blocking hop.
+    if let Err(err) = create_skeleton(temp_dir.clone(), plan.dirs.clone()).await {
+        // Best-effort cleanup: the temp root may or may not exist yet.
+        let _unused_cleanup = remove_dir_all(temp_dir.clone()).await;
+        warn!(
+            targetkey = targetkey.key(),
+            ?err,
+            "incr seed skeleton creation failed; treating as cold"
+        );
+        return Ok(SeedOutcome::NoSeed);
+    }
+
+    // Fetch + verify + write each file. One blob is resident at a time (memory
+    // bounded to the largest single file, not the whole seed). Any fetch error
+    // or digest mismatch → cold, after wiping the temp tree.
+    for file in &plan.files {
+        match fetch_and_write_file(cas_store, &temp_dir, file).await {
+            Ok(()) => {}
+            Err(FileMaterializeError::Cold(reason)) => {
+                cleanup_or_err(&temp_dir).await?;
+                emit_counter("incr_seed_present_but_cold");
+                warn!(
+                    targetkey = targetkey.key(),
+                    reason,
+                    rel_path = %file.rel_path.display(),
+                    "incr seed file materialization cold; wiped partial temp dir"
+                );
+                return Ok(SeedOutcome::NoSeed);
+            }
+            Err(FileMaterializeError::Internal(err)) => {
+                cleanup_or_err(&temp_dir).await?;
+                return Err(err).err_tip(|| "In incr_seed_fetch::materialize_tree");
+            }
+        }
+    }
+
+    // Atomically install the completed tree at the destination.
+    if let Err(err) = swap_into_place(temp_dir.clone(), dest_incr_dir.to_path_buf()).await {
+        let _unused_cleanup = remove_dir_all(temp_dir).await;
+        return Err(err).err_tip(|| "In incr_seed_fetch::materialize_tree swap");
+    }
+
+    emit_counter("incr_seed_materialized");
+    debug!(
+        targetkey = targetkey.key(),
+        ?tree_digest,
+        dirs = plan.dirs.len(),
+        files = plan.files.len(),
+        "incr seed materialized"
+    );
+    Ok(SeedOutcome::Materialized {
+        tree_digest: *tree_digest,
+    })
+}
+
+/// A single file to materialize: its path relative to the seed root, the
+/// expected blake3 digest of its content, and its executable bit.
+struct PlannedFile {
+    rel_path: PathBuf,
+    digest: DigestInfo,
+    is_executable: bool,
+}
+
+/// The in-memory materialization plan: directories to create (parents first)
+/// and files to fetch+write.
+struct MaterializePlan {
+    dirs: Vec<PathBuf>,
+    files: Vec<PlannedFile>,
+}
+
+/// Walk the `Tree` (root + digest-keyed children) into a flat
+/// [`MaterializePlan`], validating names, structural completeness and acyclicity
+/// as it goes. Returns a static reason string on any malformation (→ cold).
+///
+/// Children are keyed by the blake3 digest of their encoded proto (matching how
+/// `DirectoryNode.digest` references them). Symlinks are rejected: an `-incr`
+/// seed is symlink-free by construction, and refusing them keeps the
+/// materialized tree free of symlink-injection surface (§9).
+fn build_materialize_plan(
+    root: &Directory,
+    children: &[Directory],
+) -> Result<MaterializePlan, &'static str> {
+    // Map each child directory by its content digest (blake3 of encoded proto).
+    let mut by_digest: HashMap<DigestInfo, &Directory> = HashMap::with_capacity(children.len());
+    for child in children {
+        let mut hasher = DigestHasherFunc::Blake3.hasher();
+        hasher.update(&child.encode_to_vec());
+        by_digest.insert(hasher.finalize_digest(), child);
+    }
+
+    let mut plan = MaterializePlan {
+        dirs: Vec::new(),
+        files: Vec::new(),
+    };
+
+    // Explicit-stack DFS with Enter/Exit frames maintaining the set of digests
+    // on the CURRENT path (`ancestors`). A digest reappearing on its own path
+    // is a cycle (cryptographically impossible with honest content digests, but
+    // defended: a corrupt/adversarial Tree would otherwise loop forever). A
+    // digest reappearing OFF the current path (a legitimate diamond — two
+    // parents referencing an identical-content child) is materialized at each
+    // location.
+    enum Frame<'a> {
+        Enter {
+            dir: &'a Directory,
+            rel: PathBuf,
+            digest: Option<DigestInfo>,
+        },
+        Exit(DigestInfo),
+    }
+    let mut ancestors: HashSet<DigestInfo> = HashSet::new();
+    let mut stack: Vec<Frame<'_>> = vec![Frame::Enter {
+        dir: root,
+        rel: PathBuf::new(),
+        digest: None,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Exit(digest) => {
+                ancestors.remove(&digest);
+            }
+            Frame::Enter { dir, rel, digest } => {
+                if let Some(digest) = digest {
+                    if !ancestors.insert(digest) {
+                        return Err("tree contains a directory cycle");
+                    }
+                    stack.push(Frame::Exit(digest));
+                }
+                if !dir.symlinks.is_empty() {
+                    return Err("tree contains symlinks");
+                }
+                for file in &dir.files {
+                    validate_component(&file.name)?;
+                    let digest_proto = file.digest.as_ref().ok_or("file node missing digest")?;
+                    let file_digest = DigestInfo::try_from(digest_proto)
+                        .map_err(|_| "file node digest invalid")?;
+                    plan.files.push(PlannedFile {
+                        rel_path: rel.join(&file.name),
+                        digest: file_digest,
+                        is_executable: file.is_executable,
+                    });
+                }
+                for node in &dir.directories {
+                    validate_component(&node.name)?;
+                    let digest_proto = node
+                        .digest
+                        .as_ref()
+                        .ok_or("directory node missing digest")?;
+                    let child_digest = DigestInfo::try_from(digest_proto)
+                        .map_err(|_| "directory node digest invalid")?;
+                    let child = by_digest
+                        .get(&child_digest)
+                        .ok_or("tree missing referenced child directory")?;
+                    let child_rel = rel.join(&node.name);
+                    plan.dirs.push(child_rel.clone());
+                    stack.push(Frame::Enter {
+                        dir: child,
+                        rel: child_rel,
+                        digest: Some(child_digest),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+/// Reject path components that could escape the seed root or follow a link:
+/// empty, `.`, `..`, or anything containing a path separator or NUL.
+fn validate_component(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("invalid path component");
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err("path component contains a separator or NUL");
+    }
+    Ok(())
+}
+
+/// A unique sibling temp directory name in `dest`'s parent (same filesystem →
+/// the final rename is atomic). Returns `None` if `dest` has no parent.
+fn sibling_temp_dir(dest: &Path) -> Option<PathBuf> {
+    let parent = dest.parent()?;
+    let file_name = dest.file_name().map_or_else(
+        || OsString::from("incr-seed"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let mut name = OsString::from(".");
+    name.push(&file_name);
+    // pid + nanos gives per-process uniqueness; the §5 machine-local lease and
+    // O_EXCL creation guard against same-machine same-targetkey concurrency.
+    let suffix = format!(
+        ".incrtmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    name.push(suffix);
+    Some(parent.join(name))
+}
+
+/// Errors from writing one planned file.
+enum FileMaterializeError {
+    /// Cold (missing/corrupt blob or digest mismatch) — the caller wipes the
+    /// temp dir and returns [`SeedOutcome::NoSeed`].
+    Cold(&'static str),
+    /// An unexpected internal failure to surface as `Err`.
+    Internal(Error),
+}
+
+/// Fetch a single blob, verify its blake3 digest, and write it under the temp
+/// root. The blob is resident only for this call (bounded memory).
+async fn fetch_and_write_file(
+    cas_store: &Store,
+    temp_dir: &Path,
+    file: &PlannedFile,
+) -> Result<(), FileMaterializeError> {
+    let bytes = match cas_store
+        .get_part_unchunked(
+            StoreKey::Digest(file.digest),
+            0,
+            Some(file.digest.size_bytes()),
+        )
+        .await
+    {
+        Ok(bytes) => bytes,
+        // A missing/short blob is the §6.5 eviction / live-digest-to-nowhere
+        // case: cold, never wrong.
+        Err(_err) => return Err(FileMaterializeError::Cold("file blob unreadable")),
+    };
+
+    // Verify the content against the expected digest as we write it (§3b). A
+    // mismatch (torn/forged/evicted-and-replaced) is cold.
+    let mut hasher = DigestHasherFunc::Blake3.hasher();
+    hasher.update(&bytes);
+    if hasher.finalize_digest() != file.digest {
+        return Err(FileMaterializeError::Cold("file blob digest mismatch"));
+    }
+
+    let abs_path = temp_dir.join(&file.rel_path);
+    let mode: u32 = if file.is_executable { 0o755 } else { 0o644 };
+    write_file_nofollow(abs_path, bytes, mode)
+        .await
+        .map_err(FileMaterializeError::Internal)
+}
+
+/// Wipe the temp dir; surface a cleanup failure as `Err` (leaked disk is a real
+/// problem, not a cold outcome).
+async fn cleanup_or_err(temp_dir: &Path) -> Result<(), Error> {
+    remove_dir_all(temp_dir.to_path_buf())
+        .await
+        .err_tip(|| "cleaning up partial incr seed temp dir")
+}
+
+/// Create the temp root and every planned subdirectory (parents-before-children
+/// order guaranteed by the plan) in one blocking hop. `create_dir` (not
+/// `create_dir_all`) refuses to traverse a pre-existing symlink component.
+async fn create_skeleton(temp_root: PathBuf, dirs: Vec<PathBuf>) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || {
+        // O_EXCL semantics: create_dir fails if the unique temp root already
+        // exists (a hostile pre-creation), which is the safe outcome.
+        std::fs::create_dir(&temp_root)
+            .err_tip(|| format!("creating incr seed temp root {temp_root:?}"))?;
+        for rel in dirs {
+            let abs = temp_root.join(&rel);
+            std::fs::create_dir(&abs).err_tip(|| format!("creating incr seed subdir {abs:?}"))?;
+        }
+        Ok::<(), Error>(())
+    })
+    .await
+    .map_err(|e| make_err!(Code::Internal, "incr seed skeleton join failed: {e:?}"))?
+}
+
+/// Write `bytes` to `abs_path` with `O_CREAT | O_EXCL | O_NOFOLLOW` (§9): never
+/// follow a symlink, never overwrite. NO fsync (ZFS `sync=disabled`; durability
+/// is not this cache's concern — a lost seed is a cold rebuild).
+async fn write_file_nofollow(abs_path: PathBuf, bytes: Bytes, mode: u32) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(mode)
+            .open(&abs_path)
+            .err_tip(|| format!("opening incr seed file {abs_path:?}"))?;
+        file.write_all(&bytes)
+            .err_tip(|| format!("writing incr seed file {abs_path:?}"))?;
+        Ok::<(), Error>(())
+    })
+    .await
+    .map_err(|e| make_err!(Code::Internal, "incr seed file write join failed: {e:?}"))?
+}
+
+/// Atomically install `temp_dir` at `dest`: remove any existing `dest`
+/// (the preserved-but-stale seed, §7), then rename. Same-filesystem rename is
+/// atomic; a torn rename is impossible.
+async fn swap_into_place(temp_dir: PathBuf, dest: PathBuf) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || {
+        match std::fs::remove_dir_all(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).err_tip(|| format!("removing stale incr seed dest {dest:?}"));
+            }
+        }
+        std::fs::rename(&temp_dir, &dest)
+            .err_tip(|| format!("renaming incr seed {temp_dir:?} -> {dest:?}"))?;
+        Ok::<(), Error>(())
+    })
+    .await
+    .map_err(|e| make_err!(Code::Internal, "incr seed swap join failed: {e:?}"))?
+}
+
+/// Recursively remove a directory tree, tolerating absence.
+async fn remove_dir_all(path: PathBuf) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).err_tip(|| format!("removing incr seed temp dir {path:?}")),
+    })
+    .await
+    .map_err(|e| make_err!(Code::Internal, "incr seed remove join failed: {e:?}"))?
+}
+
+/// Emit an observability counter marker for the wired site to fold into the
+/// registered worker metrics tree.
+///
+/// TODO(#FL-1383): the wiring chunk (2b/follow-on) increments the registered
+/// `#[derive(MetricsComponent)]` worker counters from these markers / the
+/// returned [`SeedOutcome`]. A per-instance metrics tree is deliberately NOT
+/// created here: an unregistered tree would be a dark counter (0 events
+/// indistinguishable from "never called"), the trap documented in the worker
+/// metrics-exposure notes. The `counter` field is grep-stable for log-derived
+/// counting until the metric is registered.
+#[inline]
+fn emit_counter(counter: &'static str) {
+    debug!(counter, "incr seed fetch counter");
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use bytes::Bytes;
+    use nativelink_config::stores::MemorySpec;
+    use nativelink_macro::nativelink_test;
+    use nativelink_proto::build::bazel::remote::execution::v2::{
+        ActionResult, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, Tree,
+    };
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+    use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+    use nativelink_util::targetkey::TargetKey;
+    use prost::Message;
+
+    use super::{SeedOutcome, fetch_and_materialize_seed, index_action_digest};
+
+    const PRIMARY: &str = "bazel-out/cfg/bin/third_party/rust/apple_a14/libfoo.rlib";
+
+    fn blake3_digest(bytes: &[u8]) -> DigestInfo {
+        let mut hasher = DigestHasherFunc::Blake3.hasher();
+        hasher.update(bytes);
+        hasher.finalize_digest()
+    }
+
+    fn new_store() -> Store {
+        Store::new(MemoryStore::new(&MemorySpec::default()))
+    }
+
+    async fn put(store: &Store, digest: DigestInfo, bytes: Bytes) {
+        store
+            .update_oneshot(StoreKey::Digest(digest), bytes)
+            .await
+            .expect("store write should succeed");
+    }
+
+    fn targetkey() -> TargetKey {
+        TargetKey::derive(&[PRIMARY.to_string()]).expect("targetkey derives")
+    }
+
+    /// Upload a blob and return the `FileNode` referencing it.
+    async fn upload_file(cas: &Store, name: &str, content: &[u8], exec: bool) -> FileNode {
+        let digest = blake3_digest(content);
+        put(cas, digest, Bytes::copy_from_slice(content)).await;
+        FileNode {
+            name: name.to_string(),
+            digest: Some(Digest::from(&digest)),
+            is_executable: exec,
+            node_properties: None,
+        }
+    }
+
+    /// Upload a `Directory` proto to CAS and return its blake3 digest, so it can
+    /// be referenced by a `DirectoryNode`.
+    async fn upload_dir(cas: &Store, dir: &Directory) -> DigestInfo {
+        let bytes = dir.encode_to_vec();
+        let digest = blake3_digest(&bytes);
+        put(cas, digest, Bytes::from(bytes)).await;
+        digest
+    }
+
+    /// Upload a `Tree` proto and return its digest.
+    async fn upload_tree(cas: &Store, tree: &Tree) -> DigestInfo {
+        let bytes = tree.encode_to_vec();
+        let digest = blake3_digest(&bytes);
+        put(cas, digest, Bytes::from(bytes)).await;
+        digest
+    }
+
+    /// Build a single-directory `Tree` with the given (name, content, exec)
+    /// files, upload the blobs + `Tree`, and return the `Tree` digest.
+    async fn upload_flat_tree(cas: &Store, files: &[(&str, &[u8], bool)]) -> DigestInfo {
+        let mut file_nodes = Vec::new();
+        for (name, content, exec) in files {
+            file_nodes.push(upload_file(cas, name, content, *exec).await);
+        }
+        let tree = Tree {
+            root: Some(Directory {
+                files: file_nodes,
+                directories: vec![],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            children: vec![],
+        };
+        upload_tree(cas, &tree).await
+    }
+
+    /// Publish an index entry pointing `path` at `tree_digest`.
+    async fn publish_index(index: &Store, tk: &TargetKey, path: &str, tree_digest: &DigestInfo) {
+        let action_result = ActionResult {
+            output_directories: vec![OutputDirectory {
+                path: path.to_string(),
+                tree_digest: Some(Digest::from(tree_digest)),
+                is_topologically_sorted: false,
+            }],
+            ..Default::default()
+        };
+        let digest = index_action_digest(tk);
+        put(index, digest, Bytes::from(action_result.encode_to_vec())).await;
+    }
+
+    #[nativelink_test]
+    async fn hit_materializes_and_verifies() {
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+        let tree_digest = upload_flat_tree(
+            &cas,
+            &[("a.bin", b"alpha", false), ("run.sh", b"#!/bin/sh\n", true)],
+        )
+        .await;
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(5))
+            .await
+            .expect("fetch should not error on a valid hit");
+
+        assert_eq!(outcome, SeedOutcome::Materialized { tree_digest });
+        assert_eq!(std::fs::read(dest.join("a.bin")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dest.join("run.sh")).unwrap(), b"#!/bin/sh\n");
+    }
+
+    #[nativelink_test]
+    async fn hit_materializes_nested_subdir() {
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+
+        // A child directory `sub/` containing `nested.bin`.
+        let nested = upload_file(&cas, "nested.bin", b"deep", false).await;
+        let child = Directory {
+            files: vec![nested],
+            directories: vec![],
+            symlinks: vec![],
+            node_properties: None,
+        };
+        let child_digest = upload_dir(&cas, &child).await;
+
+        let top = upload_file(&cas, "top.bin", b"surface", false).await;
+        let tree = Tree {
+            root: Some(Directory {
+                files: vec![top],
+                directories: vec![DirectoryNode {
+                    name: "sub".to_string(),
+                    digest: Some(Digest::from(&child_digest)),
+                }],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            // The Tree carries every child directory inline.
+            children: vec![child],
+        };
+        let tree_digest = upload_tree(&cas, &tree).await;
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(5))
+            .await
+            .expect("fetch should not error on a nested hit");
+
+        assert_eq!(outcome, SeedOutcome::Materialized { tree_digest });
+        assert_eq!(std::fs::read(dest.join("top.bin")).unwrap(), b"surface");
+        assert_eq!(std::fs::read(dest.join("sub/nested.bin")).unwrap(), b"deep");
+    }
+
+    #[nativelink_test]
+    async fn index_miss_is_cold() {
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(5))
+            .await
+            .expect("fetch should not error on a miss");
+
+        assert_eq!(outcome, SeedOutcome::NoSeed);
+        assert!(!dest.exists(), "no dir should be created on a miss");
+    }
+
+    #[nativelink_test]
+    async fn path_mismatch_is_collision() {
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+        let tree_digest = upload_flat_tree(&cas, &[("a.bin", b"alpha", false)]).await;
+        // Publish under a DIFFERENT primary output → blake3 collision.
+        publish_index(
+            &index,
+            &tk,
+            "bazel-out/cfg/bin/third_party/rust/apple_a14/libOTHER.rlib",
+            &tree_digest,
+        )
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(5))
+            .await
+            .expect("fetch should not error on a collision");
+
+        assert_eq!(outcome, SeedOutcome::Collision);
+        assert!(!dest.exists(), "no dir on a collision");
+    }
+
+    #[nativelink_test]
+    async fn file_digest_mismatch_is_cold_no_partial_dir() {
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+
+        // Build a Tree whose FileNode claims a digest that does NOT match the
+        // blob actually stored under that digest (torn/forged content).
+        let claimed = blake3_digest(b"the-claimed-content");
+        // Store DIFFERENT bytes under the claimed digest key.
+        put(&cas, claimed, Bytes::from_static(b"WRONG-different-length")).await;
+        let tree = Tree {
+            root: Some(Directory {
+                files: vec![FileNode {
+                    name: "a.bin".to_string(),
+                    digest: Some(Digest::from(&claimed)),
+                    is_executable: false,
+                    node_properties: None,
+                }],
+                directories: vec![],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            children: vec![],
+        };
+        let tree_digest = upload_tree(&cas, &tree).await;
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(5))
+            .await
+            .expect("fetch should not error on a digest mismatch");
+
+        assert_eq!(outcome, SeedOutcome::NoSeed);
+        assert!(!dest.exists(), "dest must not exist");
+        // No partial temp dir must survive in the parent.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no partial temp dir should survive, found: {leftovers:?}"
+        );
+    }
+
+    #[nativelink_test]
+    async fn slow_index_times_out_bounded() {
+        // `SlowStore::get_part` never resolves, so the wrapped index fetch can
+        // only complete via the bounded timeout — proving a slow/absent index
+        // does not stall the build (§6.2).
+        let index = SlowStore::new_store();
+        let cas = new_store();
+        let tk = targetkey();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome =
+            fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_millis(50))
+                .await
+                .expect("fetch should not error on a timeout");
+
+        assert_eq!(outcome, SeedOutcome::TimedOut);
+        assert!(!dest.exists());
+    }
+
+    // A Store whose reads never resolve, to prove the bounded index timeout.
+    use slow_store::SlowStore;
+    mod slow_store {
+        use core::pin::Pin;
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use futures::future::pending;
+        use nativelink_error::Error;
+        use nativelink_metric::{
+            MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+        };
+        use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+        use nativelink_util::health_utils::{
+            HealthStatusIndicator, default_health_status_indicator,
+        };
+        use nativelink_util::store_trait::{
+            DurableDelegation, ItemCallback, MarkStableDelegation, PinDelegation,
+            StableDigestDelegation, Store, StoreDriver, StoreKey, UploadSizeInfo,
+        };
+
+        #[derive(Debug)]
+        pub(super) struct SlowStore;
+
+        impl MetricsComponent for SlowStore {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+
+        impl SlowStore {
+            pub(super) fn new_store() -> Store {
+                Store::new(Arc::new(SlowStore))
+            }
+        }
+
+        #[async_trait]
+        impl StoreDriver for SlowStore {
+            async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn has_with_results(
+                self: Pin<&Self>,
+                _keys: &[StoreKey<'_>],
+                results: &mut [Option<u64>],
+            ) -> Result<(), Error> {
+                for result in results.iter_mut() {
+                    *result = None;
+                }
+                Ok(())
+            }
+
+            async fn update(
+                self: Pin<&Self>,
+                _key: StoreKey<'_>,
+                _reader: DropCloserReadHalf,
+                _size_info: UploadSizeInfo,
+            ) -> Result<u64, Error> {
+                pending().await
+            }
+
+            async fn get_part(
+                self: Pin<&Self>,
+                _key: StoreKey<'_>,
+                _writer: &mut DropCloserWriteHalf,
+                _offset: u64,
+                _length: Option<u64>,
+            ) -> Result<(), Error> {
+                // Never resolves: the fetch can only end via the caller's
+                // bounded timeout.
+                pending().await
+            }
+
+            fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
+                self
+            }
+
+            fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+                self
+            }
+
+            fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+                self
+            }
+
+            fn register_item_callback(
+                self: Arc<Self>,
+                _callback: Arc<dyn ItemCallback>,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+                StableDigestDelegation::Leaf
+            }
+
+            fn pin_delegation(&self) -> PinDelegation<'_> {
+                PinDelegation::Leaf
+            }
+
+            fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+                MarkStableDelegation::Leaf
+            }
+
+            fn durable_delegation(&self) -> DurableDelegation<'_> {
+                DurableDelegation::Leaf
+            }
+        }
+
+        default_health_status_indicator!(SlowStore);
+    }
+}

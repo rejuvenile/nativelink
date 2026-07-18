@@ -13,6 +13,10 @@
 // limitations under the License.
 
 pub mod directory_cache;
+// FL-1383 portable rustc-incremental: worker out-of-band `-incr` seed
+// fetch+materialize (design §6.3). Standalone; wired into the execroot setup by
+// a follow-on chunk. TODO(#FL-1383).
+pub mod incr_seed_fetch;
 pub mod local_worker;
 // The following three modules are upstream worker subsystems that this fork
 // keeps declared but INTENTIONALLY UNWIRED: nothing outside these files (and
