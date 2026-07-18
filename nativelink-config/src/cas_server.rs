@@ -1537,6 +1537,27 @@ pub struct LocalWorkerConfig {
     /// is unset, the §12 asserts fail-loud and the feature is left DISABLED.
     #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
     pub portable_incr_sysroot_path: Option<String>,
+
+    /// FL-1383 (design §6.1/§6.3) — the name of the store instance that backs
+    /// the fleet-shared `incr_seed_index`: an AC-shaped MUTABLE index keyed by
+    /// `hash(targetkey)` whose value references the current `-incr` seed Tree in
+    /// CAS. Per design §6.1 this MUST be a DISTINCT instance from the action-cache
+    /// (`instance_name = "incr_seed_index"`) sitting BEHIND a
+    /// `completeness_checking` store so a dangling index entry (its `-incr`
+    /// content evicted) resolves to CAS-NotFound → cold, never a
+    /// live-digest-to-nowhere. See `examples/portable_incr_seed_index.json5`.
+    ///
+    /// The worker uses this store out-of-band (§6.3): it FETCHES the seed before
+    /// rustc and PUBLISHES a new entry after a successful allowlisted build. This
+    /// is worker deployment topology (which store instance), NOT shared policy —
+    /// hence a `LocalWorkerConfig` field, not part of [`PortableIncrConfig`].
+    ///
+    /// Default (absent): `None`. When unset the worker performs NO seed fetch or
+    /// publish — the seed path is INERT even if `portable_incr.enabled` is `true`
+    /// (a cold-but-correct fallback). Both must be configured for the seed path
+    /// to do work.
+    #[serde(default)]
+    pub portable_incr_seed_index_store: Option<StoreRefName>,
 }
 
 impl Default for LocalWorkerConfig {
@@ -1577,6 +1598,7 @@ impl Default for LocalWorkerConfig {
             portable_incr: Default::default(),
             portable_incr_fixed_prefix: Default::default(),
             portable_incr_sysroot_path: Default::default(),
+            portable_incr_seed_index_store: Default::default(),
         }
     }
 }

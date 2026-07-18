@@ -76,7 +76,22 @@ use nativelink_util::store_trait::{
     IS_WORKER_REQUEST, Store, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 use nativelink_util::log_utils::throughput_mbps;
+use nativelink_util::targetkey::TargetKey;
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
+
+use crate::incr_seed_fetch::{
+    SeedPublish, fetch_and_materialize_seed, note_index_published, plan_seed_publish, seed_dest_dir,
+};
+
+/// FL-1383 (design §6.2): bounded ceiling for the WHOLE out-of-band seed
+/// fetch+materialize (index `GetActionResult` + `Tree` + every blob read/write).
+/// `GrpcStore` internal RPCs carry `timeout=0`, so without this a slow/absent
+/// index or a server-CAS fall-through (§6.5) would stall the pre-rustc path
+/// unboundedly. This is NOT an internal liveness RPC deadline (which the
+/// keepalive/concurrency-isolation policy forbids) — it is a best-effort cache
+/// fetch that degrades to a cold build. Provisional value; the §12
+/// `incr_index_fetch_timeout` counter tells the canary whether to tune it.
+const INCR_SEED_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 use parking_lot::Mutex;
 use prost::Message;
 use scopeguard::{ScopeGuard, guard};
@@ -4763,6 +4778,13 @@ struct RunningActionImplState {
     /// from the post-upload site to the `ActionResourceUsage.net_output_bytes`
     /// producer. `None` until `inner_upload_results` populates it. Scalar.
     calib_output_bytes: Option<u64>,
+    /// FL-1383 (design §6.2): the `TargetKey` derived from this action's
+    /// `Command.output_paths` at the portable-incr seed-fetch site (verified
+    /// equal to the carrier), stashed so the post-execution publish site can key
+    /// the `incr_seed_index` write without re-fetching the Command. `Some` only
+    /// for an enabled+allowlisted portable-incr action; `None` on the fleet
+    /// (INERT) and for every non-portable action.
+    portable_targetkey: Option<TargetKey>,
 }
 
 #[derive(Debug)]
@@ -4885,6 +4907,8 @@ impl RunningActionImpl {
                 calib_peak_memory_kb: None,
                 calib_disk_bytes: None,
                 calib_output_bytes: None,
+                // FL-1383: populated at the seed-fetch site for a portable action.
+                portable_targetkey: None,
             }),
             // Always need to ensure that we're removed from the manager on Drop.
             has_manager_entry: AtomicBool::new(true),
@@ -5174,13 +5198,55 @@ impl RunningActionImpl {
                 })
                 .await
                 .err_tip(|| "portable_incr execroot ensure+wipe task join")??;
-                // TODO(#FL-1383): chunk 3 plugs the OUT-OF-BAND seed fetch in
-                // HERE — after the wipe-preserving-`-incr` and BEFORE [B2] input
-                // materialise: fetch the fleet-shared `-incr` seed from the
-                // `incr_seed_index` (design §6.3) and materialise it at the
-                // execroot so the REMOTE branch also reuses. 2b establishes the
-                // byte-identical path + the wipe-that-keeps-`-incr`; same-machine
-                // warm reuse already works from the preserved local seed.
+                // FL-1383 chunk 3 (design §6.3/§6.2): OUT-OF-BAND seed fetch,
+                // AFTER the wipe-preserving-`-incr` and BEFORE [B2] input
+                // materialise. Derive the TargetKey from the (already
+                // carrier-verified) Command outputs, stash it for the
+                // post-success publish, then — when a seed index store is
+                // configured — best-effort fetch+materialise the fleet-shared
+                // `-incr` seed at the execroot so the REMOTE/cold branch reuses.
+                // Any non-`Materialized` outcome (miss/collision/timeout/evicted)
+                // proceeds with a COLD build; the whole fetch is bounded (§6.2:
+                // GrpcStore `timeout=0`, so a slow/absent index must not stall).
+                let targetkey = TargetKey::derive(&cmd.output_paths);
+                if let Some(targetkey) = targetkey.as_ref() {
+                    self.state.lock().portable_targetkey = Some(targetkey.clone());
+                }
+                if let (Some(index_store), Some(targetkey)) = (
+                    self.running_actions_manager.incr_seed_index_store.as_ref(),
+                    targetkey.as_ref(),
+                ) {
+                    if let Some(dest) = seed_dest_dir(
+                        std::path::Path::new(&self.work_directory),
+                        targetkey.primary_output(),
+                    ) {
+                        let cas = Store::new(self.running_actions_manager.cas_store.clone());
+                        match fetch_and_materialize_seed(
+                            index_store,
+                            &cas,
+                            targetkey,
+                            &dest,
+                            INCR_SEED_FETCH_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => info!(
+                                %operation_id,
+                                ?outcome,
+                                dest = %dest.display(),
+                                "inner_prepare_action: portable-incr seed fetch complete"
+                            ),
+                            // Best-effort: an internal fetch error must NOT fail
+                            // the build — proceed cold (the §12 counters record it).
+                            Err(err) => warn!(
+                                %operation_id,
+                                ?err,
+                                "inner_prepare_action: portable-incr seed fetch errored; \
+                                 proceeding with a cold build"
+                            ),
+                        }
+                    }
+                }
             } else {
                 // Normal mode: create the (empty) work_directory. [B2]'s
                 // clonefile(2) fast path (macOS) removes this empty dir and
@@ -6454,6 +6520,11 @@ impl RunningActionImpl {
         // section minimal. `None` until populated.
         let mut calib_action_record: Option<CalibActionRecord> = None;
 
+        // FL-1383 (design §6.2): populated inside the state block below (needs the
+        // not-yet-moved `output_folders` + the stashed targetkey); the async index
+        // write happens AFTER the lock is released. `None` = nothing to publish.
+        let mut seed_publish: Option<SeedPublish> = None;
+
         {
             let mut state = self.state.lock();
             execution_metadata.worker_completed_timestamp =
@@ -6506,6 +6577,22 @@ impl RunningActionImpl {
             // available whenever the CPU poll sampled the action.
             state.calib_output_bytes = Some(calib_output_bytes);
 
+            // FL-1383 (design §6.2): plan the seed-index publish for a portable
+            // action while `output_folders` is still in scope (it is MOVED into
+            // `action_result` just below). Reads the stashed `portable_targetkey`
+            // + this build's success (`exit_code == 0 && error.is_none()`, both
+            // hard-gated inside `plan_seed_publish`). Computed under the lock into
+            // an owned `Option`; the actual (async) index write happens AFTER the
+            // lock is released. `None` for every non-portable action (INERT).
+            seed_publish = state.portable_targetkey.as_ref().and_then(|targetkey| {
+                plan_seed_publish(
+                    targetkey,
+                    execution_result.exit_code,
+                    state.error.is_some(),
+                    output_folders.iter().map(|d| (d.path.as_str(), d.tree_digest)),
+                )
+            });
+
             state.action_result = Some(ActionResult {
                 output_files,
                 output_folders,
@@ -6523,6 +6610,40 @@ impl RunningActionImpl {
         // Calibration probe P-A emit (`tag="calib_action"`), off the state lock.
         if let Some(record) = calib_action_record {
             record.emit(&self.operation_id);
+        }
+
+        // FL-1383 (design §6.2): worker-side seed-index write, OFF the state lock
+        // (async). The `-incr` CONTENT was already uploaded to CAS above as a
+        // normal DECLARED OUTPUT of this action — this only writes the mutable
+        // index POINTER (`hash(targetkey)` → `-incr` tree digest), LWW-overwriting
+        // any prior entry. Fires only for a portable action whose build SUCCEEDED
+        // (gated in `plan_seed_publish`) AND when a seed index store is configured.
+        // Best-effort: a publish failure must NOT fail the action — its outputs are
+        // already uploaded and cached; a missing index entry only costs peers a
+        // cold build (§6.1/§6.4).
+        if let (Some(publish), Some(index_store)) = (
+            seed_publish,
+            self.running_actions_manager.incr_seed_index_store.as_ref(),
+        ) {
+            let index_digest = publish.index_digest;
+            match index_store
+                .update_oneshot(StoreKey::Digest(index_digest), publish.encoded)
+                .await
+            {
+                Ok(()) => {
+                    note_index_published();
+                    debug!(
+                        operation_id = ?self.operation_id,
+                        ?index_digest,
+                        "portable-incr: seed index entry published (build succeeded)"
+                    );
+                }
+                Err(err) => warn!(
+                    operation_id = ?self.operation_id,
+                    ?err,
+                    "portable-incr: seed index publish failed; build unaffected"
+                ),
+            }
         }
         debug!(
             operation_id = ?self.operation_id,
@@ -7628,6 +7749,15 @@ pub struct RunningActionsManagerImpl {
     /// execroot rewire. When `None`, `plan_portable_execroot` returns `None` and
     /// every action takes the byte-identical current path.
     portable_incr: Option<crate::portable_incr::PortableIncrContext>,
+    /// FL-1383 (design §6.1/§6.3): the fleet-shared `incr_seed_index` store —
+    /// the AC-shaped mutable index (behind CompletenessCheckingStore) the worker
+    /// FETCHES the `-incr` seed from before rustc and PUBLISHES to after a
+    /// successful allowlisted build. `Some` only when the worker config names a
+    /// `portable_incr_seed_index_store` that resolved (set via
+    /// [`Self::set_incr_seed_index_store`] from `new_local_worker`); `None` on the
+    /// fleet — the whole seed path is then INERT (no fetch, no publish; a
+    /// cold-but-correct fallback), independently of `portable_incr` being `Some`.
+    incr_seed_index_store: Option<Store>,
 }
 
 impl RunningActionsManagerImpl {
@@ -7699,6 +7829,10 @@ impl RunningActionsManagerImpl {
             // construction sites — all in tests — stay untouched and remain
             // INERT). See FL-1383 chunk 2b.
             portable_incr: None,
+            // INERT by default; the production path sets this via
+            // `set_incr_seed_index_store` from `new_local_worker` (same reason as
+            // `portable_incr` — keep the many test Args sites untouched). FL-1383.
+            incr_seed_index_store: None,
         })
     }
 
@@ -7712,6 +7846,15 @@ impl RunningActionsManagerImpl {
         ctx: Option<crate::portable_incr::PortableIncrContext>,
     ) {
         self.portable_incr = ctx;
+    }
+
+    /// FL-1383 (design §6.1/§6.3): install the fleet-shared `incr_seed_index`
+    /// store handle. Called once from `new_local_worker` BEFORE the manager is
+    /// `Arc`-wrapped. `Some` only when the worker config named a
+    /// `portable_incr_seed_index_store` that resolved; `None` (the fleet default)
+    /// leaves the seed fetch/publish path fully INERT.
+    pub fn set_incr_seed_index_store(&mut self, store: Option<Store>) {
+        self.incr_seed_index_store = store;
     }
 
     /// FL-1383 chunk 2b: plan the byte-identical execroot for one action from

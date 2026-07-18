@@ -869,6 +869,8 @@ async fn new_local_worker_creates_work_directory_test() -> Result<(), Error> {
         Some(ac_store),
         None,
         cas_store,
+        // FL-1383: no incr_seed_index store in these tests (seed path INERT).
+        None,
     )
     .await?;
 
@@ -922,6 +924,8 @@ async fn new_local_worker_removes_work_directory_before_start_test() -> Result<(
         Some(ac_store),
         None,
         cas_store,
+        // FL-1383: no incr_seed_index store in these tests (seed path INERT).
+        None,
     )
     .await?;
 
@@ -2606,6 +2610,8 @@ async fn deferred_uploads_without_cas_server_port_is_rejected() -> Result<(), Er
         Some(ac_store),
         None,
         cas_store,
+        // FL-1383: no incr_seed_index store in these tests (seed path INERT).
+        None,
     )
     .await;
 
@@ -2668,6 +2674,8 @@ async fn deferred_uploads_with_cas_server_port_passes_guard() -> Result<(), Erro
         Some(ac_store),
         None,
         cas_store,
+        // FL-1383: no incr_seed_index store in these tests (seed path INERT).
+        None,
     )
     .await;
 

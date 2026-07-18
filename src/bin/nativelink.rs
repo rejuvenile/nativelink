@@ -685,6 +685,18 @@ async fn inner_main(
         nativelink_util::phase0_metrics::server_phase0_metrics_arc(),
     );
 
+    // FL-1383 (design §12): register the process-singleton three-state seed
+    // observability counters (materialized / present-but-cold / collision /
+    // index-fetch-{hit,miss,timeout,error} / publish / reuse-fired) so the
+    // canary can measure the reuse hit-rate. Registered UNCONDITIONALLY (same as
+    // the phase0 singletons): the worker produces them; a per-instance/unregistered
+    // tree would be DARK (the worker-metrics-exposure trap). Counters stay 0 while
+    // the feature is INERT — visible-and-zero, not dark.
+    metrics_registry.register(
+        "incr_seed_index",
+        nativelink_worker::incr_seed_fetch::incr_seed_metrics_arc(),
+    );
+
     // #85 (2026-06-08): 5 observability-only probes from the O11
     // investigation. All five singletons registered unconditionally:
     // the binary serves both worker and server scrapes, and the
@@ -2891,6 +2903,21 @@ async fn inner_main(
                     } else {
                         fast_slow_store.clone()
                     };
+                    // FL-1383 (design §6.1/§6.3): resolve the fleet-shared
+                    // `incr_seed_index` store the worker fetches/publishes the
+                    // `-incr` seed through. `None` (unset) leaves the seed path
+                    // INERT. Same resolve-by-name pattern as `ac_store` above.
+                    let maybe_incr_seed_index_store = if let Some(seed_index_ref) =
+                        &local_worker_cfg.portable_incr_seed_index_store
+                    {
+                        Some(store_manager.get_store(seed_index_ref).err_tip(|| {
+                            format!(
+                                "Failed to find store for portable_incr_seed_index_store in worker config : {seed_index_ref}"
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
                     // Capture before `local_worker_cfg` is moved into
                     // `new_local_worker` below — gates the exec-metrics
                     // registration (a distinct execution FSS exists iff set).
@@ -2901,6 +2928,7 @@ async fn inner_main(
                         maybe_ac_store,
                         maybe_ac_store_ref,
                         historical_store,
+                        maybe_incr_seed_index_store,
                     )
                     .await
                     .err_tip(|| "Could not make LocalWorker")?;

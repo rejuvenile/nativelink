@@ -40,15 +40,20 @@
 //! / `incr_seed_collision`, and the `incr_index_fetch_{hit,miss,timeout,error}`
 //! family — see the `emit_counter` markers below).
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use nativelink_error::{Code, Error, ResultExt, make_err};
-use nativelink_proto::build::bazel::remote::execution::v2::{ActionResult, Directory, Tree};
+use nativelink_metric::MetricsComponent;
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    ActionResult, Digest, Directory, OutputDirectory, Tree,
+};
 use nativelink_store::ac_utils::get_and_decode_digest;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
@@ -671,19 +676,203 @@ async fn remove_dir_all(path: PathBuf) -> Result<(), Error> {
     .map_err(|e| make_err!(Code::Internal, "incr seed remove join failed: {e:?}"))?
 }
 
-/// Emit an observability counter marker for the wired site to fold into the
-/// registered worker metrics tree.
-///
-/// TODO(#FL-1383): the wiring chunk (2b/follow-on) increments the registered
-/// `#[derive(MetricsComponent)]` worker counters from these markers / the
-/// returned [`SeedOutcome`]. A per-instance metrics tree is deliberately NOT
-/// created here: an unregistered tree would be a dark counter (0 events
-/// indistinguishable from "never called"), the trap documented in the worker
-/// metrics-exposure notes. The `counter` field is grep-stable for log-derived
-/// counting until the metric is registered.
-#[inline]
+/// FL-1383 three-state observability (design §12). PROCESS-SINGLETON counters
+/// for the worker out-of-band seed path, exposed via [`incr_seed_metrics`] and
+/// registered ONCE into the `MetricsRegistry` by `bin/nativelink.rs` (the
+/// `WorkerPhase0Metrics` singleton pattern). A per-instance / unregistered tree
+/// would be DARK — 0 events indistinguishable from "never called" — the
+/// worker-metrics-exposure trap (`worker-metrics-exposure-pattern` memory); a
+/// singleton registered in the binary is the only non-dark path. Every field
+/// name below is pinned by a render/`publish`-visibility test so a rename cannot
+/// silently re-dark it.
+#[derive(Debug, Default, MetricsComponent)]
+pub struct IncrSeedMetrics {
+    /// `-incr` seed dir materialized at the execroot before rustc (a warm fetch).
+    #[metric(help = "FL-1383: incr seed dirs materialized at the execroot before rustc")]
+    pub incr_seed_materialized: AtomicU64,
+    /// rustc incremental reuse actually fired. Populated by the rustc-side branch
+    /// (rules_rust, chunk 4), NOT by the worker — registered here so the name is
+    /// visible (not dark) even though the worker leaves it at 0.
+    #[metric(help = "FL-1383: rustc incremental reuse fired (rustc-side branch; worker leaves 0)")]
+    pub incr_reuse_fired: AtomicU64,
+    /// Index resolved but the referenced content was unreadable (evicted/corrupt)
+    /// or a per-file digest mismatch → cold.
+    #[metric(help = "FL-1383: index resolved but content unusable (evicted/corrupt/mismatch) -> cold")]
+    pub incr_seed_present_but_cold: AtomicU64,
+    /// Index blake3 key collision (stored path != this action's primary) → cold.
+    #[metric(help = "FL-1383: index blake3 key collision (path mismatch) -> cold")]
+    pub incr_seed_collision: AtomicU64,
+    /// Index `GetActionResult` hit.
+    #[metric(help = "FL-1383: incr seed index GetActionResult hit")]
+    pub incr_index_fetch_hit: AtomicU64,
+    /// Index `GetActionResult` miss (NotFound) → cold.
+    #[metric(help = "FL-1383: incr seed index GetActionResult miss (NotFound) -> cold")]
+    pub incr_index_fetch_miss: AtomicU64,
+    /// Index fetch exceeded the bounded deadline (§6.2) → cold.
+    #[metric(help = "FL-1383: incr seed index fetch bounded-timeout -> cold")]
+    pub incr_index_fetch_timeout: AtomicU64,
+    /// Index fetch errored (non-NotFound) → cold.
+    #[metric(help = "FL-1383: incr seed index fetch errored -> cold")]
+    pub incr_index_fetch_error: AtomicU64,
+    /// Seed index entries published after a successful allowlisted build (§6.2).
+    #[metric(help = "FL-1383: incr seed index entries published after a successful build")]
+    pub incr_index_publish: AtomicU64,
+}
+
+static INCR_SEED_METRICS: OnceLock<Arc<IncrSeedMetrics>> = OnceLock::new();
+
+fn incr_seed_metrics_inner() -> &'static Arc<IncrSeedMetrics> {
+    INCR_SEED_METRICS.get_or_init(|| Arc::new(IncrSeedMetrics::default()))
+}
+
+/// The process-global [`IncrSeedMetrics`] singleton (design §12). The producer
+/// side ([`emit_counter`]) bumps these; `bin/nativelink.rs` registers the same
+/// singleton into the `MetricsRegistry` so the counters render.
+#[must_use]
+pub fn incr_seed_metrics() -> &'static IncrSeedMetrics {
+    incr_seed_metrics_inner()
+}
+
+/// `Arc` clone of the [`incr_seed_metrics`] singleton, for registration into the
+/// `MetricsRegistry` at process start (the `worker_phase0_metrics_arc` pattern).
+#[must_use]
+pub fn incr_seed_metrics_arc() -> Arc<IncrSeedMetrics> {
+    Arc::clone(incr_seed_metrics_inner())
+}
+
+/// Emit an observability counter for the seed path: bump the process-singleton
+/// [`IncrSeedMetrics`] field of the same name AND leave a grep-stable `debug!`
+/// marker. The `&'static str` name is matched against the registered fields so a
+/// caller cannot introduce an un-registered (dark) counter unnoticed — an
+/// unmapped name is logged loudly and NOT silently swallowed.
 fn emit_counter(counter: &'static str) {
+    let metrics = incr_seed_metrics();
+    let field = match counter {
+        "incr_seed_materialized" => &metrics.incr_seed_materialized,
+        "incr_reuse_fired" => &metrics.incr_reuse_fired,
+        "incr_seed_present_but_cold" => &metrics.incr_seed_present_but_cold,
+        "incr_seed_collision" => &metrics.incr_seed_collision,
+        "incr_index_fetch_hit" => &metrics.incr_index_fetch_hit,
+        "incr_index_fetch_miss" => &metrics.incr_index_fetch_miss,
+        "incr_index_fetch_timeout" => &metrics.incr_index_fetch_timeout,
+        "incr_index_fetch_error" => &metrics.incr_index_fetch_error,
+        "incr_index_publish" => &metrics.incr_index_publish,
+        other => {
+            warn!(counter = other, "incr seed fetch counter has no registered field (dark)");
+            return;
+        }
+    };
+    field.fetch_add(1, Ordering::Relaxed);
     debug!(counter, "incr seed fetch counter");
+}
+
+/// Record a successful seed-index publish in the §12 counters. Called by the
+/// worker publish site after `update_oneshot` succeeds (the publish itself lives
+/// in the execution path, not here, but the counter stays with its siblings).
+pub fn note_index_published() {
+    emit_counter("incr_index_publish");
+}
+
+/// The on-disk destination for the fetched `-incr` seed (design §6.3/§7): a
+/// TOP-LEVEL child of the byte-identical execroot named `<stem>-incr`, where
+/// `<stem>` is the primary output's filename with its extension stripped
+/// (`bazel-out/cfg/bin/.../libfoo.rlib` → `<execroot>/libfoo-incr`). Returns
+/// `None` for a primary output with no usable filename stem.
+///
+/// CROSS-TEAM CONTRACT — REPORTED, confirm at joint e2e: the `<stem>-incr`
+/// seed-dir NAME is a rules_rust (chunk 4) output-naming convention. It is the
+/// TOP-LEVEL-child model the §7 wipe's `is_incr_seed_entry` preserves and the
+/// chunk-2 execroot tests assume (`libfoo.rlib` ↔ `libfoo-incr`). It is NOT
+/// pinned by the NativeLink-side design and NOT carried in the chunk-3 index
+/// (whose `OutputDirectory.path` is the primary output, reserved for the
+/// collision guard, so it cannot also carry the `-incr` path). If the real
+/// rules_rust name differs, the seed lands where rustc will not read it → COLD,
+/// never wrong (safe but a DARK reuse miss the §12 counters surface as
+/// `incr_index_fetch_hit` climbing while `incr_reuse_fired` stays flat).
+#[must_use]
+pub fn seed_dest_dir(execroot: &Path, primary_output: &str) -> Option<PathBuf> {
+    let file = primary_output.rsplit('/').next().unwrap_or(primary_output);
+    if file.is_empty() {
+        return None;
+    }
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _ext)| stem);
+    if stem.is_empty() {
+        return None;
+    }
+    Some(execroot.join(format!("{stem}-incr")))
+}
+
+/// A planned seed-index publish (design §6.2): the AC-shaped index KEY under
+/// `hash(targetkey)` and the encoded `ActionResult` VALUE to `update_oneshot`.
+///
+/// The seed CONTENT (the `-incr` REAPI `Tree` + its blobs) is NOT part of this —
+/// it is a normal DECLARED OUTPUT of the rustc action, already uploaded to CAS by
+/// the worker's regular output-upload path. This is purely the worker-side INDEX
+/// write that points `targetkey` at that already-resident content.
+#[derive(Debug)]
+pub struct SeedPublish {
+    /// The `incr_seed_index` AC key (`hash(targetkey)`, design §3b).
+    pub index_digest: DigestInfo,
+    /// The encoded `ActionResult` value (`output_directories[0]` = primary output
+    /// path + `-incr` tree digest).
+    pub encoded: Bytes,
+}
+
+/// Decide whether to publish a seed index entry for a just-completed action, and
+/// with what key+value (design §6.2). Returns `None` — meaning DO NOT publish —
+/// unless BOTH hold:
+///
+/// - the build SUCCEEDED (`exit_code == 0 && !has_error`). A failed or partial
+///   build's `-incr` tree is torn/half-written; publishing it would seed peers
+///   from a broken state, so publication is HARD-GATED on success; AND
+/// - the action declared an `-incr` seed output directory — a folder whose final
+///   path component ends in `-incr` (but NOT `-incr-metadata`, the distinct §4
+///   pipelined-metadata tree the single-tree Stage-1 index does not carry).
+///
+/// The value's `output_directories[0].path` is the `targetkey`'s primary output
+/// (NOT the `-incr` path) so the chunk-3 fetch collision guard
+/// (`path == primary_output`) accepts it; its `tree_digest` is the `-incr` tree.
+/// LWW by the stable `targetkey`: the caller `update_oneshot`-overwrites any
+/// prior entry.
+#[must_use]
+pub fn plan_seed_publish<'folders>(
+    targetkey: &TargetKey,
+    exit_code: i32,
+    has_error: bool,
+    output_folders: impl IntoIterator<Item = (&'folders str, DigestInfo)>,
+) -> Option<SeedPublish> {
+    // HARD success gate — never publish a failed/partial build's torn seed.
+    if exit_code != 0 || has_error {
+        return None;
+    }
+    let incr_tree_digest = select_incr_seed_folder(output_folders)?;
+    let action_result = ActionResult {
+        output_directories: vec![OutputDirectory {
+            // primary output (for the fetch collision guard), NOT the -incr path.
+            path: targetkey.primary_output().to_string(),
+            tree_digest: Some(Digest::from(&incr_tree_digest)),
+            is_topologically_sorted: false,
+        }],
+        ..Default::default()
+    };
+    Some(SeedPublish {
+        index_digest: index_action_digest(targetkey),
+        encoded: Bytes::from(action_result.encode_to_vec()),
+    })
+}
+
+/// Select the `-incr` seed tree digest from an action's output directories
+/// (design §6.1 references the single "current -incr"). Matches the first folder
+/// whose final path component ends in `-incr` and NOT `-incr-metadata` (the §4
+/// pipelined-metadata tree is a separate seed, excluded from the Stage-1
+/// single-tree index).
+fn select_incr_seed_folder<'folders>(
+    output_folders: impl IntoIterator<Item = (&'folders str, DigestInfo)>,
+) -> Option<DigestInfo> {
+    output_folders.into_iter().find_map(|(path, digest)| {
+        let last = path.rsplit('/').next().unwrap_or(path);
+        (last.ends_with("-incr") && !last.ends_with("-incr-metadata")).then_some(digest)
+    })
 }
 
 #[cfg(test)]
@@ -706,7 +895,8 @@ mod tests {
     use prost::Message;
 
     use super::{
-        SeedOutcome, build_materialize_plan, fetch_and_materialize_seed, index_action_digest,
+        IncrSeedMetrics, SeedOutcome, build_materialize_plan, fetch_and_materialize_seed,
+        incr_seed_metrics_arc, index_action_digest, plan_seed_publish, seed_dest_dir,
         traverse_into_plan, validate_component,
     };
 
@@ -1198,6 +1388,140 @@ mod tests {
             Err("path component contains a separator or NUL")
         );
         assert_eq!(validate_component("libfoo.rlib"), Ok(()));
+    }
+
+    // -- FL-1383 seed_dest_dir derivation (design §6.3/§7) --------------------
+    #[nativelink_test]
+    async fn seed_dest_dir_derives_stem_incr_top_level_child() {
+        let execroot = std::path::Path::new("/Volumes/CrowAgent/fl-incr-execroots/deadbeef");
+        // primary .rlib stem -> <execroot>/<stem>-incr top-level child.
+        assert_eq!(
+            seed_dest_dir(execroot, PRIMARY),
+            Some(execroot.join("libfoo-incr")),
+        );
+        // No extension -> the whole filename is the stem.
+        assert_eq!(
+            seed_dest_dir(execroot, "bazel-out/cfg/bin/pkg/thing"),
+            Some(execroot.join("thing-incr")),
+        );
+        // No filename stem -> None (never a bare "-incr" that could escape).
+        assert_eq!(seed_dest_dir(execroot, ""), None);
+        assert_eq!(seed_dest_dir(execroot, "pkg/"), None);
+    }
+
+    // -- FL-1383 plan_seed_publish (design §6.2) ------------------------------
+    #[nativelink_test]
+    async fn plan_seed_publish_only_on_success_with_incr_folder() {
+        let tk = targetkey();
+        let incr = blake3_digest(b"the-incr-tree");
+        // A rustc action declaring both a `-incr` seed tree and other outputs.
+        let folders = || {
+            [
+                ("bazel-out/cfg/bin/pkg/libfoo-incr", incr),
+                ("bazel-out/cfg/bin/pkg", blake3_digest(b"other")),
+            ]
+        };
+
+        // SUCCESS + an -incr folder -> publish a fetch-compatible index value.
+        let publish = plan_seed_publish(&tk, 0, false, folders())
+            .expect("a clean build with an -incr folder must publish");
+        assert_eq!(
+            publish.index_digest,
+            index_action_digest(&tk),
+            "index key must be hash(targetkey)"
+        );
+        let action_result =
+            ActionResult::decode(publish.encoded.clone()).expect("published value decodes");
+        let output_dir = action_result
+            .output_directories
+            .first()
+            .expect("value has an output_directory");
+        assert_eq!(
+            output_dir.path,
+            tk.primary_output(),
+            "value path MUST be the primary output so the chunk-3 fetch collision guard accepts it"
+        );
+        assert_eq!(
+            DigestInfo::try_from(output_dir.tree_digest.as_ref().expect("tree_digest present"))
+                .expect("tree_digest valid"),
+            incr,
+            "value tree_digest MUST be the -incr tree, not another output"
+        );
+
+        // FAILED build (nonzero exit) -> None: never publish a torn seed.
+        assert!(
+            plan_seed_publish(&tk, 1, false, folders()).is_none(),
+            "a nonzero exit code must NOT publish (torn/partial seed)"
+        );
+        // Internal error -> None.
+        assert!(
+            plan_seed_publish(&tk, 0, true, folders()).is_none(),
+            "an internal error must NOT publish"
+        );
+        // SUCCESS but no -incr folder -> None (nothing to seed).
+        assert!(
+            plan_seed_publish(&tk, 0, false, [("bazel-out/cfg/bin/pkg/libfoo.rlib", incr)])
+                .is_none(),
+            "no -incr output folder means nothing to publish"
+        );
+        // `-incr-metadata` is the distinct pipelined tree (§4), NOT the index seed.
+        assert!(
+            plan_seed_publish(&tk, 0, false, [("pkg/libfoo-incr-metadata", incr)]).is_none(),
+            "-incr-metadata is the pipelined tree, not the single -incr the index carries"
+        );
+    }
+
+    // -- FL-1383 §12 observability: counters render (not dark) ----------------
+    #[nativelink_test]
+    async fn incr_seed_metrics_render_pins_all_counter_names() {
+        use core::sync::atomic::Ordering;
+
+        use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // A FRESH instance (not the process-global singleton) so the value
+        // assertion is not raced by other tests that bump the singleton.
+        let metrics = std::sync::Arc::new(IncrSeedMetrics::default());
+        metrics.incr_seed_materialized.fetch_add(3, Ordering::Relaxed);
+        let registry = MetricsRegistry::new();
+        registry.register("incr_seed_index", metrics.clone());
+        let body = render_prometheus(&registry);
+
+        for name in [
+            "incr_seed_materialized",
+            "incr_reuse_fired",
+            "incr_seed_present_but_cold",
+            "incr_seed_collision",
+            "incr_index_fetch_hit",
+            "incr_index_fetch_miss",
+            "incr_index_fetch_timeout",
+            "incr_index_fetch_error",
+            "incr_index_publish",
+        ] {
+            assert!(
+                body.contains(name),
+                "FL-1383 counter {name} must render — a rename must not silently re-dark it; body:\n{body}"
+            );
+        }
+        assert!(
+            body.contains("incr_seed_index_incr_seed_materialized 3"),
+            "the materialized counter's VALUE must be wired into the render body, not merely a \
+             struct field; body:\n{body}"
+        );
+    }
+
+    #[nativelink_test]
+    async fn incr_seed_metrics_singleton_arc_registers_and_renders() {
+        use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // The process-singleton arc (what bin/nativelink.rs registers) must be
+        // registerable and render its names — the non-dark path.
+        let registry = MetricsRegistry::new();
+        registry.register("incr_seed_index", incr_seed_metrics_arc());
+        let body = render_prometheus(&registry);
+        assert!(
+            body.contains("incr_seed_materialized"),
+            "the process-singleton arc must register + render (non-dark); body:\n{body}"
+        );
     }
 
     // A Store whose reads never resolve, to prove the bounded index timeout.

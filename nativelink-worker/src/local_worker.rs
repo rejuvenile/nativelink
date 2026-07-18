@@ -6937,6 +6937,10 @@ pub async fn new_local_worker(
     ac_store: Option<Store>,
     ac_store_name: Option<String>,
     historical_store: Store,
+    // FL-1383 (design §6.1/§6.3): the fleet-shared `incr_seed_index` store, resolved
+    // by the caller from `config.portable_incr_seed_index_store`. `None` (the fleet
+    // default / unset) leaves the seed fetch+publish path INERT.
+    incr_seed_index_store: Option<Store>,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     // (#37 re-enable follow-up) Set the memory gate enable flag from config
     // ONCE before the sampler starts. `AtomicBool` `Relaxed` is sufficient
@@ -7385,6 +7389,11 @@ pub async fn new_local_worker(
     // fleet) BEFORE Arc-wrapping so the ~55 Args construction sites stay
     // untouched. See `RunningActionsManagerImpl::set_portable_incr`.
     running_actions_manager_impl.set_portable_incr(portable_incr_context);
+    // FL-1383 (design §6.1/§6.3): install the fleet-shared `incr_seed_index` store
+    // handle (INERT `None` on the fleet), same pre-Arc pattern as above. The worker
+    // fetches the `-incr` seed from it before rustc and publishes to it after a
+    // successful allowlisted build.
+    running_actions_manager_impl.set_incr_seed_index_store(incr_seed_index_store);
     let running_actions_manager = Arc::new(running_actions_manager_impl);
 
     // Set up BlobsAvailable reporting with drain-then-fire semantics.
