@@ -363,12 +363,13 @@ async fn materialize_tree(
     // whole seed); each blob is dropped after its write. Every per-file guard —
     // the blake3 verify and the `O_NOFOLLOW|O_EXCL` byte-copy — runs UNCHANGED
     // inside each concurrent `fetch_and_write_file`; parallelization only overlaps
-    // the (§6.5) main-CAS reads. Short-circuit is preserved: on the FIRST file's
-    // cold/error the helper stops consuming, drops the stream to abort the
-    // remaining in-flight fetches, and returns it; we then wipe the temp tree and
-    // return cold — never a partial dir. (With `buffer_unordered`, "first" is
-    // first-to-fail, not plan order; the outcome — cold, wiped, no-partial-dir —
-    // is identical either way.)
+    // the (§6.5) main-CAS reads. On the FIRST file's cold/error the helper CAPTURES
+    // it, then DRAINS the rest to completion so no in-flight `spawn_blocking` write
+    // is orphaned (spawn_blocking is uncancellable; an early drop would race the
+    // wipe below → ENOTEMPTY + a leaked temp dir). Once every in-flight write has
+    // quiesced we wipe the temp tree and return cold — never a partial dir at
+    // `dest`. (With `buffer_unordered`, "first" is first-to-fail, not plan order;
+    // the outcome — cold, wiped, no-partial-dir — is identical either way.)
     if let Some((failure, rel_path)) =
         materialize_files_parallel(cas_store, &temp_dir, &plan.files).await
     {
@@ -588,11 +589,24 @@ enum FileMaterializeError {
 /// Drive the per-file fetch+verify+write with bounded fan-out
 /// ([`PARALLEL_MATERIALIZE_CONCURRENCY`] futures in flight, via
 /// `buffer_unordered`). Returns `Some((error, rel_path))` for the FIRST file that
-/// fails (cold or internal) — after which the stream is dropped so every
-/// remaining in-flight fetch is aborted before the caller wipes the temp tree —
-/// or `None` when every file materialized. Each file's blake3 verify and
-/// `O_NOFOLLOW|O_EXCL` byte-copy run unchanged inside [`fetch_and_write_file`];
-/// this only overlaps the reads.
+/// fails (cold or internal) — or `None` when every file materialized. Each file's
+/// blake3 verify and `O_NOFOLLOW|O_EXCL` byte-copy run unchanged inside
+/// [`fetch_and_write_file`]; this only overlaps the reads.
+///
+/// DRAIN, don't abort: on a failure the stream is polled to COMPLETION (the first
+/// error is captured and returned; later results are discarded) rather than
+/// dropped early. [`write_file_nofollow`] runs the byte-copy on `spawn_blocking`,
+/// which is NOT cancellable — dropping the stream on the first error would orphan
+/// the ≤15 other in-flight blocking writes, which keep creating files under
+/// `temp_dir` and race the caller's `remove_dir_all` (observed: `ENOTEMPTY` →
+/// `cleanup_or_err` returns `Err` INSTEAD of the cold `SeedOutcome`, and a
+/// half-written temp dir LEAKS on disk). Draining lets every in-flight write
+/// quiesce before the caller wipes the tree, so the cold-wipe-no-partial-dir
+/// contract holds deterministically. This mirrors the `.collect().await`
+/// parallel-BFS pattern in `running_actions_manager`. The memory bound is
+/// unchanged: `buffer_unordered` caps in-flight fetches at
+/// `PARALLEL_MATERIALIZE_CONCURRENCY` throughout the drain, and every blob is
+/// dropped after its write.
 ///
 /// Driven over OWNED per-file items (rather than borrowing `&plan.files`): a
 /// borrowed stream item combined with the caller's `Send` bound (the worker's
@@ -627,14 +641,18 @@ async fn materialize_files_parallel(
         })
         .buffer_unordered(PARALLEL_MATERIALIZE_CONCURRENCY);
 
+    // Capture the FIRST failure but keep draining, so no in-flight `spawn_blocking`
+    // write is orphaned to race the caller's `remove_dir_all` (see the drain
+    // rationale above). All later results are discarded — any failure is cold.
+    let mut first_failure = None;
     while let Some(result) = writes.next().await {
         if let Err(failure) = result {
-            // Returning here drops `writes`, aborting the remaining in-flight
-            // fetches; the caller wipes the temp tree.
-            return Some(failure);
+            if first_failure.is_none() {
+                first_failure = Some(failure);
+            }
         }
     }
-    None
+    first_failure
 }
 
 /// Fetch a single blob, verify its blake3 digest, and write it under the temp
@@ -1237,6 +1255,84 @@ mod tests {
             let want = if *exec { 0o755 } else { 0o644 };
             assert_eq!(mode, want, "mode mismatch for {name} (executable-bit guard)");
         }
+    }
+
+    // Parallel first-failure cold path: with MANY files (past the 16-wide window)
+    // and ONE whose blob mismatches its claimed digest, the bounded fan-out will
+    // have written several good siblings into the temp dir by the time the bad
+    // file's future returns Cold. The path must DRAIN the remaining in-flight
+    // writes (so no uncancellable spawn_blocking write is orphaned to race the
+    // wipe) AND wipe the WHOLE temp tree — including the already-written siblings
+    // — so NO partial dir survives and `dest` never appears. This is the
+    // parallel-specific risk the single-file
+    // `file_digest_mismatch_is_cold_no_partial_dir` cannot exercise.
+    #[nativelink_test]
+    async fn parallel_one_bad_file_among_many_is_cold_no_partial_dir() {
+        let index = new_store();
+        let cas = new_store();
+        let tk = targetkey();
+
+        const BAD: u32 = 25;
+        let mut file_nodes = Vec::new();
+        for i in 0..40u32 {
+            let name = format!("f{i:02}.bin");
+            if i == BAD {
+                // Claim a digest but store DIFFERENT bytes under it → the
+                // post-read blake3+size verify fails → this file's future
+                // returns Cold, aborting the rest.
+                let claimed = blake3_digest(format!("claimed-{i}").as_bytes());
+                put(&cas, claimed, Bytes::from_static(b"WRONG-length-and-content")).await;
+                file_nodes.push(FileNode {
+                    name,
+                    digest: Some(Digest::from(&claimed)),
+                    is_executable: false,
+                    node_properties: None,
+                });
+            } else {
+                let content = format!("content-{i}").into_bytes();
+                file_nodes.push(upload_file(&cas, &name, &content, false).await);
+            }
+        }
+        let tree = Tree {
+            root: Some(Directory {
+                files: file_nodes,
+                directories: vec![],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            children: vec![],
+        };
+        let tree_digest = upload_tree(&cas, &tree).await;
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(10))
+            .await
+            .expect("fetch should not error on one bad file among many");
+
+        assert_eq!(
+            outcome,
+            SeedOutcome::NoSeed,
+            "one bad file among many must yield a COLD outcome"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must never appear after a parallel cold abort"
+        );
+        // The whole temp tree — including the successfully-written siblings — must
+        // be wiped; no partial dir may survive in dest's parent.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no partial temp dir may survive a parallel first-failure abort (the \
+             successfully-written siblings must be wiped too); found: {leftovers:?}"
+        );
     }
 
     #[nativelink_test]
