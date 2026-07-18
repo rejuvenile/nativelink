@@ -1448,6 +1448,257 @@ async fn portable_action_with_seeded_index_fetches_and_materializes() {
     action.cleanup().await.expect("cleanup");
 }
 
+// -- FL-1383 ask #4: SeedOutcome → flag → child-env-carrier WIRING -------------
+//
+// The pure helper `portable_incr_seed_child_env(seeded, targetkey)` is unit-
+// tested inside `running_actions_manager.rs`. These tests exercise the load-
+// bearing WIRING the unit tests can't reach: the prepare-site `SeedOutcome`→flag
+// mapping, the `state.portable_incr_seeded` stash, the `inner_execute` read, and
+// the `command_builder.env` injection — end to end, by SPAWNING the real child
+// and reading the env it actually received. The child writes the two reserved
+// carrier vars (with a shell default of `<unset>`) into `carrier-env.txt` in its
+// cwd (the execroot), which we read back after `execute()`.
+
+/// Pre-seed CAS with a flat `-incr` `Tree` (blake3-keyed, as the seed path
+/// verifies) and point the index at it for `tk`, so `fetch_and_materialize_seed`
+/// resolves to `SeedOutcome::Materialized`. Mirrors the (b)-test pre-seed block.
+async fn pre_seed_incr_index(index_store: &Store, cas: &Arc<FastSlowStore>, tk: &TargetKey) {
+    let cas_store = Store::new(cas.clone());
+    let file_content: &[u8] = b"incremental-artifact";
+    let file_digest = blake3_digest(file_content);
+    put_blob(&cas_store, file_digest, file_content.to_vec()).await;
+    let tree = Tree {
+        root: Some(Directory {
+            files: vec![FileNode {
+                name: "dep-graph.bin".to_string(),
+                digest: Some(Digest::from(&file_digest)),
+                is_executable: false,
+                node_properties: None,
+            }],
+            directories: vec![],
+            symlinks: vec![],
+            node_properties: None,
+        }),
+        children: Vec::<Directory>::new(),
+    };
+    let tree_bytes = tree.encode_to_vec();
+    let tree_digest = blake3_digest(&tree_bytes);
+    put_blob(&cas_store, tree_digest, tree_bytes).await;
+    let seeded = plan_seed_publish(tk, 0, false, std::iter::once(("z-incr", tree_digest)))
+        .expect("seed index value");
+    index_store
+        .update_oneshot(StoreKey::Digest(seeded.index_digest), seeded.encoded)
+        .await
+        .expect("pre-seed index");
+}
+
+/// A `Command` whose child dumps the two reserved `-incr` carrier vars into
+/// `carrier-env.txt` (in the execroot), each defaulting to `<unset>` via shell
+/// parameter expansion so ABSENCE is observable, not just presence. Declares the
+/// primary `.rlib` and its nested `-incr` output so the seed-fetch is attempted
+/// (`seed_dest_dir` resolves). `extra_env` lets a test forge a CLIENT-supplied
+/// reserved carrier to prove the worker strips it.
+fn carrier_dump_command(
+    primary: &str,
+    incr_output: &str,
+    extra_env: &[(&str, &str)],
+) -> Command {
+    let mut environment_variables = vec![EnvironmentVariable {
+        name: "PATH".to_string(),
+        value: std::env::var("PATH").unwrap_or_default(),
+    }];
+    for (name, value) in extra_env {
+        environment_variables.push(EnvironmentVariable {
+            name: (*name).to_string(),
+            value: (*value).to_string(),
+        });
+    }
+    Command {
+        arguments: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'SEEDED=[%s]\\n' \"${NL_PORTABLE_INCR_SEEDED:-<unset>}\" > carrier-env.txt && \
+             printf 'TARGETKEY=[%s]\\n' \"${NL_INCR_TARGETKEY:-<unset>}\" >> carrier-env.txt"
+                .to_string(),
+        ],
+        output_paths: vec![primary.to_string(), incr_output.to_string()],
+        working_directory: ".".to_string(),
+        environment_variables,
+        ..Default::default()
+    }
+}
+
+/// Drive a portable action through the REAL composition
+/// (`create_and_add_action` → `prepare_action` → `execute`) and return what the
+/// SPAWNED CHILD wrote to `carrier-env.txt` — i.e. the env the child actually
+/// received. Cleans up before returning.
+async fn execute_and_read_carrier_dump(
+    manager: &Arc<RunningActionsManagerImpl>,
+    start_execute: StartExecute,
+) -> String {
+    let action = manager
+        .create_and_add_action("test-worker".to_string(), start_execute)
+        .await
+        .expect("portable action admitted");
+    let execroot = action.get_work_directory().to_string();
+    action
+        .clone()
+        .prepare_action()
+        .await
+        .expect("prepare_action")
+        .execute()
+        .await
+        .expect("execute");
+    let dump = fs::read_to_string(Path::new(&execroot).join("carrier-env.txt")).expect(
+        "the spawned child MUST have written carrier-env.txt into the execroot — its absence \
+         means the child never ran or wrote to the wrong cwd",
+    );
+    action.cleanup().await.expect("cleanup");
+    dump
+}
+
+/// FL-1383 ask #4 — the SeedOutcome→flag→injection WIRING, end to end, for the
+/// SAME action run seeded on one worker and cold on another:
+///   (a) `Materialized`  → child env has `NL_PORTABLE_INCR_SEEDED=1` AND
+///       `NL_INCR_TARGETKEY=<TargetKey::key()>`;
+///   (b) cold (index-miss) → child env has NEITHER;
+///   (c) DIGEST NON-LEAK → the client action digest is BYTE-IDENTICAL between the
+///       seeded and cold runs (the carrier never enters the action identity).
+///
+/// Mutation coverage (both restored):
+///   - INVERT the prepare-site guard (`:5468`, `matches!(_, Materialized)` →
+///     `!matches!`): the cold run then sets the flag and the seeded run clears it,
+///     so (a) and (b) BOTH flip → RED. (The exact false-positive-on-cold the 3
+///     shipped helper-only tests miss: guard inversion passes 220/220 there.)
+///   - MOVE the injection into `command_proto.environment_variables` instead of
+///     `command_builder`: pushed AFTER the action-env loop it never reaches the
+///     child; pushed BEFORE it, the sole-authority strip removes it (reserved
+///     name) — either way the child loses the carrier → (a) RED.
+#[nativelink_test]
+async fn portable_seed_wiring_injects_carrier_into_child_env_only_when_materialized() {
+    let primary = "wire-e2e/aaa.rlib";
+    let incr_output = "wire-e2e/aaa-incr";
+    let (_key, props) = carrier_props(primary);
+    let tk = TargetKey::derive(&[primary.to_string(), incr_output.to_string()])
+        .expect("targetkey derives");
+    let command = carrier_dump_command(primary, incr_output, &[]);
+
+    // Seeded worker: its index HAS the entry → prepare materializes → flag true.
+    let (_td_s, root_s) = canonical_tempdir();
+    let index_seeded = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager_seeded, cas_seeded) = setup_portable_manager_with_index(
+        enabled_context(&root_s, &["wire-e2e/"]),
+        index_seeded.clone(),
+    )
+    .await;
+    pre_seed_incr_index(&index_seeded, &cas_seeded, &tk).await;
+    let se_seeded = upload_start_execute(&cas_seeded, &command, platform_from_props(&props)).await;
+
+    // Cold worker: EMPTY index → prepare's fetch misses → NoSeed → flag false.
+    let (_td_c, root_c) = canonical_tempdir();
+    let index_cold = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager_cold, cas_cold) =
+        setup_portable_manager_with_index(enabled_context(&root_c, &["wire-e2e/"]), index_cold)
+            .await;
+    let se_cold = upload_start_execute(&cas_cold, &command, platform_from_props(&props)).await;
+
+    // (c) DIGEST NON-LEAK: the client action digest is a pure function of the
+    // Action/Command bytes and is IDENTICAL for the seeded and cold runs — seeding
+    // (a pre-seeded index, external to the Action) does not perturb the action
+    // identity. This is the make-or-break the carrier must never break: the vars
+    // live on `command_builder` (the child), never on `command_proto` (the digest).
+    assert_eq!(
+        se_seeded
+            .execute_request
+            .as_ref()
+            .and_then(|r| r.action_digest.clone()),
+        se_cold
+            .execute_request
+            .as_ref()
+            .and_then(|r| r.action_digest.clone()),
+        "the SAME action must have a BYTE-IDENTICAL action digest whether seeded or cold — a \
+         differing digest means the carrier leaked into the REAPI Command / action identity",
+    );
+
+    let seeded_dump = execute_and_read_carrier_dump(&manager_seeded, se_seeded).await;
+    let cold_dump = execute_and_read_carrier_dump(&manager_cold, se_cold).await;
+
+    // (a) Materialized → both carriers present with the exact worker values.
+    assert!(
+        seeded_dump.contains("SEEDED=[1]"),
+        "a Materialized seed MUST inject NL_PORTABLE_INCR_SEEDED=1 into the SPAWNED CHILD so \
+         process_wrapper skips its local-tool seed path — child dump was:\n{seeded_dump}",
+    );
+    assert!(
+        seeded_dump.contains(&format!("TARGETKEY=[{}]", tk.key())),
+        "a Materialized seed MUST inject NL_INCR_TARGETKEY=<TargetKey::key()> ({}) into the \
+         spawned child — child dump was:\n{seeded_dump}",
+        tk.key(),
+    );
+
+    // (b) cold → NEITHER carrier present (both read the `<unset>` default).
+    assert!(
+        cold_dump.contains("SEEDED=[<unset>]"),
+        "a COLD outcome MUST NOT inject NL_PORTABLE_INCR_SEEDED — a false positive would make \
+         process_wrapper skip a seed that is not present → a wrong/cold-slow build; child dump \
+         was:\n{cold_dump}",
+    );
+    assert!(
+        cold_dump.contains("TARGETKEY=[<unset>]"),
+        "a COLD outcome MUST NOT inject NL_INCR_TARGETKEY either — child dump was:\n{cold_dump}",
+    );
+}
+
+/// FL-1383 ask #4 (sole-authority hardening): the worker is the ONLY authority
+/// for the reserved carrier names. A COLD portable action whose CLIENT env forges
+/// `NL_PORTABLE_INCR_SEEDED=1` (+ a bogus `NL_INCR_TARGETKEY`) must have BOTH
+/// STRIPPED from the child env — the worker injects nothing on cold, so an
+/// un-stripped client `=1` would make process_wrapper skip a non-existent seed.
+///
+/// Mutation: remove the `is_reserved_incr_env` strip in the action-env loop → the
+/// forged `NL_PORTABLE_INCR_SEEDED=client-forged-1` survives into the child →
+/// `SEEDED=[<unset>]` assertion RED.
+#[nativelink_test]
+async fn portable_cold_strips_client_supplied_reserved_carrier() {
+    let primary = "strip-wire/aaa.rlib";
+    let incr_output = "strip-wire/aaa-incr";
+    let (_key, props) = carrier_props(primary);
+
+    let (_td, root) = canonical_tempdir();
+    let index_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager, cas) =
+        setup_portable_manager_with_index(enabled_context(&root, &["strip-wire/"]), index_store)
+            .await;
+
+    // COLD (empty index) + a CLIENT action that forges BOTH reserved carriers in
+    // its own REAPI env. The worker must strip them: it is the sole authority.
+    let command = carrier_dump_command(
+        primary,
+        incr_output,
+        &[
+            ("NL_PORTABLE_INCR_SEEDED", "client-forged-1"),
+            ("NL_INCR_TARGETKEY", "client-forged-key"),
+        ],
+    );
+    let se = upload_start_execute(&cas, &command, platform_from_props(&props)).await;
+    let dump = execute_and_read_carrier_dump(&manager, se).await;
+
+    assert!(
+        dump.contains("SEEDED=[<unset>]"),
+        "the worker MUST strip a CLIENT-supplied NL_PORTABLE_INCR_SEEDED from a portable action's \
+         env (worker is sole authority): on a cold outcome the child must see NO seeded signal, \
+         else process_wrapper skips a non-existent seed → wrong/cold build; child dump was:\n{dump}",
+    );
+    assert!(
+        dump.contains("TARGETKEY=[<unset>]"),
+        "the worker MUST also strip a CLIENT-supplied NL_INCR_TARGETKEY — child dump was:\n{dump}",
+    );
+    assert!(
+        !dump.contains("client-forged"),
+        "no client-forged reserved carrier value may reach the child — child dump was:\n{dump}",
+    );
+}
+
 /// (c) INERTNESS BY ASSERTION (pair-b): a NON-portable action (no carrier props →
 /// `portable_execroot == None` → `portable_targetkey` never stashed, stays `None`)
 /// on a portable-ENABLED manager with an index store installed AND a matching

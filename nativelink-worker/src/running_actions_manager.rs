@@ -108,6 +108,21 @@ use crate::incr_seed_fetch::{
 /// `incr_index_fetch_timeout` counter tells the canary whether to tune it.
 const INCR_SEED_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// FL-1383 ask #4: the worker-RESERVED `-incr` carrier env-var names. The worker
+/// is the SOLE authority for these two signals — on the portable-incr path a
+/// client-supplied `NL_PORTABLE_INCR_SEEDED`/`NL_INCR_TARGETKEY` is STRIPPED from
+/// the action env before the worker injects its own (only on a genuine
+/// `Materialized` seed), so a client can never forge "a seed is present". Both
+/// the injector ([`portable_incr_seed_child_env`]) and the strip in
+/// `inner_execute` reference these constants so the two can never drift.
+const NL_PORTABLE_INCR_SEEDED_ENV: &str = "NL_PORTABLE_INCR_SEEDED";
+const NL_INCR_TARGETKEY_ENV: &str = "NL_INCR_TARGETKEY";
+
+/// `true` iff `name` is one of the worker-reserved `-incr` carrier env names.
+fn is_reserved_incr_env(name: &str) -> bool {
+    name == NL_PORTABLE_INCR_SEEDED_ENV || name == NL_INCR_TARGETKEY_ENV
+}
+
 /// FL-1383 ask #4 (Bazel-client contract): the worker-injected CHILD-process
 /// env vars that tell the in-action `process_wrapper` a genuine `-incr` seed
 /// was materialized on THIS remote execution, so it reliably skips its
@@ -136,8 +151,8 @@ fn portable_incr_seed_child_env(
 ) -> Vec<(&'static str, String)> {
     match (seeded, targetkey) {
         (true, Some(targetkey)) => vec![
-            ("NL_PORTABLE_INCR_SEEDED", "1".to_string()),
-            ("NL_INCR_TARGETKEY", targetkey.key().to_string()),
+            (NL_PORTABLE_INCR_SEEDED_ENV, "1".to_string()),
+            (NL_INCR_TARGETKEY_ENV, targetkey.key().to_string()),
         ],
         _ => Vec::new(),
     }
@@ -5642,6 +5657,20 @@ impl RunningActionImpl {
             envs
         };
         for environment_variable in envs {
+            // FL-1383 ask #4 (sole-authority): on the portable-incr path the
+            // worker is the ONLY authority for the reserved `-incr` carrier names.
+            // Strip any client-supplied `NL_PORTABLE_INCR_SEEDED`/`NL_INCR_TARGETKEY`
+            // from the action's own env so a client cannot forge "a seed is
+            // present": on a COLD outcome the worker injects nothing below, and an
+            // un-stripped client `NL_PORTABLE_INCR_SEEDED=1` would make
+            // `process_wrapper` skip a seed that is NOT present → wrong/cold build.
+            // Scoped to portable actions (`portable_targetkey.is_some()`) so a
+            // non-portable action's child env is byte-UNCHANGED — fleet-INERT, as
+            // `portable_targetkey` is `None` for every action on the fleet and for
+            // every non-portable action off-fleet.
+            if portable_targetkey.is_some() && is_reserved_incr_env(&environment_variable.name) {
+                continue;
+            }
             command_builder.env(&environment_variable.name, &environment_variable.value);
         }
 
