@@ -44,6 +44,7 @@ use nativelink_util::action_messages::{
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::fs_util::hardlink_directory_tree;
 use nativelink_util::store_trait::Store;
 use nativelink_util::targetkey::TargetKey;
 use nativelink_worker::portable_incr::{
@@ -328,6 +329,55 @@ async fn verify_rejects_empty_output_paths() {
     drop(plan);
 }
 
+#[nativelink_test]
+async fn verify_rejects_forged_targetkey_with_matching_primary() {
+    // Isolate the KEY guard (portable_incr.rs, `derived.key() != carrier_targetkey`)
+    // from the primary-output guard. `verify_rejects_key_mismatch` swaps the
+    // primary output, which changes the DERIVED key AND the derived primary — so
+    // it trips whichever guard survives and both messages say "worker-derived",
+    // making it unable to prove the KEY guard specifically. Here the carrier
+    // primary output EQUALS the derived primary (primary guard would PASS), but
+    // the carrier targetkey is a DIFFERENT valid 64-hex — a forged key routing a
+    // build into a different crate's warm execroot (cross-crate seed poisoning).
+    // Only the KEY guard can reject this.
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["forge-test/"]);
+    let primary = "forge-test/uniq-f/libfoo.rlib";
+    let real_key = TargetKey::derive(&[primary.to_string()])
+        .expect("derive")
+        .key()
+        .to_string();
+    // Forge a DIFFERENT valid 64-lowercase-hex key by flipping the first nibble
+    // (0↔1 keeps it lowercase-hex and guarantees inequality).
+    let mut forged = real_key.clone().into_bytes();
+    forged[0] = if forged[0] == b'0' { b'1' } else { b'0' };
+    let forged_key = String::from_utf8(forged).expect("hex is valid utf8");
+    assert_ne!(forged_key, real_key, "forged key must differ from the real key");
+
+    let mut props = HashMap::new();
+    props.insert(CARRIER_TARGETKEY_PROP.to_string(), forged_key.clone());
+    props.insert(CARRIER_PRIMARY_OUTPUT_PROP.to_string(), primary.to_string());
+    let plan = ctx
+        .plan(&props)
+        .expect("forged key is still 64-hex + allowlisted ⇒ eligible to plan");
+
+    // Command outputs derive to `real_key` with primary == carrier primary, so
+    // the primary-output guard would PASS; only the KEY guard rejects.
+    let err = plan
+        .verify_against_command_outputs(&[primary.to_string()])
+        .expect_err("forged carrier targetkey != worker-derived ⇒ Err");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("carrier targetkey"),
+        "must trip the KEY-specific guard, not the primary-output guard; got: {err}"
+    );
+    assert!(
+        msg.contains("!= worker-derived"),
+        "bespoke key-mismatch message; got: {err}"
+    );
+    drop(plan);
+}
+
 // -- §7 wipe preserves -incr, empties the rest -------------------------------
 
 #[nativelink_test]
@@ -377,6 +427,73 @@ async fn wipe_creates_execroot_when_absent() {
     assert!(!execroot.exists(), "precondition: execroot absent");
     plan.ensure_and_wipe_execroot().expect("ensure creates it");
     assert!(execroot.is_dir(), "execroot created (owner first build)");
+    drop(plan);
+}
+
+// -- §7+B2 emergent property: -incr SURVIVES the wipe→materialize chain -------
+//
+// The whole warm-reuse benefit rests on an EMERGENT property (convergent
+// distsys MAJOR-1 / red-team A1a): after the §7 wipe leaves `-incr` in place,
+// the input-materialize step (`hardlink_directory_tree` → `try_clonefile` on
+// macOS / hardlink path on Linux) must NOT recursively clear the pre-populated
+// execroot, or it destroys the seed on EVERY build (a DARK perf regression —
+// cold-not-wrong). No test locked this chain; every other test exercises
+// `portable_incr` in isolation. This drives the REAL production materialize
+// primitive against a seed-bearing warm execroot and asserts the seed (and its
+// bytes) survive. A refactor of the materialize dst-clear to a RECURSIVE delete
+// (fs_util.rs `try_clonefile` remove_dir→remove_dir_all on macOS; the Linux
+// create_dir_all→destructive on this build box) turns this test RED.
+#[nativelink_test]
+async fn incr_seed_survives_wipe_then_materialize() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["materialize-test/"]);
+    let (key, props) = carrier_props("materialize-test/uniq-m/libfoo.rlib");
+    let plan = ctx.plan(&props).expect("owner");
+    let execroot = root.join(&key);
+
+    // A prior build's warm residue: a POPULATED `-incr` seed + stale outputs.
+    fs::create_dir_all(execroot.join("libfoo-incr/dep-graph")).expect("mk incr");
+    fs::write(execroot.join("libfoo-incr/dep-graph/x"), b"seed-bytes").expect("seed");
+    fs::create_dir_all(execroot.join("bazel-out/bin")).expect("mk stale out");
+    fs::write(execroot.join("bazel-out/bin/stale.rlib"), b"stale").expect("stale output");
+
+    // B1: the §7 wipe — preserves `-incr`, empties the rest. Precondition for B2:
+    // the execroot is now NON-EMPTY (it still holds `-incr`), which is exactly
+    // the state whose non-recursive dst-clear the materialize silently depends on.
+    plan.ensure_and_wipe_execroot().expect("wipe");
+    assert!(
+        execroot.join("libfoo-incr/dep-graph/x").exists(),
+        "wipe must preserve the -incr seed (B1 precondition for this test)"
+    );
+    assert!(
+        !execroot.join("bazel-out").exists(),
+        "wipe must empty the stale non-incr output tree"
+    );
+
+    // B2: materialize fresh inputs INTO the warm, seed-bearing execroot via the
+    // exact production primitive (`hardlink_directory_tree`).
+    let src = root.join("inputs-src");
+    fs::create_dir_all(src.join("bazel-out/bin")).expect("mk src");
+    fs::write(src.join("bazel-out/bin/main.rs"), b"fn main(){}").expect("input");
+    hardlink_directory_tree(&src, &execroot)
+        .await
+        .expect("materialize into the warm execroot");
+
+    // The seed AND its bytes must survive the materialize; the fresh input landed.
+    let seed = execroot.join("libfoo-incr/dep-graph/x");
+    assert!(
+        seed.exists(),
+        "-incr seed dir DESTROYED by the input materialize (dst-clear went recursive?)"
+    );
+    assert_eq!(
+        fs::read(&seed).expect("read seed"),
+        b"seed-bytes",
+        "-incr seed CONTENTS destroyed by the input materialize"
+    );
+    assert!(
+        execroot.join("bazel-out/bin/main.rs").exists(),
+        "fresh input must materialize into the warm execroot"
+    );
     drop(plan);
 }
 

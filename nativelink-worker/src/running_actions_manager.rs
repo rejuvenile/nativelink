@@ -4594,17 +4594,29 @@ async fn do_cleanup(
     // nor saturate the blocking pool. `None` on the fleet → skipped entirely.
     // An OWNER's warm dir is NEVER here, so it is never deleted.
     let portable_discard_result = if let Some((isolated_dir, fixed_prefix)) = portable_discard {
-        match crate::portable_incr::assert_under_prefix(&isolated_dir, &fixed_prefix) {
-            Ok(()) => {
-                let dir_str = isolated_dir.to_string_lossy();
-                bounded_remove_dir_all(&dir_str).await.err_tip(|| {
-                    format!(
-                        "FL-1383 portable_incr contender discard {}",
-                        isolated_dir.display()
-                    )
-                })
-            }
-            Err(err) => Err(err).err_tip(|| "FL-1383 portable_incr contender discard containment"),
+        // S1: a Contender can be PLANNED (its `<targetkey>.<uuid>` dir chosen and
+        // lease reserved) yet never have its isolated dir CREATED — e.g. the action
+        // failed at the `running_actions` lock (AlreadyExists) before
+        // `ensure_and_wipe_execroot` ran. There is then nothing to discard;
+        // `assert_under_prefix` would `canonicalize` an absent path → ENOENT → a
+        // spurious `Code::Internal` cleanup error. Treat a non-existent target as
+        // a no-op (delete-nothing is the correct outcome).
+        match tokio::fs::try_exists(&isolated_dir).await {
+            Ok(false) => Ok(()),
+            _ => match crate::portable_incr::assert_under_prefix(&isolated_dir, &fixed_prefix) {
+                Ok(()) => {
+                    let dir_str = isolated_dir.to_string_lossy();
+                    bounded_remove_dir_all(&dir_str).await.err_tip(|| {
+                        format!(
+                            "FL-1383 portable_incr contender discard {}",
+                            isolated_dir.display()
+                        )
+                    })
+                }
+                Err(err) => {
+                    Err(err).err_tip(|| "FL-1383 portable_incr contender discard containment")
+                }
+            },
         }
     } else {
         Ok(())

@@ -18,8 +18,8 @@
 //!
 //! - **Chunk 2a (foundation):** [`provision_and_assert`] provisions the
 //!   machine-local `<FIXED_PREFIX>` root, asserts the §12 host-provisioning
-//!   invariants, and reports the effective-enabled state; the `O_EXCL` /
-//!   `O_NOFOLLOW` primitives back the materialize / relocation / EXDEV paths.
+//!   invariants, and reports the effective-enabled state; the
+//!   `create_file_exclusive_no_follow` primitive backs the §12(c) EXDEV probe.
 //! - **Chunk 2b (execroot core):** [`PortableIncrContext`] +
 //!   [`PortableExecroot`] pick the byte-identical execroot
 //!   `<FIXED_PREFIX>/<targetkey>` for an enabled+allowlisted action (§4), hold
@@ -38,7 +38,6 @@
 //! `spawn_blocking`; [`provision_and_assert`] and the chunk-2b execution-path
 //! caller both do exactly that so the tokio worker is never blocked.
 
-use core::ffi::c_int;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -381,44 +380,9 @@ fn assert_link_to_execroot(fixed_prefix: &Path, execroot_dir: &Path) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// O_EXCL / O_NOFOLLOW primitives (public — chunk 2b materialize/relocation/copy
-// paths). All are BLOCKING; callers on an async path MUST use `spawn_blocking`.
+// O_EXCL / O_NOFOLLOW primitive backing the §12(c) EXDEV probe. BLOCKING;
+// callers on an async path MUST use `spawn_blocking`.
 // ---------------------------------------------------------------------------
-
-/// Create `path` as a NEW directory, failing with an already-exists error if it
-/// already exists (mkdir(2)'s `EEXIST` exclusivity is the directory analogue of
-/// `O_EXCL`). The mode is `0o755` before umask; callers needing an exact mode
-/// must chmod afterwards. BLOCKING.
-pub fn create_dir_exclusive(path: &Path) -> Result<(), Error> {
-    mkdir_exclusive_raw(path, 0o755).map_err(|e| {
-        make_err!(
-            Code::Internal,
-            "exclusive create_dir {}: {e}",
-            path.display()
-        )
-    })
-}
-
-/// Open `path` with `O_NOFOLLOW` (and `O_CLOEXEC`) so a symlink at the final
-/// component is REFUSED (`ELOOP`) rather than silently traversed — a symlink-swap
-/// defense for the chunk-2b materialize/relocation paths (design §9). `flags`
-/// are OR'd with `O_NOFOLLOW | O_CLOEXEC`. BLOCKING.
-pub fn open_no_follow(path: &Path, flags: c_int) -> Result<OwnedFd, Error> {
-    let c_path = path_to_cstring(path)?;
-    // SAFETY: valid NUL-terminated path; standard open(2). O_NOFOLLOW refuses a
-    // final-component symlink instead of following it.
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(make_err!(
-            Code::Internal,
-            "open(O_NOFOLLOW) {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `fd` is a freshly-opened, owned, valid file descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
 
 /// Create `path` as a NEW regular file with `O_CREAT | O_EXCL | O_NOFOLLOW |
 /// O_CLOEXEC | O_WRONLY`: fails `EEXIST` if the path exists (including as a
@@ -457,10 +421,13 @@ pub fn create_file_exclusive_no_follow(path: &Path, mode: u32) -> Result<OwnedFd
 /// it to pick the byte-identical execroot BEFORE the `Command` is fetched.
 pub const CARRIER_TARGETKEY_PROP: &str = "nl_incr_targetkey";
 
-/// Action Platform property carrying the (config-stripped) primary output path
-/// that the `targetkey` hashes (design §3b carrier). The worker matches it
-/// against the allowlist and, once the `Command` is fetched, verifies the
-/// worker-derived key equals the carrier.
+/// Action Platform property carrying the primary output path the `targetkey`
+/// commits to (design §3b carrier): the lexicographically-smallest of the
+/// action's `Command.output_paths`, hashed VERBATIM by [`TargetKey::derive`]
+/// (the derivation does NOT strip any config/platform segment — the raw sorted
+/// path is what the key hashes). The worker matches it against the allowlist
+/// and, once the `Command` is fetched, verifies the worker-derived key equals
+/// the carrier.
 pub const CARRIER_PRIMARY_OUTPUT_PROP: &str = "nl_incr_primary_output";
 
 /// Whether a direct child entry of the execroot belongs to the rustc
@@ -694,6 +661,14 @@ impl PortableExecroot {
     /// empty (a no-op). ALL deletes are confined to a subtree of FIXED_PREFIX
     /// (design §9): the function refuses if the execroot does not canonicalize
     /// UNDER FIXED_PREFIX, so a wipe can never escape the machine-local prefix.
+    ///
+    /// SEED-SURVIVAL CONTRACT: after this wipe the execroot is NON-EMPTY (it
+    /// still holds `-incr`), and the subsequent input-materialize step must NOT
+    /// recursively clear it. `hardlink_directory_tree` relies on a NON-recursive
+    /// dst-clear (`fs_util::try_clonefile` `remove_dir`, NOT `remove_dir_all`) →
+    /// it fails on the seed-bearing dir and materializes INTO it via hardlink. A
+    /// refactor of that clear to a recursive delete silently destroys the seed on
+    /// every portable build. Locked by `incr_seed_survives_wipe_then_materialize`.
     ///
     /// BLOCKING (mkdir/readdir/unlink syscalls) — call under `spawn_blocking`.
     /// No `fsync`/sync-write primitive (CLAUDE.md hard rule).

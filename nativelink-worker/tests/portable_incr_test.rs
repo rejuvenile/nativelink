@@ -29,9 +29,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use nativelink_macro::nativelink_test;
-use nativelink_worker::portable_incr::{
-    create_dir_exclusive, create_file_exclusive_no_follow, provision_and_assert,
-};
+use nativelink_worker::portable_incr::{create_file_exclusive_no_follow, provision_and_assert};
 
 /// Canonicalized temp root so every path fed to the sysroot byte-identical
 /// assert is already realpath-stable (the test box's `TMPDIR` may itself be a
@@ -243,20 +241,6 @@ async fn exdev_cross_volume_refuses() {
     assert!(
         outcome.is_none(),
         "FIXED_PREFIX on a separate volume (link ⇒ EXDEV) must refuse/DISABLE in chunk 2a"
-    );
-}
-
-// Helper contract (for chunk 2b): create_dir_exclusive is O_EXCL — it refuses a
-// pre-existing path (EEXIST) rather than silently succeeding.
-#[nativelink_test]
-async fn create_dir_exclusive_refuses_existing() {
-    let (_td, root) = canonical_tempdir();
-    let dir = root.join("excl");
-    create_dir_exclusive(&dir).expect("first exclusive create succeeds");
-    let err = create_dir_exclusive(&dir).expect_err("second exclusive create must fail (EEXIST)");
-    assert!(
-        format!("{err:?}").to_lowercase().contains("exist"),
-        "exclusive dir create must report an already-exists error, got: {err:?}"
     );
 }
 
