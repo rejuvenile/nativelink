@@ -3826,10 +3826,12 @@ impl ApiWorkerSchedulerImpl {
                     // the resolved seed sub-tree becomes an ordinary Tier-1
                     // candidate ranked by the identical `(pref, load_penalty)`
                     // key (no special weight in v1). It thus inherits the
-                    // saturation/viability envelope automatically. Reuses the
-                    // EXISTING `cached_subtree_digests` membership check the
-                    // residency-gossip hook feeds. Inert when `incr_seed_digest`
-                    // is `None` (feature off / no gossip) → the OR reduces to the
+                    // saturation/viability envelope automatically. Residency is
+                    // the worker's OWN advertised `cached_subtree_digests`
+                    // (fed by its `BlobsAvailable` snapshot via
+                    // `update_cached_subtrees`) — snapshot-consistent, never a
+                    // scheduler side-inject. Inert when `incr_seed_digest` is
+                    // `None` (feature off / no gossip) → the OR reduces to the
                     // pre-feature `has_root_match || has_subtree_match`.
                     let has_seed_match = incr_seed_digest
                         .is_some_and(|sd| w.cached_subtree_digests.contains(&sd));
@@ -6174,31 +6176,33 @@ impl ApiWorkerScheduler {
         self.dag_state.lock().as_ref().map(|s| s.snapshot())
     }
 
-    /// (FL-1383 §10) Residency-GOSSIP hook: record that `worker_id` has
-    /// materialized the `-incr` seed whose Directory digest is `seed_digest`
-    /// for the portable-incr target keyed by `targetkey_key`
-    /// (`TargetKey::key()`, the blake3 hex).
+    /// (FL-1383 §10) Residency-GOSSIP hook: record that the portable-incr target
+    /// keyed by `targetkey_key` (`TargetKey::key()`, the blake3 hex) resolves to
+    /// the `-incr` seed whose Directory digest is `seed_digest`, as gossiped by
+    /// `worker_id`.
     ///
-    /// Two coupled updates under one write lock:
-    /// 1. The fleet-global `incr_seed_index` binds `targetkey_key → seed_digest`
-    ///    (last-writer-wins per design §6.2), so a future action carrying that
-    ///    `targetkey` can resolve the current seed digest at match with no store
-    ///    round-trip.
-    /// 2. The seed digest enters the advertising worker's existing
-    ///    `cached_subtree_digests`, so the ordinary match-time cache-affinity
-    ///    scorer (`inner_find_and_reserve_worker` Tier 1) scores this worker as a
-    ///    seed holder — a contribution to the existing affinity blend, NOT a new
-    ///    tier, so it inherits the saturation/viability envelope automatically.
+    /// This maintains ONLY the fleet-global `incr_seed_index` binding
+    /// `targetkey_key → seed_digest` (last-writer-wins per design §6.2), so a
+    /// future action carrying that `targetkey` can RESOLVE the current seed
+    /// digest at match with no store round-trip. The binding is worker-agnostic:
+    /// it says which digest to look for, NOT which worker holds it.
     ///
-    /// The index binding is applied even when the worker is absent (a report can
-    /// race an eviction) — the target→seed binding is fleet-global and still
-    /// useful for OTHER workers holding the same seed; the missing worker is then
-    /// reported so the caller can log it (mirrors the sibling cache setters).
+    /// Per-worker seed RESIDENCY ("does worker W hold seed S") is NOT recorded
+    /// here. It is derived at match time from each candidate worker's OWN
+    /// advertised holdings — `cached_subtree_digests`, populated by the worker's
+    /// `BlobsAvailable` advertisement path (`update_cached_subtrees`). That path
+    /// periodically REPLACES the set wholesale from a full snapshot, so any
+    /// scheduler-side side-inject into `cached_subtree_digests` would be silently
+    /// wiped by the next snapshot (a late wholesale-replace un-registering a
+    /// freshly-injected entry — the `locality-map-drift-async-callback-reorder`
+    /// class). Deriving residency from the advertised holdings keeps it
+    /// snapshot-consistent by construction.
     ///
     /// TODO(#FL-1383): chunk 3's `-incr` seed materialization is the SOURCE of
     /// this feed — a worker, after materializing the seed at its pinned path,
-    /// advertises `(targetkey_key, seed Directory digest)` over the `WorkerApi`;
-    /// the worker/service wiring that calls this hook is that chunk's scope.
+    /// advertises the seed Directory digest in its ordinary `BlobsAvailable`
+    /// holdings AND reports `(targetkey_key, seed Directory digest)` so this hook
+    /// binds the resolution index; both wirings are that chunk's scope.
     pub async fn record_incr_seed_residency(
         &self,
         worker_id: &WorkerId,
@@ -6206,20 +6210,16 @@ impl ApiWorkerScheduler {
         seed_digest: DigestInfo,
     ) -> Result<(), Error> {
         let mut inner = self.inner.write().await;
-        // Fleet-global binding first (LWW); the LruCache `put` also refreshes
-        // recency so an actively-gossiped target is not evicted under the cap.
+        // Fleet-global resolution binding only (LWW); the LruCache `put` also
+        // refreshes recency so an actively-gossiped target is not evicted under
+        // the cap. Residency is read from the worker's advertised holdings at
+        // match time — never side-injected here (would race the full-snapshot
+        // replace and go dark).
         inner.incr_seed_index.put(targetkey_key, seed_digest);
-        let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
-            make_input_err!(
-                "Worker not found in worker map in record_incr_seed_residency() {}",
-                worker_id
-            )
-        })?;
-        worker.cached_subtree_digests.insert(seed_digest);
         debug!(
             %worker_id,
             %seed_digest,
-            "worker -incr seed residency recorded (folded into cache-affinity)"
+            "worker -incr seed residency index binding recorded (targetkey -> seed)"
         );
         Ok(())
     }
@@ -20037,8 +20037,10 @@ mod b1_lock_decouple_tests {
 
         // ════════════════════════════════════════════════════════════════
         // (FL-1383 §10) `-incr` seed residency folds into the Tier-1
-        // cache-affinity blend. A worker that has materialized THIS target's
-        // `-incr` seed sub-tree (gossiped via `record_incr_seed_residency`)
+        // cache-affinity blend. A worker that has ADVERTISED THIS target's
+        // `-incr` seed sub-tree in its holdings (`cached_subtree_digests`, via
+        // the `BlobsAvailable`/`update_cached_subtrees` snapshot path) — while
+        // the resolution index is bound via `record_incr_seed_residency` —
         // must win the match for an action carrying the matching `targetkey`,
         // EVEN against a strictly-idler seedless worker — proving the seed
         // digest is scored as a Tier-1 affinity contribution (not a new tier,
@@ -20129,6 +20131,10 @@ mod b1_lock_decouple_tests {
 
         /// (FL-1383 §10) A `-incr` seed holder must WIN the match for its
         /// `targetkey` action even against a strictly-idler seedless worker.
+        /// Residency comes from W_SEED's OWN advertised holdings (the
+        /// `BlobsAvailable`/`update_cached_subtrees` full-snapshot path), the
+        /// race-free source — NOT a scheduler side-inject the next snapshot
+        /// would wipe.
         /// MUTATION (`|| has_seed_match` removed from Tier-1): the seed holder
         /// is no longer a cache-tier member, so the cascade falls through to the
         /// load-ranked fallback which picks the idler W_COLD → this red-fails
@@ -20143,7 +20149,23 @@ mod b1_lock_decouple_tests {
             add_seedless_worker(&scheduler, "W_SEED", 8, 0, 50, 50, 0).await;
             add_seedless_worker(&scheduler, "W_COLD", 8, 0, 0, 0, 0).await;
 
-            // Residency GOSSIP: W_SEED materialized the seed for this target.
+            // W_SEED ADVERTISES the seed digest in its own holdings via the
+            // production `BlobsAvailable` full-snapshot path — the same setter
+            // the periodic snapshot uses, so residency is snapshot-consistent
+            // (a later full snapshot re-supplies it, never wipes it).
+            scheduler
+                .update_cached_subtrees(
+                    &WorkerId("W_SEED".to_string()),
+                    true,
+                    vec![seed_digest()],
+                    vec![],
+                    vec![],
+                )
+                .await
+                .expect("advertise seed holdings");
+
+            // Resolution GOSSIP: bind this target's `targetkey → seed_digest` in
+            // the fleet-global index so the scorer knows WHICH digest to look for.
             let tk = seed_targetkey();
             scheduler
                 .record_incr_seed_residency(
@@ -20169,8 +20191,10 @@ mod b1_lock_decouple_tests {
         /// (FL-1383 §10, inertness) With NO `targetkey` on the action the
         /// residency scorer must be byte-for-byte the pre-feature blend: the
         /// strictly-idler seedless worker wins, NOT the seed-holding busier one —
-        /// even though the seed IS gossiped (index bound + W_SEED holds the seed
-        /// digest in `cached_subtree_digests`).
+        /// even though everything for a seed match is in place (index bound AND
+        /// W_SEED advertises the seed digest in its own `cached_subtree_digests`
+        /// via the production snapshot path). A `None` targetkey short-circuits
+        /// resolution, so the fold is inert.
         #[nativelink_test]
         async fn no_targetkey_is_inert_idler_wins() {
             let wsm = BarrierWorkerStateManager::new();
@@ -20178,6 +20202,20 @@ mod b1_lock_decouple_tests {
 
             add_seedless_worker(&scheduler, "W_SEED", 8, 0, 50, 50, 0).await;
             add_seedless_worker(&scheduler, "W_COLD", 8, 0, 0, 0, 0).await;
+
+            // W_SEED advertises the seed in its holdings (production snapshot
+            // path) AND the resolution index is bound — the strongest inertness
+            // setup: a `None` targetkey must STILL leave the scorer inert.
+            scheduler
+                .update_cached_subtrees(
+                    &WorkerId("W_SEED".to_string()),
+                    true,
+                    vec![seed_digest()],
+                    vec![],
+                    vec![],
+                )
+                .await
+                .expect("advertise seed holdings");
 
             let tk = seed_targetkey();
             scheduler
