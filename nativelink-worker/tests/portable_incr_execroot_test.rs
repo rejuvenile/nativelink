@@ -1192,6 +1192,147 @@ async fn portable_action_success_publishes_seed_index_and_bumps_counter() {
     action.cleanup().await.expect("cleanup");
 }
 
+/// Process-global `incr_reuse_fired` counter read (design §12 singleton).
+fn incr_reuse_fired_count() -> u64 {
+    incr_seed_metrics()
+        .incr_reuse_fired
+        .load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drive a portable action end-to-end (`create_and_add_action` → prepare →
+/// execute → upload_results → cleanup); its shell `script` produces `outputs`.
+/// Mirrors `portable_action_success_publishes_seed_index_and_bumps_counter`,
+/// parameterized so the three reuse-marker cases share one production
+/// composition (real `RunningActionImpl` + portable manager).
+async fn drive_portable_action(
+    manager: &Arc<RunningActionsManagerImpl>,
+    cas: &Arc<FastSlowStore>,
+    primary: &str,
+    script: &str,
+    outputs: Vec<String>,
+) {
+    let (_key, props) = carrier_props(primary);
+    // Non-empty `working_directory`: `output_paths` are relative to it, so the
+    // marker's on-disk path is `{execroot}/wd/{output_path}`. This pins the
+    // working_directory-aware join in the production read — an execroot-only join
+    // (the wd-dropping bug) would read `{execroot}/{output_path}` → NotFound →
+    // dark reuse-collapse. (Contrast the collapse of `""`/`"."` the seed_dest_dir
+    // unit tests already cover.)
+    let command = Command {
+        arguments: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+        output_paths: outputs,
+        working_directory: "wd".to_string(),
+        environment_variables: vec![EnvironmentVariable {
+            name: "PATH".to_string(),
+            value: std::env::var("PATH").unwrap_or_default(),
+        }],
+        ..Default::default()
+    };
+    let start_execute = upload_start_execute(cas, &command, platform_from_props(&props)).await;
+    let action = manager
+        .create_and_add_action("test-worker".to_string(), start_execute)
+        .await
+        .expect("portable action admitted");
+    action
+        .clone()
+        .prepare_action()
+        .await
+        .expect("prepare_action")
+        .execute()
+        .await
+        .expect("execute")
+        .upload_results()
+        .await
+        .expect("upload_results");
+    action.cleanup().await.expect("cleanup");
+}
+
+/// FL-1383 chunk 4 (design §12): the worker reads THIS action's own declared
+/// `<label>-incr-reuse` marker (a SIBLING of the `-incr` tree the client's
+/// process_wrapper always writes: content `1` = rustc incremental reuse fired,
+/// `0` = cold) at the `Command.working_directory`-aware declared path, and bumps
+/// the process-singleton `incr_reuse_fired` counter ONLY when the trimmed
+/// content is `1`. All three drive the REAL portable composition end-to-end so a
+/// mutation to the read/gate/counter in `inner_upload_results` is caught.
+///
+/// The three cases live in ONE test (sequential) because `incr_reuse_fired` is a
+/// PROCESS-global singleton: splitting them would race a content-`1` bump against
+/// a concurrent sibling's before/after read (the `0`/absent cases assert NO bump).
+/// Only a portable action declaring an `-incr-reuse` output ever touches this
+/// counter, so within one sequential test the deltas are exact.
+#[nativelink_test]
+async fn portable_action_reuse_marker_bumps_incr_reuse_fired_only_on_content_1() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["reuse-wire/"]);
+    let index_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager, cas) = setup_portable_manager_with_index(ctx, index_store).await;
+
+    // (1) marker content `1` (with a trailing newline, exercising the trim) →
+    // reuse fired → `incr_reuse_fired` increments by exactly 1.
+    let before_one = incr_reuse_fired_count();
+    drive_portable_action(
+        &manager,
+        &cas,
+        "reuse-wire/one.rlib",
+        "mkdir -p reuse-wire && : > reuse-wire/one.rlib && echo 1 > reuse-wire/one-incr-reuse",
+        vec![
+            "reuse-wire/one.rlib".to_string(),
+            "reuse-wire/one-incr-reuse".to_string(),
+        ],
+    )
+    .await;
+    let after_one = incr_reuse_fired_count();
+    assert_eq!(
+        after_one,
+        before_one + 1,
+        "a portable action whose `-incr-reuse` marker reads `1` MUST increment incr_reuse_fired \
+         exactly once — got delta {} (before {before_one}, after {after_one}); a dropped read/bump \
+         leaves rustc-reuse DARK on /metrics (the canary this chunk lights)",
+        after_one.wrapping_sub(before_one),
+    );
+
+    // (2) marker content `0` → cold → NO increment (the `0` case is implicit in
+    // `materialized − reuse`).
+    let before_zero = incr_reuse_fired_count();
+    drive_portable_action(
+        &manager,
+        &cas,
+        "reuse-wire/two.rlib",
+        "mkdir -p reuse-wire && : > reuse-wire/two.rlib && printf 0 > reuse-wire/two-incr-reuse",
+        vec![
+            "reuse-wire/two.rlib".to_string(),
+            "reuse-wire/two-incr-reuse".to_string(),
+        ],
+    )
+    .await;
+    let after_zero = incr_reuse_fired_count();
+    assert_eq!(
+        after_zero, before_zero,
+        "a `-incr-reuse` marker reading `0` (cold) MUST NOT increment incr_reuse_fired — \
+         got delta {} (before {before_zero}, after {after_zero})",
+        after_zero.wrapping_sub(before_zero),
+    );
+
+    // (3) NO `-incr-reuse` output declared (pre-chunk-4 / non-producing action) →
+    // NO increment; the read is inert and the counter stays put.
+    let before_absent = incr_reuse_fired_count();
+    drive_portable_action(
+        &manager,
+        &cas,
+        "reuse-wire/three.rlib",
+        "mkdir -p reuse-wire && : > reuse-wire/three.rlib",
+        vec!["reuse-wire/three.rlib".to_string()],
+    )
+    .await;
+    let after_absent = incr_reuse_fired_count();
+    assert_eq!(
+        after_absent, before_absent,
+        "a portable action declaring NO `-incr-reuse` output MUST NOT increment incr_reuse_fired \
+         — got delta {} (before {before_absent}, after {after_absent})",
+        after_absent.wrapping_sub(before_absent),
+    );
+}
+
 /// (b) A portable action whose targetkey has a PRE-SEEDED index entry drives the
 /// `inner_prepare_action` fetch block: the `-incr` seed is materialized at the
 /// action's DECLARED NESTED `-incr` output path (§3 option A) — proving both that

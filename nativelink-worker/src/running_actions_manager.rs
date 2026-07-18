@@ -94,7 +94,8 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::incr_seed_fetch::{
-    SeedPublish, fetch_and_materialize_seed, note_index_published, plan_seed_publish, seed_dest_dir,
+    SeedPublish, fetch_and_materialize_seed, note_index_published, note_reuse_fired,
+    plan_seed_publish, seed_dest_dir,
 };
 
 /// FL-1383 (design §6.2): bounded ceiling for the WHOLE out-of-band seed
@@ -6201,6 +6202,59 @@ impl RunningActionImpl {
         // means the cache lifetime equals this `RunningActionImpl`; Drop
         // evicts every entry on success, error, cancel, or panic.
         let action: &RunningActionImpl = &self;
+        // FL-1383 chunk 4 (design §12): read THIS action's own `<label>-incr-reuse`
+        // marker and light `incr_reuse_fired` when rustc incremental reuse actually
+        // fired (trimmed content `1`). The marker is a normal declared output the
+        // client's process_wrapper writes EVERY action — a SIBLING of the `-incr`
+        // tree (`1` = reuse fired, `0` = cold). It MUST be read HERE, BEFORE the
+        // upload loop below, which RENAMES output files out of the execroot into
+        // the store (`filesystem_store.rs` `update_with_whole_file`) — a post-upload
+        // read would `NotFound`. Read at the `Command.working_directory`-aware
+        // declared path — the SAME `{execroot}/{working_directory}/{output_path}`
+        // join `prepare_output_directory`/`seed_dest_dir` use; an execroot-only join
+        // DROPS `working_directory` → reads the wrong path → dark reuse-collapse
+        // (this drop was just fixed for the seed path). `-incr-reuse` ends in
+        // `-reuse` (never `-incr`), so it is neither the seed selector nor a
+        // targetkey member. Content `0` (cold) — the common case — bumps nothing
+        // (implicit in `materialized − reuse`). Best-effort: an absent/unreadable/
+        // malformed marker LOGS and leaves the counter at 0; it NEVER fails the
+        // action. Portable-gated (`portable_targetkey` is `None` for every fleet
+        // action), so off-fleet this whole block is byte-identical INERT.
+        let is_portable = self.state.lock().portable_targetkey.is_some();
+        if is_portable {
+            if let Some(marker_rel) = output_paths
+                .iter()
+                .find(|p| p.rsplit('/').next().unwrap_or(p).ends_with("-incr-reuse"))
+            {
+                let marker_path = if command_proto.working_directory.is_empty() {
+                    format!("{}/{}", self.work_directory, marker_rel)
+                } else {
+                    format!(
+                        "{}/{}/{}",
+                        self.work_directory, command_proto.working_directory, marker_rel
+                    )
+                };
+                match fs::read(&marker_path).await {
+                    Ok(bytes) if String::from_utf8_lossy(&bytes).trim() == "1" => {
+                        note_reuse_fired();
+                        debug!(
+                            operation_id = ?self.operation_id,
+                            marker = %marker_path,
+                            "portable-incr: rustc incremental reuse fired (-incr-reuse marker = 1)"
+                        );
+                    }
+                    // Content `0` (or any other value): cold build, no reuse —
+                    // leave `incr_reuse_fired` unchanged (the `0` case is implicit).
+                    Ok(_) => {}
+                    Err(err) => warn!(
+                        operation_id = ?self.operation_id,
+                        ?err,
+                        marker = %marker_path,
+                        "portable-incr: -incr-reuse marker unreadable; leaving incr_reuse_fired at 0"
+                    ),
+                }
+            }
+        }
         for entry in output_paths {
             let full_path = OsString::from(if command_proto.working_directory.is_empty() {
                 format!("{}/{}", self.work_directory, entry)

@@ -776,6 +776,17 @@ pub fn note_index_published() {
     emit_counter("incr_index_publish");
 }
 
+/// Record that rustc incremental reuse actually fired in the §12 counters
+/// (design §12, FL-1383 chunk 4). Called by the worker post-action site after it
+/// reads THIS action's own `<label>-incr-reuse` marker (written by the client's
+/// process_wrapper) and finds content `1`. Lights `incr_reuse_fired`, which was
+/// registered-but-dark until this read exists (the worker leaves it at 0
+/// otherwise); the read/bump lives in the execution path, but the counter stays
+/// with its siblings so a rename cannot silently re-dark it.
+pub fn note_reuse_fired() {
+    emit_counter("incr_reuse_fired");
+}
+
 /// Whether `path`'s basename names the SINGULAR `-incr` seed dir. Stage-1 (§6.1)
 /// materializes/publishes the singular `<label>-incr`, NOT the pipelined
 /// `<label>-incr-metadata`; `ends_with("-incr")` already excludes both
