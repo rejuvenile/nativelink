@@ -1,9 +1,20 @@
 # FL-688 never-BIS-acked durability pin-leak — event-driven fix (design)
 
-Status: DESIGN (goes to design cadre). Author artifact 2026-07-17.
+Status: **RECONSIDER-PREMISE (design cadre 2026-07-17, `.claude/reviews/e546af44/`). DO NOT IMPLEMENT — rework required.**
+Two convergent BLOCKs: (1) the durability-event seam crosses a CAS-data-plane ↔ WorkerApi/scheduler entry boundary
+that has NO wire today, and the design commits to neither side (worker→server per-digest signal [=Stage-A-removed
+re-advertise, must prove bounded fan-out] vs a new server-side CAS-entry→scheduler-locality dependency) — ARCHITECTURAL,
+needs operator sign-off; (2) `MarkStableAsyncDurability.tla` ACTION 5 RE-FUSES the cross-entry hop into one atom (sets
+serverDurable + reads serverLocality + appends stableDigestsQueue) AND models serverLocality as MONOTONIC — the same
+fusion class this spec exists to prevent, so "Fixed passes" is NOT proof. MAJOR: the leak condition is
+`durable ∧ held ∧ no-pending-BIS` (not "named short-circuit"); the `has_durably`-false-negative-at-advert class + the
+slow-write-FAIL trigger (batch-A PinLifecycle) are both in-scope. RECOMMENDED direction (red-team framing #2): hook the
+durability re-check to the EXISTING replay-until-acked reader (`local_worker.rs:4455`, one worker-side choke point, no
+new cross-entry wire, subsumes all triggers); re-do the spec with a cross-entry signal queue + a `LocalityEvicted`
+action before re-cadre. CONFIRMED SOUND: ≥2-replica gate (`has_durably`=slow-tier only) + no forbidden primitives.
 Companion formal spec: `specs/MarkStableAsyncDurability.tla` (+ `…Bugged.cfg`,
-`…Fixed.cfg`). Backlog: `deferred_tasks.md` `[NARROWED 2026-07-17]` block
-(line ~2455, under the pin-saturation section).
+`…Fixed.cfg` — NOTE the ACTION-5 refusion + monotonic-locality gaps above). Backlog: `deferred_tasks.md`
+`[NARROWED 2026-07-17]` block (under the pin-saturation section).
 
 ---
 
