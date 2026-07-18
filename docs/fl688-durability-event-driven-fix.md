@@ -12,6 +12,17 @@ slow-write-FAIL trigger (batch-A PinLifecycle) are both in-scope. RECOMMENDED di
 durability re-check to the EXISTING replay-until-acked reader (`local_worker.rs:4455`, one worker-side choke point, no
 new cross-entry wire, subsumes all triggers); re-do the spec with a cross-entry signal queue + a `LocalityEvicted`
 action before re-cadre. CONFIRMED SOUND: ≥2-replica gate (`has_durably`=slow-tier only) + no forbidden primitives.
+
+**AUDITOR (2nd reviewer, FIX-FIRST — convergent, see `.claude/reviews/e546af44/DECISION.md`): the DIAGNOSIS is INCOMPLETE.**
+All cites + both TLC outcomes reproduced verbatim, BUT the causal bridge is unproven: nobody cited the concrete
+SERVER-side path that makes a digest durable-for-the-FIRST-TIME without firing the pusher (all 4 fresh-durable FSS arms
+DO push — `fast_slow_store.rs:1840-1851`). Spec ACTION 5 AXIOMATIZES that unproven premise. Decisive lead:
+`pin_deferred_output_digest` (`running_actions_manager.rs:~2340`) says the F2 deferred slow-store write "is the
+AUTHORITATIVE upload and BYPASSES `FastSlowStore::update`" → the pusher may be bypassed for the WHOLE F2 deferred path
+(leak F2-UNIVERSAL, not AlreadyExists-specific) — but the live leak is a MINORITY, so the majority is BIS-acked by some
+path not yet identified. **REQUIRED BEFORE ANY FIX (supersedes the seam decision): trace a LEAKING digest's server-side
+durability path — which path BIS-acks the majority, why the minority skips the pusher — and verify the F2-bypasses-FSS
+claim. Re-diagnose (instrument/trace), THEN choose the seam + re-spec + re-cadre.**
 Companion formal spec: `specs/MarkStableAsyncDurability.tla` (+ `…Bugged.cfg`,
 `…Fixed.cfg` — NOTE the ACTION-5 refusion + monotonic-locality gaps above). Backlog: `deferred_tasks.md`
 `[NARROWED 2026-07-17]` block (under the pin-saturation section).
