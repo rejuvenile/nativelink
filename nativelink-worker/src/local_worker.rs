@@ -6921,6 +6921,44 @@ pub fn register_execution_store_metrics(
     metrics_registry.register(WORKER_EXEC_FSS_METRIC_PREFIX, execution_fast_slow_store);
 }
 
+/// FL-1383 §8 startup contender sweep — the worker-side wiring for
+/// [`crate::portable_incr::PortableIncrContext::sweep_stale_contender_dirs`].
+///
+/// Invoked ONCE from [`new_local_worker`] before the worker begins accepting
+/// actions, to reap CONTENDER dirs (`<FIXED_PREFIX>/<targetkey>.<uuid>`)
+/// orphaned by a prior worker run that crashed before Drop cold-discarded them.
+///
+/// INERT when the feature is off: `portable_incr` is `None` on the entire fleet,
+/// so no `spawn_blocking` is paid. The sweep itself is BLOCKING (readdir/unlink),
+/// so it runs under `spawn_blocking`. A sweep failure is logged and swallowed —
+/// it must never block worker startup.
+pub async fn portable_incr_startup_sweep(
+    portable_incr: Option<crate::portable_incr::PortableIncrContext>,
+) {
+    let Some(ctx) = portable_incr else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || ctx.sweep_stale_contender_dirs()).await {
+        Ok(Ok(removed)) => {
+            if removed > 0 {
+                info!(
+                    removed,
+                    "FL-1383 portable_incr: startup sweep removed stale contender dirs"
+                );
+            }
+        }
+        Ok(Err(err)) => {
+            error!(?err, "FL-1383 portable_incr: startup contender sweep failed; continuing");
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                "FL-1383 portable_incr: startup contender sweep task join failed; continuing"
+            );
+        }
+    }
+}
+
 /// Creates a new `LocalWorker`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
 ///
@@ -7041,6 +7079,13 @@ pub async fn new_local_worker(
         portable_incr_provision,
         config.portable_incr.clone(),
     );
+    // FL-1383 §8 wiring: reap CONTENDER dirs orphaned by a prior worker run that
+    // crashed before Drop cold-discarded them. Runs ONCE here — after FIXED_PREFIX
+    // is provisioned and BEFORE any action plans an execroot (no contender is live
+    // yet). Cloned so the context is still installed on the manager below. INERT on
+    // the fleet (`None` ⇒ no `spawn_blocking`); a sweep failure is logged and
+    // swallowed so it can never block worker startup.
+    portable_incr_startup_sweep(portable_incr_context.clone()).await;
 
     let entrypoint = if config.entrypoint.is_empty() {
         None

@@ -4863,6 +4863,64 @@ pub struct RunningActionImpl {
 }
 
 impl RunningActionImpl {
+    /// FL-1383 §8 post-action warm-dir eviction — the worker-side wiring for
+    /// [`crate::portable_incr::PortableIncrContext::evict_warm_dirs_over_budget`].
+    ///
+    /// Invoked from [`RunningAction::cleanup`] after a PORTABLE action finishes,
+    /// to bound the on-disk warm-dir pool at `budget_bytes` (LRU whole-dir
+    /// eviction; a dir currently LEASED by a live owner is never evicted). The
+    /// call site passes [`crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES`].
+    ///
+    /// Doubly gated so it is INERT on the fleet with no `spawn_blocking` cost:
+    /// this action must have been portable (`portable_execroot.is_some()`) AND a
+    /// live [`crate::portable_incr::PortableIncrContext`] must be installed on the
+    /// manager (`None` on the entire fleet). The eviction is BLOCKING
+    /// (readdir/lstat/unlink) so it runs under `spawn_blocking`. Any eviction
+    /// failure is logged and swallowed — it must never fail the action.
+    pub async fn maybe_evict_warm_dirs_post_action(&self, budget_bytes: u64) {
+        if self.portable_execroot.is_none() {
+            return;
+        }
+        let Some(ctx) = self.running_actions_manager.portable_incr.clone() else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || ctx.evict_warm_dirs_over_budget(budget_bytes))
+            .await
+        {
+            Ok(Ok(outcome)) => {
+                if outcome.still_over_budget {
+                    warn!(
+                        dirs_evicted = outcome.dirs_evicted,
+                        leased_skipped = outcome.leased_skipped,
+                        bytes_remaining = outcome.bytes_remaining,
+                        "FL-1383 portable_incr: warm-dir pool over budget with every remaining candidate leased — backpressure"
+                    );
+                } else if outcome.dirs_evicted > 0 {
+                    info!(
+                        dirs_evicted = outcome.dirs_evicted,
+                        bytes_freed = outcome.bytes_freed,
+                        bytes_remaining = outcome.bytes_remaining,
+                        "FL-1383 portable_incr: evicted warm dirs over budget"
+                    );
+                } else {
+                    debug!(
+                        bytes_remaining = outcome.bytes_remaining,
+                        "FL-1383 portable_incr: warm-dir pool within budget, nothing evicted"
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                error!(?err, "FL-1383 portable_incr: warm-dir eviction failed; continuing");
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "FL-1383 portable_incr: warm-dir eviction task join failed; continuing"
+                );
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_metadata: ExecutionMetadata,
@@ -6927,6 +6985,14 @@ impl RunningAction for RunningActionImpl {
                 .await;
                 self.has_manager_entry.store(false, Ordering::Release);
                 self.did_cleanup.store(true, Ordering::Release);
+                // FL-1383 §8: after a PORTABLE action's cleanup, bound the warm-dir
+                // pool at the static budget. Doubly gated (portable action AND a
+                // live context) → INERT on the fleet; failures log + continue, never
+                // failing the action.
+                self.maybe_evict_warm_dirs_post_action(
+                    crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES,
+                )
+                .await;
                 result.map(move |()| self)
             })
             .await;

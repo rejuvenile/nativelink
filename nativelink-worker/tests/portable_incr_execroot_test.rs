@@ -52,6 +52,7 @@ use nativelink_worker::portable_incr::{
     EvictionOutcome, ExecrootRole, PortableExecroot, PortableIncrContext, PortableIncrProvision,
     assert_under_prefix, ensure_and_wipe_execroot_at, is_incr_seed_entry,
 };
+use nativelink_worker::local_worker::portable_incr_startup_sweep;
 use nativelink_worker::running_actions_manager::{
     ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManagerArgs,
     RunningActionsManagerImpl,
@@ -904,5 +905,131 @@ async fn default_warm_dir_budget_is_20_gib() {
         DEFAULT_WARM_DIR_BUDGET_BYTES,
         20 * 1024 * 1024 * 1024,
         "design v4 §8 static reservation = 20 GiB (≥9 GiB over the 10.9 GB full-CI-widen worst case)"
+    );
+}
+
+// -- §8 WIRING: the call-sites this chunk adds -------------------------------
+//
+// The §8 API correctness is pinned above. These pin the CALL-SITE contracts:
+//  - `portable_incr_startup_sweep` is the exact unit `new_local_worker` invokes
+//    ONCE before accepting actions (gated on `Some(context)` = the fleet is
+//    `None`); a failure must be swallowed.
+//  - `RunningActionImpl::maybe_evict_warm_dirs_post_action` is the exact unit
+//    `cleanup()` invokes after a PORTABLE action completes (gated on both this
+//    action being portable AND a live context installed on the manager).
+
+#[nativelink_test]
+async fn startup_sweep_wiring_reaps_contender_when_context_present() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["sweep-wire/"]);
+
+    let contender = root.join(format!("{}.{}", "a".repeat(64), "b".repeat(32)));
+    fs::create_dir_all(contender.join("junk")).expect("mk contender");
+
+    // The exact call `new_local_worker` makes once at startup.
+    portable_incr_startup_sweep(Some(ctx)).await;
+
+    assert!(
+        !contender.exists(),
+        "startup wiring MUST invoke the sweep when a live context is installed"
+    );
+}
+
+#[nativelink_test]
+async fn startup_sweep_wiring_is_inert_when_context_none() {
+    let (_td, root) = canonical_tempdir();
+    let contender = root.join(format!("{}.{}", "a".repeat(64), "b".repeat(32)));
+    fs::create_dir_all(contender.join("junk")).expect("mk contender");
+
+    // `None` is the whole-fleet state: no `spawn_blocking`, no disk touch.
+    portable_incr_startup_sweep(None).await;
+
+    assert!(
+        contender.exists(),
+        "startup wiring MUST NOT sweep when the context is None (the fleet default)"
+    );
+}
+
+/// Install `ctx` on a freshly-built manager, mirroring `new_local_worker`
+/// (which calls `set_portable_incr` before Arc-wrapping the manager).
+async fn setup_manager_with_portable(
+    ctx: Option<PortableIncrContext>,
+) -> Arc<RunningActionsManagerImpl> {
+    let mut manager = setup_manager().await;
+    Arc::get_mut(&mut manager)
+        .expect("freshly-built manager is uniquely owned")
+        .set_portable_incr(ctx);
+    manager
+}
+
+#[nativelink_test]
+async fn post_action_evict_wiring_fires_for_portable_action() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-wire/"]);
+    // Two warm owner dirs; A is the LRU.
+    let (key_a, _) = carrier_props("evict-wire/uniq-a/libfoo.rlib");
+    let (key_b, _) = carrier_props("evict-wire/uniq-b/libfoo.rlib");
+    make_warm_dir(&root, &key_a, 50);
+    make_warm_dir(&root, &key_b, 50);
+    set_dir_mtime(&root.join(&key_a), epoch_plus(100));
+    set_dir_mtime(&root.join(&key_b), epoch_plus(200));
+
+    // A portable action on a manager carrying the live context.
+    let manager = setup_manager_with_portable(Some(ctx.clone())).await;
+    let (_key, props) = carrier_props("evict-wire/uniq-live/libbar.rlib");
+    let plan = ctx.plan(&props).expect("allowlisted ⇒ portable");
+    let action = make_action(manager, &rand_temp("action_dir"), Some(plan));
+
+    // total 100 > budget 60 → the post-action wiring evicts exactly the LRU (A).
+    action.maybe_evict_warm_dirs_post_action(60).await;
+
+    assert!(
+        !root.join(&key_a).exists(),
+        "post-action wiring MUST invoke eviction for a portable action (LRU warm dir removed)"
+    );
+    assert!(
+        root.join(&key_b).exists(),
+        "the newer warm dir stays within budget"
+    );
+}
+
+#[nativelink_test]
+async fn post_action_evict_wiring_skips_non_portable_action() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-skip/"]);
+    let (key_w, _) = carrier_props("evict-skip/uniq-w/libfoo.rlib");
+    make_warm_dir(&root, &key_w, 5_000);
+
+    // A NON-portable action (portable_execroot = None) on a portable-enabled
+    // manager: the `portable_execroot.is_some()` gate MUST skip eviction.
+    let manager = setup_manager_with_portable(Some(ctx)).await;
+    let action = make_action(manager, &rand_temp("action_dir"), None);
+
+    action.maybe_evict_warm_dirs_post_action(1).await;
+
+    assert!(
+        root.join(&key_w).exists(),
+        "a NON-portable action must NOT trigger warm-dir eviction even over budget"
+    );
+}
+
+#[nativelink_test]
+async fn post_action_evict_wiring_is_inert_when_context_none() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-none/"]);
+    let (key_w, _) = carrier_props("evict-none/uniq-w/libfoo.rlib");
+    make_warm_dir(&root, &key_w, 5_000);
+
+    // A portable action, but the manager carries NO context (the fleet default).
+    let manager = setup_manager_with_portable(None).await;
+    let (_key, props) = carrier_props("evict-none/uniq-live/libbar.rlib");
+    let plan = ctx.plan(&props).expect("plan");
+    let action = make_action(manager, &rand_temp("action_dir"), Some(plan));
+
+    action.maybe_evict_warm_dirs_post_action(1).await;
+
+    assert!(
+        root.join(&key_w).exists(),
+        "context None (fleet default) ⇒ no eviction even for a portable action over budget"
     );
 }
