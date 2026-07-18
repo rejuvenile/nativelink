@@ -1997,6 +1997,23 @@ pub trait ItemCallback: Debug + Send + Sync {
     /// deadline is still retried on reconnect — closing the durability
     /// gap that an auto-unpin would otherwise silently open.
     fn on_pin_expired(&self, _store_key: StoreKey<'_>, _size: u64) {}
+
+    /// FL-688 advertise-on-pin: fired when a key crosses into an INDEFINITE
+    /// (held-until-BIS-ack) pin — the fresh-indefinite insert or a
+    /// time-bounded->indefinite upgrade. The pin path moves the entry into the
+    /// `pinned` map WITHOUT an `on_insert`/`on_get`, so for a re-produced
+    /// already-resident F2 output this is the ONLY holdings signal — otherwise
+    /// the pinned digest is dark until the reconnect full snapshot and the
+    /// durable-before-pin blob is pinned indefinitely (the FL-688 leak).
+    /// `BlobChangeTracker` consumes this to advertise the digest PRESENT via the
+    /// next `BlobsAvailable` broadcast, driving the server's
+    /// `has_durably`->`mark_stable`->BIS release. Carries a FRESHLY-minted
+    /// `(ts_boot_epoch, ts_counter)` (already frozen into the value via
+    /// `set_stamp`) so the PRESENT delta STRICTLY out-ranks any prior ABSENT
+    /// evict of this key under the tracker LWW (an equal/frozen stamp would
+    /// lose the ABSENT tie and be suppressed). Fired ONCE per pin lifecycle.
+    /// Default no-op.
+    fn on_pin(&self, _store_key: StoreKey<'_>, _size: u64, _ts_boot_epoch: u64, _ts_counter: u64) {}
 }
 
 /// The instructions on how to decode a value from a Bytes & version into

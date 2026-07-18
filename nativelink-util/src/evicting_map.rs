@@ -133,6 +133,16 @@ pub trait ItemCallback<Q>: Debug + Send + Sync {
     /// for retry-on-reconnect — closing the durability gap that an
     /// auto-unpin would otherwise silently open. Default is a no-op.
     fn on_pin_expired(&self, _store_key: &Q, _size: u64) {}
+
+    /// FL-688 advertise-on-pin: fired when a key crosses into an INDEFINITE
+    /// (held-until-BIS-ack) pin. Distinct from `on_insert`: the pin path moves
+    /// the entry into the `pinned` map without an insert/get, so this is the
+    /// only holdings signal for a re-produced already-resident indefinitely-
+    /// pinned blob. Carries a FRESHLY-minted `(ts_boot_epoch, ts_counter)`
+    /// (frozen into the value) so the holdings tracker's PRESENT delta strictly
+    /// out-ranks any prior evict of this key. Fired once per pin lifecycle.
+    /// Default is a no-op.
+    fn on_pin(&self, _store_key: &Q, _size: u64, _ts_boot_epoch: u64, _ts_counter: u64) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,4 +163,6 @@ impl<Q> ItemCallback<Q> for NoopCallback {
     fn on_get(&self, _store_key: &Q, _ts_boot_epoch: u64, _ts_counter: u64) {}
 
     fn on_pin_expired(&self, _store_key: &Q, _size: u64) {}
+
+    fn on_pin(&self, _store_key: &Q, _size: u64, _ts_boot_epoch: u64, _ts_counter: u64) {}
 }

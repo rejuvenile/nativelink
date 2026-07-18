@@ -2428,6 +2428,24 @@ impl ItemCallback for BlobChangeTracker {
             }
         }
     }
+
+    // FL-688 advertise-on-pin: on an INDEFINITE (held-until-BIS) pin, record
+    // PRESENT carrying the FRESHLY-minted stamp threaded from `fire_on_pin`.
+    // The pin path moved this digest into the moka `pinned` map WITHOUT an
+    // on_insert/on_get, so for a re-produced already-resident F2 output this is
+    // the ONLY holdings delta — without it the digest stays dark until the
+    // reconnect full snapshot and its durable-before-pin blob is pinned
+    // forever. The fresh stamp STRICTLY out-ranks any prior ABSENT evict of
+    // this digest (`apply` gives an equal-stamp tie to ABSENT, so a frozen
+    // insert stamp — as `on_get` carries — would lose and be suppressed; F5).
+    fn on_pin(&self, store_key: StoreKey<'_>, _size: u64, ts_boot_epoch: u64, ts_counter: u64) {
+        if let StoreKey::Digest(digest) = store_key {
+            let mut pending = self.pending.lock();
+            if pending.apply(digest, BlobState::Present, Stamp::new(ts_boot_epoch, ts_counter)) {
+                self.notify.notify_one();
+            }
+        }
+    }
 }
 
 /// Amount of time to wait if we have actions in transit before we try to
@@ -8888,6 +8906,189 @@ mod tests {
                 "Expected d2 to NOT be evicted (most recently used)"
             );
         });
+    }
+
+    // ===============================================================
+    // FL-688 advertise-on-pin (durable-before-pin leak fix)
+    // ===============================================================
+    // An indefinite (held-until-BIS) pin moves the entry into the moka
+    // `pinned` map WITHOUT firing on_insert/on_get, so a re-produced
+    // already-resident F2 output emitted no holdings delta and stayed dark
+    // until the reconnect full snapshot. advertise-on-pin fires the new
+    // `on_pin` hook through the SAME ItemCallbackHolder -> BlobChangeTracker
+    // seam, advertising the pinned digest PRESENT so the server's
+    // has_durably -> mark_stable -> BIS releases it.
+    #[derive(Debug)]
+    struct Fl688PinValue {
+        size: u64,
+        stamp: core::sync::atomic::AtomicU64,
+    }
+    impl Fl688PinValue {
+        fn new(size: u64) -> Arc<Self> {
+            Arc::new(Self {
+                size,
+                stamp: core::sync::atomic::AtomicU64::new(0),
+            })
+        }
+    }
+    impl nativelink_util::evicting_map::LenEntry for Fl688PinValue {
+        fn len(&self) -> u64 {
+            self.size
+        }
+        fn is_empty(&self) -> bool {
+            self.size == 0
+        }
+        fn stamp(&self) -> u64 {
+            self.stamp.load(core::sync::atomic::Ordering::Acquire)
+        }
+        fn set_stamp(&self, s: u64) {
+            self.stamp.store(s, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    type Fl688PinMap = nativelink_util::moka_evicting_map::MokaEvictingMap<
+        nativelink_util::store_trait::StoreKeyBorrow,
+        StoreKey<'static>,
+        Arc<Fl688PinValue>,
+        std::time::SystemTime,
+        nativelink_store::callback_utils::ItemCallbackHolder,
+    >;
+
+    fn fl688_pin_map_and_tracker() -> (Arc<Fl688PinMap>, Arc<BlobChangeTracker>) {
+        use nativelink_config::stores::EvictionPolicy;
+        use nativelink_store::callback_utils::ItemCallbackHolder;
+        // max_bytes = 0 disables the byte-caps (indefinite_cap_admits returns
+        // true), so the indefinite pin is always admitted in the harness.
+        let evicting_map = Arc::new(Fl688PinMap::with_anchor(
+            &EvictionPolicy {
+                max_count: 16,
+                max_seconds: 0,
+                max_bytes: 0,
+                evict_bytes: 0,
+                pin_cap_bytes: 0,
+            },
+            std::time::SystemTime::now(),
+        ));
+        let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
+        evicting_map.add_item_callback(ItemCallbackHolder::new(tracker.clone()));
+        (evicting_map, tracker)
+    }
+
+    // Test 1 (advertise-on-pin, mutation target): an indefinite pin advertises
+    // the pinned digest PRESENT via the tracker seam.
+    #[test]
+    fn advertise_on_indefinite_pin_emits_present_delta() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (evicting_map, tracker) = fl688_pin_map_and_tracker();
+            let d1 = DigestInfo::new([9u8; 32], 30);
+            let key1: StoreKey<'static> = StoreKey::Digest(d1);
+            evicting_map.insert(key1.into(), Fl688PinValue::new(30)).await;
+            // Drain the insert delta so we isolate the pin advertisement.
+            tracker.swap();
+
+            // Indefinitely pin d1 (F2 held-until-BIS pin) — the ONLY holdings
+            // mutation. Before the fix the pin fired no callback -> no delta.
+            assert!(
+                evicting_map.pin_key_indefinite(StoreKey::Digest(d1).into()),
+                "indefinite pin should be admitted (max_bytes=0 => no cap)"
+            );
+
+            let (present, absent) = present_absent(tracker.swap());
+            assert!(
+                present.contains(&d1),
+                "FL-688 advertise-on-pin: an indefinite pin MUST advertise the \
+                 pinned digest PRESENT via the BlobChangeTracker seam \
+                 (durable-before-pin leak); got no PRESENT delta for d1"
+            );
+            assert!(
+                !absent.contains(&d1),
+                "pinned digest must not be advertised ABSENT"
+            );
+        });
+    }
+
+    // Test 2 (F1 fire-once): a re-pin of an already-indefinite digest must NOT
+    // re-advertise every window. The `pinned` entry's `indefinite` flag is the
+    // fire-once dedup (bounded by indefinite_pin_cap).
+    #[test]
+    fn advertise_on_pin_fires_once_per_pin_lifecycle() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (evicting_map, tracker) = fl688_pin_map_and_tracker();
+            let d1 = DigestInfo::new([8u8; 32], 40);
+            evicting_map
+                .insert(StoreKey::Digest(d1).into(), Fl688PinValue::new(40))
+                .await;
+            tracker.swap();
+
+            assert!(evicting_map.pin_key_indefinite(StoreKey::Digest(d1).into()));
+            let (present1, _absent1) = present_absent(tracker.swap());
+            assert!(
+                present1.contains(&d1),
+                "first indefinite pin advertises PRESENT"
+            );
+
+            // Re-pin the SAME already-indefinite digest: returns true (refresh)
+            // but must fire NO further advertisement.
+            assert!(
+                evicting_map.pin_key_indefinite(StoreKey::Digest(d1).into()),
+                "re-pin of an already-indefinite key returns true (refresh)"
+            );
+            let (present2, absent2) = present_absent(tracker.swap());
+            assert!(
+                present2.is_empty() && absent2.is_empty(),
+                "FL-688 F1 fire-once: a re-pin of an already-advertised indefinite \
+                 digest must emit NO further delta (the indefinite pinned flag is \
+                 the fire-once dedup); got a spurious re-advertisement"
+            );
+        });
+    }
+
+    // Test 3 (F5 LWW stamp): the advertise-on-pin PRESENT delta must carry a
+    // stamp that STRICTLY out-ranks any prior ABSENT evict of the same digest,
+    // or `apply`'s equal-stamp ABSENT-wins tie-break silently suppresses the
+    // advertisement. Driven at the BlobChangeTracker LWW seam directly.
+    #[test]
+    fn advertise_on_pin_stamp_outranks_prior_evict() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Case 1 (fresh stamp WINS): a prior evict recorded ABSENT@(1,5); the
+        // advertise-on-pin fires PRESENT@(1,6) — a fresh, strictly-higher stamp
+        // (exactly what `fire_on_pin`'s `next_stamp` mints) — so PRESENT wins.
+        let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
+        let d1 = DigestInfo::new([5u8; 32], 100);
+        rt.block_on(tracker.callback(StoreKey::Digest(d1), 1, 5));
+        tracker.on_pin(StoreKey::Digest(d1), 100, 1, 6);
+        let (present, absent) = present_absent(tracker.swap());
+        assert!(
+            present.contains(&d1) && !absent.contains(&d1),
+            "FL-688 F5: advertise-on-pin PRESENT@(1,6) must supersede a prior \
+             ABSENT evict@(1,5) — the pinned digest must end PRESENT"
+        );
+
+        // Case 2 (equal stamp LOSES — proves the fresh mint is load-bearing):
+        // a prior evict ABSENT@(1,7); an advertise-on-pin fired at the SAME
+        // stamp (1,7) — as a frozen insert stamp would be — loses the ABSENT
+        // tie and is suppressed. This is the mutation guard for `next_stamp`.
+        let d2 = DigestInfo::new([6u8; 32], 100);
+        rt.block_on(tracker.callback(StoreKey::Digest(d2), 1, 7));
+        tracker.on_pin(StoreKey::Digest(d2), 100, 1, 7);
+        let (present2, absent2) = present_absent(tracker.swap());
+        assert!(
+            !present2.contains(&d2) && absent2.contains(&d2),
+            "FL-688 F5: an EQUAL-stamp advertise-on-pin must LOSE the ABSENT \
+             tie — this proves `fire_on_pin` must mint a strictly-higher fresh \
+             stamp, not reuse the value's frozen insert stamp"
+        );
     }
 
     #[test]

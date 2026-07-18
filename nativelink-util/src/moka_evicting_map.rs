@@ -1614,6 +1614,27 @@ where
                     self.speculative_pinned_bytes
                         .fetch_sub(size, Ordering::Relaxed);
                 }
+                // FL-688 advertise-on-pin (time-bounded -> indefinite UPGRADE
+                // transition). F1 fire-once — CAPPED AT indefinite_pin_cap: the
+                // fire-once "already advertised on pin" gate is the `pinned`
+                // entry's `indefinite` flag itself. on_pin fires ONLY on this
+                // false->true transition; every later re-pin of an
+                // already-indefinite key hits the `return true` below WITHOUT
+                // re-firing. The set of indefinitely-pinned keys is bounded by
+                // `indefinite_pin_cap` (over-cap pins are REFUSED as
+                // backpressure above, so they never fire on_pin). No separate
+                // dedup set is added: it would have to mirror `pinned`
+                // membership exactly (cleared on `unpin_key`, re-armed on a
+                // fresh pin lifecycle) — redundant state.
+                // F5 stamp: mint a FRESH counter, freeze it into the value (so a
+                // later genuine eviction carries the same stamp and the tie
+                // resolves ABSENT), drop the shard guard, then fire — the
+                // PRESENT@fresh delta strictly out-ranks any prior evict.
+                let ts_counter = self.next_stamp();
+                entry.data.set_stamp(ts_counter);
+                drop(entry);
+                self.fire_on_pin_callbacks(&key, size, ts_counter);
+                return true;
             }
             return true;
         }
@@ -1665,6 +1686,24 @@ where
             return false;
         }
 
+        // FL-688 advertise-on-pin (fresh INDEFINITE pin transition). F1
+        // fire-once — CAPPED AT indefinite_pin_cap (see the upgrade path
+        // above): a brand-new `pinned` entry advertises exactly once; the
+        // indefinite flag is the fire-once gate on any subsequent re-pin. F5
+        // stamp: mint + freeze a FRESH counter into the value BEFORE it moves
+        // into the pinned map, so the on_pin PRESENT delta strictly out-ranks
+        // any prior ABSENT evict of this key under the tracker LWW (an equal
+        // frozen stamp would lose the tie and be suppressed). Only indefinite
+        // pins advertise — time-bounded/speculative pins are not the FL-688
+        // leak class and self-heal via the TTL-sweep on_insert re-ack.
+        let pin_advert_stamp = if indefinite {
+            let ts_counter = self.next_stamp();
+            value.set_stamp(ts_counter);
+            Some(ts_counter)
+        } else {
+            None
+        };
+
         // CRITICAL: Insert into pinned map FIRST, then invalidate from
         // cache. The eviction listener checks pinned map and skips
         // cleanup if the key is found there. This ordering prevents the
@@ -1691,6 +1730,11 @@ where
         // Now safe to remove from cache — listener will see it's pinned.
         self.cache.invalidate(q);
         self.cache.run_pending_tasks();
+        // Fire the advertise-on-pin hook AFTER the entry is durably in the
+        // pinned map and out of the cache (no shard/callback lock overlap).
+        if let Some(ts_counter) = pin_advert_stamp {
+            self.fire_on_pin_callbacks(&key, entry_size, ts_counter);
+        }
         true
     }
 
@@ -2572,6 +2616,22 @@ where
         let callbacks = self.callbacks.read();
         for cb in callbacks.iter() {
             cb.on_pin_expired(key.borrow(), size);
+        }
+    }
+
+    /// FL-688 advertise-on-pin: fire `on_pin` callbacks when `key` crosses into
+    /// an INDEFINITE (held-until-BIS-ack) pin. `ts_counter` is a FRESHLY minted
+    /// counter (`next_stamp`) already frozen into the value via `set_stamp`, so
+    /// the holdings tracker's PRESENT delta STRICTLY out-ranks any prior ABSENT
+    /// evict of this key (a frozen/insert stamp could tie-lose the ABSENT tie
+    /// under the tracker LWW and be silently suppressed — F5). Fired ONCE per
+    /// pin lifecycle: only at the false->true `indefinite` transition (the
+    /// caller gates this), so a re-pin of an already-indefinite key never
+    /// re-advertises.
+    fn fire_on_pin_callbacks(&self, key: &K, size: u64, ts_counter: u64) {
+        let callbacks = self.callbacks.read();
+        for cb in callbacks.iter() {
+            cb.on_pin(key.borrow(), size, self.boot_epoch(), ts_counter);
         }
     }
 }
