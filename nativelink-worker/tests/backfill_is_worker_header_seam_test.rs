@@ -90,7 +90,8 @@ use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_s
 use nativelink_proto::build::bazel::remote::execution::v2::{
     BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
     BatchUpdateBlobsResponse, FindMissingBlobsRequest, FindMissingBlobsResponse, GetTreeRequest,
-    GetTreeResponse, batch_update_blobs_response,
+    GetTreeResponse, SpliceBlobRequest, SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse,
+    batch_update_blobs_response,
 };
 use nativelink_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
 use nativelink_proto::google::bytestream::{
@@ -178,6 +179,20 @@ impl ContentAddressableStorage for HeaderCapturingCasServer {
         _request: tonic::Request<GetTreeRequest>,
     ) -> Result<tonic::Response<Self::GetTreeStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("get_tree not used"))
+    }
+
+    async fn split_blob(
+        &self,
+        _request: tonic::Request<SplitBlobRequest>,
+    ) -> Result<tonic::Response<SplitBlobResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("split_blob not used"))
+    }
+
+    async fn splice_blob(
+        &self,
+        _request: tonic::Request<SpliceBlobRequest>,
+    ) -> Result<tonic::Response<SpliceBlobResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("splice_blob not used"))
     }
 }
 

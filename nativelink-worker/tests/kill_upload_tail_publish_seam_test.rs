@@ -95,6 +95,7 @@ fn make_action_info(digest_byte: u8) -> ActionInfo {
             digest_function: DigestHasherFunc::Sha256,
             digest: action_digest,
         }),
+        targetkey: None,
     }
 }
 

@@ -187,6 +187,7 @@ fn make_test_action(manager: Arc<RunningActionsManagerImpl>) -> Arc<RunningActio
         load_timestamp: SystemTime::UNIX_EPOCH,
         insert_timestamp: SystemTime::UNIX_EPOCH,
         unique_qualifier,
+        targetkey: None,
     };
     let execution_metadata = ExecutionMetadata {
         worker: "test_worker".to_string(),
