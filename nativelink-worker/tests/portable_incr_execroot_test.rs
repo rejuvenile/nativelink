@@ -1613,11 +1613,13 @@ async fn managed_fires_on_every_portable_action_seeded_only_on_materialized() {
             .await;
     let se_cold = upload_start_execute(&cas_cold, &command, platform_from_props(&props)).await;
 
-    // (c) DIGEST NON-LEAK: the client action digest is a pure function of the
-    // Action/Command bytes and is IDENTICAL for the seeded and cold runs — seeding
-    // (a pre-seeded index, external to the Action) does not perturb the action
-    // identity. This is the make-or-break the carrier must never break: the vars
-    // live on `command_builder` (the child), never on `command_proto` (the digest).
+    // (c) SETUP SYMMETRY (not the digest-non-leak proof): both execute requests are
+    // frozen client-side from the SAME `command` before the worker runs, so this only
+    // confirms the seeded/cold runs drive an IDENTICAL action — it CANNOT observe a
+    // worker-side `command_proto` mutation (the worker never re-hashes command_builder).
+    // The real digest-non-leak guarantee is structural — the carriers are added to
+    // `command_builder` (child env), never to `command_proto` — and is exercised by the
+    // child-env dump assertions below (a MOVE-to-command_proto mutation shows up there).
     assert_eq!(
         se_seeded
             .execute_request
@@ -1627,8 +1629,8 @@ async fn managed_fires_on_every_portable_action_seeded_only_on_materialized() {
             .execute_request
             .as_ref()
             .and_then(|r| r.action_digest.clone()),
-        "the SAME action must have a BYTE-IDENTICAL action digest whether seeded or cold — a \
-         differing digest means the carrier leaked into the REAPI Command / action identity",
+        "seeded and cold runs must drive the SAME action digest — otherwise the test harness \
+         itself is asymmetric and the child-env assertions below compare different actions",
     );
 
     let seeded_dump = execute_and_read_carrier_dump(&manager_seeded, se_seeded).await;
