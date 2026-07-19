@@ -49,6 +49,7 @@ use std::ffi::OsString;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -82,6 +83,27 @@ const INDEX_KEY_PREFIX: &str = "fl-incr-seed-index:v1:";
 /// safety guard (blake3 verify, `O_NOFOLLOW|O_EXCL` byte-copy) runs unchanged
 /// inside each concurrent [`fetch_and_write_file`].
 const PARALLEL_MATERIALIZE_CONCURRENCY: usize = 16;
+
+/// §10 residency measurement-gate latency divider (design
+/// `fl1383-residency-gossip-design.md` §6). Each per-blob CAS read
+/// ([`fetch_and_write_file`]) is timed; a read whose wall span is below this
+/// threshold is counted a worker fast-tier HIT, at/above it a slow-tier
+/// (`GrpcStore` → server) FETCH. The worker fast tier is a LOCAL
+/// `FilesystemStore` (a hit reads in µs–low-ms); a miss falls through the
+/// slow tier and pays at least a cross-machine gRPC round-trip, materially
+/// longer even for a small `-incr` blob. The fast-hit fraction at the NEXT
+/// build is the residency-routing survival hit-rate the gossip's value hinges
+/// on (gate §6.2(c)).
+///
+/// OBSERVE-ONLY and HEURISTIC: this NEVER gates control flow — a
+/// misclassification only skews a diagnostic counter, never a materialized
+/// byte. Because the raw `incr_seed_materialize_read_ns` / `_bytes` sums are
+/// ALSO emitted, the divider can be re-derived from the real per-blob latency
+/// distribution once canary seeds flow, rather than trusting this compile-time
+/// guess. Under the 16-wide `buffer_unordered` fan-out a fast local read's wall
+/// span can be inflated by off-CPU scheduling delay → a fast hit can
+/// misclassify as slow; the raw sums bound that skew.
+const FAST_TIER_READ_LATENCY_THRESHOLD_NS: u64 = 1_000_000; // 1ms
 
 /// The outcome of a seed fetch+materialize attempt.
 ///
@@ -370,9 +392,9 @@ async fn materialize_tree(
     // quiesced we wipe the temp tree and return cold — never a partial dir at
     // `dest`. (With `buffer_unordered`, "first" is first-to-fail, not plan order;
     // the outcome — cold, wiped, no-partial-dir — is identical either way.)
-    if let Some((failure, rel_path)) =
-        materialize_files_parallel(cas_store, &temp_dir, &plan.files).await
-    {
+    let (timing, maybe_failure) =
+        materialize_files_parallel(cas_store, &temp_dir, &plan.files).await;
+    if let Some((failure, rel_path)) = maybe_failure {
         match failure {
             FileMaterializeError::Cold(reason) => {
                 cleanup_or_err(&temp_dir).await?;
@@ -399,11 +421,21 @@ async fn materialize_tree(
     }
 
     emit_counter("incr_seed_materialized");
+    // §10 measurement gate (design §6): fold this successful materialize's
+    // observe-only read/write/bytes/fast-vs-slow timing into the §12 singleton
+    // counters. Emitted ONLY here (the all-success path) so the counters measure
+    // real materializations, never a partial cold/timeout attempt.
+    record_materialize_timing(&timing);
     debug!(
         targetkey = targetkey.key(),
         ?tree_digest,
         dirs = plan.dirs.len(),
         files = plan.files.len(),
+        read_ns = timing.read_ns,
+        write_ns = timing.write_ns,
+        bytes = timing.bytes,
+        fast_tier_hit_blobs = timing.fast_tier_hit_blobs,
+        slow_fetch_blobs = timing.slow_fetch_blobs,
         "incr seed materialized"
     );
     Ok(SeedOutcome::Materialized {
@@ -577,6 +609,51 @@ fn sibling_temp_dir(dest: &Path) -> Option<PathBuf> {
     Some(parent.join(name))
 }
 
+/// Observe-only per-file materialize timing (design §10 measurement gate §6).
+/// The blob READ span (`get_part_unchunked`) and the byte-copy WRITE span
+/// (`write_file_nofollow`) are timed SEPARATELY so the gate can weigh whether the
+/// always-paid WRITE dominates (→ residency routing saves little) or the READ is
+/// a meaningful fraction (→ turning a slow FETCH into a local fast HIT is worth
+/// wiring). Purely diagnostic: never gates control flow.
+struct FileTiming {
+    read_ns: u64,
+    write_ns: u64,
+    bytes: u64,
+    /// The read's wall span was below [`FAST_TIER_READ_LATENCY_THRESHOLD_NS`] →
+    /// served by the worker's LOCAL fast tier (the residency-routing win proxy).
+    fast_tier_hit: bool,
+}
+
+/// Aggregated observe-only timing over one whole materialize, summed from every
+/// [`FileTiming`]. Emitted into the §12 process-singleton counters ONLY on a
+/// SUCCESSFUL materialize (a cold/timeout attempt's partial timing is not a
+/// materialize measurement, so it is discarded).
+#[derive(Default)]
+struct MaterializeTiming {
+    read_ns: u64,
+    write_ns: u64,
+    bytes: u64,
+    fast_tier_hit_blobs: u64,
+    slow_fetch_blobs: u64,
+}
+
+impl MaterializeTiming {
+    /// Fold one file's timing into the running per-materialize aggregate.
+    /// `saturating_add` on the nanosecond/byte sums is defensive only — a single
+    /// materialize's summed spans cannot approach `u64::MAX` — and keeps the
+    /// observe-only path panic-free.
+    fn add(&mut self, file: &FileTiming) {
+        self.read_ns = self.read_ns.saturating_add(file.read_ns);
+        self.write_ns = self.write_ns.saturating_add(file.write_ns);
+        self.bytes = self.bytes.saturating_add(file.bytes);
+        if file.fast_tier_hit {
+            self.fast_tier_hit_blobs += 1;
+        } else {
+            self.slow_fetch_blobs += 1;
+        }
+    }
+}
+
 /// Errors from writing one planned file.
 enum FileMaterializeError {
     /// Cold (missing/corrupt blob or digest mismatch) — the caller wipes the
@@ -629,7 +706,7 @@ async fn materialize_files_parallel(
     cas_store: &Store,
     temp_dir: &Path,
     files: &[PlannedFile],
-) -> Option<(FileMaterializeError, PathBuf)> {
+) -> (MaterializeTiming, Option<(FileMaterializeError, PathBuf)>) {
     // Own each file's plan data up-front (the `files` borrow ends here), so no
     // borrowed stream-item lifetime is captured by the buffered futures.
     let owned: Vec<(DigestInfo, PathBuf, bool)> = files
@@ -652,16 +729,22 @@ async fn materialize_files_parallel(
 
     // Capture the FIRST failure but keep draining, so no in-flight `spawn_blocking`
     // write is orphaned to race the caller's `remove_dir_all` (see the drain
-    // rationale above). All later results are discarded — any failure is cold.
+    // rationale above). Successful files' §10-gate timing is folded into `timing`;
+    // later results after a failure are still consumed (drain) but their timing is
+    // irrelevant (the caller emits `timing` only on the all-success path).
+    let mut timing = MaterializeTiming::default();
     let mut first_failure = None;
     while let Some(result) = writes.next().await {
-        if let Err(failure) = result {
-            if first_failure.is_none() {
-                first_failure = Some(failure);
+        match result {
+            Ok(file_timing) => timing.add(&file_timing),
+            Err(failure) => {
+                if first_failure.is_none() {
+                    first_failure = Some(failure);
+                }
             }
         }
     }
-    first_failure
+    (timing, first_failure)
 }
 
 /// Fetch a single blob, verify its blake3 digest, and write it under the temp
@@ -672,7 +755,11 @@ async fn fetch_and_write_file(
     cas_store: &Store,
     temp_dir: &Path,
     file: &PlannedFile,
-) -> Result<(), FileMaterializeError> {
+) -> Result<FileTiming, FileMaterializeError> {
+    // §10 gate (design §6): time the blob READ separately. OBSERVE-ONLY — the
+    // `Instant` span brackets ONLY the existing `get_part_unchunked` await and
+    // adds no store call, no branch on the timing, no allocation.
+    let read_start = Instant::now();
     // UNBOUNDED-OK: this call holds one trusted rustc -incr blob resident; the caller caps fan-out at PARALLEL_MATERIALIZE_CONCURRENCY (16), so peak residency is bounded by 16 × the largest -incr file; declared-size mismatch fails the post-read blake3+size verify → cold
     let bytes = match cas_store
         .get_part_unchunked(
@@ -687,9 +774,15 @@ async fn fetch_and_write_file(
         // case: cold, never wrong.
         Err(_err) => return Err(FileMaterializeError::Cold("file blob unreadable")),
     };
+    let read_ns = elapsed_ns(read_start);
+    // A read below the divider was served by the worker's local fast tier (the
+    // routing-win proxy); at/above it fell through to the slow tier (GrpcStore).
+    let fast_tier_hit = read_ns < FAST_TIER_READ_LATENCY_THRESHOLD_NS;
+    let bytes_len = bytes.len() as u64;
 
     // Verify the content against the expected digest as we write it (§3b). A
-    // mismatch (torn/forged/evicted-and-replaced) is cold.
+    // mismatch (torn/forged/evicted-and-replaced) is cold. NOT timed: the blake3
+    // verify is neither the READ nor the WRITE the gate weighs.
     let mut hasher = DigestHasherFunc::Blake3.hasher();
     hasher.update(&bytes);
     if hasher.finalize_digest() != file.digest {
@@ -698,9 +791,26 @@ async fn fetch_and_write_file(
 
     let abs_path = temp_dir.join(&file.rel_path);
     let mode: u32 = if file.is_executable { 0o755 } else { 0o644 };
+    // §10 gate: time the byte-copy WRITE separately (always paid, local or
+    // remote — no clonefile/hardlink, cadre-REFUTED).
+    let write_start = Instant::now();
     write_file_nofollow(abs_path, bytes, mode)
         .await
-        .map_err(FileMaterializeError::Internal)
+        .map_err(FileMaterializeError::Internal)?;
+    let write_ns = elapsed_ns(write_start);
+
+    Ok(FileTiming {
+        read_ns,
+        write_ns,
+        bytes: bytes_len,
+        fast_tier_hit,
+    })
+}
+
+/// Nanoseconds elapsed since `start`, saturating into `u64` (a per-file span can
+/// never approach `u64::MAX` ns ≈ 585 years; the cast is defensive only).
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Wipe the temp dir; surface a cleanup failure as `Err` (leaked disk is a real
@@ -824,6 +934,35 @@ pub struct IncrSeedMetrics {
     /// Seed index entries published after a successful allowlisted build (§6.2).
     #[metric(help = "FL-1383: incr seed index entries published after a successful build")]
     pub incr_index_publish: AtomicU64,
+    /// §10 measurement gate (design `fl1383-residency-gossip-design.md` §6):
+    /// summed wall time spent in the per-file blob READ (`get_part_unchunked`)
+    /// across all SUCCESSFUL materializations. Compared against `_write_ns` this
+    /// answers whether the READ is a meaningful fraction of a materialize (→
+    /// residency routing can save it) or the always-paid WRITE dominates.
+    #[metric(help = "FL-1383 gate: summed blob-read nanoseconds across successful materializations")]
+    pub incr_seed_materialize_read_ns: AtomicU64,
+    /// §10 measurement gate: summed wall time in the per-file byte-copy WRITE
+    /// (`write_file_nofollow`) across all successful materializations. The WRITE
+    /// is paid identically local or remote (no clonefile/hardlink — cadre
+    /// REFUTED), so a WRITE-dominated materialize bounds the routing win small.
+    #[metric(help = "FL-1383 gate: summed blob-write nanoseconds across successful materializations")]
+    pub incr_seed_materialize_write_ns: AtomicU64,
+    /// §10 measurement gate: summed bytes materialized across all successful
+    /// materializations (lets read/write nanoseconds be normalized to a
+    /// per-byte throughput and the fast/slow latency divider re-derived).
+    #[metric(help = "FL-1383 gate: summed bytes materialized across successful materializations")]
+    pub incr_seed_materialize_bytes: AtomicU64,
+    /// §10 measurement gate: per-blob reads classified as a worker fast-tier HIT
+    /// (read wall span below `FAST_TIER_READ_LATENCY_THRESHOLD_NS`) — the
+    /// residency-routing win PROXY. A high fast-hit fraction at the NEXT build
+    /// is exactly the survival hit-rate the gossip's value hinges on.
+    #[metric(help = "FL-1383 gate: per-blob reads served by the worker fast tier (routing-win proxy)")]
+    pub incr_seed_fast_tier_hit_blobs: AtomicU64,
+    /// §10 measurement gate: per-blob reads classified as a slow-tier FETCH
+    /// (`GrpcStore` → server, read wall span at/above the threshold) — the reads
+    /// residency routing would turn into local fast-tier hits.
+    #[metric(help = "FL-1383 gate: per-blob reads that fell through to the slow tier (GrpcStore fetch)")]
+    pub incr_seed_slow_fetch_blobs: AtomicU64,
 }
 
 static INCR_SEED_METRICS: OnceLock<Arc<IncrSeedMetrics>> = OnceLock::new();
@@ -871,6 +1010,32 @@ fn emit_counter(counter: &'static str) {
     };
     field.fetch_add(1, Ordering::Relaxed);
     debug!(counter, "incr seed fetch counter");
+}
+
+/// Fold one successful materialize's observe-only §10-gate timing into the
+/// process-singleton §12 counters (design `fl1383-residency-gossip-design.md`
+/// §6). These are cumulative SUM counters: an operator divides `read_ns` /
+/// `write_ns` / `bytes` by `incr_seed_materialized` for a per-materialize
+/// average, and reads `fast_tier_hit_blobs / (fast + slow_fetch)` for the
+/// residency-routing survival hit-rate. Bumping the SAME registered singleton
+/// [`emit_counter`] uses keeps every gate counter on the non-dark render path.
+fn record_materialize_timing(timing: &MaterializeTiming) {
+    let metrics = incr_seed_metrics();
+    metrics
+        .incr_seed_materialize_read_ns
+        .fetch_add(timing.read_ns, Ordering::Relaxed);
+    metrics
+        .incr_seed_materialize_write_ns
+        .fetch_add(timing.write_ns, Ordering::Relaxed);
+    metrics
+        .incr_seed_materialize_bytes
+        .fetch_add(timing.bytes, Ordering::Relaxed);
+    metrics
+        .incr_seed_fast_tier_hit_blobs
+        .fetch_add(timing.fast_tier_hit_blobs, Ordering::Relaxed);
+    metrics
+        .incr_seed_slow_fetch_blobs
+        .fetch_add(timing.slow_fetch_blobs, Ordering::Relaxed);
 }
 
 /// Record a successful seed-index publish in the §12 counters. Called by the
@@ -1971,6 +2136,11 @@ mod tests {
             "incr_index_fetch_timeout",
             "incr_index_fetch_error",
             "incr_index_publish",
+            "incr_seed_materialize_read_ns",
+            "incr_seed_materialize_write_ns",
+            "incr_seed_materialize_bytes",
+            "incr_seed_fast_tier_hit_blobs",
+            "incr_seed_slow_fetch_blobs",
         ] {
             assert!(
                 body.contains(name),
@@ -1999,12 +2169,130 @@ mod tests {
         );
     }
 
+    // -- FL-1383 §10 measurement gate: materialize records read/write timing and
+    //    classifies each blob read fast-tier vs slow (design §6). ------------
+    //
+    // One flat tree with two files: a FAST blob served immediately from the inner
+    // MemoryStore, and a SLOW blob whose `get_part` is delayed past the
+    // FAST_TIER_READ_LATENCY_THRESHOLD_NS (1ms) via `DelayStore`. After a
+    // SUCCESSFUL materialize the process-singleton §12 counters must show:
+    //   * non-zero read_ns AND write_ns (both spans are timed),
+    //   * bytes >= the content written,
+    //   * >= 1 fast-tier-hit blob (the immediate read) AND
+    //   * >= 1 slow-fetch blob (the delayed read).
+    // Deltas are asserted `>=` (not `==`): the counters are monotonic process
+    // sums other concurrent materialize tests also bump, but THIS materialize
+    // definitely contributes its share, so a `>=` lower bound is race-free.
+    #[nativelink_test]
+    async fn materialize_records_read_write_ns_and_classifies_fast_vs_slow() {
+        use core::sync::atomic::Ordering;
+
+        let inner = MemoryStore::new(&MemorySpec::default());
+        let populate = Store::new(inner.clone());
+        let tk = targetkey();
+
+        // Fast file: served immediately by the inner store.
+        let fast_content = b"fast-local-blob";
+        let fast_digest = blake3_digest(fast_content);
+        put(&populate, fast_digest, Bytes::from_static(fast_content)).await;
+
+        // Slow file: real bytes uploaded, but its read is delayed past the 1ms
+        // divider so it classifies as a slow-tier FETCH.
+        let slow_content = b"slow-remote-blob";
+        let slow_digest = blake3_digest(slow_content);
+        put(&populate, slow_digest, Bytes::from_static(slow_content)).await;
+
+        let tree = Tree {
+            root: Some(Directory {
+                files: vec![
+                    FileNode {
+                        name: "fast.bin".to_string(),
+                        digest: Some(Digest::from(&fast_digest)),
+                        is_executable: false,
+                        node_properties: None,
+                    },
+                    FileNode {
+                        name: "slow.bin".to_string(),
+                        digest: Some(Digest::from(&slow_digest)),
+                        is_executable: false,
+                        node_properties: None,
+                    },
+                ],
+                directories: vec![],
+                symlinks: vec![],
+                node_properties: None,
+            }),
+            children: vec![],
+        };
+        let tree_bytes = tree.encode_to_vec();
+        let tree_digest = blake3_digest(&tree_bytes);
+        put(&populate, tree_digest, Bytes::from(tree_bytes)).await;
+
+        // Serve the Tree + the fast blob immediately; delay ONLY the slow blob's
+        // read by 25ms (>> the 1ms fast/slow divider). Real clock (nativelink_test
+        // does not pause tokio time), so the std::Instant read span registers it.
+        let cas = DelayStore::new_store(inner, [slow_digest], Duration::from_millis(25));
+        let index = new_store();
+        publish_index(&index, &tk, PRIMARY, &tree_digest).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("libfoo.incr");
+
+        // Snapshot the singleton counters BEFORE, so we can assert this
+        // materialize's monotonic contribution (race-free `>=` lower bounds).
+        let m = super::incr_seed_metrics();
+        let before_read = m.incr_seed_materialize_read_ns.load(Ordering::Relaxed);
+        let before_write = m.incr_seed_materialize_write_ns.load(Ordering::Relaxed);
+        let before_bytes = m.incr_seed_materialize_bytes.load(Ordering::Relaxed);
+        let before_fast = m.incr_seed_fast_tier_hit_blobs.load(Ordering::Relaxed);
+        let before_slow = m.incr_seed_slow_fetch_blobs.load(Ordering::Relaxed);
+
+        let outcome = fetch_and_materialize_seed(&index, &cas, &tk, &dest, Duration::from_secs(10))
+            .await
+            .expect("fetch should not error on a valid two-file hit");
+        assert_eq!(outcome, SeedOutcome::Materialized { tree_digest });
+
+        let read_delta = m.incr_seed_materialize_read_ns.load(Ordering::Relaxed) - before_read;
+        let write_delta = m.incr_seed_materialize_write_ns.load(Ordering::Relaxed) - before_write;
+        let bytes_delta = m.incr_seed_materialize_bytes.load(Ordering::Relaxed) - before_bytes;
+        let fast_delta = m.incr_seed_fast_tier_hit_blobs.load(Ordering::Relaxed) - before_fast;
+        let slow_delta = m.incr_seed_slow_fetch_blobs.load(Ordering::Relaxed) - before_slow;
+
+        assert!(
+            read_delta > 0,
+            "a successful materialize MUST record non-zero blob-read nanoseconds"
+        );
+        assert!(
+            write_delta > 0,
+            "a successful materialize MUST record non-zero blob-write nanoseconds"
+        );
+        assert!(
+            bytes_delta >= (fast_content.len() + slow_content.len()) as u64,
+            "materialized bytes ({bytes_delta}) must be >= the two files' content"
+        );
+        assert!(
+            fast_delta >= 1,
+            "the immediate read MUST classify as >= 1 fast-tier HIT (got delta {fast_delta})"
+        );
+        assert!(
+            slow_delta >= 1,
+            "the 25ms-delayed read MUST classify as >= 1 slow FETCH past the {}ns divider \
+             (got delta {slow_delta})",
+            super::FAST_TIER_READ_LATENCY_THRESHOLD_NS
+        );
+    }
+
     // A Store whose reads never resolve, to prove the bounded index timeout.
     use slow_store::SlowStore;
     // A Store that delegates to an inner MemoryStore but hangs `get_part` for a
     // configured digest set, to prove the overall deadline bounds a stalled blob
     // read mid-materialize.
     use selective_store::SelectiveStore;
+    // A Store that delegates to an inner MemoryStore but DELAYS `get_part` for a
+    // configured digest set by a fixed duration, to force a per-blob read span
+    // past the fast/slow latency divider (real clock; the test does not pause
+    // tokio time).
+    use delay_store::DelayStore;
     mod slow_store {
         use core::pin::Pin;
         use std::sync::Arc;
@@ -2255,5 +2543,147 @@ mod tests {
         }
 
         default_health_status_indicator!(SelectiveStore);
+    }
+
+    mod delay_store {
+        use core::pin::Pin;
+        use core::time::Duration;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+        use nativelink_error::Error;
+        use nativelink_metric::{
+            MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+        };
+        use nativelink_store::memory_store::MemoryStore;
+        use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+        use nativelink_util::common::DigestInfo;
+        use nativelink_util::health_utils::{
+            HealthStatusIndicator, default_health_status_indicator,
+        };
+        use nativelink_util::store_trait::{
+            DurableDelegation, ItemCallback, MarkStableDelegation, PinDelegation,
+            StableDigestDelegation, Store, StoreDriver, StoreKey, UploadSizeInfo,
+        };
+
+        /// Wraps an inner [`MemoryStore`], delegating everything EXCEPT it sleeps
+        /// `delay` before serving `get_part` for any digest in `delay_on` — so a
+        /// specific blob read's measured wall span exceeds the fast/slow divider,
+        /// classifying it a slow-tier FETCH.
+        #[derive(Debug)]
+        pub(super) struct DelayStore {
+            inner: Arc<MemoryStore>,
+            delay_on: HashSet<DigestInfo>,
+            delay: Duration,
+        }
+
+        impl MetricsComponent for DelayStore {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+
+        impl DelayStore {
+            pub(super) fn new_store(
+                inner: Arc<MemoryStore>,
+                delay_on: impl IntoIterator<Item = DigestInfo>,
+                delay: Duration,
+            ) -> Store {
+                Store::new(Arc::new(Self {
+                    inner,
+                    delay_on: delay_on.into_iter().collect(),
+                    delay,
+                }))
+            }
+        }
+
+        #[async_trait]
+        impl StoreDriver for DelayStore {
+            async fn post_init(self: Arc<Self>) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn has_with_results(
+                self: Pin<&Self>,
+                keys: &[StoreKey<'_>],
+                results: &mut [Option<u64>],
+            ) -> Result<(), Error> {
+                Pin::new(self.inner.as_ref())
+                    .has_with_results(keys, results)
+                    .await
+            }
+
+            async fn update(
+                self: Pin<&Self>,
+                key: StoreKey<'_>,
+                reader: DropCloserReadHalf,
+                size_info: UploadSizeInfo,
+            ) -> Result<u64, Error> {
+                Pin::new(self.inner.as_ref())
+                    .update(key, reader, size_info)
+                    .await
+            }
+
+            async fn get_part(
+                self: Pin<&Self>,
+                key: StoreKey<'_>,
+                writer: &mut DropCloserWriteHalf,
+                offset: u64,
+                length: Option<u64>,
+            ) -> Result<(), Error> {
+                if let StoreKey::Digest(digest) = &key {
+                    if self.delay_on.contains(digest) {
+                        // Real-clock delay: pushes the measured read span past the
+                        // fast/slow divider so the blob classifies as a slow FETCH.
+                        tokio::time::sleep(self.delay).await;
+                    }
+                }
+                Pin::new(self.inner.as_ref())
+                    .get_part(key, writer, offset, length)
+                    .await
+            }
+
+            fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
+                self
+            }
+
+            fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+                self
+            }
+
+            fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+                self
+            }
+
+            fn register_item_callback(
+                self: Arc<Self>,
+                _callback: Arc<dyn ItemCallback>,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+                StableDigestDelegation::Leaf
+            }
+
+            fn pin_delegation(&self) -> PinDelegation<'_> {
+                PinDelegation::Leaf
+            }
+
+            fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+                MarkStableDelegation::Leaf
+            }
+
+            fn durable_delegation(&self) -> DurableDelegation<'_> {
+                DurableDelegation::Leaf
+            }
+        }
+
+        default_health_status_indicator!(DelayStore);
     }
 }
