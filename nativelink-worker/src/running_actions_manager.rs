@@ -109,53 +109,78 @@ use crate::incr_seed_fetch::{
 const INCR_SEED_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// FL-1383 ask #4: the worker-RESERVED `-incr` carrier env-var names. The worker
-/// is the SOLE authority for these two signals — on the portable-incr path a
-/// client-supplied `NL_PORTABLE_INCR_SEEDED`/`NL_INCR_TARGETKEY` is STRIPPED from
-/// the action env before the worker injects its own (only on a genuine
-/// `Materialized` seed), so a client can never forge "a seed is present". Both
-/// the injector ([`portable_incr_seed_child_env`]) and the strip in
-/// `inner_execute` reference these constants so the two can never drift.
+/// is the SOLE authority for these signals — on the portable-incr path a
+/// client-supplied `NL_PORTABLE_INCR_MANAGED`/`NL_PORTABLE_INCR_SEEDED`/
+/// `NL_INCR_TARGETKEY` is STRIPPED from the action env before the worker injects
+/// its own (MANAGED on every portable action; the narrow pair only on a genuine
+/// `Materialized` seed), so a client can never forge "the worker manages this" or
+/// "a seed is present". Both the injector ([`portable_incr_seed_child_env`]) and
+/// the strip in `inner_execute` reference these constants so the two can't drift.
+///
+/// `NL_PORTABLE_INCR_MANAGED` is the BROAD signal: presence tells the in-action
+/// `process_wrapper` that the WORKER owns `-incr` seeding, so it must NOT run its
+/// own local `FL_INCR_TOOL` seed setup — fired on EVERY portable action regardless
+/// of seed outcome. `NL_PORTABLE_INCR_SEEDED` is the NARROW signal: presence means
+/// a seed was GENUINELY materialized at the rebind path (Materialized-only).
+const NL_PORTABLE_INCR_MANAGED_ENV: &str = "NL_PORTABLE_INCR_MANAGED";
 const NL_PORTABLE_INCR_SEEDED_ENV: &str = "NL_PORTABLE_INCR_SEEDED";
 const NL_INCR_TARGETKEY_ENV: &str = "NL_INCR_TARGETKEY";
 
+/// The CLIENT-side env var (`process_wrapper`'s local `-incr` seed-setup tool
+/// path) that the worker SUPERSEDES on a portable action. Distinct from the
+/// worker-reserved carriers above: the worker never injects this — it STRIPS the
+/// client's value so the in-action `process_wrapper`, seeing MANAGED + no
+/// `FL_INCR_TOOL`, gracefully skips its local seed setup instead of running it off
+/// an empty PathBuf (→ ENOENT → cold build, the FL-1383 cold-remote-CI failure).
+const FL_INCR_TOOL_ENV: &str = "FL_INCR_TOOL";
+
 /// `true` iff `name` is one of the worker-reserved `-incr` carrier env names.
 fn is_reserved_incr_env(name: &str) -> bool {
-    name == NL_PORTABLE_INCR_SEEDED_ENV || name == NL_INCR_TARGETKEY_ENV
+    name == NL_PORTABLE_INCR_MANAGED_ENV
+        || name == NL_PORTABLE_INCR_SEEDED_ENV
+        || name == NL_INCR_TARGETKEY_ENV
 }
 
 /// FL-1383 ask #4 (Bazel-client contract): the worker-injected CHILD-process
-/// env vars that tell the in-action `process_wrapper` a genuine `-incr` seed
-/// was materialized on THIS remote execution, so it reliably skips its
-/// local-tool seed path (`setup()` early-return).
+/// env vars that tell the in-action `process_wrapper` how the WORKER is handling
+/// `-incr` seeding on THIS remote execution.
 ///
-/// Emits the pair ONLY when the seed fetch resolved to
-/// [`SeedOutcome::Materialized`](crate::incr_seed_fetch::SeedOutcome::Materialized)
-/// (`seeded == true`) AND a portable `targetkey` is present:
-/// - `NL_PORTABLE_INCR_SEEDED=1` — presence is the sole "the seed is genuinely
-///   here" signal; `process_wrapper` reads ONLY presence, never a value other
-///   than `1`.
-/// - `NL_INCR_TARGETKEY=<64-hex>` — the blake3 target key ([`TargetKey::key`]),
-///   the same hex form the `incr_seed_index` uses.
+/// Emits nothing for a non-portable action (`targetkey == None`). For a portable
+/// action (`targetkey == Some`) it always emits the BROAD signal, and additionally
+/// the NARROW pair only on a genuine `Materialized` seed:
+/// - `NL_PORTABLE_INCR_MANAGED=1` — BROAD, on EVERY portable action regardless of
+///   seed outcome: presence tells `process_wrapper` the worker owns `-incr`
+///   seeding, so it must SKIP its own local `FL_INCR_TOOL` seed setup. Without it,
+///   a COLD portable action's `process_wrapper` runs its local setup off an empty
+///   `FL_INCR_TOOL` PathBuf → ENOENT → exit 1 → cold build (the FL-1383 failure).
+/// - `NL_PORTABLE_INCR_SEEDED=1` — NARROW, Materialized-only: presence is the sole
+///   "a seed is genuinely here at the rebind path" signal; `process_wrapper` reads
+///   ONLY presence, never a value other than `1`. MANAGED does NOT imply SEEDED —
+///   a false-positive SEEDED on cold would make `process_wrapper` reuse a seed
+///   that isn't there → a wrong/cold-slow build.
+/// - `NL_INCR_TARGETKEY=<64-hex>` — NARROW, Materialized-only: the blake3 target
+///   key ([`TargetKey::key`]), the same hex form the `incr_seed_index` uses.
 ///
-/// A COLD outcome (`NoSeed`/`Collision`/`TimedOut`) or a non-portable action
-/// (no `targetkey`) yields an EMPTY vec. A false-positive on cold would make
-/// `process_wrapper` skip a seed that is NOT present → a wrong/cold-slow build;
-/// seed-presence alone cannot distinguish the branch, which is the whole reason
-/// this explicit signal exists. The caller applies these to the spawned child's
-/// env ONLY (after `env_clear` + the action-supplied env loop) — NEVER to the
-/// REAPI `Command`/`command_proto`, so they never enter the action digest / AC
-/// key. `rustc` does not read either var; only `process_wrapper` does.
+/// The caller applies these to the spawned child's env ONLY (after `env_clear` +
+/// the action-supplied env loop) — NEVER to the REAPI `Command`/`command_proto`,
+/// so they never enter the action digest / AC key. `rustc` reads none of them;
+/// only `process_wrapper` does.
 fn portable_incr_seed_child_env(
     seeded: bool,
     targetkey: Option<&TargetKey>,
 ) -> Vec<(&'static str, String)> {
-    match (seeded, targetkey) {
-        (true, Some(targetkey)) => vec![
-            (NL_PORTABLE_INCR_SEEDED_ENV, "1".to_string()),
-            (NL_INCR_TARGETKEY_ENV, targetkey.key().to_string()),
-        ],
-        _ => Vec::new(),
+    // Non-portable action: worker injects nothing (child env byte-unchanged).
+    let Some(targetkey) = targetkey else {
+        return Vec::new();
+    };
+    // BROAD: the worker manages `-incr` seeding on EVERY portable action.
+    let mut env = vec![(NL_PORTABLE_INCR_MANAGED_ENV, "1".to_string())];
+    // NARROW: a seed genuinely materialized at the rebind path this run.
+    if seeded {
+        env.push((NL_PORTABLE_INCR_SEEDED_ENV, "1".to_string()));
+        env.push((NL_INCR_TARGETKEY_ENV, targetkey.key().to_string()));
     }
+    env
 }
 
 // =============================================================================
@@ -5657,31 +5682,42 @@ impl RunningActionImpl {
             envs
         };
         for environment_variable in envs {
-            // FL-1383 ask #4 (sole-authority): on the portable-incr path the
-            // worker is the ONLY authority for the reserved `-incr` carrier names.
-            // Strip any client-supplied `NL_PORTABLE_INCR_SEEDED`/`NL_INCR_TARGETKEY`
-            // from the action's own env so a client cannot forge "a seed is
-            // present": on a COLD outcome the worker injects nothing below, and an
-            // un-stripped client `NL_PORTABLE_INCR_SEEDED=1` would make
-            // `process_wrapper` skip a seed that is NOT present → wrong/cold build.
+            // FL-1383 ask #4 (sole-authority): on the portable-incr path the worker
+            // is the ONLY authority for the reserved `-incr` carrier names AND it
+            // SUPERSEDES the client's local seed tool. Two distinct rationales:
+            //   - `is_reserved_incr_env` (MANAGED/SEEDED/TARGETKEY): the worker
+            //     injects its OWN below, so strip any client-supplied value first —
+            //     a client must not forge "the worker manages this" / "a seed is
+            //     present" (an un-stripped `NL_PORTABLE_INCR_SEEDED=1` on a COLD
+            //     action would make `process_wrapper` skip a non-existent seed).
+            //   - `FL_INCR_TOOL`: the worker SUPERSEDES the client's local seed
+            //     tool. The worker never injects it; stripping it (combined with
+            //     the injected `NL_PORTABLE_INCR_MANAGED=1`) makes the in-action
+            //     `process_wrapper` gracefully skip its local setup instead of
+            //     running it off an empty PathBuf → ENOENT → cold build.
             // Scoped to portable actions (`portable_targetkey.is_some()`) so a
             // non-portable action's child env is byte-UNCHANGED — fleet-INERT, as
-            // `portable_targetkey` is `None` for every action on the fleet and for
-            // every non-portable action off-fleet.
-            if portable_targetkey.is_some() && is_reserved_incr_env(&environment_variable.name) {
+            // `portable_targetkey` is `None` for every non-portable action.
+            if portable_targetkey.is_some()
+                && (is_reserved_incr_env(&environment_variable.name)
+                    || environment_variable.name == FL_INCR_TOOL_ENV)
+            {
                 continue;
             }
             command_builder.env(&environment_variable.name, &environment_variable.value);
         }
 
-        // FL-1383 ask #4 (Bazel-client contract): inject the worker-only
-        // `-incr`-seed carrier AFTER the action-supplied env loop (so nothing in
-        // the REAPI `Command` can clobber it) and BEFORE `spawn()`. These land in
-        // the SPAWNED CHILD's env ONLY — they are added to `command_builder`, NOT
-        // to `command_proto`/the REAPI `Command`, so they never enter the action
-        // digest / AC key (`env_clear()` ran above). Emitted only when a seed
-        // genuinely materialized (`SeedOutcome::Materialized`); a cold outcome
-        // injects nothing so `process_wrapper` does not skip a non-existent seed.
+        // FL-1383 ask #4 (Bazel-client contract): inject the worker-managed
+        // `-incr` carriers AFTER the action-supplied env loop (so nothing in the
+        // REAPI `Command` can clobber it) and BEFORE `spawn()`. These land in the
+        // SPAWNED CHILD's env ONLY — they are added to `command_builder`, NOT to
+        // `command_proto`/the REAPI `Command`, so they never enter the action
+        // digest / AC key (`env_clear()` ran above). On a portable action the
+        // broad `NL_PORTABLE_INCR_MANAGED=1` is always emitted (worker owns
+        // seeding → process_wrapper skips its local setup); the narrow
+        // `NL_PORTABLE_INCR_SEEDED`/`NL_INCR_TARGETKEY` pair only when a seed
+        // genuinely materialized, so process_wrapper never reuses a non-existent
+        // seed. A non-portable action emits nothing (child env byte-unchanged).
         for (name, value) in
             portable_incr_seed_child_env(portable_incr_seeded, portable_targetkey.as_ref())
         {
@@ -12829,9 +12865,21 @@ mod portable_incr_seed_env_tests {
     }
 
     #[test]
-    fn materialized_seed_injects_both_carrier_vars() {
+    fn materialized_seed_injects_managed_and_both_carrier_vars() {
         let tk = targetkey();
         let env = portable_incr_seed_child_env(true, Some(&tk));
+
+        let managed = env
+            .iter()
+            .find(|(name, _)| *name == "NL_PORTABLE_INCR_MANAGED")
+            .expect(
+                "a Materialized portable-incr seed MUST ALSO inject the broad \
+                 NL_PORTABLE_INCR_MANAGED (it fires on EVERY portable action)",
+            );
+        assert_eq!(
+            managed.1, "1",
+            "NL_PORTABLE_INCR_MANAGED must be exactly \"1\" — process_wrapper keys on presence"
+        );
 
         let seeded = env
             .iter()
@@ -12867,10 +12915,21 @@ mod portable_incr_seed_env_tests {
     }
 
     #[test]
-    fn cold_seed_injects_nothing() {
+    fn cold_seed_injects_managed_but_not_narrow_carriers() {
         // A COLD outcome (NoSeed/Collision/TimedOut) is modeled as seeded == false.
+        // MANAGED is BROAD (fires on every portable action); SEEDED/TARGETKEY are
+        // NARROW (Materialized-only).
         let tk = targetkey();
         let env = portable_incr_seed_child_env(false, Some(&tk));
+        let managed = env
+            .iter()
+            .find(|(name, _)| *name == "NL_PORTABLE_INCR_MANAGED")
+            .expect(
+                "a COLD portable action MUST STILL inject NL_PORTABLE_INCR_MANAGED=1 — the worker \
+                 owns `-incr` seeding on EVERY portable action so process_wrapper skips its local \
+                 FL_INCR_TOOL setup even when no seed materialized",
+            );
+        assert_eq!(managed.1, "1", "NL_PORTABLE_INCR_MANAGED must be exactly \"1\"");
         assert!(
             !env.iter().any(|(name, _)| *name == "NL_PORTABLE_INCR_SEEDED"),
             "a COLD outcome MUST NOT inject NL_PORTABLE_INCR_SEEDED — a false positive would \
@@ -12885,12 +12944,12 @@ mod portable_incr_seed_env_tests {
     #[test]
     fn non_portable_action_injects_nothing() {
         // A non-portable action has no targetkey (portable_targetkey == None),
-        // even if some `seeded` flag were spuriously set.
+        // even if some `seeded` flag were spuriously set — no MANAGED, no narrow.
         let env = portable_incr_seed_child_env(true, None);
         assert!(
             env.is_empty(),
-            "a non-portable action (no TargetKey) MUST inject no carrier vars — the signal is \
-             portable-incr-only"
+            "a non-portable action (no TargetKey) MUST inject no carrier vars (not even \
+             MANAGED) — the signals are portable-incr-only"
         );
     }
 }

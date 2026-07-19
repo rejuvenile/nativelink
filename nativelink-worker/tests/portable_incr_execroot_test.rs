@@ -1492,12 +1492,14 @@ async fn pre_seed_incr_index(index_store: &Store, cas: &Arc<FastSlowStore>, tk: 
         .expect("pre-seed index");
 }
 
-/// A `Command` whose child dumps the two reserved `-incr` carrier vars into
-/// `carrier-env.txt` (in the execroot), each defaulting to `<unset>` via shell
-/// parameter expansion so ABSENCE is observable, not just presence. Declares the
-/// primary `.rlib` and its nested `-incr` output so the seed-fetch is attempted
-/// (`seed_dest_dir` resolves). `extra_env` lets a test forge a CLIENT-supplied
-/// reserved carrier to prove the worker strips it.
+/// A `Command` whose child dumps the worker-managed `-incr` carrier vars (the
+/// broad `NL_PORTABLE_INCR_MANAGED`, the narrow `NL_PORTABLE_INCR_SEEDED` +
+/// `NL_INCR_TARGETKEY`) AND the client-side `FL_INCR_TOOL` into `carrier-env.txt`
+/// (in the execroot), each defaulting to `<unset>` via shell parameter expansion
+/// so ABSENCE is observable, not just presence. Declares the primary `.rlib` and
+/// its nested `-incr` output so the seed-fetch is attempted (`seed_dest_dir`
+/// resolves). `extra_env` lets a test forge a CLIENT-supplied carrier
+/// (`FL_INCR_TOOL`, or a reserved name) to prove the worker strips/supersedes it.
 fn carrier_dump_command(
     primary: &str,
     incr_output: &str,
@@ -1517,8 +1519,10 @@ fn carrier_dump_command(
         arguments: vec![
             "sh".to_string(),
             "-c".to_string(),
-            "printf 'SEEDED=[%s]\\n' \"${NL_PORTABLE_INCR_SEEDED:-<unset>}\" > carrier-env.txt && \
-             printf 'TARGETKEY=[%s]\\n' \"${NL_INCR_TARGETKEY:-<unset>}\" >> carrier-env.txt"
+            "printf 'MANAGED=[%s]\\n' \"${NL_PORTABLE_INCR_MANAGED:-<unset>}\" > carrier-env.txt && \
+             printf 'SEEDED=[%s]\\n' \"${NL_PORTABLE_INCR_SEEDED:-<unset>}\" >> carrier-env.txt && \
+             printf 'TARGETKEY=[%s]\\n' \"${NL_INCR_TARGETKEY:-<unset>}\" >> carrier-env.txt && \
+             printf 'FLINCRTOOL=[%s]\\n' \"${FL_INCR_TOOL:-<unset>}\" >> carrier-env.txt"
                 .to_string(),
         ],
         output_paths: vec![primary.to_string(), incr_output.to_string()],
@@ -1558,24 +1562,31 @@ async fn execute_and_read_carrier_dump(
 }
 
 /// FL-1383 ask #4 — the SeedOutcome→flag→injection WIRING, end to end, for the
-/// SAME action run seeded on one worker and cold on another:
-///   (a) `Materialized`  → child env has `NL_PORTABLE_INCR_SEEDED=1` AND
-///       `NL_INCR_TARGETKEY=<TargetKey::key()>`;
-///   (b) cold (index-miss) → child env has NEITHER;
+/// SAME action run seeded on one worker and cold on another. The BROAD signal
+/// (`NL_PORTABLE_INCR_MANAGED`) fires on EVERY portable action regardless of seed
+/// outcome; the NARROW pair (`NL_PORTABLE_INCR_SEEDED` + `NL_INCR_TARGETKEY`)
+/// fires ONLY on a genuine `Materialized` seed:
+///   (a) `Materialized`  → child env has ALL THREE: `NL_PORTABLE_INCR_MANAGED=1`,
+///       `NL_PORTABLE_INCR_SEEDED=1`, `NL_INCR_TARGETKEY=<TargetKey::key()>`;
+///   (b) cold (index-miss) → child env has `NL_PORTABLE_INCR_MANAGED=1` ONLY
+///       (the worker still owns seeding on a cold action so process_wrapper must
+///       skip its local setup), but NEITHER narrow seed carrier;
 ///   (c) DIGEST NON-LEAK → the client action digest is BYTE-IDENTICAL between the
 ///       seeded and cold runs (the carrier never enters the action identity).
 ///
-/// Mutation coverage (both restored):
-///   - INVERT the prepare-site guard (`:5468`, `matches!(_, Materialized)` →
-///     `!matches!`): the cold run then sets the flag and the seeded run clears it,
-///     so (a) and (b) BOTH flip → RED. (The exact false-positive-on-cold the 3
-///     shipped helper-only tests miss: guard inversion passes 220/220 there.)
+/// Mutation coverage (all restored):
+///   - GATE MANAGED behind `seeded` (make MANAGED narrow like SEEDED): the cold
+///     run then emits no MANAGED → (b) MANAGED assertion RED.
+///   - INVERT the prepare-site guard (`matches!(_, Materialized)` → `!matches!`):
+///     the cold run then sets the flag and the seeded run clears it, so the SEEDED
+///     assertions in (a)/(b) BOTH flip → RED. (The exact false-positive-on-cold
+///     the helper-only tests miss: guard inversion passes there.)
 ///   - MOVE the injection into `command_proto.environment_variables` instead of
 ///     `command_builder`: pushed AFTER the action-env loop it never reaches the
 ///     child; pushed BEFORE it, the sole-authority strip removes it (reserved
 ///     name) — either way the child loses the carrier → (a) RED.
 #[nativelink_test]
-async fn portable_seed_wiring_injects_carrier_into_child_env_only_when_materialized() {
+async fn managed_fires_on_every_portable_action_seeded_only_on_materialized() {
     let primary = "wire-e2e/aaa.rlib";
     let incr_output = "wire-e2e/aaa-incr";
     let (_key, props) = carrier_props(primary);
@@ -1623,7 +1634,23 @@ async fn portable_seed_wiring_injects_carrier_into_child_env_only_when_materiali
     let seeded_dump = execute_and_read_carrier_dump(&manager_seeded, se_seeded).await;
     let cold_dump = execute_and_read_carrier_dump(&manager_cold, se_cold).await;
 
-    // (a) Materialized → both carriers present with the exact worker values.
+    // BROAD MANAGED: present on BOTH the seeded and the cold portable action —
+    // the worker owns `-incr` seeding on every portable action, so process_wrapper
+    // must skip its local FL_INCR_TOOL setup regardless of whether a seed landed.
+    assert!(
+        seeded_dump.contains("MANAGED=[1]"),
+        "a portable action (seeded) MUST inject NL_PORTABLE_INCR_MANAGED=1 into the SPAWNED CHILD \
+         so process_wrapper skips its local FL_INCR_TOOL setup — child dump was:\n{seeded_dump}",
+    );
+    assert!(
+        cold_dump.contains("MANAGED=[1]"),
+        "a portable action (COLD/NoSeed) MUST STILL inject NL_PORTABLE_INCR_MANAGED=1 — the worker \
+         is the sole `-incr` authority on EVERY portable action; without MANAGED the in-action \
+         process_wrapper runs its own empty-FL_INCR_TOOL seed setup → ENOENT → cold-slow build \
+         (the FL-1383 cold-remote-CI failure); child dump was:\n{cold_dump}",
+    );
+
+    // (a) Materialized → both narrow carriers present with the exact worker values.
     assert!(
         seeded_dump.contains("SEEDED=[1]"),
         "a Materialized seed MUST inject NL_PORTABLE_INCR_SEEDED=1 into the SPAWNED CHILD so \
@@ -1646,6 +1673,82 @@ async fn portable_seed_wiring_injects_carrier_into_child_env_only_when_materiali
     assert!(
         cold_dump.contains("TARGETKEY=[<unset>]"),
         "a COLD outcome MUST NOT inject NL_INCR_TARGETKEY either — child dump was:\n{cold_dump}",
+    );
+}
+
+/// FL-1383 ask #4 (worker supersedes the client tool): on a PORTABLE action the
+/// worker is the sole `-incr` authority, so it STRIPS any client-supplied
+/// `FL_INCR_TOOL` from the child env (the client's local seed-setup tool is
+/// superseded by the worker's managed seeding — leaving it would let the in-action
+/// process_wrapper run its own seed setup off an empty PathBuf → ENOENT → cold).
+/// On a NON-portable action the feature is inert, so the client's `FL_INCR_TOOL`
+/// is PRESERVED byte-for-byte (the strip is scoped to `portable_targetkey.is_some()`).
+///
+/// Mutation: drop the `|| name == FL_INCR_TOOL_ENV` clause in the action-env strip
+/// → the client `FL_INCR_TOOL=/client/tool` survives on the portable action →
+/// `FLINCRTOOL=[<unset>]` assertion RED.
+#[nativelink_test]
+async fn strip_removes_client_fl_incr_tool_on_portable_only() {
+    let primary = "flincr-strip/aaa.rlib";
+    let incr_output = "flincr-strip/aaa-incr";
+    let client_tool = "/client/tool/incr_wrapper";
+
+    // -- PORTABLE branch: carrier props → portable_targetkey Some → strip fires. --
+    let (_key, props) = carrier_props(primary);
+    let (_td_p, root_p) = canonical_tempdir();
+    let index_p = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager_p, cas_p) =
+        setup_portable_manager_with_index(enabled_context(&root_p, &["flincr-strip/"]), index_p)
+            .await;
+    let command_p = carrier_dump_command(primary, incr_output, &[("FL_INCR_TOOL", client_tool)]);
+    let se_p = upload_start_execute(&cas_p, &command_p, platform_from_props(&props)).await;
+    let portable_dump = execute_and_read_carrier_dump(&manager_p, se_p).await;
+
+    assert!(
+        portable_dump.contains("FLINCRTOOL=[<unset>]"),
+        "a PORTABLE action MUST have its client-supplied FL_INCR_TOOL STRIPPED from the child — \
+         the worker supersedes the client's local seed tool; leaving it lets process_wrapper run \
+         its own empty-PathBuf seed setup → ENOENT → cold; child dump was:\n{portable_dump}",
+    );
+    assert!(
+        !portable_dump.contains(client_tool),
+        "no client FL_INCR_TOOL value may reach a portable action's child — child dump \
+         was:\n{portable_dump}",
+    );
+    // The worker still manages the portable action (broad signal present).
+    assert!(
+        portable_dump.contains("MANAGED=[1]"),
+        "the stripped FL_INCR_TOOL is superseded by the worker's NL_PORTABLE_INCR_MANAGED=1 — \
+         child dump was:\n{portable_dump}",
+    );
+
+    // -- NON-portable branch: empty platform → targetkey None → NO strip, NO inject. --
+    let (_td_n, root_n) = canonical_tempdir();
+    let index_n = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (manager_n, cas_n) =
+        setup_portable_manager_with_index(enabled_context(&root_n, &["flincr-strip/"]), index_n)
+            .await;
+    let command_n = carrier_dump_command(primary, incr_output, &[("FL_INCR_TOOL", client_tool)]);
+    // Empty platform ⇒ no carrier props ⇒ plan None ⇒ portable_targetkey None.
+    let se_n = upload_start_execute(&cas_n, &command_n, Platform::default()).await;
+    let non_portable_dump = execute_and_read_carrier_dump(&manager_n, se_n).await;
+
+    assert!(
+        non_portable_dump.contains(&format!("FLINCRTOOL=[{client_tool}]")),
+        "a NON-portable action's client FL_INCR_TOOL MUST be PRESERVED byte-for-byte — the strip \
+         is scoped to `portable_targetkey.is_some()`, so a non-portable action's child env is \
+         byte-UNCHANGED; child dump was:\n{non_portable_dump}",
+    );
+    // A non-portable action injects NONE of the worker-managed carrier vars.
+    assert!(
+        non_portable_dump.contains("MANAGED=[<unset>]"),
+        "a NON-portable action MUST NOT inject NL_PORTABLE_INCR_MANAGED — the feature is inert and \
+         the child env is byte-UNCHANGED; child dump was:\n{non_portable_dump}",
+    );
+    assert!(
+        non_portable_dump.contains("SEEDED=[<unset>]") && non_portable_dump.contains("TARGETKEY=[<unset>]"),
+        "a NON-portable action MUST NOT inject the narrow seed carriers either — child dump \
+         was:\n{non_portable_dump}",
     );
 }
 
