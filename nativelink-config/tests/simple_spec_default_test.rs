@@ -166,6 +166,11 @@ fn simple_spec_default_matches_deserialize_empty() {
          DOWN overcommit OFF by default)"
     );
     assert_eq!(
+        derived.phase3_reserve_undeclared_enabled, deserialized.phase3_reserve_undeclared_enabled,
+        "phase3_reserve_undeclared_enabled default drift (both should be TRUE — \
+         #2497 undeclared→p95 injection ships ON per the anti-dark-counter rule)"
+    );
+    assert_eq!(
         derived.phase3_overcommit_max_factor, deserialized.phase3_overcommit_max_factor,
         "phase3_overcommit_max_factor default drift — serde default is 1.0 \
          (default_phase3_overcommit_max_factor = DOWN inert); a bare #[serde(default)] \
@@ -270,6 +275,11 @@ fn simple_spec_default_concrete_values() {
         !spec.phase3_down_overcommit_enabled,
         "phase3_down_overcommit_enabled default must be FALSE — DOWN statistical \
          overcommit ships hard-OFF until a workload + observe metric justify it"
+    );
+    assert!(
+        spec.phase3_reserve_undeclared_enabled,
+        "phase3_reserve_undeclared_enabled default must be TRUE — #2497 undeclared→p95 \
+         injection ships ON (anti-dark-counter rule); config `false` is the kill-switch"
     );
     assert_eq!(
         spec.phase3_overcommit_max_factor, 1.0,

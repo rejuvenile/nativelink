@@ -509,6 +509,23 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub phase3_raise_enabled: bool,
 
+    /// (#2497 sched Phase-3 p95 policy) When ON, an action that declares NO
+    /// `memory_kb` `Minimum` (or declares `memory_kb=0`) AND has a TRUSTED (>=K)
+    /// resource profile gets a `memory_kb` `Minimum` = the profiled **p95** INJECTED
+    /// at admission (store-once, same ledger path as RAISE/DOWN). This gives an
+    /// undeclared action a measured reservation so the scheduler packs it against its
+    /// real footprint instead of treating it as free. Requires a trusted profile — an
+    /// undeclared action with no profile is left untouched (no injection).
+    ///
+    /// Default: **true** (ON) per the anti-dark-counter rule (a default-OFF feature
+    /// never soaks its own bugs). The flag is the operational KILL-SWITCH: set `false`
+    /// to restore the pre-#2497 behavior (undeclared → no reservation) without a
+    /// redeploy. The injected `Minimum` DOES affect matching (it is a real platform
+    /// property), which is the intended effect; the worker `memory_gate` free-floor NAK
+    /// remains the OOM backstop for a p95 under-estimate.
+    #[serde(default = "default_true")]
+    pub phase3_reserve_undeclared_enabled: bool,
+
     /// (#task-resource-profile Phase-3 §3 DOWN) Master gate for the DOWN
     /// statistical-OVERCOMMIT direction: reserve a CENTRAL estimate
     /// `p50 × (1 + margin(variance, tier))` clamped into
@@ -742,6 +759,10 @@ impl Default for SimpleSpec {
             // RAISE enforcement OFF (byte-identical declared-only ledger until an
             // operator enables it; the observe metric still emits).
             phase3_raise_enabled: false,
+            // (#2497 sched Phase-3 p95 policy) #[serde(default = "default_true")] → true
+            // (shipped ON per the anti-dark-counter rule; kill-switch via config `false`).
+            // Undeclared/zero memory_kb actions with a trusted profile reserve their p95.
+            phase3_reserve_undeclared_enabled: true,
             // #[serde(default)] → bool false = DOWN overcommit OFF (and inert until
             // phase3_overcommit_max_factor > 1.0 even if flipped on).
             phase3_down_overcommit_enabled: false,

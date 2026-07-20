@@ -741,6 +741,47 @@ pub struct SchedulerMetrics {
     )]
     pub profile_lookup_skip: AtomicU64,
 
+    /// (#2497 sched Phase-3 p95 policy) COUNTER: admissions where the enforce phase
+    /// (`phase3_compute_effective_action_info`) actually APPLIED a RAISE — the profiled
+    /// p95 exceeded the declared `memory_kb` and the effective (raised) reservation was
+    /// RETURNED (after the no-op `effective==declared` check). This is the APPLIED raise
+    /// rate — distinct from the observe/counterfactual `inject_observe_would_raise`
+    /// (which counts candidates, not applied overrides). Dark (0) unless
+    /// `phase3_raise_enabled`.
+    #[metric(
+        help = "(#2497 Phase-3) admissions where the enforce phase APPLIED a RAISE (effective p95 > declared, override returned)"
+    )]
+    pub phase3_raise_applied: AtomicU64,
+
+    /// (#2497 sched Phase-3 p95 policy) COUNTER: admissions where the enforce phase
+    /// actually APPLIED a DOWN/overcommit — the effective (lowered) reservation was
+    /// below declared and RETURNED. The APPLIED overcommit rate. Dark (0) unless
+    /// `phase3_down_overcommit_enabled` AND `phase3_overcommit_max_factor > 1.0`.
+    #[metric(
+        help = "(#2497 Phase-3) admissions where the enforce phase APPLIED a DOWN overcommit (effective < declared, override returned)"
+    )]
+    pub phase3_down_applied: AtomicU64,
+
+    /// (#2497 sched Phase-3 p95 policy) COUNTER: admissions where the enforce phase
+    /// INJECTED a `memory_kb` `Minimum` = p95 into an action that declared none (or
+    /// `memory_kb=0`) — the new flag-gated undeclared-reservation path. Dark (0) unless
+    /// `phase3_reserve_undeclared_enabled` (default ON) AND a trusted profile exists.
+    #[metric(
+        help = "(#2497 Phase-3) admissions where the enforce phase injected a p95 memory_kb Minimum into an undeclared action"
+    )]
+    pub phase3_undeclared_injected: AtomicU64,
+
+    /// (#2497 sched Phase-3 p95 policy) COUNTER: admissions where the enforce phase
+    /// returned `None` (no applied override): both enforcement flags off, no eligible
+    /// declaration + undeclared injection off/no-profile, no trusted profile, or the
+    /// computed effective equalled declared. The denominator half so the applied-vs-noop
+    /// rate is scrapeable (a 0 across all three applied counters + a climbing noop = the
+    /// enforce path is reachable but never moving a reservation).
+    #[metric(
+        help = "(#2497 Phase-3) admissions where the enforce phase applied no override (returned None)"
+    )]
+    pub phase3_noop_ineligible: AtomicU64,
+
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose TRUE
     /// DISPATCH-TIME leave-one-out prediction — the tail-aware statistic that stood at
     /// THIS action's dispatch (peeked BEFORE its own sample folded, stashed on the
@@ -1683,56 +1724,31 @@ fn action_declared_memory_kb(props: &PlatformProperties) -> u64 {
     }
 }
 
-/// (#task-resource-profile Phase-3 §8) Tier penalty MULTIPLIER applied to the DOWN
-/// margin when the trusted profile came from the COARSE `(instance, mnemonic)` blend
-/// rather than a FINE `(instance, target, mnemonic)` key. A coarse blend mixes cheap
-/// and expensive targets → higher true variance than the p95/p50 of any single target
-/// captures, so its margin is WIDENED (reserve closer to declared) to stay safe. `2.0`
-/// = a coarse key reserves with twice the fine margin for the same measured spread.
-/// FINE keys use penalty `1.0` (the base margin). Numeric-constant rule: this literal
-/// is authoritative.
-const PHASE3_COARSE_MARGIN_PENALTY: f64 = 2.0;
-
-/// (#task-resource-profile Phase-3 §3/§8) DOWN-overcommit effective reserve (KiB) for
-/// an OVER-declared key. `effective = clamp(p50 × (1 + margin), floor, declared)` where:
+/// (#task-resource-profile Phase-3 §3/§8; #2497 p95 policy) DOWN-overcommit effective
+/// reserve (KiB) for an OVER-declared key. `effective = clamp(p95, floor, declared)`
+/// where:
+/// * `p95` is the profiled window p95 — the RESERVATION statistic (operator policy
+///   directive 2026-07-18). This SUPERSEDES the earlier `p50 × (1 + margin(variance,
+///   tier))` approximation: with the sliding window we now have the real p95, so the
+///   margin/tier machinery that approximated a high percentile is gone.
 /// * `floor = ceil(declared / max(1.0, overcommit_max_factor))` — the profile-INDEPENDENT
 ///   bound (§6): a single wrong-low prediction can under-reserve by at most `max_factor`.
 ///   `max_factor <= 1.0` → `floor == declared` → the clamp pins `effective == declared`
 ///   (DOWN inert; the default 1.0 is the kill-dial, and a factor below 1 must not RAISE
 ///   above declared — that is the RAISE direction's job).
-/// * `margin = base_margin × tier_penalty`, `base_margin = max(0, (variance_ratio_x100
-///   − 100) / 100)` — CONTINUOUS in the measured p95/p50 spread (NOT a p95 pass/fail
-///   gate): a tight key (ratio 100) reserves p50; a 2× key reserves p50×(1+penalty),
-///   i.e. near/above its own p95. `tier_penalty` = `1.0` (FINE) or
-///   [`PHASE3_COARSE_MARGIN_PENALTY`] (COARSE blend).
 ///
-/// Pure (no lock, no I/O) so it is unit-testable in isolation. The tail risk of a
-/// wrong-low reserve is carried by the worker `memory_gate` NAK backstop, NOT this
-/// prediction.
+/// Only reached on the DOWN branch (`p95 <= declared`), so the clamp lowers the reserve
+/// to `max(p95, floor)`. Pure (no lock, no I/O) so it is unit-testable in isolation. The
+/// tail risk of a wrong-low reserve is carried by the worker `memory_gate` free-floor NAK
+/// backstop, NOT this prediction.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn phase3_down_effective_kb(
-    declared_kb: u64,
-    p50_kb: u64,
-    variance_ratio_x100: u64,
-    tier: ProfileTier,
-    overcommit_max_factor: f64,
-) -> u64 {
+fn phase3_down_effective_kb(declared_kb: u64, p95_kb: u64, overcommit_max_factor: f64) -> u64 {
     let factor = overcommit_max_factor.max(1.0);
     // ceil so the floor never rounds BELOW declared/factor (the bound must hold).
     let floor = (declared_kb as f64 / factor).ceil() as u64;
-    let base_margin = if variance_ratio_x100 > 100 {
-        (variance_ratio_x100 - 100) as f64 / 100.0
-    } else {
-        0.0
-    };
-    let tier_penalty = match tier {
-        ProfileTier::Fine => 1.0,
-        ProfileTier::Coarse => PHASE3_COARSE_MARGIN_PENALTY,
-    };
-    let margin = base_margin * tier_penalty;
-    let reserve = (p50_kb as f64 * (1.0 + margin)) as u64;
-    // clamp is safe: floor <= declared always (factor >= 1.0).
-    reserve.clamp(floor, declared_kb)
+    // clamp is safe: floor <= declared always (factor >= 1.0). Reserve the p95, but never
+    // below the profile-independent floor (bounds a single wrong-low prediction).
+    p95_kb.clamp(floor, declared_kb)
 }
 
 /// (#task-memgate-twosignal) The reactive DOWN churn-throttle: reduce the
@@ -2313,6 +2329,14 @@ struct ApiWorkerSchedulerImpl {
     /// Wired post-construction via `set_phase3_enforcement`, mirroring
     /// `set_placement_mode`, so no constructor call site changes.
     phase3_raise_enabled: bool,
+
+    /// (#2497 sched Phase-3 p95 policy) Master gate for the UNDECLARED→p95 injection
+    /// (`SimpleSpec::phase3_reserve_undeclared_enabled`, default ON). When ON, an action
+    /// declaring NO `memory_kb` `Minimum` (or `memory_kb=0`) that has a TRUSTED (>=K)
+    /// profile gets a `memory_kb` `Minimum` = its profiled p95 injected at admission.
+    /// When OFF, an undeclared action is left untouched (pre-#2497 behavior). Read once
+    /// per reserve under the `inner` write lock.
+    phase3_reserve_undeclared_enabled: bool,
 
     /// (#task-resource-profile Phase-3 §3 DOWN) Master gate for the DOWN
     /// statistical-overcommit direction (`SimpleSpec::phase3_down_overcommit_enabled`,
@@ -3279,96 +3303,121 @@ impl ApiWorkerSchedulerImpl {
     /// value at restore from the mutating profile map) is architecturally impossible
     /// here: `restore_platform_properties` reads the stored clone, never the map.
     ///
-    /// Returns `None` (no override → byte-identical declared-only ledger) when: both
-    /// enforcement flags are off (fast path — the common case); the action declares no
-    /// `memory_kb` `Minimum` (the override RAISES/LOWERS an EXISTING reservation, never
-    /// INJECTS a new dimension — injecting one could wedge a worker that does not
-    /// advertise it, the observe-path §7 lesson); the action carries no baggage key; no
-    /// TRUSTED (>=K) profile exists at either tier; or the computed effective equals
-    /// declared.
+    /// (#2497 p95 policy) The RESERVATION statistic is now the profiled window **p95**
+    /// (was the monotone-max tail) for ALL three moves. The three enforce moves are:
+    /// * RAISE — an EXISTING (>0) declaration under the p95 → reserve p95 (tightening,
+    ///   OOM-safe), starvation-clamped to the largest worker's RAM.
+    /// * DOWN — an EXISTING declaration at/over the p95 → reserve p95 floored at
+    ///   `declared / overcommit_max_factor` (statistical overcommit).
+    /// * UNDECLARED INJECT (`phase3_reserve_undeclared_enabled`, default ON) — an action
+    ///   declaring NO `memory_kb` (or `memory_kb=0`) with a TRUSTED profile → INJECT a
+    ///   `memory_kb` `Minimum` = p95 (starvation-clamped), so an undeclared action packs
+    ///   against its real footprint instead of counting as free.
+    ///
+    /// Every applied move increments its registered counter (`phase3_{raise,down}_applied`
+    /// / `phase3_undeclared_injected`); every `None` return increments
+    /// `phase3_noop_ineligible`, so the APPLIED-vs-noop rate is scrapeable.
+    ///
+    /// OOM BACKSTOP: p95 (window) can under-estimate a shifted/spiky footprint (it forgets
+    /// a one-off spike after 20 fresher samples). The SOLE OOM limiter for that under-
+    /// estimate is the worker-side `memory_gate` free-floor NAK (worker sets
+    /// memory_pressured at the <1 GiB free floor; scheduler hard-skips; worker
+    /// ResourceExhausted re-queue). That backstop is UNTOUCHED by this change.
+    ///
+    /// Returns `None` (no override, `phase3_noop_ineligible++`) when: all three flags are
+    /// off (fast path); the action is undeclared and the inject flag is off; the action is
+    /// declared and neither RAISE nor DOWN is on; the action carries no baggage key; no
+    /// TRUSTED (>=K) profile exists at either tier; the DOWN staleness gate refuses a
+    /// too-old loaded profile; or the computed effective equals the declared value.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
     fn phase3_compute_effective_action_info(
         &self,
         action_info: &ActionInfoWithProps,
         resource_profile_map: &ParkingMutex<ProfileMap>,
     ) -> Option<ActionInfoWithProps> {
-        // Fast path: no enforcement enabled → no override, no lookup, byte-identical.
-        if !self.phase3_raise_enabled && !self.phase3_down_overcommit_enabled {
+        // Fast path: no enforcement of ANY kind → no override, no lookup, byte-identical.
+        if !self.phase3_raise_enabled
+            && !self.phase3_down_overcommit_enabled
+            && !self.phase3_reserve_undeclared_enabled
+        {
+            self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        // Only an action ALREADY declaring a memory_kb Minimum is eligible.
+        // The action's declared memory_kb Minimum (0 / absent = UNDECLARED). RAISE/DOWN
+        // move an existing (>0) reservation; the undeclared→p95 inject acts only when
+        // there is none.
         let declared_kb = match action_info
             .platform_properties
             .properties
             .get(MEMORY_KB_PROPERTY)
         {
             Some(PlatformPropertyValue::Minimum(v)) => v.max(0.0) as u64,
-            _ => return None,
+            _ => 0,
         };
-        let (fine_key, coarse_key) = resource_profile_keys(action_info)?;
-        // Only a TRUSTED (>=K) profile may MOVE a reservation — an untrusted tail is
+        let is_undeclared = declared_kb == 0;
+        // Eligibility: an undeclared action needs the inject flag; a declared action needs
+        // RAISE or DOWN. Anything else is a no-op for this admission.
+        let eligible = if is_undeclared {
+            self.phase3_reserve_undeclared_enabled
+        } else {
+            self.phase3_raise_enabled || self.phase3_down_overcommit_enabled
+        };
+        if !eligible {
+            self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let Some((fine_key, coarse_key)) = resource_profile_keys(action_info) else {
+            self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        // Only a TRUSTED (>=K) profile may MOVE/INJECT a reservation — an untrusted p95 is
         // statistically meaningless (same K-gate as the observe path).
-        let TieredTail::Trusted {
-            tier,
-            tail_kb,
-            p50_kb,
-            variance_ratio_x100,
-            ..
-        } = resource_profile_map.lock().lookup_tiered(&fine_key, &coarse_key)
+        let TieredTail::Trusted { p95_kb, .. } =
+            resource_profile_map.lock().lookup_tiered(&fine_key, &coarse_key)
         else {
+            self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
             return None;
         };
 
-        let effective_kb = if self.phase3_raise_enabled && tail_kb > declared_kb {
-            // RAISE (§7): the client under-declared vs the measured worst-case tail →
-            // reserve the tail. OOM-SAFE (tightening only).
-            let raised = tail_kb;
-            // Starvation clamp (C5 / §7): if NO worker can hold the raised value, clamp
-            // to the largest single worker's RAM so the action stays schedulable
-            // instead of stranding above every worker forever.
-            let max_total = self.max_worker_total_memory_kb();
-            if max_total > 0 && raised > max_total {
-                info!(
-                    tag = "phase3_raise_starvation_clamp",
-                    target_id = %fine_key.target_id,
-                    action_mnemonic = %fine_key.action_mnemonic,
-                    declared_kb,
-                    raised_kb = raised,
-                    clamped_kb = max_total,
-                    "phase3 RAISE: raised reservation exceeds every worker's total RAM; \
-                     clamped to the max worker capacity so the action stays schedulable"
-                );
-                max_total
-            } else {
-                raised
-            }
-        } else if self.phase3_down_overcommit_enabled && tail_kb <= declared_kb {
-            // DOWN-overcommit (§3): the client OVER-declared (its measured tail sits
-            // at/under declared) → reserve a central estimate `p50 × (1 + margin)`
-            // floored at `declared / overcommit_max_factor`, so more actions pack per
-            // worker. The physical backstop is the EXISTING worker `memory_gate` NAK
-            // (re-queue on real pressure) — this design adds NO new backstop.
+        // Which applied counter to bump once the effective differs from declared.
+        enum Applied {
+            Raise,
+            Down,
+            Undeclared,
+        }
+
+        let (effective_kb, applied) = if is_undeclared {
+            // UNDECLARED INJECT (#2497): reserve the profiled p95 as a NEW memory_kb
+            // Minimum. Starvation-clamp (like RAISE) so the injected reservation stays
+            // schedulable on the largest worker. The worker free-floor NAK is the OOM
+            // backstop if p95 under-estimates.
+            (self.phase3_starvation_clamp(p95_kb, &fine_key, "inject"), Applied::Undeclared)
+        } else if self.phase3_raise_enabled && p95_kb > declared_kb {
+            // RAISE (§7): the client under-declared vs the measured p95 → reserve p95.
+            // OOM-SAFE (tightening only). Starvation-clamped to the max worker RAM.
+            (self.phase3_starvation_clamp(p95_kb, &fine_key, "raise"), Applied::Raise)
+        } else if self.phase3_down_overcommit_enabled && p95_kb <= declared_kb {
+            // DOWN-overcommit (§3): the client OVER-declared (measured p95 at/under
+            // declared) → reserve p95 floored at `declared / overcommit_max_factor`, so
+            // more actions pack per worker. The physical backstop is the worker
+            // `memory_gate` free-floor NAK — this design adds NO new backstop.
             //
-            // §12 STALENESS: a profile LOADED from a persisted snapshot is NOT trusted
-            // for LOWERING until a FRESH sample has folded AND the snapshot age is within
+            // §12 STALENESS: a profile LOADED from a persisted snapshot is NOT trusted for
+            // LOWERING until a FRESH sample has folded AND the snapshot age is within
             // `phase3_persist_max_age_secs` (live keys always pass). A stale loaded key
-            // keeps its declared reservation (over-reserve, never a stale-OOM). Re-lock is
-            // cheap; the DOWN path is not hot.
+            // keeps its declared reservation (over-reserve, never a stale-OOM).
             if !resource_profile_map.lock().down_lowering_trusted(
                 &fine_key,
                 &coarse_key,
                 self.phase3_persist_max_age_secs,
             ) {
+                self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             // (#task-memgate-twosignal) Reactive churn-throttle: back the effective
             // overcommit factor off toward 1.0 as the fleet's compressor-churn scalar
             // rises. OFF (default) → effective_factor == the static max factor →
-            // byte-identical to the pre-throttle DOWN path. Skip the O(workers)
-            // `fleet_max_churn_scalar` scan entirely when the throttle is OFF: the
-            // factor fn early-returns on `!enabled` before reading the churn arg, so
-            // the scan is pure cost with no effect — passing 0 keeps the default-config
-            // DOWN path byte-identical in COST as well as result.
+            // byte-identical. Skip the O(workers) scan entirely when the throttle is OFF.
             let fleet_churn = if self.phase3_overcommit_churn_throttle_enabled {
                 self.fleet_max_churn_scalar()
             } else {
@@ -3381,20 +3430,26 @@ impl ApiWorkerSchedulerImpl {
                 self.phase3_overcommit_churn_throttle_high,
                 self.phase3_overcommit_churn_throttle_enabled,
             );
-            phase3_down_effective_kb(
-                declared_kb,
-                p50_kb,
-                variance_ratio_x100,
-                tier,
-                effective_factor,
+            (
+                phase3_down_effective_kb(declared_kb, p95_kb, effective_factor),
+                Applied::Down,
             )
         } else {
-            declared_kb
+            (declared_kb, Applied::Raise) // sentinel; effective==declared → noop below
         };
 
         if effective_kb == declared_kb {
+            self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        // Count the APPLIED override (after the no-op check) so the counters reflect real
+        // applied moves, not candidates.
+        match applied {
+            Applied::Raise => &self.metrics.phase3_raise_applied,
+            Applied::Down => &self.metrics.phase3_down_applied,
+            Applied::Undeclared => &self.metrics.phase3_undeclared_injected,
+        }
+        .fetch_add(1, Ordering::Relaxed);
         // STORE-ONCE: clone the action and write the effective value into its memory_kb
         // Minimum. This single object is what the caller gates + reduces + stores.
         let mut effective = action_info.clone();
@@ -3403,6 +3458,30 @@ impl ApiWorkerSchedulerImpl {
             PlatformPropertyValue::Minimum(effective_kb as f64),
         );
         Some(effective)
+    }
+
+    /// (#2497 p95 policy) Starvation clamp shared by RAISE + undeclared-INJECT: if NO
+    /// worker can hold `reserve_kb`, clamp to the largest single worker's RAM so the
+    /// action stays schedulable instead of stranding above every worker forever. Workers
+    /// reporting `total_memory_kb=0` (unknown / legacy) contribute no ceiling (clamp
+    /// inert). O(workers), under the write lock already held.
+    fn phase3_starvation_clamp(&self, reserve_kb: u64, fine_key: &ProfileKey, kind: &str) -> u64 {
+        let max_total = self.max_worker_total_memory_kb();
+        if max_total > 0 && reserve_kb > max_total {
+            info!(
+                tag = "phase3_starvation_clamp",
+                kind,
+                target_id = %fine_key.target_id,
+                action_mnemonic = %fine_key.action_mnemonic,
+                reserve_kb,
+                clamped_kb = max_total,
+                "phase3: p95 reservation exceeds every worker's total RAM; clamped to the \
+                 max worker capacity so the action stays schedulable"
+            );
+            max_total
+        } else {
+            reserve_kb
+        }
     }
 
     /// Atomically finds a suitable worker AND reserves it for the given
@@ -5976,6 +6055,10 @@ impl ApiWorkerScheduler {
                 // call site changes. Factor default sourced from the SAME config
                 // default fn (single source of truth — no drift).
                 phase3_raise_enabled: false,
+                // (#2497) Undeclared→p95 injection defaults OFF at construction; the
+                // production wiring injects the configured (default-ON) value via
+                // `set_phase3_enforcement`.
+                phase3_reserve_undeclared_enabled: false,
                 phase3_down_overcommit_enabled: false,
                 phase3_overcommit_max_factor:
                     nativelink_config::schedulers::default_phase3_overcommit_max_factor(),
@@ -6139,12 +6222,14 @@ impl ApiWorkerScheduler {
         churn_throttle_enabled: bool,
         churn_throttle_low: u32,
         churn_throttle_high: u32,
+        reserve_undeclared_enabled: bool,
     ) {
         let mut inner = self.inner.try_write().expect(
             "set_phase3_enforcement must be called during one-shot wiring, before any \
              task holds the inner lock",
         );
         inner.phase3_raise_enabled = raise_enabled;
+        inner.phase3_reserve_undeclared_enabled = reserve_undeclared_enabled;
         inner.phase3_down_overcommit_enabled = down_overcommit_enabled;
         inner.phase3_overcommit_max_factor = overcommit_max_factor;
         inner.phase3_persist_max_age_secs = persist_max_age_secs;
@@ -10659,7 +10744,7 @@ impl ApiWorkerScheduler {
         self.resource_profile_map
             .lock()
             .peek(key)
-            .map(|agg| (agg.memory_p50(), agg.memory_p95()))
+            .map(|agg| (agg.memory_p50(), agg.memory_p95_kb()))
     }
 
     /// (#task-resource-profile Phase-2a) Test-only: net-dimension p95 of a
@@ -17419,19 +17504,19 @@ mod b1_lock_decouple_tests {
              both tiers is internal — must NOT double-count)"
         );
 
-        // The RIGHT sample landed under BOTH derived keys: 4096 KiB → bucket
-        // [4096,8192) → representative 6144.
+        // The RIGHT sample landed under BOTH derived keys: 4096 KiB → window p50/p95
+        // are the exact raw sample (4096), not a bucket representative.
         let key = ProfileKey::from_parts("main", "//foo:bar", "CppCompile").unwrap();
         assert_eq!(
             scheduler.resource_profile_peek_memory(&key),
-            Some((6144, 6144)),
+            Some((4096, 4096)),
             "the folded memory sample (4096 KiB) must be readable under the derived \
              fine (instance, target, mnemonic) key"
         );
         let coarse = ProfileKey::coarse("main", "CppCompile").unwrap();
         assert_eq!(
             scheduler.resource_profile_peek_memory(&coarse),
-            Some((6144, 6144)),
+            Some((4096, 4096)),
             "the same sample must ALSO be readable under the coarse (instance, mnemonic) \
              key — the fold folds into both tiers"
         );
@@ -17498,10 +17583,10 @@ mod b1_lock_decouple_tests {
     /// `net_bytes = net_input + net_output` collapse in `fold_resource_profile`
     /// must sum BOTH transfer legs into the single net dimension. Feeds
     /// net_input=1000, net_output=2000 through the real fold and reads the net
-    /// p95 back = 3000's bucket [2048,4096) → rep 3072.
+    /// p95 back = the exact sum 3000 (window quantile is the raw sample, not a bucket).
     ///
     /// MUTATION: drop `net_output_bytes` from the collapse (`:fold_resource_profile`)
-    /// → net = 1000 → bucket [512,1024) rep 768 → this test red-fails.
+    /// → net = 1000 → the p95 reads 1000 → this test red-fails.
     #[nativelink_test]
     async fn resource_profile_net_dimension_sums_both_legs() {
         use nativelink_proto::build::bazel::remote::execution::v2::RequestMetadata;
@@ -17545,9 +17630,9 @@ mod b1_lock_decouple_tests {
         let key = ProfileKey::from_parts("main", "//net:probe", "CppCompile").unwrap();
         assert_eq!(
             scheduler.resource_profile_peek_net_p95(&key),
-            Some(3072),
-            "net dimension must sum net_input (1000) + net_output (2000) = 3000 → \
-             bucket [2048,4096) rep 3072; dropping either leg changes the bucket"
+            Some(3000),
+            "net dimension must sum net_input (1000) + net_output (2000) = 3000 (the exact \
+             window p95); dropping either leg changes the value"
         );
     }
 
@@ -17962,8 +18047,8 @@ mod b1_lock_decouple_tests {
     /// trusted (≥K) profile's p50 sits BELOW the client-declared `memory_kb`, the
     /// dispatch folds `declared*100/p50` (×100) into the `down_opportunity_*`
     /// aggregate — the REAL DOWN headroom the cadre C4 said was missing. 20 samples
-    /// @2000 KiB → p50 = 1536 (bucket 11 rep); declared 15_360 → ratio 1000 (10.0×),
-    /// tier Fine. No raise fires (declared > tail 2048), so this is a pure DOWN case.
+    /// @2000 KiB → window p50 = 2000 (exact raw); declared 15_360 → ratio 768 (7.68×),
+    /// tier Fine. No raise fires (declared > p95 2000), so this is a pure DOWN case.
     ///
     /// MUTATION: comment out `down_opportunity_samples.fetch_add` in
     /// `observe_inject_counterfactual` → `down_opportunity_samples` stays 0 → the
@@ -17974,7 +18059,7 @@ mod b1_lock_decouple_tests {
         let scheduler = build_scheduler(wsm);
         let _rx_w = add_worker_with_memory(&scheduler, "W", 100_000.0).await;
 
-        // Pre-populate a trusted (≥K) profile whose p50 (1536) sits well BELOW the
+        // Pre-populate a trusted (≥K) profile whose p50 (2000) sits well BELOW the
         // declared 15_360 — a genuine DOWN-overcommit opportunity.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(2000));
@@ -17996,14 +18081,14 @@ mod b1_lock_decouple_tests {
         );
         assert_eq!(
             scheduler.metrics.down_opportunity_sum_x100.load(Ordering::Relaxed),
-            1000,
-            "down_opportunity = declared*100/p50 = 15360*100/1536 = 1000 (10.0×) must be \
+            768,
+            "down_opportunity = declared*100/p50 = 15360*100/2000 = 768 (7.68×) must be \
              summed — this is the REAL DOWN headroom (declared vs the p50 central estimate)"
         );
         assert_eq!(
             scheduler.metrics.down_opportunity_max_x100.load(Ordering::Relaxed),
-            1000,
-            "the single sample's ratio (1000) must set the max gauge"
+            768,
+            "the single sample's ratio (768) must set the max gauge"
         );
         assert_eq!(
             scheduler.metrics.down_opportunity_fine_samples.load(Ordering::Relaxed),
@@ -18015,21 +18100,21 @@ mod b1_lock_decouple_tests {
             0,
             "no coarse fallback occurred → the coarse subset must stay 0 (fine+coarse==samples)"
         );
-        // The RAISE-side would_raise must NOT fire: declared 15360 > tail 2048, so this
+        // The RAISE-side would_raise must NOT fire: declared 15360 > tail 2000, so this
         // is a pure DOWN opportunity, cleanly separated from the RAISE signal.
         assert_eq!(
             scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
             0,
-            "declared (15360) exceeds the tail (2048) → no raise; DOWN opportunity only"
+            "declared (15360) exceeds the tail (2000) → no raise; DOWN opportunity only"
         );
     }
 
     // ── (#task-resource-profile Phase-3 §5/§7) RAISE + store-once ledger ──
 
-    /// (§7 RAISE + §5 store-once) With RAISE enabled and a trusted (≥K) profile whose
-    /// tail (65_536) EXCEEDS the declared `memory_kb` (4096), the reservation reserves
-    /// the TAIL, and — the store-once contract — the worker's remaining `memory_kb` is
-    /// decremented by the EFFECTIVE (65_536), never the declared (4096). Worker RAM
+    /// (§7 RAISE + §5 store-once; #2497 p95 policy) With RAISE enabled and a trusted (≥K)
+    /// profile whose p95 (50_000) EXCEEDS the declared `memory_kb` (4096), the reservation
+    /// reserves the P95, and — the store-once contract — the worker's remaining `memory_kb`
+    /// is decremented by the EFFECTIVE (50_000), never the declared (4096). Worker RAM
     /// (100_000 total + remaining) is large enough that no clamp fires.
     ///
     /// MUTATION: in `find_and_reserve_worker`, pass the ORIGINAL `action_info` (not
@@ -18040,10 +18125,10 @@ mod b1_lock_decouple_tests {
     async fn raise_reserves_the_tail_via_store_once_ledger() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000); // RAISE on
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000, false); // RAISE on
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
 
-        // Trusted (≥K) profile: 50_000 KiB → bucket 16 → tail 2^16 = 65_536 ≫ declared 4096.
+        // Trusted (≥K) profile: 20 @ 50_000 KiB → window p95 = 50_000 ≫ declared 4096.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
         }
@@ -18058,29 +18143,29 @@ mod b1_lock_decouple_tests {
 
         assert_eq!(
             scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
-            Some(100_000.0 - 65_536.0),
-            "RAISE must reserve the EFFECTIVE tail (65_536) via the store-once ledger — the \
-             worker's remaining memory_kb must be 100_000−65_536=34_464, NOT 100_000−4096 \
+            Some(100_000.0 - 50_000.0),
+            "RAISE must reserve the EFFECTIVE p95 (50_000) via the store-once ledger — the \
+             worker's remaining memory_kb must be 100_000−50_000=50_000, NOT 100_000−4096 \
              (which would mean the gate saw the raise but reduce/store saw the declared)"
         );
     }
 
-    /// (§5 store-once SYMMETRY, the 2026-05-08 trap) reduce and restore must be
-    /// symmetric EVEN when the profile map mutates MID-ACTION. Reserve with RAISE
-    /// (tail 65_536), then fold NEW higher samples (tail jumps to 2^23) — a recompute
-    /// at restore would add back the NEW tail — then complete the action: the worker's
-    /// remaining memory_kb must return to the EXACT baseline (100_000), because restore
-    /// reads the STORED effective (65_536), never a recomputed value.
+    /// (§5 store-once SYMMETRY, the 2026-05-08 trap; #2497 p95 policy) reduce and restore
+    /// must be symmetric EVEN when the profile map mutates MID-ACTION. Reserve with RAISE
+    /// (p95 50_000), then fold NEW higher samples (window p95/max jumps to 5_000_000) — a
+    /// recompute at restore would add back the NEW value — then complete the action: the
+    /// worker's remaining memory_kb must return to the EXACT baseline (100_000), because
+    /// restore reads the STORED effective (50_000), never a recomputed value.
     ///
     /// MUTATION: in `find_and_reserve_worker`, pass the ORIGINAL `action_info` to
-    /// `inner_find_and_reserve_worker` → the post-reserve remaining assert (34_464)
+    /// `inner_find_and_reserve_worker` → the post-reserve remaining assert (50_000)
     /// red-fails (store-once write bypassed). [The post-complete baseline holds by
     /// construction: restore reads the stored clone, so no map mutation can drift it.]
     #[nativelink_test]
     async fn raise_reduce_restore_symmetric_under_midaction_map_mutation() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000);
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000, false);
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 100_000.0, 200_000).await;
 
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
@@ -18096,19 +18181,19 @@ mod b1_lock_decouple_tests {
         assert_eq!(reserved, WorkerId("W".to_string()));
         assert_eq!(
             scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
-            Some(34_464.0),
-            "after reserve the remaining must be 100_000−65_536 (the STORED effective)"
+            Some(50_000.0),
+            "after reserve the remaining must be 100_000−50_000 (the STORED effective p95)"
         );
 
-        // MID-ACTION map mutation: fold higher samples so the key's tail jumps to 2^23
-        // (5_000_000 → bucket 23). A restore that RECOMPUTED would add back 8_388_608.
+        // MID-ACTION map mutation: fold 20 higher samples so the window fully turns over to
+        // 5_000_000 (max/p95 = 5_000_000). A restore that RECOMPUTED would add that back.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(5_000_000));
         }
         assert_eq!(
             scheduler.resource_profile_peek_tail(&observe_key()).map(|(t, _)| t),
-            Some(1 << 23),
-            "the mid-action fold must have raised the key's tail (to 2^23) so a \
+            Some(5_000_000),
+            "the mid-action fold must have raised the key's window max (to 5_000_000) so a \
              recompute-at-restore would drift the ledger — the setup for the trap"
         );
 
@@ -18132,26 +18217,26 @@ mod b1_lock_decouple_tests {
         );
     }
 
-    /// (§7 RAISE starvation clamp, C5) When the raised value exceeds EVERY worker's
-    /// total RAM, RAISE clamps to the max worker capacity so the action stays
-    /// schedulable rather than stranding forever. Worker total = remaining = 8_000_000;
-    /// profile tail (2^24 = 16_777_216) > total; declared 4_000_000. The clamp brings
+    /// (§7 RAISE starvation clamp, C5; #2497 p95 policy) When the raised value exceeds
+    /// EVERY worker's total RAM, RAISE clamps to the max worker capacity so the action
+    /// stays schedulable rather than stranding forever. Worker total = remaining =
+    /// 8_000_000; profile p95 (10_000_000) > total; declared 4_000_000. The clamp brings
     /// effective down to 8_000_000, which the worker CAN satisfy → the op reserves.
     ///
-    /// MUTATION: delete the `max_total > 0 && raised > max_total` clamp branch (return
-    /// `raised` unconditionally) → effective 16_777_216 > 8_000_000 remaining →
-    /// `is_satisfied_by` fails → NO worker → the reserve returns None → the "must not
-    /// strand" expect red-fails with its bespoke message.
+    /// MUTATION: delete the `max_total > 0 && reserve_kb > max_total` clamp branch in
+    /// `phase3_starvation_clamp` (return `reserve_kb` unconditionally) → effective
+    /// 10_000_000 > 8_000_000 remaining → `is_satisfied_by` fails → NO worker → the reserve
+    /// returns None → the "must not strand" expect red-fails with its bespoke message.
     #[nativelink_test]
     async fn raise_clamps_to_max_worker_total_not_strand() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000);
+        scheduler.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000, false);
         // Worker total RAM 8_000_000; advertises 8_000_000 remaining.
         let _rx_w =
             add_worker_with_memory_and_total(&scheduler, "W", 8_000_000.0, 8_000_000).await;
 
-        // Trusted profile: 10_000_000 KiB → bucket 24 → tail 2^24 = 16_777_216 > total.
+        // Trusted profile: 20 @ 10_000_000 KiB → window p95 = 10_000_000 > total.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(10_000_000));
         }
@@ -18167,9 +18252,9 @@ mod b1_lock_decouple_tests {
             )
             .await;
         let (reserved, _tx, _msg) = reserve.expect(
-            "RAISE must CLAMP the raised reservation (2^24) down to the max worker total \
-             (8_000_000) so the action stays schedulable — it must NOT strand above every \
-             worker's RAM",
+            "RAISE must CLAMP the raised reservation (p95 10_000_000) down to the max worker \
+             total (8_000_000) so the action stays schedulable — it must NOT strand above \
+             every worker's RAM",
         );
         assert_eq!(reserved, WorkerId("W".to_string()));
         assert_eq!(
@@ -18181,57 +18266,42 @@ mod b1_lock_decouple_tests {
 
     // ── (#task-resource-profile Phase-3 §3) DOWN-overcommit ──
 
-    /// (§3/§8 pure) The DOWN reserve function: continuous margin in variance, tier
-    /// penalty, and the profile-independent floor clamp.
+    /// (§3; #2497 p95 policy) The DOWN reserve function: reserve the p95, clamped into
+    /// `[declared/max_factor, declared]` (the profile-independent floor).
+    ///
+    /// MUTATION: change the clamp low bound from `floor` to `0` → the tiny-p95 floor case
+    /// red-fails (reserve collapses to the raw p95 instead of the floor).
     #[test]
-    fn phase3_down_effective_kb_margin_tier_and_floor() {
-        use crate::resource_profile::ProfileTier;
-
-        // Tight (variance 100 → margin 0): reserve p50, above the floor.
-        // declared 100_000, p50 50_000, factor 4 → floor 25_000 → reserve 50_000.
+    fn phase3_down_effective_kb_p95_and_floor() {
+        // Reserve the p95 when it is above the floor. declared 100_000, p95 50_000,
+        // factor 4 → floor 25_000 → reserve 50_000.
         assert_eq!(
-            phase3_down_effective_kb(100_000, 50_000, 100, ProfileTier::Fine, 4.0),
+            phase3_down_effective_kb(100_000, 50_000, 4.0),
             50_000,
-            "a tight (variance=100) key reserves its p50 (50_000), well above the \
-             floor (declared/4 = 25_000)"
+            "the DOWN reserve is the p95 (50_000) when it sits above the floor (declared/4 = 25_000)"
         );
 
-        // FLOOR RESPECTED: a tiny p50 (384) must NOT drive the reserve below the
+        // FLOOR RESPECTED: a tiny p95 (384) must NOT drive the reserve below the
         // profile-independent floor. factor 2 → floor 50_000 → clamp up to 50_000.
         assert_eq!(
-            phase3_down_effective_kb(100_000, 384, 100, ProfileTier::Fine, 2.0),
+            phase3_down_effective_kb(100_000, 384, 2.0),
             50_000,
             "the floor declared/max_factor (100_000/2 = 50_000) must bound a wrong-low \
-             reserve: p50 384 is clamped UP to 50_000, so a single bad prediction \
+             reserve: p95 384 is clamped UP to 50_000, so a single bad prediction \
              under-reserves by at most the factor"
         );
 
-        // High variance widens the margin (continuous, not a gate). variance 300 →
-        // base_margin 2.0 → reserve p50×3. p50 10_000, factor 10 (floor 10_000) → 30_000.
+        // A higher factor lets the p95 pack lower. declared 100_000, p95 10_000, factor 10
+        // → floor 10_000 → reserve 10_000 (p95 == floor here).
         assert_eq!(
-            phase3_down_effective_kb(100_000, 10_000, 300, ProfileTier::Fine, 10.0),
-            30_000,
-            "a 3× (variance=300) key reserves p50×(1+2.0)=30_000 — the margin scales \
-             CONTINUOUSLY with the measured spread, tracking a high percentile"
-        );
-
-        // COARSE penalty: same spread reserves MORE than FINE (safer for the blend).
-        // variance 200 → base_margin 1.0; Fine → p50×2, Coarse → p50×3.
-        assert_eq!(
-            phase3_down_effective_kb(100_000, 10_000, 200, ProfileTier::Fine, 10.0),
-            20_000,
-            "FINE 2× key: p50×(1+1.0)=20_000"
-        );
-        assert_eq!(
-            phase3_down_effective_kb(100_000, 10_000, 200, ProfileTier::Coarse, 10.0),
-            30_000,
-            "COARSE 2× key: the coarse penalty (2.0) widens the margin → p50×(1+2.0)=30_000 \
-             — a blended (higher-variance) tier reserves closer to declared"
+            phase3_down_effective_kb(100_000, 10_000, 10.0),
+            10_000,
+            "with factor 10 the floor is declared/10 = 10_000; a p95 of 10_000 packs to 10_000"
         );
 
         // INERT at factor 1.0: floor == declared → clamp pins effective at declared.
         assert_eq!(
-            phase3_down_effective_kb(100_000, 384, 100, ProfileTier::Fine, 1.0),
+            phase3_down_effective_kb(100_000, 384, 1.0),
             100_000,
             "factor 1.0 (the default kill-dial) makes the floor == declared → DOWN is \
              INERT (reserves the declared value, no overcommit)"
@@ -18249,8 +18319,6 @@ mod b1_lock_decouple_tests {
     /// with its bespoke message (factor stays 2.0 → overcommit not backed off).
     #[test]
     fn churn_throttle_backs_off_overcommit_at_high_churn() {
-        use crate::resource_profile::ProfileTier;
-
         let (low, high) = (2_000u32, 20_000u32);
         // Below the band → FULL factor.
         assert!(
@@ -18284,7 +18352,7 @@ mod b1_lock_decouple_tests {
         // End effect through the reservation: at HIGH churn the effective factor is
         // 1.0 → the DOWN floor == declared → NO overcommit (reserve == declared).
         assert_eq!(
-            phase3_down_effective_kb(100_000, 384, 100, ProfileTier::Fine, hi_factor),
+            phase3_down_effective_kb(100_000, 384, hi_factor),
             100_000,
             "with the factor throttled to 1.0 by high churn, the DOWN reserve equals \
              declared (100_000) — overcommit is fully backed off on a thrashing fleet"
@@ -18294,8 +18362,6 @@ mod b1_lock_decouple_tests {
             phase3_down_effective_kb(
                 100_000,
                 384,
-                100,
-                ProfileTier::Fine,
                 phase3_churn_throttled_factor(2.0, 0, low, high, true),
             ),
             50_000,
@@ -18347,11 +18413,11 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_floor_respected_at_max_factor() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 2.0, 604_800, false, 2000, 20000); // DOWN on, factor 2.0
+        scheduler.set_phase3_enforcement(false, true, 2.0, 604_800, false, 2000, 20000, false); // DOWN on, factor 2.0
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
-        // Over-declared key: 500 KiB samples → bucket 9 → p50 rep 384, tail 512 <=
-        // declared 100_000 (so the DOWN branch fires), tight variance → margin 0.
+        // Over-declared key: 20 samples @ 500 KiB → window p95 = 500 <= declared 100_000
+        // (so the DOWN branch fires), tight window.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(500));
         }
@@ -18368,14 +18434,14 @@ mod b1_lock_decouple_tests {
             scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
             Some(200_000.0 - 50_000.0),
             "DOWN must FLOOR the reserve at declared/max_factor (100_000/2 = 50_000), NOT \
-             collapse to the tiny p50 (384) — the worker's remaining must be 200_000−50_000 \
+             collapse to the tiny p95 (500) — the worker's remaining must be 200_000−50_000 \
              = 150_000, the single-wrong-low bound the overcommit factor guarantees"
         );
     }
 
-    /// (§3) DOWN packs: a low-variance over-declared key reserves its p50-based central
-    /// estimate BELOW declared, freeing capacity. p50 49_152 (50_000 samples), declared
-    /// 100_000, factor 4 (floor 25_000), tight → reserve 49_152 < declared 100_000.
+    /// (§3; #2497) DOWN packs: a low-variance over-declared key reserves its p95 BELOW
+    /// declared, freeing capacity. p95 50_000 (20 @ 50_000 samples), declared 100_000,
+    /// factor 4 (floor 25_000) → reserve 50_000 < declared 100_000.
     ///
     /// MUTATION: in the effective-compute, replace the DOWN branch result with
     /// `declared_kb` → remaining reads 100_000 (no packing) → this red-fails.
@@ -18383,10 +18449,10 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_lowers_reservation_below_declared() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000);
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000, false);
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
-        // 50_000 KiB → bucket 16 rep 49_152 (p50), tail 65_536 <= declared 100_000.
+        // 20 samples @ 50_000 KiB → window p95 = 50_000 <= declared 100_000.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
         }
@@ -18400,9 +18466,9 @@ mod b1_lock_decouple_tests {
         assert_eq!(reserved, WorkerId("W".to_string()));
         assert_eq!(
             scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
-            Some(200_000.0 - 49_152.0),
-            "DOWN must reserve the p50 central estimate (49_152) BELOW declared (100_000) → \
-             remaining 200_000−49_152=150_848 — this is where the packing comes from"
+            Some(200_000.0 - 50_000.0),
+            "DOWN must reserve the p95 (50_000) BELOW declared (100_000) → remaining \
+             200_000−50_000=150_000 — this is where the packing comes from"
         );
     }
 
@@ -18413,7 +18479,7 @@ mod b1_lock_decouple_tests {
     async fn down_overcommit_inert_at_factor_one() {
         let wsm = BarrierWorkerStateManager::new();
         let scheduler = build_scheduler(wsm);
-        scheduler.set_phase3_enforcement(false, true, 1.0, 604_800, false, 2000, 20000); // enabled but factor 1.0
+        scheduler.set_phase3_enforcement(false, true, 1.0, 604_800, false, 2000, 20000, false); // enabled but factor 1.0
         let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 200_000).await;
 
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
@@ -18432,6 +18498,180 @@ mod b1_lock_decouple_tests {
             Some(200_000.0 - 100_000.0),
             "factor 1.0 → floor == declared → DOWN reserves the DECLARED 100_000 (byte-\
              identical), so remaining is 200_000−100_000=100_000"
+        );
+    }
+
+    // ── (#2497 sched Phase-3 p95 policy) undeclared→p95 injection + enforce counters ──
+
+    /// (#2497 change 3) An action declaring NO `memory_kb` (baggage present, trusted
+    /// profile) with the inject flag ON gets a `memory_kb` Minimum = the profiled p95
+    /// INJECTED — so the store-once ledger reserves the p95 against a worker that
+    /// advertises `memory_kb`. The `phase3_undeclared_injected` counter fires; the RAISE
+    /// and DOWN applied counters stay 0 (this is the inject path, not a move).
+    ///
+    /// MUTATION: force `is_undeclared = false` (skip the undeclared branch) in
+    /// `phase3_compute_effective_action_info` → no injection → remaining stays 200_000 (no
+    /// reservation) and `phase3_undeclared_injected` stays 0 → this red-fails.
+    #[nativelink_test]
+    async fn undeclared_injection_reserves_p95_and_counts() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+        // Inject flag ON (last arg); RAISE + DOWN OFF — proves injection is independent.
+        scheduler.set_phase3_enforcement(false, false, 1.0, 604_800, false, 2000, 20000, true);
+        let _rx_w = add_worker_with_memory_and_total(&scheduler, "W", 200_000.0, 500_000).await;
+
+        // Trusted (≥K) profile for //foo:bar/CppCompile → window p95 = 50_000.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        // An UNDECLARED action (no memory_kb Minimum) carrying the matching baggage.
+        let op = OperationId::default();
+        let action = action_baggage(0xe1, "//foo:bar", "CppCompile");
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named("W"), &op, &action, false)
+            .await
+            .expect("the undeclared action must reserve worker W with the injected p95");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(200_000.0 - 50_000.0),
+            "an undeclared action must reserve the INJECTED p95 (50_000) → worker remaining \
+             200_000−50_000=150_000 (the injection changed the reservation)"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_undeclared_injected.load(Ordering::Relaxed),
+            1,
+            "the undeclared→p95 injection must increment phase3_undeclared_injected exactly once"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_raise_applied.load(Ordering::Relaxed),
+            0,
+            "an injection is NOT a RAISE — phase3_raise_applied must stay 0"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_down_applied.load(Ordering::Relaxed),
+            0,
+            "an injection is NOT a DOWN — phase3_down_applied must stay 0"
+        );
+    }
+
+    /// (#2497 change 3) The undeclared injection is a NO-OP (no reservation change, no
+    /// injected counter, `phase3_noop_ineligible` bumps) when the flag is OFF, and when the
+    /// flag is ON but NO trusted profile exists.
+    #[nativelink_test]
+    async fn undeclared_injection_noop_when_flag_off_or_no_profile() {
+        // ── flag OFF (all enforcement off → fast-path noop) ──
+        let sched_off = build_scheduler(BarrierWorkerStateManager::new());
+        sched_off.set_phase3_enforcement(false, false, 1.0, 604_800, false, 2000, 20000, false);
+        let _rx_off = add_worker_with_memory_and_total(&sched_off, "W", 200_000.0, 500_000).await;
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_off.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        let op_off = OperationId::default();
+        let action_off = action_baggage(0xe2, "//foo:bar", "CppCompile");
+        let (reserved_off, _t, _m) = sched_off
+            .find_and_reserve_worker(&props_named("W"), &op_off, &action_off, false)
+            .await
+            .expect("op must reserve W even with injection off");
+        assert_eq!(reserved_off, WorkerId("W".to_string()));
+        assert_eq!(
+            sched_off.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(200_000.0),
+            "injection OFF → no memory_kb reserved for the undeclared action (remaining unchanged)"
+        );
+        assert_eq!(
+            sched_off.metrics.phase3_undeclared_injected.load(Ordering::Relaxed),
+            0,
+            "injection OFF → phase3_undeclared_injected must stay 0"
+        );
+        assert!(
+            sched_off.metrics.phase3_noop_ineligible.load(Ordering::Relaxed) >= 1,
+            "an all-flags-off admission must count phase3_noop_ineligible"
+        );
+
+        // ── flag ON but NO profile (trusted-profile gate refuses injection) ──
+        let sched_np = build_scheduler(BarrierWorkerStateManager::new());
+        sched_np.set_phase3_enforcement(false, false, 1.0, 604_800, false, 2000, 20000, true);
+        let _rx_np = add_worker_with_memory_and_total(&sched_np, "W", 200_000.0, 500_000).await;
+        let op_np = OperationId::default();
+        let action_np = action_baggage(0xe3, "//foo:bar", "CppCompile");
+        let (reserved_np, _t2, _m2) = sched_np
+            .find_and_reserve_worker(&props_named("W"), &op_np, &action_np, false)
+            .await
+            .expect("op must reserve W even with no profile to inject");
+        assert_eq!(reserved_np, WorkerId("W".to_string()));
+        assert_eq!(
+            sched_np.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(200_000.0),
+            "no trusted profile → no injection (remaining unchanged) even with the flag ON"
+        );
+        assert_eq!(
+            sched_np.metrics.phase3_undeclared_injected.load(Ordering::Relaxed),
+            0,
+            "no trusted profile → phase3_undeclared_injected must stay 0"
+        );
+        assert!(
+            sched_np.metrics.phase3_noop_ineligible.load(Ordering::Relaxed) >= 1,
+            "a no-trusted-profile admission must count phase3_noop_ineligible"
+        );
+    }
+
+    /// (#2497 change 5) The enforce path increments a registered APPLIED counter on each
+    /// real override: `phase3_raise_applied` on an applied RAISE, `phase3_down_applied` on
+    /// an applied DOWN. This makes the applied overcommit/raise rate scrapeable.
+    ///
+    /// MUTATION: delete the `Applied::Raise => &self.metrics.phase3_raise_applied` counter
+    /// bump → the RAISE assert red-fails (counter stays 0 despite the reservation moving).
+    #[nativelink_test]
+    async fn phase3_applied_counters_track_raise_and_down() {
+        // ── RAISE applied: declared 4096 < p95 50_000 → raise, raise_applied == 1 ──
+        let sched_r = build_scheduler(BarrierWorkerStateManager::new());
+        sched_r.set_phase3_enforcement(true, false, 1.0, 604_800, false, 2000, 20000, false);
+        let _rx_r = add_worker_with_memory_and_total(&sched_r, "W", 200_000.0, 500_000).await;
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_r.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        let op_r = OperationId::default();
+        let action_r = action_with_memory_and_baggage("W", 0xe4, 4096.0);
+        sched_r
+            .find_and_reserve_worker(&props_named_with_memory("W", 4096.0), &op_r, &action_r, false)
+            .await
+            .expect("RAISE op must reserve W");
+        assert_eq!(
+            sched_r.metrics.phase3_raise_applied.load(Ordering::Relaxed),
+            1,
+            "an applied RAISE (p95 50_000 > declared 4096) must increment phase3_raise_applied"
+        );
+        assert_eq!(
+            sched_r.metrics.phase3_down_applied.load(Ordering::Relaxed),
+            0,
+            "a RAISE must NOT increment phase3_down_applied"
+        );
+
+        // ── DOWN applied: declared 100_000 >= p95 50_000, factor 4 → down, down_applied == 1 ──
+        let sched_d = build_scheduler(BarrierWorkerStateManager::new());
+        sched_d.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000, false);
+        let _rx_d = add_worker_with_memory_and_total(&sched_d, "W", 200_000.0, 500_000).await;
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            sched_d.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+        let op_d = OperationId::default();
+        let action_d = action_with_memory_and_baggage("W", 0xe5, 100_000.0);
+        sched_d
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op_d, &action_d, false)
+            .await
+            .expect("DOWN op must reserve W");
+        assert_eq!(
+            sched_d.metrics.phase3_down_applied.load(Ordering::Relaxed),
+            1,
+            "an applied DOWN (p95 50_000 <= declared 100_000, factor 4) must increment \
+             phase3_down_applied"
+        );
+        assert_eq!(
+            sched_d.metrics.phase3_raise_applied.load(Ordering::Relaxed),
+            0,
+            "a DOWN must NOT increment phase3_raise_applied"
         );
     }
 
@@ -18637,7 +18877,7 @@ mod b1_lock_decouple_tests {
     /// when the fallback resolved to coarse, so the completion-path accuracy classification
     /// (and the eventual Phase-3 down-override, which must distrust a coarse tail) can see
     /// it. Reserve when only the coarse key is ≥K → the stash must be
-    /// `Some((Coarse, 65536, 20))`.
+    /// `Some((Coarse, 50000, 20))` (the window max of the 50_000 samples).
     ///
     /// MUTATION: change the stash `TieredTail::Trusted { tier, ... }` arm to hardcode
     /// `ProfileTier::Fine` → the stashed tier reads Fine → this red-fails.
@@ -18666,7 +18906,7 @@ mod b1_lock_decouple_tests {
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
                 .await,
-            Some(Some((ProfileTier::Coarse, 65_536, 20))),
+            Some(Some((ProfileTier::Coarse, 50_000, 20))),
             "the dispatch stash must mark the COARSE tier when the fallback resolved to coarse \
              — so completion (and Phase-3) can treat the coarse tail conservatively"
         );
@@ -18899,14 +19139,14 @@ mod b1_lock_decouple_tests {
             .expect("op must reserve worker W");
         assert_eq!(reserved, WorkerId("W".to_string()));
 
-        // The stash carries the present-but-`< K` tuple (tail 65_536, 5 samples).
+        // The stash carries the present-but-`< K` tuple (tail=window max 50_000, 5 samples).
         assert_eq!(
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
                 .await,
-            Some(Some((ProfileTier::Fine, 65_536, LOW))),
+            Some(Some((ProfileTier::Fine, 50_000, LOW))),
             "the production stash arm must stash the present-but-<K LowSample tuple \
-             (tier Fine, tail 65536, 5 samples), not drop it"
+             (tier Fine, tail 50000, 5 samples), not drop it"
         );
 
         // Completion: the K-recheck reclassifies the < K stash to SkippedLowSample.
@@ -18934,7 +19174,7 @@ mod b1_lock_decouple_tests {
         assert_eq!(
             covered + under,
             0,
-            "the < K tail must NOT be scored as a cover/under (tail 65536 vs actual 200000 \
+            "the < K tail must NOT be scored as a cover/under (tail 50000 vs actual 200000 \
              WOULD read Under, suppressed by the K-gate), got covered={covered} under={under}"
         );
     }
@@ -19237,7 +19477,7 @@ mod b1_lock_decouple_tests {
         let real_p = scheduler.resource_profile_peek_memory(&observe_key());
         let ref_agg_p = reference
             .peek(&observe_key())
-            .map(|agg| (agg.memory_p50(), agg.memory_p95()));
+            .map(|agg| (agg.memory_p50(), agg.memory_p95_kb()));
         assert_eq!(
             real_p, ref_agg_p,
             "OBSERVE-ONLY VIOLATED: the leave-one-out accuracy check changed the folded \
@@ -19293,14 +19533,14 @@ mod b1_lock_decouple_tests {
             .expect("op must reserve worker W");
         assert_eq!(reserved, WorkerId("W".to_string()));
 
-        // The dispatch-time prediction (tail 65_536, 20 samples) was stashed on the
+        // The dispatch-time prediction (window max 50_000, 20 samples) was stashed on the
         // running action.
         assert_eq!(
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W".to_string()), &op)
                 .await,
-            Some(Some((ProfileTier::Fine, 65_536, 20))),
-            "the dispatch-time tail (65536, 20 samples) must be stashed on the reserved \
+            Some(Some((ProfileTier::Fine, 50_000, 20))),
+            "the dispatch-time tail (50000, 20 samples) must be stashed on the reserved \
              running action for the out-of-sample check"
         );
         // The stash changed NO reservation: worker W (500_000) reserved the DECLARED
@@ -19312,8 +19552,8 @@ mod b1_lock_decouple_tests {
              (remaining reflects declared 4096, not the tail)"
         );
 
-        // MORE same-key actions complete, raising the COMPLETION-time map tail to
-        // 262_144 (200_000 KiB → bucket 18 → tail 2^18) — far above the action's peak.
+        // MORE same-key actions complete, turning the window over to 200_000 (the
+        // COMPLETION-time map max) — far above the action's peak.
         for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
             scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(200_000));
         }
@@ -19321,8 +19561,8 @@ mod b1_lock_decouple_tests {
             scheduler
                 .resource_profile_peek_tail(&observe_key())
                 .map(|(t, _)| t),
-            Some(262_144),
-            "the completion-time map tail must now be 262144 (> the action's 131072 peak) \
+            Some(200_000),
+            "the completion-time map max must now be 200000 (> the action's 131072 peak) \
              — a hindsight recompute would read COVERED"
         );
 
@@ -19341,8 +19581,8 @@ mod b1_lock_decouple_tests {
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         assert_eq!(
             under, 1,
-            "classified against the DISPATCH tail (65536 < 131072) → UNDER. A completion-time \
-             hindsight recompute (262144 >= 131072) would wrongly read COVERED. got under={under}"
+            "classified against the DISPATCH tail (50000 < 131072) → UNDER. A completion-time \
+             hindsight recompute (200000 >= 131072) would wrongly read COVERED. got under={under}"
         );
         assert_eq!(
             covered, 0,
@@ -19388,7 +19628,7 @@ mod b1_lock_decouple_tests {
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W1".to_string()), &op_cancel)
                 .await,
-            Some(Some((ProfileTier::Fine, 65_536, 20))),
+            Some(Some((ProfileTier::Fine, 50_000, 20))),
             "reserve must stash the dispatch prediction on W1's running action"
         );
         scheduler
@@ -19415,7 +19655,7 @@ mod b1_lock_decouple_tests {
             scheduler
                 .running_action_dispatch_prediction(&WorkerId("W2".to_string()), &op_evict)
                 .await,
-            Some(Some((ProfileTier::Fine, 65_536, 20))),
+            Some(Some((ProfileTier::Fine, 50_000, 20))),
             "reserve must stash the dispatch prediction on W2's running action"
         );
         // remove_worker → immediate_evict_worker drains the op and re-queues it through

@@ -25,10 +25,13 @@
 //!
 //! # Design constraints (from the v3 design + cadre findings)
 //!
-//! * The per-dimension estimator MUST be a COMPACT FIXED-SIZE SKETCH, never a
-//!   growing sample buffer (assumption-auditor N-3): a growing buffer breaks
-//!   both the per-entry byte-cost bound and the LRU cap sizing. We use a
-//!   log2-bucketed histogram ([`LogHistogram`]).
+//! * (#2497 sched Phase-3 p95 policy) The per-dimension estimator is a BOUNDED
+//!   SLIDING WINDOW of the last [`WINDOW_SIZE`] (20) raw samples ([`SampleWindow`]),
+//!   FIFO-evicting the oldest on overflow. It is fixed-capacity (never grows past
+//!   20 u64 per dimension), so the per-entry byte-cost bound and the LRU cap sizing
+//!   still hold. The reservation statistic is now the window **p95** (operator
+//!   policy directive) — the earlier monotone log2-bucket max is superseded; the
+//!   window recomputes p50/p95/max from the ≤20 retained samples on demand.
 //! * The map MUST be bounded (CLAUDE.md unbounded-buffer rule): an
 //!   [`LruCache`] with a documented cap; over-cap evicts the LRU key and the
 //!   eviction is counted so working-set overflow is visible, not silent.
@@ -36,18 +39,18 @@
 //!   never leaks into another's.
 
 use core::num::NonZeroUsize;
+use std::collections::VecDeque;
 
 use lru::LruCache;
 use wincode::{SchemaRead, SchemaWrite};
 
-/// Number of log2 buckets per dimension in the compact histogram sketch.
-///
-/// Bucket `i` (for `1 <= i <= 62`) holds values in `[2^(i-1), 2^i)`; bucket `0`
-/// holds the value `0`. The TOP bucket `63` is saturating: [`bucket_index`]
-/// clamps any value `>= 2^62` into it, so bucket `63` covers `[2^62, 2^64)`
-/// (a merged top octave — the only imprecision, at magnitudes far above any
-/// real resource value). `64 * size_of::<u32>() = 256` bytes per dimension.
-const HIST_BUCKETS: usize = 64;
+/// (#2497 sched Phase-3 p95 policy) Number of raw samples retained per dimension
+/// in the sliding window. The window keeps the LAST `WINDOW_SIZE` completions
+/// (FIFO); p50/p95/max are recomputed from the retained samples. `20 *
+/// size_of::<u64>() = 160` bytes of samples per dimension. Chosen equal to
+/// [`PROFILE_MIN_SAMPLES`] so a K-mature key's window is exactly full — the p95
+/// estimate then spans the same sample budget the trust gate requires.
+const WINDOW_SIZE: usize = 20;
 
 /// (#task-resource-profile Phase-2a, S4 hardening) Maximum characters kept from
 /// each [`ProfileKey`] string component. The LRU cap bounds the key COUNT, not
@@ -57,8 +60,8 @@ const HIST_BUCKETS: usize = 64;
 /// truncation only collides pathological/oversized keys (bounded, self-limiting).
 const PROFILE_KEY_MAX_STR_LEN: usize = 256;
 
-/// (#task-resource-profile Phase-2a) Maximum distinct keys in the bounded
-/// [`ProfileMap`] LRU.
+/// (#task-resource-profile Phase-2a; #2497 cap bump) Maximum distinct keys in the
+/// bounded [`ProfileMap`] LRU.
 ///
 /// The coarse key is `(instance_name, target_id, action_mnemonic)`. A large
 /// Bazel repo has tens of thousands of distinct targets, but the LRU bounds
@@ -68,10 +71,13 @@ const PROFILE_KEY_MAX_STR_LEN: usize = 256;
 /// window for the churned keys).
 ///
 /// Per-entry cost ≈ key (3 `String`s, ~72 B inline + ~100 B heap for a
-/// ~100-char Bazel label) + [`Agg`] (4 × 256 B histograms + 8 B count = 1032 B)
-/// + LRU node overhead (~48 B) ≈ **~1.25 KiB/entry**. `16384 × 1.25 KiB ≈
-/// 20 MiB` — bounded and modest for the scheduler process.
-pub const PROFILE_MAP_MAX_KEYS: usize = 16384;
+/// ~100-char Bazel label) + [`Agg`] (4 × [`WINDOW_SIZE`]-slot sliding windows =
+/// 4 × 20 × 8 B = 640 B of sample bytes + 4 `VecDeque` headers ~128 B + 8 B
+/// count ≈ 776 B) + LRU node overhead (~48 B) ≈ **~1 KiB/entry**. `32768 ×
+/// 1 KiB ≈ 32 MiB` — bounded and modest for the scheduler process. (The 20-sample
+/// window is SMALLER per-dimension than the old 256-byte histogram, so doubling the
+/// key cap keeps the footprint in the same ~tens-of-MiB envelope.)
+pub const PROFILE_MAP_MAX_KEYS: usize = 32768;
 
 /// (#task-resource-profile Phase-2a) Minimum samples before a key's variance is
 /// trusted (and, in a later phase, before the key is eligible for measured
@@ -86,134 +92,73 @@ pub const PROFILE_MIN_SAMPLES: u64 = 20;
 /// surface (a finer per-output key would be needed there).
 pub const PROFILE_HIGH_VARIANCE_RATIO_X100: u64 = 200;
 
-/// Map a value to its log2 histogram bucket index (saturating at the top
-/// bucket).
-#[inline]
-const fn bucket_index(v: u64) -> usize {
-    if v == 0 {
-        0
-    } else {
-        // bit-length of v == floor(log2(v)) + 1; clamp the top power-of-two
-        // range into the last bucket so no index exceeds HIST_BUCKETS - 1.
-        let idx = (u64::BITS - v.leading_zeros()) as usize;
-        if idx >= HIST_BUCKETS {
-            HIST_BUCKETS - 1
-        } else {
-            idx
+/// (#2497 sched Phase-3 p95 policy) A bounded sliding window of the last
+/// [`WINDOW_SIZE`] raw samples for ONE dimension — a fixed-CAPACITY FIFO ring.
+/// `record` pushes; on overflow the OLDEST sample is evicted, so the window
+/// always reflects the most-recent ≤20 completions. p50/p95/max are recomputed
+/// on demand from the retained samples (a ≤20-element sort — trivial cost).
+///
+/// This SUPERSEDES the earlier monotone log2-bucket histogram: the reservation
+/// statistic is now the window p95 (operator policy directive 2026-07-18). The
+/// monotone-max conservatism (which never forgot a one-off spike) is dropped;
+/// the sole OOM backstop for a p95 under-estimate is the worker-side
+/// `memory_gate` free-floor NAK (re-queue on real pressure).
+// CAPPED AT WINDOW_SIZE (20): FIFO ring, oldest evicted on overflow — the window
+// never holds more than 20 u64 per dimension, so the per-entry byte-cost bound
+// and the LRU cap sizing hold (no per-sample growth beyond the fixed 20 slots).
+#[derive(Clone, Debug, Default)]
+struct SampleWindow {
+    samples: VecDeque<u64>,
+}
+
+impl SampleWindow {
+    /// Push one observed value; evict the oldest when the window would exceed
+    /// [`WINDOW_SIZE`] (FIFO). O(1) amortized.
+    fn record(&mut self, value: u64) {
+        self.samples.push_back(value);
+        if self.samples.len() > WINDOW_SIZE {
+            self.samples.pop_front();
         }
     }
-}
 
-/// The representative value reported for a bucket: the geometric-ish midpoint
-/// `1.5 * 2^(i-1)` of the bucket's `[2^(i-1), 2^i)` range. This keeps a
-/// percentile estimate within roughly a factor of √2 of the true value.
-#[inline]
-const fn bucket_representative(i: usize) -> u64 {
-    if i == 0 {
-        0
-    } else {
-        let lower = 1u64 << (i - 1);
-        lower + (lower >> 1)
-    }
-}
-
-/// A fixed-size, log2-bucketed histogram — a compact streaming percentile
-/// sketch. `256` bytes (64 `u32` counts). It NEVER grows with the number of
-/// samples folded into it (contrast a `Vec<u64>` sample buffer, which the
-/// auditor flagged as breaking the per-entry cost + cap sizing).
-#[derive(Clone, Debug)]
-struct LogHistogram {
-    buckets: [u32; HIST_BUCKETS],
-}
-
-impl Default for LogHistogram {
-    fn default() -> Self {
-        Self {
-            buckets: [0; HIST_BUCKETS],
-        }
-    }
-}
-
-impl LogHistogram {
-    /// Fold one observed value into the sketch. Counts saturate (a single
-    /// bucket overflowing `u32::MAX` would require >4e9 identical-magnitude
-    /// samples for one key; saturation keeps the estimate monotone rather than
-    /// wrapping).
-    #[inline]
-    const fn record(&mut self, value: u64) {
-        let idx = bucket_index(value);
-        self.buckets[idx] = self.buckets[idx].saturating_add(1);
-    }
-
-    /// Estimate the value at quantile `q_num / q_den` (e.g. `19/20` = p95) given
-    /// the total sample count (which equals the sum of the bucket counts — the
-    /// caller tracks it once in [`Agg::sample_count`], so we do not re-sum here).
-    ///
-    /// Exact integer rank math (no float, no truncating cast): the 1-indexed
-    /// rank is `ceil(total * q_num / q_den)`, clamped into `[1, total]`.
-    fn quantile(&self, q_num: u64, q_den: u64, total: u64) -> u64 {
-        if total == 0 {
+    /// Estimate the value at quantile `q_num / q_den` (e.g. `19/20` = p95) over
+    /// the CURRENT window contents. Exact integer rank math (no float): sort the
+    /// ≤20 samples ascending and return the 1-indexed rank `ceil(n * q_num /
+    /// q_den)`, clamped into `[1, n]`. `0` for an empty window.
+    fn quantile(&self, q_num: u64, q_den: u64) -> u64 {
+        let n = self.samples.len();
+        if n == 0 {
             return 0;
         }
-        // ceil(total * q_num / q_den) via integer arithmetic. `saturating_mul`
-        // guards the (unreachable for realistic counts) overflow; the result is
-        // clamped to `total` regardless.
-        let rank = (total.saturating_mul(q_num).saturating_add(q_den - 1) / q_den).clamp(1, total);
-        let mut cum: u64 = 0;
-        for (i, &count) in self.buckets.iter().enumerate() {
-            cum += u64::from(count);
-            if cum >= rank {
-                return bucket_representative(i);
-            }
-        }
-        // Unreachable when `total` matches the folded counts, but stay total:
-        // return the top populated bucket's representative.
-        bucket_representative(HIST_BUCKETS - 1)
+        let mut sorted: Vec<u64> = self.samples.iter().copied().collect();
+        sorted.sort_unstable();
+        let rank =
+            ((n as u64).saturating_mul(q_num).saturating_add(q_den - 1) / q_den).clamp(1, n as u64);
+        sorted[(rank - 1) as usize]
     }
 
-    /// TAIL-AWARE statistic: the UPPER BOUND of the highest populated bucket —
-    /// strictly greater than every value ever folded into the sketch, so a
-    /// reservation sized on it never under-reserves the observed peak. `0` for an
-    /// empty sketch (or a sketch holding only the value `0`).
-    ///
-    /// This is the statistic a memory RESERVATION must use, NOT p95: p95 is BLIND
-    /// to the sub-5% catastrophic tail (review A1b / the TLC lower-bound result) —
-    /// a 96%@2 GB / 4%@20 GB key has p95 in the 2 GB mode → under-reserve → OOM.
-    /// Over-reserve is the OOM-safe direction, so the worst observed MAGNITUDE
-    /// (bucket upper bound) is the safe input.
-    ///
-    /// Bucket `i` (`1 <= i <= 62`) holds `[2^(i-1), 2^i)`; its upper bound is
-    /// `2^i`. Bucket `0` holds only `0` → upper bound `0`. The saturating top
-    /// bucket `63` conceptually merges `[2^62, 2^64)`; its reported upper bound
-    /// `2^63` under-states that merged octave — a purely theoretical imprecision
-    /// at magnitudes (≥ 2^62 KiB ≈ 4.6 EiB) far above any real resource value
-    /// (mirrors [`bucket_representative`]'s top-octave saturation note).
-    fn max_bucket_upper_bound(&self) -> u64 {
-        for (i, &count) in self.buckets.iter().enumerate().rev() {
-            if count > 0 {
-                return if i == 0 { 0 } else { 1u64 << i };
-            }
-        }
-        0
+    /// The MAX sample currently in the window (observability only — the
+    /// reservation basis is now p95, not this). `0` for an empty window.
+    fn max(&self) -> u64 {
+        self.samples.iter().copied().max().unwrap_or(0)
     }
 
-    /// (#task-resource-profile Phase-3 §12) The bucket counts as a plain `Vec<u32>`
-    /// for a persistence snapshot (fixed length [`HIST_BUCKETS`]).
-    fn buckets_vec(&self) -> Vec<u32> {
-        self.buckets.to_vec()
+    /// The retained samples as a plain `Vec<u64>` for a persistence snapshot
+    /// (length `0..=WINDOW_SIZE`, oldest-first).
+    fn samples_vec(&self) -> Vec<u64> {
+        self.samples.iter().copied().collect()
     }
 
-    /// (#task-resource-profile Phase-3 §12) Reconstruct a sketch from a snapshot's
-    /// bucket vector. `None` when the length is not exactly [`HIST_BUCKETS`] (a corrupt
-    /// / version-mismatched entry) — the caller drops the entry and starts fresh for
-    /// that key, never panicking.
-    fn from_buckets_vec(v: &[u32]) -> Option<Self> {
-        if v.len() != HIST_BUCKETS {
+    /// Reconstruct a window from a snapshot's sample vector. `None` when the
+    /// length exceeds [`WINDOW_SIZE`] (a corrupt / version-mismatched entry) — the
+    /// caller drops the entry and starts fresh for that key, never panicking.
+    fn from_samples_vec(v: &[u64]) -> Option<Self> {
+        if v.len() > WINDOW_SIZE {
             return None;
         }
-        let mut buckets = [0u32; HIST_BUCKETS];
-        buckets.copy_from_slice(v);
-        Some(Self { buckets })
+        Some(Self {
+            samples: v.iter().copied().collect(),
+        })
     }
 }
 
@@ -228,15 +173,16 @@ pub struct ResourceSample {
     pub net_bytes: u64,
 }
 
-/// Compact streaming aggregate for one [`ProfileKey`]: a fixed-size p50/p95
-/// sketch per dimension plus the sample count. `~1032` bytes regardless of how
-/// many samples are folded.
+/// (#2497 sched Phase-3 p95 policy) Bounded per-[`ProfileKey`] aggregate: a
+/// [`WINDOW_SIZE`]-slot sliding window per dimension plus the (monotone) total
+/// sample count. Fixed-capacity — the four windows hold at most `4 × 20` u64,
+/// regardless of how many samples are folded over the key's lifetime.
 #[derive(Clone, Debug, Default)]
 pub struct Agg {
-    memory_kb: LogHistogram,
-    cpu_ns: LogHistogram,
-    disk_bytes: LogHistogram,
-    net_bytes: LogHistogram,
+    memory_kb: SampleWindow,
+    cpu_ns: SampleWindow,
+    disk_bytes: SampleWindow,
+    net_bytes: SampleWindow,
     sample_count: u64,
     /// (#task-resource-profile Phase-3 §12 staleness) `true` iff this agg was
     /// reconstructed from a persisted snapshot (vs folded live this run). A live key
@@ -252,8 +198,9 @@ pub struct Agg {
 }
 
 impl Agg {
-    /// Fold one sample into every dimension's sketch. O(1), fixed work.
-    const fn fold(&mut self, sample: ResourceSample) {
+    /// Fold one sample into every dimension's window. O(1) amortized (each
+    /// window pushes and, once full, pops the oldest).
+    fn fold(&mut self, sample: ResourceSample) {
         self.memory_kb.record(sample.memory_kb);
         self.cpu_ns.record(sample.cpu_ns);
         self.disk_bytes.record(sample.disk_bytes);
@@ -284,87 +231,92 @@ impl Agg {
 
     #[inline]
     pub fn memory_p50(&self) -> u64 {
-        self.memory_kb.quantile(1, 2, self.sample_count)
+        self.memory_kb.quantile(1, 2)
     }
 
+    /// (#2497 sched Phase-3 p95 policy) The memory p95 over the sliding window —
+    /// the RESERVATION statistic (operator policy). Replaces the monotone-max
+    /// `memory_tail_kb` as the basis for RAISE / DOWN / undeclared injection. The
+    /// window forgets a one-off spike after 20 fresher samples, so a p95
+    /// under-estimate is possible; the worker `memory_gate` free-floor NAK is the
+    /// sole OOM backstop for that case.
     #[inline]
-    pub fn memory_p95(&self) -> u64 {
-        self.memory_kb.quantile(19, 20, self.sample_count)
+    pub fn memory_p95_kb(&self) -> u64 {
+        self.memory_kb.quantile(19, 20)
     }
 
-    /// (#task-resource-profile Phase-2b) TAIL-AWARE memory statistic for a
-    /// reservation (the enforce phase's injected memory floor). Returns the upper
-    /// bound of the highest populated memory bucket — NEVER p95, which is blind to
-    /// the sub-5% catastrophic tail (review A1b). See
-    /// [`LogHistogram::max_bucket_upper_bound`].
+    /// (observability) The MAX memory sample in the window. Kept for the observe
+    /// path / accuracy classification; NO LONGER the reservation basis.
     #[inline]
     pub fn memory_tail_kb(&self) -> u64 {
-        self.memory_kb.max_bucket_upper_bound()
+        self.memory_kb.max()
     }
 
     #[inline]
     pub fn cpu_ns_p95(&self) -> u64 {
-        self.cpu_ns.quantile(19, 20, self.sample_count)
+        self.cpu_ns.quantile(19, 20)
     }
 
     #[inline]
     pub fn disk_bytes_p95(&self) -> u64 {
-        self.disk_bytes.quantile(19, 20, self.sample_count)
+        self.disk_bytes.quantile(19, 20)
     }
 
     #[inline]
     pub fn net_bytes_p95(&self) -> u64 {
-        self.net_bytes.quantile(19, 20, self.sample_count)
+        self.net_bytes.quantile(19, 20)
     }
 
     /// Variance measure = memory p95/p50 ratio, ×100 to stay in integer math.
-    /// Memory is the load-bearing dimension for the eventual reservation, so
-    /// variance is measured there. A ratio of exactly 1.0 reports `100`.
-    /// A degenerate `p50 == 0` with `p95 > 0` reports `u64::MAX` (treat as
-    /// maximally spread).
+    /// Memory is the load-bearing dimension for the reservation, so variance is
+    /// measured there. A ratio of exactly 1.0 reports `100`. A degenerate
+    /// `p50 == 0` with `p95 > 0` reports `u64::MAX` (treat as maximally spread).
     pub fn memory_variance_ratio_x100(&self) -> u64 {
         let p50 = self.memory_p50();
-        let p95 = self.memory_p95();
+        let p95 = self.memory_p95_kb();
         if p50 == 0 {
             return if p95 == 0 { 100 } else { u64::MAX };
         }
         p95.saturating_mul(100) / p50
     }
 
-    /// (#task-resource-profile Phase-3 §12) Build a plain-data snapshot of this agg's
-    /// four dimension sketches + sample count for persistence. The staleness flags are
-    /// NOT persisted — they are a per-RUN property (a reloaded agg is `loaded=true,
-    /// fresh_since_load=false` by construction).
-    fn to_hist_dims(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, u64) {
+    /// (#task-resource-profile Phase-3 §12; #2497 window format) Build a plain-data
+    /// snapshot of this agg's four dimension WINDOWS + total sample count for
+    /// persistence. The staleness flags are NOT persisted — they are a per-RUN
+    /// property (a reloaded agg is `loaded=true, fresh_since_load=false` by
+    /// construction).
+    fn to_sample_dims(&self) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, u64) {
         (
-            self.memory_kb.buckets_vec(),
-            self.cpu_ns.buckets_vec(),
-            self.disk_bytes.buckets_vec(),
-            self.net_bytes.buckets_vec(),
+            self.memory_kb.samples_vec(),
+            self.cpu_ns.samples_vec(),
+            self.disk_bytes.samples_vec(),
+            self.net_bytes.samples_vec(),
             self.sample_count,
         )
     }
 
-    /// (#task-resource-profile Phase-3 §12) Reconstruct a LOADED agg from a snapshot's
-    /// dimension vectors. `None` when any histogram length is wrong OR the sample count
-    /// is implausible vs the folded bucket totals (a corrupt entry — dropped, never
-    /// panics). The reconstructed agg is marked `loaded` + not-yet-`fresh_since_load`.
-    fn from_hist_dims(
-        mem: &[u32],
-        cpu: &[u32],
-        disk: &[u32],
-        net: &[u32],
+    /// (#task-resource-profile Phase-3 §12; #2497 window format) Reconstruct a LOADED
+    /// agg from a snapshot's per-dimension sample vectors. `None` when any window
+    /// length exceeds [`WINDOW_SIZE`], OR the sample count is implausible vs the
+    /// retained window (a corrupt entry — dropped, never panics). The reconstructed
+    /// agg is marked `loaded` + not-yet-`fresh_since_load`.
+    fn from_sample_dims(
+        mem: &[u64],
+        cpu: &[u64],
+        disk: &[u64],
+        net: &[u64],
         sample_count: u64,
     ) -> Option<Self> {
-        let memory_kb = LogHistogram::from_buckets_vec(mem)?;
-        let cpu_ns = LogHistogram::from_buckets_vec(cpu)?;
-        let disk_bytes = LogHistogram::from_buckets_vec(disk)?;
-        let net_bytes = LogHistogram::from_buckets_vec(net)?;
-        // Validation: the memory sketch's bucket total must not EXCEED the sample count
-        // (saturating fold means it can be <= when counts saturated). A total that
-        // exceeds the declared count is a corrupt entry.
-        let mem_total: u64 = memory_kb.buckets.iter().map(|&c| u64::from(c)).sum();
-        if sample_count == 0 || mem_total > sample_count {
+        let memory_kb = SampleWindow::from_samples_vec(mem)?;
+        let cpu_ns = SampleWindow::from_samples_vec(cpu)?;
+        let disk_bytes = SampleWindow::from_samples_vec(disk)?;
+        let net_bytes = SampleWindow::from_samples_vec(net)?;
+        // Validation: the retained window can hold at most `sample_count` samples (it
+        // is the last min(count, WINDOW_SIZE) of them). A window LONGER than the
+        // declared total is a corrupt entry. All four dimensions fold together, so the
+        // memory window's length is representative.
+        let mem_len = memory_kb.samples.len() as u64;
+        if sample_count == 0 || mem_len > sample_count {
             return None;
         }
         Some(Self {
@@ -379,19 +331,25 @@ impl Agg {
     }
 }
 
-/// (#task-resource-profile Phase-3 §12) Plain-data snapshot of one profile-map entry
-/// (key parts + the four dimension histograms + sample count) for persistence. Pure
-/// data — the persist layer serializes this directly as the versioned wincode blob's
-/// entry form. The staleness flags are per-run and NOT part of the snapshot.
+/// (#task-resource-profile Phase-3 §12; #2497 window format) Plain-data snapshot of
+/// one profile-map entry (key parts + the four dimension SAMPLE WINDOWS + total
+/// sample count) for persistence. Pure data — the persist layer serializes this
+/// directly as the versioned wincode blob's entry form. The staleness flags are
+/// per-run and NOT part of the snapshot.
+///
+/// SCHEMA CHANGE (#2497): the four dimensions are now raw `Vec<u64>` sliding-window
+/// samples (was fixed-length `Vec<u32>` log2-bucket histograms). The persistence
+/// blob VERSION is bumped so a pre-#2497 snapshot version-mismatches on load and is
+/// DISCARDED (re-learn) rather than mis-parsed.
 #[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
 pub struct ProfileEntrySnapshot {
     pub instance_name: String,
     pub target_id: String,
     pub action_mnemonic: String,
-    pub memory_hist: Vec<u32>,
-    pub cpu_hist: Vec<u32>,
-    pub disk_hist: Vec<u32>,
-    pub net_hist: Vec<u32>,
+    pub memory_samples: Vec<u64>,
+    pub cpu_samples: Vec<u64>,
+    pub disk_samples: Vec<u64>,
+    pub net_samples: Vec<u64>,
     pub sample_count: u64,
 }
 
@@ -503,6 +461,9 @@ pub enum ProfileTier {
 #[derive(Clone, Copy, Debug)]
 struct TierStats {
     tail_kb: u64,
+    /// (#2497 sched Phase-3 p95 policy) The window p95 — the RESERVATION statistic
+    /// (RAISE / DOWN / undeclared injection all read this).
+    p95_kb: u64,
     p50_kb: u64,
     variance_ratio_x100: u64,
     samples: u64,
@@ -521,6 +482,10 @@ pub enum TieredTail {
     Trusted {
         tier: ProfileTier,
         tail_kb: u64,
+        /// (#2497 sched Phase-3 p95 policy) The window p95 — the RESERVATION basis
+        /// the enforce phase uses for RAISE, DOWN, and undeclared injection.
+        /// `tail_kb` (window max) is retained for the observe/accuracy path only.
+        p95_kb: u64,
         p50_kb: u64,
         variance_ratio_x100: u64,
         samples: u64,
@@ -721,6 +686,7 @@ impl ProfileMap {
                 return TieredTail::Trusted {
                     tier: ProfileTier::Fine,
                     tail_kb: s.tail_kb,
+                    p95_kb: s.p95_kb,
                     p50_kb: s.p50_kb,
                     variance_ratio_x100: s.variance_ratio_x100,
                     samples: s.samples,
@@ -733,6 +699,7 @@ impl ProfileMap {
                 return TieredTail::Trusted {
                     tier: ProfileTier::Coarse,
                     tail_kb: s.tail_kb,
+                    p95_kb: s.p95_kb,
                     p50_kb: s.p50_kb,
                     variance_ratio_x100: s.variance_ratio_x100,
                     samples: s.samples,
@@ -766,6 +733,7 @@ impl ProfileMap {
     fn peek_tier_stats(&self, key: &ProfileKey) -> Option<TierStats> {
         self.cache.peek(key).map(|agg| TierStats {
             tail_kb: agg.memory_tail_kb(),
+            p95_kb: agg.memory_p95_kb(),
             p50_kb: agg.memory_p50(),
             variance_ratio_x100: agg.memory_variance_ratio_x100(),
             samples: agg.sample_count(),
@@ -796,15 +764,16 @@ impl ProfileMap {
         self.cache
             .iter()
             .map(|(key, agg)| {
-                let (memory_hist, cpu_hist, disk_hist, net_hist, sample_count) = agg.to_hist_dims();
+                let (memory_samples, cpu_samples, disk_samples, net_samples, sample_count) =
+                    agg.to_sample_dims();
                 ProfileEntrySnapshot {
                     instance_name: key.instance_name.clone(),
                     target_id: key.target_id.clone(),
                     action_mnemonic: key.action_mnemonic.clone(),
-                    memory_hist,
-                    cpu_hist,
-                    disk_hist,
-                    net_hist,
+                    memory_samples,
+                    cpu_samples,
+                    disk_samples,
+                    net_samples,
                     sample_count,
                 }
             })
@@ -832,11 +801,11 @@ impl ProfileMap {
             let Some(key) = key else {
                 continue;
             };
-            let Some(agg) = Agg::from_hist_dims(
-                &e.memory_hist,
-                &e.cpu_hist,
-                &e.disk_hist,
-                &e.net_hist,
+            let Some(agg) = Agg::from_sample_dims(
+                &e.memory_samples,
+                &e.cpu_samples,
+                &e.disk_samples,
+                &e.net_samples,
                 e.sample_count,
             ) else {
                 continue;
@@ -901,62 +870,111 @@ mod tests {
         }
     }
 
-    // ── (a) compact estimator: fold a known distribution, assert p50/p95 +
-    //         variance land in the expected buckets ──
+    // ── (a) (#2497) sliding-window estimator: p50/p95/max over the last ≤20 raw
+    //         samples (exact values, not bucket representatives) ──
 
     #[test]
-    fn estimator_p50_p95_land_in_expected_buckets() {
-        // 90 samples at ~1000 KiB, 10 samples at ~1_000_000 KiB.
+    fn window_p50_p95_max_over_last_twenty() {
+        // A spread of exactly 20 samples (window full): 15 @ 1000, 5 @ 100_000.
         let mut agg = Agg::default();
-        for _ in 0..90 {
+        for _ in 0..15 {
             agg.fold(mem_sample(1000));
         }
-        for _ in 0..10 {
-            agg.fold(mem_sample(1_000_000));
+        for _ in 0..5 {
+            agg.fold(mem_sample(100_000));
         }
-        assert_eq!(agg.sample_count(), 100);
+        assert_eq!(agg.sample_count(), 20);
 
-        // 1000 falls in bucket 10 = [512, 1024); representative = 768.
+        // Sorted window = [1000×15, 100_000×5]. p50 rank ceil(20/2)=10 → the 10th
+        // smallest = 1000 (an EXACT raw sample, not a bucket rep).
         assert_eq!(
             agg.memory_p50(),
-            768,
-            "estimator p50 must fall in the 1000-KiB bucket [512,1024) → rep 768, \
-             got {}",
+            1000,
+            "window p50 must be the exact 10th-of-20 raw sample (1000), not a bucket \
+             representative; got {}",
             agg.memory_p50()
         );
-        // rank(0.95)=95 skips past the 90 low samples into the 1_000_000 bucket
-        // 20 = [524288, 1048576); representative = 786432.
+        // p95 rank ceil(20*19/20)=19 → the 19th smallest = 100_000 (into the high mode).
         assert_eq!(
-            agg.memory_p95(),
-            786_432,
-            "estimator p95 must fall in the 1_000_000-KiB bucket [2^19,2^20) → rep \
-             786432, got {}",
-            agg.memory_p95()
+            agg.memory_p95_kb(),
+            100_000,
+            "window p95 must be the exact 19th-of-20 raw sample (100_000); got {}",
+            agg.memory_p95_kb()
         );
-        // variance ratio ×100 = 786432*100/768 = 102400 (1024×) → high spread.
-        assert_eq!(agg.memory_variance_ratio_x100(), 102_400);
+        // Max = the largest raw sample.
+        assert_eq!(agg.memory_tail_kb(), 100_000, "window max must be the largest raw sample");
+        // variance ratio ×100 = 100_000*100/1000 = 10000 (100×).
+        assert_eq!(agg.memory_variance_ratio_x100(), 10_000);
     }
 
     #[test]
-    fn estimator_tight_distribution_is_low_variance() {
+    fn window_evicts_oldest_beyond_twenty() {
+        // Fill the window with 20 @ 1000, then fold ONE fresh 9000. The 21st push
+        // must FIFO-evict the oldest (a 1000), so the window is [1000×19, 9000] and
+        // the stats reflect ONLY the last 20 — the monotone-max history is forgotten.
+        let mut agg = Agg::default();
+        for _ in 0..20 {
+            agg.fold(mem_sample(1000));
+        }
+        agg.fold(mem_sample(9000));
+        assert_eq!(agg.sample_count(), 21, "sample_count is the monotone total (21)");
+        // Window (oldest-first) must be exactly the last 20 samples: [1000×19, 9000].
+        let win = agg.to_sample_dims().0;
+        assert_eq!(win.len(), WINDOW_SIZE, "the window must stay bounded at WINDOW_SIZE (20)");
+        assert_eq!(
+            win.iter().filter(|&&v| v == 1000).count(),
+            19,
+            "the 21st fold must evict exactly ONE oldest 1000 (FIFO), leaving 19"
+        );
+        assert_eq!(
+            win.iter().filter(|&&v| v == 9000).count(),
+            1,
+            "the fresh 9000 must be retained as the newest sample"
+        );
+        // p95 rank ceil(20*19/20)=19 → 19th of [1000×19, 9000] = 1000; max = 9000.
+        assert_eq!(agg.memory_p95_kb(), 1000, "stats reflect ONLY the last 20 samples");
+        assert_eq!(agg.memory_tail_kb(), 9000, "max reflects the fresh sample in the window");
+    }
+
+    #[test]
+    fn window_below_k_computes_over_available_samples() {
+        // Fewer than 20 samples: the quantile is over the available window, not padded.
+        // 4 @ 1000, 1 @ 50_000 (5 samples). Sorted [1000×4, 50_000]. p95 rank
+        // ceil(5*19/20)=ceil(4.75)=5 → the 5th (last) = 50_000; p50 rank ceil(5/2)=3 → 1000.
+        let mut agg = Agg::default();
+        for _ in 0..4 {
+            agg.fold(mem_sample(1000));
+        }
+        agg.fold(mem_sample(50_000));
+        assert_eq!(agg.sample_count(), 5);
+        assert_eq!(agg.memory_p50(), 1000, "p50 over 5 samples = 3rd smallest = 1000");
+        assert_eq!(
+            agg.memory_p95_kb(),
+            50_000,
+            "p95 over 5 samples = 5th (ceil(5*19/20)=5) = 50_000"
+        );
+    }
+
+    #[test]
+    fn window_tight_distribution_is_low_variance() {
         let mut agg = Agg::default();
         for _ in 0..100 {
             agg.fold(mem_sample(1000));
         }
-        assert_eq!(agg.memory_p50(), agg.memory_p95());
+        assert_eq!(agg.memory_p50(), agg.memory_p95_kb());
+        assert_eq!(agg.memory_tail_kb(), 1000, "a tight window's max equals its p50/p95");
         assert_eq!(
             agg.memory_variance_ratio_x100(),
             100,
-            "a single-bucket (tight) distribution must report a 1.0× ratio (100), \
-             got {}",
+            "a single-valued (tight) window must report a 1.0× ratio (100), got {}",
             agg.memory_variance_ratio_x100()
         );
     }
 
     #[test]
-    fn estimator_dimensions_are_independent() {
-        // Each dimension folds its own value; a per-dim p95 must reflect only
-        // that dimension (no cross-contamination in the sketch layout).
+    fn window_dimensions_are_independent() {
+        // Each dimension folds its own value; a per-dim p95 must reflect only that
+        // dimension (independent windows — no cross-contamination).
         let mut agg = Agg::default();
         for _ in 0..10 {
             agg.fold(ResourceSample {
@@ -966,31 +984,30 @@ mod tests {
                 net_bytes: 8192,
             });
         }
-        // 2048 → bucket 12 [2048,4096) rep 3072.
-        assert_eq!(agg.memory_p95(), 3072);
-        // 1<<30 → bucket 31 [2^30,2^31) rep 1610612736.
-        assert_eq!(agg.cpu_ns_p95(), (1 << 30) + (1 << 29));
-        // 4096 → bucket 13 [4096,8192) rep 6144.
-        assert_eq!(agg.disk_bytes_p95(), 6144);
-        // 8192 → bucket 14 [8192,16384) rep 12288.
-        assert_eq!(agg.net_bytes_p95(), 12288);
+        // All 10 samples identical per dim → p95 == that exact raw value.
+        assert_eq!(agg.memory_p95_kb(), 2048);
+        assert_eq!(agg.cpu_ns_p95(), 1 << 30);
+        assert_eq!(agg.disk_bytes_p95(), 4096);
+        assert_eq!(agg.net_bytes_p95(), 8192);
     }
 
     #[test]
-    fn estimator_is_fixed_size_regardless_of_sample_count() {
-        // A compact sketch's size does not grow with samples. Fold many; the
-        // struct is Copy-of-arrays-sized (no heap sample buffer). The four fixed
-        // histograms + the u64 count dominate; the two Phase-3 §12 staleness bools
-        // (`loaded`, `fresh_since_load`) add only a fixed, alignment-padded byte or two
-        // — the invariant that matters is "no per-sample growth", so assert the size is
-        // the histograms + count + a small bounded fixed overhead (<= one u64 word).
-        let hist_and_count = 4 * (HIST_BUCKETS * size_of::<u32>()) + size_of::<u64>();
-        let sz = size_of::<Agg>();
-        assert!(
-            sz >= hist_and_count && sz <= hist_and_count + size_of::<u64>(),
-            "Agg must be histograms + count + a small fixed (bool flags) overhead with NO \
-             per-sample growth: got {sz}, expected in [{hist_and_count}, {}]",
-            hist_and_count + size_of::<u64>()
+    fn window_is_bounded_at_window_size() {
+        // The window NEVER grows past WINDOW_SIZE regardless of total samples folded —
+        // the per-entry cost bound that keeps the LRU footprint sizing valid.
+        let mut agg = Agg::default();
+        for i in 0..1000u64 {
+            agg.fold(mem_sample(i + 1));
+        }
+        let (mem, cpu, disk, net, _count) = agg.to_sample_dims();
+        assert_eq!(mem.len(), WINDOW_SIZE, "the memory window must be capped at WINDOW_SIZE (20)");
+        assert_eq!(cpu.len(), WINDOW_SIZE, "every dimension window must be capped at WINDOW_SIZE");
+        assert_eq!(disk.len(), WINDOW_SIZE);
+        assert_eq!(net.len(), WINDOW_SIZE);
+        assert_eq!(
+            agg.sample_count(),
+            1000,
+            "sample_count is the monotone total (1000) even though the window holds only 20"
         );
     }
 
@@ -1104,63 +1121,46 @@ mod tests {
         );
     }
 
-    // ── (Phase-2b) tail-aware memory statistic (NOT p95) ──
+    // ── (#2497) p95 reservation statistic drops the single-spike max conservatism ──
 
     #[test]
-    fn tail_stat_picks_the_tail_not_p95() {
-        // The bimodal catastrophe (red-team A1b): 96% at ~2 GB, 4% at ~20 GB.
-        // p95 sits IN the 2 GB mode (blind to the 4% tail that OOM-kills); the
-        // tail statistic must capture the 20 GB mode.
-        //   2 GB  = 2_097_152 KiB → bit_len 22 → bucket 22 = [2^21,2^22), tail 2^22
-        //   20 GB = 20_971_520 KiB → bit_len 25 → bucket 25 = [2^24,2^25), tail 2^25
-        let low = 2_097_152;
-        let high = 20_971_520;
+    fn window_p95_below_max_drops_single_spike() {
+        // 19 @ 1000 + 1 @ 1_000_000 (20 samples, window full). The old monotone-max
+        // reservation would have stood at ~1_000_000 forever; the p95 policy reserves
+        // 1000 (the single 1_000_000 spike is above the 95th percentile). The worker
+        // free-floor NAK is the OOM backstop for the dropped spike.
         let mut agg = Agg::default();
-        for _ in 0..96 {
-            agg.fold(mem_sample(low));
+        for _ in 0..19 {
+            agg.fold(mem_sample(1000));
         }
-        for _ in 0..4 {
-            agg.fold(mem_sample(high));
-        }
-        assert_eq!(agg.sample_count(), 100);
+        agg.fold(mem_sample(1_000_000));
+        assert_eq!(agg.sample_count(), 20);
 
-        // p95 lands in the LOW (2 GB) mode — the blindness the reservation must avoid.
-        let p95 = agg.memory_p95();
+        let p95 = agg.memory_p95_kb();
+        // Sorted [1000×19, 1_000_000]. p95 rank ceil(20*19/20)=19 → 19th = 1000.
         assert_eq!(
-            p95, 3_145_728,
-            "p95 must sit in the 2 GB mode (bucket 22 rep 3145728) — blind to the \
-             4% 20 GB tail; got {p95}"
+            p95, 1000,
+            "p95 must be the 19th-of-20 sample (1000) — the single 1_000_000 spike sits \
+             ABOVE p95, so p95 drops it (the whole point of moving off monotone-max); got {p95}"
         );
-
-        // The tail statistic captures the 20 GB mode (upper bound of the highest
-        // populated bucket 25 = 2^25 = 33_554_432).
-        let tail = agg.memory_tail_kb();
-        assert_eq!(
-            tail, 33_554_432,
-            "memory_tail_kb must be the upper bound of the highest populated bucket \
-             (bucket 25 → 2^25 = 33554432), capturing the catastrophic 20 GB tail; \
-             got {tail}"
-        );
+        let max = agg.memory_tail_kb();
+        assert_eq!(max, 1_000_000, "the window max still sees the spike (observability only)");
         assert!(
-            tail > p95,
-            "the tail statistic MUST exceed p95 on a bimodal key (over-reserve is the \
-             OOM-safe direction) — tail {tail} !> p95 {p95}"
-        );
-        assert!(
-            tail >= high,
-            "the tail statistic must be >= the max observed sample ({high}) so a \
-             reservation sized on it never under-reserves the observed peak; got {tail}"
+            p95 < max,
+            "on a single-spike window the p95 reservation statistic MUST be BELOW the max — \
+             this is the conservatism the p95 policy intentionally drops; p95 {p95} !< max {max}"
         );
     }
 
     #[test]
-    fn tail_stat_of_empty_agg_is_zero() {
+    fn p95_and_max_of_empty_agg_are_zero() {
         let agg = Agg::default();
         assert_eq!(
-            agg.memory_tail_kb(),
+            agg.memory_p95_kb(),
             0,
-            "an un-sampled agg has no tail → 0 (the K-gate keeps it out of any raise)"
+            "an un-sampled agg has no p95 → 0 (the K-gate keeps it out of any reservation)"
         );
+        assert_eq!(agg.memory_tail_kb(), 0, "an un-sampled agg has no max → 0");
     }
 
     #[test]
@@ -1169,14 +1169,14 @@ mod tests {
         // None for an absent one, and (unlike get) does NOT bump LRU recency.
         let mut map = ProfileMap::new(NonZeroUsize::new(2).unwrap(), 1, 200);
         let (k1, k2, k3) = (key("//a", "M"), key("//b", "M"), key("//c", "M"));
-        map.record(k1.clone(), mem_sample(2_097_152)); // bucket 22 → tail 2^22
-        map.record(k1.clone(), mem_sample(20_971_520)); // bucket 25 → tail 2^25
+        map.record(k1.clone(), mem_sample(2_097_152)); // window sample
+        map.record(k1.clone(), mem_sample(20_971_520)); // window sample (the max)
         map.record(k2.clone(), mem_sample(100));
 
         assert_eq!(
             map.peek_memory_tail(&k1),
-            Some((33_554_432, 2)),
-            "peek_memory_tail must return (tail=2^25, samples=2) for a profiled key"
+            Some((20_971_520, 2)),
+            "peek_memory_tail must return (max=20_971_520, samples=2) for a profiled key"
         );
         assert_eq!(
             map.peek_memory_tail(&key("//absent", "M")),
@@ -1282,7 +1282,7 @@ mod tests {
         let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
         let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
         for _ in 0..3 {
-            map.record(fine.clone(), mem_sample(50_000)); // 50000 → bucket16 → tail 2^16
+            map.record(fine.clone(), mem_sample(50_000)); // exact raw sample
         }
         // Coarse has ≥K but at a different magnitude — must be ignored when fine is trusted.
         for _ in 0..5 {
@@ -1292,14 +1292,14 @@ mod tests {
             map.lookup_tiered(&fine, &coarse),
             TieredTail::Trusted {
                 tier: ProfileTier::Fine,
-                tail_kb: 1 << 16,
-                // 50000 → bucket 16 [2^15,2^16) → p50 rep 1.5·2^15 = 49152; a
-                // single-bucket (tight) distribution → p95==p50 → ratio 100.
-                p50_kb: 49_152,
+                // A tight window of 50_000 → max/p95/p50 all the exact raw sample.
+                tail_kb: 50_000,
+                p95_kb: 50_000,
+                p50_kb: 50_000,
                 variance_ratio_x100: 100,
                 samples: 3,
             },
-            "a fine key with ≥K samples must be chosen over coarse (Fine tier, fine's tail)"
+            "a fine key with ≥K samples must be chosen over coarse (Fine tier, fine's p95)"
         );
     }
 
@@ -1309,7 +1309,7 @@ mod tests {
         // needs BOTH the central estimate (p50) and the spread (p95/p50 ×100) — the
         // tail alone (a monotone max) cannot express `p50 × (1 + margin(variance))`.
         // Prove a SPREAD trusted key threads them through, not just the tail.
-        // 15 samples @1000 (bucket10 rep 768) + 5 @100000 (bucket17 rep 98304), K=20.
+        // 15 samples @1000 + 5 @100000 (window full at 20), K=20.
         let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 20, 200);
         let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
         for _ in 0..15 {
@@ -1322,18 +1322,18 @@ mod tests {
             map.lookup_tiered(&fine, &coarse),
             TieredTail::Trusted {
                 tier: ProfileTier::Fine,
-                // tail = upper bound of the highest populated bucket 17 = 2^17.
-                tail_kb: 1 << 17,
-                // p50 rank 10 lands in the 15-sample low mode → bucket10 rep 768.
-                p50_kb: 768,
-                // p95 rank 19 lands in the high mode → bucket17 rep 98304;
-                // variance = 98304·100/768 = 12800 (128×).
-                variance_ratio_x100: 12_800,
+                // Sorted window [1000×15, 100_000×5]: max = 100_000.
+                tail_kb: 100_000,
+                // p95 rank 19 lands in the high mode → exact 100_000.
+                p95_kb: 100_000,
+                // p50 rank 10 lands in the 15-sample low mode → exact 1000.
+                p50_kb: 1000,
+                // variance = 100_000·100/1000 = 10000 (100×).
+                variance_ratio_x100: 10_000,
                 samples: 20,
             },
-            "lookup_tiered must carry p50_kb (central estimate) AND variance_ratio_x100 \
-             (p95/p50 ×100) alongside the tail so the Phase-3 margin function can size \
-             p50 × (1 + margin(variance)); a spread key must report p50=768, variance=12800"
+            "lookup_tiered must carry the p95 reservation statistic AND p50/variance \
+             alongside the max; a spread window must report p95=100_000, p50=1000, variance=10000"
         );
     }
 
@@ -1347,18 +1347,19 @@ mod tests {
             map.record(fine.clone(), mem_sample(1000));
         }
         for _ in 0..4 {
-            map.record(coarse.clone(), mem_sample(50_000)); // tail 2^16
+            map.record(coarse.clone(), mem_sample(50_000)); // tight window @50_000
         }
         assert_eq!(
             map.lookup_tiered(&fine, &coarse),
             TieredTail::Trusted {
                 tier: ProfileTier::Coarse,
-                tail_kb: 1 << 16,
-                p50_kb: 49_152,
+                tail_kb: 50_000,
+                p95_kb: 50_000,
+                p50_kb: 50_000,
                 variance_ratio_x100: 100,
                 samples: 4,
             },
-            "fine below K but coarse ≥K → the fallback must borrow the mature coarse tail \
+            "fine below K but coarse ≥K → the fallback must borrow the mature coarse p95 \
              (Coarse tier) — this is the K-starvation defeat"
         );
     }
@@ -1379,10 +1380,10 @@ mod tests {
             map.lookup_tiered(&fine, &coarse),
             TieredTail::LowSample {
                 tier: ProfileTier::Fine,
-                tail_kb: 1 << 10,
+                tail_kb: 1000,
                 samples: 2,
             },
-            "neither tier reaching K → LowSample carrying the fine (preferred) tier's tail"
+            "neither tier reaching K → LowSample carrying the fine (preferred) tier's max"
         );
     }
 
@@ -1441,17 +1442,22 @@ mod tests {
     /// re-collecting samples — the whole point of persistence (no re-warm tax). The
     /// loaded key's tail/p50/count match the source, and it is immediately Trusted.
     ///
-    /// MUTATION: make `Agg::from_hist_dims` drop the sample_count (set 0) → the loaded
+    /// MUTATION: make `Agg::from_sample_dims` drop the sample_count (set 0) → the loaded
     /// key falls below K → `lookup_tiered` no longer Trusted → this red-fails.
     #[test]
     fn snapshot_entries_and_load_round_trip_preserves_trusted_key() {
         let mut src = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
         let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
         for _ in 0..3 {
-            src.record(fine.clone(), mem_sample(50_000)); // bucket16 → tail 2^16, p50 49152
+            src.record(fine.clone(), mem_sample(50_000)); // tight window @50_000
         }
         let entries = src.snapshot_entries();
         assert_eq!(entries.len(), 1, "one resident key must snapshot to one entry");
+        assert_eq!(
+            entries[0].memory_samples,
+            vec![50_000u64; 3],
+            "the new snapshot format must persist the RAW window samples (not bucket counts)"
+        );
 
         let mut dst = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
         let loaded = dst.load_entries(entries, 100);
@@ -1460,12 +1466,13 @@ mod tests {
             dst.lookup_tiered(&fine, &coarse),
             TieredTail::Trusted {
                 tier: ProfileTier::Fine,
-                tail_kb: 1 << 16,
-                p50_kb: 49_152,
+                tail_kb: 50_000,
+                p95_kb: 50_000,
+                p50_kb: 50_000,
                 variance_ratio_x100: 100,
                 samples: 3,
             },
-            "the loaded key must be immediately Trusted (>=K) with the SAME tail/p50/count \
+            "the loaded key must be immediately Trusted (>=K) with the SAME p95/p50/count \
              — profiles survive restart with NO re-collection (the no-re-warm-tax goal)"
         );
     }
@@ -1525,7 +1532,7 @@ mod tests {
         );
     }
 
-    /// A corrupt entry (wrong histogram length) is SKIPPED on load, never panics.
+    /// A corrupt entry (window LONGER than WINDOW_SIZE) is SKIPPED on load, never panics.
     #[test]
     fn load_entries_skips_corrupt_entry() {
         let mut dst = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
@@ -1533,16 +1540,16 @@ mod tests {
             instance_name: "main".to_string(),
             target_id: "//a".to_string(),
             action_mnemonic: "M".to_string(),
-            memory_hist: vec![0u32; 10], // WRONG length (not 64)
-            cpu_hist: vec![0u32; 64],
-            disk_hist: vec![0u32; 64],
-            net_hist: vec![0u32; 64],
+            memory_samples: vec![0u64; WINDOW_SIZE + 1], // WRONG length (> WINDOW_SIZE)
+            cpu_samples: vec![0u64; 5],
+            disk_samples: vec![0u64; 5],
+            net_samples: vec![0u64; 5],
             sample_count: 5,
         };
         let loaded = dst.load_entries(vec![bad], 100);
         assert_eq!(
             loaded, 0,
-            "an entry with a wrong-length histogram must be SKIPPED (corrupt), not loaded \
+            "an entry with an over-long window must be SKIPPED (corrupt), not loaded \
              and not a panic"
         );
     }

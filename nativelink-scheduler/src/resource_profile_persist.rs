@@ -62,9 +62,14 @@ pub type WincodeConfig = wincode::config::Configuration<
 const SNAPSHOT_MAGIC: u32 = 0x4E4C_5250;
 
 /// On-disk schema version. Bump on ANY incompatible layout change; a loaded file whose
-/// version differs starts FRESH (the histograms re-accumulate; no migration needed for
+/// version differs starts FRESH (the profiles re-accumulate; no migration needed for
 /// advisory data).
-const SNAPSHOT_VERSION: u32 = 1;
+///
+/// VERSION 2 (#2497 sched Phase-3 p95 policy): [`ProfileEntrySnapshot`] changed from
+/// fixed-length log2-bucket histograms (`Vec<u32>`) to raw sliding-window samples
+/// (`Vec<u64>`). A pre-#2497 (version-1) snapshot version-mismatches on load and is
+/// DISCARDED (re-learn) — NO migration of the old histogram is attempted.
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Versioned header stamped at the front of every snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
@@ -166,17 +171,18 @@ pub async fn write_snapshot_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error
 mod tests {
     use super::*;
 
-    fn entry(target: &str, mnemonic: &str, mem_bucket: usize, count: u64) -> ProfileEntrySnapshot {
-        let mut memory_hist = vec![0u32; 64];
-        memory_hist[mem_bucket] = count as u32;
+    fn entry(target: &str, mnemonic: &str, mem_sample: u64, count: u64) -> ProfileEntrySnapshot {
+        // (#2497 window format) A short window of `count` (<= WINDOW_SIZE) identical
+        // memory samples; other dimensions empty.
+        let n = count.min(20) as usize;
         ProfileEntrySnapshot {
             instance_name: "main".to_string(),
             target_id: target.to_string(),
             action_mnemonic: mnemonic.to_string(),
-            memory_hist,
-            cpu_hist: vec![0u32; 64],
-            disk_hist: vec![0u32; 64],
-            net_hist: vec![0u32; 64],
+            memory_samples: vec![mem_sample; n],
+            cpu_samples: vec![],
+            disk_samples: vec![],
+            net_samples: vec![],
             sample_count: count,
         }
     }
@@ -187,7 +193,7 @@ mod tests {
     /// `deserialize_snapshot` returns Err → the `expect` here red-fails.
     #[test]
     fn snapshot_round_trips_entries_and_time() {
-        let entries = vec![entry("//a:a", "CppCompile", 16, 25), entry("//b:b", "CppLink", 20, 40)];
+        let entries = vec![entry("//a:a", "CppCompile", 50_000, 15), entry("//b:b", "CppLink", 8192, 20)];
         let bytes = serialize_snapshot(entries.clone(), 1_700_000_000).expect("serialize");
         let (secs, got) = deserialize_snapshot(&bytes).expect("round-trip must deserialize");
         assert_eq!(secs, 1_700_000_000, "the snapshot wall-time must round-trip");
