@@ -1800,31 +1800,32 @@ fn phase3_churn_throttled_factor(
 /// completion-time recompute). Pure: no lock, no I/O, testable in isolation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PredictionAccuracy {
-    /// `tail >= actual`: the reservation would have been a safe over-estimate.
-    /// `over_ratio_x100 = Some(tail * 100 / actual)` when it strictly OVER-reserved
-    /// (`tail > actual`), the concurrency-waste half of the signal (Upgrade 2);
-    /// `None` when `tail == actual` (an exact, waste-free cover).
+    /// `p95 >= actual`: the reservation would have been a safe over-estimate.
+    /// `over_ratio_x100 = Some(p95 * 100 / actual)` when it strictly OVER-reserved
+    /// (`p95 > actual`), the concurrency-waste half of the signal (Upgrade 2);
+    /// `None` when `p95 == actual` (an exact, waste-free cover).
     Covered {
-        /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch tail came
+        /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch p95 came
         /// from. A `Coarse` cover blends all target-bearing samples of a mnemonic (higher
         /// variance), so the eventual Phase-3 down-override must NOT trust it — carried so that gate has
         /// the signal. OBSERVE-ONLY here.
         tier: ProfileTier,
         over_ratio_x100: Option<u64>,
     },
-    /// `tail < actual`: the reservation would have UNDER-reserved this action (the
+    /// `p95 < actual`: the reservation would have UNDER-reserved this action (the
     /// OOM-risk case the Phase-3 FALSIFIER watches — its firing DISPROVES safety, but its
     /// absence does not prove it; see `accuracy_predicted_under`). `ratio_x100 =
-    /// actual * 100 / tail`.
+    /// actual * 100 / p95`. (#2497) `p95` is the SAME statistic the enforce phase reserves
+    /// on, so this falsifier now falsifies the statistic we actually reserve.
     Under {
-        /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch tail came
+        /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch p95 came
         /// from (see [`Self::Covered`]).
         tier: ProfileTier,
         ratio_x100: u64,
     },
-    /// A dispatch prediction existed but with `< K` prior samples: the tail was not yet
+    /// A dispatch prediction existed but with `< K` prior samples: the p95 was not yet
     /// trustworthy — excluded from the accuracy ratio (same K-gate as the inject-observe
-    /// path; below K the tail is statistically meaningless).
+    /// path; below K the p95 is statistically meaningless).
     SkippedLowSample,
     /// No dispatch-time prediction was stashed (map warming, absent baggage, or the op
     /// never traversed the reserve path). No out-of-sample prediction existed to score —
@@ -1832,12 +1833,13 @@ enum PredictionAccuracy {
     SkippedNoDispatch,
 }
 
-/// (#task-resource-profile Phase-2c) Classify a folded sample against the TRUE
-/// DISPATCH-TIME leave-one-out prediction. `dispatch_prediction` is the
-/// [`ProfileMap::peek_memory_tail`](crate::resource_profile::ProfileMap::peek_memory_tail)
-/// result captured AT THIS ACTION'S DISPATCH (stashed on the running action), NOT a
+/// (#task-resource-profile Phase-2c; #2497 p95 policy) Classify a folded sample against
+/// the TRUE DISPATCH-TIME leave-one-out prediction. `dispatch_prediction` is the tiered
+/// lookup captured AT THIS ACTION'S DISPATCH (stashed on the running action), NOT a
 /// completion-time recompute: `None` when no profile existed at dispatch, else
-/// `(tail_kb, prior_samples)`. `actual_kb` is this action's measured peak.
+/// `(tier, p95_kb, prior_samples)`. The predicted value is the WINDOW p95 — the SAME
+/// statistic the enforce phase reserves on — so this falsifier scores the reservation we
+/// actually stand. `actual_kb` is this action's measured peak.
 fn classify_prediction_accuracy(
     dispatch_prediction: Option<(ProfileTier, u64, u64)>,
     actual_kb: u64,
@@ -1845,7 +1847,7 @@ fn classify_prediction_accuracy(
     match dispatch_prediction {
         // No dispatch-time prediction existed (map warming / absent baggage / raced).
         None => PredictionAccuracy::SkippedNoDispatch,
-        // Prediction present but below K at dispatch: the tail was not yet trustworthy
+        // Prediction present but below K at dispatch: the p95 was not yet trustworthy
         // (pair-a MINOR / red-team A1b), so no prediction stood — skip rather than score
         // a spurious cover/under. LOAD-BEARING on the PRODUCTION path: the stash arm in
         // `find_and_reserve_worker` stashes `TieredTail::LowSample { samples < K }` tuples
@@ -1855,13 +1857,13 @@ fn classify_prediction_accuracy(
         Some((_, _, prior_samples)) if prior_samples < PROFILE_MIN_SAMPLES => {
             PredictionAccuracy::SkippedLowSample
         }
-        Some((tier, tail_kb, _)) => {
-            if tail_kb >= actual_kb {
+        Some((tier, p95_kb, _)) => {
+            if p95_kb >= actual_kb {
                 // Over-reservation waste (Upgrade 2): record the ratio only when the
                 // reservation STRICTLY exceeds the actual peak. Guard `actual == 0` (a
                 // degenerate 0-memory action) with `max(1)` so the ratio stays finite.
-                let over_ratio_x100 = if tail_kb > actual_kb {
-                    Some(tail_kb.saturating_mul(100) / actual_kb.max(1))
+                let over_ratio_x100 = if p95_kb > actual_kb {
+                    Some(p95_kb.saturating_mul(100) / actual_kb.max(1))
                 } else {
                     None
                 };
@@ -1870,10 +1872,10 @@ fn classify_prediction_accuracy(
                     over_ratio_x100,
                 }
             } else {
-                // tail < actual → under-reserve. Guard `tail == 0` (a degenerate
+                // p95 < actual → under-reserve. Guard `p95 == 0` (a degenerate
                 // ≥K all-zero-memory key): divide by at least 1 so the ratio stays
                 // finite (predicted-0 / got-A reads as A×100, a huge magnitude).
-                let ratio_x100 = actual_kb.saturating_mul(100) / tail_kb.max(1);
+                let ratio_x100 = actual_kb.saturating_mul(100) / p95_kb.max(1);
                 PredictionAccuracy::Under { tier, ratio_x100 }
             }
         }
@@ -6715,8 +6717,9 @@ impl ApiWorkerScheduler {
     /// dispatch — NOT per `do_try_match` cycle, so no per-match hot-loop cost), it
     /// looks up the action's resource profile by the SAME key the completion-path
     /// fold uses, computes the memory reservation the enforce phase (Phase-3) WOULD
-    /// inject — `would_raise_to = max(declared_memory_kb, tail_stat)`, RAISE-ONLY —
-    /// and LOGS it.
+    /// inject — `would_raise_to = max(declared_memory_kb, p95_stat)`, RAISE-ONLY —
+    /// and LOGS it. (#2497) The counterfactual keys on the WINDOW p95, the SAME statistic
+    /// the enforce phase reserves on, so `would_raise` proxies `phase3_raise_applied`.
     ///
     /// It changes NOTHING: the reservation was already made above with the
     /// client-declared props; this reads the profile map via `peek` (no LRU-recency
@@ -6759,10 +6762,10 @@ impl ApiWorkerScheduler {
             .resource_profile_map
             .lock()
             .lookup_tiered(&fine_key, &coarse_key);
-        let (tier, tail_kb, p50_kb, samples) = match lookup {
+        let (tier, p95_kb, p50_kb, samples) = match lookup {
             TieredTail::Trusted {
                 tier,
-                tail_kb,
+                p95_kb,
                 p50_kb,
                 samples,
                 ..
@@ -6773,10 +6776,10 @@ impl ApiWorkerScheduler {
                     ProfileTier::Coarse => &self.metrics.profile_lookup_coarse,
                 }
                 .fetch_add(1, Ordering::Relaxed);
-                (tier, tail_kb, p50_kb, samples)
+                (tier, p95_kb, p50_kb, samples)
             }
             TieredTail::LowSample { .. } => {
-                // A profile exists at some tier but below K → tail untrusted (pair-a
+                // A profile exists at some tier but below K → p95 untrusted (pair-a
                 // MINOR / red-team A1b's K-gate). Keep it out of any counterfactual raise.
                 self.metrics
                     .inject_observe_skipped_low_sample
@@ -6801,41 +6804,45 @@ impl ApiWorkerScheduler {
         };
 
         let declared_kb = action_declared_memory_kb(&action_info.platform_properties);
-        // RAISE-ONLY: the injection could only ever RAISE the reserved memory toward
-        // the tail statistic, never below the client-declared value (Phase-2b is
-        // OOM-safe: tightening only). `would_raise_to == declared` when the tail is
-        // at/under declared (no raise).
-        let would_raise_to = declared_kb.max(tail_kb);
+        // (#2497 p95 policy) The counterfactual keys on the WINDOW p95 — the SAME statistic
+        // the enforce phase reserves on — so `would_raise` and `down_opportunity` mirror the
+        // enforce RAISE/DOWN predicates EXACTLY and are mutually exclusive:
+        //   p95 >  declared → the enforce RAISE side would fire → `inject_observe_would_raise`.
+        //   p95 <= declared → the enforce DOWN  side would fire → `down_opportunity_*`.
+        // With this, `would_raise` is a faithful proxy for `phase3_raise_applied` again.
+        let would_raise_to = declared_kb.max(p95_kb);
         let delta_kb = would_raise_to - declared_kb;
-        if delta_kb > 0 {
+        let down_opportunity_x100 = if delta_kb > 0 {
+            // RAISE side (p95 > declared): tightening-only, no DOWN headroom.
             self.metrics
                 .inject_observe_would_raise
                 .fetch_add(1, Ordering::Relaxed);
-        }
-
-        // (#task-resource-profile Phase-3 §4) DOWN-OPPORTUNITY observe metric — the
-        // REAL DOWN headroom (`declared / p50`, ×100) the cadre C4 said was missing.
-        // Measured here on the TRUSTED (≥K) tiered lookup so it uses the same central
-        // estimate the enforce phase's margin function reads. `p50.max(1)` guards a
-        // degenerate ≥K all-zero-memory key (ratio finite, never a divide-by-zero).
-        // OBSERVE-ONLY: emitted whether or not any enforcement flag is on (ships ON).
-        let down_opportunity_x100 = declared_kb.saturating_mul(100) / p50_kb.max(1);
-        self.metrics
-            .down_opportunity_max_x100
-            .fetch_max(down_opportunity_x100, Ordering::Relaxed);
-        let _ = self.metrics.down_opportunity_sum_x100.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |s| Some(s.saturating_add(down_opportunity_x100)),
-        );
-        self.metrics
-            .down_opportunity_samples
+            0
+        } else {
+            // DOWN side (p95 <= declared): the REAL overcommit headroom (`declared / p50`,
+            // ×100) the cadre C4 said was missing — measured on the SAME central estimate
+            // the enforce DOWN reserve floors from. `p50.max(1)` guards a degenerate ≥K
+            // all-zero-memory key (ratio finite, never a divide-by-zero). OBSERVE-ONLY:
+            // folded whether or not any enforcement flag is on (ships ON).
+            let opp = declared_kb.saturating_mul(100) / p50_kb.max(1);
+            self.metrics
+                .down_opportunity_max_x100
+                .fetch_max(opp, Ordering::Relaxed);
+            let _ = self.metrics.down_opportunity_sum_x100.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |s| Some(s.saturating_add(opp)),
+            );
+            self.metrics
+                .down_opportunity_samples
+                .fetch_add(1, Ordering::Relaxed);
+            match tier {
+                ProfileTier::Fine => &self.metrics.down_opportunity_fine_samples,
+                ProfileTier::Coarse => &self.metrics.down_opportunity_coarse_samples,
+            }
             .fetch_add(1, Ordering::Relaxed);
-        match tier {
-            ProfileTier::Fine => &self.metrics.down_opportunity_fine_samples,
-            ProfileTier::Coarse => &self.metrics.down_opportunity_coarse_samples,
-        }
-        .fetch_add(1, Ordering::Relaxed);
+            opp
+        };
 
         // Rate-limited (≤ 1/s) per-decision sample so an operator can SEE one
         // decision's key/declared/tail/would_raise/delta without flooding.
@@ -6861,7 +6868,7 @@ impl ApiWorkerScheduler {
                 profile_tier = ?tier,
                 samples,
                 declared_memory_kb = declared_kb,
-                tail_stat_kb = tail_kb,
+                p95_stat_kb = p95_kb,
                 would_raise_to_kb = would_raise_to,
                 delta_kb,
                 // (#task-resource-profile Phase-3 §4) DOWN-opportunity spot values:
@@ -7280,11 +7287,12 @@ impl ApiWorkerScheduler {
         // WITHOUT holding inner). OBSERVE-ONLY: no reservation/gate/dispatch change.
         if let Some((reserved_worker_id, _, _)) = result.as_ref() {
             if let Some((fine_key, coarse_key)) = resource_profile_keys(action_info) {
-                // (#task-resource-profile hierarchical-key) The FINE→COARSE lookup resolves
-                // the tier the enforce phase WOULD have used at dispatch. Stash
-                // `(tier, tail_kb, samples)` so completion can classify actual-vs-dispatch
-                // WITHOUT hindsight AND know whether the tail was a (conservative) coarse
-                // fallback. Convert to the stash tuple; `NoProfile` stashes nothing.
+                // (#task-resource-profile hierarchical-key; #2497 p95 policy) The FINE→COARSE
+                // lookup resolves the tier the enforce phase WOULD have used at dispatch. Stash
+                // `(tier, p95_kb, samples)` — the SAME p95 statistic the enforce phase reserves
+                // on — so completion classifies actual-vs-DISPATCH-p95 WITHOUT hindsight AND
+                // knows whether the p95 was a (conservative) coarse fallback. `NoProfile`
+                // stashes nothing.
                 let dispatch_prediction: Option<(ProfileTier, u64, u64)> = match self
                     .resource_profile_map
                     .lock()
@@ -7292,16 +7300,16 @@ impl ApiWorkerScheduler {
                 {
                     TieredTail::Trusted {
                         tier,
-                        tail_kb,
+                        p95_kb,
                         samples,
                         ..
                     }
                     | TieredTail::LowSample {
                         tier,
-                        tail_kb,
+                        p95_kb,
                         samples,
                         ..
-                    } => Some((tier, tail_kb, samples)),
+                    } => Some((tier, p95_kb, samples)),
                     TieredTail::NoProfile => None,
                 };
                 // Only walk the worker map when there is something to stash (the empty-map
@@ -18106,6 +18114,65 @@ mod b1_lock_decouple_tests {
             scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
             0,
             "declared (15360) exceeds the tail (2000) → no raise; DOWN opportunity only"
+        );
+    }
+
+    /// (#2497 p95 policy) THE observe/enforce-consistency discriminator: a SPREAD window
+    /// whose MAX exceeds declared but whose P95 is at/under declared must count as a
+    /// DOWN-opportunity (p95 <= declared), NOT a would-raise — because the enforce phase
+    /// reserves on p95, so the observe counterfactual must too. Under the old max-based
+    /// observe this same key counted as would_raise (max > declared), the exact
+    /// inconsistency this change removes.
+    ///
+    /// Window = 19 @ 10_000 + 1 @ 500_000: max 500_000, p95 10_000, p50 10_000. Declared
+    /// 50_000 → max (500_000) > declared but p95 (10_000) <= declared.
+    ///
+    /// MUTATION: key the observe on `memory_tail_kb` (max) instead of `p95_kb` → max
+    /// 500_000 > declared 50_000 → would_raise fires (1) and down_opportunity stays 0 →
+    /// BOTH asserts red-fail.
+    #[nativelink_test]
+    async fn observe_keys_on_p95_not_max_spread_window() {
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 1_000_000.0).await;
+
+        // A K-mature SPREAD window: 19 low + 1 high, so max ≫ p95.
+        for _ in 0..(crate::resource_profile::PROFILE_MIN_SAMPLES - 1) {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(10_000));
+        }
+        scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(500_000));
+
+        // The window MAX is above declared (the discriminator: max-based observe would raise).
+        assert_eq!(
+            scheduler.resource_profile_peek_tail(&observe_key()).map(|(t, _)| t),
+            Some(500_000),
+            "window max must be 500_000 (> declared 50_000) — the old max-based observe would \
+             have counted this as would_raise"
+        );
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xda, 50_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 50_000.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+
+        assert_eq!(
+            scheduler.metrics.inject_observe_would_raise.load(Ordering::Relaxed),
+            0,
+            "p95 (10_000) <= declared (50_000) → the observe must NOT count would_raise, even \
+             though the window MAX (500_000) exceeds declared — the observe keys on p95, not max"
+        );
+        assert_eq!(
+            scheduler.metrics.down_opportunity_samples.load(Ordering::Relaxed),
+            1,
+            "p95 <= declared → this is the DOWN side: down_opportunity must fire exactly once"
+        );
+        assert_eq!(
+            scheduler.metrics.down_opportunity_sum_x100.load(Ordering::Relaxed),
+            500,
+            "down_opportunity = declared*100/p50 = 50_000*100/10_000 = 500 (p50 is the exact \
+             10_000 low mode)"
         );
     }
 

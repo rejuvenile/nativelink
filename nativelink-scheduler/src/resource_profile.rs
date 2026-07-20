@@ -491,13 +491,16 @@ pub enum TieredTail {
         samples: u64,
     },
     /// A profile existed at >= 1 tier but NEITHER reached `K` samples (untrusted
-    /// tail). Carries the consulted tier's tail + sample count (fine preferred) so a
+    /// tail). Carries the consulted tier's tail + p95 + sample count (fine preferred) so a
     /// dispatch-time stash can represent "present-but-untrusted" for the leave-one-out
     /// check. `p50_kb`/`variance_ratio_x100` are NOT carried: they are trustworthy only
     /// at `>= K` samples (the caller gates on `samples >= K`), so only `Trusted` holds them.
+    /// `p95_kb` (#2497) is carried so a `< K` dispatch stash records the SAME statistic the
+    /// enforce/observe path reserves on — though it is suppressed by the K-recheck at scoring.
     LowSample {
         tier: ProfileTier,
         tail_kb: u64,
+        p95_kb: u64,
         samples: u64,
     },
     /// No profile at either tier (map warming / absent baggage).
@@ -713,11 +716,13 @@ impl ProfileMap {
             (Some(s), _) => TieredTail::LowSample {
                 tier: ProfileTier::Fine,
                 tail_kb: s.tail_kb,
+                p95_kb: s.p95_kb,
                 samples: s.samples,
             },
             (None, Some(s)) => TieredTail::LowSample {
                 tier: ProfileTier::Coarse,
                 tail_kb: s.tail_kb,
+                p95_kb: s.p95_kb,
                 samples: s.samples,
             },
             (None, None) => TieredTail::NoProfile,
@@ -1381,9 +1386,10 @@ mod tests {
             TieredTail::LowSample {
                 tier: ProfileTier::Fine,
                 tail_kb: 1000,
+                p95_kb: 1000,
                 samples: 2,
             },
-            "neither tier reaching K → LowSample carrying the fine (preferred) tier's max"
+            "neither tier reaching K → LowSample carrying the fine (preferred) tier's max + p95"
         );
     }
 
