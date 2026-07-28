@@ -320,6 +320,22 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             return;
         }
 
+        // #F3 sibling (2026-07-28): pin the digest's chunked-partial
+        // state (the SpawnBlocking entry this session's
+        // `write_chunk_at_offset` calls create/reuse) against the
+        // idle-TTL reap for the SESSION's lifetime. RAII: the guard
+        // drops on EVERY exit from this function — the deliberate
+        // abort paths that leave the entry for retry-reuse (client
+        // stream error, client hang-up, writer-ended-without-finish)
+        // included — so the idle clock starts exactly when the session
+        // ends. Acquired BEFORE the race-state attach so the pin
+        // window covers the whole attachment: while ANY v2 writer is
+        // attached to the digest's race-state, the reaper cannot
+        // remove the partial its `chunks_present` bits describe.
+        let _chunked_writer_session_guard = self
+            .filesystem_store_for_v2()
+            .begin_chunked_write_session(digest);
+
         // FIX-4: Atomic get-or-create + attach via the registry. The
         // previous pattern (separate get_or_create + RaceWriterGuard::attach)
         // had an 8-line TOCTOU window where a concurrent

@@ -15,6 +15,8 @@
 use core::fmt::{Debug, Formatter};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "chunked_fast_slow")]
+use core::time::Duration;
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, Weak};
@@ -49,10 +51,12 @@ use crate::callback_utils::ItemCallbackHolder;
 use crate::cas_utils::is_zero_digest;
 #[cfg(feature = "chunked_fast_slow")]
 use crate::chunked::chunked_filesystem::{
-    ChunkedPartialsMap, commit_chunked_to_holding as chunked_commit_to_holding,
+    ChunkedPartialsMap, ChunkedWriterSessionGuard,
+    commit_chunked_to_holding as chunked_commit_to_holding,
     discard_chunked as chunked_discard, finalize_holding as chunked_finalize_holding,
     holding_content_path as chunked_holding_path,
     prune_holding_partials as chunked_prune_holding_partials,
+    spawn_idle_partial_reaper as chunked_spawn_idle_partial_reaper,
     unlink_holding as chunked_unlink_holding,
     write_chunk_at_offset as chunked_write_chunk_at_offset,
 };
@@ -1170,6 +1174,23 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // `.claude/plans/212-chunk-pinned-async-slow-writes.md` §4 Q7
         // and §7.4 once the Phase 2.3 driver lands.
 
+        // #F3 sibling (2026-07-28): idle-TTL reap of abandoned
+        // SpawnBlocking chunked-partial entries. Config-tunable,
+        // default ON (600 s); 0 is the operational kill-switch. The
+        // task holds only a Weak on the map and exits when this store
+        // (the sole strong holder) drops.
+        #[cfg(feature = "chunked_fast_slow")]
+        let chunked_partials = {
+            let map = Arc::new(ChunkedPartialsMap::new());
+            if spec.chunked_idle_partial_reap_ttl_s > 0 {
+                chunked_spawn_idle_partial_reaper(
+                    &map,
+                    Duration::from_secs(spec.chunked_idle_partial_reap_ttl_s),
+                );
+            }
+            map
+        };
+
         Ok(Arc::new_cyclic(|weak_self| Self {
             shared_context,
             evicting_map,
@@ -1187,7 +1208,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             },
             large_read_threshold: spec.large_read_threshold_bytes,
             #[cfg(feature = "chunked_fast_slow")]
-            chunked_partials: Arc::new(ChunkedPartialsMap::new()),
+            chunked_partials,
             #[cfg(feature = "chunked_fast_slow")]
             chunked_race_registry: Arc::new(
                 crate::chunked::chunked_race_state::ChunkRaceRegistry::new(),
@@ -1762,6 +1783,83 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             chunk_bytes,
         )
         .await
+    }
+
+    /// #F3 sibling (2026-07-28): begin a writer session for `digest`,
+    /// pinning its chunked-partial state against the idle-TTL reap for
+    /// the returned guard's lifetime (RAII; Drop is sync and runs on
+    /// normal return, error, panic, and task abort alike — abort-safe
+    /// by construction).
+    ///
+    /// Every writer session that calls [`Self::write_chunk_at_offset`]
+    /// across multiple awaits (the `WriteChunkedV2` per-session task)
+    /// MUST hold one of these for its whole lifetime; otherwise a
+    /// TTL-scale mid-session stall could let the reaper remove the
+    /// partial out from under the live writer. (Single writes are
+    /// additionally protected by the per-write activity stamp.)
+    pub fn begin_chunked_write_session(
+        &self,
+        digest: DigestInfo,
+    ) -> ChunkedWriterSessionGuard {
+        self.chunked_partials.begin_writer_session(digest)
+    }
+
+    /// #F3 sibling test seam: run one idle-reap pass with an explicit
+    /// TTL against this store's `chunked_partials` map. Returns the
+    /// number of entries reaped. Production reaping runs via the
+    /// config-spawned periodic task (`chunked_idle_partial_reap_ttl_s`).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn reap_idle_chunked_partials_for_test(
+        &self,
+        idle_ttl: core::time::Duration,
+    ) -> usize {
+        crate::chunked::chunked_filesystem::reap_idle_spawn_blocking_partials(
+            &self.chunked_partials,
+            idle_ttl,
+        )
+        .await
+    }
+
+    /// #F3 sibling test seam: live writer-session guard count for
+    /// `digest` (the reap's pin signal).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn chunked_active_writers_for_test(
+        &self,
+        digest: &DigestInfo,
+    ) -> usize {
+        self.chunked_partials.active_writer_count(digest)
+    }
+
+    /// #F3 sibling test seam: register (and return) the pre-unlink
+    /// interleaving gate for `digest`. The reaper parks at the gate
+    /// between map-removal and the on-disk unlink. Tests MUST pair with
+    /// [`Self::clear_test_reap_pre_unlink_gate`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_test_reap_pre_unlink_gate(
+        &self,
+        digest: &DigestInfo,
+    ) -> Arc<crate::chunked::chunked_filesystem::ReapGate> {
+        let gate = Arc::new(crate::chunked::chunked_filesystem::ReapGate::new());
+        crate::chunked::chunked_filesystem::TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST
+            .lock()
+            .insert(*digest, Arc::clone(&gate));
+        gate
+    }
+
+    /// #F3 sibling test seam: cleanup counterpart to
+    /// [`Self::set_test_reap_pre_unlink_gate`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn clear_test_reap_pre_unlink_gate(
+        &self,
+        digest: &DigestInfo,
+    ) {
+        crate::chunked::chunked_filesystem::TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST
+            .lock()
+            .remove(digest);
     }
 
     /// #47 b1 Phase 2 Step 2: open the partial fd AND insert the io_uring

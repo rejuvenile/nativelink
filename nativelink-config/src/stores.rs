@@ -818,6 +818,34 @@ pub struct FilesystemSpec {
     /// Default: false (gate off — no change for server-side or non-reconcile stores).
     #[serde(default)]
     pub startup_reconcile_gate: bool,
+
+    /// #F3 sibling (2026-07-28): idle TTL, in seconds, for reaping
+    /// ABANDONED chunked-partial write state (`SpawnBlocking` entries in
+    /// the in-process `chunked_partials` map: open fd + on-disk
+    /// `.partial`). A WriteChunkedV2 session abort deliberately leaves
+    /// the entry so the next retry resumes the same partial; when the
+    /// writers never come back (client gone for good) the entry + fd +
+    /// partial previously leaked until process restart and poisoned
+    /// Path-A dispatch for the digest with `AlreadyExists`. Entries with
+    /// an ACTIVE writer session are never reaped regardless of age;
+    /// io_uring marker entries are handled separately (#F3 liveness
+    /// takeover) and are exempt.
+    ///
+    /// Default: 600 (10 minutes). Rationale: the worker deferred-upload
+    /// retry cadence is ~41 s observed, so a digest still being retried
+    /// refreshes its activity stamp ~14x per TTL and can never idle out;
+    /// 600 s is also 10x the 60 s chunked commit watchdog, so no live
+    /// commit path can outlast it. A truly abandoned digest reclaims
+    /// within TTL + one reap tick (≤ 60 s).
+    ///
+    /// 0 disables the reaper — an operational KILL-SWITCH, not a resting
+    /// state (default stays ON per house policy).
+    #[serde(default = "default_chunked_idle_partial_reap_ttl_s")]
+    pub chunked_idle_partial_reap_ttl_s: u64,
+}
+
+const fn default_chunked_idle_partial_reap_ttl_s() -> u64 {
+    600 // 10 min — see the field doc-comment for the cadence math.
 }
 
 fn default_large_read_threshold() -> u64 {
@@ -840,6 +868,7 @@ impl Default for FilesystemSpec {
             large_read_threshold_bytes: 4 * 1024 * 1024,
             pending_bis_pin_max_bytes: 0,
             startup_reconcile_gate: false,
+            chunked_idle_partial_reap_ttl_s: default_chunked_idle_partial_reap_ttl_s(),
         }
     }
 }

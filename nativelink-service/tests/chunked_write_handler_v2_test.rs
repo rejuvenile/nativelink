@@ -573,6 +573,136 @@ async fn v2_cancel_mid_blob_handoff_to_second_writer_completes() {
 
 
 // -----------------------------------------------------------------------------
+// #F3 sibling: SpawnBlocking abandoned-entry idle reap — v2 session
+// guard composition
+// -----------------------------------------------------------------------------
+
+/// #F3 sibling (2026-07-28): end-to-end composition of the v2 session's
+/// RAII chunked-writer guard with the idle-TTL reap, in the EXACT
+/// production leak shape (client opens a WriteChunkedV2 stream, sends
+/// one chunk, then disconnects for good).
+///
+/// Three contracts in one composition:
+///  1. A LIVE v2 session pins the entry (reap with TTL=0 must skip it).
+///  2. The abort still LEAVES the entry (retry-reuse is load-bearing —
+///     this test guards against "fixing" the leak by discarding on
+///     abort, which would break resume).
+///  3. Once the session is gone and the entry idles, the reap clears
+///     entry + on-disk partial (the leak class itself).
+///
+/// MUTATION M3 (comment out the guard decrement): the wait-for-release
+/// below times out with its bespoke message.
+#[cfg(feature = "test-utils")]
+#[nativelink_test]
+async fn v2_session_abort_leaves_entry_then_idle_reap_clears_it() {
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| (i as u8).wrapping_mul(29))
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let handler = make_handler(Arc::clone(&store), budget);
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // Channel-backed request stream: send chunk 0 (finish=false), then
+    // HOLD the sender so the session stays live mid-blob.
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<WriteChunk>(4);
+    chunk_tx
+        .send(make_chunk(digest, 0, &payload[..TEST_CHUNK_SIZE], false))
+        .await
+        .expect("first chunk send into the request channel must succeed");
+    let mut c = client.clone();
+    let session_handle = tokio::spawn(async move {
+        let stream = tokio_stream::wrappers::ReceiverStream::new(chunk_rx);
+        let response = c.write_chunked_v2(stream).await?;
+        let (final_res, _) = drain_v2_response(response.into_inner()).await;
+        Ok::<_, tonic::Status>(final_res)
+    });
+
+    // Wait until the server-side session has registered the partial.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !store.has_in_flight_chunked_partial(&digest) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("partial entry must appear after chunk 0 lands (deadlock detector)");
+
+    // Contract 1: the live session holds the writer-session guard, so
+    // even a TTL=0 reap must skip the entry.
+    assert!(
+        store.chunked_active_writers_for_test(&digest) >= 1,
+        "run_v2_session must hold the chunked writer-session guard while the \
+         stream is live — count 0 means the RAII guard is not wired into the \
+         v2 session and the reaper could yank a live session's partial",
+    );
+    let reaped = store
+        .reap_idle_chunked_partials_for_test(Duration::ZERO)
+        .await;
+    assert_eq!(
+        reaped, 0,
+        "a LIVE v2 session must pin its SpawnBlocking entry against the reap \
+         (active_writers > 0) — reaping here would delete the partial under a \
+         mid-blob writer",
+    );
+    assert!(
+        store.has_in_flight_chunked_partial(&digest),
+        "entry must survive the reap attempt while the v2 session is live",
+    );
+
+    // Client gone for good — the production leak shape.
+    drop(chunk_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(10), session_handle)
+        .await
+        .expect("v2 session must terminate after client disconnect (deadlock detector)")
+        .expect("session task must not panic");
+
+    // Contract: the guard is released on the abort path (RAII Drop —
+    // abort-safe by construction).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.chunked_active_writers_for_test(&digest) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "the chunked writer-session guard must be RELEASED when the v2 session \
+         aborts (client disconnect) — a stuck active_writers count means the \
+         RAII decrement is broken and abandoned entries would be pinned forever \
+         (the reap could then never fire)",
+    );
+
+    // Contract 2: the abort LEAVES the entry — retry-reuse preserved.
+    assert!(
+        store.has_in_flight_chunked_partial(&digest),
+        "a v2 session abort must LEAVE the SpawnBlocking entry in \
+         chunked_partials (retry-reuse is load-bearing: the next retry resumes \
+         the same .partial without rewriting bytes) — discard-on-abort is the \
+         WRONG fix for the leak",
+    );
+
+    // Contract 3: once idle (TTL=0 here), the reap clears entry + disk.
+    let reaped = store
+        .reap_idle_chunked_partials_for_test(Duration::ZERO)
+        .await;
+    assert_eq!(
+        reaped, 1,
+        "the idle reap must clear the abandoned v2 session's SpawnBlocking \
+         entry — 0 means the 2026-07-28 leak class (entry+fd+partial held until \
+         process restart) is back",
+    );
+    assert!(
+        !store.has_in_flight_chunked_partial(&digest),
+        "entry must be gone from chunked_partials after the idle reap",
+    );
+    assert!(
+        !store.partial_path_for_digest(&digest).exists(),
+        "on-disk .partial must be deleted by the idle reap",
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test 5: corruption regression — bit-identical canonical post-race
 // -----------------------------------------------------------------------------
 

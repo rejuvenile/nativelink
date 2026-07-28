@@ -66,7 +66,8 @@
 #![allow(dead_code, reason = "Phase 2.1 SKELETON; consumers land in Phase 2.3 (#212)")]
 
 use core::fmt::Debug;
-use std::collections::HashMap;
+use core::time::Duration;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -76,7 +77,9 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::spawn_rate_probe::{record, SpawnSite};
 use parking_lot::Mutex;
+use nativelink_util::background_spawn;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::Instant as TokioInstant;
 #[cfg(feature = "bench-trace")]
 use tracing::info;
 use tracing::{debug, warn};
@@ -179,6 +182,17 @@ pub(crate) enum ChunkInProgress {
         /// path (the caller passes `expected_size` to commit) but
         /// useful for log messages and the commit length-check.
         declared_size: u64,
+        /// #F3 sibling (2026-07-28 abandoned-entry reap): last moment
+        /// this entry showed writer activity — refreshed on entry
+        /// creation, on every per-chunk fetch, on writer-session begin,
+        /// and when the last writer-session guard drops (the
+        /// `idle_since` stamp). The idle-TTL reap
+        /// ([`reap_idle_spawn_blocking_partials`]) removes entries whose
+        /// stamp is older than the configured TTL AND whose
+        /// `active_writers` count is zero. `tokio::time::Instant` so
+        /// paused-clock tests can drive the TTL deterministically
+        /// (identical to `std` in production).
+        last_activity: Mutex<TokioInstant>,
     },
     /// #47 b1 Phase 2 Step 3: io_uring writev coalescer marker. The
     /// fd lives inside the per-blob `writer_task`; this entry only
@@ -269,7 +283,9 @@ impl Drop for IoUringMarkerGuard {
         // `write_chunk_at_offset`, Path-A reap in
         // `open_or_create_partial_marker`) remove it once the fd dies.
         // If no retry ever arrives the entry persists until restart —
-        // same accepted class as abandoned SpawnBlocking entries.
+        // the #F3-sibling idle-TTL reap deliberately EXEMPTS
+        // IoUringMarker entries (see `reap_idle_spawn_blocking_partials`)
+        // precisely so it can never race this drain window.
         // A `Weak` count can never go 0 → >0, so observing 0 here is
         // terminal and the removal below cannot race a resurrection.
         if let ChunkInProgress::IoUringMarker { writer_fd, .. } = mine.as_ref() {
@@ -284,12 +300,13 @@ impl Drop for IoUringMarkerGuard {
                 return;
             }
         }
-        let mut guard = self.map.inner.lock();
+        let mut guard = self.map.state.lock();
         let still_mine = guard
+            .partials
             .get(&self.digest)
             .is_some_and(|current| Arc::ptr_eq(current, &mine));
         if still_mine {
-            guard.remove(&self.digest);
+            guard.partials.remove(&self.digest);
             drop(guard);
             warn!(
                 digest = ?self.digest,
@@ -342,6 +359,32 @@ impl Debug for ChunkInProgress {
     }
 }
 
+/// All mutable map state behind ONE `parking_lot::Mutex`. The three
+/// collections share the lock deliberately: the #F3-sibling idle reap's
+/// correctness argument is that entry acquisition, the
+/// `active_writers` check, the entry removal, and the `reaping` mark
+/// are all serialized on this single lock — no cross-lock ordering to
+/// get wrong.
+#[derive(Debug, Default)]
+struct PartialsState {
+    /// digest → in-flight chunked partial (the original map).
+    partials: HashMap<DigestInfo, Arc<ChunkInProgress>>,
+    /// #F3 sibling: digest → count of live writer-session guards
+    /// ([`ChunkedWriterSessionGuard`]). The idle reap NEVER removes an
+    /// entry whose count is non-zero (#494 protection direction).
+    /// Entries are removed when the count returns to zero, so the map
+    /// is bounded by the number of concurrently live sessions.
+    active_writers: HashMap<DigestInfo, usize>,
+    /// #F3 sibling: digests whose entry has been removed by the reap
+    /// but whose on-disk `.partial` unlink is still in flight. A new
+    /// session's file-open WAITS (via [`ChunkedPartialsMap::reap_done`])
+    /// while its digest is here, so it can never create a fresh partial
+    /// that the in-flight unlink would then delete (torn state).
+    /// Bounded by the reap batch size (transient, microseconds-long
+    /// residency per digest).
+    reaping: HashSet<DigestInfo>,
+}
+
 /// Process-internal map of digest → in-flight chunked partial. Owned
 /// by `FilesystemStore` (one per store; chunked partials are tied to
 /// the store's `temp_path` layout).
@@ -354,7 +397,12 @@ impl Debug for ChunkInProgress {
 /// mutex inside.
 #[derive(Debug, Default)]
 pub(crate) struct ChunkedPartialsMap {
-    inner: Mutex<HashMap<DigestInfo, Arc<ChunkInProgress>>>,
+    state: Mutex<PartialsState>,
+    /// #F3 sibling: notified (via `notify_waiters`) each time a reap
+    /// finishes a digest's unlink and clears its `reaping` mark. Woken
+    /// waiters re-check `reaping` under the state lock (enable-before-
+    /// check pattern; spurious wakeups just loop).
+    reap_done: tokio::sync::Notify,
 }
 
 impl ChunkedPartialsMap {
@@ -366,7 +414,7 @@ impl ChunkedPartialsMap {
     /// metric hook; non-load-bearing for the I/O path.
     #[allow(dead_code, reason = "wired in Phase 2.3 driver instrumentation")]
     pub(crate) fn in_flight_count(&self) -> usize {
-        self.inner.lock().len()
+        self.state.lock().partials.len()
     }
 
     /// Returns `true` if the given digest currently has an in-flight
@@ -374,7 +422,107 @@ impl ChunkedPartialsMap {
     /// the `commit_chunked` / `discard_chunked` return code instead.
     #[allow(dead_code, reason = "test-only observation; Phase 2.3 may use during drain")]
     pub(crate) fn contains(&self, digest: &DigestInfo) -> bool {
-        self.inner.lock().contains_key(digest)
+        self.state.lock().partials.contains_key(digest)
+    }
+
+    /// #F3 sibling: number of live writer-session guards for `digest`.
+    /// Test observation seam (exposed via
+    /// `FilesystemStore::chunked_active_writers_for_test`).
+    #[allow(dead_code, reason = "test observation seam")]
+    pub(crate) fn active_writer_count(&self, digest: &DigestInfo) -> usize {
+        self.state
+            .lock()
+            .active_writers
+            .get(digest)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// #F3 sibling: begin a writer session for `digest`, returning the
+    /// RAII guard that pins the digest's chunked-partial state against
+    /// the idle reap for the guard's lifetime. Sync (one short lock
+    /// hold) so it can be acquired anywhere, and the release is a plain
+    /// `Drop` — abort-safe by construction (runs on normal return,
+    /// `?`-error, panic, and task abort alike).
+    ///
+    /// Serialization contract: the increment happens under the same
+    /// state lock the reap's `active_writers == 0` check takes, so a
+    /// session acquiring concurrently with a reap pass either lands
+    /// first (reap sees the count and skips) or lands after the entry
+    /// was removed (its first write creates a fresh entry — waiting out
+    /// any in-flight unlink via the `reaping` mark).
+    pub(crate) fn begin_writer_session(
+        self: &Arc<Self>,
+        digest: DigestInfo,
+    ) -> ChunkedWriterSessionGuard {
+        let mut st = self.state.lock();
+        *st.active_writers.entry(digest).or_insert(0) += 1;
+        if let Some(entry) = st.partials.get(&digest) {
+            touch_spawn_blocking_activity(entry);
+        }
+        ChunkedWriterSessionGuard {
+            map: Arc::clone(self),
+            digest,
+        }
+    }
+}
+
+/// #F3 sibling: refresh a `SpawnBlocking` entry's `last_activity`
+/// stamp. No-op for `IoUringMarker` (exempt from the idle reap — #F3's
+/// Weak-fd liveness takeover owns that variant's lifecycle).
+fn touch_spawn_blocking_activity(entry: &Arc<ChunkInProgress>) {
+    if let ChunkInProgress::SpawnBlocking { last_activity, .. } = entry.as_ref() {
+        *last_activity.lock() = TokioInstant::now();
+    }
+}
+
+/// #F3 sibling (2026-07-28): RAII pin for a writer session on a
+/// digest's chunked-partial state. Held by every live writer session
+/// (the `WriteChunkedV2` per-session task holds one for its whole
+/// lifetime); the idle-TTL reap skips any digest with a live guard, so
+/// a mid-blob session can never have its partial reaped out from under
+/// it regardless of how long it stalls.
+///
+/// Drop decrements the per-digest count under the map's state lock and,
+/// when the count reaches zero, stamps the entry's `last_activity`
+/// (the brief's `idle_since`): the idle-TTL clock starts at last
+/// session exit, not at last write.
+#[must_use = "dropping the guard immediately would unpin the session's chunked-partial state"]
+pub struct ChunkedWriterSessionGuard {
+    map: Arc<ChunkedPartialsMap>,
+    digest: DigestInfo,
+}
+
+impl Debug for ChunkedWriterSessionGuard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ChunkedWriterSessionGuard")
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
+impl Drop for ChunkedWriterSessionGuard {
+    fn drop(&mut self) {
+        let mut st = self.map.state.lock();
+        let mut now_zero = false;
+        if let Some(count) = st.active_writers.get_mut(&self.digest) {
+            *count = count.saturating_sub(1);
+            now_zero = *count == 0;
+        } else {
+            debug_assert!(
+                false,
+                "ChunkedWriterSessionGuard dropped for a digest with no \
+                 active_writers record — double-drop or bookkeeping bug"
+            );
+        }
+        if now_zero {
+            st.active_writers.remove(&self.digest);
+            // Stamp idle_since: the TTL clock starts when the LAST
+            // writer session for the digest exits.
+            if let Some(entry) = st.partials.get(&self.digest) {
+                touch_spawn_blocking_activity(entry);
+            }
+        }
     }
 }
 
@@ -509,60 +657,107 @@ async fn open_or_create_partial(
     digest: DigestInfo,
     temp_path_root: &str,
 ) -> Result<Arc<ChunkInProgress>, Error> {
-    // Fast path: entry already exists. Avoid the spawn_blocking on the
-    // hot per-chunk path when the file is already open.
-    if let Some(existing) = map.inner.lock().get(&digest).cloned() {
-        return Ok(existing);
-    }
-
-    // Slow path: open the file. Done in `spawn_blocking` because
-    // `OpenOptions::open` is a blocking syscall that on a slow ZFS
-    // pool can take milliseconds.
     let path = partial_temp_path(temp_path_root, &digest);
-    let path_for_blocking = path.clone();
-    let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
-        // create(true) + write(true) — sparse semantics handled by the
-        // kernel + ZFS on first pwrite at a non-zero offset. NO O_SYNC,
-        // NO O_DSYNC, NO O_DIRECT (CLAUDE.md hard rule).
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path_for_blocking)
-    })
-    .await
-    .map_err(|join_err| make_err!(Code::Internal, "spawn_blocking join error opening chunked partial: {join_err:?}"))?
-    .map_err(|io_err| {
-        make_err!(
-            Code::Internal,
-            "failed to open chunked partial temp file {}: {io_err:?}",
-            path.display()
-        )
-    })?;
+    loop {
+        // Fast path + reap gate, under one lock hold. If an entry
+        // exists, use it (refreshing its activity stamp — the idle-TTL
+        // reap must never fire on an actively-written entry). If the
+        // digest's previous entry is mid-reap (removed from the map,
+        // on-disk unlink still in flight), WAIT for the unlink to
+        // finish before creating a fresh file — otherwise the in-flight
+        // unlink would delete the file we just created (#F3 sibling
+        // torn-state closure; the map is the sync point).
+        {
+            // Enable-before-check so a reap finishing between the lock
+            // release and the `.await` still wakes us (no lost wakeup).
+            let notified = map.reap_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let st = map.state.lock();
+                if let Some(existing) = st.partials.get(&digest) {
+                    touch_spawn_blocking_activity(existing);
+                    return Ok(Arc::clone(existing));
+                }
+                if st.reaping.contains(&digest) {
+                    drop(st);
+                    debug!(
+                        ?digest,
+                        "open_or_create_partial: digest is mid-reap (unlink in \
+                         flight); waiting before creating a fresh partial"
+                    );
+                    notified.await;
+                    continue;
+                }
+            }
+        }
 
-    let new_entry = Arc::new(ChunkInProgress::SpawnBlocking {
-        path,
-        file: AsyncMutex::new(opened),
-        declared_size: digest.size_bytes(),
-    });
+        // Slow path: open the file. Done in `spawn_blocking` because
+        // `OpenOptions::open` is a blocking syscall that on a slow ZFS
+        // pool can take milliseconds.
+        let path_for_blocking = path.clone();
+        let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
+            // create(true) + write(true) — sparse semantics handled by the
+            // kernel + ZFS on first pwrite at a non-zero offset. NO O_SYNC,
+            // NO O_DSYNC, NO O_DIRECT (CLAUDE.md hard rule).
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path_for_blocking)
+        })
+        .await
+        .map_err(|join_err| make_err!(Code::Internal, "spawn_blocking join error opening chunked partial: {join_err:?}"))?
+        .map_err(|io_err| {
+            make_err!(
+                Code::Internal,
+                "failed to open chunked partial temp file {}: {io_err:?}",
+                path.display()
+            )
+        })?;
 
-    // Race resolution: another caller may have created the entry
-    // between our `cloned()` check above and the `open_or_create_partial`
-    // re-acquire here. If so, drop our just-opened file and use theirs.
-    // Cost: one extra `open` + `close` syscall for the loser. Not on
-    // the steady-state hot path (only first chunk per digest).
-    let mut guard = map.inner.lock();
-    if let Some(existing) = guard.get(&digest).cloned() {
-        debug!(?digest, "chunked partial open race resolved; using existing entry");
-        drop(guard);
-        // `new_entry`'s file dropped here — the actual on-disk file
-        // remains (both opens went to the SAME path so the second open
-        // just re-opened the same inode). The race-loser's open
-        // dropped its fd; the winner still holds theirs.
-        return Ok(existing);
+        let new_entry = Arc::new(ChunkInProgress::SpawnBlocking {
+            path: path.clone(),
+            file: AsyncMutex::new(opened),
+            declared_size: digest.size_bytes(),
+            last_activity: Mutex::new(TokioInstant::now()),
+        });
+
+        // Race resolution: another caller may have created the entry
+        // between our fast-path check above and the re-acquire here. If
+        // so, drop our just-opened file and use theirs. Cost: one extra
+        // `open` + `close` syscall for the loser. Not on the
+        // steady-state hot path (only first chunk per digest).
+        let mut guard = map.state.lock();
+        if let Some(existing) = guard.partials.get(&digest).cloned() {
+            debug!(?digest, "chunked partial open race resolved; using existing entry");
+            touch_spawn_blocking_activity(&existing);
+            drop(guard);
+            // `new_entry`'s file dropped here — the actual on-disk file
+            // remains (both opens went to the SAME path so the second open
+            // just re-opened the same inode). The race-loser's open
+            // dropped its fd; the winner still holds theirs.
+            return Ok(existing);
+        }
+        if guard.reaping.contains(&digest) {
+            // A reap collected the digest's (previous) entry while we
+            // were opening; our freshly-opened fd points at a path the
+            // in-flight unlink will delete. Drop the fd and re-run the
+            // wait loop. (Reachable only when the previous entry
+            // crossed the idle TTL between our fast-path check and
+            // here — paused-clock tests can drive it deterministically;
+            // in production it needs a TTL-scale stall inside `open`.)
+            drop(guard);
+            debug!(
+                ?digest,
+                "open_or_create_partial: open raced an in-flight reap unlink; \
+                 dropping the fresh fd and retrying"
+            );
+            continue;
+        }
+        guard.partials.insert(digest, Arc::clone(&new_entry));
+        return Ok(new_entry);
     }
-    guard.insert(digest, Arc::clone(&new_entry));
-    Ok(new_entry)
 }
 
 /// #47 b1 Phase 2 Step 3: open the partial temp file AND insert the
@@ -585,90 +780,131 @@ pub(crate) async fn open_or_create_partial_marker(
     temp_path_root: &str,
 ) -> Result<(Arc<std::fs::File>, IoUringMarkerGuard), Error> {
     let path = partial_temp_path(temp_path_root, &digest);
-    let path_for_blocking = path.clone();
-    let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
-        // NO O_SYNC, NO O_DSYNC, NO O_DIRECT (CLAUDE.md hard rule).
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path_for_blocking)
-    })
-    .await
-    .map_err(|join_err| {
-        make_err!(
-            Code::Internal,
-            "spawn_blocking join error opening chunked partial (marker): {join_err:?}"
-        )
-    })?
-    .map_err(|io_err| {
-        make_err!(
-            Code::Internal,
-            "failed to open chunked partial temp file {} (marker): {io_err:?}",
-            path.display()
-        )
-    })?;
-
-    let fd_arc = Arc::new(opened);
-
-    // Insert the marker. The handler-side admission contract guarantees
-    // at-most-one driver per digest at a time, so a same-digest race
-    // here would be a contract bug; but be defensive — if an entry
-    // already exists with a LIVE owner, return an error rather than
-    // overwrite. #F3 sibling of the `write_chunk_at_offset` takeover: a
-    // pre-existing IoUringMarker whose driver is DEAD (fd Weak dangles —
-    // aborted driver, un-discarded error exit) is reaped here so a
-    // Path-A retry is not wedged behind its own predecessor's corpse.
-    // SpawnBlocking entries are never reaped from here: their fd lives
-    // IN the map (no liveness signal) and Path-B reuses them by design.
-    let mut guard = map.inner.lock();
-    // CR-2 (fc2573b4 review): the reap + fresh-insert MUST stay atomic
-    // under one lock hold, so the reap `warn!` is deferred to after the
-    // lock is released (flag below) — matching `IoUringMarkerGuard::drop`'s
-    // drop-before-warn hygiene.
-    let mut reaped_stale = false;
-    if let Some(existing) = guard.get(&digest) {
-        let stale_io_uring = match existing.as_ref() {
-            ChunkInProgress::SpawnBlocking { .. } => false,
-            ChunkInProgress::IoUringMarker { writer_fd, .. } => writer_fd.strong_count() == 0,
-        };
-        if stale_io_uring {
-            guard.remove(&digest);
-            reaped_stale = true;
-        } else {
-            let variant = match existing.as_ref() {
-                ChunkInProgress::SpawnBlocking { .. } => "SpawnBlocking",
-                ChunkInProgress::IoUringMarker { .. } => "IoUringMarker",
-            };
-            drop(guard);
-            return Err(make_err!(
-                Code::AlreadyExists,
-                "chunked partial entry already exists for {digest} (variant={variant}); \
-                 open_or_create_partial_marker called while a driver is in flight"
-            ));
+    loop {
+        // #F3-sibling reap gate: if the digest's previous SpawnBlocking
+        // entry is mid-reap (map entry removed, on-disk unlink still in
+        // flight), WAIT before opening — otherwise the fresh Path-A
+        // partial we create below would be deleted by the in-flight
+        // unlink. Same enable-before-check pattern as
+        // `open_or_create_partial`.
+        {
+            let notified = map.reap_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let st = map.state.lock();
+                if st.reaping.contains(&digest) {
+                    drop(st);
+                    debug!(
+                        ?digest,
+                        "open_or_create_partial_marker: digest is mid-reap; \
+                         waiting before creating a fresh partial"
+                    );
+                    notified.await;
+                    continue;
+                }
+            }
         }
+
+        let path_for_blocking = path.clone();
+        let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
+            // NO O_SYNC, NO O_DSYNC, NO O_DIRECT (CLAUDE.md hard rule).
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path_for_blocking)
+        })
+        .await
+        .map_err(|join_err| {
+            make_err!(
+                Code::Internal,
+                "spawn_blocking join error opening chunked partial (marker): {join_err:?}"
+            )
+        })?
+        .map_err(|io_err| {
+            make_err!(
+                Code::Internal,
+                "failed to open chunked partial temp file {} (marker): {io_err:?}",
+                path.display()
+            )
+        })?;
+
+        let fd_arc = Arc::new(opened);
+
+        // Insert the marker. The handler-side admission contract guarantees
+        // at-most-one driver per digest at a time, so a same-digest race
+        // here would be a contract bug; but be defensive — if an entry
+        // already exists with a LIVE owner, return an error rather than
+        // overwrite. #F3 sibling of the `write_chunk_at_offset` takeover: a
+        // pre-existing IoUringMarker whose driver is DEAD (fd Weak dangles —
+        // aborted driver, un-discarded error exit) is reaped here so a
+        // Path-A retry is not wedged behind its own predecessor's corpse.
+        // SpawnBlocking entries are never reaped from here: their fd lives
+        // IN the map (no liveness signal) and Path-B reuses them by design.
+        // (Abandoned SpawnBlocking entries are instead reclaimed by the
+        // idle-TTL reap — `reap_idle_spawn_blocking_partials`.)
+        let mut guard = map.state.lock();
+        if guard.reaping.contains(&digest) {
+            // A reap collected the digest's previous entry while we were
+            // opening; drop the fresh fd and wait out the unlink.
+            drop(guard);
+            drop(fd_arc);
+            debug!(
+                ?digest,
+                "open_or_create_partial_marker: open raced an in-flight reap \
+                 unlink; dropping the fresh fd and retrying"
+            );
+            continue;
+        }
+        // CR-2 (fc2573b4 review): the reap + fresh-insert MUST stay atomic
+        // under one lock hold, so the reap `warn!` is deferred to after the
+        // lock is released (flag below) — matching `IoUringMarkerGuard::drop`'s
+        // drop-before-warn hygiene.
+        let mut reaped_stale = false;
+        if let Some(existing) = guard.partials.get(&digest) {
+            let stale_io_uring = match existing.as_ref() {
+                ChunkInProgress::SpawnBlocking { .. } => false,
+                ChunkInProgress::IoUringMarker { writer_fd, .. } => writer_fd.strong_count() == 0,
+            };
+            if stale_io_uring {
+                guard.partials.remove(&digest);
+                reaped_stale = true;
+            } else {
+                let variant = match existing.as_ref() {
+                    ChunkInProgress::SpawnBlocking { .. } => "SpawnBlocking",
+                    ChunkInProgress::IoUringMarker { .. } => "IoUringMarker",
+                };
+                drop(guard);
+                return Err(make_err!(
+                    Code::AlreadyExists,
+                    "chunked partial entry already exists for {digest} (variant={variant}); \
+                     open_or_create_partial_marker called while a driver is in flight"
+                ));
+            }
+        }
+        let entry = Arc::new(ChunkInProgress::IoUringMarker {
+            path: path.clone(),
+            declared_size: digest.size_bytes(),
+            writer_fd: Arc::downgrade(&fd_arc),
+        });
+        let cleanup_guard = IoUringMarkerGuard {
+            map: Arc::clone(map),
+            digest,
+            entry: Arc::downgrade(&entry),
+        };
+        guard.partials.insert(digest, entry);
+        drop(guard);
+        if reaped_stale {
+            warn!(
+                ?digest,
+                "open_or_create_partial_marker: reaped STALE IoUringMarker entry \
+                 (previous io_uring driver died without cleanup) before inserting a \
+                 fresh marker (#F3 2026-07-28)",
+            );
+        }
+        return Ok((fd_arc, cleanup_guard));
     }
-    let entry = Arc::new(ChunkInProgress::IoUringMarker {
-        path,
-        declared_size: digest.size_bytes(),
-        writer_fd: Arc::downgrade(&fd_arc),
-    });
-    let cleanup_guard = IoUringMarkerGuard {
-        map: Arc::clone(map),
-        digest,
-        entry: Arc::downgrade(&entry),
-    };
-    guard.insert(digest, entry);
-    drop(guard);
-    if reaped_stale {
-        warn!(
-            ?digest,
-            "open_or_create_partial_marker: reaped STALE IoUringMarker entry \
-             (previous io_uring driver died without cleanup) before inserting a \
-             fresh marker (#F3 2026-07-28)",
-        );
-    }
-    Ok((fd_arc, cleanup_guard))
 }
 
 /// Write one chunk at the given byte offset into the sparse partial.
@@ -726,7 +962,7 @@ pub(crate) async fn write_chunk_at_offset(
     #[cfg(any(test, feature = "test-utils"))]
     if let Some(delay_ms) = delay {
         if delay_ms > 0 {
-            tokio::time::sleep(core::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
 
@@ -769,12 +1005,13 @@ pub(crate) async fn write_chunk_at_offset(
              taking the entry over for the fallback writer (#F3 2026-07-28 wedge self-heal)",
         );
         {
-            let mut guard = map.inner.lock();
+            let mut guard = map.state.lock();
             let still_same = guard
+                .partials
                 .get(digest)
                 .is_some_and(|current| Arc::ptr_eq(current, &entry));
             if still_same {
-                guard.remove(digest);
+                guard.partials.remove(digest);
             }
         }
         entry = open_or_create_partial(map, *digest, temp_path_root).await?;
@@ -1042,7 +1279,7 @@ pub(crate) async fn commit_chunked_to_holding(
     // path below correctly handles it: `actual_len == 0 == expected_size`
     // → rename succeeds. So we don't disturb that case.
     if expected_size == 0 {
-        let has_entry = map.inner.lock().contains_key(digest);
+        let has_entry = map.state.lock().partials.contains_key(digest);
         if !has_entry {
             let to_path_for_blocking = holding_path.clone();
             tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
@@ -1075,8 +1312,8 @@ pub(crate) async fn commit_chunked_to_holding(
     // fails we want the entry to remain so `discard_chunked` (called
     // by the caller) can find it.
     let entry = {
-        let guard = map.inner.lock();
-        guard.get(digest).cloned()
+        let guard = map.state.lock();
+        guard.partials.get(digest).cloned()
     };
     let entry = entry.ok_or_else(|| {
         make_err!(
@@ -1228,7 +1465,7 @@ pub(crate) async fn finalize_holding(
     // it referred to has already been renamed → unlinked from its
     // original directory entry, so the closing fd is a no-op WRT the
     // canonical CAS file (a different inode at this point).
-    let removed = map.inner.lock().remove(digest);
+    let removed = map.state.lock().partials.remove(digest);
     drop(removed);
     Ok(())
 }
@@ -1300,7 +1537,7 @@ pub(crate) async fn discard_chunked(
     #[cfg(any(test, feature = "test-utils"))]
     if let Some(delay_ms) = discard_delay {
         if delay_ms > 0 {
-            tokio::time::sleep(core::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
     }
 
@@ -1311,16 +1548,17 @@ pub(crate) async fn discard_chunked(
     // `discard_chunked` only knows about in-process state. The
     // recovery sweep handles disk-only orphans.
     let entry = {
-        let mut guard = map.inner.lock();
+        let mut guard = map.state.lock();
         match expected_identity {
-            None => guard.remove(digest),
+            None => guard.partials.remove(digest),
             Some(expected) => {
                 let is_mine = expected.upgrade().is_some_and(|mine| {
                     guard
+                        .partials
                         .get(digest)
                         .is_some_and(|current| Arc::ptr_eq(current, &mine))
                 });
-                if is_mine { guard.remove(digest) } else { None }
+                if is_mine { guard.partials.remove(digest) } else { None }
             }
         }
     };
@@ -1363,6 +1601,235 @@ pub(crate) async fn discard_chunked(
         )
     })?;
     Ok(())
+}
+
+/// #F3 sibling (2026-07-28) test hook: per-digest gate the idle reap
+/// parks at BETWEEN map-removal (+ `reaping` mark) and the on-disk
+/// unlink. Lets the deterministic reap-vs-new-session race test pin the
+/// exact interleaving (notify + semaphore; no sleeps, no jitter).
+/// Production builds compile the lookup out entirely.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) static TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST: std::sync::LazyLock<
+    Mutex<HashMap<DigestInfo, Arc<ReapGate>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// #F3 sibling test hook: the gate object for
+/// [`TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST`]. The reaper sets
+/// `reached_flag` + notifies `reached` when it arrives at the
+/// pre-unlink point, then awaits one `proceed` permit.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub struct ReapGate {
+    /// Notified when the reaper reaches the pre-unlink point.
+    pub reached: tokio::sync::Notify,
+    /// Set before `reached` is notified (enable-before-check on the
+    /// test side avoids lost wakeups).
+    pub reached_flag: core::sync::atomic::AtomicBool,
+    /// The reaper awaits one permit here before unlinking.
+    pub proceed: tokio::sync::Semaphore,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ReapGate {
+    pub fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            reached_flag: core::sync::atomic::AtomicBool::new(false),
+            proceed: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Default for ReapGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// #F3 sibling (2026-07-28): reap ABANDONED `SpawnBlocking` entries —
+/// idle (no writer-session guard, no write activity) for at least
+/// `idle_ttl` — from the in-process `chunked_partials` map. For each
+/// victim: remove the entry from the map (the entry `Arc` drop closes
+/// the held fd), then best-effort unlink the on-disk `.partial`.
+///
+/// Why this exists: a `WriteChunkedV2` session abort deliberately
+/// LEAVES the entry so the next retry resumes the same partial (that
+/// reuse is load-bearing and preserved — a live retry cadence, ~41 s
+/// observed, refreshes the activity stamp and never idles out). But a
+/// digest whose writers never return (client gone for good) previously
+/// held entry + open fd + on-disk partial until PROCESS RESTART — the
+/// map is process-memory only — and poisoned Path-A dispatch for the
+/// digest with `Code::AlreadyExists`.
+///
+/// Synchronization contract (all on the single `state` lock):
+/// - An entry with `active_writers > 0` is NEVER touched (#494
+///   double-writer protection direction; the RAII
+///   [`ChunkedWriterSessionGuard`] is the pin).
+/// - Victim selection + map removal + the `reaping` mark happen in ONE
+///   lock hold, so a concurrent session acquisition either lands first
+///   (count observed, reap skips) or finds no entry (creates fresh).
+/// - The `reaping` mark makes a fresh CREATE for the digest wait until
+///   the unlink completes (`open_or_create_partial` /
+///   `open_or_create_partial_marker` gate), closing the torn-state
+///   window where the in-flight unlink would delete a file a new
+///   session just created.
+/// - `IoUringMarker` entries are EXEMPT: #F3's Weak-fd liveness
+///   takeover + `IoUringMarkerGuard` own that variant's lifecycle;
+///   reaping them here could race the takeover.
+///
+/// Returns the number of entries reaped.
+pub(crate) async fn reap_idle_spawn_blocking_partials(
+    map: &Arc<ChunkedPartialsMap>,
+    idle_ttl: Duration,
+) -> usize {
+    let now = TokioInstant::now();
+    let mut victims: Vec<(DigestInfo, PathBuf, Arc<ChunkInProgress>)> = Vec::new();
+    {
+        let mut st = map.state.lock();
+        let expired: Vec<DigestInfo> = st
+            .partials
+            .iter()
+            .filter(|(digest, entry)| {
+                // MUTATION M2 target: an entry with a live writer
+                // session is pinned regardless of idle age.
+                if st.active_writers.get(*digest).copied().unwrap_or(0) > 0 {
+                    return false;
+                }
+                match entry.as_ref() {
+                    ChunkInProgress::SpawnBlocking { last_activity, .. } => {
+                        now.saturating_duration_since(*last_activity.lock()) >= idle_ttl
+                    }
+                    // #F3 owns IoUringMarker lifecycle (Weak-fd
+                    // takeover + marker guard) — never double-handle.
+                    // Post-F1 this exemption is also LOAD-BEARING for
+                    // the abort-drain window: a marker left resident
+                    // with a live writer fd (IoUringMarkerGuard::drop
+                    // F1 arm) must never be idle-reaped — removing it
+                    // drops the #494 presence-keyed gate while the
+                    // detached writer can still write the inode.
+                    ChunkInProgress::IoUringMarker { .. } => false,
+                }
+            })
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in expired {
+            // MUTATION M1 target: the removal itself.
+            if let Some(entry) = st.partials.remove(&digest) {
+                st.reaping.insert(digest);
+                let path = entry.path().clone();
+                victims.push((digest, path, entry));
+            }
+        }
+    }
+    if victims.is_empty() {
+        return 0;
+    }
+    let reaped = victims.len();
+    for (digest, path, entry) in victims {
+        let idle_for = match entry.as_ref() {
+            ChunkInProgress::SpawnBlocking { last_activity, .. } => {
+                now.saturating_duration_since(*last_activity.lock())
+            }
+            ChunkInProgress::IoUringMarker { .. } => Duration::ZERO,
+        };
+        // Drop OUR Arc outside the lock: normally the last reference,
+        // closing the SpawnBlocking fd before the unlink (Linux
+        // delete-while-open is safe regardless if a stray clone lives).
+        drop(entry);
+
+        // Test-only interleaving gate (reap-vs-new-session race test).
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let gate = TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST.lock().get(&digest).cloned();
+            if let Some(gate) = gate {
+                gate.reached_flag
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+                gate.reached.notify_waiters();
+                let _permit = gate
+                    .proceed
+                    .acquire()
+                    .await
+                    .expect("test reap pre-unlink gate semaphore must not be closed");
+            }
+        }
+
+        // Best-effort unlink. NotFound is fine (e.g. a concurrent
+        // discard already unlinked). Errors are logged, never fatal —
+        // the startup prune sweep remains the disk-side backstop.
+        let path_for_unlink = path.clone();
+        let unlink_res = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+            match std::fs::remove_file(&path_for_unlink) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        match unlink_res {
+            Ok(Ok(())) => {}
+            Ok(Err(io_err)) => warn!(
+                ?digest,
+                ?path,
+                ?io_err,
+                "chunked idle reap: best-effort .partial unlink failed; \
+                 startup prune sweep will collect it"
+            ),
+            Err(join_err) => warn!(
+                ?digest,
+                ?path,
+                ?join_err,
+                "chunked idle reap: spawn_blocking join error during unlink"
+            ),
+        }
+
+        // ALWAYS clear the reaping mark (waiters would wedge forever
+        // otherwise), then wake any create that was gated on it.
+        {
+            let mut st = map.state.lock();
+            st.reaping.remove(&digest);
+        }
+        map.reap_done.notify_waiters();
+
+        warn!(
+            ?digest,
+            idle_secs = idle_for.as_secs(),
+            ?path,
+            "chunked idle reap: removed abandoned SpawnBlocking chunked-partial \
+             entry (entry + fd + on-disk partial) — no writer session for longer \
+             than the idle TTL (#F3 sibling, 2026-07-28); the digest's next \
+             retry restarts from offset 0",
+        );
+    }
+    reaped
+}
+
+/// #F3 sibling: spawn the periodic idle-reap task for a store's
+/// `chunked_partials` map. Holds only a `Weak` on the map: the task
+/// exits when the owning `FilesystemStore` (the sole strong holder)
+/// drops. Tick = `min(idle_ttl, 60 s)`, bounding reclaim latency at
+/// `idle_ttl + tick`. Callers gate on `idle_ttl > 0` (config
+/// kill-switch).
+///
+/// Why a dedicated periodic task (and not the existing
+/// `run_async_commit_reaper`): that reaper is a PER-COMMIT watchdog —
+/// spawned per dispatched commit and gone when the commit resolves —
+/// while this leak's defining condition is "NO live session/commit for
+/// the digest", when no such task exists to piggy-back on. It also
+/// lives in `nativelink-service`; the map is store-internal.
+pub(crate) fn spawn_idle_partial_reaper(map: &Arc<ChunkedPartialsMap>, idle_ttl: Duration) {
+    let weak_map = Arc::downgrade(map);
+    let tick = idle_ttl.min(Duration::from_secs(60));
+    background_spawn!("chunked_idle_partial_reaper", async move {
+        loop {
+            tokio::time::sleep(tick).await;
+            let Some(map) = weak_map.upgrade() else {
+                // Owning store dropped; nothing left to reap.
+                return;
+            };
+            let _ = reap_idle_spawn_blocking_partials(&map, idle_ttl).await;
+        }
+    });
 }
 
 // Crash-recovery for chunked partials is handled by the legacy
