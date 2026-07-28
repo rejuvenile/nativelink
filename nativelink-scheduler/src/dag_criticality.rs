@@ -63,7 +63,10 @@ pub type DagNodeKey = ProfileKey;
 /// bounds the map to the recency window of actively-observed edges. Over-cap evicts the
 /// least-recently-observed edge (counted), so stale edges from deleted targets age out —
 /// the desired recency semantics.
-pub const EDGE_STORE_MAX: usize = 65536;
+// 2026-07-28 operator bump 65536 → 1048576 (16x): live scrape showed edge_count
+// pinned exactly at the old cap with 1.82M evictions in 2 days (~28x cap) —
+// recency-window churn was plausibly capping dag_band coverage (63.3% banded).
+pub const EDGE_STORE_MAX: usize = 1_048_576;
 
 /// (#dag-criticality) Maximum distinct per-node duration histograms in the bounded
 /// duration LRU. Sized to match [`crate::resource_profile::PROFILE_MAP_MAX_KEYS`] (the
@@ -235,10 +238,10 @@ struct EdgeStat {
 /// Guarded by a strict-LEAF `parking_lot::Mutex` — never held across `.await`.
 #[derive(Debug)]
 pub struct EdgeStore {
-    // CAPPED AT EDGE_STORE_MAX (65536): bounded LRU of stable-key edges; over-cap evicts
+    // CAPPED AT EDGE_STORE_MAX (1048576): bounded LRU of stable-key edges; over-cap evicts
     // the LRU edge, counted via `evictions`. Worst case ≈ 8 clamped strings ×
-    // PROFILE_KEY_MAX_STR_LEN(256) × 65536 ≈ ~144 MiB (typical ~32 MiB); no owned blob
-    // bytes. (v2 fix 9 — honest worst-case bound.)
+    // PROFILE_KEY_MAX_STR_LEN(256) × 1048576 ≈ ~2.3 GiB (typical ~512 MiB); no owned blob
+    // bytes. (v2 fix 9 — honest worst-case bound; 2026-07-28 16x bump re-derived.)
     edges: LruCache<DagEdge, EdgeStat>,
     // CAPPED AT NODE_DURATION_MAX (16384): bounded LRU of per-node duration sketches
     // (its OWN cap — the key differs from `ProfileMap`, v2 fix 5); 256 B/node fixed, no
