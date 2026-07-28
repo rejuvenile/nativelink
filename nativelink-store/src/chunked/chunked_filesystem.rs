@@ -231,11 +231,21 @@ pub(crate) enum ChunkInProgress {
 /// The file remains for the startup `prune_temp_path` sweep — the same
 /// disk-side behavior as before this fix; only the poisonous in-memory
 /// entry is reaped.
+#[derive(Debug)]
 #[must_use = "dropping the guard immediately would remove the marker entry it protects"]
 pub struct IoUringMarkerGuard {
     map: Arc<ChunkedPartialsMap>,
     digest: DigestInfo,
     entry: Weak<ChunkInProgress>,
+}
+
+impl IoUringMarkerGuard {
+    /// #F3 F2: the marker entry's identity, for identity-scoped
+    /// [`discard_chunked`] calls from the owning driver's error arms
+    /// (so a discard can never delete a takeover successor's entry).
+    pub(crate) fn entry_identity(&self) -> Weak<ChunkInProgress> {
+        Weak::clone(&self.entry)
+    }
 }
 
 impl Drop for IoUringMarkerGuard {
@@ -245,6 +255,35 @@ impl Drop for IoUringMarkerGuard {
         let Some(mine) = self.entry.upgrade() else {
             return;
         };
+        // #F3 F1 (pair-a MAJOR, fc2573b4 review): if the writer fd is
+        // still ALIVE, a detached writer task may still be draining
+        // queued WriteJobs / kernel-pending writev SQEs into the inode
+        // (on abort, `writer_state`'s plain JoinHandle detaches — it
+        // does not cancel the writer; its doc contract is
+        // drain-remaining-then-exit). The #494 double-writer gate is
+        // keyed on entry PRESENCE, so removing the entry here would
+        // admit a concurrent Path-B writer onto the same inode
+        // mid-drain. LEAVE the entry resident: residency then exactly
+        // tracks "a writer may still touch the inode", and the two
+        // liveness-gated reapers (Path-B takeover in
+        // `write_chunk_at_offset`, Path-A reap in
+        // `open_or_create_partial_marker`) remove it once the fd dies.
+        // If no retry ever arrives the entry persists until restart —
+        // same accepted class as abandoned SpawnBlocking entries.
+        // A `Weak` count can never go 0 → >0, so observing 0 here is
+        // terminal and the removal below cannot race a resurrection.
+        if let ChunkInProgress::IoUringMarker { writer_fd, .. } = mine.as_ref() {
+            if writer_fd.strong_count() > 0 {
+                warn!(
+                    digest = ?self.digest,
+                    "IoUringMarkerGuard: driver exited while its writer fd is still live \
+                     (abort drain window) — leaving marker resident so the #494 gate keeps \
+                     rejecting Path-B writers; liveness-gated reapers reap it once the \
+                     writer drains (#F3 F1)",
+                );
+                return;
+            }
+        }
         let mut guard = self.map.inner.lock();
         let still_mine = guard
             .get(&self.digest)
@@ -583,6 +622,11 @@ pub(crate) async fn open_or_create_partial_marker(
     // SpawnBlocking entries are never reaped from here: their fd lives
     // IN the map (no liveness signal) and Path-B reuses them by design.
     let mut guard = map.inner.lock();
+    // CR-2 (fc2573b4 review): the reap + fresh-insert MUST stay atomic
+    // under one lock hold, so the reap `warn!` is deferred to after the
+    // lock is released (flag below) — matching `IoUringMarkerGuard::drop`'s
+    // drop-before-warn hygiene.
+    let mut reaped_stale = false;
     if let Some(existing) = guard.get(&digest) {
         let stale_io_uring = match existing.as_ref() {
             ChunkInProgress::SpawnBlocking { .. } => false,
@@ -590,12 +634,7 @@ pub(crate) async fn open_or_create_partial_marker(
         };
         if stale_io_uring {
             guard.remove(&digest);
-            warn!(
-                ?digest,
-                "open_or_create_partial_marker: reaped STALE IoUringMarker entry \
-                 (previous io_uring driver died without cleanup) before inserting a \
-                 fresh marker (#F3 2026-07-28)",
-            );
+            reaped_stale = true;
         } else {
             let variant = match existing.as_ref() {
                 ChunkInProgress::SpawnBlocking { .. } => "SpawnBlocking",
@@ -620,6 +659,15 @@ pub(crate) async fn open_or_create_partial_marker(
         entry: Arc::downgrade(&entry),
     };
     guard.insert(digest, entry);
+    drop(guard);
+    if reaped_stale {
+        warn!(
+            ?digest,
+            "open_or_create_partial_marker: reaped STALE IoUringMarker entry \
+             (previous io_uring driver died without cleanup) before inserting a \
+             fresh marker (#F3 2026-07-28)",
+        );
+    }
     Ok((fd_arc, cleanup_guard))
 }
 
@@ -1223,9 +1271,22 @@ pub(crate) async fn unlink_holding(holding_path: PathBuf) -> Result<(), Error> {
 /// - The §6.7 termination triggers (panic, shutdown, retry exhaustion).
 /// - The startup recovery sweep (per Q7=(c)) when finding stale
 ///   `.partial` files from a previous process.
+///
+/// #F3 F2 / SEC-1 (fc2573b4 review, convergent): `expected_identity`
+/// identity-scopes the removal. `None` preserves the legacy
+/// digest-scoped behavior (service-level cleanup sites that own no
+/// entry identity: watchdog, admit-loop GC, duplicate-commit guard).
+/// `Some(weak)` removes the entry ONLY if the map still holds THAT
+/// entry (`Arc::ptr_eq`) — the Path-A driver passes its marker
+/// identity so a dead-writer-but-alive-driver's error-arm discard can
+/// never delete a takeover successor's entry and unlink the partial
+/// the successor is actively writing. A dead `Weak` means our entry
+/// is gone already (the map holds a strong ref while resident) →
+/// no-op, idempotent-Ok like the absent case.
 pub(crate) async fn discard_chunked(
     map: &ChunkedPartialsMap,
     digest: &DigestInfo,
+    expected_identity: Option<&Weak<ChunkInProgress>>,
 ) -> Result<(), Error> {
     // #213 reviewer round-2 MAJOR-B test hook: when the per-digest
     // test-only delay is set, sleep BEFORE the actual discard so the
@@ -1249,7 +1310,20 @@ pub(crate) async fn discard_chunked(
     // open call in this process (e.g. startup-orphan path), but
     // `discard_chunked` only knows about in-process state. The
     // recovery sweep handles disk-only orphans.
-    let entry = map.inner.lock().remove(digest);
+    let entry = {
+        let mut guard = map.inner.lock();
+        match expected_identity {
+            None => guard.remove(digest),
+            Some(expected) => {
+                let is_mine = expected.upgrade().is_some_and(|mine| {
+                    guard
+                        .get(digest)
+                        .is_some_and(|current| Arc::ptr_eq(current, &mine))
+                });
+                if is_mine { guard.remove(digest) } else { None }
+            }
+        }
+    };
 
     // If we have an in-process entry, delete its on-disk file. If not,
     // there's nothing to do — return Ok (idempotent).
@@ -1589,7 +1663,7 @@ mod tests {
             .unwrap();
             assert!(map.contains(&digest), "writes must register in-flight state");
 
-            discard_chunked(&map, &digest)
+            discard_chunked(&map, &digest, None)
                 .await
                 .expect("discard must succeed");
 
@@ -1606,7 +1680,7 @@ mod tests {
                 "discard must remove in-flight state"
             );
             // Idempotent: second discard is Ok.
-            discard_chunked(&map, &digest)
+            discard_chunked(&map, &digest, None)
                 .await
                 .expect("discard must be idempotent");
 
@@ -1993,6 +2067,74 @@ mod tests {
         drop(fd);
     }
 
+    /// #F3 F1 (pair-a MAJOR): the ABORT drain window. When the driver
+    /// task dies (guard drops) while the DETACHED writer task still
+    /// holds the fd — and may still be writing the inode (queued
+    /// WriteJobs + kernel-pending writev SQEs drain after abort by
+    /// contract, chunked_writer.rs "Cancellation" doc) — the guard must
+    /// LEAVE the marker resident: the #494 double-writer gate is keyed
+    /// on entry PRESENCE, so removing the entry would admit a
+    /// concurrent Path-B writer onto the same inode mid-drain. Once the
+    /// writer's fd dies, the liveness-gated reapers (Path-B takeover /
+    /// Path-A reap) remove the entry.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[nativelink_test]
+    async fn guard_drop_leaves_entry_while_writer_fd_alive_then_takeover_after_death() {
+        use super::open_or_create_partial_marker;
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = std::sync::Arc::new(ChunkedPartialsMap::new());
+        let digest = make_test_digest(0x50, total);
+
+        let (fd, cleanup_guard) = open_or_create_partial_marker(&map, digest, &root)
+            .await
+            .expect("marker insert must succeed on a fresh map");
+        // Simulate the production abort: the driver task's locals drop
+        // (guard) while the detached writer task (modeled by `fd`)
+        // is still draining writes.
+        drop(cleanup_guard);
+        assert!(
+            map.contains(&digest),
+            "guard drop with a LIVE writer fd must LEAVE the marker resident — removing \
+             it drops the #494 presence-keyed gate while the orphaned writer can still \
+             write the inode (pair-a F1, fc2573b4 review)",
+        );
+
+        // Path-B write during the drain window must be REJECTED by the
+        // live-marker arm.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_chunk_at_offset(&map, &root, &digest, 0, Bytes::from(vec![0xCCu8; CHUNK])),
+        )
+        .await
+        .expect("drain-window rejection must not hang (deadlock detector)")
+        .expect_err(
+            "a Path-B write during the abort drain window (writer fd alive, entry \
+             resident) must be REJECTED — admitting it puts two writers on one inode \
+             (pair-a F1 straggler-writev corruption seam)",
+        );
+        assert!(
+            err.message_string()
+                .contains("contract bug: io_uring driver branch should not invoke fallback writer"),
+            "drain-window rejection must be the live-marker defensive error; got {err:?}",
+        );
+
+        // Writer finishes draining: fd dies → marker stale → takeover.
+        drop(fd);
+        let payload = Bytes::from(vec![0xDDu8; CHUNK]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write_chunk_at_offset(&map, &root, &digest, 0, payload),
+        )
+        .await
+        .expect("post-drain takeover must not hang (deadlock detector)")
+        .expect(
+            "after the orphaned writer's fd dies the stale marker must be taken over \
+             so retry N+1 completes (F1: entry residency exactly tracks writer liveness)",
+        );
+    }
+
     /// #F3 leak-source fix: dropping the `IoUringMarkerGuard` (as the
     /// aborted driver task's scope unwind does) must remove the marker
     /// entry from the map — the in-memory entry is the wedge, and no
@@ -2017,5 +2159,128 @@ mod tests {
             "IoUringMarkerGuard::drop must remove the marker entry — a leaked entry is \
              the permanent Path-B wedge (2026-07-28 incident)",
         );
+    }
+
+    /// #F3 T-1 / pair-a F3 (fc2573b4 review, convergent ×3): the Path-A
+    /// stale-reap in `open_or_create_partial_marker` is LOAD-BEARING
+    /// after F1 (the guard now deliberately leaves the entry resident
+    /// through the abort drain window, so a later Path-A retry meets a
+    /// stale corpse here). Pair-b's M3 mutation proved this branch was
+    /// uncovered: with the reap disabled, all 101 tests stayed green.
+    ///
+    /// Mutation step (M3): disable the reap arm (`stale_io_uring`
+    /// forced false) — this test must fail with the "must REAP a stale
+    /// IoUringMarker" message below.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[nativelink_test]
+    async fn stale_iouring_marker_is_reaped_on_new_marker_open() {
+        use super::open_or_create_partial_marker;
+        const CHUNK: usize = 4 * 1024;
+        let root = make_chunked_test_root().await;
+        let map = std::sync::Arc::new(ChunkedPartialsMap::new());
+        let digest = make_test_digest(0x51, CHUNK as u64);
+
+        // Fixture: the pre-fix leak shape — marker resident, driver dead.
+        let (fd, cleanup_guard) = open_or_create_partial_marker(&map, digest, &root)
+            .await
+            .expect("first marker insert must succeed on a fresh map");
+        drop(fd);
+        core::mem::forget(cleanup_guard);
+        assert!(
+            map.contains(&digest),
+            "fixture must model the leak: stale IoUringMarker resident with dead driver",
+        );
+
+        // A Path-A retry must reap the corpse and claim a fresh marker,
+        // not fail AlreadyExists forever.
+        let (fd2, _cleanup_guard2) = tokio::time::timeout(
+            Duration::from_secs(5),
+            open_or_create_partial_marker(&map, digest, &root),
+        )
+        .await
+        .expect("stale-marker reap must not hang (deadlock detector)")
+        .expect(
+            "open_or_create_partial_marker must REAP a stale IoUringMarker (dead \
+             predecessor driver) and insert a fresh marker instead of failing \
+             AlreadyExists — a Path-A retry must not wedge on its own predecessor's \
+             corpse (#F3 T-1, fc2573b4 review)",
+        );
+        assert!(map.contains(&digest), "fresh marker must be resident after reap");
+        drop(fd2);
+    }
+
+    /// #F3 F2 / SEC-1 / T-2 (fc2573b4 review, convergent): an
+    /// identity-scoped discard from a dead-writer-but-alive-driver must
+    /// NOT remove a takeover successor's entry nor unlink the partial
+    /// the successor is writing.
+    ///
+    /// Mutation step (M5): make the `Some(expected)` arm of
+    /// `discard_chunked` behave like `None` (drop the `Arc::ptr_eq`
+    /// scope) — this test must fail with the "must NOT remove the
+    /// takeover successor's entry" message below.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[nativelink_test]
+    async fn scoped_discard_does_not_remove_takeover_successors_entry() {
+        use super::open_or_create_partial_marker;
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = std::sync::Arc::new(ChunkedPartialsMap::new());
+        let digest = make_test_digest(0x52, total);
+
+        // Driver 1's marker; its WRITER dies (fd dropped) while the
+        // driver itself stays alive (guard held → we hold its identity).
+        let (fd1, cleanup_guard1) = open_or_create_partial_marker(&map, digest, &root)
+            .await
+            .expect("marker insert must succeed on a fresh map");
+        let identity1 = cleanup_guard1.entry_identity();
+        drop(fd1);
+
+        // Takeover successor: a Path-B session legitimately claims the
+        // stale marker and starts writing.
+        let payload = Bytes::from(vec![0xEEu8; CHUNK]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write_chunk_at_offset(&map, &root, &digest, 0, payload),
+        )
+        .await
+        .expect("takeover write must not hang (deadlock detector)")
+        .expect("takeover of the dead-writer marker must succeed (fixture step)");
+        assert!(map.contains(&digest), "successor entry must be resident");
+
+        // Driver 1's error arm now runs its scoped discard.
+        discard_chunked(&map, &digest, Some(&identity1))
+            .await
+            .expect("scoped discard must return Ok (idempotent no-op on identity miss)");
+        assert!(
+            map.contains(&digest),
+            "identity-scoped discard from the dead-writer driver must NOT remove the \
+             takeover successor's entry (#F3 F2/SEC-1: unscoped discard deleted the \
+             successor's session and unlinked its live partial)",
+        );
+        let partial = partial_temp_path(&root, &digest);
+        assert!(
+            tokio::fs::metadata(&partial).await.is_ok(),
+            "identity-scoped discard must NOT unlink the successor's live partial file",
+        );
+
+        // Positive direction: with NO successor, the same scoped discard
+        // removes the caller's own entry + file (normal error-arm cleanup).
+        let digest2 = make_test_digest(0x53, total);
+        let (fd_b, cleanup_guard_b) = open_or_create_partial_marker(&map, digest2, &root)
+            .await
+            .expect("second-digest marker insert must succeed");
+        let identity_b = cleanup_guard_b.entry_identity();
+        drop(fd_b);
+        discard_chunked(&map, &digest2, Some(&identity_b))
+            .await
+            .expect("scoped discard of own entry must succeed");
+        assert!(
+            !map.contains(&digest2),
+            "scoped discard MUST still remove the caller's own entry when no successor \
+             replaced it (identity match ⇒ normal cleanup)",
+        );
+        drop(cleanup_guard_b);
+        drop(cleanup_guard1);
     }
 }

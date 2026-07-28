@@ -1192,19 +1192,25 @@ async fn b1_writev_warn_contains_cqe_split_fields() {
 /// (the production leak path — bytestream idle-stream sweeper cancels
 /// `FastSlowStore::update (chunked)` mid-dispatch → `InFlightCleanup`
 /// drops the last `Arc<ChunkedDriver>` → `JoinHandleDropGuard` aborts
-/// `run_driver` at an await point) must NOT leak the `IoUringMarker`
-/// entry in the `chunked_partials` map. A leaked entry wedges every
-/// subsequent Path-B (`write_chunk_at_offset`) session for the digest
-/// forever: 41 digests, ~3.6K aborts/hour in production.
+/// `run_driver` at an await point) must NOT wedge Path-B retries for
+/// the digest. Pre-fix: the leaked `IoUringMarker` entry error-looped
+/// every retry forever (41 digests, ~3.6K aborts/hour in production).
 ///
-/// Mutation step: replace `_marker_guard = Some(guard)` in
-/// `run_driver` (chunked_driver.rs Path A lazy-init) with
-/// `core::mem::forget(guard)` — this test must fail with the
-/// "aborted io_uring driver must remove its IoUringMarker entry"
+/// Post-F1 (pair-a MAJOR) semantics: after the abort, the marker MAY
+/// legitimately remain resident while the detached writer task drains
+/// (its fd is alive; the #494 presence-keyed gate must keep rejecting
+/// Path-B in that window), so this test polls a real Path-B write:
+/// every interim failure must be the live-marker rejection, and the
+/// write must succeed (stale-marker takeover) within the deadline once
+/// the orphaned writer's fd dies.
+///
+/// Mutation step: disable the takeover arm in `write_chunk_at_offset`
+/// (`if true || writer_fd.strong_count() > 0`) — this test must fail
+/// with the "Path-B retry must succeed via stale-marker takeover"
 /// message below.
 #[nativelink_test]
-async fn f3_driver_abort_removes_iouring_marker_entry() {
-    if !skip_if_no_io_uring("f3_driver_abort_removes_iouring_marker_entry").await {
+async fn f3_driver_abort_does_not_wedge_path_b_retries() {
+    if !skip_if_no_io_uring("f3_driver_abort_does_not_wedge_path_b_retries").await {
         return;
     }
     let store = make_fs_store().await;
@@ -1247,16 +1253,41 @@ async fn f3_driver_abort_removes_iouring_marker_entry() {
     // between awaits, exactly like the production sweeper-cancel path.
     drop(driver);
 
+    // A Path-B retry (the worker deferred-upload shape) must complete.
+    // During the orphaned writer's drain window the ONLY acceptable
+    // failure is the live-marker #494 rejection; once the writer's fd
+    // dies, the takeover must admit the write.
+    let retry_bytes = Bytes::from(blob[..CHUNK_SIZE].to_vec());
     tokio::time::timeout(Duration::from_secs(5), async {
-        while store.has_in_flight_chunked_partial(&digest) {
-            tokio::task::yield_now().await;
+        loop {
+            match store
+                .write_chunk_at_offset(&digest, 0, retry_bytes.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(err) => {
+                    assert!(
+                        err.message_string().contains(
+                            "contract bug: io_uring driver branch should not invoke fallback writer"
+                        ),
+                        "during the post-abort drain window the only acceptable Path-B \
+                         failure is the live-marker rejection; got {err:?}",
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
         }
     })
     .await
     .expect(
-        "aborted io_uring driver must remove its IoUringMarker entry \
-         (IoUringMarkerGuard::drop) — a leaked entry is the permanent Path-B \
-         wedge of 2026-07-28 (41 digests retry-forever on the contract-bug error)",
+        "after the aborted driver's orphaned writer drains (fd dies), a Path-B retry \
+         must succeed via stale-marker takeover — pre-fix this wedged forever on the \
+         contract-bug error (2026-07-28, 41 digests); F1: the entry stays resident \
+         only while the writer fd is alive",
+    );
+    assert!(
+        store.has_in_flight_chunked_partial(&digest),
+        "takeover must install a usable SpawnBlocking entry for the retry session",
     );
     drop(tx);
 }

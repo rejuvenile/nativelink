@@ -898,14 +898,24 @@ async fn run_driver<Fe: FileEntry>(
 
     // #F3 (2026-07-28 stale-marker wedge): RAII holder for the
     // `IoUringMarkerGuard`, populated at Path-A lazy-init alongside
-    // `writer_state`. Never read — its Drop (which runs on normal
-    // return, `?`-error, panic AND task abort) is the mechanism that
-    // guarantees the in-memory `chunked_partials` marker entry cannot
-    // outlive this driver. Kept OUT of `writer_state` so the
-    // error-arm `writer_state.take()` drains do not drop it before
+    // `writer_state`. Its Drop (which runs on normal return, `?`-error,
+    // panic AND task abort) guarantees the in-memory `chunked_partials`
+    // marker entry cannot outlive this driver — EXCEPT while the
+    // detached writer task's fd is still alive (F1: the guard then
+    // leaves the entry resident so the #494 presence-keyed gate holds
+    // through the abort drain window; the liveness-gated reapers finish
+    // the job). Kept OUT of `writer_state` so the error-arm
+    // `writer_state.take()` drains do not drop it before
     // `discard_chunked` runs (discard needs the entry to find the
     // `.partial` path for eager unlink).
-    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    //
+    // Declared unconditionally (always `None` off-linux/io-uring, where
+    // `open_chunked_partial_marker` is compiled out) so the F2
+    // identity-scoped discard sites below need no cfg-gating.
+    #[cfg_attr(
+        not(all(feature = "io-uring", target_os = "linux")),
+        allow(unused_mut, reason = "only assigned inside the cfg'd Path-A lazy-init")
+    )]
     let mut _marker_guard: Option<super::chunked_filesystem::IoUringMarkerGuard> = None;
 
     while let Some(work) = rx.recv().await {
@@ -1231,9 +1241,15 @@ async fn run_driver<Fe: FileEntry>(
             // Per #213 reviewer M2: bound the discard wall-clock so a
             // wedged slow tier cannot hang the driver task here either
             // (same rationale as the timeout-arm above).
+            // #F3 F2: identity-scoped — if a takeover successor replaced
+            // our (dead-writer) marker, this discard must not delete the
+            // successor's entry nor unlink the partial it is writing.
+            let marker_identity = _marker_guard
+                .as_ref()
+                .map(super::chunked_filesystem::IoUringMarkerGuard::entry_identity);
             match tokio::time::timeout(
                 DISCARD_AFTER_FAILURE_TIMEOUT,
-                filesystem_store.discard_chunked(&digest),
+                filesystem_store.discard_chunked_scoped(&digest, marker_identity.as_ref()),
             )
             .await
             {
@@ -1397,7 +1413,14 @@ async fn run_driver<Fe: FileEntry>(
                         )
                     })??;
             }
-            return commit_and_verify(&filesystem_store, &digest, expected_size).await;
+            // #F3 F2: thread our marker identity into the commit path's
+            // discard-on-failure arms (same successor-protection scope
+            // as the per-chunk error arm above). None on Path B.
+            let marker_identity = _marker_guard
+                .as_ref()
+                .map(super::chunked_filesystem::IoUringMarkerGuard::entry_identity);
+            return commit_and_verify(&filesystem_store, &digest, expected_size, marker_identity)
+                .await;
         }
     }
 
@@ -1544,6 +1567,10 @@ async fn commit_and_verify<Fe: FileEntry>(
     filesystem_store: &Arc<FilesystemStore<Fe>>,
     digest: &DigestInfo,
     expected_size: u64,
+    // #F3 F2: the Path-A caller's marker-entry identity; discard arms
+    // below are scoped to it so they cannot delete a takeover
+    // successor's entry (None on Path B → legacy digest-scoped).
+    marker_identity: Option<std::sync::Weak<super::chunked_filesystem::ChunkInProgress>>,
 ) -> Result<ChunkedCommitResult, Error> {
     // Step 1: rename to holding path + length check.
     if let Err(commit_err) = filesystem_store.commit_chunked(digest, expected_size).await {
@@ -1560,7 +1587,7 @@ async fn commit_and_verify<Fe: FileEntry>(
         // here either (post-error cleanup contract).
         match tokio::time::timeout(
             DISCARD_AFTER_FAILURE_TIMEOUT,
-            filesystem_store.discard_chunked(digest),
+            filesystem_store.discard_chunked_scoped(digest, marker_identity.as_ref()),
         )
         .await
         {
@@ -1707,7 +1734,7 @@ async fn commit_and_verify<Fe: FileEntry>(
         }
         match tokio::time::timeout(
             DISCARD_AFTER_FAILURE_TIMEOUT,
-            filesystem_store.discard_chunked(digest),
+            filesystem_store.discard_chunked_scoped(digest, marker_identity.as_ref()),
         )
         .await
         {
@@ -1776,7 +1803,7 @@ async fn commit_and_verify<Fe: FileEntry>(
         }
         match tokio::time::timeout(
             DISCARD_AFTER_FAILURE_TIMEOUT,
-            filesystem_store.discard_chunked(digest),
+            filesystem_store.discard_chunked_scoped(digest, marker_identity.as_ref()),
         )
         .await
         {

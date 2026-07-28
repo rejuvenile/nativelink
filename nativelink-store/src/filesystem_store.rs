@@ -2212,7 +2212,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             // duplicate case, so we own the cleanup. `discard_chunked`
             // is idempotent: returns Ok via the "no in-flight state"
             // branch if the entry is already absent.
-            chunked_discard(&self.chunked_partials, digest).await?;
+            chunked_discard(&self.chunked_partials, digest, None).await?;
             return Ok(());
         }
 
@@ -2313,7 +2313,23 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// - The §6.7 termination triggers (panic, shutdown, retry
     ///   exhaustion).
     pub async fn discard_chunked(&self, digest: &DigestInfo) -> Result<(), Error> {
-        chunked_discard(&self.chunked_partials, digest).await
+        chunked_discard(&self.chunked_partials, digest, None).await
+    }
+
+    /// #F3 F2 / SEC-1 (fc2573b4 review): identity-scoped discard for the
+    /// Path-A driver's error arms. Removes the in-flight entry ONLY if
+    /// the map still holds the caller's own entry (`Arc::ptr_eq` against
+    /// `expected_identity`), so a dead-writer-but-alive-driver's discard
+    /// can never delete a takeover successor's entry nor unlink the
+    /// partial the successor is actively writing. `None` falls back to
+    /// the digest-scoped legacy behavior (Path-B drivers own the
+    /// digest's only entry by construction).
+    pub(crate) async fn discard_chunked_scoped(
+        &self,
+        digest: &DigestInfo,
+        expected_identity: Option<&Weak<crate::chunked::chunked_filesystem::ChunkInProgress>>,
+    ) -> Result<(), Error> {
+        chunked_discard(&self.chunked_partials, digest, expected_identity).await
     }
 
     /// Cheap in-process index probe: returns `Some(size)` if the digest
