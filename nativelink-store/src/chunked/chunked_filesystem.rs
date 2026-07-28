@@ -68,7 +68,7 @@
 use core::fmt::Debug;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -191,7 +191,75 @@ pub(crate) enum ChunkInProgress {
         /// Pinned digest size copy; consumed by
         /// [`commit_chunked_to_holding`]'s length-check.
         declared_size: u64,
+        /// #F3 (2026-07-28 stale-marker wedge): liveness token for the
+        /// io_uring driver that owns this marker. `Weak` of the fd
+        /// `Arc<std::fs::File>` that [`open_or_create_partial_marker`]
+        /// hands to the driver / writer task. The fd Arc's lifetime
+        /// exactly tracks the owning driver: writer task exits (normal
+        /// drain, error drain, panic) or the driver task is ABORTED
+        /// pre-spawn → the Arc drops → `strong_count() == 0` → the
+        /// marker is STALE and Path-B writers may take the entry over
+        /// (see `write_chunk_at_offset`) instead of wedging forever on
+        /// the defensive contract-bug error. While the driver lives,
+        /// `strong_count() > 0` and the defensive rejection stands
+        /// (#494 double-writer corruption protection).
+        writer_fd: Weak<std::fs::File>,
     },
+}
+
+/// #F3 (2026-07-28 stale-marker wedge): RAII cleanup for the io_uring
+/// marker entry, armed by [`open_or_create_partial_marker`] and held by
+/// the driver task (`run_driver` Path A) for the driver's lifetime.
+///
+/// The `chunked_partials` map is purely in-memory and the marker entry
+/// has NO other owner that survives a task abort: `JoinHandleDropGuard`
+/// aborts the driver task at an await point, so no `.await`-based
+/// cleanup (`discard_chunked`) can run — the entry then leaked forever
+/// and every subsequent Path-B write for the digest hit the defensive
+/// contract-bug error (production wedge: 41 digests, ~3.6K aborts/hour,
+/// 2026-07-28). Drop is fully synchronous (one `parking_lot` map lock)
+/// so it runs on ANY exit: normal return, `?`-error, panic, task abort.
+///
+/// Identity-scoped: removal fires only if the map still holds THIS
+/// guard's entry (`Arc::ptr_eq`), so a successor entry inserted after
+/// `finalize_holding` / `discard_chunked` already removed ours is never
+/// touched. On the happy path the entry is gone by the time the guard
+/// drops → no-op.
+///
+/// The on-disk `.partial` file is intentionally NOT unlinked here
+/// (Drop cannot await; sync unlink on a tokio worker is forbidden).
+/// The file remains for the startup `prune_temp_path` sweep — the same
+/// disk-side behavior as before this fix; only the poisonous in-memory
+/// entry is reaped.
+#[must_use = "dropping the guard immediately would remove the marker entry it protects"]
+pub struct IoUringMarkerGuard {
+    map: Arc<ChunkedPartialsMap>,
+    digest: DigestInfo,
+    entry: Weak<ChunkInProgress>,
+}
+
+impl Drop for IoUringMarkerGuard {
+    fn drop(&mut self) {
+        // If the entry Arc is already gone, the map cannot still hold it
+        // (the map holds a strong ref while the entry is resident).
+        let Some(mine) = self.entry.upgrade() else {
+            return;
+        };
+        let mut guard = self.map.inner.lock();
+        let still_mine = guard
+            .get(&self.digest)
+            .is_some_and(|current| Arc::ptr_eq(current, &mine));
+        if still_mine {
+            guard.remove(&self.digest);
+            drop(guard);
+            warn!(
+                digest = ?self.digest,
+                "IoUringMarkerGuard: removed io_uring marker entry on abnormal driver exit \
+                 (abort / un-discarded error) — without this the entry wedges all Path-B \
+                 retries for the digest (#F3 2026-07-28)",
+            );
+        }
+    }
 }
 
 impl ChunkInProgress {
@@ -221,10 +289,15 @@ impl Debug for ChunkInProgress {
                 .field("declared_size", declared_size)
                 .field("file", &"<async-mutex<std::fs::File>>")
                 .finish(),
-            Self::IoUringMarker { path, declared_size } => f
+            Self::IoUringMarker {
+                path,
+                declared_size,
+                writer_fd,
+            } => f
                 .debug_struct("ChunkInProgress::IoUringMarker")
                 .field("path", path)
                 .field("declared_size", declared_size)
+                .field("writer_alive", &(writer_fd.strong_count() > 0))
                 .finish(),
         }
     }
@@ -468,10 +541,10 @@ async fn open_or_create_partial(
 /// receive `Code::AlreadyExists` at handler admission.
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub(crate) async fn open_or_create_partial_marker(
-    map: &ChunkedPartialsMap,
+    map: &Arc<ChunkedPartialsMap>,
     digest: DigestInfo,
     temp_path_root: &str,
-) -> Result<Arc<std::fs::File>, Error> {
+) -> Result<(Arc<std::fs::File>, IoUringMarkerGuard), Error> {
     let path = partial_temp_path(temp_path_root, &digest);
     let path_for_blocking = path.clone();
     let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
@@ -501,30 +574,53 @@ pub(crate) async fn open_or_create_partial_marker(
 
     // Insert the marker. The handler-side admission contract guarantees
     // at-most-one driver per digest at a time, so a same-digest race
-    // here would be a contract bug; but be defensive — if a SpawnBlocking
-    // entry already exists (e.g. a previous fallback driver hasn't yet
-    // discarded), return an error rather than overwrite.
+    // here would be a contract bug; but be defensive — if an entry
+    // already exists with a LIVE owner, return an error rather than
+    // overwrite. #F3 sibling of the `write_chunk_at_offset` takeover: a
+    // pre-existing IoUringMarker whose driver is DEAD (fd Weak dangles —
+    // aborted driver, un-discarded error exit) is reaped here so a
+    // Path-A retry is not wedged behind its own predecessor's corpse.
+    // SpawnBlocking entries are never reaped from here: their fd lives
+    // IN the map (no liveness signal) and Path-B reuses them by design.
     let mut guard = map.inner.lock();
     if let Some(existing) = guard.get(&digest) {
-        let variant = match existing.as_ref() {
-            ChunkInProgress::SpawnBlocking { .. } => "SpawnBlocking",
-            ChunkInProgress::IoUringMarker { .. } => "IoUringMarker",
+        let stale_io_uring = match existing.as_ref() {
+            ChunkInProgress::SpawnBlocking { .. } => false,
+            ChunkInProgress::IoUringMarker { writer_fd, .. } => writer_fd.strong_count() == 0,
         };
-        drop(guard);
-        return Err(make_err!(
-            Code::AlreadyExists,
-            "chunked partial entry already exists for {digest} (variant={variant}); \
-             open_or_create_partial_marker called while a driver is in flight"
-        ));
+        if stale_io_uring {
+            guard.remove(&digest);
+            warn!(
+                ?digest,
+                "open_or_create_partial_marker: reaped STALE IoUringMarker entry \
+                 (previous io_uring driver died without cleanup) before inserting a \
+                 fresh marker (#F3 2026-07-28)",
+            );
+        } else {
+            let variant = match existing.as_ref() {
+                ChunkInProgress::SpawnBlocking { .. } => "SpawnBlocking",
+                ChunkInProgress::IoUringMarker { .. } => "IoUringMarker",
+            };
+            drop(guard);
+            return Err(make_err!(
+                Code::AlreadyExists,
+                "chunked partial entry already exists for {digest} (variant={variant}); \
+                 open_or_create_partial_marker called while a driver is in flight"
+            ));
+        }
     }
-    guard.insert(
+    let entry = Arc::new(ChunkInProgress::IoUringMarker {
+        path,
+        declared_size: digest.size_bytes(),
+        writer_fd: Arc::downgrade(&fd_arc),
+    });
+    let cleanup_guard = IoUringMarkerGuard {
+        map: Arc::clone(map),
         digest,
-        Arc::new(ChunkInProgress::IoUringMarker {
-            path,
-            declared_size: digest.size_bytes(),
-        }),
-    );
-    Ok(fd_arc)
+        entry: Arc::downgrade(&entry),
+    };
+    guard.insert(digest, entry);
+    Ok((fd_arc, cleanup_guard))
 }
 
 /// Write one chunk at the given byte offset into the sparse partial.
@@ -586,7 +682,55 @@ pub(crate) async fn write_chunk_at_offset(
         }
     }
 
-    let entry = open_or_create_partial(map, *digest, temp_path_root).await?;
+    let mut entry = open_or_create_partial(map, *digest, temp_path_root).await?;
+
+    // #F3 (2026-07-28 stale-marker wedge): a resident `IoUringMarker`
+    // whose owning driver is DEAD (fd `Weak` dangles — the driver task
+    // was aborted by `JoinHandleDropGuard`, or exited an error path
+    // without discard) would otherwise wedge THIS digest forever: the
+    // map is purely in-memory, nothing else removes the entry, and every
+    // retry session lands here and hits the defensive contract-bug error
+    // below (production: 41 digests, ~3.6K aborts/hour, retry-forever).
+    // Detect the dead driver and TAKE the entry OVER: remove it (scoped
+    // by `Arc::ptr_eq` so a racing successor's fresh entry is never
+    // touched) and re-create as `SpawnBlocking`. The on-disk `.partial`
+    // at the same path is intentionally REUSED (create(true) +
+    // truncate(false)) — any bytes a previous writer landed are
+    // identical by content-addressing, and the race-state's
+    // `chunks_present` bits may rely on them.
+    //
+    // A LIVE marker (driver fd still held) keeps the defensive error:
+    // that is the #494 protection against two writers pwriting the same
+    // partial through different fds (observed 2026-07-27 19:4x when a
+    // v2 watchdog force-remove let v2 sessions race a slow-but-alive v1
+    // driver — the rejection there is correct and self-clears when the
+    // driver commits or fails).
+    //
+    // Steady-state cost: one pattern check on the already-fetched entry;
+    // no extra locking or awaits on the SpawnBlocking hot path.
+    while let ChunkInProgress::IoUringMarker { writer_fd, .. } = entry.as_ref() {
+        if writer_fd.strong_count() > 0 {
+            // Live driver: fall through to the defensive match below
+            // (kept as the single authoritative rejection site).
+            break;
+        }
+        warn!(
+            ?digest,
+            chunk_offset,
+            "write_chunk_at_offset: stale IoUringMarker (owning io_uring driver is dead) — \
+             taking the entry over for the fallback writer (#F3 2026-07-28 wedge self-heal)",
+        );
+        {
+            let mut guard = map.inner.lock();
+            let still_same = guard
+                .get(digest)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry));
+            if still_same {
+                guard.remove(digest);
+            }
+        }
+        entry = open_or_create_partial(map, *digest, temp_path_root).await?;
+    }
 
     // Acquire the per-blob async mutex. We hold this across the
     // spawn_blocking await so that concurrent chunks for the SAME
@@ -1733,6 +1877,145 @@ mod tests {
         .expect(
             "must not deadlock — adapter discard should finish promptly through real \
              FilesystemStore",
+        );
+    }
+
+    /// #F3 (2026-07-28 production wedge): a stale `IoUringMarker` entry —
+    /// left behind by an io_uring driver task that was ABORTED
+    /// (`JoinHandleDropGuard`) without running any discard — must NOT
+    /// permanently wedge Path-B writers for that digest. The fallback
+    /// writer detects the dead driver (fd liveness token) and takes the
+    /// entry over, so the worker's retry N+1 completes the blob.
+    ///
+    /// Reproduces: 26.5K WARN/24h `write_chunk_at_offset called on
+    /// IoUringMarker entry for <digest> — contract bug` on buildcache,
+    /// 41 digests wedged forever (leak event: bytestream idle-stream
+    /// sweeper cancels FastSlowStore::update (chunked) mid-dispatch →
+    /// driver task aborted between marker-insert and commit).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[nativelink_test]
+    async fn stale_iouring_marker_is_taken_over_by_fallback_writer() {
+        use super::open_or_create_partial_marker;
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = std::sync::Arc::new(ChunkedPartialsMap::new());
+        let digest = make_test_digest(0x47, total);
+
+        // Simulate the production leak: marker inserted, driver dead
+        // (fd dropped), no cleanup ran. `core::mem::forget` on the
+        // cleanup guard models the PRE-FIX abort path where no Drop-based
+        // cleanup existed.
+        let (fd, cleanup_guard) = open_or_create_partial_marker(&map, digest, &root)
+            .await
+            .expect("marker insert must succeed on a fresh map");
+        drop(fd);
+        core::mem::forget(cleanup_guard);
+        assert!(
+            map.contains(&digest),
+            "fixture must model the leak: IoUringMarker entry present with dead driver",
+        );
+
+        let payload = Bytes::from(vec![0xAAu8; CHUNK]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write_chunk_at_offset(&map, &root, &digest, 0, payload.clone()),
+        )
+        .await
+        .expect("stale-marker takeover must not hang (deadlock detector)")
+        .expect(
+            "write_chunk_at_offset must TAKE OVER a stale IoUringMarker (dead io_uring \
+             driver) instead of wedging with the contract-bug error — the 2026-07-28 \
+             production wedge (41 digests, retry-forever)",
+        );
+
+        // Retry-completes-the-blob: the takeover must leave a usable
+        // SpawnBlocking entry so the full commit path succeeds.
+        let final_path = std::path::PathBuf::from(format!("{root}/d/47/{digest}"));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            commit_chunked_test_compat(&map, &digest, total, final_path.clone()),
+        )
+        .await
+        .expect("commit after takeover must not hang (deadlock detector)")
+        .expect(
+            "commit after stale-marker takeover must succeed — the wedged digest must \
+             be able to complete on retry N+1",
+        );
+        let on_disk = tokio::fs::read(&final_path)
+            .await
+            .expect("final CAS file must exist after takeover + commit");
+        assert_eq!(
+            on_disk,
+            payload.to_vec(),
+            "committed bytes must match the takeover writer's payload",
+        );
+    }
+
+    /// #F3 companion: the defensive contract-bug error MUST still fire
+    /// when the io_uring driver is ALIVE (fd Arc held). This is the
+    /// #494-class protection against two writers pwriting the same
+    /// `.partial` through different fds — observed live on 2026-07-27
+    /// 19:4x when a v2 commit-watchdog force-remove let v2 sessions race
+    /// a slow-but-alive v1 driver; the defensive arm correctly rejected
+    /// them until the driver committed.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[nativelink_test]
+    async fn live_iouring_marker_still_rejects_fallback_writer() {
+        use super::open_or_create_partial_marker;
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = std::sync::Arc::new(ChunkedPartialsMap::new());
+        let digest = make_test_digest(0x48, total);
+
+        let (fd, _cleanup_guard) = open_or_create_partial_marker(&map, digest, &root)
+            .await
+            .expect("marker insert must succeed on a fresh map");
+        // `fd` stays alive for the duration: the driver is "alive".
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_chunk_at_offset(&map, &root, &digest, 0, Bytes::from(vec![0xBBu8; CHUNK])),
+        )
+        .await
+        .expect("live-marker rejection must not hang (deadlock detector)")
+        .expect_err(
+            "a LIVE IoUringMarker (driver fd held) must still reject Path-B writes — \
+             deleting the defensive arm re-opens the #494 double-writer corruption",
+        );
+        assert_eq!(err.code, nativelink_error::Code::Internal, "err: {err:?}");
+        assert!(
+            err.message_string()
+                .contains("contract bug: io_uring driver branch should not invoke fallback writer"),
+            "defensive error must keep its bespoke message; got: {err:?}",
+        );
+        drop(fd);
+    }
+
+    /// #F3 leak-source fix: dropping the `IoUringMarkerGuard` (as the
+    /// aborted driver task's scope unwind does) must remove the marker
+    /// entry from the map — the in-memory entry is the wedge, and no
+    /// async cleanup can run on task abort.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    #[nativelink_test]
+    async fn marker_guard_drop_removes_entry_from_map() {
+        use super::open_or_create_partial_marker;
+        const CHUNK: usize = 4 * 1024;
+        let root = make_chunked_test_root().await;
+        let map = std::sync::Arc::new(ChunkedPartialsMap::new());
+        let digest = make_test_digest(0x49, CHUNK as u64);
+
+        let (fd, cleanup_guard) = open_or_create_partial_marker(&map, digest, &root)
+            .await
+            .expect("marker insert must succeed on a fresh map");
+        assert!(map.contains(&digest), "entry present while guard armed");
+        drop(fd);
+        drop(cleanup_guard);
+        assert!(
+            !map.contains(&digest),
+            "IoUringMarkerGuard::drop must remove the marker entry — a leaked entry is \
+             the permanent Path-B wedge (2026-07-28 incident)",
         );
     }
 }

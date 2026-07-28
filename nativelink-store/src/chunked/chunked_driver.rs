@@ -896,6 +896,18 @@ async fn run_driver<Fe: FileEntry>(
         tokio::task::JoinHandle<Result<(), Error>>,
     )> = None;
 
+    // #F3 (2026-07-28 stale-marker wedge): RAII holder for the
+    // `IoUringMarkerGuard`, populated at Path-A lazy-init alongside
+    // `writer_state`. Never read — its Drop (which runs on normal
+    // return, `?`-error, panic AND task abort) is the mechanism that
+    // guarantees the in-memory `chunked_partials` marker entry cannot
+    // outlive this driver. Kept OUT of `writer_state` so the
+    // error-arm `writer_state.take()` drains do not drop it before
+    // `discard_chunked` runs (discard needs the entry to find the
+    // `.partial` path for eager unlink).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    let mut _marker_guard: Option<super::chunked_filesystem::IoUringMarkerGuard> = None;
+
     while let Some(work) = rx.recv().await {
         chunks_received.fetch_add(1, Ordering::Relaxed);
         let ChunkWork {
@@ -998,9 +1010,22 @@ async fn run_driver<Fe: FileEntry>(
                             // commit_chunked_to_holding's lookup finds
                             // the marker entry regardless of writer
                             // task lifecycle.
-                            let fd_arc = filesystem_store
+                            let (fd_arc, marker_cleanup_guard) = filesystem_store
                                 .open_chunked_partial_marker(digest)
                                 .await?;
+                            // #F3 (2026-07-28 stale-marker wedge): hold
+                            // the guard for the driver's lifetime. Its
+                            // synchronous Drop reaps the marker entry on
+                            // ANY exit that did not already remove it —
+                            // task ABORT via JoinHandleDropGuard (the
+                            // production leak: idle-stream sweeper
+                            // cancels FSS::update mid-dispatch) and the
+                            // natural "upstream dropped without finish"
+                            // Err (which by design skips discard).
+                            // Happy-path finalize / explicit discard
+                            // remove the entry first; the guard then
+                            // no-ops (Arc::ptr_eq scope).
+                            _marker_guard = Some(marker_cleanup_guard);
                             let (chunk_tx, chunk_rx) = mpsc::channel::<
                                 super::chunked_writer::WriteJob,
                             >(

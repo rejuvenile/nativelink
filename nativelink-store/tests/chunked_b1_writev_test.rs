@@ -1187,3 +1187,145 @@ async fn b1_writev_warn_contains_cqe_split_fields() {
         }
     });
 }
+
+/// #F3 (2026-07-28 stale-marker wedge) T3: ABORTING the driver task
+/// (the production leak path — bytestream idle-stream sweeper cancels
+/// `FastSlowStore::update (chunked)` mid-dispatch → `InFlightCleanup`
+/// drops the last `Arc<ChunkedDriver>` → `JoinHandleDropGuard` aborts
+/// `run_driver` at an await point) must NOT leak the `IoUringMarker`
+/// entry in the `chunked_partials` map. A leaked entry wedges every
+/// subsequent Path-B (`write_chunk_at_offset`) session for the digest
+/// forever: 41 digests, ~3.6K aborts/hour in production.
+///
+/// Mutation step: replace `_marker_guard = Some(guard)` in
+/// `run_driver` (chunked_driver.rs Path A lazy-init) with
+/// `core::mem::forget(guard)` — this test must fail with the
+/// "aborted io_uring driver must remove its IoUringMarker entry"
+/// message below.
+#[nativelink_test]
+async fn f3_driver_abort_removes_iouring_marker_entry() {
+    if !skip_if_no_io_uring("f3_driver_abort_removes_iouring_marker_entry").await {
+        return;
+    }
+    let store = make_fs_store().await;
+    let (blob, digest, total) = make_blob_mib(2, 0x53);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+    let permit = budget
+        .try_acquire_chunk()
+        .expect("ChunkBudget must have permits available");
+
+    // First (non-finish) chunk: triggers Path A lazy-init → marker
+    // inserted + writer task spawned. The blob is NOT completed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tx.send(ChunkWork {
+            chunk_offset: 0,
+            chunk_bytes: Bytes::from(blob[..CHUNK_SIZE].to_vec()),
+            finish: false,
+            _permit: permit,
+            _pin_permit: None,
+        })
+        .await
+        .expect("ChunkWork send must succeed on a fresh driver");
+        // Wait until the driver has actually inserted the marker.
+        while !store.has_in_flight_chunked_partial(&digest) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("marker entry must appear after first chunk (deadlock detector)");
+
+    // Abort the driver task mid-blob: drop the ChunkedDriver while the
+    // sender is still alive — `JoinHandleDropGuard` aborts `run_driver`
+    // between awaits, exactly like the production sweeper-cancel path.
+    drop(driver);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.has_in_flight_chunked_partial(&digest) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "aborted io_uring driver must remove its IoUringMarker entry \
+         (IoUringMarkerGuard::drop) — a leaked entry is the permanent Path-B \
+         wedge of 2026-07-28 (41 digests retry-forever on the contract-bug error)",
+    );
+    drop(tx);
+}
+
+/// #F3 T3b: the driver's NATURAL error exit "upstream dropped without
+/// finish" (`run_driver` returns `Err(Code::Aborted)` WITHOUT calling
+/// `discard_chunked` — by design the partial file stays for retry
+/// reuse) must also not leak the `IoUringMarker` entry. Unlike the
+/// abort path this exit is deterministic: the guard drops before
+/// `await_completion` resolves, so the map must be clean immediately
+/// after the completion error is observed.
+#[nativelink_test]
+async fn f3_driver_upstream_drop_removes_iouring_marker_entry() {
+    if !skip_if_no_io_uring("f3_driver_upstream_drop_removes_iouring_marker_entry").await {
+        return;
+    }
+    let store = make_fs_store().await;
+    let (blob, digest, total) = make_blob_mib(2, 0x54);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+    let permit = budget
+        .try_acquire_chunk()
+        .expect("ChunkBudget must have permits available");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tx.send(ChunkWork {
+            chunk_offset: 0,
+            chunk_bytes: Bytes::from(blob[..CHUNK_SIZE].to_vec()),
+            finish: false,
+            _permit: permit,
+            _pin_permit: None,
+        })
+        .await
+        .expect("ChunkWork send must succeed on a fresh driver");
+        while !store.has_in_flight_chunked_partial(&digest) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("marker entry must appear after first chunk (deadlock detector)");
+
+    // Upstream drop WITHOUT finish: driver exits via the
+    // "mpsc closed without commit" arm (case i) — Err(Aborted), no
+    // discard by design.
+    drop(tx);
+    let completion = tokio::time::timeout(Duration::from_secs(5), driver.await_completion())
+        .await
+        .expect("driver must terminate after upstream drop (deadlock detector)");
+    let err = completion.expect_err(
+        "upstream-drop-without-finish must surface Err from the driver (fixture guard: \
+         if this is Ok the test is not exercising the leak arm)",
+    );
+    assert!(
+        err.messages
+            .iter()
+            .any(|m| m.contains("upstream dropped without finish")),
+        "fixture guard: expected the case-(i) driver error, got {err:?}",
+    );
+    assert!(
+        !store.has_in_flight_chunked_partial(&digest),
+        "driver's natural 'upstream dropped without finish' exit must remove the \
+         IoUringMarker entry (IoUringMarkerGuard::drop) — a leaked entry is the \
+         permanent Path-B wedge of 2026-07-28",
+    );
+}

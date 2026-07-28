@@ -1775,11 +1775,23 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// pool mutex (the dominant cost per FL-402 RCA). On non-io-uring
     /// kernels, the driver continues to call [`Self::write_chunk_at_offset`]
     /// per chunk (Path B / fallback; zero behavior change).
+    ///
+    /// #F3 (2026-07-28): also returns the [`IoUringMarkerGuard`] that the
+    /// driver task MUST hold for its lifetime — the guard's synchronous
+    /// Drop reaps the marker entry on abnormal driver exit (task abort,
+    /// un-discarded error), which is the only cleanup that can run when
+    /// `JoinHandleDropGuard` aborts the task at an await point.
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     pub async fn open_chunked_partial_marker(
         &self,
         digest: DigestInfo,
-    ) -> Result<std::sync::Arc<std::fs::File>, Error> {
+    ) -> Result<
+        (
+            std::sync::Arc<std::fs::File>,
+            crate::chunked::chunked_filesystem::IoUringMarkerGuard,
+        ),
+        Error,
+    > {
         crate::chunked::chunked_filesystem::open_or_create_partial_marker(
             &self.chunked_partials,
             digest,
