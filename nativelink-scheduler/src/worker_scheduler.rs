@@ -147,6 +147,21 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
         Ok(())
     }
 
+    /// (#37/F4 fail-open damper, FINDING 3) Records that this worker just
+    /// NAK'd a placed action with a PRESSURE `ResourceExhausted` (message
+    /// carrying "disk pressure"/"memory pressure"), observed by the server on
+    /// the `update_operation` path (`worker_api_server`). The `Worker` entry
+    /// stamps `last_pressure_nak = now`; the FLEET FAIL-OPEN pool
+    /// (`inner_find_worker_for_action`) excludes workers whose stamp is
+    /// younger than the configured `pressure_nak_cooldown_s`, damping the
+    /// place→NAK→free-requeue loop (ResourceExhausted does not consume retry
+    /// attempts, so without this the loop is undamped). Normal matching is
+    /// unaffected. Default impl is a no-op so schedulers without a worker pool
+    /// need not implement it (mirrors `update_worker_disk_pressure`).
+    async fn record_worker_pressure_nak(&self, _worker_id: &WorkerId) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// (#obs-tuning) OBSERVABILITY-ONLY. Updates the worker's last-gossiped
     /// DECAYED p95 COLD dir-cache construct latency (ms) — the
     /// `construct_fetch_p95` estimator (a time-decayed fixed-bucket histogram)

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::cas_server::WorkerApiConfig;
 use nativelink_config::schedulers::WorkerAllocationStrategy;
-use nativelink_error::{Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -657,6 +657,205 @@ pub async fn execution_response_success_test() -> Result<(), Box<dyn core::error
         };
         assert_eq!(execute_response, client_given_state.into());
     }
+    Ok(())
+}
+
+/// (FINDING 3, fix 2 — NAK observation seam) A worker `ExecuteResult` carrying
+/// a PRESSURE `ResourceExhausted` (`"Worker under disk pressure"`, the exact
+/// wire shape `local_worker`'s StartAction disk gate emits) must arm the
+/// fail-open cooldown: the server stamps `last_pressure_nak` on the `Worker`
+/// entry via `record_worker_pressure_nak`, and the fleet fail-open pool
+/// excludes that worker for `pressure_nak_cooldown_s`. Production composition:
+/// real `WorkerApiServer` + real `ApiWorkerScheduler` (only the state manager
+/// is mocked).
+///
+/// Falsification mutation (TDD #5): remove the `record_worker_pressure_nak`
+/// call from `inner_execution_response`'s `InternalError` arm — the stamp stays
+/// `None` and this test red-fails with the bespoke hook message below.
+#[nativelink_test]
+pub async fn pressure_nak_execute_result_arms_failopen_cooldown_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let mut test_context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
+
+    // Reserve an operation on the worker (production shape: a pressure NAK
+    // arrives for an operation the scheduler placed on the worker).
+    let action_digest = DigestInfo::new([7u8; 32], 123);
+    let unique_qualifier = ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+        instance_name: "instance_name".to_string(),
+        digest_function: DigestHasherFunc::Sha256,
+        digest: action_digest,
+    });
+    let action_info = Arc::new(ActionInfo {
+        command_digest: DigestInfo::new([0u8; 32], 0),
+        input_root_digest: DigestInfo::new([0u8; 32], 0),
+        timeout: Duration::MAX,
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: make_system_time(0),
+        insert_timestamp: make_system_time(0),
+        unique_qualifier,
+        targetkey: None,
+    });
+    let operation_id = OperationId::default();
+    let platform_properties = test_context
+        .scheduler
+        .get_platform_property_manager()
+        .make_platform_properties(action_info.platform_properties.clone())
+        .err_tip(|| "Failed to make platform properties")?;
+    test_context
+        .scheduler
+        .worker_notify_run_action(
+            test_context.worker_id.clone(),
+            operation_id.clone(),
+            ActionInfoWithProps {
+                inner: action_info,
+                platform_properties,
+                origin_metadata: OriginMetadata::default(),
+                scheduler_start_execute_event_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let update_for_worker = test_context
+        .connection_worker_stream
+        .next()
+        .await
+        .expect("Worker stream ended early")?
+        .update
+        .expect("Expected update field to be populated");
+    assert!(
+        matches!(update_for_worker, update_for_worker::Update::StartAction(_)),
+        "Expected StartAction message"
+    );
+
+    // Precondition: no pressure NAK observed yet.
+    assert_eq!(
+        test_context
+            .scheduler
+            .worker_last_pressure_nak_for_test(&test_context.worker_id)
+            .await,
+        Some(None),
+        "precondition: no pressure NAK may be recorded before the ExecuteResult"
+    );
+
+    // The worker NAKs the placed action with the pressure wire shape.
+    let result = ExecuteResult {
+        instance_name: "instance_name".to_string(),
+        operation_id: operation_id.to_string(),
+        result: Some(execute_result::Result::InternalError(
+            make_err!(Code::ResourceExhausted, "Worker under disk pressure").into(),
+        )),
+        resource_usage: None,
+    };
+    let (send_result, _update_op) = join!(
+        test_context.worker_stream.send(Update::ExecuteResult(result)),
+        test_context.state_manager.expect_update_operation(Ok(())),
+    );
+    send_result?;
+
+    let stamp = test_context
+        .scheduler
+        .worker_last_pressure_nak_for_test(&test_context.worker_id)
+        .await
+        .expect("worker must still be in the pool after a pressure NAK");
+    assert!(
+        stamp.is_some(),
+        "NAK-observation hook violated (FINDING 3): a worker ExecuteResult \
+         carrying ResourceExhausted + 'disk pressure' must arm the fail-open \
+         cooldown (last_pressure_nak stamped) — without the stamp the \
+         place→NAK→free-requeue loop is undamped"
+    );
+    Ok(())
+}
+
+/// (FINDING 3, fix 2 — NAK observation seam, asymmetric direction) A
+/// NON-pressure `ResourceExhausted` (`"Worker startup reconcile in progress"`,
+/// the reconcile-gate wire shape) must NOT arm the fail-open cooldown: the
+/// damper is scoped to PRESSURE NAKs ("disk pressure"/"memory pressure") only.
+/// A reconcile/shutdown ResourceExhausted is transient by design and must not
+/// bar the worker from a legitimate fail-open placement.
+#[nativelink_test]
+pub async fn non_pressure_resource_exhausted_does_not_arm_cooldown_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let mut test_context = setup_api_server(BASE_WORKER_TIMEOUT_S, Box::new(static_now_fn)).await?;
+
+    let action_digest = DigestInfo::new([8u8; 32], 124);
+    let unique_qualifier = ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+        instance_name: "instance_name".to_string(),
+        digest_function: DigestHasherFunc::Sha256,
+        digest: action_digest,
+    });
+    let action_info = Arc::new(ActionInfo {
+        command_digest: DigestInfo::new([0u8; 32], 0),
+        input_root_digest: DigestInfo::new([0u8; 32], 0),
+        timeout: Duration::MAX,
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: make_system_time(0),
+        insert_timestamp: make_system_time(0),
+        unique_qualifier,
+        targetkey: None,
+    });
+    let operation_id = OperationId::default();
+    let platform_properties = test_context
+        .scheduler
+        .get_platform_property_manager()
+        .make_platform_properties(action_info.platform_properties.clone())
+        .err_tip(|| "Failed to make platform properties")?;
+    test_context
+        .scheduler
+        .worker_notify_run_action(
+            test_context.worker_id.clone(),
+            operation_id.clone(),
+            ActionInfoWithProps {
+                inner: action_info,
+                platform_properties,
+                origin_metadata: OriginMetadata::default(),
+                scheduler_start_execute_event_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let update_for_worker = test_context
+        .connection_worker_stream
+        .next()
+        .await
+        .expect("Worker stream ended early")?
+        .update
+        .expect("Expected update field to be populated");
+    assert!(
+        matches!(update_for_worker, update_for_worker::Update::StartAction(_)),
+        "Expected StartAction message"
+    );
+
+    let result = ExecuteResult {
+        instance_name: "instance_name".to_string(),
+        operation_id: operation_id.to_string(),
+        result: Some(execute_result::Result::InternalError(
+            make_err!(
+                Code::ResourceExhausted,
+                "Worker startup reconcile in progress"
+            )
+            .into(),
+        )),
+        resource_usage: None,
+    };
+    let (send_result, _update_op) = join!(
+        test_context.worker_stream.send(Update::ExecuteResult(result)),
+        test_context.state_manager.expect_update_operation(Ok(())),
+    );
+    send_result?;
+
+    assert_eq!(
+        test_context
+            .scheduler
+            .worker_last_pressure_nak_for_test(&test_context.worker_id)
+            .await,
+        Some(None),
+        "NAK-observation hook over-firing (FINDING 3): a NON-pressure \
+         ResourceExhausted ('startup reconcile in progress') must NOT arm the \
+         fail-open cooldown — the damper is scoped to pressure NAKs only"
+    );
     Ok(())
 }
 

@@ -1255,6 +1255,194 @@ async fn all_disk_pressured_fleet_fail_open_does_not_wedge_test() -> Result<(), 
     Ok(())
 }
 
+/// (FINDING 3, fix 1 — trigger correctness, production composition) The fleet
+/// fail-open may fire ONLY when pressure was the SOLE excluder. This is the
+/// FINDING 3 incident shape end-to-end: the healthy worker is CAPACITY-excluded
+/// (at its 1/1 `max_inflight_tasks` cap via a real dispatch) while every other
+/// candidate is disk-pressure-gated; pre-fix the fail-open placed onto a
+/// disk-full worker whose StartAction gate deterministically NAKs
+/// `ResourceExhausted` — which consumes no retry attempts — an undamped
+/// place→NAK→free-requeue loop (96K bounces/24h). Post-fix the action stays
+/// QUEUED until capacity or pressure clears ("queue and wait" strictly
+/// dominates "place on a known rejector"), and the recovery leg proves the
+/// stay-queued state is a WAIT, not a wedge.
+///
+/// Drives the real `SimpleScheduler` (matcher + worker pool + state manager):
+/// `update_worker_disk_pressure` → `worker_matches` exclusion-reason tracking →
+/// the fail-open trigger in `inner_find_worker_for_action`.
+///
+/// Mutation step (CLAUDE.md TDD #5): remove the `capacity_excluded_healthy == 0`
+/// condition from the fail-open trigger — action 2 dispatches to a
+/// disk-pressured worker and the Queued assertion red-fails with the bespoke
+/// trigger-correctness message below.
+#[nativelink_test]
+async fn fail_open_stays_queued_when_healthy_candidate_capacity_excluded_e2e_test()
+-> Result<(), Error> {
+    let pressured_worker_1 = WorkerId("pressured_worker_1".to_string());
+    let pressured_worker_2 = WorkerId("pressured_worker_2".to_string());
+    let capped_worker = WorkerId("capped_healthy_worker".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_pressured_1 =
+        setup_new_worker(&scheduler, pressured_worker_1.clone(), PlatformProperties::default())
+            .await?;
+    let mut rx_pressured_2 =
+        setup_new_worker(&scheduler, pressured_worker_2.clone(), PlatformProperties::default())
+            .await?;
+    // The healthy worker carries `max_inflight_tasks = 1` so a SINGLE dispatch
+    // saturates its capacity (`setup_new_worker` hardcodes unlimited, so build
+    // it inline with the same connection handshake).
+    let mut rx_capped = {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(
+            capped_worker.clone(),
+            PlatformProperties::default(),
+            tx,
+            NOW_TIME,
+            1,
+        );
+        scheduler
+            .add_worker(worker)
+            .await
+            .err_tip(|| "Failed to add capped worker")?;
+        tokio::task::yield_now().await;
+        verify_initial_connection_message(capped_worker.clone(), &mut rx).await;
+        rx
+    };
+
+    scheduler
+        .update_worker_disk_pressure(&pressured_worker_1, true, 1 << 30)
+        .await?;
+    scheduler
+        .update_worker_disk_pressure(&pressured_worker_2, true, 4 * (1 << 30))
+        .await?;
+    tokio::task::yield_now().await;
+
+    // Action 1 → the only healthy worker (capped) → Executing. The capped
+    // worker is now CAPACITY-excluded (1/1 in-flight), NOT pressured.
+    let action1_digest = DigestInfo::new([81u8; 32], 512);
+    let mut listener1 =
+        setup_action(&scheduler, action1_digest, HashMap::new(), make_system_time(17)).await?;
+    {
+        let (action_state, _maybe_origin_metadata) = listener1
+            .changed()
+            .await
+            .expect("action 1 listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Executing,
+            "precondition: action 1 must dispatch to the only healthy worker"
+        );
+    }
+    let mut capped_saw_start = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(5), rx_capped.recv()).await {
+            Ok(Some(msg)) => match msg.update {
+                Some(update_for_worker::Update::StartAction(_)) => {
+                    capped_saw_start = true;
+                    break;
+                }
+                _ => continue,
+            },
+            Ok(None) => panic!("capped worker channel closed"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        capped_saw_start,
+        "precondition: action 1's StartAction must land on the healthy capped worker"
+    );
+
+    // Action 2: the healthy worker is capacity-excluded and every other
+    // candidate is pressure-gated → the FINDING 3 trigger fix must keep it
+    // QUEUED (no fail-open placement onto a deterministic rejector).
+    let action2_digest = DigestInfo::new([82u8; 32], 512);
+    let mut listener2 =
+        setup_action(&scheduler, action2_digest, HashMap::new(), make_system_time(18)).await?;
+    {
+        let (action_state, _maybe_origin_metadata) = listener2
+            .changed()
+            .await
+            .expect("action 2 listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Queued,
+            "trigger-correctness violated (FINDING 3): with a HEALTHY \
+             capacity-excluded candidate present the action must stay QUEUED — \
+             the fleet fail-open placed onto a pressure-gated worker anyway \
+             (the 96K-bounce place→NAK→free-requeue loop shape)"
+        );
+    }
+    // Neither pressure-gated worker may have received action 2's StartAction.
+    for (name, rx) in [
+        ("pressured_worker_1", &mut rx_pressured_1),
+        ("pressured_worker_2", &mut rx_pressured_2),
+    ] {
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg.update, Some(update_for_worker::Update::StartAction(_))),
+                "trigger-correctness violated (FINDING 3): pressure-gated {name} \
+                 received a StartAction while a healthy capacity-excluded worker \
+                 existed"
+            );
+        }
+    }
+
+    // RECOVERY — stay-queued must be a WAIT, not a wedge: one worker's disk
+    // pressure clears → `update_worker_disk_pressure(false)` wakes the matcher
+    // → action 2 dispatches to it through the NORMAL (non-fail-open) path.
+    scheduler
+        .update_worker_disk_pressure(&pressured_worker_2, false, 100 * (1 << 30))
+        .await?;
+    tokio::task::yield_now().await;
+    {
+        let (action_state, _maybe_origin_metadata) = listener2
+            .changed()
+            .await
+            .expect("action 2 listener closed before recovery state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Executing,
+            "recovery violated (FINDING 3): once a candidate's pressure clears \
+             the stay-queued action must dispatch to it — stay-queued must be a \
+             bounded wait, not a wedge"
+        );
+    }
+    let mut recovered_saw_start = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(Duration::from_secs(5), rx_pressured_2.recv()).await {
+            Ok(Some(msg)) => match msg.update {
+                Some(update_for_worker::Update::StartAction(_)) => {
+                    recovered_saw_start = true;
+                    break;
+                }
+                _ => continue,
+            },
+            Ok(None) => panic!("pressured worker 2 channel closed"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        recovered_saw_start,
+        "recovery (FINDING 3): the un-pressured worker must receive the \
+         StartAction for the formerly stay-queued action"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn set_drain_worker_pauses_and_resumes_worker_test() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());

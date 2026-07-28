@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::cell::Cell;
 use core::fmt::Write as _;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
@@ -1685,6 +1686,17 @@ fn worker_has_p_headroom(w: &Worker, idle_threshold_pct: u32, override_factor: u
 /// second is enough to read the stuck-predicate state while staying negligible.
 const DECISION_TRACE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// (FINDING 3, fix 3) Minimum wall-clock spacing between two fail-open-
+/// SUPPRESSED log lines (healthy capacity-excluded candidate present → stay
+/// queued, or every fail-open candidate in pressure-NAK cooldown → stay
+/// queued). The suppressed state recurs on EVERY match attempt of a backlog
+/// burst (the FINDING 3 incident retried 4,442 ops up to 1,334 times), so an
+/// unthrottled line would flood; one line per interval is enough for an
+/// investigator to see the state and WHY. INFO (not debug): the release build
+/// pins `release_max_level_info`, so debug would be dark in prod — the exact
+/// mislead this FINDING 3 fix exists to prevent.
+const FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// (#sched-decision-trace) Formats the `Minimum`-valued platform properties of a
 /// property set into a compact, sorted `key=value` string for the decision
 /// trace. The `Minimum` values are exactly the numeric resource reservations
@@ -2176,6 +2188,22 @@ struct ApiWorkerSchedulerImpl {
     /// actions (design §3, I5_Bounded). Config
     /// (`SimpleSpec::p_headroom_override_factor`). Default 2.
     p_headroom_override_factor: u32,
+    /// (#37/F4 fail-open damper, FINDING 3) Per-worker cooldown (seconds) after
+    /// a pressure NAK before the FLEET FAIL-OPEN may re-select that worker
+    /// (config `SimpleSpec::pressure_nak_cooldown_s`, default 10; `0` =
+    /// kill-switch, damper off). Read once per fail-open evaluation under the
+    /// worker write lock. Wired post-construction via
+    /// `set_pressure_nak_cooldown` (mirrors `set_decision_trace_enabled`), so
+    /// no constructor call site changes.
+    pressure_nak_cooldown_s: u32,
+    /// (#37/F4 fail-open trigger fix, FINDING 3) Rate-limit state for the
+    /// fail-open-SUPPRESSED info log (healthy capacity-excluded candidate
+    /// exists → stay queued): wall-clock instant of the last emitted line.
+    /// Read+written only under the worker write lock (dispatch is serialized on
+    /// it), so a plain field is race-free (mirrors `last_decision_trace_at`).
+    /// `None` until the first suppression, then throttles to at most one line
+    /// per `FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL`.
+    last_failopen_suppressed_log_at: Option<Instant>,
     /// (#sched-cpu-first §7) Winner-RANKING policy. `CacheAffinityFirst` (default)
     /// is byte-identical to the pre-`#sched-cpu-first` matcher; `CpuIdleFirst`
     /// swaps ONLY the winner-selection (eligibility unchanged) for P-core-idle-
@@ -2766,6 +2794,26 @@ impl ApiWorkerSchedulerImpl {
             }
         }
 
+        // (FINDING 3, fix 1 — exclusion-reason tracking) WHY candidates fell
+        // out of `worker_matches`, tallied inline in the existing single pass
+        // (two stack `Cell<u32>`s — no per-candidate allocation, no extra
+        // iteration; this is the `do_try_match`-adjacent hot path, see the
+        // expensive-observability-probe incident).
+        //   - `capacity_excluded_healthy`: NON-pressured candidates rejected by
+        //     a CAPACITY predicate (`can_accept_work`, indefinite-pin
+        //     saturation, `is_satisfied_by` Minimum reservations) — workers
+        //     that free up in seconds, so their existence makes "queue and
+        //     wait" strictly dominate a fail-open placement.
+        //   - `pressure_gated`: candidates rejected by the swap/disk pressure
+        //     skips (a candidate that is BOTH pressured and capacity-limited
+        //     counts here only if the pressure check rejected it first; if
+        //     capacity rejected it first it counts in NEITHER — it is not a
+        //     healthy waiter, and the fail-open pool re-checks capacity anyway).
+        //   - Quarantined workers count in NEITHER: their exclusion has no
+        //     bounded horizon, so they neither justify nor suppress a fail-open.
+        let capacity_excluded_healthy = Cell::new(0u32);
+        let pressure_gated = Cell::new(0u32);
+
         // Check function for availability AND dynamic Minimum property verification.
         // The index only does presence checks for Minimum properties since their
         // values change dynamically as jobs are assigned to workers.
@@ -2781,6 +2829,12 @@ impl ApiWorkerSchedulerImpl {
             }
 
             if !w.can_accept_work() {
+                // (FINDING 3) A healthy (non-pressured) worker rejected for
+                // capacity — its slot frees up shortly, so it suppresses the
+                // fleet fail-open below.
+                if !w.swap_pressured && !w.disk_pressured {
+                    capacity_excluded_healthy.set(capacity_excluded_healthy.get() + 1);
+                }
                 if full_worker_logging {
                     debug!(
                         "Worker {worker_id} cannot accept work: is_paused={}, is_draining={}, inflight={}/{}",
@@ -2799,6 +2853,12 @@ impl ApiWorkerSchedulerImpl {
             // SEPARATE from `can_accept_work()` so the `update_action` pause
             // logic (which also calls `can_accept_work()`) is untouched.
             if w.indefinite_pin_saturated {
+                // (FINDING 3) Saturation clears when pins release/complete —
+                // a bounded wait, so it counts as capacity-excluded (suppresses
+                // the fail-open) when the worker is not also pressured.
+                if !w.swap_pressured && !w.disk_pressured {
+                    capacity_excluded_healthy.set(capacity_excluded_healthy.get() + 1);
+                }
                 if full_worker_logging {
                     debug!(
                         "Worker {worker_id} skipped: indefinite-pin cap saturated (FL-681 re-saturation gate)"
@@ -2816,6 +2876,8 @@ impl ApiWorkerSchedulerImpl {
             // (`best_swap_gated`) re-admits the least-pressured one rather
             // than wedging — so this skip never causes a deadlock.
             if w.swap_pressured {
+                // (FINDING 3) Pressure-gated: a fail-open candidate class.
+                pressure_gated.set(pressure_gated.get() + 1);
                 if full_worker_logging {
                     debug!(
                         "Worker {worker_id} skipped: host swap pressure (#37 swap gate)"
@@ -2833,6 +2895,8 @@ impl ApiWorkerSchedulerImpl {
             // (`worker_matches_ignoring_pressure` + the most-free ranking)
             // re-admits the least-pressured one rather than wedging.
             if w.disk_pressured {
+                // (FINDING 3) Pressure-gated: a fail-open candidate class.
+                pressure_gated.set(pressure_gated.get() + 1);
                 if full_worker_logging {
                     debug!(
                         "Worker {worker_id} skipped: physical disk pressure (F4 disk gate)"
@@ -2843,6 +2907,13 @@ impl ApiWorkerSchedulerImpl {
 
             // Verify Minimum properties at runtime (their values are dynamic)
             if !platform_properties.is_satisfied_by(&w.platform_properties, full_worker_logging) {
+                // (FINDING 3) Reached only for NON-pressured workers (the
+                // pressure skips above returned earlier), so this is always a
+                // healthy capacity exclusion: the Minimum reservation
+                // (`memory_kb` etc.) is restored when in-flight actions
+                // complete. This was the CONFIRMED incident excluder for all
+                // 8 healthy workers.
+                capacity_excluded_healthy.set(capacity_excluded_healthy.get() + 1);
                 return false;
             }
 
@@ -2960,14 +3031,26 @@ impl ApiWorkerSchedulerImpl {
             .min_by_key(|(_, key)| *key)
             .map(|(id, _)| id.clone());
 
-        // (#37 + F4 fleet fail-open, §5 case 3a) Nothing viable: if there ARE
-        // otherwise-viable candidates that were excluded ONLY by a pressure
-        // skip (swap OR disk), place on the LEAST-pressured one instead of
-        // wedging the capability class. The worker-local fail-opens still
-        // backstop a stale server view (swap: time-bounded; disk: the statvfs
-        // authoritative fallback rejects only a TRULY-full disk); this just
-        // avoids the wasted queue-stall when the server already knows every
-        // candidate is gated.
+        // (#37 + F4 fleet fail-open, §5 case 3a; FINDING 3 trigger fix)
+        // Nothing viable: if pressure (swap OR disk) was the SOLE excluder —
+        // no healthy candidate was rejected for a capacity-only reason — place
+        // on the LEAST-pressured gated candidate instead of wedging the
+        // capability class. The worker-local fail-opens still backstop a stale
+        // server view (swap: time-bounded; disk: the statvfs authoritative
+        // fallback rejects only a TRULY-full disk).
+        //
+        // (FINDING 3, fix 1 — trigger correctness) If ANY healthy candidate
+        // was capacity-excluded (`capacity_excluded_healthy > 0`), the action
+        // stays QUEUED instead: a capacity-excluded healthy worker frees up in
+        // seconds, so "queue and wait" strictly dominates placing on a worker
+        // whose fresh pressure state says it will deterministically NAK (the
+        // NAK gate and the wire flag share ONE sampler atomic and the same
+        // floor, so with a fresh sampler the old trigger fired exactly and
+        // only in states where the target rejects — 96K bounced placements in
+        // 24 h, undamped because ResourceExhausted consumes no retry
+        // attempts). True case 3a — ALL capable workers pressure-gated, none
+        // capacity-excluded — still fires: that capability-class wedge escape
+        // is why the fail-open exists.
         //
         // (F4) The ranking key is a tuple `(disk_pressured, swap_shortfall,
         // Reverse(available_disk_bytes))`: prefer a NOT-disk-pressured worker
@@ -2977,7 +3060,33 @@ impl ApiWorkerSchedulerImpl {
         // disk-pressured (all keys share `disk_pressured=false` → ranks purely
         // by `mem_pressure_churn_scalar`), and to most-free-bytes when all are
         // disk-pressured (shared `swap=0` → ranks by `Reverse(free)`).
-        if worker_id.is_none() {
+        if worker_id.is_none() && capacity_excluded_healthy.get() == 0 {
+            // (FINDING 3, fix 2 — pressure-NAK cooldown damper) Exclude a
+            // candidate whose last observed pressure NAK is younger than the
+            // configured window (`pressure_nak_cooldown_s`, 0 = kill-switch):
+            // even a legitimately-nonempty pool must not tight-loop onto a
+            // worker that just told us "no". Placements continue at a damped
+            // one-per-worker-per-window rate, so the worker-side 30 s
+            // `AcceptFailOpen` escape stays reachable.
+            let cooldown = Duration::from_secs(u64::from(self.pressure_nak_cooldown_s));
+            let cooldown_suppressed = Cell::new(0u32);
+            let pool_admits = |pair: &(&WorkerId, &Worker)| -> bool {
+                let w = pair.1;
+                if !(w.swap_pressured || w.disk_pressured) {
+                    return false;
+                }
+                if !worker_matches_ignoring_pressure(pair) {
+                    return false;
+                }
+                if !cooldown.is_zero()
+                    && w.last_pressure_nak
+                        .is_some_and(|nak_at| nak_at.elapsed() < cooldown)
+                {
+                    cooldown_suppressed.set(cooldown_suppressed.get() + 1);
+                    return false;
+                }
+                true
+            };
             let workers_iter = self.workers.iter();
             let rank_key = |w: &Worker| {
                 (
@@ -2990,26 +3099,78 @@ impl ApiWorkerSchedulerImpl {
                 WorkerAllocationStrategy::LeastRecentlyUsed => workers_iter
                     .rev()
                     .filter(|(wid, _)| candidates.contains(wid))
-                    .filter(|pair| pair.1.swap_pressured || pair.1.disk_pressured)
-                    .filter(|pair| worker_matches_ignoring_pressure(pair))
+                    .filter(|pair| pool_admits(pair))
                     .min_by_key(|(_, w)| rank_key(w))
                     .map(|(_, w)| w.id.clone()),
                 WorkerAllocationStrategy::MostRecentlyUsed => workers_iter
                     .filter(|(wid, _)| candidates.contains(wid))
-                    .filter(|pair| pair.1.swap_pressured || pair.1.disk_pressured)
-                    .filter(|pair| worker_matches_ignoring_pressure(pair))
+                    .filter(|pair| pool_admits(pair))
                     .min_by_key(|(_, w)| rank_key(w))
                     .map(|(_, w)| w.id.clone()),
             };
             if let Some(ref wid) = least_pressured {
+                // (FINDING 3, fix 3 — truthful WARN) State what was actually
+                // checked, with counts, so the next investigator is not misled
+                // (the old text claimed "every candidate worker is
+                // pressure-gated" while 8 of 10 were capacity-gated).
                 warn!(
                     worker_id = %wid,
-                    "fleet fail-open: every candidate worker is pressure-gated (swap and/or \
-                     disk); placing on the least-pressured one to avoid a capability-class \
-                     wedge (#37 / F4 §5 case 3a)"
+                    pressure_gated = pressure_gated.get(),
+                    capacity_excluded_healthy = capacity_excluded_healthy.get(),
+                    nak_cooldown_suppressed = cooldown_suppressed.get(),
+                    candidates = candidates.len(),
+                    "fleet fail-open: pressure was the sole excluder (no healthy \
+                     candidate capacity-excluded); placing on the least-pressured \
+                     pressure-gated worker to avoid a capability-class wedge \
+                     (#37 / F4 §5 case 3a; FINDING 3 trigger-checked)"
                 );
+            } else if cooldown_suppressed.get() > 0 {
+                // Pool emptied by the cooldown alone → stay queued for the
+                // remainder of the window (the loop is damped, not rotated).
+                // Rate-limited INFO (release compiles out debug).
+                let now = Instant::now();
+                if self
+                    .last_failopen_suppressed_log_at
+                    .is_none_or(|at| now.duration_since(at) >= FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL)
+                {
+                    self.last_failopen_suppressed_log_at = Some(now);
+                    info!(
+                        pressure_gated = pressure_gated.get(),
+                        nak_cooldown_suppressed = cooldown_suppressed.get(),
+                        candidates = candidates.len(),
+                        cooldown_s = self.pressure_nak_cooldown_s,
+                        "fleet fail-open suppressed: every fail-open candidate is \
+                         in pressure-NAK cooldown — staying queued for the \
+                         remainder of the window (FINDING 3 damper; rate-limited)"
+                    );
+                }
             }
             worker_id = least_pressured;
+        } else if worker_id.is_none()
+            && capacity_excluded_healthy.get() > 0
+            && pressure_gated.get() > 0
+        {
+            // (FINDING 3, fix 1+3 — stay-queued branch log) The fail-open WOULD
+            // have been considered (pressure-gated candidates exist) but a
+            // healthy capacity-excluded candidate suppressed it. Rate-limited
+            // INFO naming why, so a queued-action investigation sees the
+            // trigger decision instead of inferring from silence.
+            let now = Instant::now();
+            if self
+                .last_failopen_suppressed_log_at
+                .is_none_or(|at| now.duration_since(at) >= FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL)
+            {
+                self.last_failopen_suppressed_log_at = Some(now);
+                info!(
+                    capacity_excluded_healthy = capacity_excluded_healthy.get(),
+                    pressure_gated = pressure_gated.get(),
+                    candidates = candidates.len(),
+                    "fleet fail-open suppressed: healthy candidate(s) excluded \
+                     for capacity only — staying queued until capacity or \
+                     pressure clears rather than placing on a pressure-gated \
+                     worker (FINDING 3 trigger fix; rate-limited)"
+                );
+            }
         }
 
         // Log load-aware selection decision.
@@ -6006,6 +6167,15 @@ impl ApiWorkerScheduler {
                 p_headroom_gate_enabled,
                 p_idle_threshold_pct,
                 p_headroom_override_factor,
+                // (#37/F4 fail-open damper) Default from the SAME config default
+                // fn (single source of truth); the production wiring
+                // (`SimpleScheduler::new`) injects the configured value via
+                // `set_pressure_nak_cooldown` post-construction (mirrors
+                // `set_decision_trace_enabled`), so no constructor call site
+                // changes. Suppressed-log rate-limit state starts empty.
+                pressure_nak_cooldown_s:
+                    nativelink_config::schedulers::default_pressure_nak_cooldown_s(),
+                last_failopen_suppressed_log_at: None,
                 // (#sched-cpu-first §7) Placement mode defaults to the byte-
                 // identical CacheAffinityFirst; the production wiring
                 // (`SimpleScheduler::new`) injects the configured mode +
@@ -6188,6 +6358,24 @@ impl ApiWorkerScheduler {
                  before any task holds the inner lock",
             )
             .decision_trace_enabled = enabled;
+    }
+
+    /// (#37/F4 fail-open damper, FINDING 3) Set the per-worker pressure-NAK
+    /// cooldown (seconds) the fleet fail-open pool applies (config
+    /// `SimpleSpec::pressure_nak_cooldown_s`; `0` = kill-switch, damper off).
+    /// Wired ONCE by `SimpleScheduler::new` right after construction, mirroring
+    /// `set_decision_trace_enabled`. SYNCHRONOUS one-shot wiring on the
+    /// freshly-returned `Arc<Self>` before any task can hold `inner`, so
+    /// `try_write()` is uncontended. Tests call it to shrink/disable the window
+    /// before driving a dispatch.
+    pub fn set_pressure_nak_cooldown(&self, cooldown_s: u32) {
+        self.inner
+            .try_write()
+            .expect(
+                "set_pressure_nak_cooldown must be called during one-shot wiring, \
+                 before any task holds the inner lock",
+            )
+            .pressure_nak_cooldown_s = cooldown_s;
     }
 
     /// (#sched-cpu-first §7) Select the winner-ranking policy (+ the synthetic
@@ -7706,6 +7894,22 @@ impl ApiWorkerScheduler {
             .0
             .peek(worker_id)
             .map(|w| w.indefinite_pin_saturated)
+    }
+
+    /// (#37/F4 fail-open damper, FINDING 3) Reads a worker's `last_pressure_nak`
+    /// stamp. Test-only — lets the `worker_api_server` NAK-observation seam test
+    /// assert that a worker `ExecuteResult` carrying a pressure
+    /// `ResourceExhausted` (message with "disk pressure"/"memory pressure")
+    /// arms the fail-open cooldown, and that a NON-pressure `ResourceExhausted`
+    /// (e.g. "startup reconcile in progress") does NOT. Outer `None` when the
+    /// worker is absent; inner `None` when no pressure NAK was recorded.
+    #[must_use]
+    pub async fn worker_last_pressure_nak_for_test(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Option<Option<Instant>> {
+        let inner = self.inner.read().await;
+        inner.workers.0.peek(worker_id).map(|w| w.last_pressure_nak)
     }
 
     /// (#sched-zeroload) Reads a worker's `has_reported_load` flag. Test-only —
@@ -11507,6 +11711,28 @@ impl WorkerScheduler for ApiWorkerScheduler {
         if !disk_pressured {
             inner.worker_change_notify.notify_one();
         }
+        Ok(())
+    }
+
+    async fn record_worker_pressure_nak(&self, worker_id: &WorkerId) -> Result<(), Error> {
+        // peek_mut to avoid LRU promotion — a pressure-NAK observation is
+        // telemetry, not work assignment, and must not reorder scheduling
+        // (mirrors update_worker_disk_pressure). No matcher wake: this stamp
+        // only ever SHRINKS the fail-open pool, so there is no newly-placeable
+        // work to announce.
+        let mut inner = self.inner.write().await;
+        let worker = inner.workers.0.peek_mut(worker_id).ok_or_else(|| {
+            make_input_err!(
+                "Worker not found in worker map in \
+                 record_worker_pressure_nak() {}",
+                worker_id
+            )
+        })?;
+        debug!(
+            %worker_id,
+            "worker pressure NAK observed; fail-open cooldown armed (#37/F4 damper)"
+        );
+        worker.last_pressure_nak = Some(Instant::now());
         Ok(())
     }
 
@@ -19801,6 +20027,54 @@ mod b1_lock_decouple_tests {
         rx
     }
 
+    /// (FINDING 3) Like `add_worker_in_pool`, but with a real
+    /// `max_inflight_tasks` cap so a worker can be driven into the
+    /// CAPACITY-excluded state (`!can_accept_work()`) through the real
+    /// reservation path — the shape of the FINDING 3 incident (8 healthy
+    /// workers capacity-excluded while 2 disk-full ones "had capacity").
+    async fn add_worker_in_pool_max_inflight(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+        max_inflight_tasks: u64,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(
+            WorkerId(name.to_string()),
+            props_pool(),
+            tx,
+            42,
+            max_inflight_tasks,
+        );
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
+    /// (FINDING 3) `ActionInfoWithProps` whose platform properties are the
+    /// shared `pool=swap` capability, so it matches every `add_worker_in_pool*`
+    /// worker (mirrors `make_action_info_with_props` for the named-props tests).
+    fn make_action_info_in_pool(seed: u8) -> ActionInfoWithProps {
+        ActionInfoWithProps {
+            inner: Arc::new(ActionInfo {
+                command_digest: DigestInfo::new([0u8; 32], 0),
+                input_root_digest: DigestInfo::new([0u8; 32], 0),
+                timeout: Duration::MAX,
+                platform_properties: HashMap::new(),
+                priority: 0,
+                load_timestamp: UNIX_EPOCH,
+                insert_timestamp: SystemTime::now(),
+                unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                    instance_name: "main".to_string(),
+                    digest_function: DigestHasherFunc::Sha256,
+                    digest: DigestInfo::new([seed; 32], 1),
+                }),
+                targetkey: None,
+            }),
+            platform_properties: props_pool(),
+            origin_metadata: Default::default(),
+            scheduler_start_execute_event_id: None,
+        }
+    }
+
     /// (#37) COMPOSITE regression test (design §5). Composes the scheduler
     /// matcher (admission corner) + the swap-pressure ingest path + the
     /// fleet fail-open, in production composition, with TWO corners of the
@@ -19914,6 +20188,221 @@ mod b1_lock_decouple_tests {
             "the matcher must PROACTIVELY skip the swap-pressured worker (WA) \
              and place on the healthy one (WB); the fail-open must NOT fire \
              while a clean worker exists"
+        );
+    }
+
+    /// (FINDING 3, fix 1 — trigger correctness) The fleet fail-open may fire
+    /// ONLY when pressure was the SOLE excluder. Here a HEALTHY (unpressured)
+    /// candidate WC exists but is CAPACITY-excluded (1/1 in-flight via the real
+    /// reservation path) while WA/WB are pressure-gated — the exact FINDING 3
+    /// incident shape (8 capacity-excluded healthy workers, 2 disk-full ones
+    /// structurally "with capacity" because their NAKs unwind reservations).
+    /// The matcher must return None (action stays QUEUED: a capacity-excluded
+    /// healthy worker frees up in seconds and strictly dominates placing on a
+    /// known deterministic rejector), NOT place on a pressure-gated worker.
+    ///
+    /// Falsification mutation (TDD #5): remove the
+    /// `capacity_excluded_healthy == 0` condition from the fail-open trigger in
+    /// `inner_find_worker_for_action` — the pool re-admits WA/WB and this test
+    /// red-fails with the bespoke trigger-correctness message below.
+    #[nativelink_test]
+    async fn fail_open_stays_queued_when_healthy_candidate_capacity_excluded() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool_max_inflight(&scheduler, "WC", 1).await;
+
+        // WA swap-gated, WB disk-gated (BOTH pressure classes represented);
+        // WC healthy.
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA swap-pressured");
+        scheduler
+            .update_worker_disk_pressure(&WorkerId("WB".to_string()), true, 1 << 30)
+            .await
+            .expect("mark WB disk-pressured");
+
+        // Saturate WC through the REAL reservation path: the only healthy
+        // worker takes the first action and is now at its 1/1 in-flight cap
+        // (capacity-excluded, NOT pressured).
+        let op = OperationId::default();
+        let action = make_action_info_in_pool(0xc1);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_pool(), &op, &action, false)
+            .await
+            .expect("the healthy worker WC must take the first action");
+        assert_eq!(
+            reserved,
+            WorkerId("WC".to_string()),
+            "precondition: the first action must land on the only healthy worker"
+        );
+
+        // Second action: WC capacity-excluded, WA/WB pressure-gated. The
+        // fail-open must NOT fire (pressure was not the sole excluder).
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang");
+        assert!(
+            chosen.is_none(),
+            "trigger-correctness violated (FINDING 3): a HEALTHY capacity-excluded \
+             candidate (WC, 1/1 in-flight) exists, yet the matcher placed on \
+             {chosen:?} — the fail-open may fire only when pressure was the SOLE \
+             excluder; placing on a pressure-gated worker re-arms the undamped \
+             place→NAK→free-requeue loop"
+        );
+    }
+
+    /// (FINDING 3, preserved direction — #37/F4 case-3a wedge protection) When
+    /// ALL capable workers are pressure-gated and NONE is capacity-excluded,
+    /// the fail-open MUST still fire and place on the least-pressured worker —
+    /// that capability-class wedge escape is the reason the fail-open exists,
+    /// and the FINDING 3 trigger fix must not remove it. Mixed pressure
+    /// classes: the rank key `(disk_pressured, churn, Reverse(free))` prefers
+    /// the non-disk-pressured (swap-only) worker.
+    ///
+    /// Falsification mutation (TDD #5): delete/disable the fail-open arm in
+    /// `inner_find_worker_for_action` (as if the trigger fix had removed
+    /// case 3a) — the matcher returns None and this test red-fails with the
+    /// bespoke wedge message below.
+    #[nativelink_test]
+    async fn fail_open_fires_when_all_capable_pressure_gated() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool(&scheduler, "WC").await;
+
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 42_000)
+            .await
+            .expect("mark WA swap-pressured");
+        scheduler
+            .update_worker_disk_pressure(&WorkerId("WB".to_string()), true, 4 * (1 << 30))
+            .await
+            .expect("mark WB disk-pressured");
+        scheduler
+            .update_worker_disk_pressure(&WorkerId("WC".to_string()), true, 1 << 30)
+            .await
+            .expect("mark WC disk-pressured");
+
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang")
+        .expect(
+            "case-3a capability-class wedge protection violated (#37/F4): with \
+             EVERY capable worker pressure-gated and NONE capacity-excluded the \
+             fail-open must still place on the least-pressured worker, not \
+             return None and wedge the class",
+        );
+        assert_eq!(
+            chosen,
+            WorkerId("WA".to_string()),
+            "fail-open rank `(disk_pressured, churn, Reverse(free))` must prefer \
+             the non-disk-pressured (swap-only) worker WA over disk-gated WB/WC"
+        );
+    }
+
+    /// (FINDING 3, fix 2 — pressure-NAK cooldown damper) A worker that just
+    /// pressure-NAK'd a placement is excluded from the fail-open pool for the
+    /// cooldown window, so even a legitimately-nonempty pool cannot tight-loop
+    /// onto a deterministic rejector (ResourceExhausted consumes no retry
+    /// attempts, so the requeue loop has no other damping). Also proves: all
+    /// candidates in cooldown → stay queued for the window; cooldown `0`
+    /// (kill-switch) restores the undamped pool.
+    ///
+    /// Falsification mutation (TDD #5): remove the `last_pressure_nak`
+    /// cooldown filter from the fail-open pool — WB (least-pressured) wins
+    /// despite its fresh NAK and this test red-fails with the bespoke damper
+    /// message below.
+    #[nativelink_test]
+    async fn fail_open_skips_worker_in_pressure_nak_cooldown() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+
+        // Both pressure-gated; WB is the least-pressured → the fail-open's
+        // default winner.
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WB".to_string()), true, 10_000)
+            .await
+            .expect("mark WB pressured");
+
+        // WB just pressure-NAK'd a placement (the server-observed
+        // `ResourceExhausted` + "disk pressure"/"memory pressure" path).
+        scheduler
+            .record_worker_pressure_nak(&WorkerId("WB".to_string()))
+            .await
+            .expect("record WB pressure NAK");
+
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang")
+        .expect("fail-open pool must not be empty: WA is not in cooldown");
+        assert_eq!(
+            chosen,
+            WorkerId("WA".to_string()),
+            "cooldown damper violated (FINDING 3): WB pressure-NAK'd within the \
+             cooldown window and must be excluded from the fail-open pool — \
+             re-placing on a just-NAK'd worker re-arms the undamped \
+             place→NAK→free-requeue loop"
+        );
+
+        // Every candidate in cooldown → the pool is empty → stay queued for
+        // the window (the loop is fully damped, not merely rotated).
+        scheduler
+            .record_worker_pressure_nak(&WorkerId("WA".to_string()))
+            .await
+            .expect("record WA pressure NAK");
+        let chosen2 = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang");
+        assert!(
+            chosen2.is_none(),
+            "cooldown damper violated (FINDING 3): with EVERY fail-open candidate \
+             in pressure-NAK cooldown the matcher must stay queued for the window \
+             rather than re-place on a known rejector (got {chosen2:?})"
+        );
+
+        // Kill-switch: `pressure_nak_cooldown_s = 0` disables the damper — the
+        // least-pressured worker wins again despite its fresh NAK.
+        scheduler.set_pressure_nak_cooldown(0);
+        let chosen3 = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang")
+        .expect(
+            "kill-switch violated (FINDING 3): with pressure_nak_cooldown_s=0 \
+             the damper must be OFF and the fail-open must place",
+        );
+        assert_eq!(
+            chosen3,
+            WorkerId("WB".to_string()),
+            "with the damper disabled the least-pressured worker (WB @ 10k \
+             churn) must win the fail-open again"
         );
     }
 

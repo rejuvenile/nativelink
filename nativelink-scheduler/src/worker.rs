@@ -15,7 +15,7 @@
 use core::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_metric::MetricsComponent;
@@ -338,6 +338,19 @@ pub struct Worker {
     #[metric(help = "Worker-reported free bytes on its CAS volume (fail-open ranking).")]
     pub available_disk_bytes: u64,
 
+    /// (#37/F4 fail-open damper, FINDING 3) Instant of the last worker-side
+    /// PRESSURE NAK the server observed from this worker (`ResourceExhausted`
+    /// carrying "disk pressure"/"memory pressure" on `update_operation`, the
+    /// same rejection class `local_worker`'s StartAction gate emits). `None`
+    /// until the first such NAK. Consulted ONLY by the fleet fail-open pool
+    /// (`inner_find_worker_for_action`): a worker whose stamp is younger than
+    /// `pressure_nak_cooldown_s` is excluded from fail-open placement, damping
+    /// the place→NAK→free-requeue loop (ResourceExhausted is classified as
+    /// backpressure and does not consume retry attempts, so that loop is
+    /// otherwise undamped). Normal (non-fail-open) matching never reads this.
+    /// Telemetry write — recorded via `peek_mut`, no LRU promotion.
+    pub last_pressure_nak: Option<Instant>,
+
     /// Digests of input root directories cached in the worker's directory cache.
     /// The scheduler gives routing preference to workers that already have the
     /// action's input_root_digest cached.
@@ -447,6 +460,8 @@ impl Worker {
             mem_pressure_churn_scalar: 0,
             disk_pressured: false,
             available_disk_bytes: 0,
+            // (#37/F4 fail-open damper) No pressure NAK observed yet.
+            last_pressure_nak: None,
             cached_directory_digests: HashSet::new(),
             cached_subtree_digests: HashSet::new(),
             metrics: Arc::new(Metrics {

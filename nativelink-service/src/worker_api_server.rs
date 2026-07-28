@@ -2584,11 +2584,43 @@ impl WorkerConnection {
                     ?e,
                     "action failed with internal error"
                 );
+                let err: Error = e.into();
+                // (FINDING 3, fix 2 — pressure-NAK observation) A worker-side
+                // PRESSURE NAK — `ResourceExhausted` whose message carries
+                // "disk pressure"/"memory pressure", the exact wire shapes
+                // `local_worker`'s StartAction gates emit ("Worker under disk
+                // pressure" / "Worker under memory pressure") — arms the
+                // per-worker fail-open cooldown so the fleet fail-open cannot
+                // tight-loop onto a deterministic rejector (ResourceExhausted
+                // is classified as backpressure and consumes NO retry
+                // attempts, so that loop has no other damping). Scoped by
+                // message on purpose: the reconcile/shutdown ResourceExhausted
+                // shapes are NOT pressure and must not bar a legitimate
+                // fail-open placement. Recorded BEFORE `update_action` so the
+                // stamp lands even if the op-state update errors.
+                if err.code == Code::ResourceExhausted
+                    && err
+                        .messages
+                        .iter()
+                        .any(|m| m.contains("disk pressure") || m.contains("memory pressure"))
+                {
+                    if let Err(nak_err) = self
+                        .scheduler
+                        .record_worker_pressure_nak(&self.worker_id)
+                        .await
+                    {
+                        warn!(
+                            worker_id=?self.worker_id,
+                            ?nak_err,
+                            "Failed to record worker pressure NAK"
+                        );
+                    }
+                }
                 self.scheduler
                     .update_action(
                         &self.worker_id,
                         &operation_id,
-                        UpdateOperationType::UpdateWithError(e.into()),
+                        UpdateOperationType::UpdateWithError(err),
                     )
                     .await
                     .err_tip(|| format!("Failed to operation {operation_id}"))?;

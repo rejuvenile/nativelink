@@ -2691,6 +2691,12 @@ impl SimpleScheduler {
         // `set_exec_clock` one-shot wiring above.
         worker_scheduler.set_decision_trace_enabled(spec.scheduler_decision_trace_enabled);
 
+        // (#37/F4 fail-open damper, FINDING 3) Wire the per-worker pressure-NAK
+        // cooldown the fleet fail-open pool applies (default 10 s ON; `0` is the
+        // kill-switch). Mirrors the `set_decision_trace_enabled` one-shot wiring
+        // above (uncontended try_write on the freshly-built Arc).
+        worker_scheduler.set_pressure_nak_cooldown(spec.pressure_nak_cooldown_s);
+
         // (#sched-cpu-first §7) Wire the winner-ranking policy from config
         // (default `CacheAffinityFirst` = byte-identical to today) + the
         // synthetic-load pct-per-task for `CpuIdleFirst`. Mirrors the
@@ -3513,6 +3519,17 @@ impl WorkerScheduler for SimpleScheduler {
     ) -> Result<(), Error> {
         self.worker_scheduler
             .update_worker_disk_pressure(worker_id, disk_pressured, available_disk_bytes)
+            .await
+    }
+
+    async fn record_worker_pressure_nak(&self, worker_id: &WorkerId) -> Result<(), Error> {
+        // (#37/F4 fail-open damper, FINDING 3) Forward to the worker pool —
+        // the default trait impl is a no-op, so omitting this delegation would
+        // silently disarm the fail-open cooldown in production (the
+        // WorkerApiServer holds the SimpleScheduler, not the inner
+        // ApiWorkerScheduler).
+        self.worker_scheduler
+            .record_worker_pressure_nak(worker_id)
             .await
     }
 

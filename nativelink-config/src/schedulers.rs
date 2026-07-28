@@ -451,6 +451,26 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub scheduler_decision_trace_enabled: bool,
 
+    /// (#37/F4 fail-open damper, FINDING 3) Per-worker cooldown, in seconds,
+    /// after a worker-side PRESSURE NAK (`ResourceExhausted` with "disk
+    /// pressure"/"memory pressure" on `update_operation`). While a worker's
+    /// last pressure NAK is younger than this window, the FLEET FAIL-OPEN
+    /// (the #37/F4 case-3a least-pressured placement) excludes it from the
+    /// fail-open candidate pool, so a deterministic-rejector worker cannot be
+    /// re-selected in a tight place→NAK→requeue loop (the 96K-bounce FINDING 3
+    /// incident: ResourceExhausted is classified as backpressure and does not
+    /// consume retry attempts, so the loop had NO damping). Normal (non-fail-
+    /// open) matching is unaffected — a worker whose pressure has cleared is
+    /// admitted by the regular path regardless of this window. The worker-side
+    /// 30 s `AcceptFailOpen` escape stays reachable: placements continue at a
+    /// damped one-per-worker-per-window rate instead of a tight loop.
+    ///
+    /// Default: 10 (ON — ship features on; per user 2026-07-07 default-off
+    /// flags just delay fixing their bugs). `0` is the operational KILL-SWITCH:
+    /// it disables the damper entirely (pre-FINDING-3 fail-open pool behavior).
+    #[serde(default = "default_pressure_nak_cooldown_s")]
+    pub pressure_nak_cooldown_s: u32,
+
     /// (#sched-cpu-first) Worker winner-RANKING policy. `CacheAffinityFirst`
     /// (the default) is byte-identical to the pre-`#sched-cpu-first` matcher;
     /// `CpuIdleFirst` ranks by (synthetic-compensated) P-core load ascending,
@@ -750,6 +770,9 @@ impl Default for SimpleSpec {
             // OFF (observability-only; an operator turns it ON briefly to diagnose
             // a placement question, then OFF).
             scheduler_decision_trace_enabled: false,
+            // (#37/F4 fail-open damper) #[serde(default = "...")] → 10 s (ON by
+            // default per the anti-dark-counter rule; `0` is the kill-switch).
+            pressure_nak_cooldown_s: default_pressure_nak_cooldown_s(),
             // #[serde(default)] → PlacementMode::default() = CacheAffinityFirst
             // (byte-identical to today until an operator selects CpuIdleFirst).
             placement_mode: PlacementMode::default(),
@@ -867,6 +890,17 @@ pub const fn default_cpu_first_synthetic_pct_per_task() -> u32 {
 /// and its counters are dark (per user 2026-07-07).
 const fn default_true() -> bool {
     true
+}
+
+/// (#37/F4 fail-open damper, FINDING 3) Default per-worker cooldown (seconds)
+/// after a pressure NAK before the fleet fail-open may re-select that worker.
+/// 10 s damps the place→NAK→requeue loop to at most one placement per worker
+/// per window while keeping the worker-side 30 s `AcceptFailOpen` escape
+/// reachable (placements continue, just damped). `pub` so the scheduler's
+/// no-config `ApiWorkerScheduler::new` path sources the SAME value (single
+/// source of truth — no hardcoded copy to drift).
+pub const fn default_pressure_nak_cooldown_s() -> u32 {
+    10
 }
 
 /// (#sched-blend) Default cache-vs-load crossover anchor (512 KiB).
