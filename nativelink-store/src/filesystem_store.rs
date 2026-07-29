@@ -1355,15 +1355,18 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// seams, so the worker-side `gate ⇒ evict` end-to-end test can
     /// drive a heal against a real `FilesystemStore` + `FileEntryImpl`
     /// (whose `unref` deletes the on-disk file) — review 9fd52fc0
-    /// pair-b T5. Gated exactly like `BlobsAvailableState::from_test_args`.
-    #[cfg(any(test, feature = "test-utils"))]
+    /// pair-b T5. Feature-only gate (NOT `any(test, ...)`): the underlying
+    /// `MokaEvictingMap` seams exist only under `nativelink-util/test-utils`,
+    /// which this crate's own `cfg(test)` does not enable — an `any(test)`
+    /// arm here breaks `cargo check --all-targets` without the feature.
+    #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub fn test_inflate_wedge_observation(&self, extra_bytes: u64) {
         self.evicting_map.test_inflate_wedge_observation(extra_bytes);
     }
 
     /// (FINDING 2, test seam) See [`Self::test_inflate_wedge_observation`].
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub async fn test_maybe_selfheal_wedged_eviction(
         &self,
