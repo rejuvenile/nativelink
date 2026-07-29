@@ -3614,6 +3614,88 @@ impl WorkerScheduler for SimpleScheduler {
 impl RootMetricsComponent for SimpleScheduler {}
 
 #[cfg(test)]
+mod calib_offender_dump_cadence_test {
+    //! (#calib under-attribution, 48bc07ab T2) The CADENCE wiring for the
+    //! per-key under-offender dump: `emit_accuracy_under_offenders_log` must be
+    //! CALLED from the `simple_scheduler_hold_counters_log` periodic task —
+    //! deleting that one call previously left every suite green (the
+    //! worker-metrics-exposure trap shape: a correct emit fn that nothing
+    //! invokes). Detection is via the always-counted
+    //! `accuracy_under_offender_dump_scans` liveness probe, which the emit
+    //! advances even when the offender map is empty — so this test needs no
+    //! seeded unders, only elapsed cadence time. Paused tokio time (no
+    //! sleep-as-synchronization); the emit BODY (silence/rows/truncation) is
+    //! pinned separately in `api_worker_scheduler.rs`.
+
+    use core::sync::atomic::Ordering;
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use nativelink_config::schedulers::SimpleSpec;
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::instant_wrapper::MockInstantWrapped;
+    use tokio::sync::Notify;
+
+    use super::{HOLD_COUNTERS_LOG_INTERVAL_S, SimpleScheduler};
+    use crate::default_scheduler_factory::memory_awaited_action_db_factory;
+
+    /// MUTATION (review-pair-b T2): delete the
+    /// `worker_scheduler.emit_accuracy_under_offenders_log()` call from the
+    /// `simple_scheduler_hold_counters_log` task → the scan probe stays 0 after
+    /// two full intervals → red-fails with "offender dump unwired".
+    #[nativelink_test(start_paused = true)]
+    async fn hold_counters_cadence_calls_offender_dump() {
+        let task_change_notify = Arc::new(Notify::new());
+        let (scheduler, _ws) = SimpleScheduler::new(
+            &SimpleSpec::default(),
+            memory_awaited_action_db_factory(
+                0,
+                &task_change_notify.clone(),
+                MockInstantWrapped::default,
+            ),
+            task_change_notify,
+            None,
+        );
+        let dump_scans = || {
+            scheduler
+                .worker_scheduler_for_test()
+                .get_metrics()
+                .accuracy_under_offender_dump_scans
+                .load(Ordering::Relaxed)
+        };
+        // Let the freshly-spawned periodic task START (create its interval and
+        // register the timer) before advancing the paused clock — a timer that
+        // does not exist yet cannot be fired by `advance`.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // The periodic task deliberately skips the interval's immediate first
+        // tick, so nothing may have scanned yet.
+        assert_eq!(
+            dump_scans(),
+            0,
+            "no offender-dump scan may run before the first cadence interval \
+             elapses (the immediate tick is skipped by design)"
+        );
+        // Advance past TWO full intervals (+1 s slack) so at least one real
+        // cadence tick fires regardless of tick alignment.
+        tokio::time::advance(Duration::from_secs(HOLD_COUNTERS_LOG_INTERVAL_S * 2 + 1)).await;
+        // Let the woken periodic task actually run its tick body.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dump_scans() >= 1,
+            "offender dump unwired: two hold-counters intervals elapsed but \
+             accuracy_under_offender_dump_scans is still 0 — the \
+             emit_accuracy_under_offenders_log call is missing from the \
+             simple_scheduler_hold_counters_log periodic task, so the per-key \
+             under attribution would never reach the logs in production"
+        );
+    }
+}
+
+#[cfg(test)]
 mod batch_sched_gain_test {
     //! (#p1p2 M1-replay) Prod-shape tests for the batch-scheduling counterfactual
     //! that FAITHFULLY REPLAYS the live M1 P-headroom gate. The gate is CONFIRMED

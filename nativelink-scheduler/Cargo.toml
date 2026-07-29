@@ -73,6 +73,11 @@ tokio = { version = "1.52.2", features = [
   "test-util",
 ], default-features = false }
 
+# (#calib T2) `test-util` enables `start_paused` so the hold-counters cadence
+# wiring test can advance the 15 s interval deterministically (no
+# sleep-as-synchronization). Mirrors nativelink-util's dev-dep line.
+tokio = { version = "1.52.2", features = ["macros", "test-util"], default-features = false }
+
 pretty_assertions = { version = "1.4.1", features = [
   "std",
 ], default-features = false }

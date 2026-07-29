@@ -1783,26 +1783,40 @@ pub struct MemoryGateCounters {
     // went; the gauges read 0 after). These fields make the busy-window history
     // self-recording: a HIGH-WATER max per signal (+ churn) and a fixed 6-band
     // tick histogram per signal, all fed by [`Self::record_calibration_tick`]
-    // on the ~100 ms sampler tick (readable-signals path only). O(1) atomics
-    // per tick; reset only at process start.
+    // on the ~100 ms sampler tick (readable-signals path with a real prior
+    // anchor only — synthetic first/recovery-tick zeros are not measurements).
+    // O(1) atomics per tick; reset only at process start.
+    //
+    // SOAK-READING CAVEATS (48bc07ab assumption-auditor):
+    // - The four maxes are PROCESS-LIFETIME and cannot be windowed: a
+    //   calibration soak must either restart the workers before its window or
+    //   read band DELTAS between two scrapes (the bands are monotonic, so
+    //   scrape-to-scrape subtraction windows them; the maxes do not subtract).
+    // - The bands count TICKS AT a rate, not consecutive-RUN lengths. They are
+    //   a sound calibration input for the RATE thresholds
+    //   (`memory_gate_swapin_confirm_rate`, churn low/high) but only PARTIALLY
+    //   inform the sustained-window-N knob: they bound how many ticks sat
+    //   at/above a rate, not whether those ticks were consecutive.
     /// High-water mark of the churn EWMA (`churn_ewma`) since process start.
-    /// `fetch_max` gauge — never reset, never decays.
+    /// `fetch_max` gauge — never reset, never decays, cannot be windowed (see
+    /// the soak-reading caveats above).
     pub churn_ewma_max: AtomicU32,
     /// High-water mark of the raw per-second COMPRESSION rate since process
-    /// start. `fetch_max` gauge.
+    /// start. `fetch_max` gauge (process-lifetime; not windowable).
     pub compress_rate_max: AtomicU32,
     /// High-water mark of the raw per-second DECOMPRESSION rate since process
-    /// start. `fetch_max` gauge.
+    /// start. `fetch_max` gauge (process-lifetime; not windowable).
     pub decompress_rate_max: AtomicU32,
     /// High-water mark of the raw per-second SWAPIN rate since process start.
-    /// `fetch_max` gauge — the direct calibration input for
-    /// `memory_gate_swapin_confirm_rate` (currently suppressed at `u32::MAX`).
+    /// `fetch_max` gauge (process-lifetime; not windowable) — the direct
+    /// calibration input for `memory_gate_swapin_confirm_rate` (currently
+    /// suppressed at `u32::MAX`).
     pub swapin_rate_max: AtomicU32,
     /// Sampler-tick counts by COMPRESSION-rate band
     /// `{0, 1-10, 11-100, 101-1000, 1001-10000, >10000}/s` (index 0..=5).
-    /// Monotonic counters — sustained-vs-spike is read from the band SHAPE
-    /// (the gate's sustained-N-ticks semantics needs tick-duration, which a
-    /// max alone cannot give).
+    /// Monotonic counters — sustained-vs-spike is read from the band SHAPE.
+    /// NOTE: tick counts, not consecutive-run lengths — see the
+    /// soak-reading caveats above for what this can and cannot calibrate.
     pub compress_rate_bands: [AtomicU64; MEMORY_GATE_RATE_BANDS],
     /// Sampler-tick counts by DECOMPRESSION-rate band (same bands as
     /// [`Self::compress_rate_bands`]).
@@ -1854,13 +1868,15 @@ impl MemoryGateCounters {
         }
     }
 
-    /// (#calib) Record one readable-signals sampler tick into the busy-window
+    /// (#calib) Record one measured sampler tick into the busy-window
     /// self-recording state: high-water `fetch_max` per signal (+ churn) and
     /// one band-tick per signal. Called from the worker memory-gate sampler
-    /// (`sample_mem_pressure`) on the readable path ONLY — the unreadable-signals
-    /// early-return does NOT call it (an unreadable tick is not a measurement,
-    /// and the maxes must survive it). Cost: 7 relaxed atomic RMWs per ~100 ms
-    /// tick; no allocation, no lock.
+    /// (`sample_mem_pressure`) ONLY when the tick had a real prior anchor —
+    /// the unreadable-signals early-return does NOT call it (not a
+    /// measurement, and the maxes must survive it), and neither does the
+    /// anchorless first/recovery tick whose rates are synthetic zeros
+    /// (48bc07ab LOW-C3). Cost: 7 relaxed atomic RMWs per ~100 ms tick; no
+    /// allocation, no lock.
     pub fn record_calibration_tick(
         &self,
         compress_rate: u32,
@@ -2029,7 +2045,9 @@ impl MetricsComponent for MemoryGateCounters {
             MetricKind::Default,
             "high-water mark of the raw per-second SWAPIN rate since process \
              start (fetch_max, never reset) — the direct calibration input for \
-             memory_gate_swapin_confirm_rate (currently suppressed at u32::MAX)."
+             memory_gate_swapin_confirm_rate (currently suppressed at u32::MAX). \
+             PROCESS-LIFETIME: to window a soak, restart workers first or read \
+             the band-counter deltas instead."
         );
         // The 18 band-tick counters: sampler ticks (~100 ms each) whose rate fell
         // in the band. Monotonic; band SHAPE distinguishes sustained pressure

@@ -1509,10 +1509,21 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     // (#calib) Busy-window self-recording: high-water maxes + band-tick
     // histograms on the SAME singleton, so the threshold-calibration soak can
     // read burst history from /metrics after the burst (the instantaneous
-    // gauges above read 0 between bursts — 2026-07-28). Readable-path only:
-    // the unreadable early-return above records nothing (not a measurement,
-    // and the maxes must survive it). Cost: 7 relaxed atomic RMWs per tick.
-    counters.record_calibration_tick(compress_rate, decompress_rate, swapin_rate, churn_rounded);
+    // gauges above read 0 between bursts — 2026-07-28). Recorded ONLY when a
+    // real interval existed (`state.prev` was `Some`): the first tick after
+    // start AND the recovery tick after an unreadable gap force synthetic
+    // `(0,0,0)` rates, and a synthetic zero is not a measurement (review
+    // 48bc07ab LOW-C3 — flapping signals would otherwise silently absorb every
+    // recovery into band-0). The unreadable early-return above records nothing
+    // either (and the maxes survive it). Cost: 7 relaxed atomic RMWs per tick.
+    if state.prev.is_some() {
+        counters.record_calibration_tick(
+            compress_rate,
+            decompress_rate,
+            swapin_rate,
+            churn_rounded,
+        );
+    }
 
     // OOM SUSTAINED-SWAPIN signal: require the swapin rate to stay at/above the
     // threshold for a consecutive-tick window (rejects one-off spikes).
@@ -10422,12 +10433,17 @@ mod tests {
 
     /// (#calib wiring) The PRODUCTION `sample_mem_pressure` readable-signals path
     /// must feed the calibration self-recording (`record_calibration_tick` on the
-    /// `/metrics` singleton): each readable tick adds exactly ONE band-tick per
-    /// signal (3 total). Drives the real sampler through TWO ticks and asserts
-    /// the singleton's summed band counts advanced by >= 6. Delta-`>=` because
-    /// the singleton is process-wide and the counters monotonic — a parallel
-    /// test can only ADD ticks, never remove them (still `#[serial]` to follow
-    /// the sampler-atomics convention).
+    /// `/metrics` singleton): each readable tick WITH a prior anchor adds exactly
+    /// ONE band-tick per signal (3 total). The FIRST tick (`prev == None`,
+    /// synthetic zero rates) must NOT record (review 48bc07ab LOW-C3: a
+    /// synthetic zero is not a measurement). Drives the real sampler through
+    /// THREE ticks — tick 1 records nothing, ticks 2+3 record 3 each — and
+    /// asserts the singleton's summed band counts advanced by >= 6.
+    /// Delta-`>=` because the singleton is process-wide and the counters
+    /// monotonic — a parallel test can only ADD ticks, never remove them
+    /// (still `#[serial]` to follow the sampler-atomics convention; an exact
+    /// `== 6` would race other sampler-driving tests, so the no-record-on-
+    /// first-tick contract is pinned by the dedicated single-tick guard below).
     ///
     /// `#[cfg(any(linux, macos))]`: only there does `read_memory_signals` return
     /// `Some` (the readable path that records calibration ticks); the fallback
@@ -10452,15 +10468,55 @@ mod tests {
         };
         let before = band_sum();
         let state = sample_mem_pressure(SwapSamplerState::new());
+        let state = sample_mem_pressure(state);
         let _ = sample_mem_pressure(state);
         let after = band_sum();
         assert!(
             after >= before + 6,
-            "sampler not feeding calibration bands: two readable \
-             sample_mem_pressure ticks must record >= 6 band-ticks (3 signals x 2 \
-             ticks) into the /metrics singleton, got {before} -> {after}. The \
+            "sampler not feeding calibration bands: three readable \
+             sample_mem_pressure ticks must record >= 6 band-ticks (3 signals x \
+             the 2 anchored ticks; the first, anchorless tick records nothing) \
+             into the /metrics singleton, got {before} -> {after}. The \
              swapin/churn threshold calibration data is DARK — the \
              record_calibration_tick call is missing from the sampler."
+        );
+    }
+
+    /// (#calib, review 48bc07ab LOW-C3) The FIRST readable tick after start —
+    /// `prev == None`, so the rates are the synthetic `(0, 0, 0)` — must NOT be
+    /// recorded as a band-0 measurement: a flapping signal source would
+    /// otherwise absorb every recovery tick into band-0 and skew the
+    /// sustained-vs-spike shape. Drives exactly ONE anchorless tick and asserts
+    /// the band sum did not move.
+    ///
+    /// Mutation: drop the `state.prev.is_some()` guard around
+    /// `record_calibration_tick` in `sample_mem_pressure` → the single
+    /// anchorless tick records 3 band-0 ticks → red-fails with "anchorless
+    /// tick was recorded".
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[serial(swap_sampler_atomics)]
+    fn sampler_skips_calibration_recording_on_anchorless_first_tick() {
+        let counters = nativelink_util::o11_probes::memory_gate_counters();
+        let band_sum = || -> u64 {
+            counters
+                .compress_rate_bands
+                .iter()
+                .chain(counters.decompress_rate_bands.iter())
+                .chain(counters.swapin_rate_bands.iter())
+                .map(|b| b.load(Ordering::Relaxed))
+                .sum()
+        };
+        let before = band_sum();
+        // One tick from a fresh state: prev == None → synthetic zero rates.
+        let _ = sample_mem_pressure(SwapSamplerState::new());
+        let after = band_sum();
+        assert_eq!(
+            after, before,
+            "anchorless tick was recorded: the first readable tick after start \
+             has no prev anchor (synthetic (0,0,0) rates — not a measurement) \
+             and must not add band ticks; got {before} -> {after}. Guard \
+             record_calibration_tick with state.prev.is_some()."
         );
     }
 
