@@ -702,6 +702,122 @@ async fn v2_session_abort_leaves_entry_then_idle_reap_clears_it() {
     );
 }
 
+/// BLOCK-1 (aa3fa9e3f review, pair-a + red-team convergent): the idle
+/// reap must co-remove the digest's `ChunkRaceState` with its partial.
+/// The reap's victim population ("pwrote ≥1 chunk then vanished") has
+/// `chunks_present` bits SET by construction; if the bitmap survived
+/// the reap, the next retry through the REAL `write_chunked_v2` would
+/// get `AlreadyHave` for the set bits, skip re-uploading them, produce
+/// a sparse fresh partial, pass the length check, and die only at the
+/// e2e hash — bumping `sha256_e2e_mismatches_total` (the CAS-poisoning
+/// alarm) and wasting a full-blob upload.
+///
+/// This test drives the full production shape: abort mid-blob → reap →
+/// RETRY the same digest through the v2 RPC → the retry must be told to
+/// upload ALL chunks (accepted == n, already_have == 0) and must commit
+/// CLEAN on the first attempt.
+///
+/// MUTATION B1M (comment out the reap's `force_remove` of the
+/// race-state): already_have > 0 and/or the final response is an e2e
+/// mismatch error → red below.
+#[cfg(feature = "test-utils")]
+#[nativelink_test]
+async fn v2_retry_after_reap_uploads_all_chunks_and_commits_clean() {
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| (i as u8).wrapping_mul(31))
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let handler = make_handler(Arc::clone(&store), budget);
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // Session A: chunk 0 only (bits set for offset 0), then client
+    // gone for good — the leak shape.
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<WriteChunk>(4);
+    chunk_tx
+        .send(make_chunk(digest, 0, &payload[..TEST_CHUNK_SIZE], false))
+        .await
+        .expect("first chunk send into the request channel must succeed");
+    let mut ca = client.clone();
+    let session_a = tokio::spawn(async move {
+        let stream = tokio_stream::wrappers::ReceiverStream::new(chunk_rx);
+        let response = ca.write_chunked_v2(stream).await?;
+        let (final_res, _) = drain_v2_response(response.into_inner()).await;
+        Ok::<_, tonic::Status>(final_res)
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !store.has_in_flight_chunked_partial(&digest) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("partial entry must appear after chunk 0 lands (deadlock detector)");
+    drop(chunk_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(10), session_a)
+        .await
+        .expect("aborted session must terminate (deadlock detector)")
+        .expect("session task must not panic");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.chunked_active_writers_for_test(&digest) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session guard must release after the abort (deadlock detector)");
+
+    // The reap collects the abandoned state — partial AND race-state.
+    let reaped = store
+        .reap_idle_chunked_partials_for_test(Duration::ZERO)
+        .await;
+    assert_eq!(reaped, 1, "fixture guard: the abandoned entry must be reaped");
+
+    // RETRY through the real v2 RPC. It must re-upload EVERYTHING and
+    // commit clean.
+    let chunks = build_chunks(digest, &payload);
+    let n_chunks = chunks.len() as u64;
+    let mut cb = client.clone();
+    let retry = tokio::spawn(async move {
+        let stream = tokio_stream::iter(chunks);
+        let response = cb.write_chunked_v2(stream).await?;
+        let (final_res, acks) = drain_v2_response(response.into_inner()).await;
+        Ok::<_, tonic::Status>((final_res, acks))
+    });
+    let (final_res, acks) = tokio::time::timeout(Duration::from_secs(15), retry)
+        .await
+        .expect("post-reap retry must not deadlock")
+        .expect("retry task must not panic")
+        .expect("write_chunked_v2 must return Ok for the retry");
+    let committed_size = final_res
+        .expect("retry must observe a final frame")
+        .expect(
+            "the post-reap retry must commit CLEAN on its first attempt — an \
+             error here (e2e hash mismatch) means the reaped digest's \
+             ChunkRaceState bitmap survived the reap and told the retry to \
+             skip chunks whose bytes were deleted (BLOCK-1: sparse partial, \
+             spurious sha256_e2e_mismatches_total, wasted full-blob upload)",
+        );
+    assert_eq!(
+        committed_size,
+        payload.len() as u64,
+        "retry's committed_size must equal the blob length",
+    );
+    assert_eq!(
+        acks.already_have, 0,
+        "the post-reap retry must be told to upload ALL chunks — already_have > 0 \
+         means stale chunks_present bits survived the reap (BLOCK-1: the \
+         race-state must be force-removed in the same reap that deletes the \
+         partial)",
+    );
+    assert_eq!(
+        acks.accepted, n_chunks,
+        "every chunk of the post-reap retry must be ACCEPTED (fresh race-state, \
+         fresh partial — the genuine restart-from-offset-0 the reap's warn \
+         claims)",
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test 5: corruption regression — bit-identical canonical post-race
 // -----------------------------------------------------------------------------

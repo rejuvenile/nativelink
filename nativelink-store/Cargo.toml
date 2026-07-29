@@ -438,3 +438,11 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "chunked_b1_writev_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #F3 sibling: idle-TTL reap of abandoned SpawnBlocking chunked-partial
+# entries + RAII writer-session guard. Registered with required-features
+# (repo convention) so a featureless `cargo test` SKIPS the target
+# instead of reporting a silently-empty "0 tests ok" suite.
+[[test]]
+name = "chunked_spawnblocking_reap_test"
+required-features = ["chunked_fast_slow", "test-utils"]

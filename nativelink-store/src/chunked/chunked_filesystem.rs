@@ -67,6 +67,7 @@
 
 use core::fmt::Debug;
 use core::time::Duration;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -74,16 +75,18 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
+use nativelink_metric::MetricsComponent;
+use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::spawn_rate_probe::{record, SpawnSite};
 use parking_lot::Mutex;
-use nativelink_util::background_spawn;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant as TokioInstant;
 #[cfg(feature = "bench-trace")]
 use tracing::info;
 use tracing::{debug, warn};
 
+use crate::chunked::chunked_race_state::ChunkRaceRegistry;
 use crate::filesystem_store::digest_shard_prefix;
 
 /// #213 NMA2 test hook: per-digest millisecond delay injected at
@@ -368,20 +371,26 @@ impl Debug for ChunkInProgress {
 #[derive(Debug, Default)]
 struct PartialsState {
     /// digest → in-flight chunked partial (the original map).
+    // UNBOUNDED-OK: one entry (fd + PathBuf, no payload bytes) per
+    // concurrently in-flight chunked upload — admission-bounded by the
+    // handler/driver concurrency above; the idle-TTL reap additionally
+    // bounds entry RESIDENCY in time (this commit's purpose).
     partials: HashMap<DigestInfo, Arc<ChunkInProgress>>,
     /// #F3 sibling: digest → count of live writer-session guards
     /// ([`ChunkedWriterSessionGuard`]). The idle reap NEVER removes an
     /// entry whose count is non-zero (#494 protection direction).
-    /// Entries are removed when the count returns to zero, so the map
-    /// is bounded by the number of concurrently live sessions.
+    // CAPPED AT live-session count: entries hold one usize and are
+    // removed when the guard count returns to zero (RAII Drop), so
+    // cardinality ≤ concurrently live writer sessions.
     active_writers: HashMap<DigestInfo, usize>,
     /// #F3 sibling: digests whose entry has been removed by the reap
     /// but whose on-disk `.partial` unlink is still in flight. A new
     /// session's file-open WAITS (via [`ChunkedPartialsMap::reap_done`])
     /// while its digest is here, so it can never create a fresh partial
     /// that the in-flight unlink would then delete (torn state).
-    /// Bounded by the reap batch size (transient, microseconds-long
-    /// residency per digest).
+    // CAPPED AT 1 per in-flight reap victim: per-victim mark scope
+    // (set immediately before a victim's unlink, cleared immediately
+    // after), key-only, microseconds-long residency.
     reaping: HashSet<DigestInfo>,
 }
 
@@ -395,14 +404,23 @@ struct PartialsState {
 /// outer map lock releases immediately after the `Arc::clone`, leaving
 /// the long-running `pwrite` to serialize only on the per-blob async
 /// mutex inside.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, MetricsComponent)]
 pub(crate) struct ChunkedPartialsMap {
     state: Mutex<PartialsState>,
     /// #F3 sibling: notified (via `notify_waiters`) each time a reap
     /// finishes a digest's unlink and clears its `reaping` mark. Woken
     /// waiters re-check `reaping` under the state lock (enable-before-
-    /// check pattern; spurious wakeups just loop).
+    /// check pattern; spurious wakeups just loop). Registration is LAZY
+    /// (only after observing the `reaping` mark), so the waiter list is
+    /// empty in the steady state.
     reap_done: tokio::sync::Notify,
+    /// aa3fa9e3f review MAJOR-2: countable output for the idle reap
+    /// (the per-victim `warn!` alone is not alertable). Rendered via
+    /// the owning `FilesystemStore`'s `chunked_partials` metric group.
+    #[metric(
+        help = "Total abandoned SpawnBlocking chunked-partial entries reaped by the idle-TTL reaper (entry + fd + on-disk partial + race-state)"
+    )]
+    reaped_total: AtomicU64,
 }
 
 impl ChunkedPartialsMap {
@@ -667,28 +685,65 @@ async fn open_or_create_partial(
         // finish before creating a fresh file — otherwise the in-flight
         // unlink would delete the file we just created (#F3 sibling
         // torn-state closure; the map is the sync point).
-        {
-            // Enable-before-check so a reap finishing between the lock
-            // release and the `.await` still wakes us (no lost wakeup).
+        //
+        // P-1 (aa3fa9e3f review, convergent): the `Notify` registration
+        // is LAZY — the hot per-chunk path takes ONLY the state lock;
+        // `notified()+enable()` (two acquisitions of tokio's shared
+        // `Notify.waiters` mutex) happen only after OBSERVING the
+        // `reaping` mark (cold: only ever after a reap fired for this
+        // digest). Lost-wakeup safety is preserved by the standard
+        // register-then-RE-CHECK idiom below.
+        let reaping_hit = {
+            let st = map.state.lock();
+            if let Some(existing) = st.partials.get(&digest) {
+                touch_spawn_blocking_activity(existing);
+                return Ok(Arc::clone(existing));
+            }
+            st.reaping.contains(&digest)
+        };
+        if reaping_hit {
+            // Cold path: register, then re-check under the lock, then
+            // wait. A clear+notify landing between the hot check and
+            // `enable()` is caught by the re-check; one landing after
+            // `enable()` wakes the registered waiter. No lost wakeup.
             let notified = map.reap_done.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
+            let still_reaping = {
                 let st = map.state.lock();
                 if let Some(existing) = st.partials.get(&digest) {
                     touch_spawn_blocking_activity(existing);
                     return Ok(Arc::clone(existing));
                 }
-                if st.reaping.contains(&digest) {
-                    drop(st);
-                    debug!(
-                        ?digest,
-                        "open_or_create_partial: digest is mid-reap (unlink in \
-                         flight); waiting before creating a fresh partial"
-                    );
-                    notified.await;
-                    continue;
-                }
+                st.reaping.contains(&digest)
+            };
+            if still_reaping {
+                debug!(
+                    ?digest,
+                    "open_or_create_partial: digest is mid-reap (unlink in \
+                     flight); waiting before creating a fresh partial"
+                );
+                notified.await;
+            }
+            continue;
+        }
+
+        // T-1 test hook (aa3fa9e3f review): park HERE — after the
+        // pre-open reaping check, before the open — so tests can pin
+        // (a) the post-open re-check (hold a create mid-"open" while a
+        // reap runs) and (b) the pre-open wait (prove a create never
+        // reaches this point while an unlink is in flight).
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let gate = TEST_CREATE_PRE_OPEN_GATE_BY_DIGEST.lock().get(&digest).cloned();
+            if let Some(gate) = gate {
+                gate.reached_flag.store(true, Ordering::SeqCst);
+                gate.reached.notify_waiters();
+                let _permit = gate
+                    .proceed
+                    .acquire()
+                    .await
+                    .expect("test create pre-open gate semaphore must not be closed");
             }
         }
 
@@ -785,25 +840,24 @@ pub(crate) async fn open_or_create_partial_marker(
         // entry is mid-reap (map entry removed, on-disk unlink still in
         // flight), WAIT before opening — otherwise the fresh Path-A
         // partial we create below would be deleted by the in-flight
-        // unlink. Same enable-before-check pattern as
+        // unlink. P-1: registration is LAZY (register + re-check only
+        // after observing the mark), same idiom as
         // `open_or_create_partial`.
-        {
+        let reaping_hit = map.state.lock().reaping.contains(&digest);
+        if reaping_hit {
             let notified = map.reap_done.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let st = map.state.lock();
-                if st.reaping.contains(&digest) {
-                    drop(st);
-                    debug!(
-                        ?digest,
-                        "open_or_create_partial_marker: digest is mid-reap; \
-                         waiting before creating a fresh partial"
-                    );
-                    notified.await;
-                    continue;
-                }
+            let still_reaping = map.state.lock().reaping.contains(&digest);
+            if still_reaping {
+                debug!(
+                    ?digest,
+                    "open_or_create_partial_marker: digest is mid-reap; \
+                     waiting before creating a fresh partial"
+                );
+                notified.await;
             }
+            continue;
         }
 
         let path_for_blocking = path.clone();
@@ -1613,10 +1667,32 @@ pub(crate) static TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST: std::sync::LazyLock<
     Mutex<HashMap<DigestInfo, Arc<ReapGate>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// T-2 test hook (aa3fa9e3f review): digests whose reap-side unlink is
+/// forced to FAIL (injected `PermissionDenied`), so tests can pin the
+/// "reaping mark is ALWAYS cleared, even on unlink failure" contract.
+/// Production builds compile the lookup out entirely.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) static TEST_REAP_UNLINK_ERROR_BY_DIGEST: std::sync::LazyLock<
+    Mutex<HashSet<DigestInfo>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// T-1 test hook (aa3fa9e3f review): per-digest gate a CREATE parks at
+/// in `open_or_create_partial`, AFTER its pre-open reaping check and
+/// BEFORE the `spawn_blocking` open. Lets tests (a) hold a create
+/// mid-open while a reap runs (pinning the post-open re-check) and (b)
+/// prove via `reached_flag` that a create never even reaches the open
+/// while a reap unlink is in flight (pinning the pre-open wait).
+/// Production builds compile the lookup out entirely.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) static TEST_CREATE_PRE_OPEN_GATE_BY_DIGEST: std::sync::LazyLock<
+    Mutex<HashMap<DigestInfo, Arc<ReapGate>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// #F3 sibling test hook: the gate object for
-/// [`TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST`]. The reaper sets
-/// `reached_flag` + notifies `reached` when it arrives at the
-/// pre-unlink point, then awaits one `proceed` permit.
+/// [`TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST`] (and, re-used for its
+/// identical shape, [`TEST_CREATE_PRE_OPEN_GATE_BY_DIGEST`]). The
+/// parked side sets `reached_flag` + notifies `reached` on arrival,
+/// then awaits one `proceed` permit.
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
 pub struct ReapGate {
@@ -1656,24 +1732,45 @@ impl Default for ReapGate {
 /// Why this exists: a `WriteChunkedV2` session abort deliberately
 /// LEAVES the entry so the next retry resumes the same partial (that
 /// reuse is load-bearing and preserved — a live retry cadence, ~41 s
-/// observed, refreshes the activity stamp and never idles out). But a
+/// DERIVED from the F3 incident journal (≈3.6K aborts/hour ÷ 41
+/// digests ≈ one retry per digest per 41 s), refreshes the activity
+/// stamp and never idles out). But a
 /// digest whose writers never return (client gone for good) previously
 /// held entry + open fd + on-disk partial until PROCESS RESTART — the
 /// map is process-memory only — and poisoned Path-A dispatch for the
 /// digest with `Code::AlreadyExists`.
 ///
-/// Synchronization contract (all on the single `state` lock):
+/// Synchronization contract (all anchored on the single `state` lock):
 /// - An entry with `active_writers > 0` is NEVER touched (#494
 ///   double-writer protection direction; the RAII
 ///   [`ChunkedWriterSessionGuard`] is the pin).
-/// - Victim selection + map removal + the `reaping` mark happen in ONE
-///   lock hold, so a concurrent session acquisition either lands first
-///   (count observed, reap skips) or finds no entry (creates fresh).
+/// - PER VICTIM (aa3fa9e3f review C-1/S-1: per-victim, not batch-wide,
+///   so no digest's create ever waits behind ANOTHER digest's unlink on
+///   a saturated blocking pool): eligibility re-verification, the
+///   race-state `force_remove`, the map removal, and the `reaping` mark
+///   happen in ONE `state`-lock hold. A concurrent session either lands
+///   first (its guard's count is observed → victim skipped) or after
+///   (finds no entry AND a fresh race-state → creates both cleanly).
+/// - BLOCK-1 (aa3fa9e3f review): the victim's `ChunkRaceState` is
+///   `force_remove`d from the `ChunkRaceRegistry` in the SAME critical
+///   section that removes the partial — the two structures are 1:1 and
+///   deleting the bytes while keeping the bitmap would make the next
+///   retry skip chunks that no longer exist (sparse partial → e2e-hash
+///   failure → a spurious `sha256_e2e_mismatches_total`, the
+///   CAS-poisoning alarm). LOCK ORDER: `state` → registry `inner`,
+///   taken nowhere else nested; the registry never touches this map
+///   (`chunked_race_state.rs` is self-contained), so the order cannot
+///   invert.
 /// - The `reaping` mark makes a fresh CREATE for the digest wait until
 ///   the unlink completes (`open_or_create_partial` /
 ///   `open_or_create_partial_marker` gate), closing the torn-state
 ///   window where the in-flight unlink would delete a file a new
-///   session just created.
+///   session just created. The mark is ALWAYS cleared — including on
+///   unlink failure — else waiters wedge forever. (Cancellation caveat:
+///   the clear sits past an `.await`; the production reaper task is
+///   never aborted — `background_spawn!` detaches — so the only
+///   cancellation source is runtime shutdown. Callers that might abort
+///   a reap mid-flight must not exist; see pair-b C-1.)
 /// - `IoUringMarker` entries are EXEMPT: #F3's Weak-fd liveness
 ///   takeover + `IoUringMarkerGuard` own that variant's lifecycle;
 ///   reaping them here could race the takeover.
@@ -1681,14 +1778,16 @@ impl Default for ReapGate {
 /// Returns the number of entries reaped.
 pub(crate) async fn reap_idle_spawn_blocking_partials(
     map: &Arc<ChunkedPartialsMap>,
+    race_registry: Option<&ChunkRaceRegistry>,
     idle_ttl: Duration,
 ) -> usize {
     let now = TokioInstant::now();
-    let mut victims: Vec<(DigestInfo, PathBuf, Arc<ChunkInProgress>)> = Vec::new();
-    {
-        let mut st = map.state.lock();
-        let expired: Vec<DigestInfo> = st
-            .partials
+    // Phase 1: candidate digests only, one short lock hold. Eligibility
+    // is RE-VERIFIED per victim below — a session can legitimately
+    // arrive between phases.
+    let candidates: Vec<DigestInfo> = {
+        let st = map.state.lock();
+        st.partials
             .iter()
             .filter(|(digest, entry)| {
                 // MUTATION M2 target: an entry with a live writer
@@ -1712,26 +1811,50 @@ pub(crate) async fn reap_idle_spawn_blocking_partials(
                 }
             })
             .map(|(digest, _)| *digest)
-            .collect();
-        for digest in expired {
-            // MUTATION M1 target: the removal itself.
-            if let Some(entry) = st.partials.remove(&digest) {
+            .collect()
+    };
+    let mut reaped = 0usize;
+    for digest in candidates {
+        // Phase 2, per victim: re-verify + co-reap race-state + remove
+        // + mark, all in ONE state-lock hold.
+        let taken: Option<(PathBuf, Arc<ChunkInProgress>, Duration)> = {
+            let mut st = map.state.lock();
+            let still_eligible = st.active_writers.get(&digest).copied().unwrap_or(0) == 0
+                && st.partials.get(&digest).is_some_and(|entry| {
+                    match entry.as_ref() {
+                        ChunkInProgress::SpawnBlocking { last_activity, .. } => {
+                            now.saturating_duration_since(*last_activity.lock()) >= idle_ttl
+                        }
+                        ChunkInProgress::IoUringMarker { .. } => false,
+                    }
+                });
+            if still_eligible {
+                // MUTATION B1M target (BLOCK-1): co-reap the digest's
+                // race-state so its `chunks_present` bitmap cannot
+                // outlive the bytes it indexes. Nested lock: state →
+                // registry (documented order above).
+                if let Some(registry) = race_registry {
+                    let _ = registry.force_remove(&digest);
+                }
+                // MUTATION M1 target: the removal itself.
+                let entry = st
+                    .partials
+                    .remove(&digest)
+                    .expect("checked is_some_and above under the same lock hold");
                 st.reaping.insert(digest);
-                let path = entry.path().clone();
-                victims.push((digest, path, entry));
+                let idle_for = match entry.as_ref() {
+                    ChunkInProgress::SpawnBlocking { last_activity, .. } => {
+                        now.saturating_duration_since(*last_activity.lock())
+                    }
+                    ChunkInProgress::IoUringMarker { .. } => Duration::ZERO,
+                };
+                Some((entry.path().clone(), entry, idle_for))
+            } else {
+                None
             }
-        }
-    }
-    if victims.is_empty() {
-        return 0;
-    }
-    let reaped = victims.len();
-    for (digest, path, entry) in victims {
-        let idle_for = match entry.as_ref() {
-            ChunkInProgress::SpawnBlocking { last_activity, .. } => {
-                now.saturating_duration_since(*last_activity.lock())
-            }
-            ChunkInProgress::IoUringMarker { .. } => Duration::ZERO,
+        };
+        let Some((path, entry, idle_for)) = taken else {
+            continue;
         };
         // Drop OUR Arc outside the lock: normally the last reference,
         // closing the SpawnBlocking fd before the unlink (Linux
@@ -1744,7 +1867,7 @@ pub(crate) async fn reap_idle_spawn_blocking_partials(
             let gate = TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST.lock().get(&digest).cloned();
             if let Some(gate) = gate {
                 gate.reached_flag
-                    .store(true, core::sync::atomic::Ordering::SeqCst);
+                    .store(true, Ordering::SeqCst);
                 gate.reached.notify_waiters();
                 let _permit = gate
                     .proceed
@@ -1757,8 +1880,19 @@ pub(crate) async fn reap_idle_spawn_blocking_partials(
         // Best-effort unlink. NotFound is fine (e.g. a concurrent
         // discard already unlinked). Errors are logged, never fatal —
         // the startup prune sweep remains the disk-side backstop.
+        #[cfg(any(test, feature = "test-utils"))]
+        let inject_unlink_error = TEST_REAP_UNLINK_ERROR_BY_DIGEST.lock().contains(&digest);
         let path_for_unlink = path.clone();
         let unlink_res = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+            // T-2 test hook (aa3fa9e3f review): force the unlink to
+            // FAIL so the "mark is ALWAYS cleared" contract is testable.
+            #[cfg(any(test, feature = "test-utils"))]
+            if inject_unlink_error {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected unlink failure (TEST_REAP_UNLINK_ERROR_BY_DIGEST)",
+                ));
+            }
             match std::fs::remove_file(&path_for_unlink) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1784,21 +1918,26 @@ pub(crate) async fn reap_idle_spawn_blocking_partials(
         }
 
         // ALWAYS clear the reaping mark (waiters would wedge forever
-        // otherwise), then wake any create that was gated on it.
+        // otherwise — including when the unlink FAILED above), then
+        // wake any create that was gated on it.
+        // MUTATION MY-2 target: this clear must be unconditional.
         {
             let mut st = map.state.lock();
             st.reaping.remove(&digest);
         }
         map.reap_done.notify_waiters();
 
+        reaped += 1;
+        map.reaped_total.fetch_add(1, Ordering::Relaxed);
         warn!(
             ?digest,
             idle_secs = idle_for.as_secs(),
             ?path,
-            "chunked idle reap: removed abandoned SpawnBlocking chunked-partial \
-             entry (entry + fd + on-disk partial) — no writer session for longer \
-             than the idle TTL (#F3 sibling, 2026-07-28); the digest's next \
-             retry restarts from offset 0",
+            "chunked idle reap: removed abandoned chunked-write state for the \
+             digest — SpawnBlocking entry + fd + on-disk partial AND its \
+             ChunkRaceState bitmap (#F3 sibling, 2026-07-28); the digest's next \
+             retry genuinely restarts from offset 0 (fresh race-state, fresh \
+             partial)",
         );
     }
     reaped
@@ -1817,17 +1956,29 @@ pub(crate) async fn reap_idle_spawn_blocking_partials(
 /// while this leak's defining condition is "NO live session/commit for
 /// the digest", when no such task exists to piggy-back on. It also
 /// lives in `nativelink-service`; the map is store-internal.
-pub(crate) fn spawn_idle_partial_reaper(map: &Arc<ChunkedPartialsMap>, idle_ttl: Duration) {
+pub(crate) fn spawn_idle_partial_reaper(
+    map: &Arc<ChunkedPartialsMap>,
+    // BLOCK-1 (aa3fa9e3f review): the registry is co-reaped with the
+    // partials so a victim's `chunks_present` bitmap cannot outlive
+    // its bytes. Both Arcs are owned by the same `FilesystemStore`.
+    race_registry: &Arc<ChunkRaceRegistry>,
+    idle_ttl: Duration,
+) {
     let weak_map = Arc::downgrade(map);
+    let weak_registry = Arc::downgrade(race_registry);
     let tick = idle_ttl.min(Duration::from_secs(60));
     background_spawn!("chunked_idle_partial_reaper", async move {
         loop {
             tokio::time::sleep(tick).await;
+            let Some(registry) = weak_registry.upgrade() else {
+                // Owning store dropped; nothing left to reap.
+                return;
+            };
             let Some(map) = weak_map.upgrade() else {
                 // Owning store dropped; nothing left to reap.
                 return;
             };
-            let _ = reap_idle_spawn_blocking_partials(&map, idle_ttl).await;
+            let _ = reap_idle_spawn_blocking_partials(&map, Some(&registry), idle_ttl).await;
         }
     });
 }

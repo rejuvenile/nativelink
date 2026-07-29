@@ -1195,9 +1195,20 @@ impl Drop for CommitRunnerGuard {
 /// path's open-file lifecycle independent of the v2 multi-writer
 /// state.
 ///
-/// Invariant: an entry exists iff at least one writer is attached OR
-/// commit is in progress. The last `RaceWriterGuard` drop after commit
-/// publish removes the entry (via `try_close_after_commit`).
+/// Lifecycle (corrected 2026-07-28, aa3fa9e3f review — the previous
+/// text claimed a self-cleaning invariant enforced by a
+/// `try_close_after_commit` that does not exist): entries are removed
+/// on the COMMIT paths (`try_remove_if_unused` via the handler's
+/// `try_drop_race_state` after publish) and by the wedge-recovery
+/// `force_remove` sites (v2 commit-watchdog, v1 watchdog). ABORT paths
+/// (client disconnect, writer-ended-without-finish) only detach the
+/// writer (`RaceWriterGuard::drop` decrements) and may leave the entry
+/// — with its `chunks_present` bits — resident. Consumers MUST NOT
+/// assume an entry implies a live writer or an intact partial; the
+/// idle-TTL partials reap (`reap_idle_spawn_blocking_partials`)
+/// `force_remove`s a victim digest's entry in the same critical
+/// section that removes its partial, so the pair cannot diverge
+/// through that path.
 #[derive(Debug, Default)]
 pub struct ChunkRaceRegistry {
     inner: Mutex<HashMap<DigestInfo, Arc<ChunkRaceState>>>,

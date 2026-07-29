@@ -999,6 +999,7 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     /// production binaries are byte-identical to the pre-Phase-2.1
     /// build).
     #[cfg(feature = "chunked_fast_slow")]
+    #[metric(group = "chunked_partials")]
     chunked_partials: Arc<ChunkedPartialsMap>,
     /// #494-v3 Phase 2: per-digest multi-writer race-state registry for
     /// the `WriteChunkedV2` bidi RPC. Distinct from `chunked_partials`
@@ -1177,14 +1178,22 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // #F3 sibling (2026-07-28): idle-TTL reap of abandoned
         // SpawnBlocking chunked-partial entries. Config-tunable,
         // default ON (600 s); 0 is the operational kill-switch. The
-        // task holds only a Weak on the map and exits when this store
-        // (the sole strong holder) drops.
+        // task holds only Weaks on the map + race registry and exits
+        // when this store (the sole strong holder of both) drops.
+        // BLOCK-1 (aa3fa9e3f review): the race registry is handed to
+        // the reaper so a victim's `ChunkRaceState` bitmap is
+        // force-removed in the same critical section as its partial —
+        // the two are 1:1 and must not diverge.
+        #[cfg(feature = "chunked_fast_slow")]
+        let chunked_race_registry =
+            Arc::new(crate::chunked::chunked_race_state::ChunkRaceRegistry::new());
         #[cfg(feature = "chunked_fast_slow")]
         let chunked_partials = {
             let map = Arc::new(ChunkedPartialsMap::new());
             if spec.chunked_idle_partial_reap_ttl_s > 0 {
                 chunked_spawn_idle_partial_reaper(
                     &map,
+                    &chunked_race_registry,
                     Duration::from_secs(spec.chunked_idle_partial_reap_ttl_s),
                 );
             }
@@ -1210,9 +1219,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             #[cfg(feature = "chunked_fast_slow")]
             chunked_partials,
             #[cfg(feature = "chunked_fast_slow")]
-            chunked_race_registry: Arc::new(
-                crate::chunked::chunked_race_state::ChunkRaceRegistry::new(),
-            ),
+            chunked_race_registry,
         }))
     }
 
@@ -1812,10 +1819,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     #[doc(hidden)]
     pub async fn reap_idle_chunked_partials_for_test(
         &self,
-        idle_ttl: core::time::Duration,
+        idle_ttl: Duration,
     ) -> usize {
         crate::chunked::chunked_filesystem::reap_idle_spawn_blocking_partials(
             &self.chunked_partials,
+            Some(&self.chunked_race_registry),
             idle_ttl,
         )
         .await
@@ -1858,6 +1866,52 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         digest: &DigestInfo,
     ) {
         crate::chunked::chunked_filesystem::TEST_REAP_PRE_UNLINK_GATE_BY_DIGEST
+            .lock()
+            .remove(digest);
+    }
+
+    /// T-2 test seam (aa3fa9e3f review): force the reap's unlink for
+    /// `digest` to FAIL (injected error) so the "reaping mark is ALWAYS
+    /// cleared" contract is testable. Pair with the clear fn.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_test_reap_unlink_error(&self, digest: &DigestInfo) {
+        crate::chunked::chunked_filesystem::TEST_REAP_UNLINK_ERROR_BY_DIGEST
+            .lock()
+            .insert(*digest);
+    }
+
+    /// Cleanup counterpart to [`Self::set_test_reap_unlink_error`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn clear_test_reap_unlink_error(&self, digest: &DigestInfo) {
+        crate::chunked::chunked_filesystem::TEST_REAP_UNLINK_ERROR_BY_DIGEST
+            .lock()
+            .remove(digest);
+    }
+
+    /// T-1 test seam (aa3fa9e3f review): register (and return) the
+    /// create-side pre-open gate for `digest` — parks a
+    /// `open_or_create_partial` create between its pre-open reaping
+    /// check and the `spawn_blocking` open. Pair with the clear fn.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_test_create_pre_open_gate(
+        &self,
+        digest: &DigestInfo,
+    ) -> Arc<crate::chunked::chunked_filesystem::ReapGate> {
+        let gate = Arc::new(crate::chunked::chunked_filesystem::ReapGate::new());
+        crate::chunked::chunked_filesystem::TEST_CREATE_PRE_OPEN_GATE_BY_DIGEST
+            .lock()
+            .insert(*digest, Arc::clone(&gate));
+        gate
+    }
+
+    /// Cleanup counterpart to [`Self::set_test_create_pre_open_gate`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn clear_test_create_pre_open_gate(&self, digest: &DigestInfo) {
+        crate::chunked::chunked_filesystem::TEST_CREATE_PRE_OPEN_GATE_BY_DIGEST
             .lock()
             .remove(digest);
     }

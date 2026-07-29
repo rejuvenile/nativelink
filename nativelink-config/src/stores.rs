@@ -832,11 +832,14 @@ pub struct FilesystemSpec {
     /// takeover) and are exempt.
     ///
     /// Default: 600 (10 minutes). Rationale: the worker deferred-upload
-    /// retry cadence is ~41 s observed, so a digest still being retried
-    /// refreshes its activity stamp ~14x per TTL and can never idle out;
-    /// 600 s is also 10x the 60 s chunked commit watchdog, so no live
-    /// commit path can outlast it. A truly abandoned digest reclaims
-    /// within TTL + one reap tick (≤ 60 s).
+    /// retry cadence is ~41 s — DERIVED from the F3 incident journal
+    /// (2026-07-28: ≈3.6K aborts/hour across 41 wedged digests ≈ one
+    /// retry per digest per 41 s; a derivation, not a direct
+    /// measurement, and it assumes one retry per abort) — so a digest
+    /// still being retried refreshes its activity stamp ~14x per TTL
+    /// and can never idle out; 600 s is also 10x the 60 s chunked
+    /// commit watchdog, so no live commit path can outlast it. A truly
+    /// abandoned digest reclaims within TTL + one reap tick (≤ 60 s).
     ///
     /// 0 disables the reaper — an operational KILL-SWITCH, not a resting
     /// state (default stays ON per house policy).

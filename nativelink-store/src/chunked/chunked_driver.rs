@@ -918,6 +918,18 @@ async fn run_driver<Fe: FileEntry>(
     )]
     let mut _marker_guard: Option<super::chunked_filesystem::IoUringMarkerGuard> = None;
 
+    // #F3 sibling fix-up (aa3fa9e3f review, pair-a MAJOR-1 + pair-b S-1
+    // note): pin this driver's digest against the idle-TTL reap for the
+    // driver's whole lifetime (writes AND the commit_and_verify tail).
+    // Path-B (`write_chunk_at_offset`) creates guard-less SpawnBlocking
+    // entries — the only writer on non-io-uring builds (macOS workers)
+    // — and without this pin a >TTL inter-chunk stall could get the
+    // partial reaped mid-blob (fail-closed via the e2e hash, but a
+    // wasted full-blob retry). RAII Drop runs on normal return,
+    // `?`-error, panic, and task abort alike. Harmless on Path A
+    // (markers are reap-exempt regardless).
+    let _writer_session_guard = filesystem_store.begin_chunked_write_session(digest);
+
     while let Some(work) = rx.recv().await {
         chunks_received.fetch_add(1, Ordering::Relaxed);
         let ChunkWork {

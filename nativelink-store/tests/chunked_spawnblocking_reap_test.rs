@@ -37,8 +37,11 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use nativelink_config::stores::FilesystemSpec;
 use nativelink_macro::nativelink_test;
+use nativelink_store::chunked::chunk_budget::ChunkBudget;
+use nativelink_store::chunked::chunked_driver::{ChunkedDriver, PER_BLOB_MPSC_CAP};
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_util::common::DigestInfo;
+use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
 
 /// 4 KiB test chunks (production `CHUNK_SIZE` is 1 MiB; the reap logic
 /// is size-agnostic and small chunks keep the tests fast).
@@ -550,5 +553,472 @@ async fn reap_vs_new_session_race_no_torn_state() {
         committed.iter().all(|b| *b == 0xE1),
         "committed content must be entirely the NEW session's bytes — any 0xE0 \
          byte means old-file state leaked across the reap boundary",
+    );
+}
+
+/// T-2 (aa3fa9e3f review pair-b, mutation-proven gap MY-2): the reaping
+/// mark must be cleared even when the on-disk unlink FAILS — a waiting
+/// create must proceed, not wedge forever. Unlink failure is injected
+/// via the test seam; the parked create is the observable.
+///
+/// MUTATION MY-2 (make the clear conditional on unlink success): the
+/// waiting create below never completes and its deadlock detector fires
+/// with the bespoke message.
+#[nativelink_test]
+async fn reaping_mark_cleared_even_when_unlink_fails() {
+    let (store, _content) = make_store(0).await;
+    let digest = make_digest(0x07);
+
+    // Abandoned entry.
+    {
+        let _session = store.begin_chunked_write_session(digest);
+        store
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xA1; CHUNK]))
+            .await
+            .expect("chunk 0 write must succeed");
+    }
+
+    store.set_test_reap_unlink_error(&digest);
+    let reap_gate = store.set_test_reap_pre_unlink_gate(&digest);
+
+    // Reaper parks pre-unlink with the mark set.
+    let store_a = Arc::clone(&store);
+    let reap_handle = tokio::spawn(async move {
+        store_a
+            .reap_idle_chunked_partials_for_test(Duration::ZERO)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = reap_gate.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if reap_gate.reached_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("reaper must reach the pre-unlink gate (deadlock detector)");
+
+    // A create arrives and parks on the reaping mark.
+    let store_b = Arc::clone(&store);
+    let mut create_handle = tokio::spawn(async move {
+        let _session = store_b.begin_chunked_write_session(digest);
+        store_b
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xA2; CHUNK]))
+            .await
+    });
+    let parked = tokio::time::timeout(Duration::from_millis(200), &mut create_handle).await;
+    assert!(
+        parked.is_err(),
+        "fixture guard: the create must be parked on the reaping mark before \
+         the gate is released (otherwise this test is not exercising the \
+         failed-unlink clear path)",
+    );
+
+    // Release the reaper; the unlink FAILS (injected), and the mark
+    // must be cleared anyway.
+    reap_gate.proceed.add_permits(1);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), reap_handle)
+        .await
+        .expect("reaper must complete after gate release even with a failing unlink")
+        .expect("reaper task must not panic");
+    assert_eq!(reaped, 1, "the entry must still count as reaped on unlink failure");
+    tokio::time::timeout(Duration::from_secs(5), &mut create_handle)
+        .await
+        .expect(
+            "a waiting create must PROCEED after a FAILED unlink — the reaping \
+             mark must be cleared UNCONDITIONALLY (clear-on-success-only wedges \
+             every future create for the digest forever, strictly worse than \
+             the AlreadyExists poisoning this feature fixes)",
+        )
+        .expect("create task must not panic")
+        .expect("create's write must succeed once the mark clears");
+    assert!(
+        store.has_in_flight_chunked_partial(&digest),
+        "the post-reap create must own a fresh map entry",
+    );
+
+    store.clear_test_reap_unlink_error(&digest);
+    store.clear_test_reap_pre_unlink_gate(&digest);
+}
+
+/// T-1 pre-open half (aa3fa9e3f review pair-b, M4a): a create for a
+/// digest whose reap unlink is in flight must WAIT at the pre-open
+/// reaping check — it must never even REACH the file-open. Proven
+/// positively via the create-side pre-open gate's `reached_flag`
+/// (not just via "task is pending").
+///
+/// MUTATION M4a (disable the pre-open reaping check alone): the create
+/// reaches the open while the reaper is parked → red below.
+#[nativelink_test]
+async fn create_never_opens_while_reap_unlink_in_flight() {
+    let (store, _content) = make_store(0).await;
+    let digest = make_digest(0x08);
+
+    // Abandoned entry.
+    {
+        let _session = store.begin_chunked_write_session(digest);
+        store
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xB0; CHUNK]))
+            .await
+            .expect("chunk 0 write must succeed");
+    }
+
+    let reap_gate = store.set_test_reap_pre_unlink_gate(&digest);
+    let open_gate = store.set_test_create_pre_open_gate(&digest);
+
+    let store_a = Arc::clone(&store);
+    let reap_handle = tokio::spawn(async move {
+        store_a
+            .reap_idle_chunked_partials_for_test(Duration::ZERO)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = reap_gate.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if reap_gate.reached_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("reaper must reach the pre-unlink gate (deadlock detector)");
+
+    // The racing create: must park at the pre-open reaping wait,
+    // BEFORE the open (i.e. before the open gate's flag flips).
+    let store_b = Arc::clone(&store);
+    let mut create_handle = tokio::spawn(async move {
+        let _session = store_b.begin_chunked_write_session(digest);
+        store_b
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xB1; CHUNK]))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !open_gate.reached_flag.load(Ordering::SeqCst),
+        "a create must WAIT at the PRE-OPEN reaping check while the reap unlink \
+         is in flight — reaching the file-open here (gate flag set) means the \
+         pre-open wait is gone (M4a) and the create burns an open on a path the \
+         in-flight unlink owns",
+    );
+    let parked = tokio::time::timeout(Duration::from_millis(50), &mut create_handle).await;
+    assert!(parked.is_err(), "create must still be pending while parked pre-open");
+
+    // Release the reap; the create must now proceed THROUGH the open.
+    reap_gate.proceed.add_permits(1);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), reap_handle)
+        .await
+        .expect("reaper must complete after gate release (deadlock detector)")
+        .expect("reaper task must not panic");
+    assert_eq!(reaped, 1, "the reap must have collected the abandoned entry");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = open_gate.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if open_gate.reached_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("create must reach the open after the mark clears (deadlock detector)");
+    open_gate.proceed.add_permits(10);
+    tokio::time::timeout(Duration::from_secs(5), &mut create_handle)
+        .await
+        .expect("create must complete after the open gate releases (deadlock detector)")
+        .expect("create task must not panic")
+        .expect("create's write must succeed");
+    let meta = std::fs::metadata(store.partial_path_for_digest(&digest))
+        .expect("the post-reap create's fresh .partial must exist");
+    assert_eq!(meta.len(), CHUNK as u64, "fresh partial must hold exactly the new chunk");
+
+    store.clear_test_create_pre_open_gate(&digest);
+    store.clear_test_reap_pre_unlink_gate(&digest);
+}
+
+/// T-1 post-open half (aa3fa9e3f review pair-b, M4b): a reap that
+/// starts and reaches its unlink window while a create is ALREADY
+/// inside its `spawn_blocking` open (the genuinely racy interleaving,
+/// unreachable by the original T4's construction) must be caught by
+/// the create's POST-OPEN re-check: the create loops, waits out the
+/// unlink, and re-creates FRESH — its file is never deleted underneath
+/// it. The create is held "mid-open" deterministically via the
+/// create-side pre-open gate.
+///
+/// MUTATION M4b (disable the post-open re-check alone): the create
+/// inserts while the mark is set, the reap's unlink then deletes the
+/// create's fresh file → red at the metadata assert below.
+#[nativelink_test]
+async fn create_open_racing_reap_completion_recreates_fresh() {
+    let (store, _content) = make_store(0).await;
+    let digest = make_digest(0x09);
+
+    // Park a guard-LESS create at the open gate on an EMPTY map (its
+    // pre-open reaping check legitimately saw nothing). Guard-less so
+    // the later reap's active_writers re-check is not pinned by this
+    // task's own session (the mid-open create models a raw Path-B
+    // writer, e.g. the v1 driver's fallback).
+    let open_gate = store.set_test_create_pre_open_gate(&digest);
+    let store_b = Arc::clone(&store);
+    let mut create_handle = tokio::spawn(async move {
+        store_b
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xB2; CHUNK]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = open_gate.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if open_gate.reached_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("create must reach the pre-open gate (deadlock detector)");
+    // Later loop iterations of the parked create must skip the gate.
+    store.clear_test_create_pre_open_gate(&digest);
+
+    // While the create is "inside its open", another writer creates the
+    // entry and abandons it (guard-less write; completes fully).
+    store
+        .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xC9; CHUNK]))
+        .await
+        .expect("the interleaved writer's chunk 0 must land");
+
+    // A reap collects that entry and parks pre-unlink (mark set).
+    let reap_gate = store.set_test_reap_pre_unlink_gate(&digest);
+    let store_a = Arc::clone(&store);
+    let reap_handle = tokio::spawn(async move {
+        store_a
+            .reap_idle_chunked_partials_for_test(Duration::ZERO)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = reap_gate.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if reap_gate.reached_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("reaper must reach the pre-unlink gate (deadlock detector)");
+
+    // NOW release the create's open: it finishes opening a path the
+    // in-flight unlink owns, and its POST-OPEN re-check must catch the
+    // mark and loop instead of inserting.
+    open_gate.proceed.add_permits(10);
+    let parked = tokio::time::timeout(Duration::from_millis(200), &mut create_handle).await;
+    assert!(
+        parked.is_err(),
+        "a create whose open completed while the reap unlink is in flight must \
+         LOOP at the post-open re-check (M4b) — completing here means it \
+         inserted an entry whose file the in-flight unlink will delete",
+    );
+
+    // Release the reap; the create must recover with a FRESH file.
+    reap_gate.proceed.add_permits(1);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), reap_handle)
+        .await
+        .expect("reaper must complete after gate release (deadlock detector)")
+        .expect("reaper task must not panic");
+    assert_eq!(reaped, 1, "the reap must have collected the abandoned entry");
+    tokio::time::timeout(Duration::from_secs(5), &mut create_handle)
+        .await
+        .expect("racing create must complete after the unlink finishes (deadlock detector)")
+        .expect("create task must not panic")
+        .expect("racing create's write must succeed");
+    let meta = std::fs::metadata(store.partial_path_for_digest(&digest)).expect(
+        "the racing create's fresh .partial must exist — NotFound means the \
+         post-open re-check is gone (M4b) and the in-flight unlink deleted the \
+         file the create just made (torn state)",
+    );
+    assert_eq!(
+        meta.len(),
+        CHUNK as u64,
+        "fresh partial must hold exactly the racing create's chunk",
+    );
+    store.clear_test_reap_pre_unlink_gate(&digest);
+}
+
+/// Path-A gate (aa3fa9e3f review pair-b T-1, related): the marker
+/// create (`open_or_create_partial_marker`) must also wait out an
+/// in-flight reap unlink before opening — previously untested.
+///
+/// MUTATION (disable the marker fn's pre-open reaping wait): the
+/// marker create completes while the reaper is parked → the pending
+/// assert below reds.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[nativelink_test]
+async fn marker_create_waits_while_reap_unlink_in_flight() {
+    let (store, _content) = make_store(0).await;
+    let digest = make_digest(0x0a);
+
+    // Abandoned SpawnBlocking entry (what the reap collects).
+    {
+        let _session = store.begin_chunked_write_session(digest);
+        store
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xD1; CHUNK]))
+            .await
+            .expect("chunk 0 write must succeed");
+    }
+
+    let reap_gate = store.set_test_reap_pre_unlink_gate(&digest);
+    let store_a = Arc::clone(&store);
+    let reap_handle = tokio::spawn(async move {
+        store_a
+            .reap_idle_chunked_partials_for_test(Duration::ZERO)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = reap_gate.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if reap_gate.reached_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("reaper must reach the pre-unlink gate (deadlock detector)");
+
+    // Path-A retry racing the reap: must WAIT, not create a marker
+    // whose file the in-flight unlink would delete.
+    let store_b = Arc::clone(&store);
+    let mut marker_handle =
+        tokio::spawn(async move { store_b.open_chunked_partial_marker(digest).await });
+    let parked = tokio::time::timeout(Duration::from_millis(200), &mut marker_handle).await;
+    assert!(
+        parked.is_err(),
+        "a Path-A marker create must WAIT at its pre-open reaping check while \
+         the reap unlink is in flight — completing here means the fresh marker's \
+         partial can be deleted by the in-flight unlink (untested gate, pair-b T-1)",
+    );
+
+    reap_gate.proceed.add_permits(1);
+    let reaped = tokio::time::timeout(Duration::from_secs(5), reap_handle)
+        .await
+        .expect("reaper must complete after gate release (deadlock detector)")
+        .expect("reaper task must not panic");
+    assert_eq!(reaped, 1, "the reap must have collected the abandoned entry");
+    let (fd, marker_guard) = tokio::time::timeout(Duration::from_secs(5), &mut marker_handle)
+        .await
+        .expect("marker create must complete after the unlink finishes (deadlock detector)")
+        .expect("marker task must not panic")
+        .expect("marker create must succeed once the mark clears");
+    assert!(
+        store.has_in_flight_chunked_partial(&digest),
+        "the post-reap marker create must own a fresh map entry",
+    );
+    assert!(
+        store.partial_path_for_digest(&digest).exists(),
+        "the fresh Path-A partial must exist (not deleted by the finished unlink)",
+    );
+    drop(marker_guard);
+    drop(fd);
+    store.clear_test_reap_pre_unlink_gate(&digest);
+}
+
+/// Item-0 (aa3fa9e3f review, pair-a MAJOR-1 residual + pair-b S-1
+/// note): the v1 `ChunkedDriver` holds a chunked writer-session guard
+/// for its whole lifetime, so a v1 Path-B blob (the ONLY chunked
+/// writer on non-io-uring builds, e.g. macOS workers) can never have
+/// its partial idle-reaped mid-blob no matter how long it stalls
+/// between chunks.
+///
+/// MUTATION M-DG (comment out the driver's
+/// `begin_chunked_write_session` line): the count never rises → red at
+/// the first wait below.
+#[nativelink_test]
+async fn v1_driver_holds_writer_session_guard() {
+    let (store, _content) = make_store(0).await;
+    let digest = make_digest(0x0b);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        (2 * CHUNK) as u64,
+        CHUNK,
+        PER_BLOB_MPSC_CAP,
+    );
+    let _ = &budget; // budget participates in ChunkWork permits only; none sent here.
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.chunked_active_writers_for_test(&digest) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "the v1 ChunkedDriver must hold the chunked writer-session guard for \
+         its lifetime (aa3fa9e3f MAJOR-1 residual) — a zero count means a >TTL \
+         mid-blob stall could get a v1 Path-B partial idle-reaped out from \
+         under the live driver",
+    );
+
+    // Driver exits (upstream drop); the guard must release.
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), driver.await_completion())
+        .await
+        .expect("driver must terminate after upstream drop (deadlock detector)");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while store.chunked_active_writers_for_test(&digest) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the driver's writer-session guard must release when the driver exits");
+}
+
+/// MAJOR-2 (aa3fa9e3f review pair-a): the reap has countable output —
+/// `chunked_partials_reaped_total` increments per victim and RENDERS
+/// under the store's metric tree with that literal name (dark-counter
+/// trap: a counter that exists but never registers is
+/// indistinguishable from zero events; the render pin is the guard).
+#[nativelink_test]
+async fn reaped_total_metric_renders_and_counts() {
+    let (store, _content) = make_store(0).await;
+    let digest = make_digest(0x0c);
+    {
+        let _session = store.begin_chunked_write_session(digest);
+        store
+            .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0xE7; CHUNK]))
+            .await
+            .expect("chunk 0 write must succeed");
+    }
+    let reaped = store.reap_idle_chunked_partials_for_test(Duration::ZERO).await;
+    assert_eq!(reaped, 1, "fixture guard: exactly one entry must be reaped");
+
+    let registry = MetricsRegistry::new();
+    registry.register("sbreap_store", store.clone());
+    let body = render_prometheus(&registry);
+    assert!(
+        body.contains("chunked_partials_reaped_total"),
+        "chunked_partials_reaped_total must render under the store's metric \
+         tree — absent name means the reap's only countable output is dark \
+         (pair-a MAJOR-2). body=\n{body}",
+    );
+    assert!(
+        body.contains("chunked_partials_reaped_total 1"),
+        "chunked_partials_reaped_total must equal 1 after one reaped victim — \
+         a zero value means the increment site is disconnected from the \
+         rendered counter. body=\n{body}",
     );
 }
