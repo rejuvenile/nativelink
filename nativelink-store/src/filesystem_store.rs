@@ -1338,16 +1338,37 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     }
 
     /// (FINDING 2 moka-eviction-wedge piece 3) Rate-limited kick of the
-    /// eviction map's background drain arm. The worker's disk-pressure NAK
-    /// site calls this so the admission gate actively drives eviction
-    /// (admission-eviction-pin composite: `gate ⇒ evict`) instead of only
-    /// refusing work on the assumption that "eviction catches up" — an
-    /// assumption the moka stale-probation-front livelock (FINDING 2)
-    /// falsified for 4 days on 2 of 10 workers. Non-blocking (one atomic
-    /// compare + `Notify::notify_one`), safe inline on the NAK path.
-    /// Returns whether the kick was accepted (`false` = rate-limited).
+    /// eviction map's background drain arm, called from the worker's
+    /// disk-pressure NAK site. Honest scope (review 9fd52fc0 MINOR-6):
+    /// the `gate ⇒ evict` composite is closed by the map's PERIODIC
+    /// drain arm (capacity drain + wedge self-heal every 10 s,
+    /// unconditional); this kick only trims up to one tick interval
+    /// (≤10 s) of latency between a NAK and the next drain pass.
+    /// Non-blocking (one atomic compare + `Notify::notify_one`), safe
+    /// inline on the NAK path. Returns whether the kick was accepted
+    /// (`false` = rate-limited).
     pub fn kick_eviction_drain(&self) -> bool {
         self.evicting_map.kick_drain()
+    }
+
+    /// (FINDING 2, test seam) Passthroughs for the wedge self-heal test
+    /// seams, so the worker-side `gate ⇒ evict` end-to-end test can
+    /// drive a heal against a real `FilesystemStore` + `FileEntryImpl`
+    /// (whose `unref` deletes the on-disk file) — review 9fd52fc0
+    /// pair-b T5. Gated exactly like `BlobsAvailableState::from_test_args`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_inflate_wedge_observation(&self, extra_bytes: u64) {
+        self.evicting_map.test_inflate_wedge_observation(extra_bytes);
+    }
+
+    /// (FINDING 2, test seam) See [`Self::test_inflate_wedge_observation`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn test_maybe_selfheal_wedged_eviction(
+        &self,
+    ) -> nativelink_util::moka_evicting_map::WedgeSelfHealOutcome {
+        self.evicting_map.test_maybe_selfheal_wedged_eviction().await
     }
 
     /// (#locality-map-drift) Stamp the eviction map's logical-LWW boot-epoch

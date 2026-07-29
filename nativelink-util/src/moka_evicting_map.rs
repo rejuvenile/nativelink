@@ -89,27 +89,49 @@ pub const PIN_TIMEOUT_SECS: u64 = 120;
 /// loop-driven maintenance call exactly like `expire_stale_pins`.
 const DRAIN_INTERVAL_SECS: u64 = 10;
 /// (FINDING 2 moka-eviction-wedge, 2026-07-28) Number of CONSECUTIVE
-/// drain-arm evaluations that must observe the cache at-or-over
-/// `max_bytes` with ZERO eviction progress (`evicted_items` unchanged)
-/// before the self-healing fallback evictor fires. moka 0.12.15's
-/// `evict_lru_entries` livelocks when the probation-deque front node is
-/// stale (invalidated + re-inserted key → different `EntryInfo`;
-/// `skip_updated_entry_ao` moves the MAP entry's node back but never the
-/// peeked stale front → re-peeks the same node every maintenance call,
-/// evicts 0, forever). Our pin path mints exactly that churn
-/// (`pin_key_with_mode` = `cache.invalidate`, `unpin_key` = bare
-/// `cache.insert`). Production: 2 of 10 workers wedged at 3.3× over a
-/// 40 GB budget for 4 days. The frozen-evictions requirement is what
-/// prevents false-firing during normal at-cap operation: a healthy
-/// at-cap cache under churn evicts every tick, so the counter always
-/// advances and the fallback never triggers.
+/// drain-arm evaluations that must observe the cache STRICTLY OVER
+/// `max_bytes` with ZERO size-eviction progress (`size_evicted_items`
+/// unchanged) before the self-healing fallback evictor fires. moka
+/// 0.12.15's `evict_lru_entries` livelocks when the probation-deque
+/// front node is stale (invalidated + re-inserted key → different
+/// `EntryInfo`; `skip_updated_entry_ao` moves the MAP entry's node back
+/// but never the peeked stale front → re-peeks the same node every
+/// maintenance call, evicts 0, forever). Our pin path mints exactly that
+/// churn (`pin_key_with_mode` = `cache.invalidate`, `unpin_key` = bare
+/// `cache.insert`). Production (fleet artifact 2026-07-28): 2 of 10
+/// workers at 3.36× over a 40 GB budget with evictions FROZEN for
+/// 8h 36m at scrape time (the widely-quoted 4-day figure is the
+/// disk-full/NAK duration, not the measured frozen window). The
+/// frozen-evictions requirement is what prevents false-firing during
+/// normal at-cap operation: a healthy at-cap cache under churn
+/// size-evicts every tick, so the counter always advances and the
+/// fallback never triggers.
 const WEDGE_FROZEN_TICKS_TRIGGER: u64 = 3;
-/// Bound on fallback key-walk rounds per self-heal firing. Each round is
-/// capped at `EVICT_SCAN_HARD_CAP` (10 000) scanned entries, so 64 rounds
-/// covers ~640K entries — far above the ~92K-entry production worker map
-/// that motivated the fallback. Hitting this bound leaves the wedge gauge
-/// set and the next trigger re-fires 3 ticks later (bounded duty cycle).
-const WEDGE_SELFHEAL_MAX_ROUNDS: u32 = 64;
+/// Bound on fallback key-walk rounds per ARM INVOCATION (metering,
+/// review 9fd52fc0 pair-a MAJOR-4 / pair-b P3). Each round is capped at
+/// `EVICT_SCAN_HARD_CAP` (10 000) evictions and each worker-FS eviction
+/// unlinks a file, so an unbounded single pass would monopolize the
+/// drain task for the whole heal — starving the `pin_check_interval`
+/// arm (whose `MissedTickBehavior::Skip` DROPS missed pin-expiry
+/// sweeps) and dumping the full eviction burst into the
+/// BlobChangeTracker → BlobsAvailable delta path in one message. Two
+/// rounds ≈ ≤20 000 evictions ≈ ≤5 chunks of the resend ring (cap 256)
+/// per invocation; the heal then RE-ARMS on the next tick/kick via
+/// `selfheal_resume` (no fresh frozen-tick accumulation) until the
+/// observation converges under budget. Convergence sizing: the incident
+/// worker (~66 000 evictions) heals in ~4 invocations ≈ 40 s; the
+/// largest deployed map (server cas slow tier, ~3.4M entries,
+/// `prod-server.json5:137`) at a hypothetical 20% overshoot (~680K
+/// evictions) heals in ~34 invocations ≈ 6 min — each invocation
+/// bounded, the loop servicing pin sweeps between them.
+const WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION: u32 = 2;
+/// Minimum interval between self-heal WARN emissions (duty-cycle
+/// hygiene, review 9fd52fc0 pair-b C5). A pathological no-candidates
+/// wedge re-fires every `WEDGE_FROZEN_TICKS_TRIGGER` evaluations
+/// (~30 s → ~2 880 warns/day/store without a limit); 15 min bounds it
+/// to ≤96/day while `eviction_wedge_selfheal_total` still counts every
+/// firing and `eviction_wedge_detected` carries the persistent state.
+const WEDGE_SELFHEAL_WARN_MIN_INTERVAL_MILLIS: u64 = 900_000;
 /// (FINDING 2 piece 3) Minimum interval between ACCEPTED
 /// [`MokaEvictingMap::kick_drain`] wakes of the background drain arm. The
 /// disk-pressure NAK site kicks on every refused action; one drain pass
@@ -181,6 +203,14 @@ struct EvictionEvent<K, T> {
     /// `ts_evict(V) < ts_reinsert` even when the async callback is delivered
     /// out of order relative to a re-insert.
     ts_counter: u64,
+    /// (FINDING 2 fix-up, red-team alt-framing 2) moka's removal cause,
+    /// captured by the eviction listener. `process_eviction_event`
+    /// advances the wedge sensor (`size_evicted_items`) ONLY for
+    /// `RemovalCause::Size` — the cause class the wedge actually kills.
+    /// Counting all causes would let TTL expiries (`Expired`, e.g. the
+    /// server targetkey store's `max_seconds: 604800`) or explicit
+    /// removes permanently mask a size-eviction wedge.
+    cause: RemovalCause,
 }
 
 /// Result of [`MokaEvictingMap::evict_unpinned_lru_bytes`].
@@ -236,25 +266,33 @@ pub enum WedgeSelfHealOutcome {
     /// No byte budget configured (`max_bytes == 0`) — the trigger
     /// predicate can never hold.
     NoByteBudget,
-    /// Observed weighted bytes strictly under `max_bytes` — trigger state
-    /// reset (frozen-tick count zeroed, wedge gauge cleared).
+    /// Observed weighted bytes AT-OR-UNDER `max_bytes` — within budget,
+    /// trigger state reset (frozen-tick count zeroed, resume latch and
+    /// wedge gauge cleared). Includes exact equality: the trigger is
+    /// STRICT `>` (operator decision 2026-07-29 on review 9fd52fc0
+    /// MAJOR-2) because at `weighted == max` moka owes zero eviction —
+    /// a wedge is unobservable there, so firing would be a guaranteed
+    /// false positive.
     UnderBudget,
-    /// At-or-over budget but `evicted_items` advanced since the previous
-    /// evaluation: eviction is making progress, no wedge. Trigger state
-    /// reset. This is the branch that prevents false-firing during
-    /// normal at-cap operation.
+    /// Strictly over budget but `size_evicted_items` advanced since the
+    /// previous evaluation: SIZE eviction is making progress, no wedge.
+    /// Trigger state reset. This is the branch that prevents
+    /// false-firing during normal at-cap operation.
     ProgressObserved,
-    /// At-or-over budget with frozen evictions, but below the
+    /// Strictly over budget with frozen size-evictions, but below the
     /// `WEDGE_FROZEN_TICKS_TRIGGER` consecutive-evaluation threshold.
     /// Carries the frozen-tick count so far.
     Accumulating(u64),
-    /// Trigger met — the fallback key-walk evictor fired.
+    /// Trigger met (or a metered heal resumed via `selfheal_resume`) —
+    /// the fallback key-walk evictor ran this invocation.
     Fired {
-        /// Entries evicted across all rounds of this firing.
+        /// Entries evicted across the rounds of THIS invocation.
         evicted_count: u64,
-        /// Bytes (value `len()` sum) evicted across all rounds.
+        /// Bytes (value `len()` sum) evicted across THIS invocation.
         evicted_bytes: u64,
-        /// Key-walk rounds executed (each bounded by `EVICT_SCAN_HARD_CAP`).
+        /// Key-walk rounds executed this invocation (each bounded by
+        /// `EVICT_SCAN_HARD_CAP`; at most
+        /// `WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION`).
         rounds: u32,
     },
 }
@@ -406,15 +444,36 @@ pub struct MokaEvictingMap<
     /// ordering against the reads is needed.
     boot_epoch: AtomicU64,
     /// (FINDING 2 moka-eviction-wedge) Consecutive drain-arm evaluations
-    /// that observed the cache at-or-over `max_bytes` with `evicted_items`
-    /// unchanged. Reset to 0 whenever the cache is under budget or
-    /// evictions progress; at `WEDGE_FROZEN_TICKS_TRIGGER` the fallback
-    /// evictor fires. Only the background drain task writes it (single
-    /// evaluator), so `Relaxed` suffices.
+    /// that observed the cache strictly over `max_bytes` with
+    /// `size_evicted_items` unchanged. Reset to 0 whenever the cache is
+    /// at-or-under budget or size-evictions progress; at
+    /// `WEDGE_FROZEN_TICKS_TRIGGER` the fallback evictor fires. Only the
+    /// background drain task writes it (single evaluator), so `Relaxed`
+    /// suffices.
     selfheal_frozen_ticks: AtomicU64,
-    /// (FINDING 2) `evicted_items` value at the previous drain-arm
+    /// (FINDING 2, sensor) Count of `RemovalCause::Size` evictions that
+    /// flowed through `process_eviction_event`. The wedge sensor reads
+    /// THIS — not `evicted_items` — because the moka livelock kills SIZE
+    /// eviction specifically; TTL expiries (server targetkey store,
+    /// `max_seconds: 604800`) or explicit removes advancing a
+    /// coarse-grained counter would permanently mask a size-wedge
+    /// (review 9fd52fc0 red-team alt-framing 2).
+    size_evicted_items: AtomicU64,
+    /// (FINDING 2) `size_evicted_items` value at the previous drain-arm
     /// evaluation — the frozen-evictions sensor baseline.
-    selfheal_last_evicted_items: AtomicU64,
+    selfheal_last_size_evicted_items: AtomicU64,
+    /// (FINDING 2, metering) `true` when the previous heal invocation hit
+    /// `WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION` while still observing
+    /// over-budget AND made progress: the next drain-arm evaluation
+    /// resumes the heal immediately (no fresh frozen-tick accumulation)
+    /// so a large overshoot converges across metered invocations instead
+    /// of one loop-monopolizing pass (review 9fd52fc0 pair-a MAJOR-4).
+    selfheal_resume: AtomicBool,
+    /// (FINDING 2, warn duty-cycle) `drain_kick_anchor.elapsed()` millis
+    /// (+1; 0 = never) of the last self-heal WARN emission — rate-limits
+    /// the warn to one per `WEDGE_SELFHEAL_WARN_MIN_INTERVAL_MILLIS`
+    /// (pair-b C5).
+    last_selfheal_warn_millis: AtomicU64,
     /// (FINDING 2 piece 2) Wedge gauge: `true` while the self-heal trigger
     /// condition holds (at-or-over budget AND evictions frozen for the
     /// full `WEDGE_FROZEN_TICKS_TRIGGER` window). Published as the
@@ -425,15 +484,31 @@ pub struct MokaEvictingMap<
     /// so the render also carries `last_time` — "when did the wedge last
     /// self-heal" is the staleness signal an operator alert wants.
     eviction_wedge_selfheal_total: CounterWithTime,
-    /// (FINDING 2, test seam) When non-zero, overrides the weighted-bytes
-    /// observation `maybe_selfheal_wedged_eviction` reads. A genuinely
-    /// over-budget cache with a FRESH `weighted_size()` is by construction
-    /// the wedged state (any completed maintenance pass either evicts to
-    /// cap or is wedged), which tests cannot reproduce without moka's bug;
-    /// this override injects the trigger observation while the
-    /// EVICTION-EXECUTION half still runs against the real cache. Never
-    /// set in production (one relaxed load per 10 s tick to check).
-    test_observed_weighted_bytes_override: AtomicU64,
+    /// (FINDING 2, test seam) Phantom EXTRA bytes ADDED to the real
+    /// weighted-bytes observation. A genuinely over-budget cache with a
+    /// FRESH `weighted_size()` is by construction the wedged state (any
+    /// completed maintenance pass either evicts to cap or is wedged),
+    /// which tests cannot reproduce without moka's bug; this seam models
+    /// the wedge faithfully — a constant stuck overage on top of the
+    /// REAL evictable residency — so the observation FALLS as the heal
+    /// evicts real entries and the convergence/stop logic is exercised
+    /// for real. The EVICTION-EXECUTION half always runs against the
+    /// real cache. cfg-gated out of production builds (review 9fd52fc0
+    /// pair-a MINOR-5 / pair-b C4).
+    #[cfg(any(test, feature = "test-utils"))]
+    test_observed_extra_bytes: AtomicU64,
+    /// (FINDING 2, test seam) When non-zero, overrides
+    /// `EVICT_SCAN_HARD_CAP` so multi-round heal invocations are
+    /// exercisable with small fixtures (pair-b T2). cfg-gated out of
+    /// production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_evict_scan_cap_override: AtomicU64,
+    /// (FINDING 2, test seam) When non-zero, overrides
+    /// `DRAIN_KICK_MIN_INTERVAL_MILLIS` so the rate-limiter's RELEASE
+    /// direction is testable with a short real sleep (pair-b T4).
+    /// cfg-gated out of production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_drain_kick_interval_override: AtomicU64,
     /// (FINDING 2 piece 3) Wake signal for the background drain arm. The
     /// disk-pressure NAK site kicks this (via
     /// `FilesystemStore::kick_eviction_drain`) so the admission gate
@@ -609,7 +684,14 @@ where
         // live-rendering tree as weighted_size_bytes (dark-counter trap:
         // the production wedge sat at 3.3x over budget + 3K disk NAKs and
         // nothing paged).
-        let overshoot_bytes: u64 = weighted_size_bytes.saturating_sub(self.max_bytes);
+        // (pair-b C1) `max_bytes == 0` = no byte budget: overshoot is
+        // meaningless, not "the whole cache" — mirror the guards in
+        // `would_exceed_capacity` and `maybe_selfheal_wedged_eviction`.
+        let overshoot_bytes: u64 = if self.max_bytes == 0 {
+            0
+        } else {
+            weighted_size_bytes.saturating_sub(self.max_bytes)
+        };
         let eviction_wedge_detected: u64 =
             u64::from(self.eviction_wedge_detected.load(Ordering::Relaxed));
         nativelink_metric::publish!(
@@ -866,6 +948,9 @@ where
                 key: Arc::clone(&key),
                 value,
                 ts_counter,
+                // (FINDING 2 fix-up) carry moka's removal cause so the
+                // wedge sensor counts ONLY `RemovalCause::Size` events.
+                cause,
             });
             // Unbounded channel never blocks — send only fails if the
             // receiver is dropped (shutdown).
@@ -926,10 +1011,18 @@ where
             clock: AtomicU64::new(1),
             boot_epoch: AtomicU64::new(boot_epoch),
             selfheal_frozen_ticks: AtomicU64::new(0),
-            selfheal_last_evicted_items: AtomicU64::new(0),
+            size_evicted_items: AtomicU64::new(0),
+            selfheal_last_size_evicted_items: AtomicU64::new(0),
+            selfheal_resume: AtomicBool::new(false),
+            last_selfheal_warn_millis: AtomicU64::new(0),
             eviction_wedge_detected: AtomicBool::new(false),
             eviction_wedge_selfheal_total: CounterWithTime::default(),
-            test_observed_weighted_bytes_override: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_observed_extra_bytes: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_evict_scan_cap_override: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_drain_kick_interval_override: AtomicU64::new(0),
             drain_kick: Notify::new(),
             drain_kick_anchor: Instant::now(),
             last_drain_kick_millis: AtomicU64::new(0),
@@ -2361,6 +2454,20 @@ where
     ///     durability invariant. A future moka release exposing an
     ///     ordered LRU walker (or a `coldest_n` API) can be slotted in
     ///     here without changing call sites.
+    ///   * (FINDING 2 fix-up, review 9fd52fc0 MAJOR-3) The wedge
+    ///     self-heal (`maybe_selfheal_wedged_eviction`, reached from the
+    ///     drain tick and the disk-NAK kick) made this the recovery
+    ///     eviction path for EVERY byte-budgeted `MokaEvictingMap` —
+    ///     worker fast tier AND server tiers — whose load-bearing
+    ///     property is WORKING-SET retention, not just durability.
+    ///     Arbitrary order costs cache-hit fidelity: a full incident
+    ///     heal (~66 000 entries over ~4 metered invocations) discards a
+    ///     hash-arbitrary rather than coldest-first subset of the
+    ///     working set. Accepted deliberately: the alternative is an
+    ///     unboundedly ratcheting overshoot with a permanently dead
+    ///     evictor (3.36× over budget in the incident), and moka exposes
+    ///     no ordered walk. The order caveat is scoped to WEDGE RECOVERY
+    ///     — normal (non-wedged) eviction remains moka's LRU.
     ///
     /// **Concurrency.** This is a sync method. Holds no awaits. Moka's
     /// `cache.iter()` and `cache.invalidate()` are lock-free /
@@ -2394,12 +2501,22 @@ where
         // `would_exceed_capacity` re-check is still authoritative for
         // admission; this cap only bounds the SCAN, not the eviction
         // contract.
+        // (FINDING 2, test seam) scan cap is overridable in test builds
+        // so multi-round metered heals are exercisable with small
+        // fixtures; production always uses EVICT_SCAN_HARD_CAP.
+        #[cfg(any(test, feature = "test-utils"))]
+        let scan_cap = match self.test_evict_scan_cap_override.load(Ordering::Relaxed) {
+            0 => EVICT_SCAN_HARD_CAP,
+            cap => cap,
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let scan_cap = EVICT_SCAN_HARD_CAP;
         for (key_arc, value) in self.cache.iter() {
             iter_scanned = iter_scanned.saturating_add(1);
             if evicted_bytes >= target_bytes {
                 break;
             }
-            if iter_scanned >= EVICT_SCAN_HARD_CAP {
+            if iter_scanned >= scan_cap {
                 iter_truncated = true;
                 break;
             }
@@ -2484,13 +2601,48 @@ where
         Arc::clone(&self.reconcile_complete)
     }
 
-    /// (FINDING 2, test seam) Force the weighted-bytes observation the
-    /// wedge trigger reads. See `test_observed_weighted_bytes_override`.
-    /// `0` restores the real `cache.weighted_size()` observation.
+    /// (FINDING 2, test seam) Add phantom EXTRA bytes to the wedge
+    /// trigger's weighted-bytes observation (models the wedge's stuck
+    /// overage on top of the REAL evictable residency — see
+    /// `test_observed_extra_bytes`). `0` restores the real observation.
+    #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn test_force_wedge_observation(&self, weighted_bytes: u64) {
-        self.test_observed_weighted_bytes_override
-            .store(weighted_bytes, Ordering::Relaxed);
+    pub fn test_inflate_wedge_observation(&self, extra_bytes: u64) {
+        self.test_observed_extra_bytes
+            .store(extra_bytes, Ordering::Relaxed);
+    }
+
+    /// (FINDING 2, test seam) Override `EVICT_SCAN_HARD_CAP` for the
+    /// fallback key walk so multi-round heals are exercisable with small
+    /// fixtures. `0` restores the production cap.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_force_evict_scan_cap(&self, cap: u64) {
+        self.test_evict_scan_cap_override
+            .store(cap, Ordering::Relaxed);
+    }
+
+    /// (FINDING 2, test seam) Shrink the kick rate-limiter's minimum
+    /// interval so the limiter's RELEASE direction is testable with a
+    /// short real sleep instead of a full 5 s
+    /// `DRAIN_KICK_MIN_INTERVAL_MILLIS` wait (pair-b T4; the anchor is
+    /// `std::time::Instant`, unaffected by tokio's paused clock, so the
+    /// real elapsed-time comparison is exercised unmodified). `0`
+    /// restores the production interval.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_force_drain_kick_min_interval(&self, millis: u64) {
+        self.test_drain_kick_interval_override
+            .store(millis, Ordering::Relaxed);
+    }
+
+    /// (FINDING 2, test seam) Drive one drain-arm self-heal evaluation
+    /// deterministically (the production callers are the two drain arms
+    /// via `gated_drain_arm`).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn test_maybe_selfheal_wedged_eviction(&self) -> WedgeSelfHealOutcome {
+        self.maybe_selfheal_wedged_eviction().await
     }
 
     /// (FINDING 2) The weighted-bytes observation the wedge trigger reads:
@@ -2502,24 +2654,27 @@ where
     /// The weigher rounds sizes UP, so this over-estimates true bytes —
     /// the safe direction (can never under-fire on a real overshoot).
     fn observed_weighted_bytes(&self) -> u64 {
-        let over = self
-            .test_observed_weighted_bytes_override
-            .load(Ordering::Relaxed);
-        if over != 0 {
-            return over;
-        }
         const SCALE: u64 = 1024;
-        self.cache.weighted_size().saturating_mul(SCALE)
+        let real = self.cache.weighted_size().saturating_mul(SCALE);
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            return real.saturating_add(
+                self.test_observed_extra_bytes.load(Ordering::Relaxed),
+            );
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        real
     }
 
     /// (FINDING 2) One evaluation of the eviction-wedge self-heal trigger,
     /// run by BOTH background drain arms (periodic tick + NAK kick) right
     /// after `run_pending_tasks_and_drain`.
     ///
-    /// Trigger: the cache is AT-OR-OVER `max_bytes` AND `evicted_items`
-    /// has not advanced for `WEDGE_FROZEN_TICKS_TRIGGER` consecutive
-    /// evaluations. moka 0.12.15's `evict_lru_entries` can livelock on a
-    /// stale probation-deque front node (see `WEDGE_FROZEN_TICKS_TRIGGER`
+    /// Trigger: the cache is STRICTLY OVER `max_bytes` AND
+    /// `size_evicted_items` has not advanced for
+    /// `WEDGE_FROZEN_TICKS_TRIGGER` consecutive evaluations. moka
+    /// 0.12.15's `evict_lru_entries` can livelock on a stale
+    /// probation-deque front node (see `WEDGE_FROZEN_TICKS_TRIGGER`
     /// docs); in that state `run_pending_tasks` returns normally but
     /// evicts 0 forever while the weight ledger stays accurate — this
     /// evaluation detects exactly that signature and re-establishes the
@@ -2530,11 +2685,16 @@ where
     /// unlinks each entry's own deque node — none of it peeks the wedged
     /// probation front).
     ///
-    /// `#[doc(hidden)] pub` so tests drive evaluations deterministically
-    /// (like `expire_stale_pins`); production callers are the two drain
-    /// arms only.
-    #[doc(hidden)]
-    pub async fn maybe_selfheal_wedged_eviction(&self) -> WedgeSelfHealOutcome {
+    /// METERED (review 9fd52fc0 pair-a MAJOR-4 / pair-b P3): each
+    /// invocation runs at most `WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION`
+    /// key-walk rounds with a `yield_now` between rounds, then RE-ARMS
+    /// via `selfheal_resume` so the next tick/kick continues the heal —
+    /// the select loop keeps servicing the pin-expiry arms between
+    /// invocations and the BlobChangeTracker delta burst stays bounded
+    /// per BlobsAvailable message. Production callers: the two drain
+    /// arms via `gated_drain_arm`; tests drive it via the cfg-gated
+    /// `test_maybe_selfheal_wedged_eviction`.
+    async fn maybe_selfheal_wedged_eviction(&self) -> WedgeSelfHealOutcome {
         // Suppressed IDENTICALLY to the drain tick while the FL-688
         // startup reconcile gate is armed (belt + braces: both arms also
         // check before calling). Leaves trigger state untouched.
@@ -2545,50 +2705,67 @@ where
             return WedgeSelfHealOutcome::NoByteBudget;
         }
         let observed = self.observed_weighted_bytes();
-        let evicted_now = self.evicted_items.counter.load(Ordering::Relaxed);
-        // OPERATOR-SPECIFIED THRESHOLD (2026-07-28, do not change):
-        // trigger at `observed >= max_bytes`, NOT a slack multiple like
-        // 1.05×max — with a slack multiplier a wedge sitting between max
-        // and the slack line never self-heals and the budget stays
-        // violated forever. Compared in the weigher-derived bytes against
-        // the same `self.max_bytes` that `would_exceed_capacity` uses.
-        if observed < self.max_bytes {
+        let evicted_now = self.size_evicted_items.load(Ordering::Relaxed);
+        // STRICT `>` threshold (operator decision 2026-07-29, review
+        // 9fd52fc0 MAJOR-2, superseding the earlier `>=` directive): at
+        // exact equality moka owes ZERO eviction
+        // (`weights_to_evict = weighted_size.saturating_sub(max)`), so a
+        // wedge is mathematically unobservable there and firing would be
+        // a guaranteed false positive — and every deployed `max_bytes`
+        // is an exact multiple of 1024, making equality routinely
+        // reachable by an idle at-cap cache. The original no-SLACK
+        // rationale still holds: there is no multiplier band a wedge
+        // could park inside — nothing sits strictly between `max` and
+        // `max` — so any real overshoot (≥ one weigher unit over)
+        // triggers. Compared in the weigher-derived bytes against the
+        // same `self.max_bytes` that `would_exceed_capacity` uses.
+        if observed <= self.max_bytes {
             self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
-            self.selfheal_last_evicted_items
+            self.selfheal_last_size_evicted_items
                 .store(evicted_now, Ordering::Relaxed);
+            self.selfheal_resume.store(false, Ordering::Relaxed);
             self.eviction_wedge_detected.store(false, Ordering::Relaxed);
             return WedgeSelfHealOutcome::UnderBudget;
         }
-        let last = self
-            .selfheal_last_evicted_items
-            .swap(evicted_now, Ordering::Relaxed);
-        if evicted_now != last {
-            // Evictions are progressing (any pipeline event: size/LRU,
-            // TTL, explicit remove — all advance `evicted_items` via
-            // `process_eviction_event`). Normal at-cap operation lands
-            // here every tick, which is what prevents false-firing.
-            self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
-            self.eviction_wedge_detected.store(false, Ordering::Relaxed);
-            return WedgeSelfHealOutcome::ProgressObserved;
-        }
-        let frozen = self.selfheal_frozen_ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        if frozen < WEDGE_FROZEN_TICKS_TRIGGER {
-            return WedgeSelfHealOutcome::Accumulating(frozen);
+        let resumed = self.selfheal_resume.load(Ordering::Relaxed);
+        if !resumed {
+            let last = self
+                .selfheal_last_size_evicted_items
+                .swap(evicted_now, Ordering::Relaxed);
+            if evicted_now != last {
+                // SIZE evictions are progressing — no wedge. Normal
+                // at-cap operation lands here every tick, which is what
+                // prevents false-firing. Non-Size progress (TTL
+                // `Expired`, explicit removes) deliberately does NOT
+                // land here — see `size_evicted_items`.
+                self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
+                self.eviction_wedge_detected.store(false, Ordering::Relaxed);
+                return WedgeSelfHealOutcome::ProgressObserved;
+            }
+            let frozen = self.selfheal_frozen_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+            if frozen < WEDGE_FROZEN_TICKS_TRIGGER {
+                return WedgeSelfHealOutcome::Accumulating(frozen);
+            }
         }
 
-        // Trigger met — the evictor is wedged. Fire the fallback.
+        // Trigger met (or metered heal resumed) — run the fallback for
+        // ONE bounded invocation.
         self.eviction_wedge_detected.store(true, Ordering::Relaxed);
-        self.eviction_wedge_selfheal_total.inc();
-        // Bring the weighted size back STRICTLY under `max_bytes`. The
-        // `.max(1)` covers the `== max` equality the `>=` trigger admits:
-        // a zero overshoot still evicts one entry so the boundary state
-        // converges under budget instead of re-firing every
-        // `WEDGE_FROZEN_TICKS_TRIGGER` ticks forever.
-        let mut target = observed.saturating_sub(self.max_bytes).max(1);
         let mut total_count = 0u64;
         let mut total_bytes = 0u64;
         let mut rounds = 0u32;
-        while rounds < WEDGE_SELFHEAL_MAX_ROUNDS {
+        while rounds < WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION {
+            // Per-round target: the current overage. Under a real wedge
+            // the observation is the live weighted size, which FALLS as
+            // the heal evicts, so the loop stops exactly when the cache
+            // is back at-or-under `max_bytes` (strict `>` here too — at
+            // equality there is nothing owed). `observed_weighted_bytes`
+            // adds the cfg-gated test overage on top of the real value.
+            let live = self.observed_weighted_bytes();
+            if live <= self.max_bytes {
+                break;
+            }
+            let target = live - self.max_bytes;
             let report = self.evict_unpinned_lru_bytes(target);
             // Route the invalidations through the NORMAL eviction
             // pipeline (listener → event → unref + removal callbacks) so
@@ -2597,48 +2774,65 @@ where
             // owner of the periodic drain), so draining inline here is
             // the same single-consumer discipline as the drain arms.
             self.drain_pending_evictions().await;
+            // Metering (pair-b P3): each round is a bounded synchronous
+            // stretch (scan + invalidate + listener per entry); yield so
+            // co-scheduled tasks run between rounds.
+            tokio::task::yield_now().await;
             total_count += report.evicted_count;
             total_bytes += report.evicted_bytes;
             rounds += 1;
             if report.evicted_count == 0 {
-                // No evictable candidates left (everything remaining is
+                // No evictable candidates (everything remaining is
                 // pin-protected or the cache is empty). Leave the wedge
-                // gauge set; the next trigger re-fires 3 ticks later.
+                // gauge set; the trigger re-accumulates and re-fires on
+                // its normal duty cycle.
                 break;
             }
-            // Re-read the REAL post-eviction weighted size (the rounds
-            // after the first are driven by actual convergence, not the
-            // trigger observation).
-            const SCALE: u64 = 1024;
-            let live = self.cache.weighted_size().saturating_mul(SCALE);
-            if live < self.max_bytes {
-                break;
-            }
-            target = live.saturating_sub(self.max_bytes).max(1);
         }
-        // Our own fallback evictions advanced `evicted_items` (via
-        // `process_eviction_event`); re-baseline on the post-heal value
-        // so a still-wedged cache needs a fresh N frozen ticks before the
-        // next firing (bounded duty cycle), and a healed cache reads
-        // "no progress" correctly rather than a phantom "progress".
+        // Re-arm (metering): if this bounded invocation made progress
+        // but the observation is still over budget, the next drain-arm
+        // evaluation RESUMES the heal immediately — no fresh frozen-tick
+        // accumulation. (The heal's own `Explicit` invalidations do not
+        // advance the Size sensor, so waiting for "frozen" again would
+        // only add dead ticks to convergence.)
+        let still_over = self.observed_weighted_bytes() > self.max_bytes;
+        self.selfheal_resume
+            .store(still_over && total_count > 0, Ordering::Relaxed);
         self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
-        self.selfheal_last_evicted_items.store(
-            self.evicted_items.counter.load(Ordering::Relaxed),
+        self.selfheal_last_size_evicted_items.store(
+            self.size_evicted_items.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        // ONE warn per firing (never per evicted entry).
-        warn!(
-            target: "nativelink::eviction_wedge_selfheal",
-            observed_weighted_bytes = observed,
-            max_bytes = self.max_bytes,
-            evicted_count = total_count,
-            evicted_bytes = total_bytes,
-            rounds,
-            frozen_ticks = WEDGE_FROZEN_TICKS_TRIGGER,
-            "moka eviction wedge self-heal fired: evictions made no progress while \
-             at-or-over budget (FINDING 2 stale-probation-front livelock signature); \
-             fallback key-walk evictor ran"
-        );
+        if !resumed {
+            // Count every LOGICAL firing (resumed continuations are part
+            // of the same firing: no increment, no warn). The warn is
+            // additionally rate-limited (pair-b C5) — the gauge +
+            // counter carry the persistent state between warns.
+            self.eviction_wedge_selfheal_total.inc();
+            let now_millis = self.drain_kick_anchor.elapsed().as_millis() as u64 + 1;
+            let last_warn = self.last_selfheal_warn_millis.load(Ordering::Relaxed);
+            if last_warn == 0
+                || now_millis.saturating_sub(last_warn)
+                    >= WEDGE_SELFHEAL_WARN_MIN_INTERVAL_MILLIS
+            {
+                self.last_selfheal_warn_millis
+                    .store(now_millis, Ordering::Relaxed);
+                warn!(
+                    target: "nativelink::eviction_wedge_selfheal",
+                    observed_weighted_bytes = observed,
+                    max_bytes = self.max_bytes,
+                    evicted_count = total_count,
+                    evicted_bytes = total_bytes,
+                    rounds,
+                    frozen_ticks = WEDGE_FROZEN_TICKS_TRIGGER,
+                    "moka eviction wedge self-heal fired: size-evictions made no \
+                     progress while strictly over budget (FINDING 2 \
+                     stale-probation-front livelock signature); metered fallback \
+                     key-walk evictor ran (continues across ticks until under \
+                     budget)"
+                );
+            }
+        }
         WedgeSelfHealOutcome::Fired {
             evicted_count: total_count,
             evicted_bytes: total_bytes,
@@ -2648,9 +2842,17 @@ where
 
     /// (FINDING 2 piece 3) Rate-limited wake of the background drain arm.
     /// Called from the worker's disk-pressure NAK site (via
-    /// `FilesystemStore::kick_eviction_drain`) so the admission gate
-    /// actively drives eviction (`gate ⇒ evict`) instead of only refusing
-    /// work. Non-blocking: one atomic compare-exchange + `notify_one`; no
+    /// `FilesystemStore::kick_eviction_drain`).
+    ///
+    /// Honest scope (review 9fd52fc0 MINOR-6): the `gate ⇒ evict`
+    /// composite is CLOSED BY PIECE 1 — the periodic
+    /// `DRAIN_INTERVAL_SECS = 10` tick already runs the capacity drain +
+    /// wedge self-heal unconditionally. This kick only removes up to one
+    /// tick interval of latency (≤10 s) between a disk-NAK and the next
+    /// drain pass. Cheap, so kept — but it is a latency optimisation,
+    /// not the invariant's load-bearing mechanism.
+    ///
+    /// Non-blocking: one atomic compare-exchange + `notify_one`; no
     /// locks, no awaits — safe inline on any path. Returns whether the
     /// kick was accepted (`false` = within `DRAIN_KICK_MIN_INTERVAL_MILLIS`
     /// of the previous accepted kick, or lost a race to a concurrent
@@ -2659,7 +2861,14 @@ where
         // `+ 1` so a stored 0 always means "never kicked".
         let now_millis = self.drain_kick_anchor.elapsed().as_millis() as u64 + 1;
         let last = self.last_drain_kick_millis.load(Ordering::Relaxed);
-        if last != 0 && now_millis.saturating_sub(last) < DRAIN_KICK_MIN_INTERVAL_MILLIS {
+        #[cfg(any(test, feature = "test-utils"))]
+        let min_interval = match self.test_drain_kick_interval_override.load(Ordering::Relaxed) {
+            0 => DRAIN_KICK_MIN_INTERVAL_MILLIS,
+            v => v,
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let min_interval = DRAIN_KICK_MIN_INTERVAL_MILLIS;
+        if last != 0 && now_millis.saturating_sub(last) < min_interval {
             return false;
         }
         if self
@@ -2748,11 +2957,13 @@ where
                 _ = drain_interval.tick() => {
                     self.gated_drain_arm().await;
                 }
-                // (FINDING 2 piece 3) Disk-NAK force-drain kick: the
-                // worker's disk-pressure gate wakes this arm (rate-limited
-                // at `kick_drain`) so `gate ⇒ evict` holds actively — the
-                // gate's "eviction catches up" premise is driven, not
-                // assumed. Runs the SAME gated body as the periodic tick.
+                // (FINDING 2 piece 3) Disk-NAK drain kick: the worker's
+                // disk-pressure gate wakes this arm (rate-limited at
+                // `kick_drain`) so a NAK is followed by a drain pass
+                // within ~0 s instead of up to one DRAIN_INTERVAL tick —
+                // a ≤10 s latency optimisation on the `gate ⇒ evict`
+                // composite that the periodic tick arm (piece 1) closes.
+                // Runs the SAME gated body as the periodic tick.
                 () = self.drain_kick.notified() => {
                     self.gated_drain_arm().await;
                 }
@@ -2787,6 +2998,14 @@ where
         let size = event.value.len();
         self.evicted_bytes.add(size);
         self.evicted_items.inc();
+        // (FINDING 2 fix-up) The wedge sensor counts ONLY size evictions:
+        // the moka livelock kills `RemovalCause::Size` specifically, and
+        // non-Size progress (TTL `Expired` on the targetkey store's
+        // `max_seconds`, explicit removes, the heal's own `Explicit`
+        // invalidations) must not reset the freeze counter.
+        if event.cause == RemovalCause::Size {
+            self.size_evicted_items.fetch_add(1, Ordering::Relaxed);
+        }
 
         event.value.unref().await;
 
@@ -2999,7 +3218,7 @@ mod tests {
 
     use super::{
         MokaEvictingMap, PinnedEntry, WedgeSelfHealOutcome, PIN_SATURATION_HEADROOM_DIVISOR,
-        PIN_TIMEOUT_SECS, WEDGE_FROZEN_TICKS_TRIGGER,
+        PIN_TIMEOUT_SECS, WEDGE_FROZEN_TICKS_TRIGGER, WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION,
     };
     use crate::evicting_map::{ItemCallback, LenEntry};
 
@@ -4809,10 +5028,13 @@ mod tests {
     // `weighted_size()` is by construction the WEDGED state (a completed
     // moka maintenance pass either evicts to cap or is livelocked on the
     // stale probation front), which a test cannot reproduce without
-    // moka's bug. `test_force_wedge_observation` therefore injects the
-    // TRIGGER observation, while the EVICTION-EXECUTION half always runs
-    // against the REAL map (real `cache.iter()` walk, real `invalidate`,
-    // real listener → event → unref → removal callbacks).
+    // moka's bug. `test_inflate_wedge_observation(extra)` therefore adds
+    // a PHANTOM stuck overage on top of the REAL residency — the
+    // observation falls as the heal evicts real entries, so the
+    // convergence/stop logic is exercised for real — while the
+    // EVICTION-EXECUTION half always runs against the REAL map (real
+    // `cache.iter()` walk, real `invalidate`, real listener → event →
+    // unref → removal callbacks).
     // ---------------------------------------------------------------
 
     /// (FINDING 2) Budget for the wedge tests: 100 KiB = 100 weigher
@@ -4847,12 +5069,13 @@ mod tests {
     #[tokio::test]
     async fn fallback_evictor_fires_when_eviction_wedged_at_cap() {
         let (map, removal_count) = wedge_map_with_entries(50).await;
-        // Inject the wedge observation: 130 KiB >= the 100 KiB budget
-        // (30 KiB overshoot). Real map: 50 KiB resident, evictions frozen.
-        map.test_force_wedge_observation(130 * 1024);
+        // Inject an 80 KiB phantom stuck overage: observed = 50 KiB real
+        // + 80 KiB = 130 KiB, strictly over the 100 KiB budget (30 KiB
+        // overshoot). Real map: 50 KiB resident, size-evictions frozen.
+        map.test_inflate_wedge_observation(80 * 1024);
 
         for expect_ticks in 1..WEDGE_FROZEN_TICKS_TRIGGER {
-            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
             assert_eq!(
                 outcome,
                 WedgeSelfHealOutcome::Accumulating(expect_ticks),
@@ -4862,7 +5085,7 @@ mod tests {
         }
         let outcome = tokio::time::timeout(
             core::time::Duration::from_secs(5),
-            map.maybe_selfheal_wedged_eviction(),
+            map.test_maybe_selfheal_wedged_eviction(),
         )
         .await
         .expect("must not deadlock — self-heal eviction-event drain wedged");
@@ -4874,20 +5097,27 @@ mod tests {
             } => {
                 assert_eq!(
                     evicted_count, 30,
-                    "self-heal must evict exactly the overshoot (30 KiB / 1 KiB entries = 30)"
+                    "self-heal must evict exactly the overshoot (30 KiB / 1 KiB entries = 30) \
+                     and STOP once the observation converges to the budget"
                 );
                 assert_eq!(
                     evicted_bytes,
                     30 * 1024,
                     "self-heal evicted_bytes must equal the 30 KiB overshoot"
                 );
-                assert_eq!(rounds, 1, "a 30-entry overshoot must heal in one key-walk round");
+                assert_eq!(
+                    rounds, 1,
+                    "a 30-entry overshoot must heal in one key-walk round (the round-2 \
+                     re-read sees 20 KiB real + 80 KiB phantom = exactly max -> at-or-under \
+                     -> converged)"
+                );
             }
             other => panic!(
                 "moka-wedge self-heal: fallback evictor must FIRE after \
-                 {WEDGE_FROZEN_TICKS_TRIGGER} frozen at-or-over-budget evaluations — without \
-                 it eviction stays permanently dead while over budget (FINDING 2: 3.3x over \
-                 max_bytes for 4 days); got {other:?}"
+                 {WEDGE_FROZEN_TICKS_TRIGGER} frozen strictly-over-budget evaluations — \
+                 without it eviction stays permanently dead while over budget (FINDING 2 \
+                 fleet artifact: 3.36x over max_bytes, size-evictions frozen 8h36m at \
+                 scrape); got {other:?}"
             ),
         }
         // Index-visibility: fallback evictions must flow through the
@@ -4914,12 +5144,12 @@ mod tests {
         );
         // Restoring the real (under-budget) observation resets state and
         // clears the gauge on the next evaluation.
-        map.test_force_wedge_observation(0);
-        let outcome = map.maybe_selfheal_wedged_eviction().await;
+        map.test_inflate_wedge_observation(0);
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
         assert_eq!(
             outcome,
             WedgeSelfHealOutcome::UnderBudget,
-            "with the override cleared the real 20 KiB residency is under budget"
+            "with the phantom overage cleared the real 20 KiB residency is under budget"
         );
         assert!(
             !map.eviction_wedge_detected.load(Ordering::Relaxed),
@@ -4938,9 +5168,10 @@ mod tests {
     async fn fallback_evictor_inert_below_max_and_requires_consecutive_ticks() {
         let (map, removal_count) = wedge_map_with_entries(50).await;
 
-        map.test_force_wedge_observation(WEDGE_MAX_BYTES as u64 - 1024);
+        // 49 KiB phantom: observed = 50 + 49 = 99 KiB, strictly under.
+        map.test_inflate_wedge_observation(49 * 1024);
         for _ in 0..5 {
-            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
             assert_eq!(
                 outcome,
                 WedgeSelfHealOutcome::UnderBudget,
@@ -4961,34 +5192,35 @@ mod tests {
 
         // over, over, UNDER, over, over → no fire (each frozen run is
         // below the 3-evaluation trigger); the 3rd consecutive fires.
-        let over = WEDGE_MAX_BYTES as u64 + 10 * 1024;
-        map.test_force_wedge_observation(over);
+        // 60 KiB phantom: observed = 50 + 60 = 110 KiB, strictly over.
+        let over_extra = 60 * 1024;
+        map.test_inflate_wedge_observation(over_extra);
         assert_eq!(
-            map.maybe_selfheal_wedged_eviction().await,
+            map.test_maybe_selfheal_wedged_eviction().await,
             WedgeSelfHealOutcome::Accumulating(1)
         );
         assert_eq!(
-            map.maybe_selfheal_wedged_eviction().await,
+            map.test_maybe_selfheal_wedged_eviction().await,
             WedgeSelfHealOutcome::Accumulating(2)
         );
-        map.test_force_wedge_observation(WEDGE_MAX_BYTES as u64 - 1024);
+        map.test_inflate_wedge_observation(49 * 1024);
         assert_eq!(
-            map.maybe_selfheal_wedged_eviction().await,
+            map.test_maybe_selfheal_wedged_eviction().await,
             WedgeSelfHealOutcome::UnderBudget,
             "an under-budget observation must reset the frozen-tick accumulation"
         );
-        map.test_force_wedge_observation(over);
+        map.test_inflate_wedge_observation(over_extra);
         assert_eq!(
-            map.maybe_selfheal_wedged_eviction().await,
+            map.test_maybe_selfheal_wedged_eviction().await,
             WedgeSelfHealOutcome::Accumulating(1),
             "frozen-tick count must restart from 1 after an under-budget reset — \
              NON-consecutive over-budget observations must never fire"
         );
         assert_eq!(
-            map.maybe_selfheal_wedged_eviction().await,
+            map.test_maybe_selfheal_wedged_eviction().await,
             WedgeSelfHealOutcome::Accumulating(2)
         );
-        let outcome = map.maybe_selfheal_wedged_eviction().await;
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
         assert!(
             matches!(outcome, WedgeSelfHealOutcome::Fired { .. }),
             "the {WEDGE_FROZEN_TICKS_TRIGGER}rd CONSECUTIVE frozen at-or-over evaluation \
@@ -5009,10 +5241,12 @@ mod tests {
         // insert genuinely evicts (real moka LRU eviction → the
         // `evicted_items` sensor advances).
         let (map, _removal_count) = wedge_map_with_entries(100).await;
-        map.test_force_wedge_observation(WEDGE_MAX_BYTES as u64 + 50 * 1024);
+        // 50 KiB phantom on a genuinely at-cap map: observed ~150 KiB,
+        // strictly over throughout.
+        map.test_inflate_wedge_observation(50 * 1024);
         for k in 0..6u64 {
             map.insert(1000 + k, BytesEntry(1024)).await;
-            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
             assert_eq!(
                 outcome,
                 WedgeSelfHealOutcome::ProgressObserved,
@@ -5070,14 +5304,14 @@ mod tests {
             },
         );
 
-        // Overshoot far larger than everything evictable → the heal
-        // tries to evict every unpinned resident.
-        map.test_force_wedge_observation(10 * WEDGE_MAX_BYTES as u64);
+        // Phantom overage far larger than everything evictable → the
+        // heal tries to evict every unpinned resident.
+        map.test_inflate_wedge_observation(10 * WEDGE_MAX_BYTES as u64);
         let mut outcome = WedgeSelfHealOutcome::UnderBudget;
         for _ in 0..WEDGE_FROZEN_TICKS_TRIGGER {
             outcome = tokio::time::timeout(
                 core::time::Duration::from_secs(5),
-                map.maybe_selfheal_wedged_eviction(),
+                map.test_maybe_selfheal_wedged_eviction(),
             )
             .await
             .expect("must not deadlock — self-heal eviction-event drain wedged");
@@ -5137,10 +5371,10 @@ mod tests {
     #[tokio::test]
     async fn fallback_evictor_suppressed_while_reconcile_gate_armed() {
         let (map, removal_count) = wedge_map_with_entries(50).await;
-        map.test_force_wedge_observation(2 * WEDGE_MAX_BYTES as u64);
+        map.test_inflate_wedge_observation(2 * WEDGE_MAX_BYTES as u64);
         map.set_startup_reconcile_gate();
         for _ in 0..5 {
-            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
             assert_eq!(
                 outcome,
                 WedgeSelfHealOutcome::SuppressedReconcileGate,
@@ -5157,12 +5391,12 @@ mod tests {
         map.release_startup_reconcile_gate();
         for expect_ticks in 1..WEDGE_FROZEN_TICKS_TRIGGER {
             assert_eq!(
-                map.maybe_selfheal_wedged_eviction().await,
+                map.test_maybe_selfheal_wedged_eviction().await,
                 WedgeSelfHealOutcome::Accumulating(expect_ticks),
                 "after gate release the trigger must accumulate normally"
             );
         }
-        let outcome = map.maybe_selfheal_wedged_eviction().await;
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
         assert!(
             matches!(outcome, WedgeSelfHealOutcome::Fired { .. }),
             "after gate release the fallback must fire normally (got {outcome:?})"
@@ -5180,7 +5414,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn drain_tick_arm_invokes_wedge_selfheal() {
         let (map, removal_count) = wedge_map_with_entries(50).await;
-        map.test_force_wedge_observation(130 * 1024); // 30 KiB overshoot
+        map.test_inflate_wedge_observation(80 * 1024); // 30 KiB overshoot
         map.start_background_eviction();
         let drain_period = core::time::Duration::from_secs(super::DRAIN_INTERVAL_SECS);
         const MAX_TICKS: u32 = 20;
@@ -5257,9 +5491,9 @@ mod tests {
             "precondition: without a kick and without a further tick the drain arm must \
              not run (startup overshoot must still be un-enforced)"
         );
-        // Force the wedge observation so the kick arm's selfheal
+        // Inflate the wedge observation so the kick arm's selfheal
         // evaluation is observable via the sensor baseline.
-        map.test_force_wedge_observation(200 * 1024);
+        map.test_inflate_wedge_observation(200 * 1024);
         assert!(
             map.kick_drain(),
             "first kick must be accepted (rate limiter fresh)"
@@ -5290,36 +5524,60 @@ mod tests {
              (19 entries - 1 kept at the 1-unit cap = 18 evictions)"
         );
         // The kick arm must ALSO have run the selfheal evaluation: the
-        // 18 drain evictions advanced `evicted_items`, so the evaluation
-        // records ProgressObserved and updates the sensor baseline.
+        // 18 drain evictions are `RemovalCause::Size` (moka capacity
+        // enforcement), so they advanced the Size sensor and the
+        // evaluation records ProgressObserved + updates the baseline.
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            map.selfheal_last_evicted_items.load(Ordering::Relaxed),
+            map.selfheal_last_size_evicted_items.load(Ordering::Relaxed),
             18,
             "piece 3: the kick arm must run the wedge selfheal evaluation after the \
-             drain — the frozen-evictions sensor baseline must have observed the 18 \
-             evictions (stayed at {} instead)",
-            map.selfheal_last_evicted_items.load(Ordering::Relaxed),
+             drain — the frozen-size-evictions sensor baseline must have observed the \
+             18 Size evictions (stayed at {} instead)",
+            map.selfheal_last_size_evicted_items.load(Ordering::Relaxed),
         );
     }
 
     /// Piece 3: kick delivery is rate-limited so a NAK storm cannot turn
-    /// the drain loop busy.
+    /// the drain loop busy — AND the limiter RELEASES after the interval
+    /// (asymmetric-contract coverage, pair-b T4: a permanently-latched
+    /// limiter would silently kill the kick path after the first NAK of
+    /// the process's life).
     ///
-    /// Mutation step: remove the interval check in `kick_drain` → the
-    /// second-kick assertion red-fails.
+    /// Mutation steps: (a) remove the interval check in `kick_drain` →
+    /// the second-kick assertion red-fails; (b) latch the limiter
+    /// (`if last != 0 { return false; }`) → the release assertion
+    /// red-fails.
     #[tokio::test]
-    async fn drain_kick_rate_limited() {
+    async fn drain_kick_rate_limited_and_releases() {
         let cfg = policy(WEDGE_MAX_BYTES, 0);
         let map = Arc::new(make_map_cb(&cfg));
+        // Shrink the interval to 50 ms so the RELEASE half needs only a
+        // short real sleep; the elapsed-time comparison itself runs
+        // unmodified against the std::time::Instant anchor.
+        map.test_force_drain_kick_min_interval(50);
         assert!(map.kick_drain(), "first kick must be accepted");
         assert!(
             !map.kick_drain(),
             "an immediate second kick must be rate-limited (one accepted kick per \
              DRAIN_KICK_MIN_INTERVAL_MILLIS) — a disk-NAK storm must not become a busy \
              drain loop"
+        );
+        // Real elapsed time past the (shrunk) interval — the limiter
+        // must RELEASE.
+        tokio::time::sleep(core::time::Duration::from_millis(80)).await;
+        assert!(
+            map.kick_drain(),
+            "the kick rate-limiter must RELEASE once the minimum interval has elapsed \
+             since the last accepted kick — a permanently-latched limiter makes the \
+             disk-NAK kick path dead after the first NAK of the process's life \
+             (gate => evict latency guarantee silently lost)"
+        );
+        assert!(
+            !map.kick_drain(),
+            "after the released kick is accepted the limiter must re-arm"
         );
     }
 
@@ -5358,6 +5616,310 @@ mod tests {
             "FL-688 Stage C: a kick received while the startup reconcile gate is armed \
              must be a no-op — the kick arm must honor the gate identically to the \
              periodic drain tick (evictions fired during the reconcile window)"
+        );
+    }
+
+    /// Boundary semantics (operator decision 2026-07-29, review 9fd52fc0
+    /// MAJOR-2 / pair-b T3): at EXACTLY `max_bytes` the trigger must NOT
+    /// arm — moka owes zero eviction at equality
+    /// (`weights_to_evict = weighted_size.saturating_sub(max) = 0`), so
+    /// a wedge is mathematically unobservable there, and every deployed
+    /// `max_bytes` is 1024-divisible so an idle at-cap cache reaches
+    /// equality routinely. One weigher unit over IS a genuine overshoot
+    /// and must trigger normally (the no-slack rationale).
+    ///
+    /// Mutation step: revert the strict `>` to `>=` (make the reset
+    /// branch `observed < self.max_bytes`) → the exact-cap assertions
+    /// red-fail with the bespoke "at EXACTLY max_bytes" message.
+    #[tokio::test]
+    async fn fallback_evictor_no_fire_at_exact_cap() {
+        let (map, removal_count) = wedge_map_with_entries(50).await;
+        // Phantom 50 KiB: observed = 50 KiB real + 50 KiB = exactly max.
+        map.test_inflate_wedge_observation(50 * 1024);
+        for _ in 0..5 {
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::UnderBudget,
+                "at EXACTLY max_bytes the trigger must NOT arm (strict >, operator \
+                 decision 2026-07-29): moka owes zero eviction at equality, so a wedge \
+                 is unobservable there — firing would evict from a correctly-behaving \
+                 at-cap cache and teach operators to ignore the wedge signal (got \
+                 {outcome:?})"
+            );
+        }
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "no eviction may fire at exact cap"
+        );
+        assert_eq!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed),
+            0,
+            "selfheal_total must stay 0 at exact cap (a spurious count here is the \
+             cried-wolf failure mode)"
+        );
+        assert!(
+            !map.eviction_wedge_detected.load(Ordering::Relaxed),
+            "wedge gauge must stay clear at exact cap"
+        );
+        // ONE weigher unit over is a genuine overshoot: normal trigger.
+        map.test_inflate_wedge_observation(51 * 1024);
+        assert_eq!(
+            map.test_maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::Accumulating(1),
+            "one weigher unit over max_bytes must arm the trigger (no-slack rationale)"
+        );
+        assert_eq!(
+            map.test_maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::Accumulating(2)
+        );
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+        assert_eq!(
+            outcome,
+            WedgeSelfHealOutcome::Fired {
+                evicted_count: 1,
+                evicted_bytes: 1024,
+                rounds: 1
+            },
+            "a one-weigher-unit overshoot must heal by evicting exactly one entry"
+        );
+    }
+
+    /// pair-b T1: the `NoByteBudget` guard is load-bearing. Without it,
+    /// `max_bytes == 0` makes every evaluation read strictly-over-budget
+    /// (`observed > 0`), and the third drains a COUNT-capped map — the
+    /// deployed server existence_cache shape (`prod-server.json5:237-239`,
+    /// `max_count: 50000000`, no `max_bytes`) — to EMPTY every 3 ticks,
+    /// forever.
+    ///
+    /// Mutation step: delete the `if self.max_bytes == 0` guard → the
+    /// NoByteBudget assertions red-fail (third evaluation fires and the
+    /// removal-count assertion trips).
+    #[tokio::test]
+    async fn fallback_evictor_inert_without_byte_budget() {
+        // Count-capped only: max_bytes == 0, max_count = 100.
+        let cfg = policy(0, 100);
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+        for k in 0..50u64 {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        // Even a huge phantom overage must not matter: there is no byte
+        // budget to enforce.
+        map.test_inflate_wedge_observation(10 * 1024 * 1024);
+        for _ in 0..5 {
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::NoByteBudget,
+                "a map with max_bytes == 0 has no byte budget: every evaluation must \
+                 return NoByteBudget — without this guard the heal reads any non-empty \
+                 count-capped map as infinitely over budget (got {outcome:?})"
+            );
+        }
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "NoByteBudget guard is load-bearing: without it the fallback drains a \
+             COUNT-capped map (the deployed server existence_cache shape) to EMPTY \
+             every 3 ticks"
+        );
+        assert_eq!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed),
+            0,
+            "selfheal_total must stay 0 on a byte-budget-less map"
+        );
+        assert_eq!(
+            map.len_for_test().await,
+            50,
+            "all 50 entries of the count-capped map must survive"
+        );
+    }
+
+    /// pair-b T2 + pair-a MAJOR-4: the METERED multi-round heal. Small
+    /// scan cap (11 → 10 evictions/round) + a 95 KiB phantom overage on
+    /// 50 real KiB drives the full metering machinery:
+    ///   * per-invocation round cap (2) with truncated rounds,
+    ///   * `selfheal_resume` re-arm (continuations fire WITHOUT fresh
+    ///     frozen-tick accumulation and WITHOUT re-counting the firing),
+    ///   * per-round observation re-read (target falls as real entries
+    ///     are evicted),
+    ///   * convergence stop at at-or-under budget (strict `>` there
+    ///     too).
+    ///
+    /// Mutation steps (each must red-fail):
+    ///   (a) round cap → `while rounds < 1` → invocation 1 returns
+    ///       `rounds: 1, evicted_count: 10`;
+    ///   (b) per-round `target` → `0` → rounds evict nothing;
+    ///   (c) round cap removed (`u32::MAX`) → invocation 1 heals to
+    ///       convergence in one pass (`evicted_count: 45`);
+    ///   (d) resume latch never set → the 4th evaluation is
+    ///       `Accumulating(1)` instead of `Fired`.
+    #[tokio::test]
+    async fn wedge_selfheal_metered_rounds_resume_and_convergence() {
+        let (map, removal_count) = wedge_map_with_entries(50).await;
+        // 10 evictions per round (scan-cap check breaks at the 11th
+        // scanned entry, matching EVICT_SCAN_HARD_CAP's semantics).
+        map.test_force_evict_scan_cap(11);
+        map.test_inflate_wedge_observation(95 * 1024);
+
+        for expect_ticks in 1..WEDGE_FROZEN_TICKS_TRIGGER {
+            assert_eq!(
+                map.test_maybe_selfheal_wedged_eviction().await,
+                WedgeSelfHealOutcome::Accumulating(expect_ticks)
+            );
+        }
+        // Invocation 1 (initial firing): 2 metered rounds x 10 entries,
+        // still over -> re-armed for resume.
+        let outcome = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            map.test_maybe_selfheal_wedged_eviction(),
+        )
+        .await
+        .expect("must not deadlock — metered heal invocation 1 wedged");
+        assert_eq!(
+            outcome,
+            WedgeSelfHealOutcome::Fired {
+                evicted_count: 20,
+                evicted_bytes: 20 * 1024,
+                rounds: 2
+            },
+            "metering: the initial firing must run EXACTLY \
+             WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION \
+             ({WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION}) scan-capped rounds and stop \
+             (an unmetered heal monopolizes the drain loop, starving the pin-expiry \
+             sweeps and dumping the full BlobsAvailable delta burst in one message)"
+        );
+        // Invocation 2: RESUMED immediately — no fresh frozen-tick
+        // accumulation between metered invocations.
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+        assert_eq!(
+            outcome,
+            WedgeSelfHealOutcome::Fired {
+                evicted_count: 20,
+                evicted_bytes: 20 * 1024,
+                rounds: 2
+            },
+            "resume: a metered heal that stopped at the round cap while still over \
+             budget must CONTINUE on the next evaluation (Accumulating here means the \
+             re-arm latch is lost and convergence gains 30 s of dead ticks per 2 rounds)"
+        );
+        // Invocation 3: evicts the last 5 over-budget entries, then the
+        // round-2 re-read sees 5 KiB real + 95 KiB phantom = exactly max
+        // -> at-or-under -> converged (strict `>` at the round boundary).
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+        assert_eq!(
+            outcome,
+            WedgeSelfHealOutcome::Fired {
+                evicted_count: 5,
+                evicted_bytes: 5 * 1024,
+                rounds: 1
+            },
+            "convergence: the heal must stop evicting the moment the observation is \
+             at-or-under max_bytes — not drain the map"
+        );
+        // Converged: next evaluation is a plain UnderBudget reset.
+        assert_eq!(
+            map.test_maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::UnderBudget,
+            "post-convergence the trigger must reset (observation sits exactly at max)"
+        );
+        assert!(
+            !map.eviction_wedge_detected.load(Ordering::Relaxed),
+            "wedge gauge must clear after convergence"
+        );
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            45,
+            "the full metered heal must evict exactly the 45-entry overage across \
+             invocations (5 of 50 entries survive)"
+        );
+        assert_eq!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed),
+            1,
+            "resumed continuations are the SAME logical firing: selfheal_total must \
+             count 1, not one per invocation"
+        );
+    }
+
+    /// Sensor refinement (review 9fd52fc0 red-team alt-framing 2): the
+    /// freeze sensor counts ONLY `RemovalCause::Size` evictions. On the
+    /// server targetkey store (`max_seconds: 604800`) TTL expiries
+    /// advance the coarse `evicted_items` counter continuously, so a
+    /// coarse sensor would read a dead size-evictor as "progressing"
+    /// FOREVER — the wedge permanently masked.
+    ///
+    /// Real TTL composition: `max_seconds: 1` → moka `time_to_idle(1s)`,
+    /// a real 1.3 s idle, and the drain-arm's own
+    /// `run_pending_tasks_and_drain` expiring the entries (cause
+    /// `Expired`) exactly as the production tick would.
+    ///
+    /// Mutation step: point the sensor back at
+    /// `self.evicted_items.counter` → the first evaluation returns
+    /// `ProgressObserved` (the 50 Expired events reset the freeze
+    /// counter) and red-fails the bespoke TTL-masking message.
+    #[tokio::test]
+    async fn wedge_sensor_ignores_non_size_eviction_progress() {
+        let cfg = EvictionPolicy {
+            max_bytes: WEDGE_MAX_BYTES,
+            evict_bytes: 0,
+            max_seconds: 1, // time_to_idle(1s) — the targetkey shape
+            max_count: 0,
+            pin_cap_bytes: 0,
+        };
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+        for k in 0..50u64 {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        // Real idle past the 1 s TTI so every entry is expired.
+        tokio::time::sleep(core::time::Duration::from_millis(1300)).await;
+        // The drain arm's first half (exactly what the production tick
+        // runs before the evaluation): expires all 50 entries with
+        // cause `Expired`.
+        map.run_pending_tasks_and_drain().await;
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            50,
+            "fixture: the TTI sweep must have expired all 50 entries"
+        );
+        assert_eq!(
+            map.evicted_items.counter.load(Ordering::Relaxed),
+            50,
+            "fixture: the coarse evicted_items counter must have advanced by the 50 \
+             Expired events (this is the progress a coarse sensor would wrongly credit)"
+        );
+        assert_eq!(
+            map.size_evicted_items.load(Ordering::Relaxed),
+            0,
+            "fixture: no Size eviction happened — the Size sensor must not move on \
+             Expired events"
+        );
+        // Strictly-over observation with a frozen SIZE sensor: the
+        // trigger must accumulate and fire despite the coarse counter's
+        // TTL progress.
+        map.test_inflate_wedge_observation(150 * 1024);
+        for expect_ticks in 1..WEDGE_FROZEN_TICKS_TRIGGER {
+            let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::Accumulating(expect_ticks),
+                "TTL-expiry (RemovalCause::Expired) progress must NOT reset the \
+                 size-wedge freeze counter — on the server targetkey store \
+                 (max_seconds: 604800) TTL churn would otherwise permanently mask a \
+                 dead size-evictor (got {outcome:?})"
+            );
+        }
+        let outcome = map.test_maybe_selfheal_wedged_eviction().await;
+        assert!(
+            matches!(outcome, WedgeSelfHealOutcome::Fired { .. }),
+            "the size-wedge must fire despite continuous TTL-expiry progress on the \
+             coarse counter (got {outcome:?})"
         );
     }
 }

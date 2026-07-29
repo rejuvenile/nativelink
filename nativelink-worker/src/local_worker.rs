@@ -1941,16 +1941,16 @@ fn disk_gate_decision(
     }
 }
 
-/// (FINDING 2 moka-eviction-wedge piece 3) On a disk-pressure NAK, actively
-/// kick the fast-tier `FilesystemStore`'s eviction drain arm. The disk gate's
-/// stated premise is "backstop before ENOSPC while eviction catches up" — but
-/// FINDING 2 showed eviction can be PERMANENTLY dead (moka stale-probation-
-/// front livelock, 3.3× over budget for 4 days) while this gate NAKs, so the
-/// admission-eviction-pin composite (`gate ⇒ evict`) requires the gate itself
-/// to drive the drain rather than assume it. Rate-limited inside
-/// `kick_drain` (once per `DRAIN_KICK_MIN_INTERVAL`); non-blocking, no
-/// awaits — safe inline on the NAK path. Returns whether a kick was
-/// delivered (`false` = no FilesystemStore fast tier, or rate-limited).
+/// (FINDING 2 moka-eviction-wedge piece 3) On a disk-pressure NAK, kick the
+/// fast-tier `FilesystemStore`'s eviction drain arm. Honest scope (review
+/// 9fd52fc0 MINOR-6): the `gate ⇒ evict` composite is closed by the map's
+/// PERIODIC drain arm (capacity drain + wedge self-heal every 10 s,
+/// unconditional — FINDING 2 piece 1); this kick only trims up to one tick
+/// interval (≤10 s) of latency between a NAK and the next drain pass —
+/// cheap, so kept. Rate-limited inside `kick_drain` (once per
+/// `DRAIN_KICK_MIN_INTERVAL`); non-blocking, no awaits — safe inline on
+/// the NAK path. Returns whether a kick was delivered (`false` = no
+/// FilesystemStore fast tier, or rate-limited).
 ///
 /// `#[doc(hidden)] pub` so the integration test can drive the exact
 /// production helper against a real `FilesystemStore`-backed
@@ -5989,12 +5989,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                          CAS/work_directory volume (backstop before ENOSPC while \
                                          eviction catches up)"
                                     );
-                                    // (FINDING 2 piece 3) gate ⇒ evict: actively
-                                    // kick the fast-tier eviction drain so this
-                                    // gate's "eviction catches up" premise is
-                                    // DRIVEN, not assumed — FINDING 2 showed the
-                                    // moka evictor can be permanently wedged
-                                    // while this arm NAKs. Rate-limited +
+                                    // (FINDING 2 piece 3) kick the fast-tier
+                                    // eviction drain so a NAK is followed by a
+                                    // drain pass promptly instead of up to one
+                                    // 10 s tick later. The `gate ⇒ evict`
+                                    // composite itself is closed by the map's
+                                    // periodic drain arm (piece 1); this is a
+                                    // ≤10 s latency trim. Rate-limited +
                                     // non-blocking inside `kick_drain`.
                                     kick_fs_eviction_on_disk_nak(
                                         self.blobs_available_state.as_ref(),

@@ -862,11 +862,12 @@ mod tests {
              self-heal firing. body=\n{body}"
         );
 
-        // Drive the wedge trigger (injected observation, real eviction —
-        // see moka_evicting_map.rs test-seam docs) and re-render.
-        map.test_force_wedge_observation(2 * 64 * 1024);
+        // Drive the wedge trigger (phantom stuck overage on top of the
+        // real residency, real eviction — see moka_evicting_map.rs
+        // test-seam docs) and re-render.
+        map.test_inflate_wedge_observation(2 * 64 * 1024);
         for _ in 0..3 {
-            map.maybe_selfheal_wedged_eviction().await;
+            map.test_maybe_selfheal_wedged_eviction().await;
         }
         let body = render_prometheus(&registry);
         assert!(
@@ -880,13 +881,13 @@ mod tests {
             "F2-wedge: eviction_wedge_selfheal_total must count the self-heal firing \
              (exactly one per firing). body=\n{body}"
         );
-        // overshoot_bytes reads the REAL cache (the injected observation
-        // is a trigger-only test seam): the heal evicted the resident
-        // blob, so the real overshoot is still 0.
+        // overshoot_bytes reads the REAL cache (the phantom overage is a
+        // cfg-gated trigger seam): the heal evicted the resident blob,
+        // so the real overshoot is still 0.
         assert!(
             body.contains("\nmemstore_overshoot_bytes 0\n"),
             "F2-wedge: overshoot_bytes must read the REAL weighted size (0 after the \
-             heal evicted the resident blob), not the injected test observation. \
+             heal evicted the resident blob), not the test seam's phantom overage. \
              body=\n{body}"
         );
     }

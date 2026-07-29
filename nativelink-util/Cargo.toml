@@ -50,7 +50,15 @@ hyper = { version = "1.6.0", default-features = false }
 hyper-util = { version = "0.1.11", default-features = false }
 dashmap = { version = "6", default-features = false }
 libc = { version = "0.2.177", default-features = false }
-moka = { version = "0.12", features = ["sync"], default-features = false }
+# PINNED =0.12.15 (FINDING 2, review 9fd52fc0 red-team framing 3): the
+# eviction-wedge self-heal in moka_evicting_map.rs depends on VERIFIED
+# 0.12.15 internals (evict_lru_entries livelock shape; iter()/invalidate
+# deque-independence; do_run_pending_tasks apply-writes-before-evict
+# ordering + no-progress break). A silent `cargo update` to a different
+# 0.12.x must not move off the audited version — re-verify those
+# internals before bumping. Upstream livelock report + un-pin is a filed
+# follow-up (deferred_tasks.md, FINDING 2 prevention 4).
+moka = { version = "=0.12.15", features = ["sync"], default-features = false }
 mock_instant = { version = "0.5.3", default-features = false }
 opentelemetry = { version = "0.32.0", default-features = false }
 opentelemetry-appender-tracing = { version = "0.32.0", default-features = false }

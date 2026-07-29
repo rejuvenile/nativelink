@@ -155,8 +155,10 @@ failpoints = ["dep:fail", "fail/failpoints", "nativelink-util/failpoints"]
 # Test-only hooks (e.g. `set_mirror_blobs_max_bytes_for_test`). Must be
 # enabled by integration tests under `[dev-dependencies]`. Production
 # builds MUST NOT enable this feature — these hooks bypass safety
-# invariants for testing convenience.
-test-utils = []
+# invariants for testing convenience. Forwards to nativelink-util's
+# test-utils so the FilesystemStore wedge-selfheal test passthroughs
+# (FINDING 2) reach the cfg-gated map seams.
+test-utils = ["nativelink-util/test-utils"]
 # Phase 1 SKELETON for #212 (chunked-streaming architecture). Gates the
 # `chunked` module — no production data path consumes it yet, so the
 # default build is byte-identical to before this flag existed. Phase 2
