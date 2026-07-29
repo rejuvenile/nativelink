@@ -202,6 +202,10 @@ async fn build_ac_filesystem_store(
         }),
         block_size: 4096,
         max_concurrent_writes: 0,
+        // Serde default (600 s, always-on). The AC micro-bench never runs
+        // chunked writes, so the reaper finds an empty partials map; any
+        // nonzero TTL is behavior-identical here.
+        chunked_idle_partial_reap_ttl_s: 600,
         // CLAUDE.md HARD-RULE: NO fsync / fdatasync / sync_file_range /
         // msync / O_SYNC / O_DSYNC anywhere in the codebase, including
         // bench. Production runs ZFS tank with sync=disabled; durability
