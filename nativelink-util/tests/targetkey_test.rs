@@ -342,3 +342,131 @@ async fn targetkey_from_carrier_rejects_mismatched_key() -> Result<(), Error> {
     );
     Ok(())
 }
+
+// ---- FL-1383 T29/T30: the `.incrkey_*` carrier on link actions ---------------------------------
+//
+// A `RustcLink` action's declared outputs used to contain nothing config-dependent: the only
+// non-`-incr` entry was the bare binary, and `--experimental_output_paths=strip` has already
+// collapsed `bazel-out/<config>` to `bazel-out/cfg` by the time `Command.output_paths` reaches this
+// crate. Every configuration of a rust_binary therefore derived ONE key and they took turns
+// evicting each other's incremental session (the `targetkey_discriminates_build_config` property
+// above is only reachable on UNSTRIPPED paths, which the FL fleet does not have).
+//
+// rules_rust now declares an extra output per link action — `.incrkey_<name>_<config_hash>`, named
+// with the same `config_salt` that already names a `.rlib`. `derive` is UNCHANGED: `.` is 0x2E,
+// below every ASCII alphanumeric, so the existing bytewise min picks it up. That is what lets the
+// worker's `verify_against_command_outputs` agree with the client's carrier by construction —
+// a disagreement there is `Code::Internal`, a hard build failure, not a cold build — so no repo had
+// to deploy before any other.
+
+/// The full `RustcLink` declared-output set as rules_rust emits it post-T29.
+const KAT_LINK_OUTPUTS: &[&str] = &[
+    "bazel-out/cfg/bin/pkg/.incrkey_foo_1272650966",
+    "bazel-out/cfg/bin/pkg/foo",
+    "bazel-out/cfg/bin/pkg/foo-incr",
+    "bazel-out/cfg/bin/pkg/foo-incr-reuse",
+    "bazel-out/cfg/bin/pkg/foo-incr-unused-inputs.txt",
+];
+/// `blake3("bazel-out/cfg/bin/pkg/.incrkey_foo_1272650966")`. BYTE-IDENTICAL to the vectors in
+/// `incr_seed_index/src/targetkey.rs` and `RemoteIncrTargetKeyTest.java`. If these drift, fleet
+/// builds go silently cold — never update one side alone.
+const KAT_LINK_KEY: &str = "1e5379848f6b0f40dda6b5d526aa6ef8271b356689f197c8820ace3e9cfe2235";
+/// `blake3("bazel-out/cfg/bin/pkg/foo")` — the WRONG key, the one the pre-T29 output set produced
+/// for EVERY configuration of this target. The negative assertion forbids it.
+const KAT_LINK_BARE_BINARY_KEY: &str =
+    "012d3c3628532dbb41098522a4d5214ab9a2d657c3039e80264acb4650a1c090";
+/// The same target, one configuration over: only the `config_salt` component of
+/// `determine_output_hash` differs, and it is the ONLY byte-level difference in the whole set.
+const KAT_LINK_PRIMARY_DBG: &str = "bazel-out/cfg/bin/pkg/.incrkey_foo_3122765277";
+const KAT_LINK_KEY_DBG: &str = "a75c1bd9abbd0eaf7a58cc46cbc34f4551121f27fa353f550f0d0451c0d758b1";
+
+#[nativelink_test]
+async fn targetkey_kat_rustclink_selects_the_incrkey_carrier() -> Result<(), Error> {
+    let outputs: Vec<String> = KAT_LINK_OUTPUTS.iter().map(|s| (*s).to_string()).collect();
+    let tk = TargetKey::derive(&outputs).expect("a link action must derive a targetkey");
+    assert_eq!(
+        tk.primary_output(),
+        "bazel-out/cfg/bin/pkg/.incrkey_foo_1272650966",
+        "primary must be the config-bearing carrier, not the config-blind bare binary"
+    );
+    assert_eq!(tk.key(), KAT_LINK_KEY);
+    assert_ne!(
+        tk.key(),
+        KAT_LINK_BARE_BINARY_KEY,
+        "must NOT be blake3(the bare binary) — that is the pre-T29 config-blind key"
+    );
+
+    // The same set one configuration over resolves to a DIFFERENT pinned key. Pinning both, rather
+    // than only asserting inequality, is what makes cross-repo drift show up as a golden-vector
+    // failure instead of as a silently cold fleet.
+    let dbg_outputs: Vec<String> = KAT_LINK_OUTPUTS
+        .iter()
+        .map(|s| {
+            if s.contains(".incrkey_") {
+                KAT_LINK_PRIMARY_DBG.to_string()
+            } else {
+                (*s).to_string()
+            }
+        })
+        .collect();
+    let dbg = TargetKey::derive(&dbg_outputs).expect("a link action must derive a targetkey");
+    assert_eq!(dbg.primary_output(), KAT_LINK_PRIMARY_DBG);
+    assert_eq!(dbg.key(), KAT_LINK_KEY_DBG);
+    assert_ne!(
+        tk.key(),
+        dbg.key(),
+        "two configurations of one rust_binary must not share a <FIXED_PREFIX>/<targetkey> slot"
+    );
+    Ok(())
+}
+
+/// ★ THE SORT IS THE WHOLE MECHANISM, SO ASSERT IT DIRECTLY. T29 relies on `.` (0x2E) sorting below
+/// every ASCII alphanumeric (`0` is 0x30, `A` 0x41, `a` 0x61) — implicit magic a reviewer is right
+/// to push on. This pins it against the real sibling family a rules_rust link action can declare on
+/// any target OS, independently of the observed hashes.
+///
+/// Second property: the carrier must SURVIVE the `-incr` exclusion. If it tripped it, the carrier
+/// would be dropped before the min and the key would fall straight back to the bare binary — the
+/// original bug, with every implementation still agreeing and every test still green. rules_rust's
+/// `_incrkey_marker_basename` makes that unreachable by emitting a basename containing no `-`.
+#[nativelink_test]
+async fn targetkey_incrkey_carrier_wins_the_bytewise_min() -> Result<(), Error> {
+    let dir = "bazel-out/cfg/bin/pkg/";
+    let carrier = format!("{dir}.incrkey_mybin_1272650966");
+    for sibling in [
+        "mybin",            // unix binary
+        "mybin.exe",        // windows binary
+        "mybin.pdb",        // msvc debug info
+        "mybin.dSYM",       // darwin debug info
+        "mybin.dll.lib",    // windows cdylib import library
+        "mybin.rustc-output",
+        "0mybin",           // adversarial: `0` (0x30) is the lowest alnum byte
+        "Mybin",            // adversarial: `A`-range
+    ] {
+        let sibling = format!("{dir}{sibling}");
+        assert!(
+            carrier < sibling,
+            "the carrier must sort BEFORE {sibling}, else the unchanged min rule keeps selecting \
+             the config-blind output and the fix is silently inert"
+        );
+        let tk = TargetKey::derive(&paths(&[&sibling, &carrier])).expect("must derive");
+        assert_eq!(tk.primary_output(), carrier, "min over {{carrier, {sibling}}}");
+    }
+
+    // The `-incr` exclusion must not eat the carrier. The hyphenated shape rejected during design
+    // (for a rust_binary whose name begins `incr`) is the control that proves the filter is live.
+    let hyphenated = format!("{dir}.incrkey-incremental-1272650966");
+    let actual = format!("{dir}.incrkey_incremental_1272650966");
+    assert!(
+        TargetKey::derive(&paths(&[&hyphenated])).is_none(),
+        "premise: the hyphenated shape WOULD be excluded as an -incr artifact"
+    );
+    let tk = TargetKey::derive(&paths(&[
+        &actual,
+        &format!("{dir}incremental"),
+        &format!("{dir}incremental-incr"),
+    ]))
+    .expect("must derive");
+    assert_eq!(tk.primary_output(), actual);
+    Ok(())
+}
