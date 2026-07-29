@@ -68,15 +68,11 @@ nativelink-redis-tester = { path = "../nativelink-redis-tester" }
 # cooldown-expiry self-wake test drives the NAK stamps AND the wake timer on one
 # paused clock (deterministic, zero wall wait). Test-only — dev-dep features do
 # not reach the shipped binary. Mirrors nativelink-util's dev tokio declaration.
+# (#calib T2 also relies on `test-util` for start_paused cadence tests.)
 tokio = { version = "1.52.2", features = [
   "macros",
   "test-util",
 ], default-features = false }
-
-# (#calib T2) `test-util` enables `start_paused` so the hold-counters cadence
-# wiring test can advance the 15 s interval deterministically (no
-# sleep-as-synchronization). Mirrors nativelink-util's dev-dep line.
-tokio = { version = "1.52.2", features = ["macros", "test-util"], default-features = false }
 
 pretty_assertions = { version = "1.4.1", features = [
   "std",
