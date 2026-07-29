@@ -2612,7 +2612,7 @@ impl WorkerConnection {
                         warn!(
                             worker_id=?self.worker_id,
                             ?nak_err,
-                            "Failed to record worker pressure NAK"
+                            "failed to record worker pressure NAK"
                         );
                     }
                 }

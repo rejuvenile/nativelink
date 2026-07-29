@@ -1443,6 +1443,136 @@ async fn fail_open_stays_queued_when_healthy_candidate_capacity_excluded_e2e_tes
     Ok(())
 }
 
+/// (FINDING 3 fix-up, pair-a F1 — cooldown-expiry self-wake, production
+/// composition) The match loop waits solely on notifies (`do_try_match`
+/// returning Ok on a no-match cycle never arms the 100 ms retry), and
+/// `record_worker_pressure_nak` deliberately does not notify (the pool only
+/// shrinks). So when the cooldown ALONE empties the fail-open pool, the
+/// scheduler itself must arm a one-shot delayed wake for the earliest cooldown
+/// expiry — otherwise a quiescent true-case-3a fleet (every capable worker
+/// pressure-gated, e.g. overnight fleet-wide disk pressure) leaves the queued
+/// action sleeping until an UNRELATED scheduler event arrives (red-team
+/// pre-mortem: one queued job sleeps 4 h until the next push).
+///
+/// NOTHING else notifies here: no pressure clear, no completion, no new
+/// action after the queued one — the ONLY path to Executing is the armed
+/// wake. Runs on the REAL clock with a 1 s cooldown and a 10 s hang-guard
+/// deadline (10× margin; the wake fires at cooldown expiry): the paused-clock
+/// deterministic direction is covered by the bare-scheduler lib sibling
+/// `fail_open_cooldown_expiry_wake_notifies_matcher` (the full
+/// `new_with_callback` machinery inhibits tokio auto-advance, so this
+/// composition test uses real time).
+///
+/// Mutation step (CLAUDE.md TDD #5): comment out the `background_spawn!` wake
+/// arm in `inner_find_worker_for_action`'s all-in-cooldown branch — the action
+/// stays Queued forever and this test red-fails with the bespoke expiry-wake
+/// message below.
+#[nativelink_test]
+async fn fail_open_cooldown_expiry_self_wakes_and_places_e2e_test() -> Result<(), Error> {
+    let worker_id_1 = WorkerId("cooldown_worker_1".to_string());
+    let worker_id_2 = WorkerId("cooldown_worker_2".to_string());
+
+    // 1 s cooldown (vs the 10 s default) keeps the real-clock wait short; the
+    // contract under test is the SELF-wake, not the window length (the window
+    // length is pinned by the lib cooldown tests + the config default fn).
+    let spec = SimpleSpec {
+        pressure_nak_cooldown_s: 1,
+        ..SimpleSpec::default()
+    };
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(0, &task_change_notify.clone(), MockInstantWrapped::default),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    let mut rx_from_worker_1 =
+        setup_new_worker(&scheduler, worker_id_1.clone(), PlatformProperties::default()).await?;
+    let mut rx_from_worker_2 =
+        setup_new_worker(&scheduler, worker_id_2.clone(), PlatformProperties::default()).await?;
+
+    // True case 3a: BOTH workers disk-pressured (no healthy candidate, no
+    // capacity exclusion) AND both freshly pressure-NAK'd, so the fail-open
+    // pool is emptied by the cooldown alone.
+    scheduler
+        .update_worker_disk_pressure(&worker_id_1, true, 1 << 30)
+        .await?;
+    scheduler
+        .update_worker_disk_pressure(&worker_id_2, true, 4 * (1 << 30))
+        .await?;
+    scheduler.record_worker_pressure_nak(&worker_id_1).await?;
+    scheduler.record_worker_pressure_nak(&worker_id_2).await?;
+    tokio::task::yield_now().await;
+
+    let action_digest = DigestInfo::new([83u8; 32], 512);
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), make_system_time(19)).await?;
+
+    {
+        let (action_state, _maybe_origin_metadata) = action_listener
+            .changed()
+            .await
+            .expect("action listener closed before first state");
+        assert_eq!(
+            action_state.stage,
+            ActionStage::Queued,
+            "precondition: with every fail-open candidate in pressure-NAK \
+             cooldown the action must initially stay Queued"
+        );
+    }
+
+    // NO other event from here on. The ONLY thing that can place the action
+    // is the scheduler's own cooldown-expiry wake (fires at ~1 s; 10 s
+    // deadline = 10x margin, hang-guard only — the assertion is the event).
+    let executing = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (action_state, _maybe_origin_metadata) = action_listener
+                .changed()
+                .await
+                .expect("action listener closed while waiting for expiry-wake dispatch");
+            if action_state.stage == ActionStage::Executing {
+                return;
+            }
+        }
+    })
+    .await;
+    executing.expect(
+        "cooldown-expiry wake violated (pair-a F1): every fail-open candidate \
+         was in pressure-NAK cooldown and NO other scheduler event occurred — \
+         the matcher must self-wake at the earliest cooldown expiry and place \
+         the action, else a quiescent fleet-wide pressure state wedges the \
+         queued action until an unrelated event",
+    );
+
+    // The wake led to a REAL placement: one of the two workers received the
+    // StartAction.
+    let mut saw_start = false;
+    'outer: for _ in 0..4 {
+        for rx in [&mut rx_from_worker_1, &mut rx_from_worker_2] {
+            while let Ok(msg) = rx.try_recv() {
+                if let Some(update_for_worker::Update::StartAction(_)) = msg.update {
+                    saw_start = true;
+                    break 'outer;
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        saw_start,
+        "cooldown-expiry wake (pair-a F1): the post-expiry fail-open placement \
+         must deliver a StartAction to one of the pressure-gated workers"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn set_drain_worker_pauses_and_resumes_worker_test() -> Result<(), Error> {
     let worker_id = WorkerId("worker_id".to_string());

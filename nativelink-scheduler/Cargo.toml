@@ -64,6 +64,14 @@ wincode = { version = "0.5.4", default-features = false, features = [
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
 nativelink-redis-tester = { path = "../nativelink-redis-tester" }
+# (FINDING 3 fix-up, pair-a F1) `test-util` enables `tokio::time::pause` so the
+# cooldown-expiry self-wake test drives the NAK stamps AND the wake timer on one
+# paused clock (deterministic, zero wall wait). Test-only — dev-dep features do
+# not reach the shipped binary. Mirrors nativelink-util's dev tokio declaration.
+tokio = { version = "1.52.2", features = [
+  "macros",
+  "test-util",
+], default-features = false }
 
 pretty_assertions = { version = "1.4.1", features = [
   "std",

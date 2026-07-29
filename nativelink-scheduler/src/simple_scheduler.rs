@@ -3523,11 +3523,15 @@ impl WorkerScheduler for SimpleScheduler {
     }
 
     async fn record_worker_pressure_nak(&self, worker_id: &WorkerId) -> Result<(), Error> {
-        // (#37/F4 fail-open damper, FINDING 3) Forward to the worker pool —
-        // the default trait impl is a no-op, so omitting this delegation would
-        // silently disarm the fail-open cooldown in production (the
-        // WorkerApiServer holds the SimpleScheduler, not the inner
-        // ApiWorkerScheduler).
+        // (#37/F4 fail-open damper, FINDING 3; wording corrected per pair-a
+        // F4) Forward to the worker pool. DEFENSE-IN-DEPTH + test path, NOT
+        // the production dispatch path: `new_with_callback` returns the inner
+        // `ApiWorkerScheduler` Arc as the `Arc<dyn WorkerScheduler>` handed to
+        // `worker_schedulers`, so the production WorkerApiServer dispatches
+        // DIRECTLY to `ApiWorkerScheduler::record_worker_pressure_nak`. This
+        // delegation covers any holder of SimpleScheduler-as-WorkerScheduler
+        // (the e2e tests, future compositions); without it such a holder would
+        // silently hit the trait's no-op default.
         self.worker_scheduler
             .record_worker_pressure_nak(worker_id)
             .await

@@ -16,7 +16,7 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -63,6 +63,7 @@ use parking_lot::Mutex as ParkingMutex;
 use prost::Message;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::time::Instant as TokioInstant;
 use tonic::async_trait;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -2197,13 +2198,32 @@ struct ApiWorkerSchedulerImpl {
     /// no constructor call site changes.
     pressure_nak_cooldown_s: u32,
     /// (#37/F4 fail-open trigger fix, FINDING 3) Rate-limit state for the
-    /// fail-open-SUPPRESSED info log (healthy capacity-excluded candidate
-    /// exists → stay queued): wall-clock instant of the last emitted line.
-    /// Read+written only under the worker write lock (dispatch is serialized on
-    /// it), so a plain field is race-free (mirrors `last_decision_trace_at`).
-    /// `None` until the first suppression, then throttles to at most one line
-    /// per `FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL`.
-    last_failopen_suppressed_log_at: Option<Instant>,
+    /// fail-open-SUPPRESSED-by-capacity info log (healthy capacity-excluded
+    /// candidate exists → stay queued): wall-clock instant of the last emitted
+    /// line. Read+written only under the worker write lock (dispatch is
+    /// serialized on it), so a plain field is race-free (mirrors
+    /// `last_decision_trace_at`). `None` until the first suppression, then
+    /// throttles to at most one line per `FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL`.
+    /// SEPARATE from the cooldown-suppressed throttle below (pair-a F6 /
+    /// pair-b C8): the two states can alternate within one interval, and a
+    /// shared stamp would hide one class entirely.
+    last_failopen_capacity_suppressed_log_at: Option<Instant>,
+    /// (FINDING 3, pair-a F1/F6) Rate-limit state for the
+    /// all-candidates-in-cooldown info log. Same locking story as its
+    /// capacity sibling above.
+    last_failopen_cooldown_suppressed_log_at: Option<Instant>,
+    /// (FINDING 3 fix-up, pair-a F1 — cooldown-expiry self-wake) Whether a
+    /// one-shot delayed `worker_change_notify` wake is currently outstanding
+    /// for a cooldown-emptied fail-open pool. The match loop waits solely on
+    /// notifies (a no-match cycle is `Ok`, so the 100 ms retry never arms) and
+    /// `record_worker_pressure_nak` deliberately does not notify — so when the
+    /// cooldown alone empties the pool, the scheduler must wake ITSELF at the
+    /// earliest stamp expiry or a quiescent fully-pressure-gated fleet leaves
+    /// the queued action sleeping until an unrelated event. CAS-armed; the
+    /// spawned timer disarms (Release) BEFORE notifying so the woken cycle can
+    /// re-arm if a re-NAK re-emptied the pool. `Arc` so the timer task holds
+    /// it without `self`.
+    failopen_wake_armed: Arc<AtomicBool>,
     /// (#sched-cpu-first §7) Winner-RANKING policy. `CacheAffinityFirst` (default)
     /// is byte-identical to the pre-`#sched-cpu-first` matcher; `CpuIdleFirst`
     /// swaps ONLY the winner-selection (eligibility unchanged) for P-core-idle-
@@ -2831,8 +2851,15 @@ impl ApiWorkerSchedulerImpl {
             if !w.can_accept_work() {
                 // (FINDING 3) A healthy (non-pressured) worker rejected for
                 // capacity — its slot frees up shortly, so it suppresses the
-                // fleet fail-open below.
-                if !w.swap_pressured && !w.disk_pressured {
+                // fleet fail-open below. DRAINING workers do NOT count
+                // (pair-a F2 / pair-b C1, convergent): a drain ends when the
+                // operator removes the worker, not when a slot frees — an
+                // unbounded horizon, the same class as quarantine (counted in
+                // neither tally). `is_paused` and the inflight cap DO count:
+                // both are bounded by in-flight completion (`complete_action`
+                // clears the pause; the pre-pass un-pauses capacity-paused
+                // workers).
+                if !w.is_draining && !w.swap_pressured && !w.disk_pressured {
                     capacity_excluded_healthy.set(capacity_excluded_healthy.get() + 1);
                 }
                 if full_worker_logging {
@@ -3070,6 +3097,11 @@ impl ApiWorkerSchedulerImpl {
             // `AcceptFailOpen` escape stays reachable.
             let cooldown = Duration::from_secs(u64::from(self.pressure_nak_cooldown_s));
             let cooldown_suppressed = Cell::new(0u32);
+            // (pair-a F1) Minimum remaining cooldown among suppressed
+            // candidates — the deadline for the self-wake below. Tokio clock
+            // (same domain as the stamps AND the wake timer).
+            let min_remaining = Cell::new(Duration::MAX);
+            let now = TokioInstant::now();
             let pool_admits = |pair: &(&WorkerId, &Worker)| -> bool {
                 let w = pair.1;
                 if !(w.swap_pressured || w.disk_pressured) {
@@ -3078,12 +3110,15 @@ impl ApiWorkerSchedulerImpl {
                 if !worker_matches_ignoring_pressure(pair) {
                     return false;
                 }
-                if !cooldown.is_zero()
-                    && w.last_pressure_nak
-                        .is_some_and(|nak_at| nak_at.elapsed() < cooldown)
-                {
-                    cooldown_suppressed.set(cooldown_suppressed.get() + 1);
-                    return false;
+                if !cooldown.is_zero() {
+                    if let Some(nak_at) = w.last_pressure_nak {
+                        let elapsed = now.saturating_duration_since(nak_at);
+                        if elapsed < cooldown {
+                            cooldown_suppressed.set(cooldown_suppressed.get() + 1);
+                            min_remaining.set(min_remaining.get().min(cooldown - elapsed));
+                            return false;
+                        }
+                    }
                 }
                 true
             };
@@ -3125,23 +3160,53 @@ impl ApiWorkerSchedulerImpl {
                      (#37 / F4 §5 case 3a; FINDING 3 trigger-checked)"
                 );
             } else if cooldown_suppressed.get() > 0 {
-                // Pool emptied by the cooldown alone → stay queued for the
-                // remainder of the window (the loop is damped, not rotated).
-                // Rate-limited INFO (release compiles out debug).
-                let now = Instant::now();
+                // (pair-a F1) Pool emptied by the cooldown ALONE → the
+                // scheduler must wake ITSELF: the match loop waits solely on
+                // notifies (a no-match cycle is Ok, so the 100 ms retry never
+                // arms), `record_worker_pressure_nak` deliberately does not
+                // notify, and keepalives do not notify — so with no unrelated
+                // scheduler event, the queued action would sleep past every
+                // cooldown expiry (red-team pre-mortem: quiescent fleet-wide
+                // disk pressure overnight). Arm ONE outstanding one-shot timer
+                // for the earliest remaining cooldown; it disarms (Release)
+                // BEFORE notifying so the woken cycle can re-arm if a re-NAK
+                // re-emptied the pool. Never rate-limited (the wake is the
+                // liveness mechanism; only the LOG below is throttled).
+                let wake_after = min_remaining.get().min(cooldown);
                 if self
-                    .last_failopen_suppressed_log_at
-                    .is_none_or(|at| now.duration_since(at) >= FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL)
+                    .failopen_wake_armed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
                 {
-                    self.last_failopen_suppressed_log_at = Some(now);
+                    let armed = Arc::clone(&self.failopen_wake_armed);
+                    let notify = Arc::clone(&self.worker_change_notify);
+                    background_spawn!("failopen_cooldown_expiry_wake", async move {
+                        tokio::time::sleep(wake_after).await;
+                        armed.store(false, Ordering::Release);
+                        notify.notify_one();
+                    });
+                }
+                // Rate-limited INFO (release compiles out debug). Separate
+                // throttle stamp from the capacity-suppressed class (pair-a
+                // F6 / pair-b C8).
+                let log_now = Instant::now();
+                if self
+                    .last_failopen_cooldown_suppressed_log_at
+                    .is_none_or(|at| {
+                        log_now.duration_since(at) >= FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL
+                    })
+                {
+                    self.last_failopen_cooldown_suppressed_log_at = Some(log_now);
                     info!(
                         pressure_gated = pressure_gated.get(),
                         nak_cooldown_suppressed = cooldown_suppressed.get(),
                         candidates = candidates.len(),
                         cooldown_s = self.pressure_nak_cooldown_s,
+                        wake_in_ms = u64::try_from(wake_after.as_millis()).unwrap_or(u64::MAX),
                         "fleet fail-open suppressed: every fail-open candidate is \
-                         in pressure-NAK cooldown — staying queued for the \
-                         remainder of the window (FINDING 3 damper; rate-limited)"
+                         in pressure-NAK cooldown — staying queued with a one-shot \
+                         matcher wake armed for the earliest cooldown expiry \
+                         (FINDING 3 damper / pair-a F1; rate-limited)"
                     );
                 }
             }
@@ -3157,10 +3222,10 @@ impl ApiWorkerSchedulerImpl {
             // trigger decision instead of inferring from silence.
             let now = Instant::now();
             if self
-                .last_failopen_suppressed_log_at
+                .last_failopen_capacity_suppressed_log_at
                 .is_none_or(|at| now.duration_since(at) >= FAILOPEN_SUPPRESSED_LOG_MIN_INTERVAL)
             {
-                self.last_failopen_suppressed_log_at = Some(now);
+                self.last_failopen_capacity_suppressed_log_at = Some(now);
                 info!(
                     capacity_excluded_healthy = capacity_excluded_healthy.get(),
                     pressure_gated = pressure_gated.get(),
@@ -6175,7 +6240,10 @@ impl ApiWorkerScheduler {
                 // changes. Suppressed-log rate-limit state starts empty.
                 pressure_nak_cooldown_s:
                     nativelink_config::schedulers::default_pressure_nak_cooldown_s(),
-                last_failopen_suppressed_log_at: None,
+                last_failopen_capacity_suppressed_log_at: None,
+                last_failopen_cooldown_suppressed_log_at: None,
+                // (pair-a F1) No cooldown-expiry wake outstanding at start.
+                failopen_wake_armed: Arc::new(AtomicBool::new(false)),
                 // (#sched-cpu-first §7) Placement mode defaults to the byte-
                 // identical CacheAffinityFirst; the production wiring
                 // (`SimpleScheduler::new`) injects the configured mode +
@@ -7907,7 +7975,7 @@ impl ApiWorkerScheduler {
     pub async fn worker_last_pressure_nak_for_test(
         &self,
         worker_id: &WorkerId,
-    ) -> Option<Option<Instant>> {
+    ) -> Option<Option<TokioInstant>> {
         let inner = self.inner.read().await;
         inner.workers.0.peek(worker_id).map(|w| w.last_pressure_nak)
     }
@@ -11732,7 +11800,9 @@ impl WorkerScheduler for ApiWorkerScheduler {
             %worker_id,
             "worker pressure NAK observed; fail-open cooldown armed (#37/F4 damper)"
         );
-        worker.last_pressure_nak = Some(Instant::now());
+        // Tokio clock — same domain as the fail-open's cooldown check and its
+        // expiry-wake timer (see `Worker::last_pressure_nak` doc).
+        worker.last_pressure_nak = Some(TokioInstant::now());
         Ok(())
     }
 
@@ -20049,6 +20119,38 @@ mod b1_lock_decouple_tests {
         rx
     }
 
+    /// (FINDING 3 fix-up, pair-b T1) `pool=swap` capability PLUS a `memory_kb`
+    /// Minimum property — the CONFIRMED incident data shape (`is_satisfied_by`
+    /// memory_kb reservation shortfalls excluded all 8 healthy workers), so
+    /// the `is_satisfied_by` tally branch is exercised by the production
+    /// excluder, not only the `max_inflight` sibling.
+    fn props_pool_mem(mem_kb: f64) -> PlatformProperties {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "pool".to_string(),
+            PlatformPropertyValue::Exact("swap".to_string()),
+        );
+        properties.insert(
+            "memory_kb".to_string(),
+            PlatformPropertyValue::Minimum(mem_kb),
+        );
+        PlatformProperties { properties }
+    }
+
+    /// (FINDING 3 fix-up, pair-b T1) Pool worker carrying a `memory_kb`
+    /// Minimum budget (decremented by `reduce_platform_properties` as actions
+    /// reserve, restored on completion — the production reservation ledger).
+    async fn add_worker_in_pool_mem(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        name: &str,
+        mem_kb: f64,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new(WorkerId(name.to_string()), props_pool_mem(mem_kb), tx, 42, 0);
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
     /// (FINDING 3) `ActionInfoWithProps` whose platform properties are the
     /// shared `pool=swap` capability, so it matches every `add_worker_in_pool*`
     /// worker (mirrors `make_action_info_with_props` for the named-props tests).
@@ -20073,6 +20175,15 @@ mod b1_lock_decouple_tests {
             origin_metadata: Default::default(),
             scheduler_start_execute_event_id: None,
         }
+    }
+
+    /// (FINDING 3 fix-up, pair-b T1) Like `make_action_info_in_pool` but the
+    /// action ALSO demands a `memory_kb` Minimum reservation (the incident's
+    /// production excluder shape).
+    fn make_action_info_in_pool_mem(seed: u8, mem_kb: f64) -> ActionInfoWithProps {
+        let mut info = make_action_info_in_pool(seed);
+        info.platform_properties = props_pool_mem(mem_kb);
+        info
     }
 
     /// (#37) COMPOSITE regression test (design §5). Composes the scheduler
@@ -20403,6 +20514,301 @@ mod b1_lock_decouple_tests {
             WorkerId("WB".to_string()),
             "with the damper disabled the least-pressured worker (WB @ 10k \
              churn) must win the fail-open again"
+        );
+    }
+
+    /// (FINDING 3 fix-up, pair-a F2 + pair-b C1 — CONVERGENT) A DRAINING
+    /// healthy candidate must NOT suppress the case-3a fail-open: draining is
+    /// an operator-scoped state with no bounded horizon (it ends when the
+    /// operator removes the worker, not when a slot frees), the same class as
+    /// quarantine — which the tally deliberately counts in NEITHER bucket.
+    /// Mixed state {one draining healthy worker + all others pressure-gated}
+    /// must still place on the least-pressured gated worker, not wedge for the
+    /// whole drain.
+    ///
+    /// Falsification mutation (TDD #5): remove the `!w.is_draining` guard from
+    /// the `!can_accept_work()` healthy tally — the draining worker counts as
+    /// a healthy waiter, the fail-open is suppressed, and this test red-fails
+    /// with the bespoke draining message below.
+    #[nativelink_test]
+    async fn fail_open_fires_when_healthy_candidate_is_draining() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool(&scheduler, "WC").await;
+
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WB".to_string()), true, 10_000)
+            .await
+            .expect("mark WB pressured");
+        // WC healthy but DRAINING (routine operator action: rolling deploy /
+        // fleet drain) — unbounded horizon, must not count as a healthy waiter.
+        scheduler
+            .set_drain_worker(&WorkerId("WC".to_string()), true)
+            .await
+            .expect("drain WC");
+
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang")
+        .expect(
+            "draining-candidate suppression (pair-a F2 / pair-b C1): a DRAINING \
+             healthy candidate has no bounded horizon and must NOT suppress the \
+             case-3a fail-open — the matcher returned None, wedging the \
+             capability class for the whole drain",
+        );
+        assert_eq!(
+            chosen,
+            WorkerId("WB".to_string()),
+            "with the draining worker ignored, the fail-open must place on the \
+             least-pressured gated worker (WB @ 10k churn)"
+        );
+    }
+
+    /// (FINDING 3 fix-up, pair-b T1 — the CONFIRMED incident excluder shape)
+    /// The healthy candidate is excluded by an `is_satisfied_by` `memory_kb`
+    /// Minimum RESERVATION shortfall (the exact production mechanism that
+    /// excluded all 8 healthy workers in the incident: reservations decrement
+    /// the worker's Minimum budget in place and are restored on completion) —
+    /// NOT by an inflight cap. The fail-open must stay suppressed (action
+    /// queued): the reservation unwinds within seconds when an in-flight
+    /// action completes.
+    ///
+    /// Falsification mutation (TDD #5, pair-b probe M6): remove the
+    /// `capacity_excluded_healthy` increment in the `is_satisfied_by` branch of
+    /// `worker_matches` — the memory-reserved healthy worker is no longer
+    /// tallied, the fail-open fires onto a pressure-gated worker, and this
+    /// test red-fails with the bespoke incident-shape message below. (Pair-b
+    /// proved this branch was previously UNCOVERED: removing the increment
+    /// redded nothing.)
+    #[nativelink_test]
+    async fn fail_open_stays_queued_when_healthy_candidate_memory_reserved() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        // All three workers carry a memory_kb Minimum budget; WA/WB are
+        // pressure-gated, WC is healthy with a 6 GB budget.
+        let _rx_a = add_worker_in_pool_mem(&scheduler, "WA", 8_000_000.0).await;
+        let _rx_b = add_worker_in_pool_mem(&scheduler, "WB", 8_000_000.0).await;
+        let _rx_c = add_worker_in_pool_mem(&scheduler, "WC", 6_000_000.0).await;
+
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_disk_pressure(&WorkerId("WB".to_string()), true, 1 << 30)
+            .await
+            .expect("mark WB disk-pressured");
+
+        // Reserve a 4 GB action on WC through the REAL reservation path:
+        // `reduce_platform_properties` decrements WC's memory_kb budget to
+        // 2 GB in place.
+        let op = OperationId::default();
+        let action = make_action_info_in_pool_mem(0xd1, 4_000_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_pool_mem(4_000_000.0), &op, &action, false)
+            .await
+            .expect("the healthy worker WC must take the first 4 GB action");
+        assert_eq!(
+            reserved,
+            WorkerId("WC".to_string()),
+            "precondition: the first action must reserve the only healthy worker"
+        );
+
+        // Second 4 GB action: WC now fails `is_satisfied_by` (2 GB remaining
+        // < 4 GB required) — the CONFIRMED incident excluder. The fail-open
+        // must NOT fire.
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool_mem(4_000_000.0), false),
+        )
+        .await
+        .expect("matcher must not hang");
+        assert!(
+            chosen.is_none(),
+            "trigger-correctness violated (FINDING 3 incident shape): the \
+             healthy candidate WC is excluded by a memory_kb Minimum \
+             RESERVATION shortfall (2 GB remaining < 4 GB required — the \
+             CONFIRMED incident excluder), yet the matcher placed on {chosen:?} \
+             — the is_satisfied_by exclusion must count as healthy-capacity and \
+             suppress the fail-open"
+        );
+    }
+
+    /// (FINDING 3 fix-up, pair-b T2) An indefinite-pin-SATURATED healthy
+    /// candidate counts as capacity-excluded (saturation clears when pins
+    /// release — a bounded wait), so it suppresses the fail-open like any
+    /// other healthy capacity exclusion.
+    ///
+    /// Falsification mutation (TDD #5, pair-b probe M7): remove the
+    /// `capacity_excluded_healthy` increment in the `indefinite_pin_saturated`
+    /// branch of `worker_matches` — the fail-open fires onto a pressure-gated
+    /// worker and this test red-fails with the bespoke pin-saturation message
+    /// below.
+    #[nativelink_test]
+    async fn fail_open_stays_queued_when_healthy_candidate_pin_saturated() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        let _rx_c = add_worker_in_pool(&scheduler, "WC").await;
+
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WB".to_string()), true, 10_000)
+            .await
+            .expect("mark WB pressured");
+        scheduler
+            .update_worker_indefinite_pin_saturation(&WorkerId("WC".to_string()), true)
+            .await
+            .expect("saturate WC pins");
+
+        let chosen = tokio::time::timeout(
+            Duration::from_secs(2),
+            scheduler.find_worker_for_action(&props_pool(), false),
+        )
+        .await
+        .expect("matcher must not hang");
+        assert!(
+            chosen.is_none(),
+            "trigger-correctness violated (FINDING 3, pin-saturation branch): \
+             the healthy candidate WC is excluded only by indefinite-pin \
+             saturation (a bounded wait — pins release), yet the matcher placed \
+             on {chosen:?} — the pin-saturated exclusion must count as \
+             healthy-capacity and suppress the fail-open"
+        );
+    }
+
+    /// (FINDING 3 fix-up, pair-a F1 — deterministic cooldown-expiry self-wake)
+    /// When the pressure-NAK cooldown ALONE empties the fail-open pool, the
+    /// scheduler must arm a one-shot delayed `worker_change_notify` for the
+    /// earliest remaining cooldown: the match loop waits solely on notifies
+    /// and `record_worker_pressure_nak` deliberately does not notify, so
+    /// without the self-wake a quiescent fully-pressure-gated fleet leaves the
+    /// queued action sleeping until an UNRELATED scheduler event.
+    ///
+    /// FULLY DETERMINISTIC: bare scheduler (no background tasks) + paused
+    /// tokio clock. The armed wake sleep is the only pending scheduler timer,
+    /// so auto-advance fires it with zero wall wait; `last_pressure_nak`
+    /// stamps live on the SAME tokio clock, so the same advance expires the
+    /// cooldown — the untestable direction and the untested direction were the
+    /// same defect (red-team blind spot #2), and this pins both. The
+    /// production-composition sibling (`simple_scheduler_test.rs`
+    /// `fail_open_cooldown_expiry_self_wakes_and_places_e2e_test`) proves the
+    /// full matcher loop consumes the wake.
+    ///
+    /// Falsification mutation (TDD #5): comment out the `background_spawn!`
+    /// wake arm in the all-in-cooldown branch — no wake ever fires and this
+    /// test red-fails with the bespoke expiry-wake message below.
+    #[nativelink_test]
+    async fn fail_open_cooldown_expiry_wake_notifies_matcher() {
+        // Paused BEFORE any stamp so stamps + wake timer share the paused
+        // clock (current-thread runtime; auto-advance fires pending sleeps
+        // when the runtime idles).
+        tokio::time::pause();
+
+        let wsm = BarrierWorkerStateManager::new();
+        // Own the notify handle so the test can await the wake directly.
+        let worker_change_notify = Arc::new(Notify::new());
+        let scheduler = ApiWorkerScheduler::new_with_locality_map(
+            wsm,
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            worker_change_notify.clone(),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+            None,
+            512 * 1024,
+            8,
+            false, // p_headroom_gate OFF (test default, mirrors build_scheduler)
+            0,
+            2,
+            false,
+            false,
+            None,
+        );
+
+        let _rx_a = add_worker_in_pool(&scheduler, "WA").await;
+        let _rx_b = add_worker_in_pool(&scheduler, "WB").await;
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WA".to_string()), true, 50_000)
+            .await
+            .expect("mark WA pressured");
+        scheduler
+            .update_worker_swap_pressure(&WorkerId("WB".to_string()), true, 10_000)
+            .await
+            .expect("mark WB pressured");
+        scheduler
+            .record_worker_pressure_nak(&WorkerId("WA".to_string()))
+            .await
+            .expect("record WA pressure NAK");
+        scheduler
+            .record_worker_pressure_nak(&WorkerId("WB".to_string()))
+            .await
+            .expect("record WB pressure NAK");
+
+        // Drain any permit stored by setup (add_worker notifies) so the await
+        // below can only be satisfied by the expiry wake itself.
+        while tokio::time::timeout(
+            Duration::from_millis(1),
+            worker_change_notify.notified(),
+        )
+        .await
+        .is_ok()
+        {}
+
+        // All candidates freshly NAK'd → pool emptied by cooldown alone →
+        // stay queued AND arm the self-wake.
+        let chosen = scheduler.find_worker_for_action(&props_pool(), false).await;
+        assert!(
+            chosen.is_none(),
+            "precondition: both fail-open candidates are in fresh cooldown — \
+             the matcher must stay queued (got {chosen:?})"
+        );
+
+        // The ONLY pending scheduler timer is the armed wake (10 s default
+        // cooldown); auto-advance fires it. NO other event occurs.
+        tokio::time::timeout(Duration::from_secs(60), worker_change_notify.notified())
+            .await
+            .expect(
+                "cooldown-expiry wake violated (pair-a F1): with every fail-open \
+                 candidate in pressure-NAK cooldown the scheduler must arm a \
+                 one-shot delayed worker_change_notify for the earliest cooldown \
+                 expiry — no wake fired, so a quiescent fully-pressure-gated \
+                 fleet would wedge the queued action until an unrelated event",
+            );
+
+        // The wake and the stamps share one clock: by the time the wake fires
+        // the cooldown has expired, so the woken match cycle CAN place.
+        let chosen = scheduler
+            .find_worker_for_action(&props_pool(), false)
+            .await
+            .expect(
+                "post-expiry placement violated (pair-a F1): after the self-wake \
+                 the cooldown has expired on the same clock — the fail-open must \
+                 place instead of staying queued",
+            );
+        assert_eq!(
+            chosen,
+            WorkerId("WB".to_string()),
+            "least-pressured worker (WB @ 10k churn) must win the post-expiry \
+             fail-open"
         );
     }
 

@@ -15,7 +15,7 @@
 use core::hash::{Hash, Hasher};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_metric::MetricsComponent;
@@ -28,6 +28,7 @@ use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime, FuncC
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::Instant;
 
 use crate::resource_profile::ProfileTier;
 
@@ -349,6 +350,12 @@ pub struct Worker {
     /// backpressure and does not consume retry attempts, so that loop is
     /// otherwise undamped). Normal (non-fail-open) matching never reads this.
     /// Telemetry write — recorded via `peek_mut`, no LRU promotion.
+    ///
+    /// `tokio::time::Instant`, NOT `std` (pair-a F1 determinism): the stamp
+    /// and the fail-open's cooldown-expiry wake timer (`tokio::time::sleep`)
+    /// must live in ONE clock domain, or a paused-clock test would see the
+    /// timer fire while the stamp's elapsed stays frozen (re-arm forever).
+    /// In production tokio time IS monotonic real time.
     pub last_pressure_nak: Option<Instant>,
 
     /// Digests of input root directories cached in the worker's directory cache.
