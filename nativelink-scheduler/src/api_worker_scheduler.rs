@@ -895,6 +895,55 @@ pub struct SchedulerMetrics {
     )]
     pub accuracy_under_ratio_max_x100: AtomicU64,
 
+    /// (#calib under-attribution) COUNTER: `accuracy_predicted_under` samples whose
+    /// reservation was DOWN-overridden at dispatch — the OOM-RELEVANT under: the
+    /// action ran with LESS memory reserved than the client declared and its actual
+    /// peak exceeded the dispatch p95. The four `accuracy_under_by_arm_*` counters
+    /// partition the under total EXACTLY:
+    /// `by_arm_down + by_arm_raise + by_arm_inject + by_arm_unmodified ==
+    /// accuracy_predicted_under`.
+    #[metric(
+        help = "(#calib under-attribution) unders on DOWN-overridden reservations (OOM-relevant: reserved below declared and actual peak exceeded the dispatch p95); partitions accuracy_predicted_under with the other by_arm counters"
+    )]
+    pub accuracy_under_by_arm_down: AtomicU64,
+
+    /// (#calib under-attribution) COUNTER: unders whose reservation was RAISEd at
+    /// dispatch (tightened above the declaration — the reservation was ALREADY the
+    /// p95; the under means even the p95 was exceeded, not that enforcement removed
+    /// headroom). See `accuracy_under_by_arm_down` for the partition identity.
+    #[metric(
+        help = "(#calib under-attribution) unders on RAISEd reservations (reservation was the p95 and the peak still exceeded it)"
+    )]
+    pub accuracy_under_by_arm_raise: AtomicU64,
+
+    /// (#calib under-attribution) COUNTER: unders whose reservation was p95-INJECTED
+    /// at dispatch (undeclared action packed against its profiled p95 instead of
+    /// counting as free) — OOM-relevant like DOWN: the injection is what stood the
+    /// too-small reservation. See `accuracy_under_by_arm_down` for the partition.
+    #[metric(
+        help = "(#calib under-attribution) unders on p95-INJECTED (undeclared) reservations (OOM-relevant: the injected p95 was exceeded)"
+    )]
+    pub accuracy_under_by_arm_inject: AtomicU64,
+
+    /// (#calib under-attribution) COUNTER: unders on reservations Phase-3 left
+    /// UNTOUCHED (flags off / no trusted profile at enforce / staleness refusal /
+    /// effective == declared). A pure falsifier miss with NO enforcement
+    /// involvement. See `accuracy_under_by_arm_down` for the partition identity.
+    #[metric(
+        help = "(#calib under-attribution) unders on untouched reservations (no Phase-3 override applied at dispatch)"
+    )]
+    pub accuracy_under_by_arm_unmodified: AtomicU64,
+
+    /// (#calib under-attribution) GAUGE: distinct profile keys currently resident in
+    /// the bounded under-offender LRU (cap 256 — saturates there; an eviction under
+    /// churn drops the oldest key's row). Answers "is the fine-tier under rate a few
+    /// hot nonstationary keys or broad low-sample noise" together with the periodic
+    /// `accuracy_under_offenders` top-offender log.
+    #[metric(
+        help = "(#calib under-attribution) distinct profile keys resident in the under-offender LRU (gauge, saturates at the 256 cap)"
+    )]
+    pub accuracy_under_distinct_keys: AtomicU64,
+
     /// (#task-resource-profile Phase-3 §4, RENAMED from `accuracy_over_ratio_max_x100`)
     /// GAUGE: the WORST (max) observed ratio of the PREDICTED TAIL to the ACTUAL
     /// MEASURED PEAK, `tail * 100 / actual` (×100 integer), over the covered
@@ -1434,8 +1483,8 @@ use crate::simple_scheduler::{
     BatchSchedAction, BatchSchedGain, BatchSchedGateCfg, BatchSchedWorker, compute_batch_sched_gain,
 };
 use crate::worker::{
-    ActionInfoWithProps, PendingActionInfoData, Worker, WorkerTimestamp, WorkerUpdate,
-    reduce_platform_properties,
+    ActionInfoWithProps, DispatchPhase3, PendingActionInfoData, Phase3Arm, Worker,
+    WorkerTimestamp, WorkerUpdate, reduce_platform_properties,
 };
 use crate::worker_capability_index::WorkerCapabilityIndex;
 use crate::worker_registry::SharedWorkerRegistry;
@@ -1918,6 +1967,52 @@ fn resource_profile_keys(action_info: &ActionInfoWithProps) -> Option<(ProfileKe
     let coarse = ProfileKey::coarse(instance_name, action_mnemonic)
         .expect("coarse key derivable whenever the fine key is (both require a mnemonic)");
     Some((fine, coarse))
+}
+
+/// (#calib under-attribution) Cap on the per-key under-offender LRU. 256 keys
+/// covers the observed fine-key under population (~hundreds of distinct keys)
+/// while bounding the map at ~50 KiB; `accuracy_under_distinct_keys` pinning at
+/// 256 is the overflow tell.
+const ACCURACY_UNDER_OFFENDERS_MAX_KEYS: usize = 256;
+
+/// (#calib under-attribution) Max rows in one periodic `accuracy_under_offenders`
+/// log dump (sorted by `under_count` descending).
+const ACCURACY_UNDER_OFFENDERS_LOG_ROWS: usize = 20;
+
+/// (#calib under-attribution) One profile key's under-offender row: how often and
+/// how badly the key's dispatch p95 under-predicted, plus the last observed
+/// declared/predicted/actual triple — the data that separates a genuinely nonstationary
+/// key (high count, recurring ratio) from low-sample noise (count 1, scattered
+/// keys). `tier` is the tier of the LAST under's dispatch prediction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnderOffender {
+    pub tier: ProfileTier,
+    pub under_count: u64,
+    /// Worst observed `actual * 100 / predicted` for this key.
+    pub worst_ratio_x100: u64,
+    /// Client-declared `memory_kb` at the last under's dispatch (0 = undeclared).
+    pub last_declared_kb: u64,
+    /// Dispatch-time p95 prediction at the last under.
+    pub last_predicted_kb: u64,
+    /// Actual peak at the last under.
+    pub last_actual_kb: u64,
+    /// Phase-3 arm of the last under's reservation.
+    pub last_arm: Phase3Arm,
+}
+
+/// The action's declared `memory_kb` `Minimum` in KB (`0` = undeclared/absent).
+/// Shared by the Phase-3 enforce eligibility check and the (#calib) dispatch-time
+/// arm stash so both read the declaration IDENTICALLY.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn declared_memory_kb(action_info: &ActionInfoWithProps) -> u64 {
+    match action_info
+        .platform_properties
+        .properties
+        .get(MEMORY_KB_PROPERTY)
+    {
+        Some(PlatformPropertyValue::Minimum(v)) => v.max(0.0) as u64,
+        _ => 0,
+    }
 }
 
 fn decision_trace_min_props(props: &PlatformProperties) -> String {
@@ -3557,12 +3652,17 @@ impl ApiWorkerSchedulerImpl {
     /// declared and neither RAISE nor DOWN is on; the action carries no baggage key; no
     /// TRUSTED (>=K) profile exists at either tier; the DOWN staleness gate refuses a
     /// too-old loaded profile; or the computed effective equals the declared value.
+    ///
+    /// (#calib under-attribution) `Some` also carries WHICH enforce arm produced the
+    /// override ([`Phase3Arm`]), mirrored from the applied-counter move, so the caller
+    /// can stash it on the running action for the completion-side under split.
+    /// OBSERVE-ONLY payload — the ledger object (the effective clone) is unchanged.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
     fn phase3_compute_effective_action_info(
         &self,
         action_info: &ActionInfoWithProps,
         resource_profile_map: &ParkingMutex<ProfileMap>,
-    ) -> Option<ActionInfoWithProps> {
+    ) -> Option<(ActionInfoWithProps, Phase3Arm)> {
         // Fast path: no enforcement of ANY kind → no override, no lookup, byte-identical.
         if !self.phase3_raise_enabled
             && !self.phase3_down_overcommit_enabled
@@ -3574,14 +3674,7 @@ impl ApiWorkerSchedulerImpl {
         // The action's declared memory_kb Minimum (0 / absent = UNDECLARED). RAISE/DOWN
         // move an existing (>0) reservation; the undeclared→p95 inject acts only when
         // there is none.
-        let declared_kb = match action_info
-            .platform_properties
-            .properties
-            .get(MEMORY_KB_PROPERTY)
-        {
-            Some(PlatformPropertyValue::Minimum(v)) => v.max(0.0) as u64,
-            _ => 0,
-        };
+        let declared_kb = declared_memory_kb(action_info);
         let is_undeclared = declared_kb == 0;
         // Eligibility: an undeclared action needs the inject flag; a declared action needs
         // RAISE or DOWN. Anything else is a no-op for this admission.
@@ -3678,6 +3771,15 @@ impl ApiWorkerSchedulerImpl {
             Applied::Undeclared => &self.metrics.phase3_undeclared_injected,
         }
         .fetch_add(1, Ordering::Relaxed);
+        // (#calib under-attribution) Mirror the applied move as the arm the caller
+        // stashes on the running action. Unreachable-by-construction for
+        // `Unmodified`: the sentinel branch always trips the effective==declared
+        // no-op return above.
+        let arm = match applied {
+            Applied::Raise => Phase3Arm::Raise,
+            Applied::Down => Phase3Arm::Down,
+            Applied::Undeclared => Phase3Arm::Inject,
+        };
         // STORE-ONCE: clone the action and write the effective value into its memory_kb
         // Minimum. This single object is what the caller gates + reduces + stores.
         let mut effective = action_info.clone();
@@ -3685,7 +3787,7 @@ impl ApiWorkerSchedulerImpl {
             MEMORY_KB_PROPERTY.to_string(),
             PlatformPropertyValue::Minimum(effective_kb as f64),
         );
-        Some(effective)
+        Some((effective, arm))
     }
 
     /// (#2497 p95 policy) Starvation clamp shared by RAISE + undeclared-INJECT: if NO
@@ -5053,6 +5155,9 @@ impl ApiWorkerSchedulerImpl {
                 // `find_and_reserve_worker` once the dispatch-time profile tail is
                 // peeked; `None` here is the pre-stamp default (map warming / no key).
                 dispatch_memory_prediction: None,
+                // (#calib) stamped by the same post-reservation block; the default
+                // (Unmodified/0) stands when no prediction is stashed.
+                dispatch_phase3: DispatchPhase3::default(),
             },
         );
         // (#specprefetch-rebind) MEASUREMENT-ONLY prewarm-landing read: if this op
@@ -5415,6 +5520,21 @@ pub struct ApiWorkerScheduler {
     /// `None` until the first sample. Throttles to at most one line per
     /// `INJECT_OBSERVE_SAMPLE_MIN_INTERVAL`.
     inject_observe_sample_at: ParkingMutex<Option<Instant>>,
+
+    /// (#calib under-attribution) Per-key under-offender rows: which profile keys
+    /// drive `accuracy_predicted_under`, with count / worst ratio / last
+    /// declared-predicted-actual. Written ONLY when a completion classifies
+    /// `Under` (rare by construction — the falsifier fires on <20% of covered
+    /// samples today); read by the periodic `emit_accuracy_under_offenders_log`
+    /// dump on the `simple_scheduler_hold_counters_log` cadence. Brief
+    /// `parking_lot` lock on the completion path, NEVER across an `.await`,
+    /// NEVER in `do_try_match`.
+    // CAPPED AT 256 (`ACCURACY_UNDER_OFFENDERS_MAX_KEYS`): bounded LRU keyed by
+    // the already-clamped `ProfileKey`; each row is 5×u64 + tier (~200 B incl.
+    // key + node → ~50 KiB total). Over-cap evicts the LRU key's row — history
+    // for the evicted key is lost, acceptable for a top-offender diagnostic
+    // (`accuracy_under_distinct_keys` saturating at 256 flags the overflow).
+    accuracy_under_offenders: ParkingMutex<LruCache<ProfileKey, UnderOffender>>,
 
     /// (#dag-criticality) The DAG-from-history critical-path state, or `None` when
     /// `dag_critical_path_enabled` is off (the kill-switch) — set once during
@@ -6374,6 +6494,11 @@ impl ApiWorkerScheduler {
             // and must not be dark; see the field doc). See PROFILE_MAP_MAX_KEYS.
             resource_profile_map: ParkingMutex::new(ProfileMap::with_default_tuning()),
             inject_observe_sample_at: ParkingMutex::new(None),
+            // CAPPED AT 256: see the field's cap comment.
+            accuracy_under_offenders: ParkingMutex::new(LruCache::new(
+                NonZeroUsize::new(ACCURACY_UNDER_OFFENDERS_MAX_KEYS)
+                    .expect("ACCURACY_UNDER_OFFENDERS_MAX_KEYS is nonzero"),
+            )),
             // (#dag-criticality) DAG state OFF by default; the production wiring
             // (`SimpleScheduler::new`) injects `Some(Arc<DagState>)` via `set_dag_state`
             // when `dag_critical_path_enabled` is true (mirrors `set_phase3_enforcement`).
@@ -6734,7 +6859,11 @@ impl ApiWorkerScheduler {
         &self,
         worker_id: &WorkerId,
         operation_id: &OperationId,
-    ) -> Option<(ActionInfoWithProps, Option<(ProfileTier, u64, u64)>)> {
+    ) -> Option<(
+        ActionInfoWithProps,
+        Option<(ProfileTier, u64, u64)>,
+        DispatchPhase3,
+    )> {
         let inner = self.inner.read().await;
         inner
             .workers
@@ -6744,6 +6873,9 @@ impl ApiWorkerScheduler {
                 (
                     pending.action_info.clone(),
                     pending.dispatch_memory_prediction,
+                    // (#calib under-attribution) the Phase-3 arm + declared kb
+                    // stashed by the same reserve-point block.
+                    pending.dispatch_phase3,
                 )
             })
     }
@@ -6767,6 +6899,12 @@ impl ApiWorkerScheduler {
         // dispatch. Classified against the actual peak WITHOUT any completion-time
         // recompute → hindsight-free.
         dispatch_prediction: Option<(ProfileTier, u64, u64)>,
+        // (#calib under-attribution) The Phase-3 arm this action's reservation was
+        // actually stood under (+ the client-declared kb), stashed at the same
+        // reserve point. Only consulted when the classification is `Under` —
+        // splits the falsifier by the OOM-relevant arm (DOWN/INJECT vs
+        // RAISE/untouched) and feeds the per-key offender LRU.
+        dispatch_phase3: DispatchPhase3,
     ) {
         // Gate on `sampled`: an unsampled report carries no real measurement, and
         // folding its (typically 0) memory would poison the variance signal — a
@@ -6813,6 +6951,17 @@ impl ApiWorkerScheduler {
         // Classification is independent of the map, so it needs no lock. OBSERVE-ONLY.
         let actual_kb = usage.peak_memory_kb;
         let accuracy = classify_prediction_accuracy(dispatch_prediction, actual_kb);
+        // (#calib under-attribution) Pre-clone the offender key for an Under NOW —
+        // the fold below consumes both keys by value (`map.record`). The key of
+        // the prediction's TIER is the offender (a coarse under attributes to the
+        // coarse blend key, matching the tier-split counters).
+        let under_offender_key = match &accuracy {
+            PredictionAccuracy::Under { tier, .. } => Some(match tier {
+                ProfileTier::Fine => fine_key.clone(),
+                ProfileTier::Coarse => coarse_key.clone(),
+            }),
+            _ => None,
+        };
         // (#task-resource-profile hierarchical-key) Fold the SAME sample into BOTH tiers
         // under ONE lock acquisition: the fine (instance,target,mnemonic) key AND the
         // coarse (instance,mnemonic) fallback key. Both live in the same bounded LRU.
@@ -6904,6 +7053,59 @@ impl ApiWorkerScheduler {
                 self.metrics
                     .accuracy_under_ratio_max_x100
                     .fetch_max(ratio_x100, Ordering::Relaxed);
+                // (#calib under-attribution) Arm split: which Phase-3 enforce arm
+                // stood the DISPATCHED reservation (threaded from the running-
+                // action stash, like `tier`). Partition identity:
+                // `sum(accuracy_under_by_arm_*) == accuracy_predicted_under`.
+                match dispatch_phase3.arm {
+                    Phase3Arm::Down => &self.metrics.accuracy_under_by_arm_down,
+                    Phase3Arm::Raise => &self.metrics.accuracy_under_by_arm_raise,
+                    Phase3Arm::Inject => &self.metrics.accuracy_under_by_arm_inject,
+                    Phase3Arm::Unmodified => {
+                        &self.metrics.accuracy_under_by_arm_unmodified
+                    }
+                }
+                .fetch_add(1, Ordering::Relaxed);
+                // (#calib under-attribution) Per-key offender row: count, running
+                // worst ratio, last declared/predicted/actual + arm. Brief SEPARATE
+                // lock (never nested with the resource_profile_map lock above,
+                // never across an `.await`); O(1) amortized on the completion path
+                // — NOT in do_try_match (the 2026-07-06 hot-loop-probe trap).
+                let predicted_kb = dispatch_prediction.map_or(0, |(_, p, _)| p);
+                if let Some(key) = under_offender_key {
+                    let resident = {
+                        let mut offenders = self.accuracy_under_offenders.lock();
+                        if let Some(row) = offenders.get_mut(&key) {
+                            row.tier = tier;
+                            row.under_count += 1;
+                            row.worst_ratio_x100 = row.worst_ratio_x100.max(ratio_x100);
+                            row.last_declared_kb = dispatch_phase3.declared_kb;
+                            row.last_predicted_kb = predicted_kb;
+                            row.last_actual_kb = actual_kb;
+                            row.last_arm = dispatch_phase3.arm;
+                        } else {
+                            // CAPPED AT 256: `push` on the bounded LRU evicts the
+                            // oldest key's row when full (field cap note).
+                            offenders.push(
+                                key,
+                                UnderOffender {
+                                    tier,
+                                    under_count: 1,
+                                    worst_ratio_x100: ratio_x100,
+                                    last_declared_kb: dispatch_phase3.declared_kb,
+                                    last_predicted_kb: predicted_kb,
+                                    last_actual_kb: actual_kb,
+                                    last_arm: dispatch_phase3.arm,
+                                },
+                            );
+                        }
+                        offenders.len() as u64
+                    };
+                    // Last-write-wins resident-count gauge (converges per event).
+                    self.metrics
+                        .accuracy_under_distinct_keys
+                        .store(resident, Ordering::Relaxed);
+                }
             }
             PredictionAccuracy::SkippedLowSample => {
                 self.metrics
@@ -6944,6 +7146,74 @@ impl ApiWorkerScheduler {
         self.metrics
             .profile_high_variance_keys
             .store(coarse_outcome.high_variance_keys, Ordering::Relaxed);
+    }
+
+    /// (#calib under-attribution) Top under-offender rows sorted by `under_count`
+    /// descending, capped at `cap`. Clones the (<= 256) resident rows out under
+    /// the brief lock; sorts + truncates OFF the lock. O(cap-256) — called on the
+    /// periodic log cadence (and by tests), never per-event, never in the match
+    /// loop.
+    pub(crate) fn top_accuracy_under_offenders(
+        &self,
+        cap: usize,
+    ) -> Vec<(ProfileKey, UnderOffender)> {
+        let mut rows: Vec<(ProfileKey, UnderOffender)> = {
+            let offenders = self.accuracy_under_offenders.lock();
+            offenders
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        rows.sort_by(|a, b| b.1.under_count.cmp(&a.1.under_count));
+        rows.truncate(cap);
+        rows
+    }
+
+    /// (#calib under-attribution) Emit ONE `tag = "accuracy_under_offenders"`
+    /// info-log carrying the top under-offender rows (count-sorted, <= 20) + the
+    /// distinct-key gauge. Called from the SAME spawn-once periodic task as the
+    /// other `emit_*_counters_log` emits (`simple_scheduler_hold_counters_log`
+    /// cadence) — rate-limited BY that cadence, NEVER per-event, NEVER in the
+    /// match loop (the 2026-07-06 hot-loop-probe trap). Silent while no under has
+    /// ever fired (nothing to attribute; the aggregate counters already read 0).
+    /// MUST be `info!` (`release_max_level_info` strips lower levels).
+    pub fn emit_accuracy_under_offenders_log(&self) {
+        let rows = self.top_accuracy_under_offenders(ACCURACY_UNDER_OFFENDERS_LOG_ROWS);
+        if rows.is_empty() {
+            return;
+        }
+        let mut top = String::new();
+        for (i, (key, row)) in rows.iter().enumerate() {
+            if i > 0 {
+                top.push_str("; ");
+            }
+            // `target|mnemonic` (coarse keys render as `|mnemonic` — empty
+            // target is the coarse marker). Both components already clamped.
+            let _ = write!(
+                top,
+                "{}|{}: tier={:?} arm={:?} n={} worst_x100={} declared={} predicted={} actual={}",
+                key.target_id,
+                key.action_mnemonic,
+                row.tier,
+                row.last_arm,
+                row.under_count,
+                row.worst_ratio_x100,
+                row.last_declared_kb,
+                row.last_predicted_kb,
+                row.last_actual_kb,
+            );
+        }
+        info!(
+            tag = "accuracy_under_offenders",
+            distinct_keys = self
+                .metrics
+                .accuracy_under_distinct_keys
+                .load(Ordering::Relaxed),
+            rows = rows.len(),
+            top = %top,
+            "per-key under-offender attribution (count-sorted; answers whether the \
+             fine-tier under rate is a few nonstationary keys or broad noise)"
+        );
     }
 
     /// (#task-resource-profile Phase-3 §12) Plain-data snapshot of the resource-profile
@@ -7487,9 +7757,14 @@ impl ApiWorkerScheduler {
             inner.phase3_compute_effective_action_info(action_info, &self.resource_profile_map);
         let (sel_props, sel_action_info): (&PlatformProperties, &ActionInfoWithProps) =
             match &effective_action_info {
-                Some(eff) => (&eff.platform_properties, eff),
+                Some((eff, _arm)) => (&eff.platform_properties, eff),
                 None => (platform_properties, action_info),
             };
+        // (#calib under-attribution) The arm the ledger was actually stood under:
+        // an applied override's arm, or `Unmodified` when no override applied.
+        let phase3_arm = effective_action_info
+            .as_ref()
+            .map_or(Phase3Arm::Unmodified, |(_, arm)| *arm);
         let mut result = inner.inner_find_and_reserve_worker(
             sel_props,
             operation_id,
@@ -7576,6 +7851,17 @@ impl ApiWorkerScheduler {
                             worker.running_action_infos.get_mut(operation_id)
                         {
                             pending.dispatch_memory_prediction = dispatch_prediction;
+                            // (#calib under-attribution) Stash the Phase-3 arm +
+                            // the client-DECLARED memory_kb (read from the ORIGINAL
+                            // `action_info` — the stored clone's memory_kb is the
+                            // RESERVED value) so the completion-side accuracy check
+                            // can attribute an under to the arm that stood the
+                            // reservation. OBSERVE-ONLY: same lifecycle as the
+                            // prediction stash (auto-cleaned on terminal paths).
+                            pending.dispatch_phase3 = DispatchPhase3 {
+                                arm: phase3_arm,
+                                declared_kb: declared_memory_kb(action_info),
+                            };
                         }
                     }
                 }
@@ -10960,6 +11246,7 @@ impl ApiWorkerScheduler {
                     action_info: action,
                     exec_start_time: None,
                     dispatch_memory_prediction: None,
+                    dispatch_phase3: DispatchPhase3::default(),
                 },
             );
         }
@@ -11113,8 +11400,13 @@ impl WorkerScheduler for ApiWorkerScheduler {
             .running_action_info_and_dispatch_prediction(worker_id, operation_id)
             .await;
         match maybe.as_ref() {
-            Some((action_info, dispatch_prediction)) => {
-                self.fold_resource_profile(action_info, &resource_usage, *dispatch_prediction);
+            Some((action_info, dispatch_prediction, dispatch_phase3)) => {
+                self.fold_resource_profile(
+                    action_info,
+                    &resource_usage,
+                    *dispatch_prediction,
+                    *dispatch_phase3,
+                );
             }
             // The op was already gone from `running_action_infos` (completion /
             // cancellation raced this usage report). Count it so the dark-detector
@@ -11136,7 +11428,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
         let Some(origin_event_tx) = self.maybe_origin_event_tx.as_ref() else {
             return Ok(());
         };
-        let Some((action_info, _dispatch_prediction)) = maybe else {
+        let Some((action_info, _dispatch_prediction, _dispatch_phase3)) = maybe else {
             return Ok(());
         };
 
@@ -12332,6 +12624,7 @@ mod tests {
                     action_info: action,
                     exec_start_time: None,
                     dispatch_memory_prediction: None,
+                    dispatch_phase3: DispatchPhase3::default(),
                 },
             );
         }
@@ -17138,6 +17431,15 @@ mod tests {
         scheduler.metrics.accuracy_predicted_covered_coarse.fetch_add(232, Ordering::Relaxed);
         scheduler.metrics.accuracy_predicted_under_fine.fetch_add(233, Ordering::Relaxed);
         scheduler.metrics.accuracy_predicted_under_coarse.fetch_add(234, Ordering::Relaxed);
+        // (#calib under-attribution) distinctive values on the four per-arm under
+        // counters + the offender distinct-keys gauge — the whole point of the arm
+        // split is answering "were any unders on DOWN/INJECTED reservations" from
+        // scrape data, so a DARK field here re-opens exactly that blind spot.
+        scheduler.metrics.accuracy_under_by_arm_down.fetch_add(261, Ordering::Relaxed);
+        scheduler.metrics.accuracy_under_by_arm_raise.fetch_add(262, Ordering::Relaxed);
+        scheduler.metrics.accuracy_under_by_arm_inject.fetch_add(263, Ordering::Relaxed);
+        scheduler.metrics.accuracy_under_by_arm_unmodified.fetch_add(264, Ordering::Relaxed);
+        scheduler.metrics.accuracy_under_distinct_keys.store(265, Ordering::Relaxed);
         // (#dag-criticality §6c) distinctive values on the seven DAG kill/keep +
         // confident-node telemetry fields — the feature ships ON under the anti-dark-
         // counter rule, so a DARK field here re-opens the exact blind spot the fix-up
@@ -17317,6 +17619,13 @@ mod tests {
             ("accuracy_predicted_covered_coarse", 232),
             ("accuracy_predicted_under_fine", 233),
             ("accuracy_predicted_under_coarse", 234),
+            // (#calib under-attribution) the four per-arm under counters + the
+            // offender distinct-keys gauge.
+            ("accuracy_under_by_arm_down", 261),
+            ("accuracy_under_by_arm_raise", 262),
+            ("accuracy_under_by_arm_inject", 263),
+            ("accuracy_under_by_arm_unmodified", 264),
+            ("accuracy_under_distinct_keys", 265),
         ] {
             assert!(
                 body.contains(&format!("scheduler_metrics_{name}")),
@@ -17550,7 +17859,7 @@ mod b1_lock_decouple_tests {
     };
     use crate::platform_property_manager::PlatformPropertyManager;
     use crate::resource_profile::ProfileTier;
-    use crate::worker::ActionInfoWithProps;
+    use crate::worker::{ActionInfoWithProps, DispatchPhase3, Phase3Arm};
     use crate::worker_registry::WorkerRegistry;
     use crate::worker_scheduler::WorkerScheduler;
 
@@ -19077,8 +19386,8 @@ mod b1_lock_decouple_tests {
         let a = action_baggage(0x01, "//a:a", "CppCompile");
         let b = action_baggage(0x02, "//b:b", "CppCompile");
         // Two completions, same mnemonic, different targets, no dispatch prediction.
-        scheduler.fold_resource_profile(&a, &usage_mem(1000), None);
-        scheduler.fold_resource_profile(&b, &usage_mem(2000), None);
+        scheduler.fold_resource_profile(&a, &usage_mem(1000), None, DispatchPhase3::default());
+        scheduler.fold_resource_profile(&b, &usage_mem(2000), None, DispatchPhase3::default());
 
         let fine_a = ProfileKey::from_parts("main", "//a:a", "CppCompile").unwrap();
         let fine_b = ProfileKey::from_parts("main", "//b:b", "CppCompile").unwrap();
@@ -19581,7 +19890,7 @@ mod b1_lock_decouple_tests {
 
         let action = action_with_memory_and_baggage("W", 0xe1, 4096.0);
         // ACTUAL peak 65_536 == dispatch tail 65_536 → an EXACT (waste-free) cover.
-        scheduler.fold_resource_profile(&action, &usage_mem(65_536), Some((ProfileTier::Fine, 65_536, 20)));
+        scheduler.fold_resource_profile(&action, &usage_mem(65_536), Some((ProfileTier::Fine, 65_536, 20)), DispatchPhase3::default());
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -19633,7 +19942,7 @@ mod b1_lock_decouple_tests {
 
         let action = action_with_memory_and_baggage("W", 0xe2, 4096.0);
         // ACTUAL peak 131_072 > dispatch tail 65_536 → the tail UNDER-predicted.
-        scheduler.fold_resource_profile(&action, &usage_mem(131_072), Some((ProfileTier::Fine, 65_536, 20)));
+        scheduler.fold_resource_profile(&action, &usage_mem(131_072), Some((ProfileTier::Fine, 65_536, 20)), DispatchPhase3::default());
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -19683,7 +19992,7 @@ mod b1_lock_decouple_tests {
 
         // Dispatch prediction present but with only 1 prior sample (< K). Tail 1024 <
         // actual 200_000 → WOULD under, but the K-gate suppresses it → skipped_low_sample.
-        scheduler.fold_resource_profile(&action, &usage_mem(200_000), Some((ProfileTier::Fine, 1024, 1)));
+        scheduler.fold_resource_profile(&action, &usage_mem(200_000), Some((ProfileTier::Fine, 1024, 1)), DispatchPhase3::default());
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -19729,7 +20038,7 @@ mod b1_lock_decouple_tests {
         let action = action_with_memory_and_baggage("W", 0xe5, 4096.0);
 
         // No dispatch prediction was stashed (None) — nothing to score.
-        scheduler.fold_resource_profile(&action, &usage_mem(200_000), None);
+        scheduler.fold_resource_profile(&action, &usage_mem(200_000), None, DispatchPhase3::default());
 
         let covered = scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed);
         let under = scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed);
@@ -19773,7 +20082,7 @@ mod b1_lock_decouple_tests {
         let action = action_with_memory_and_baggage("W", 0xe6, 4096.0);
 
         // Dispatch tail 65_536 STRICTLY exceeds actual 16_384 → covered + over-reserved.
-        scheduler.fold_resource_profile(&action, &usage_mem(16_384), Some((ProfileTier::Fine, 65_536, 20)));
+        scheduler.fold_resource_profile(&action, &usage_mem(16_384), Some((ProfileTier::Fine, 65_536, 20)), DispatchPhase3::default());
 
         assert_eq!(
             scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed),
@@ -19833,7 +20142,7 @@ mod b1_lock_decouple_tests {
         for &kb in &samples {
             // A varying dispatch prediction exercises the covered/under/over/skip arms;
             // NONE of them may perturb the aggregation the reference computes.
-            scheduler.fold_resource_profile(&action, &usage_mem(kb), Some((ProfileTier::Fine, 65_536, 20)));
+            scheduler.fold_resource_profile(&action, &usage_mem(kb), Some((ProfileTier::Fine, 65_536, 20)), DispatchPhase3::default());
             reference.record(observe_key(), mem_only_sample(kb));
         }
 
@@ -19951,6 +20260,254 @@ mod b1_lock_decouple_tests {
             covered, 0,
             "the dispatch-time tail under-predicted → NOT covered (a covered reading would be \
              the hindsight bug), got covered={covered}"
+        );
+    }
+
+    /// (#calib under-attribution, PRODUCTION-COMPOSITION) An under on an action
+    /// whose reservation Phase-3 DOWN-overrode must increment
+    /// `accuracy_under_by_arm_down` and NONE of the other arm counters — the arm
+    /// is threaded from `phase3_compute_effective_action_info` through the
+    /// running-action stash to the completion-side accuracy split (the SAME
+    /// plumbing as the `ProfileTier` dispatch marker). The DOWN is proven to have
+    /// actually applied via the worker's remaining `memory_kb` (500_000 − p95
+    /// 50_000 = 450_000, NOT 500_000 − declared 100_000) BEFORE the under is
+    /// asserted, so the attribution claim cannot pass vacuously. Also proves the
+    /// offender LRU records the row (distinct-keys gauge, worst ratio, the
+    /// declared/predicted/actual triple + arm).
+    ///
+    /// MUTATION: comment out the `accuracy_under_by_arm_*` increment match in
+    /// `fold_resource_profile` → `by_arm_down` stays 0 → red-fails with
+    /// "under-attribution arm split dark". Comment out the offender-LRU update →
+    /// the distinct-keys assert red-fails with "offender tracking dark".
+    #[nativelink_test]
+    async fn accuracy_under_attributes_down_arm_and_records_offender() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+        // DOWN enforcement ON (factor 2.0); RAISE + undeclared-inject OFF.
+        scheduler.set_phase3_enforcement(false, true, 2.0, 604_800, false, 2000, 20000, false);
+
+        // Trusted (>=K) profile: p95 = 50_000 (20 identical samples).
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        }
+
+        let op = OperationId::default();
+        // Declared 100_000 >= p95 50_000 → DOWN reserves max(p95, declared/2) = 50_000.
+        let action = action_with_memory_and_baggage("W", 0xd0, 100_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+        // Precondition: the DOWN override actually stood in the ledger.
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(450_000.0),
+            "precondition: the DOWN override must reserve the p95 (50_000, leaving \
+             450_000) — without an applied DOWN this test cannot attribute an under \
+             to the down arm"
+        );
+
+        // Actual peak 131_072 > dispatch p95 50_000 → Under on a DOWN-overridden action.
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 131_072,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record_action_resource_usage must return Ok");
+
+        assert_eq!(
+            scheduler.metrics.accuracy_under_by_arm_down.load(Ordering::Relaxed),
+            1,
+            "under-attribution arm split dark: an under on a DOWN-overridden \
+             reservation must increment accuracy_under_by_arm_down — the arm \
+             stashed at dispatch is not reaching the completion-side split"
+        );
+        for (name, counter) in [
+            ("raise", &scheduler.metrics.accuracy_under_by_arm_raise),
+            ("inject", &scheduler.metrics.accuracy_under_by_arm_inject),
+            ("unmodified", &scheduler.metrics.accuracy_under_by_arm_unmodified),
+        ] {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                0,
+                "under-attribution mis-attribution: a DOWN under must increment ONLY \
+                 by_arm_down, but by_arm_{name} advanced — the arm partition \
+                 (sum of by_arm_* == accuracy_predicted_under) is broken"
+            );
+        }
+        assert_eq!(
+            scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed),
+            1,
+            "the under total must still advance exactly once — the arm split is a \
+             PARTITION of accuracy_predicted_under, not a replacement"
+        );
+
+        // Offender row: the under's FINE key with the full attribution payload.
+        assert_eq!(
+            scheduler
+                .metrics
+                .accuracy_under_distinct_keys
+                .load(Ordering::Relaxed),
+            1,
+            "offender tracking dark: the under's profile key must be resident in \
+             the offender LRU (accuracy_under_distinct_keys gauge = 1)"
+        );
+        let offenders = scheduler.top_accuracy_under_offenders(20);
+        assert_eq!(offenders.len(), 1, "exactly one offender row expected");
+        let (key, row) = &offenders[0];
+        assert_eq!(
+            key,
+            &observe_key(),
+            "offender must be keyed by the under's FINE profile key"
+        );
+        assert_eq!(
+            (row.tier, row.under_count, row.worst_ratio_x100),
+            (ProfileTier::Fine, 1, 262),
+            "offender row must carry tier=Fine, count=1, worst ratio \
+             131072*100/50000 = 262"
+        );
+        assert_eq!(
+            (
+                row.last_declared_kb,
+                row.last_predicted_kb,
+                row.last_actual_kb,
+                row.last_arm
+            ),
+            (100_000, 50_000, 131_072, Phase3Arm::Down),
+            "offender row must carry the last declared/predicted/actual triple + \
+             the arm — declared comes from the ORIGINAL action (the stored ledger \
+             clone holds the RESERVED value, so a wrong source reads 50_000 here)"
+        );
+    }
+
+    /// (#calib under-attribution) The offender LRU is bounded: 257 distinct under
+    /// keys leave exactly 256 resident rows (LRU evicts the oldest) and the
+    /// `accuracy_under_distinct_keys` gauge saturates at the cap. Drives the
+    /// completion-path fold directly with distinct fine keys.
+    ///
+    /// MUTATION: comment out the offender-LRU update in `fold_resource_profile` →
+    /// the gauge stays 0 → red-fails with "offender tracking dark". Raise the
+    /// `ACCURACY_UNDER_OFFENDERS_MAX_KEYS` cap → the ==256 asserts red-fail.
+    #[nativelink_test]
+    async fn accuracy_under_offender_lru_capped_at_256() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        for i in 0..257u32 {
+            let mut action = action_with_memory_and_baggage("W", 0x33, 4096.0);
+            if let Some(m) = action.origin_metadata.bazel_metadata.as_mut() {
+                m.target_id = format!("//offender:{i}");
+            }
+            // Trusted prediction p95 1000 < actual 5000 → Under per key.
+            scheduler.fold_resource_profile(
+                &action,
+                &usage_mem(5000),
+                Some((ProfileTier::Fine, 1000, 20)),
+                DispatchPhase3 {
+                    arm: Phase3Arm::Unmodified,
+                    declared_kb: 4096,
+                },
+            );
+        }
+        assert_eq!(
+            scheduler
+                .metrics
+                .accuracy_under_distinct_keys
+                .load(Ordering::Relaxed),
+            256,
+            "offender tracking dark (or cap broken): 257 distinct under keys must \
+             saturate the offender LRU at its 256 cap — the gauge is the resident \
+             key count"
+        );
+        assert_eq!(
+            scheduler.top_accuracy_under_offenders(usize::MAX).len(),
+            256,
+            "the offender LRU must hold exactly 256 rows after 257 distinct under \
+             keys (bounded-buffer contract: over-cap evicts, never grows)"
+        );
+        // Cross-check the arm partition on the same drive: all 257 unders carried
+        // arm=Unmodified.
+        assert_eq!(
+            scheduler
+                .metrics
+                .accuracy_under_by_arm_unmodified
+                .load(Ordering::Relaxed),
+            257,
+            "all 257 unders were dispatched unmodified → by_arm_unmodified must \
+             count every one (the partition identity)"
+        );
+    }
+
+    /// (#calib under-attribution) `top_accuracy_under_offenders` sorts by
+    /// `under_count` descending and caps the row count; a key's row aggregates
+    /// across unders (count increments, worst ratio is a running max, the
+    /// declared/predicted/actual triple is last-write-wins).
+    ///
+    /// MUTATION: make the offender update overwrite `worst_ratio_x100` instead of
+    /// max-ing → the worst-ratio assert red-fails (last ratio 500 would replace
+    /// the peak 900).
+    #[nativelink_test]
+    async fn accuracy_under_top_offenders_sorted_by_count_and_capped() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let mut action_a = action_with_memory_and_baggage("W", 0x34, 4096.0);
+        if let Some(m) = action_a.origin_metadata.bazel_metadata.as_mut() {
+            m.target_id = "//offender:a".to_string();
+        }
+        let mut action_b = action_with_memory_and_baggage("W", 0x35, 4096.0);
+        if let Some(m) = action_b.origin_metadata.bazel_metadata.as_mut() {
+            m.target_id = "//offender:b".to_string();
+        }
+        let phase3 = DispatchPhase3 {
+            arm: Phase3Arm::Unmodified,
+            declared_kb: 4096,
+        };
+        let pred = Some((ProfileTier::Fine, 1000, 20));
+        // Key A: three unders with ratios 500, 900, 500 (worst must stick at 900,
+        // last actual must be the FINAL fold's 5000).
+        scheduler.fold_resource_profile(&action_a, &usage_mem(5000), pred, phase3);
+        scheduler.fold_resource_profile(&action_a, &usage_mem(9000), pred, phase3);
+        scheduler.fold_resource_profile(&action_a, &usage_mem(5000), pred, phase3);
+        // Key B: one under.
+        scheduler.fold_resource_profile(&action_b, &usage_mem(5000), pred, phase3);
+
+        let top1 = scheduler.top_accuracy_under_offenders(1);
+        assert_eq!(
+            top1.len(),
+            1,
+            "cap=1 must truncate the dump to the single top offender"
+        );
+        assert_eq!(
+            (top1[0].0.target_id.as_str(), top1[0].1.under_count),
+            ("//offender:a", 3),
+            "top offender must be key A (3 unders > 1), sorted by count descending"
+        );
+        assert_eq!(
+            top1[0].1.worst_ratio_x100, 900,
+            "worst_ratio_x100 must be the running MAX across a key's unders (900 \
+             from the 9000-peak fold), not the last fold's 500"
+        );
+        assert_eq!(
+            top1[0].1.last_actual_kb, 5000,
+            "the declared/predicted/actual triple is last-write-wins — the FINAL \
+             fold's actual (5000) must stand"
+        );
+        let top10 = scheduler.top_accuracy_under_offenders(10);
+        assert_eq!(
+            top10.len(),
+            2,
+            "both offender keys must be resident below the cap"
+        );
+        assert_eq!(
+            top10[1].0.target_id.as_str(),
+            "//offender:b",
+            "key B (1 under) must sort after key A (3 unders)"
         );
     }
 
@@ -21561,6 +22118,7 @@ mod b1_lock_decouple_tests {
                         action_info: pool_action(),
                         exec_start_time: None,
                         dispatch_memory_prediction: None,
+                        dispatch_phase3: DispatchPhase3::default(),
                     },
                 );
             }
@@ -22695,6 +23253,7 @@ mod b1_lock_decouple_tests {
                         action_info: pool_action(),
                         exec_start_time: Some(*start),
                         dispatch_memory_prediction: None,
+                        dispatch_phase3: DispatchPhase3::default(),
                     },
                 );
             }

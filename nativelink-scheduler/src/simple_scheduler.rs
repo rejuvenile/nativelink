@@ -3119,6 +3119,12 @@ impl SimpleScheduler {
                         // accuracy gate (accuracy_predicted_under ≈ 0 ⇒ tail is a
                         // safe reservation) — so the observe-only signal is readable.
                         emit_prediction_accuracy_counters_log(worker_scheduler.get_metrics());
+                        // (#calib under-attribution) Same spawn-once cadence: dump
+                        // the top per-key under offenders (count-sorted, <= 20 rows,
+                        // ONE structured line) so the fine-tier under rate can be
+                        // attributed to specific keys. Rate-limited BY this cadence
+                        // — never per-event. Silent while no under has fired.
+                        worker_scheduler.emit_accuracy_under_offenders_log();
                         for (worker_id, construct_latency_ms_p95) in
                             worker_scheduler.construct_latency_snapshot().await
                         {

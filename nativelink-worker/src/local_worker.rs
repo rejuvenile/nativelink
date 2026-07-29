@@ -1506,6 +1506,13 @@ fn sample_mem_pressure(state: SwapSamplerState) -> SwapSamplerState {
     counters.compress_rate_last.store(compress_rate, Ordering::Relaxed);
     counters.decompress_rate_last.store(decompress_rate, Ordering::Relaxed);
     counters.swapin_rate_last.store(swapin_rate, Ordering::Relaxed);
+    // (#calib) Busy-window self-recording: high-water maxes + band-tick
+    // histograms on the SAME singleton, so the threshold-calibration soak can
+    // read burst history from /metrics after the burst (the instantaneous
+    // gauges above read 0 between bursts — 2026-07-28). Readable-path only:
+    // the unreadable early-return above records nothing (not a measurement,
+    // and the maxes must survive it). Cost: 7 relaxed atomic RMWs per tick.
+    counters.record_calibration_tick(compress_rate, decompress_rate, swapin_rate, churn_rounded);
 
     // OOM SUSTAINED-SWAPIN signal: require the swapin rate to stay at/above the
     // threshold for a consecutive-tick window (rejects one-off spikes).
@@ -10411,6 +10418,50 @@ mod tests {
         SWAPIN_CONFIRM_RATE.store(orig_rate, Ordering::Relaxed);
         SWAPIN_CONFIRM_WINDOW_TICKS.store(orig_window, Ordering::Relaxed);
         MEMORY_GATE_ENABLED.store(orig_gate, Ordering::Relaxed);
+    }
+
+    /// (#calib wiring) The PRODUCTION `sample_mem_pressure` readable-signals path
+    /// must feed the calibration self-recording (`record_calibration_tick` on the
+    /// `/metrics` singleton): each readable tick adds exactly ONE band-tick per
+    /// signal (3 total). Drives the real sampler through TWO ticks and asserts
+    /// the singleton's summed band counts advanced by >= 6. Delta-`>=` because
+    /// the singleton is process-wide and the counters monotonic — a parallel
+    /// test can only ADD ticks, never remove them (still `#[serial]` to follow
+    /// the sampler-atomics convention).
+    ///
+    /// `#[cfg(any(linux, macos))]`: only there does `read_memory_signals` return
+    /// `Some` (the readable path that records calibration ticks); the fallback
+    /// mem_impl early-returns before the recording point.
+    ///
+    /// Mutation (CLAUDE.md TDD #5): comment out the `record_calibration_tick`
+    /// call in `sample_mem_pressure` → the band sum stays flat → red-fails with
+    /// "sampler not feeding calibration bands".
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[serial(swap_sampler_atomics)]
+    fn sampler_records_calibration_bands_into_metrics_singleton() {
+        let counters = nativelink_util::o11_probes::memory_gate_counters();
+        let band_sum = || -> u64 {
+            counters
+                .compress_rate_bands
+                .iter()
+                .chain(counters.decompress_rate_bands.iter())
+                .chain(counters.swapin_rate_bands.iter())
+                .map(|b| b.load(Ordering::Relaxed))
+                .sum()
+        };
+        let before = band_sum();
+        let state = sample_mem_pressure(SwapSamplerState::new());
+        let _ = sample_mem_pressure(state);
+        let after = band_sum();
+        assert!(
+            after >= before + 6,
+            "sampler not feeding calibration bands: two readable \
+             sample_mem_pressure ticks must record >= 6 band-ticks (3 signals x 2 \
+             ticks) into the /metrics singleton, got {before} -> {after}. The \
+             swapin/churn threshold calibration data is DARK — the \
+             record_calibration_tick call is missing from the sampler."
+        );
     }
 
     /// (#task-memgate-twosignal, pair-a fix-up) A REALISTIC swapin rate, computed

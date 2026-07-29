@@ -62,6 +62,47 @@ pub enum WorkerUpdate {
     Disconnect,
 }
 
+/// (#calib under-attribution) Which Phase-3 enforce arm produced the memory
+/// reservation an action was DISPATCHED with, mirrored from
+/// `phase3_compute_effective_action_info`'s applied move. Threaded through the
+/// running-action record (the SAME plumbing as the [`ProfileTier`] dispatch
+/// marker) so the completion-side accuracy check can split
+/// `accuracy_predicted_under` by arm — the OOM-relevant question is whether an
+/// under happened on a reservation Phase-3 actually LOWERED (`Down`) or
+/// INJECTED, vs RAISEd/untouched. OBSERVE-ONLY: never read by any gate /
+/// reserve / restore decision (the store-once ledger is untouched).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase3Arm {
+    /// DOWN-overcommit lowered an existing declaration to the profiled p95
+    /// (floored at `declared / overcommit_max_factor`).
+    Down,
+    /// RAISE lifted an under-declared reservation to the profiled p95.
+    Raise,
+    /// Undeclared-INJECT stood a p95 reservation where none was declared.
+    Inject,
+    /// No Phase-3 override applied (flags off, no trusted profile, staleness
+    /// refusal, or effective == declared).
+    #[default]
+    Unmodified,
+}
+
+/// (#calib under-attribution) Dispatch-time Phase-3 context stashed on the
+/// running-action record alongside `dispatch_memory_prediction`: the applied
+/// [`Phase3Arm`] plus the client-DECLARED `memory_kb` at admission. The
+/// declared value must ride here because the STORED `action_info` is the
+/// store-once EFFECTIVE clone (its `memory_kb` is the RESERVED value after any
+/// override), so the pre-override declaration is otherwise unrecoverable at
+/// completion. `Default` = `Unmodified`/`0` — the value used by insert paths
+/// that never traverse the Phase-3 reserve (only meaningful next to a `Some`
+/// `dispatch_memory_prediction`, without which no under can be classified).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DispatchPhase3 {
+    /// Which enforce arm produced the dispatched reservation.
+    pub arm: Phase3Arm,
+    /// Client-declared `memory_kb` `Minimum` at admission (`0` = undeclared).
+    pub declared_kb: u64,
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct PendingActionInfoData {
     #[metric]
@@ -105,6 +146,13 @@ pub struct PendingActionInfoData {
     /// `remove_worker`) with zero bespoke cleanup — no side map, no leak surface.
     /// Read (never enforced) at completion by `record_action_resource_usage`.
     pub dispatch_memory_prediction: Option<(ProfileTier, u64, u64)>,
+
+    /// (#calib under-attribution) The Phase-3 arm + declared `memory_kb` this
+    /// action was dispatched under, stashed by the SAME reserve-point block that
+    /// stashes `dispatch_memory_prediction` (and auto-cleaned by the same
+    /// terminal paths). OBSERVE-ONLY — read only by the completion-side
+    /// accuracy attribution, never by gate/reduce/restore.
+    pub dispatch_phase3: DispatchPhase3,
 }
 
 /// (#sched-blend, security S1) Upper bound on the worker-reported P/E
@@ -575,6 +623,8 @@ impl Worker {
                         // (#task-resource-profile Phase-2c) reconnect-notify insert
                         // is dead in prod (Disconnect-only) → no dispatch prediction.
                         dispatch_memory_prediction: None,
+                        // (#calib) same dead path → no Phase-3 arm context.
+                        dispatch_phase3: DispatchPhase3::default(),
                     },
                 );
 

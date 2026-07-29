@@ -1774,10 +1774,67 @@ pub struct MemoryGateCounters {
     /// every sampler tick: set to 0 on the unreadable-signals early-return path,
     /// set to the computed level on the readable path. Non-monotonic gauge.
     pub pressure_level_mib: AtomicU32,
+
+    // ── (#calib swapin/churn threshold calibration) busy-window self-recording ──
+    // The `*_rate_last` / `churn_ewma` gauges above are INSTANTANEOUS: a scrape
+    // between busy windows reads 0, so the "measure a busy soak → set
+    // `memory_gate_swapin_confirm_rate` + churn low/high thresholds" plan can
+    // never complete from scrapes alone (2026-07-28: a benchmark burst came and
+    // went; the gauges read 0 after). These fields make the busy-window history
+    // self-recording: a HIGH-WATER max per signal (+ churn) and a fixed 6-band
+    // tick histogram per signal, all fed by [`Self::record_calibration_tick`]
+    // on the ~100 ms sampler tick (readable-signals path only). O(1) atomics
+    // per tick; reset only at process start.
+    /// High-water mark of the churn EWMA (`churn_ewma`) since process start.
+    /// `fetch_max` gauge — never reset, never decays.
+    pub churn_ewma_max: AtomicU32,
+    /// High-water mark of the raw per-second COMPRESSION rate since process
+    /// start. `fetch_max` gauge.
+    pub compress_rate_max: AtomicU32,
+    /// High-water mark of the raw per-second DECOMPRESSION rate since process
+    /// start. `fetch_max` gauge.
+    pub decompress_rate_max: AtomicU32,
+    /// High-water mark of the raw per-second SWAPIN rate since process start.
+    /// `fetch_max` gauge — the direct calibration input for
+    /// `memory_gate_swapin_confirm_rate` (currently suppressed at `u32::MAX`).
+    pub swapin_rate_max: AtomicU32,
+    /// Sampler-tick counts by COMPRESSION-rate band
+    /// `{0, 1-10, 11-100, 101-1000, 1001-10000, >10000}/s` (index 0..=5).
+    /// Monotonic counters — sustained-vs-spike is read from the band SHAPE
+    /// (the gate's sustained-N-ticks semantics needs tick-duration, which a
+    /// max alone cannot give).
+    pub compress_rate_bands: [AtomicU64; MEMORY_GATE_RATE_BANDS],
+    /// Sampler-tick counts by DECOMPRESSION-rate band (same bands as
+    /// [`Self::compress_rate_bands`]).
+    pub decompress_rate_bands: [AtomicU64; MEMORY_GATE_RATE_BANDS],
+    /// Sampler-tick counts by SWAPIN-rate band (same bands as
+    /// [`Self::compress_rate_bands`]).
+    pub swapin_rate_bands: [AtomicU64; MEMORY_GATE_RATE_BANDS],
+}
+
+/// (#calib) Number of fixed calibration rate bands:
+/// `{0, 1-10, 11-100, 101-1000, 1001-10000, >10000}` events/sec.
+pub const MEMORY_GATE_RATE_BANDS: usize = 6;
+
+/// (#calib) Map a per-second rate into its fixed calibration band index:
+/// `0 → 0`, `1-10 → 1`, `11-100 → 2`, `101-1000 → 3`, `1001-10000 → 4`,
+/// `>10000 → 5`. Pure so the band edges are unit-testable exactly.
+const fn rate_band_index(rate: u32) -> usize {
+    match rate {
+        0 => 0,
+        1..=10 => 1,
+        11..=100 => 2,
+        101..=1_000 => 3,
+        1_001..=10_000 => 4,
+        _ => 5,
+    }
 }
 
 impl MemoryGateCounters {
     const fn new() -> Self {
+        // Array-init idiom for a non-Copy const-constructible element: a const
+        // ITEM is instantiated per use, so `[ZERO_U64; N]` is N fresh atomics.
+        const ZERO_U64: AtomicU64 = AtomicU64::new(0);
         Self {
             nak_free_floor: AtomicU64::new(0),
             nak_swapin: AtomicU64::new(0),
@@ -1787,7 +1844,43 @@ impl MemoryGateCounters {
             swapin_rate_last: AtomicU32::new(0),
             swap_used_bytes: AtomicU64::new(0),
             pressure_level_mib: AtomicU32::new(0),
+            churn_ewma_max: AtomicU32::new(0),
+            compress_rate_max: AtomicU32::new(0),
+            decompress_rate_max: AtomicU32::new(0),
+            swapin_rate_max: AtomicU32::new(0),
+            compress_rate_bands: [ZERO_U64; MEMORY_GATE_RATE_BANDS],
+            decompress_rate_bands: [ZERO_U64; MEMORY_GATE_RATE_BANDS],
+            swapin_rate_bands: [ZERO_U64; MEMORY_GATE_RATE_BANDS],
         }
+    }
+
+    /// (#calib) Record one readable-signals sampler tick into the busy-window
+    /// self-recording state: high-water `fetch_max` per signal (+ churn) and
+    /// one band-tick per signal. Called from the worker memory-gate sampler
+    /// (`sample_mem_pressure`) on the readable path ONLY — the unreadable-signals
+    /// early-return does NOT call it (an unreadable tick is not a measurement,
+    /// and the maxes must survive it). Cost: 7 relaxed atomic RMWs per ~100 ms
+    /// tick; no allocation, no lock.
+    pub fn record_calibration_tick(
+        &self,
+        compress_rate: u32,
+        decompress_rate: u32,
+        swapin_rate: u32,
+        churn_ewma: u32,
+    ) {
+        self.compress_rate_max
+            .fetch_max(compress_rate, Ordering::Relaxed);
+        self.decompress_rate_max
+            .fetch_max(decompress_rate, Ordering::Relaxed);
+        self.swapin_rate_max
+            .fetch_max(swapin_rate, Ordering::Relaxed);
+        self.churn_ewma_max.fetch_max(churn_ewma, Ordering::Relaxed);
+        self.compress_rate_bands[rate_band_index(compress_rate)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.decompress_rate_bands[rate_band_index(decompress_rate)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.swapin_rate_bands[rate_band_index(swapin_rate)]
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1897,6 +1990,74 @@ impl MetricsComponent for MemoryGateCounters {
              sampler runs (server-only processes stay 0). Non-monotonic; per-worker \
              only — do NOT sum across processes."
         );
+        // ── (#calib) busy-window self-recording: high-water maxes + band ticks ──
+        // Same MetricKind::Default rendering note as above (the library renders
+        // numeric Default as `# TYPE ... counter`); the four maxes are
+        // NON-MONOTONIC-in-name only — they are in fact monotone high-water
+        // marks, but read the INSTANT value (no rate()). The 18 band counters
+        // ARE monotonic tick counts (`_total`).
+        let v = self.churn_ewma_max.load(Ordering::Relaxed);
+        publish!(
+            "churn_ewma_max",
+            &v,
+            MetricKind::Default,
+            "high-water mark of the churn EWMA since process start (fetch_max, \
+             never reset) — the busy-window churn peak a between-burst scrape \
+             would otherwise miss; calibration input for the churn-throttle \
+             low/high thresholds."
+        );
+        let v = self.compress_rate_max.load(Ordering::Relaxed);
+        publish!(
+            "compress_rate_max",
+            &v,
+            MetricKind::Default,
+            "high-water mark of the raw per-second COMPRESSION rate since \
+             process start (fetch_max, never reset). Calibration signal."
+        );
+        let v = self.decompress_rate_max.load(Ordering::Relaxed);
+        publish!(
+            "decompress_rate_max",
+            &v,
+            MetricKind::Default,
+            "high-water mark of the raw per-second DECOMPRESSION rate since \
+             process start (fetch_max, never reset). Calibration signal."
+        );
+        let v = self.swapin_rate_max.load(Ordering::Relaxed);
+        publish!(
+            "swapin_rate_max",
+            &v,
+            MetricKind::Default,
+            "high-water mark of the raw per-second SWAPIN rate since process \
+             start (fetch_max, never reset) — the direct calibration input for \
+             memory_gate_swapin_confirm_rate (currently suppressed at u32::MAX)."
+        );
+        // The 18 band-tick counters: sampler ticks (~100 ms each) whose rate fell
+        // in the band. Monotonic; band SHAPE distinguishes sustained pressure
+        // (many high-band ticks) from a spike (few) — what the gate's
+        // sustained-N-ticks semantics needs a threshold calibrated against.
+        for (signal, bands) in [
+            ("compress", &self.compress_rate_bands),
+            ("decompress", &self.decompress_rate_bands),
+            ("swapin", &self.swapin_rate_bands),
+        ] {
+            for (i, suffix) in ["0", "1_10", "11_100", "101_1k", "1k_10k", "gt10k"]
+                .iter()
+                .enumerate()
+            {
+                let v = bands[i].load(Ordering::Relaxed);
+                publish!(
+                    format!("{signal}_rate_band_{suffix}_total"),
+                    &v,
+                    MetricKind::Counter,
+                    format!(
+                        "sampler ticks (~100 ms) with the {signal} rate in band \
+                         {suffix} events/sec (bands 0, 1-10, 11-100, 101-1k, \
+                         1k-10k, >10k); monotonic — band shape distinguishes \
+                         sustained pressure from a spike."
+                    )
+                );
+            }
+        }
         Ok(MetricPublishKnownKindData::Component)
     }
 }
@@ -3896,6 +4057,172 @@ mod tests {
         assert!(
             !body.contains("memory_gate_memory_gate"),
             "#64 doubled metric name: rendered output contains `memory_gate_memory_gate`. \
+             body=\n{body}"
+        );
+    }
+
+    /// (#calib) `record_calibration_tick` must bucket each signal's rate into
+    /// the EXACT fixed band edges `{0, 1-10, 11-100, 101-1000, 1001-10000,
+    /// >10000}/s` — the gate's sustained-N-ticks semantics reads sustained-vs-
+    /// spike from the band SHAPE, so an off-by-one edge silently mis-attributes
+    /// a whole soak. Drives every boundary value on the swapin signal while
+    /// compress stays 0, proving per-signal independence.
+    ///
+    /// Mutation: change any edge in `rate_band_index` (e.g. `1..=10` → `1..=11`)
+    /// → the exact-array assert red-fails with "calibration band edges".
+    #[test]
+    fn memory_gate_rate_band_edges_bucket_correctly() {
+        let c = MemoryGateCounters::new();
+        // Every band boundary (low + high side of each edge) PLUS filler so each
+        // band receives a UNIQUE tick count [1,2,3,4,5,6] — an equal-count
+        // expected array would pass under a band-index swap (caught live by a
+        // passing mutation: swapping bands 1↔2 left [1,2,2,2,2,1] unchanged).
+        for rate in [
+            0u32, // band 0 (×1)
+            1, 10, // band 1 boundaries (×2)
+            11, 50, 100, // band 2 boundaries + filler (×3)
+            101, 500, 999, 1_000, // band 3 (×4)
+            1_001, 2_000, 5_000, 9_999, 10_000, // band 4 (×5)
+            10_001, 20_000, 100_000, 1_000_000, u32::MAX - 1, u32::MAX, // band 5 (×6)
+        ] {
+            c.record_calibration_tick(0, 0, rate, 0);
+        }
+        let swapin: Vec<u64> = c
+            .swapin_rate_bands
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            swapin,
+            vec![1, 2, 3, 4, 5, 6],
+            "calibration band edges: the 21 driven rates (all boundaries of \
+             {{0, 1-10, 11-100, 101-1k, 1k-10k, >10k}} + unique-count filler) must \
+             bucket into swapin bands [1,2,3,4,5,6] — an off-by-one OR a swapped \
+             band index in rate_band_index mis-attributes sustained-vs-spike"
+        );
+        let compress: Vec<u64> = c
+            .compress_rate_bands
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            compress,
+            vec![21, 0, 0, 0, 0, 0],
+            "calibration band independence: all 21 ticks had compress_rate=0, so \
+             ONLY compress band-0 may count — cross-signal leakage would poison \
+             the per-signal histograms"
+        );
+    }
+
+    /// (#calib) The `*_rate_max` / `churn_ewma_max` fields must be HIGH-WATER
+    /// marks: a later smaller tick must NOT lower them (this is what makes the
+    /// busy-window burst survive until the next scrape — the whole point of the
+    /// calibration change; the instantaneous `_rate_last` gauges already read 0
+    /// after a burst).
+    ///
+    /// Mutation: comment out any `fetch_max` in `record_calibration_tick` → the
+    /// corresponding assert red-fails with "high-water mark lost".
+    #[test]
+    fn memory_gate_rate_max_is_high_water() {
+        let c = MemoryGateCounters::new();
+        c.record_calibration_tick(500, 20_000, 7, 42);
+        c.record_calibration_tick(50, 3, 3, 7); // burst over; smaller tick
+        assert_eq!(
+            c.compress_rate_max.load(Ordering::Relaxed),
+            500,
+            "high-water mark lost: compress_rate_max must hold the burst peak 500 \
+             after a smaller (50) tick — record_calibration_tick must fetch_max, \
+             never store"
+        );
+        assert_eq!(
+            c.decompress_rate_max.load(Ordering::Relaxed),
+            20_000,
+            "high-water mark lost: decompress_rate_max must hold the burst peak \
+             20000 after a smaller (3) tick — record_calibration_tick must \
+             fetch_max, never store"
+        );
+        assert_eq!(
+            c.swapin_rate_max.load(Ordering::Relaxed),
+            7,
+            "high-water mark lost: swapin_rate_max must hold the burst peak 7 \
+             after a smaller (3) tick — this is the calibration input for \
+             memory_gate_swapin_confirm_rate"
+        );
+        assert_eq!(
+            c.churn_ewma_max.load(Ordering::Relaxed),
+            42,
+            "high-water mark lost: churn_ewma_max must hold the burst peak 42 \
+             after a smaller (7) tick — this is the calibration input for the \
+             churn low/high thresholds"
+        );
+    }
+
+    /// (#calib) EVERY new calibration metric name must render on the real
+    /// `/metrics` path under the production `memory_gate` prefix — the
+    /// worker-metrics-exposure trap (#37/#64/#86) is a name that increments
+    /// in-process but never renders. Pins all 22 EXACT literal names: 4
+    /// high-water maxes + 3 signals × 6 band-tick counters.
+    ///
+    /// Mutation: drop any `publish!` (or break a band-name `format!`) in
+    /// `MemoryGateCounters::publish` → red-fails with "calibration metric dark
+    /// on /metrics".
+    #[test]
+    fn memory_gate_render_prometheus_exposes_calibration_maxes_and_bands() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let counters = Arc::new(MemoryGateCounters::new());
+        // Distinctive sentinel per field so a misrouted band renders a
+        // different number (wrong-field guard).
+        counters.churn_ewma_max.store(61, Ordering::Relaxed);
+        counters.compress_rate_max.store(62, Ordering::Relaxed);
+        counters.decompress_rate_max.store(63, Ordering::Relaxed);
+        counters.swapin_rate_max.store(64, Ordering::Relaxed);
+        for (i, band) in counters.compress_rate_bands.iter().enumerate() {
+            band.store(70 + i as u64, Ordering::Relaxed);
+        }
+        for (i, band) in counters.decompress_rate_bands.iter().enumerate() {
+            band.store(76 + i as u64, Ordering::Relaxed);
+        }
+        for (i, band) in counters.swapin_rate_bands.iter().enumerate() {
+            band.store(82 + i as u64, Ordering::Relaxed);
+        }
+
+        let registry = MetricsRegistry::new();
+        // Prefix "memory_gate" — the exact key production nativelink.rs uses.
+        registry.register("memory_gate", counters);
+        let body = render_prometheus(&registry);
+
+        let mut expected: Vec<(String, u64)> = vec![
+            ("memory_gate_churn_ewma_max".to_string(), 61),
+            ("memory_gate_compress_rate_max".to_string(), 62),
+            ("memory_gate_decompress_rate_max".to_string(), 63),
+            ("memory_gate_swapin_rate_max".to_string(), 64),
+        ];
+        for (signal, base) in [("compress", 70u64), ("decompress", 76), ("swapin", 82)] {
+            for (i, suffix) in ["0", "1_10", "11_100", "101_1k", "1k_10k", "gt10k"]
+                .iter()
+                .enumerate()
+            {
+                expected.push((
+                    format!("memory_gate_{signal}_rate_band_{suffix}_total"),
+                    base + i as u64,
+                ));
+            }
+        }
+        assert_eq!(expected.len(), 22, "self-check: 4 maxes + 18 band counters");
+        for (name, value) in &expected {
+            let needle = format!("\n{name} {value}\n");
+            assert!(
+                body.contains(&needle),
+                "calibration metric dark on /metrics: expected exact line `{name} \
+                 {value}` from the render_prometheus walk, but it is ABSENT — the \
+                 swapin/churn threshold calibration soak cannot read it. body=\n{body}"
+            );
+        }
+        // Guard the doubled-prefix trap.
+        assert!(
+            !body.contains("memory_gate_memory_gate"),
+            "doubled metric name: rendered output contains `memory_gate_memory_gate`. \
              body=\n{body}"
         );
     }
