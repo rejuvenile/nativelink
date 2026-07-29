@@ -30,7 +30,7 @@ use moka::sync::Cache;
 use nativelink_config::stores::EvictionPolicy;
 use nativelink_metric::MetricsComponent;
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{info, warn};
 
 use crate::background_spawn;
@@ -88,6 +88,35 @@ pub const PIN_TIMEOUT_SECS: u64 = 120;
 /// it adds no `time_to_live`/`time_to_idle` to cache entries; it is a
 /// loop-driven maintenance call exactly like `expire_stale_pins`.
 const DRAIN_INTERVAL_SECS: u64 = 10;
+/// (FINDING 2 moka-eviction-wedge, 2026-07-28) Number of CONSECUTIVE
+/// drain-arm evaluations that must observe the cache at-or-over
+/// `max_bytes` with ZERO eviction progress (`evicted_items` unchanged)
+/// before the self-healing fallback evictor fires. moka 0.12.15's
+/// `evict_lru_entries` livelocks when the probation-deque front node is
+/// stale (invalidated + re-inserted key → different `EntryInfo`;
+/// `skip_updated_entry_ao` moves the MAP entry's node back but never the
+/// peeked stale front → re-peeks the same node every maintenance call,
+/// evicts 0, forever). Our pin path mints exactly that churn
+/// (`pin_key_with_mode` = `cache.invalidate`, `unpin_key` = bare
+/// `cache.insert`). Production: 2 of 10 workers wedged at 3.3× over a
+/// 40 GB budget for 4 days. The frozen-evictions requirement is what
+/// prevents false-firing during normal at-cap operation: a healthy
+/// at-cap cache under churn evicts every tick, so the counter always
+/// advances and the fallback never triggers.
+const WEDGE_FROZEN_TICKS_TRIGGER: u64 = 3;
+/// Bound on fallback key-walk rounds per self-heal firing. Each round is
+/// capped at `EVICT_SCAN_HARD_CAP` (10 000) scanned entries, so 64 rounds
+/// covers ~640K entries — far above the ~92K-entry production worker map
+/// that motivated the fallback. Hitting this bound leaves the wedge gauge
+/// set and the next trigger re-fires 3 ticks later (bounded duty cycle).
+const WEDGE_SELFHEAL_MAX_ROUNDS: u32 = 64;
+/// (FINDING 2 piece 3) Minimum interval between ACCEPTED
+/// [`MokaEvictingMap::kick_drain`] wakes of the background drain arm. The
+/// disk-pressure NAK site kicks on every refused action; one drain pass
+/// per few seconds is plenty (the periodic arm already runs every
+/// `DRAIN_INTERVAL_SECS` anyway) and the limit keeps a NAK storm from
+/// turning into a busy drain loop.
+const DRAIN_KICK_MIN_INTERVAL_MILLIS: u64 = 5_000;
 /// Diagnostic-only stale-pin alert threshold. An INDEFINITE pin
 /// (worker-local F2 output blob, held until the server's
 /// BlobsInStableStorage ack calls [`MokaEvictingMap::unpin_key`]) that is
@@ -192,6 +221,42 @@ pub struct StalePinAlertSummary {
     /// `STALE_PIN_ALERT_MAX_LINES`). Distinct from `stale_count` so the
     /// flood cap is independently testable.
     pub lines_emitted: usize,
+}
+
+/// (FINDING 2 moka-eviction-wedge) Outcome of one
+/// [`MokaEvictingMap::maybe_selfheal_wedged_eviction`] evaluation,
+/// returned so tests can assert each branch of the trigger predicate
+/// with a bespoke message instead of inferring state from side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WedgeSelfHealOutcome {
+    /// Startup reconcile gate armed — evaluation suppressed, identically
+    /// to the drain tick itself (FL-688 v3 Stage C: the fallback must
+    /// never race the reconcile-pin window).
+    SuppressedReconcileGate,
+    /// No byte budget configured (`max_bytes == 0`) — the trigger
+    /// predicate can never hold.
+    NoByteBudget,
+    /// Observed weighted bytes strictly under `max_bytes` — trigger state
+    /// reset (frozen-tick count zeroed, wedge gauge cleared).
+    UnderBudget,
+    /// At-or-over budget but `evicted_items` advanced since the previous
+    /// evaluation: eviction is making progress, no wedge. Trigger state
+    /// reset. This is the branch that prevents false-firing during
+    /// normal at-cap operation.
+    ProgressObserved,
+    /// At-or-over budget with frozen evictions, but below the
+    /// `WEDGE_FROZEN_TICKS_TRIGGER` consecutive-evaluation threshold.
+    /// Carries the frozen-tick count so far.
+    Accumulating(u64),
+    /// Trigger met — the fallback key-walk evictor fired.
+    Fired {
+        /// Entries evicted across all rounds of this firing.
+        evicted_count: u64,
+        /// Bytes (value `len()` sum) evicted across all rounds.
+        evicted_bytes: u64,
+        /// Key-walk rounds executed (each bounded by `EVICT_SCAN_HARD_CAP`).
+        rounds: u32,
+    },
 }
 
 /// Hard cap on entries `evict_unpinned_lru_bytes` may scan in a single
@@ -340,6 +405,46 @@ pub struct MokaEvictingMap<
     /// set-once before the first insert on the single-threaded boot path, so no
     /// ordering against the reads is needed.
     boot_epoch: AtomicU64,
+    /// (FINDING 2 moka-eviction-wedge) Consecutive drain-arm evaluations
+    /// that observed the cache at-or-over `max_bytes` with `evicted_items`
+    /// unchanged. Reset to 0 whenever the cache is under budget or
+    /// evictions progress; at `WEDGE_FROZEN_TICKS_TRIGGER` the fallback
+    /// evictor fires. Only the background drain task writes it (single
+    /// evaluator), so `Relaxed` suffices.
+    selfheal_frozen_ticks: AtomicU64,
+    /// (FINDING 2) `evicted_items` value at the previous drain-arm
+    /// evaluation — the frozen-evictions sensor baseline.
+    selfheal_last_evicted_items: AtomicU64,
+    /// (FINDING 2 piece 2) Wedge gauge: `true` while the self-heal trigger
+    /// condition holds (at-or-over budget AND evictions frozen for the
+    /// full `WEDGE_FROZEN_TICKS_TRIGGER` window). Published as the
+    /// `eviction_wedge_detected` 0/1 gauge so a wedged evictor pages
+    /// instead of sitting dark (3.3× over budget + 3K NAKs paged nothing).
+    eviction_wedge_detected: AtomicBool,
+    /// (FINDING 2 piece 1) Count of self-heal firings. `CounterWithTime`
+    /// so the render also carries `last_time` — "when did the wedge last
+    /// self-heal" is the staleness signal an operator alert wants.
+    eviction_wedge_selfheal_total: CounterWithTime,
+    /// (FINDING 2, test seam) When non-zero, overrides the weighted-bytes
+    /// observation `maybe_selfheal_wedged_eviction` reads. A genuinely
+    /// over-budget cache with a FRESH `weighted_size()` is by construction
+    /// the wedged state (any completed maintenance pass either evicts to
+    /// cap or is wedged), which tests cannot reproduce without moka's bug;
+    /// this override injects the trigger observation while the
+    /// EVICTION-EXECUTION half still runs against the real cache. Never
+    /// set in production (one relaxed load per 10 s tick to check).
+    test_observed_weighted_bytes_override: AtomicU64,
+    /// (FINDING 2 piece 3) Wake signal for the background drain arm. The
+    /// disk-pressure NAK site kicks this (via
+    /// `FilesystemStore::kick_eviction_drain`) so the admission gate
+    /// actively drives eviction (`gate ⇒ evict`) instead of only refusing
+    /// work while the evictor may be wedged.
+    drain_kick: Notify,
+    /// (FINDING 2 piece 3) Rate-limit anchor for `kick_drain`.
+    drain_kick_anchor: Instant,
+    /// (FINDING 2 piece 3) `drain_kick_anchor.elapsed()` millis (+1 so 0
+    /// means "never kicked") of the last ACCEPTED kick.
+    last_drain_kick_millis: AtomicU64,
     // Metrics
     evicted_bytes: Counter,
     evicted_items: CounterWithTime,
@@ -499,6 +604,31 @@ where
             &weighted_size_bytes,
             nativelink_metric::MetricKind::Default,
             "Live weighted size (bytes) of moka cache entries: weighted_size × 1024 (the weigher's KB scale, matching would_exceed_capacity). Use this — not weighted_size — for byte-vs-disk comparisons; reading weighted_size as bytes under-counts by 1024×. Pinned-only bytes accounted separately under pinned_bytes."
+        );
+        // (FINDING 2 piece 2) Wedge observability, on the same
+        // live-rendering tree as weighted_size_bytes (dark-counter trap:
+        // the production wedge sat at 3.3x over budget + 3K disk NAKs and
+        // nothing paged).
+        let overshoot_bytes: u64 = weighted_size_bytes.saturating_sub(self.max_bytes);
+        let eviction_wedge_detected: u64 =
+            u64::from(self.eviction_wedge_detected.load(Ordering::Relaxed));
+        nativelink_metric::publish!(
+            "overshoot_bytes",
+            &overshoot_bytes,
+            nativelink_metric::MetricKind::Default,
+            "FINDING 2: bytes the live weighted size (weighted_size_bytes) exceeds max_bytes; 0 while at-or-under budget. A sustained non-zero value with evicted_items frozen is the moka eviction-wedge signature — alert on it."
+        );
+        nativelink_metric::publish!(
+            "eviction_wedge_detected",
+            &eviction_wedge_detected,
+            nativelink_metric::MetricKind::Default,
+            "FINDING 2: 1 while the eviction-wedge self-heal trigger condition holds (weighted size at-or-over max_bytes AND evicted_items frozen for the full trigger window); 0 otherwise. Page on sustained 1 — the built-in fallback evictor is compensating for a wedged moka evictor."
+        );
+        nativelink_metric::publish!(
+            "eviction_wedge_selfheal_total",
+            &self.eviction_wedge_selfheal_total,
+            nativelink_metric::MetricKind::Component,
+            "FINDING 2: eviction-wedge self-heal firings (CounterWithTime — emits .counter and .last_time; one increment + one warn per firing, never per evicted entry)."
         );
         nativelink_metric::publish!(
             "max_bytes",
@@ -795,6 +925,14 @@ where
             // collide with the unset sentinel.
             clock: AtomicU64::new(1),
             boot_epoch: AtomicU64::new(boot_epoch),
+            selfheal_frozen_ticks: AtomicU64::new(0),
+            selfheal_last_evicted_items: AtomicU64::new(0),
+            eviction_wedge_detected: AtomicBool::new(false),
+            eviction_wedge_selfheal_total: CounterWithTime::default(),
+            test_observed_weighted_bytes_override: AtomicU64::new(0),
+            drain_kick: Notify::new(),
+            drain_kick_anchor: Instant::now(),
+            last_drain_kick_millis: AtomicU64::new(0),
             evicted_bytes: Counter::default(),
             evicted_items: CounterWithTime::default(),
             replaced_bytes: Counter::default(),
@@ -2346,6 +2484,197 @@ where
         Arc::clone(&self.reconcile_complete)
     }
 
+    /// (FINDING 2, test seam) Force the weighted-bytes observation the
+    /// wedge trigger reads. See `test_observed_weighted_bytes_override`.
+    /// `0` restores the real `cache.weighted_size()` observation.
+    #[doc(hidden)]
+    pub fn test_force_wedge_observation(&self, weighted_bytes: u64) {
+        self.test_observed_weighted_bytes_override
+            .store(weighted_bytes, Ordering::Relaxed);
+    }
+
+    /// (FINDING 2) The weighted-bytes observation the wedge trigger reads:
+    /// the moka weigher's KB-weight sum scaled back to bytes — the SAME
+    /// derivation `would_exceed_capacity` uses for its cache term (pinned
+    /// bytes deliberately excluded here: the fallback substitutes for
+    /// moka's OWN evictor, which only sees cache residents; pinned entries
+    /// live outside the cache under their separately-capped 25% budget).
+    /// The weigher rounds sizes UP, so this over-estimates true bytes —
+    /// the safe direction (can never under-fire on a real overshoot).
+    fn observed_weighted_bytes(&self) -> u64 {
+        let over = self
+            .test_observed_weighted_bytes_override
+            .load(Ordering::Relaxed);
+        if over != 0 {
+            return over;
+        }
+        const SCALE: u64 = 1024;
+        self.cache.weighted_size().saturating_mul(SCALE)
+    }
+
+    /// (FINDING 2) One evaluation of the eviction-wedge self-heal trigger,
+    /// run by BOTH background drain arms (periodic tick + NAK kick) right
+    /// after `run_pending_tasks_and_drain`.
+    ///
+    /// Trigger: the cache is AT-OR-OVER `max_bytes` AND `evicted_items`
+    /// has not advanced for `WEDGE_FROZEN_TICKS_TRIGGER` consecutive
+    /// evaluations. moka 0.12.15's `evict_lru_entries` can livelock on a
+    /// stale probation-deque front node (see `WEDGE_FROZEN_TICKS_TRIGGER`
+    /// docs); in that state `run_pending_tasks` returns normally but
+    /// evicts 0 forever while the weight ledger stays accurate — this
+    /// evaluation detects exactly that signature and re-establishes the
+    /// budget via the deque-INDEPENDENT key walk
+    /// (`evict_unpinned_lru_bytes`: `cache.iter()` scans the hash-table
+    /// segments; `cache.invalidate` removes map entries directly and its
+    /// `WriteOp::Remove` weight decrement in moka's `handle_remove`
+    /// unlinks each entry's own deque node — none of it peeks the wedged
+    /// probation front).
+    ///
+    /// `#[doc(hidden)] pub` so tests drive evaluations deterministically
+    /// (like `expire_stale_pins`); production callers are the two drain
+    /// arms only.
+    #[doc(hidden)]
+    pub async fn maybe_selfheal_wedged_eviction(&self) -> WedgeSelfHealOutcome {
+        // Suppressed IDENTICALLY to the drain tick while the FL-688
+        // startup reconcile gate is armed (belt + braces: both arms also
+        // check before calling). Leaves trigger state untouched.
+        if !self.reconcile_complete.load(Ordering::Acquire) {
+            return WedgeSelfHealOutcome::SuppressedReconcileGate;
+        }
+        if self.max_bytes == 0 {
+            return WedgeSelfHealOutcome::NoByteBudget;
+        }
+        let observed = self.observed_weighted_bytes();
+        let evicted_now = self.evicted_items.counter.load(Ordering::Relaxed);
+        // OPERATOR-SPECIFIED THRESHOLD (2026-07-28, do not change):
+        // trigger at `observed >= max_bytes`, NOT a slack multiple like
+        // 1.05×max — with a slack multiplier a wedge sitting between max
+        // and the slack line never self-heals and the budget stays
+        // violated forever. Compared in the weigher-derived bytes against
+        // the same `self.max_bytes` that `would_exceed_capacity` uses.
+        if observed < self.max_bytes {
+            self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
+            self.selfheal_last_evicted_items
+                .store(evicted_now, Ordering::Relaxed);
+            self.eviction_wedge_detected.store(false, Ordering::Relaxed);
+            return WedgeSelfHealOutcome::UnderBudget;
+        }
+        let last = self
+            .selfheal_last_evicted_items
+            .swap(evicted_now, Ordering::Relaxed);
+        if evicted_now != last {
+            // Evictions are progressing (any pipeline event: size/LRU,
+            // TTL, explicit remove — all advance `evicted_items` via
+            // `process_eviction_event`). Normal at-cap operation lands
+            // here every tick, which is what prevents false-firing.
+            self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
+            self.eviction_wedge_detected.store(false, Ordering::Relaxed);
+            return WedgeSelfHealOutcome::ProgressObserved;
+        }
+        let frozen = self.selfheal_frozen_ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        if frozen < WEDGE_FROZEN_TICKS_TRIGGER {
+            return WedgeSelfHealOutcome::Accumulating(frozen);
+        }
+
+        // Trigger met — the evictor is wedged. Fire the fallback.
+        self.eviction_wedge_detected.store(true, Ordering::Relaxed);
+        self.eviction_wedge_selfheal_total.inc();
+        // Bring the weighted size back STRICTLY under `max_bytes`. The
+        // `.max(1)` covers the `== max` equality the `>=` trigger admits:
+        // a zero overshoot still evicts one entry so the boundary state
+        // converges under budget instead of re-firing every
+        // `WEDGE_FROZEN_TICKS_TRIGGER` ticks forever.
+        let mut target = observed.saturating_sub(self.max_bytes).max(1);
+        let mut total_count = 0u64;
+        let mut total_bytes = 0u64;
+        let mut rounds = 0u32;
+        while rounds < WEDGE_SELFHEAL_MAX_ROUNDS {
+            let report = self.evict_unpinned_lru_bytes(target);
+            // Route the invalidations through the NORMAL eviction
+            // pipeline (listener → event → unref + removal callbacks) so
+            // disk file, index entry, and BlobChangeTracker delta stay
+            // consistent. This task is the background drainer (sole
+            // owner of the periodic drain), so draining inline here is
+            // the same single-consumer discipline as the drain arms.
+            self.drain_pending_evictions().await;
+            total_count += report.evicted_count;
+            total_bytes += report.evicted_bytes;
+            rounds += 1;
+            if report.evicted_count == 0 {
+                // No evictable candidates left (everything remaining is
+                // pin-protected or the cache is empty). Leave the wedge
+                // gauge set; the next trigger re-fires 3 ticks later.
+                break;
+            }
+            // Re-read the REAL post-eviction weighted size (the rounds
+            // after the first are driven by actual convergence, not the
+            // trigger observation).
+            const SCALE: u64 = 1024;
+            let live = self.cache.weighted_size().saturating_mul(SCALE);
+            if live < self.max_bytes {
+                break;
+            }
+            target = live.saturating_sub(self.max_bytes).max(1);
+        }
+        // Our own fallback evictions advanced `evicted_items` (via
+        // `process_eviction_event`); re-baseline on the post-heal value
+        // so a still-wedged cache needs a fresh N frozen ticks before the
+        // next firing (bounded duty cycle), and a healed cache reads
+        // "no progress" correctly rather than a phantom "progress".
+        self.selfheal_frozen_ticks.store(0, Ordering::Relaxed);
+        self.selfheal_last_evicted_items.store(
+            self.evicted_items.counter.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        // ONE warn per firing (never per evicted entry).
+        warn!(
+            target: "nativelink::eviction_wedge_selfheal",
+            observed_weighted_bytes = observed,
+            max_bytes = self.max_bytes,
+            evicted_count = total_count,
+            evicted_bytes = total_bytes,
+            rounds,
+            frozen_ticks = WEDGE_FROZEN_TICKS_TRIGGER,
+            "moka eviction wedge self-heal fired: evictions made no progress while \
+             at-or-over budget (FINDING 2 stale-probation-front livelock signature); \
+             fallback key-walk evictor ran"
+        );
+        WedgeSelfHealOutcome::Fired {
+            evicted_count: total_count,
+            evicted_bytes: total_bytes,
+            rounds,
+        }
+    }
+
+    /// (FINDING 2 piece 3) Rate-limited wake of the background drain arm.
+    /// Called from the worker's disk-pressure NAK site (via
+    /// `FilesystemStore::kick_eviction_drain`) so the admission gate
+    /// actively drives eviction (`gate ⇒ evict`) instead of only refusing
+    /// work. Non-blocking: one atomic compare-exchange + `notify_one`; no
+    /// locks, no awaits — safe inline on any path. Returns whether the
+    /// kick was accepted (`false` = within `DRAIN_KICK_MIN_INTERVAL_MILLIS`
+    /// of the previous accepted kick, or lost a race to a concurrent
+    /// kicker — either way a drain pass is already imminent).
+    pub fn kick_drain(&self) -> bool {
+        // `+ 1` so a stored 0 always means "never kicked".
+        let now_millis = self.drain_kick_anchor.elapsed().as_millis() as u64 + 1;
+        let last = self.last_drain_kick_millis.load(Ordering::Relaxed);
+        if last != 0 && now_millis.saturating_sub(last) < DRAIN_KICK_MIN_INTERVAL_MILLIS {
+            return false;
+        }
+        if self
+            .last_drain_kick_millis
+            .compare_exchange(last, now_millis, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        // `notify_one` stores a permit if the drain arm is not currently
+        // awaiting, so a kick between select iterations is never lost.
+        self.drain_kick.notify_one();
+        true
+    }
+
     pub fn start_background_eviction(self: &Arc<Self>) {
         if self
             .background_running
@@ -2417,25 +2746,41 @@ where
                     self.sweep_stale_indefinite_pins();
                 }
                 _ = drain_interval.tick() => {
-                    // (FL-688 v3 Stage C) Skip the forced drain during the
-                    // worker startup reconcile window. The PRIMARY protection
-                    // is reconcile-pin (`pin_digest_indefinite_with_result`);
-                    // this gate is SECONDARY — it prevents the EXPLICIT
-                    // periodic LRU sweep from racing the reconcile-pin call.
-                    // Per-insert moka eviction (in `insert_inner`) cannot be
-                    // gated here; pinning each blob handles that.
-                    // Acquire matches the Release in `release_startup_reconcile_gate`.
-                    if !self.reconcile_complete.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    // Force moka's capacity check + drain the resulting
-                    // eviction events on THIS task (the sole owner of the
-                    // shared `pending_evictions` queue) — never a parallel
-                    // task, which would double-drain the queue.
-                    self.run_pending_tasks_and_drain().await;
+                    self.gated_drain_arm().await;
+                }
+                // (FINDING 2 piece 3) Disk-NAK force-drain kick: the
+                // worker's disk-pressure gate wakes this arm (rate-limited
+                // at `kick_drain`) so `gate ⇒ evict` holds actively — the
+                // gate's "eviction catches up" premise is driven, not
+                // assumed. Runs the SAME gated body as the periodic tick.
+                () = self.drain_kick.notified() => {
+                    self.gated_drain_arm().await;
                 }
             }
         }
+    }
+
+    /// Shared body of the periodic drain tick and the disk-NAK kick arm.
+    ///
+    /// (FL-688 v3 Stage C) Skips the forced drain during the worker
+    /// startup reconcile window. The PRIMARY protection is reconcile-pin
+    /// (`pin_digest_indefinite_with_result`); this gate is SECONDARY — it
+    /// prevents the EXPLICIT periodic LRU sweep from racing the
+    /// reconcile-pin call. Per-insert moka eviction (in `insert_inner`)
+    /// cannot be gated here; pinning each blob handles that. Acquire
+    /// matches the Release in `release_startup_reconcile_gate`.
+    ///
+    /// When the gate is open: forces moka's capacity check + drains the
+    /// resulting eviction events on THIS task (the sole owner of the
+    /// shared `pending_evictions` queue) — never a parallel task, which
+    /// would double-drain the queue — then runs one eviction-wedge
+    /// self-heal evaluation (FINDING 2 piece 1).
+    async fn gated_drain_arm(&self) {
+        if !self.reconcile_complete.load(Ordering::Acquire) {
+            return;
+        }
+        self.run_pending_tasks_and_drain().await;
+        self.maybe_selfheal_wedged_eviction().await;
     }
 
     async fn process_eviction_event(&self, event: EvictionEvent<K, T>) {
@@ -2652,7 +2997,10 @@ mod tests {
 
     use nativelink_config::stores::EvictionPolicy;
 
-    use super::{MokaEvictingMap, PinnedEntry, PIN_SATURATION_HEADROOM_DIVISOR, PIN_TIMEOUT_SECS};
+    use super::{
+        MokaEvictingMap, PinnedEntry, WedgeSelfHealOutcome, PIN_SATURATION_HEADROOM_DIVISOR,
+        PIN_TIMEOUT_SECS, WEDGE_FROZEN_TICKS_TRIGGER,
+    };
     use crate::evicting_map::{ItemCallback, LenEntry};
 
     // ---------------------------------------------------------------
@@ -4453,4 +4801,563 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------
+    // FINDING 2 (moka-eviction-wedge): self-healing fallback evictor +
+    // wedge observability + disk-NAK drain kick.
+    //
+    // Simulation seam: a genuinely over-budget cache with a FRESH
+    // `weighted_size()` is by construction the WEDGED state (a completed
+    // moka maintenance pass either evicts to cap or is livelocked on the
+    // stale probation front), which a test cannot reproduce without
+    // moka's bug. `test_force_wedge_observation` therefore injects the
+    // TRIGGER observation, while the EVICTION-EXECUTION half always runs
+    // against the REAL map (real `cache.iter()` walk, real `invalidate`,
+    // real listener → event → unref → removal callbacks).
+    // ---------------------------------------------------------------
+
+    /// (FINDING 2) Budget for the wedge tests: 100 KiB = 100 weigher
+    /// KB-units, so 1024-byte entries map 1:1 onto weights.
+    const WEDGE_MAX_BYTES: usize = 100 * 1024;
+
+    /// Map holding `n` 1 KiB entries inserted via the RUNTIME path (each
+    /// insert enforces the cap; with `n` ≤ 100 the cache is under budget,
+    /// no eviction fires, `evicted_items` stays frozen at 0).
+    async fn wedge_map_with_entries(n: u64) -> (Arc<TestMapCb>, Arc<AtomicU64>) {
+        let cfg = policy(WEDGE_MAX_BYTES, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+        for k in 0..n {
+            map.insert(k, BytesEntry(1024)).await;
+        }
+        (map, removal_count)
+    }
+
+    /// Piece 1 primary contract (invariant-walk test): the fallback
+    /// evictor FIRES after `WEDGE_FROZEN_TICKS_TRIGGER` consecutive
+    /// at-or-over-budget evaluations with frozen evictions, and evicts
+    /// the overshoot from the REAL map through the NORMAL eviction
+    /// pipeline.
+    ///
+    /// Mutation step: comment out the trigger (the `Fired` branch call to
+    /// the heal loop, or the frozen-tick accumulation) in
+    /// `maybe_selfheal_wedged_eviction` → red-fails with the bespoke
+    /// "fallback evictor must FIRE" message.
+    #[tokio::test]
+    async fn fallback_evictor_fires_when_eviction_wedged_at_cap() {
+        let (map, removal_count) = wedge_map_with_entries(50).await;
+        // Inject the wedge observation: 130 KiB >= the 100 KiB budget
+        // (30 KiB overshoot). Real map: 50 KiB resident, evictions frozen.
+        map.test_force_wedge_observation(130 * 1024);
+
+        for expect_ticks in 1..WEDGE_FROZEN_TICKS_TRIGGER {
+            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::Accumulating(expect_ticks),
+                "below the {WEDGE_FROZEN_TICKS_TRIGGER}-evaluation trigger the fallback must only \
+                 ACCUMULATE frozen ticks (got {outcome:?} at tick {expect_ticks})"
+            );
+        }
+        let outcome = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            map.maybe_selfheal_wedged_eviction(),
+        )
+        .await
+        .expect("must not deadlock — self-heal eviction-event drain wedged");
+        match outcome {
+            WedgeSelfHealOutcome::Fired {
+                evicted_count,
+                evicted_bytes,
+                rounds,
+            } => {
+                assert_eq!(
+                    evicted_count, 30,
+                    "self-heal must evict exactly the overshoot (30 KiB / 1 KiB entries = 30)"
+                );
+                assert_eq!(
+                    evicted_bytes,
+                    30 * 1024,
+                    "self-heal evicted_bytes must equal the 30 KiB overshoot"
+                );
+                assert_eq!(rounds, 1, "a 30-entry overshoot must heal in one key-walk round");
+            }
+            other => panic!(
+                "moka-wedge self-heal: fallback evictor must FIRE after \
+                 {WEDGE_FROZEN_TICKS_TRIGGER} frozen at-or-over-budget evaluations — without \
+                 it eviction stays permanently dead while over budget (FINDING 2: 3.3x over \
+                 max_bytes for 4 days); got {other:?}"
+            ),
+        }
+        // Index-visibility: fallback evictions must flow through the
+        // normal eviction listener → event → removal callback pipeline
+        // (disk file + index entry + BlobChangeTracker delta stay
+        // consistent).
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            30,
+            "fallback evictions must fire the normal removal callbacks (index-visibility \
+             contract) — got {} callback firings for 30 evictions",
+            removal_count.load(Ordering::Relaxed),
+        );
+        // Piece 2 accounting.
+        assert!(
+            map.eviction_wedge_detected.load(Ordering::Relaxed),
+            "piece 2: eviction_wedge_detected gauge must be 1 while the trigger condition holds"
+        );
+        assert_eq!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed),
+            1,
+            "piece 1: eviction_wedge_selfheal_total must count exactly ONE firing (one warn \
+             per firing, not per evicted entry)"
+        );
+        // Restoring the real (under-budget) observation resets state and
+        // clears the gauge on the next evaluation.
+        map.test_force_wedge_observation(0);
+        let outcome = map.maybe_selfheal_wedged_eviction().await;
+        assert_eq!(
+            outcome,
+            WedgeSelfHealOutcome::UnderBudget,
+            "with the override cleared the real 20 KiB residency is under budget"
+        );
+        assert!(
+            !map.eviction_wedge_detected.load(Ordering::Relaxed),
+            "piece 2: the wedge gauge must CLEAR once the cache is observed under budget"
+        );
+    }
+
+    /// Inert direction 1: strictly under `max_bytes` the fallback never
+    /// accumulates or fires; an interleaved under-budget observation
+    /// RESETS the consecutive-frozen-tick count.
+    ///
+    /// Mutation step: remove the `observed < max_bytes` early-return (or
+    /// the frozen-tick reset in it) → red-fails with the bespoke
+    /// under-budget / reset messages.
+    #[tokio::test]
+    async fn fallback_evictor_inert_below_max_and_requires_consecutive_ticks() {
+        let (map, removal_count) = wedge_map_with_entries(50).await;
+
+        map.test_force_wedge_observation(WEDGE_MAX_BYTES as u64 - 1024);
+        for _ in 0..5 {
+            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::UnderBudget,
+                "under-budget evaluations must be inert — a fallback that fires below \
+                 max_bytes would evict a healthy cache (got {outcome:?})"
+            );
+        }
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "no fallback eviction may fire below max_bytes"
+        );
+        assert_eq!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed),
+            0,
+            "selfheal_total must stay 0 below max_bytes"
+        );
+
+        // over, over, UNDER, over, over → no fire (each frozen run is
+        // below the 3-evaluation trigger); the 3rd consecutive fires.
+        let over = WEDGE_MAX_BYTES as u64 + 10 * 1024;
+        map.test_force_wedge_observation(over);
+        assert_eq!(
+            map.maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::Accumulating(1)
+        );
+        assert_eq!(
+            map.maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::Accumulating(2)
+        );
+        map.test_force_wedge_observation(WEDGE_MAX_BYTES as u64 - 1024);
+        assert_eq!(
+            map.maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::UnderBudget,
+            "an under-budget observation must reset the frozen-tick accumulation"
+        );
+        map.test_force_wedge_observation(over);
+        assert_eq!(
+            map.maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::Accumulating(1),
+            "frozen-tick count must restart from 1 after an under-budget reset — \
+             NON-consecutive over-budget observations must never fire"
+        );
+        assert_eq!(
+            map.maybe_selfheal_wedged_eviction().await,
+            WedgeSelfHealOutcome::Accumulating(2)
+        );
+        let outcome = map.maybe_selfheal_wedged_eviction().await;
+        assert!(
+            matches!(outcome, WedgeSelfHealOutcome::Fired { .. }),
+            "the {WEDGE_FROZEN_TICKS_TRIGGER}rd CONSECUTIVE frozen at-or-over evaluation \
+             must fire (got {outcome:?})"
+        );
+    }
+
+    /// Inert direction 2 (the no-false-fire proof for normal at-cap
+    /// operation): at-or-over budget WITH real eviction progress between
+    /// evaluations never accumulates or fires — evictions progressing
+    /// every tick ⇒ no trigger.
+    ///
+    /// Mutation step: remove the `evicted_now != last` progress branch →
+    /// red-fails with the bespoke "progressing evictions" message.
+    #[tokio::test]
+    async fn fallback_evictor_inert_when_evictions_progressing_at_cap() {
+        // Fill EXACTLY to the 100-weight cap so each further runtime
+        // insert genuinely evicts (real moka LRU eviction → the
+        // `evicted_items` sensor advances).
+        let (map, _removal_count) = wedge_map_with_entries(100).await;
+        map.test_force_wedge_observation(WEDGE_MAX_BYTES as u64 + 50 * 1024);
+        for k in 0..6u64 {
+            map.insert(1000 + k, BytesEntry(1024)).await;
+            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::ProgressObserved,
+                "at-or-over budget with PROGRESSING evictions must never fire the fallback \
+                 — normal at-cap operation evicts every tick and is not a wedge (got \
+                 {outcome:?} on insert #{k})"
+            );
+        }
+        assert_eq!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed),
+            0,
+            "selfheal_total must stay 0 while evictions progress at cap"
+        );
+        assert!(
+            !map.eviction_wedge_detected.load(Ordering::Relaxed),
+            "wedge gauge must stay clear while evictions progress at cap"
+        );
+    }
+
+    /// Composite-invariant direction: the fallback must NEVER evict a
+    /// pinned entry of ANY class — real (`pin_key`), indefinite/BIS
+    /// (`pin_key_indefinite`, the FL-688 durability replica), speculative
+    /// (`pin_key_speculative`) — nor a RACE-WINDOW key that is still
+    /// resident in the moka cache while already present in `pinned`
+    /// (models the `pin_key_with_mode` window between the DashMap insert
+    /// and `cache.invalidate`; the key-walk's `pinned.contains_key` skip
+    /// is the ONLY protection for it).
+    ///
+    /// Mutation step: comment out the `pinned.contains_key` skip in
+    /// `evict_unpinned_lru_bytes` → the race-window assertion red-fails.
+    #[tokio::test]
+    async fn fallback_evictor_never_evicts_pinned_any_class() {
+        let (map, _removal_count) = wedge_map_with_entries(40).await;
+        map.insert(900, BytesEntry(1024)).await;
+        assert!(map.pin_key(900), "real pin of a present key must succeed");
+        map.insert(901, BytesEntry(1024)).await;
+        assert!(
+            map.pin_key_indefinite(901),
+            "indefinite pin of a present key must succeed"
+        );
+        map.insert(902, BytesEntry(1024)).await;
+        assert!(
+            map.pin_key_speculative(902),
+            "speculative pin of a present key must succeed"
+        );
+        map.insert(903, BytesEntry(1024)).await;
+        map.pinned.insert(
+            903,
+            PinnedEntry {
+                data: BytesEntry(1024),
+                pinned_at: Instant::now(),
+                size: 1024,
+                indefinite: false,
+                speculative: false,
+            },
+        );
+
+        // Overshoot far larger than everything evictable → the heal
+        // tries to evict every unpinned resident.
+        map.test_force_wedge_observation(10 * WEDGE_MAX_BYTES as u64);
+        let mut outcome = WedgeSelfHealOutcome::UnderBudget;
+        for _ in 0..WEDGE_FROZEN_TICKS_TRIGGER {
+            outcome = tokio::time::timeout(
+                core::time::Duration::from_secs(5),
+                map.maybe_selfheal_wedged_eviction(),
+            )
+            .await
+            .expect("must not deadlock — self-heal eviction-event drain wedged");
+        }
+        let WedgeSelfHealOutcome::Fired { evicted_count, .. } = outcome else {
+            panic!("self-heal must fire under a forced 10x overshoot (got {outcome:?})");
+        };
+        assert_eq!(
+            evicted_count, 40,
+            "the fallback must evict ONLY the 40 unpinned residents — never a pinned \
+             (real/indefinite/speculative) or race-window entry (got {evicted_count})"
+        );
+        for (key, class) in [(900u64, "real"), (901, "indefinite/BIS"), (902, "speculative")] {
+            assert!(
+                map.get(&key).await.is_some(),
+                "FL-688 durability: the {class}-pinned blob (key {key}) must survive the \
+                 fallback evictor — evicting a pinned blob loses the durability replica"
+            );
+        }
+        assert!(
+            map.get(&903).await.is_some(),
+            "race-window: a key resident in the cache while present in `pinned` must be \
+             skipped by the fallback key-walk (`pinned.contains_key` guard)"
+        );
+        for k in 0..40u64 {
+            assert!(
+                map.get(&k).await.is_none(),
+                "unpinned entry {k} must have been evicted by the forced 10x-overshoot heal"
+            );
+        }
+        // Pin accounting intact (the 3 pins taken via the pin API; the
+        // race-window DashMap insert deliberately bypasses accounting).
+        assert_eq!(
+            map.pinned_bytes(),
+            3 * 1024,
+            "pinned byte accounting must be intact after the fallback fired"
+        );
+        assert_eq!(
+            map.indefinite_pinned_bytes(),
+            1024,
+            "indefinite (BIS) pin accounting must be intact after the fallback fired"
+        );
+        assert_eq!(
+            map.speculative_pinned_bytes(),
+            1024,
+            "speculative pin accounting must be intact after the fallback fired"
+        );
+    }
+
+    /// Composite-invariant direction: while the FL-688 startup reconcile
+    /// gate is armed the fallback is suppressed IDENTICALLY to the drain
+    /// tick; after release it fires normally.
+    ///
+    /// Mutation step: remove the `reconcile_complete` check in
+    /// `maybe_selfheal_wedged_eviction` → red-fails with the bespoke
+    /// suppression message.
+    #[tokio::test]
+    async fn fallback_evictor_suppressed_while_reconcile_gate_armed() {
+        let (map, removal_count) = wedge_map_with_entries(50).await;
+        map.test_force_wedge_observation(2 * WEDGE_MAX_BYTES as u64);
+        map.set_startup_reconcile_gate();
+        for _ in 0..5 {
+            let outcome = map.maybe_selfheal_wedged_eviction().await;
+            assert_eq!(
+                outcome,
+                WedgeSelfHealOutcome::SuppressedReconcileGate,
+                "FL-688 Stage C: the fallback evictor must be suppressed IDENTICALLY to \
+                 the drain tick while the startup reconcile gate is armed — firing during \
+                 the reconcile window races the reconcile-pin protection (got {outcome:?})"
+            );
+        }
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "no fallback eviction may fire while the reconcile gate is armed"
+        );
+        map.release_startup_reconcile_gate();
+        for expect_ticks in 1..WEDGE_FROZEN_TICKS_TRIGGER {
+            assert_eq!(
+                map.maybe_selfheal_wedged_eviction().await,
+                WedgeSelfHealOutcome::Accumulating(expect_ticks),
+                "after gate release the trigger must accumulate normally"
+            );
+        }
+        let outcome = map.maybe_selfheal_wedged_eviction().await;
+        assert!(
+            matches!(outcome, WedgeSelfHealOutcome::Fired { .. }),
+            "after gate release the fallback must fire normally (got {outcome:?})"
+        );
+    }
+
+    /// Piece 1 WIRING: the periodic drain-tick arm itself must invoke the
+    /// self-heal evaluation (after `run_pending_tasks_and_drain`). Mirrors
+    /// the `periodic_forced_drain_arm_converges_unpinned_under_cap`
+    /// paused-clock technique.
+    ///
+    /// Mutation step: delete the `maybe_selfheal_wedged_eviction` call
+    /// from the drain-tick arm → the bounded advance loop exhausts and
+    /// red-fails with the bespoke WIRING message.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_tick_arm_invokes_wedge_selfheal() {
+        let (map, removal_count) = wedge_map_with_entries(50).await;
+        map.test_force_wedge_observation(130 * 1024); // 30 KiB overshoot
+        map.start_background_eviction();
+        let drain_period = core::time::Duration::from_secs(super::DRAIN_INTERVAL_SECS);
+        const MAX_TICKS: u32 = 20;
+        let converged = tokio::time::timeout(core::time::Duration::from_secs(3600), async {
+            for _ in 0..MAX_TICKS {
+                tokio::time::advance(drain_period).await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                if removal_count.load(Ordering::Relaxed) >= 30 {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("deadlock: drain-tick selfheal convergence loop did not finish");
+        assert!(
+            converged,
+            "piece 1 WIRING: the periodic drain arm must invoke \
+             maybe_selfheal_wedged_eviction after run_pending_tasks_and_drain — with the \
+             trigger observation forced over budget and evictions frozen, {MAX_TICKS} \
+             ticks produced {} fallback evictions (expected >= 30). A wedged moka evictor \
+             never self-heals without this arm (FINDING 2).",
+            removal_count.load(Ordering::Relaxed),
+        );
+        assert!(
+            map.eviction_wedge_selfheal_total.counter.load(Ordering::Relaxed) >= 1,
+            "selfheal_total must count the tick-arm firing"
+        );
+    }
+
+    /// Piece 3 WIRING (map level): `kick_drain` must wake the background
+    /// drain arm WITHOUT waiting for the 10 s tick (paused clock ⇒ no
+    /// tick can fire), and the kick arm must run BOTH halves of the drain
+    /// body: `run_pending_tasks_and_drain` (observed via the startup-
+    /// overshoot evictions) AND the self-heal evaluation (observed via
+    /// the frozen-evictions sensor baseline advancing).
+    ///
+    /// Mutation steps: (a) comment `drain_kick.notify_one()` in
+    /// `kick_drain` → the bounded yield loop exhausts, red-fails the
+    /// "kick must wake" message; (b) delete the selfheal call from the
+    /// kick arm → the sensor-baseline assertion red-fails.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_kick_wakes_drain_arm_without_tick() {
+        // Startup-overshoot recipe (mirrors the periodic-drain test): 19
+        // 10-byte entries over a 1-unit cap via `insert_with_time` — moka
+        // has NOT enforced the cap and, with the clock paused, never will
+        // on its own.
+        let cfg = policy(100, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+        // Start the loop FIRST and let the intervals' IMMEDIATE first
+        // ticks fire on the still-empty map (tokio intervals complete
+        // their first tick at once); with the clock paused no further
+        // tick can ever fire, so everything after this point is
+        // kick-driven only.
+        map.start_background_eviction();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        // NOW take the startup overshoot (deferred maintenance).
+        for k in 0..19u64 {
+            map.insert_with_time(k, BytesEntry(10), 0).await;
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "precondition: without a kick and without a further tick the drain arm must \
+             not run (startup overshoot must still be un-enforced)"
+        );
+        // Force the wedge observation so the kick arm's selfheal
+        // evaluation is observable via the sensor baseline.
+        map.test_force_wedge_observation(200 * 1024);
+        assert!(
+            map.kick_drain(),
+            "first kick must be accepted (rate limiter fresh)"
+        );
+        // Bounded yield loop (NOT a paused-clock timeout: the hot loop
+        // prevents auto-advance, so a timeout would never fire; loop
+        // exhaustion is the clean failure).
+        let mut woke = false;
+        for _ in 0..1000 {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            if removal_count.load(Ordering::Relaxed) >= 18 {
+                woke = true;
+                break;
+            }
+        }
+        assert!(
+            woke,
+            "piece 3 WIRING: kick_drain must wake the background drain arm WITHOUT \
+             waiting for the 10 s tick (gate => evict: the disk-NAK site depends on this \
+             wake) — the startup overshoot stayed un-evicted after the kick"
+        );
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            18,
+            "the kick-driven drain must run run_pending_tasks_and_drain to convergence \
+             (19 entries - 1 kept at the 1-unit cap = 18 evictions)"
+        );
+        // The kick arm must ALSO have run the selfheal evaluation: the
+        // 18 drain evictions advanced `evicted_items`, so the evaluation
+        // records ProgressObserved and updates the sensor baseline.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            map.selfheal_last_evicted_items.load(Ordering::Relaxed),
+            18,
+            "piece 3: the kick arm must run the wedge selfheal evaluation after the \
+             drain — the frozen-evictions sensor baseline must have observed the 18 \
+             evictions (stayed at {} instead)",
+            map.selfheal_last_evicted_items.load(Ordering::Relaxed),
+        );
+    }
+
+    /// Piece 3: kick delivery is rate-limited so a NAK storm cannot turn
+    /// the drain loop busy.
+    ///
+    /// Mutation step: remove the interval check in `kick_drain` → the
+    /// second-kick assertion red-fails.
+    #[tokio::test]
+    async fn drain_kick_rate_limited() {
+        let cfg = policy(WEDGE_MAX_BYTES, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        assert!(map.kick_drain(), "first kick must be accepted");
+        assert!(
+            !map.kick_drain(),
+            "an immediate second kick must be rate-limited (one accepted kick per \
+             DRAIN_KICK_MIN_INTERVAL_MILLIS) — a disk-NAK storm must not become a busy \
+             drain loop"
+        );
+    }
+
+    /// Piece 3 + FL-688 Stage C: a kick delivered while the startup
+    /// reconcile gate is armed must NOT drain (the kick ARM honors the
+    /// gate identically to the periodic tick).
+    ///
+    /// Mutation step: remove the `reconcile_complete` check from the kick
+    /// arm → the zero-evictions assertion red-fails.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_kick_suppressed_while_reconcile_gate_armed() {
+        let cfg = policy(100, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+        for k in 0..19u64 {
+            map.insert_with_time(k, BytesEntry(10), 0).await;
+        }
+        map.set_startup_reconcile_gate();
+        map.start_background_eviction();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            map.kick_drain(),
+            "kick DELIVERY is not gated (the ARM checks the gate) — must be accepted"
+        );
+        // Bounded yield budget for the (suppressed) arm to run.
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "FL-688 Stage C: a kick received while the startup reconcile gate is armed \
+             must be a no-op — the kick arm must honor the gate identically to the \
+             periodic drain tick (evictions fired during the reconcile window)"
+        );
+    }
 }

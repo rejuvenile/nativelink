@@ -1941,6 +1941,25 @@ fn disk_gate_decision(
     }
 }
 
+/// (FINDING 2 moka-eviction-wedge piece 3) On a disk-pressure NAK, actively
+/// kick the fast-tier `FilesystemStore`'s eviction drain arm. The disk gate's
+/// stated premise is "backstop before ENOSPC while eviction catches up" — but
+/// FINDING 2 showed eviction can be PERMANENTLY dead (moka stale-probation-
+/// front livelock, 3.3× over budget for 4 days) while this gate NAKs, so the
+/// admission-eviction-pin composite (`gate ⇒ evict`) requires the gate itself
+/// to drive the drain rather than assume it. Rate-limited inside
+/// `kick_drain` (once per `DRAIN_KICK_MIN_INTERVAL`); non-blocking, no
+/// awaits — safe inline on the NAK path. Returns whether a kick was
+/// delivered (`false` = no FilesystemStore fast tier, or rate-limited).
+///
+/// `#[doc(hidden)] pub` so the integration test can drive the exact
+/// production helper against a real `FilesystemStore`-backed
+/// `BlobsAvailableState` without standing up the full `run()` loop.
+#[doc(hidden)]
+pub fn kick_fs_eviction_on_disk_nak(state: Option<&BlobsAvailableState>) -> bool {
+    state.is_some_and(|s| s.fs_store.kick_eviction_drain())
+}
+
 /// (F4) Returns the worker's last-sampled free bytes on the CAS/work_directory
 /// volume. `u64::MAX` sentinel (never-sampled) is mapped to `0` on the wire so
 /// the server's most-free ranking treats an un-sampled worker as fully
@@ -5969,6 +5988,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         "worker NAKing action: physical disk pressure on the \
                                          CAS/work_directory volume (backstop before ENOSPC while \
                                          eviction catches up)"
+                                    );
+                                    // (FINDING 2 piece 3) gate ⇒ evict: actively
+                                    // kick the fast-tier eviction drain so this
+                                    // gate's "eviction catches up" premise is
+                                    // DRIVEN, not assumed — FINDING 2 showed the
+                                    // moka evictor can be permanently wedged
+                                    // while this arm NAKs. Rate-limited +
+                                    // non-blocking inside `kick_drain`.
+                                    kick_fs_eviction_on_disk_nak(
+                                        self.blobs_available_state.as_ref(),
                                     );
                                     if let Some(instance_name) = start_execute.execute_request.map(|request| request.instance_name) {
                                         self.grpc_client.clone().execution_response(

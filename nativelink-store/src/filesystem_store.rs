@@ -1337,6 +1337,19 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.reconcile_complete_flag()
     }
 
+    /// (FINDING 2 moka-eviction-wedge piece 3) Rate-limited kick of the
+    /// eviction map's background drain arm. The worker's disk-pressure NAK
+    /// site calls this so the admission gate actively drives eviction
+    /// (admission-eviction-pin composite: `gate ⇒ evict`) instead of only
+    /// refusing work on the assumption that "eviction catches up" — an
+    /// assumption the moka stale-probation-front livelock (FINDING 2)
+    /// falsified for 4 days on 2 of 10 workers. Non-blocking (one atomic
+    /// compare + `Notify::notify_one`), safe inline on the NAK path.
+    /// Returns whether the kick was accepted (`false` = rate-limited).
+    pub fn kick_eviction_drain(&self) -> bool {
+        self.evicting_map.kick_drain()
+    }
+
     /// (#locality-map-drift) Stamp the eviction map's logical-LWW boot-epoch
     /// (HIGH word of every holdings stamp). The worker calls this at boot with
     /// `boot_epoch_id()` — BEFORE any insert — so a restarted worker's fresh

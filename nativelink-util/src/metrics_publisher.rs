@@ -791,4 +791,103 @@ mod tests {
             "F3a: legacy weighted_size help-text must state KB-WEIGHT units and must not claim '(bytes)' (the units mislabel that caused the phantom 144 GB orphan). help line=\n{legacy_help}\nbody=\n{body}"
         );
     }
+
+    /// (FINDING 2 piece 2) Render-test pinning the eviction-wedge
+    /// observability names on the SAME live-rendering tree as
+    /// `weighted_size_bytes` (dark-counter trap: the production wedge sat
+    /// at 3.3× over budget with 3K disk-NAKs and NOTHING paged, because
+    /// no rendered metric carried the overshoot or the wedge verdict).
+    /// Pins, via the same `render_prometheus` walk `/metrics` uses:
+    ///
+    ///   1. `overshoot_bytes` — bytes the live weighted size exceeds
+    ///      `max_bytes` (0 at-or-under; reads the REAL cache state).
+    ///   2. `eviction_wedge_detected` — 0/1 gauge, 1 while the self-heal
+    ///      trigger condition holds.
+    ///   3. `eviction_wedge_selfheal_total` — `CounterWithTime` firing
+    ///      count (renders `_counter` + `_last_time`).
+    ///
+    /// Mutation step (CLAUDE.md TDD): drop any of the three `publish!`
+    /// calls in `MokaEvictingMap::publish` → the matching assertion below
+    /// red-fails with its bespoke `F2-wedge:` message.
+    #[nativelink_test("crate")]
+    async fn moka_wedge_observability_metrics_render() {
+        use std::time::SystemTime;
+
+        use nativelink_config::stores::EvictionPolicy;
+
+        use crate::evicting_map::NoopCallback;
+        use crate::moka_evicting_map::MokaEvictingMap;
+
+        #[derive(Debug, Clone)]
+        struct Entry(u64);
+        impl crate::evicting_map::LenEntry for Entry {
+            fn len(&self) -> u64 {
+                self.0
+            }
+            fn is_empty(&self) -> bool {
+                self.0 == 0
+            }
+        }
+
+        // 64 KiB cap so the single 4 KiB blob stays resident.
+        let cfg = EvictionPolicy {
+            max_bytes: 64 * 1024,
+            evict_bytes: 0,
+            max_seconds: 0,
+            max_count: 0,
+            pin_cap_bytes: 0,
+        };
+        let map: Arc<MokaEvictingMap<u64, u64, Entry, SystemTime, NoopCallback>> =
+            Arc::new(MokaEvictingMap::with_anchor(&cfg, SystemTime::now()));
+        map.insert(1, Entry(4096)).await;
+
+        let registry = MetricsRegistry::new();
+        registry.register("memstore", Arc::clone(&map));
+
+        // Baseline: healthy under-budget cache → 0 / 0 / 0.
+        let body = render_prometheus(&registry);
+        assert!(
+            body.contains("\nmemstore_overshoot_bytes 0\n"),
+            "F2-wedge: overshoot_bytes gauge must render (0 while at-or-under budget) so \
+             a budget overshoot is visible on the live metrics tree. body=\n{body}"
+        );
+        assert!(
+            body.contains("\nmemstore_eviction_wedge_detected 0\n"),
+            "F2-wedge: eviction_wedge_detected gauge must render 0 on a healthy cache. \
+             body=\n{body}"
+        );
+        assert!(
+            body.contains("\nmemstore_eviction_wedge_selfheal_total_counter 0\n"),
+            "F2-wedge: eviction_wedge_selfheal_total counter must render 0 before any \
+             self-heal firing. body=\n{body}"
+        );
+
+        // Drive the wedge trigger (injected observation, real eviction —
+        // see moka_evicting_map.rs test-seam docs) and re-render.
+        map.test_force_wedge_observation(2 * 64 * 1024);
+        for _ in 0..3 {
+            map.maybe_selfheal_wedged_eviction().await;
+        }
+        let body = render_prometheus(&registry);
+        assert!(
+            body.contains("\nmemstore_eviction_wedge_detected 1\n"),
+            "F2-wedge: eviction_wedge_detected must render 1 while the wedge trigger \
+             condition holds (at-or-over budget + evictions frozen for the full \
+             trigger window). body=\n{body}"
+        );
+        assert!(
+            body.contains("\nmemstore_eviction_wedge_selfheal_total_counter 1\n"),
+            "F2-wedge: eviction_wedge_selfheal_total must count the self-heal firing \
+             (exactly one per firing). body=\n{body}"
+        );
+        // overshoot_bytes reads the REAL cache (the injected observation
+        // is a trigger-only test seam): the heal evicted the resident
+        // blob, so the real overshoot is still 0.
+        assert!(
+            body.contains("\nmemstore_overshoot_bytes 0\n"),
+            "F2-wedge: overshoot_bytes must read the REAL weighted size (0 after the \
+             heal evicted the resident blob), not the injected test observation. \
+             body=\n{body}"
+        );
+    }
 }

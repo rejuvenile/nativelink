@@ -172,6 +172,14 @@ name = "blobs_available_ack_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (FINDING 2 moka-eviction-wedge piece 3) Disk-NAK → eviction-drain kick
+# seam: drives `kick_fs_eviction_on_disk_nak` against a real
+# FilesystemStore-backed `BlobsAvailableState` (via `from_test_args`,
+# gated behind `cfg(any(test, feature = "test-utils"))`).
+name = "disk_nak_evict_kick_test"
+required-features = ["test-utils"]
+
+[[test]]
 # (FL-688 v3 §3.8 drain-on-ack flip) End-to-end convergence proof for the
 # per-tick replay reader. Drives `send_periodic_blobs_available_for_test` +
 # `test_record_added_digest` + the resend-buffer accessors, all gated
