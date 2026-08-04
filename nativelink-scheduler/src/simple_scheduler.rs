@@ -1869,10 +1869,15 @@ impl SimpleScheduler {
         }
 
         let mut futures_set = futures::stream::FuturesUnordered::<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>>,
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, Error>> + Send + '_>>,
         >::new();
         let mut action_iter = queued_actions.into_iter();
         let mut result = Ok(());
+        // (#matchcycle) Actions matched (assigned + worker notified) in
+        // THIS cycle, counted from `match_action_to_worker_cached`'s
+        // `Ok(true)` — the real per-cycle count, not a counter delta that
+        // concurrent do_try_match callers could skew.
+        let mut actions_matched: u64 = 0;
 
         // Seed the initial batch.
         for action_state_result in action_iter.by_ref().take(MATCH_CONCURRENCY) {
@@ -1891,7 +1896,11 @@ impl SimpleScheduler {
 
         // Process futures as they complete, adding new ones to maintain concurrency.
         while let Some(match_result) = futures_set.next().await {
-            result = result.merge(match_result);
+            match match_result {
+                Ok(true) => actions_matched += 1,
+                Ok(false) => {}
+                Err(err) => result = result.merge(Err(err)),
+            }
 
             if let Some(action_state_result) = action_iter.next() {
                 futures_set.push(Box::pin(Self::match_action_to_worker_cached(
@@ -1916,6 +1925,22 @@ impl SimpleScheduler {
                 "Slow do_try_match cycle"
             );
         }
+
+        // (#matchcycle) Pure matcher-work telemetry: ONE O(1) record per
+        // CYCLE (8 relaxed RMWs; never per action — the
+        // expensive-observability-probe-in-hot-loop incident is the
+        // standing ceiling). Lands on the registered `SchedulerMetrics`
+        // tree, rendering as
+        // `scheduler_<name>_worker_scheduler_metrics_do_try_match_*`;
+        // matcher-only work is `cycle_ms_sum - query_ms_sum`. The >5s WARN
+        // above stays the human-readable twin.
+        self.worker_scheduler
+            .get_metrics()
+            .record_do_try_match_cycle(
+                u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
+                u64::try_from(query_elapsed.as_millis()).unwrap_or(u64::MAX),
+                actions_matched,
+            );
 
         // (#specprefetch, #specprefetch-rebind §2.1) Speculative prefetch backlog
         // trigger.
@@ -2190,6 +2215,11 @@ impl SimpleScheduler {
     /// When `max_per_client > 0`, enforces fair scheduling by limiting how
     /// many actions from the same `instance_name` can be matched per cycle.
     /// Actions that exceed the limit are skipped (left in queue for next cycle).
+    /// (#matchcycle) Returns `Ok(true)` when the action was assigned to a
+    /// worker AND the worker was notified (a completed match this cycle);
+    /// `Ok(false)` when the action was skipped, rejected to the client, or
+    /// left queued (no worker / benign Aborted race). The per-cycle sum of
+    /// `Ok(true)` feeds `do_try_match_actions_matched_{sum,max}`.
     async fn match_action_to_worker_cached(
         action_state_result: Box<dyn ActionStateResult>,
         workers: &ApiWorkerScheduler,
@@ -2202,7 +2232,7 @@ impl SimpleScheduler {
         max_per_client: usize,
         maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
         full_worker_logging: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let (action_info, maybe_origin_metadata) = action_state_result
             .as_action_info()
             .await
@@ -2217,7 +2247,7 @@ impl SimpleScheduler {
             let count = map.entry(client_name.clone()).or_insert(0);
             if *count >= max_per_client {
                 // Skip — action stays queued for next cycle.
-                return Ok(());
+                return Ok(false);
             }
             *count += 1;
             true
@@ -2341,7 +2371,7 @@ impl SimpleScheduler {
                                 undo_claim(per_client_matches, &client_name);
                             }
                             if assign_err.code == Code::Aborted {
-                                return Ok(());
+                                return Ok(false);
                             }
                             return Err(assign_err.append(
                                 "Failed to record action rejection in \
@@ -2354,7 +2384,7 @@ impl SimpleScheduler {
                         if claimed_slot {
                             undo_claim(per_client_matches, &client_name);
                         }
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(err) => return Err(err.append(
                         "Failed to make platform properties in SimpleScheduler::do_try_match",
@@ -2407,7 +2437,7 @@ impl SimpleScheduler {
                 if claimed_slot {
                     undo_claim(per_client_matches, &client_name);
                 }
-                return Ok(());
+                return Ok(false);
             }
         };
 
@@ -2425,7 +2455,7 @@ impl SimpleScheduler {
             if err.code == Code::Aborted {
                 // The operation was cancelled due to another operation
                 // being assigned to the worker.
-                return Ok(());
+                return Ok(false);
             }
             // Any other error is a real error.
             return Err(err);
@@ -2491,7 +2521,8 @@ impl SimpleScheduler {
             }
         }
 
-        notify_result
+        // (#matchcycle) A completed match: assigned + worker notified.
+        notify_result.map(|()| true)
     }
 }
 

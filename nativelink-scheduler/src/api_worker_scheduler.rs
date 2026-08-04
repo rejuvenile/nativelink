@@ -103,6 +103,96 @@ pub struct SchedulerMetrics {
     /// Total number of action dispatches.
     #[metric(help = "total number of action dispatches")]
     pub actions_dispatched: AtomicU64,
+
+    // ── (#matchcycle) pure matcher-work cycle telemetry ──
+    // One O(1) record per `do_try_match` CYCLE (never per action; the
+    // expensive-observability-probe-in-hot-loop incident is the standing
+    // ceiling), from `record_do_try_match_cycle` at the cycle's
+    // `total_elapsed` site in `simple_scheduler.rs`. Answers "is the
+    // matcher ever the bottleneck under burst" from a scrape: mean cycle
+    // cost = `cycle_ms_sum / cycles_total`, worst = `cycle_ms_max`,
+    // matcher-only work = `cycle_ms_sum - query_ms_sum`, and the fixed
+    // band histogram gives the burst SHAPE. The >5s `Slow do_try_match
+    // cycle` WARN is unchanged; these are its scrapeable counterpart.
+    /// (#matchcycle) COUNTER: completed `do_try_match` cycles. A cycle
+    /// that errors before its match phase completes is not recorded.
+    #[metric(help = "(#matchcycle) completed do_try_match cycles")]
+    pub do_try_match_cycles_total: AtomicU64,
+    /// (#matchcycle) COUNTER: cumulative full-cycle duration in ms
+    /// (queued-operations query + collect + match). Mean cycle ms = this
+    /// / `do_try_match_cycles_total`.
+    #[metric(
+        help = "(#matchcycle) cumulative do_try_match full-cycle duration ms (mean = sum / cycles_total)"
+    )]
+    pub do_try_match_cycle_ms_sum: AtomicU64,
+    /// (#matchcycle) High-water mark of a single cycle's duration in ms
+    /// (`fetch_max`, process-lifetime, never reset). Renders with a
+    /// counter TYPE line (the library has no gauge kind) — read the
+    /// INSTANT value, do NOT apply `rate()`.
+    #[metric(
+        help = "(#matchcycle) worst single do_try_match cycle ms (fetch_max high-water, never reset; read instant, no rate())"
+    )]
+    pub do_try_match_cycle_ms_max: AtomicU64,
+    /// (#matchcycle) COUNTER: cumulative `get_queued_operations` query
+    /// duration in ms across cycles. `cycle_ms_sum - query_ms_sum` is the
+    /// pure matcher-work sum (the split the >1s query WARN vs >5s cycle
+    /// WARN pair reads, made scrapeable).
+    #[metric(
+        help = "(#matchcycle) cumulative do_try_match get_queued_operations query ms (cycle_ms_sum - query_ms_sum = pure matcher work)"
+    )]
+    pub do_try_match_query_ms_sum: AtomicU64,
+    /// (#matchcycle) High-water mark of a single cycle's query duration in
+    /// ms (`fetch_max`, never reset; read instant, no `rate()`).
+    #[metric(
+        help = "(#matchcycle) worst single do_try_match query ms (fetch_max high-water, never reset; read instant, no rate())"
+    )]
+    pub do_try_match_query_ms_max: AtomicU64,
+    /// (#matchcycle) COUNTER: cumulative actions matched (assigned to a
+    /// worker AND the worker notified) across cycles. Rate against
+    /// `cycles_total` for mean matches/cycle; near-zero under a deep queue
+    /// with slow cycles = the matcher is the bottleneck.
+    #[metric(
+        help = "(#matchcycle) cumulative actions matched (assigned + worker notified) across do_try_match cycles"
+    )]
+    pub do_try_match_actions_matched_sum: AtomicU64,
+    /// (#matchcycle) High-water mark of actions matched in a single cycle
+    /// (`fetch_max`, never reset; read instant, no `rate()`).
+    #[metric(
+        help = "(#matchcycle) most actions matched in a single do_try_match cycle (fetch_max high-water, never reset; read instant, no rate())"
+    )]
+    pub do_try_match_actions_matched_max: AtomicU64,
+    /// (#matchcycle) BAND COUNTER: cycles with duration <1 ms. Fixed bands
+    /// {<1, 1-10, 11-100, 101-1000, 1001-5000, >5000} ms (#calib band
+    /// pattern); each cycle ticks exactly one band.
+    #[metric(help = "(#matchcycle) do_try_match cycles with duration <1ms (fixed band histogram)")]
+    pub do_try_match_cycle_ms_band_lt1_total: AtomicU64,
+    /// (#matchcycle) BAND COUNTER: cycles with duration 1-10 ms.
+    #[metric(
+        help = "(#matchcycle) do_try_match cycles with duration 1-10ms (fixed band histogram)"
+    )]
+    pub do_try_match_cycle_ms_band_1_10_total: AtomicU64,
+    /// (#matchcycle) BAND COUNTER: cycles with duration 11-100 ms.
+    #[metric(
+        help = "(#matchcycle) do_try_match cycles with duration 11-100ms (fixed band histogram)"
+    )]
+    pub do_try_match_cycle_ms_band_11_100_total: AtomicU64,
+    /// (#matchcycle) BAND COUNTER: cycles with duration 101-1000 ms.
+    #[metric(
+        help = "(#matchcycle) do_try_match cycles with duration 101-1000ms (fixed band histogram)"
+    )]
+    pub do_try_match_cycle_ms_band_101_1k_total: AtomicU64,
+    /// (#matchcycle) BAND COUNTER: cycles with duration 1001-5000 ms.
+    #[metric(
+        help = "(#matchcycle) do_try_match cycles with duration 1001-5000ms (fixed band histogram)"
+    )]
+    pub do_try_match_cycle_ms_band_1k_5k_total: AtomicU64,
+    /// (#matchcycle) BAND COUNTER: cycles with duration >5000 ms — the
+    /// scrapeable twin of the `Slow do_try_match cycle` WARN threshold.
+    #[metric(
+        help = "(#matchcycle) do_try_match cycles with duration >5000ms (fixed band histogram; twin of the >5s Slow do_try_match cycle WARN)"
+    )]
+    pub do_try_match_cycle_ms_band_gt5k_total: AtomicU64,
+
     /// Total number of keep-alive updates.
     #[metric(help = "total number of keep-alive updates")]
     pub keep_alive_updates: AtomicU64,
@@ -1143,6 +1233,43 @@ impl SchedulerMetrics {
             &self.tree_resolution_ms_gt_30000
         };
         bucket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (#matchcycle) Record one completed `do_try_match` cycle: cycle/query
+    /// duration sum + high-water max, the per-cycle matched-action sum +
+    /// max, and exactly one duration-band tick. Called ONCE per cycle from
+    /// the `total_elapsed` site in `SimpleScheduler::do_try_match` — O(1):
+    /// 8 relaxed atomic RMWs, no allocation, no lock (the
+    /// expensive-observability-probe-in-hot-loop incident is the standing
+    /// ceiling; this must stay trivial).
+    pub fn record_do_try_match_cycle(&self, cycle_ms: u64, query_ms: u64, actions_matched: u64) {
+        self.do_try_match_cycles_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.do_try_match_cycle_ms_sum
+            .fetch_add(cycle_ms, Ordering::Relaxed);
+        self.do_try_match_cycle_ms_max
+            .fetch_max(cycle_ms, Ordering::Relaxed);
+        self.do_try_match_query_ms_sum
+            .fetch_add(query_ms, Ordering::Relaxed);
+        self.do_try_match_query_ms_max
+            .fetch_max(query_ms, Ordering::Relaxed);
+        self.do_try_match_actions_matched_sum
+            .fetch_add(actions_matched, Ordering::Relaxed);
+        self.do_try_match_actions_matched_max
+            .fetch_max(actions_matched, Ordering::Relaxed);
+        // Fixed band histogram {<1, 1-10, 11-100, 101-1000, 1001-5000,
+        // >5000} ms — half-open integer ranges over the truncating
+        // `as_millis` value, so every cycle lands in one and only one band
+        // (mirrors the #calib `rate_band_index` edges style).
+        let band = match cycle_ms {
+            0 => &self.do_try_match_cycle_ms_band_lt1_total,
+            1..=10 => &self.do_try_match_cycle_ms_band_1_10_total,
+            11..=100 => &self.do_try_match_cycle_ms_band_11_100_total,
+            101..=1_000 => &self.do_try_match_cycle_ms_band_101_1k_total,
+            1_001..=5_000 => &self.do_try_match_cycle_ms_band_1k_5k_total,
+            _ => &self.do_try_match_cycle_ms_band_gt5k_total,
+        };
+        band.fetch_add(1, Ordering::Relaxed);
     }
 }
 
