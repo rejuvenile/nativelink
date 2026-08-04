@@ -104,41 +104,48 @@ pub struct SchedulerMetrics {
     #[metric(help = "total number of action dispatches")]
     pub actions_dispatched: AtomicU64,
 
-    // ── (#matchcycle) pure matcher-work cycle telemetry ──
+    // ── (#matchcycle) matcher-cost cycle telemetry ──
     // One O(1) record per `do_try_match` CYCLE (never per action; the
     // expensive-observability-probe-in-hot-loop incident is the standing
     // ceiling), from `record_do_try_match_cycle` at the cycle's
     // `total_elapsed` site in `simple_scheduler.rs`. Answers "is the
     // matcher ever the bottleneck under burst" from a scrape: mean cycle
     // cost = `cycle_ms_sum / cycles_total`, worst = `cycle_ms_max`,
-    // matcher-only work = `cycle_ms_sum - query_ms_sum`, and the fixed
-    // band histogram gives the burst SHAPE. The >5s `Slow do_try_match
-    // cycle` WARN is unchanged; these are its scrapeable counterpart.
+    // collect+match work = `cycle_ms_sum - query_ms_sum` (the query stamp
+    // precedes the `stream.collect()`, so the difference still CONTAINS
+    // the collect — per-op store work on the Redis backend), and the fixed
+    // band histogram gives the burst SHAPE. `cycle_ms` EXCLUDES the
+    // post-match speculative-prefetch tail (backlog-gated, ON in the
+    // deployed config) — same window as the >5s `Slow do_try_match cycle`
+    // WARN, which is unchanged; these are its scrapeable counterpart.
     /// (#matchcycle) COUNTER: completed `do_try_match` cycles. A cycle
     /// that errors before its match phase completes is not recorded.
     #[metric(help = "(#matchcycle) completed do_try_match cycles")]
     pub do_try_match_cycles_total: AtomicU64,
     /// (#matchcycle) COUNTER: cumulative full-cycle duration in ms
-    /// (queued-operations query + collect + match). Mean cycle ms = this
-    /// / `do_try_match_cycles_total`.
+    /// (queued-operations query + collect + match; EXCLUDES the
+    /// post-match speculative-prefetch tail, which only runs under
+    /// backlog). Mean cycle ms = this / `do_try_match_cycles_total`.
     #[metric(
-        help = "(#matchcycle) cumulative do_try_match full-cycle duration ms (mean = sum / cycles_total)"
+        help = "(#matchcycle) cumulative do_try_match full-cycle duration ms (query+collect+match; excludes the post-match speculative-prefetch tail; mean = sum / cycles_total)"
     )]
     pub do_try_match_cycle_ms_sum: AtomicU64,
     /// (#matchcycle) High-water mark of a single cycle's duration in ms
     /// (`fetch_max`, process-lifetime, never reset). Renders with a
-    /// counter TYPE line (the library has no gauge kind) — read the
+    /// counter TYPE line (numeric fields have no gauge kind) — read the
     /// INSTANT value, do NOT apply `rate()`.
     #[metric(
         help = "(#matchcycle) worst single do_try_match cycle ms (fetch_max high-water, never reset; read instant, no rate())"
     )]
     pub do_try_match_cycle_ms_max: AtomicU64,
     /// (#matchcycle) COUNTER: cumulative `get_queued_operations` query
-    /// duration in ms across cycles. `cycle_ms_sum - query_ms_sum` is the
-    /// pure matcher-work sum (the split the >1s query WARN vs >5s cycle
-    /// WARN pair reads, made scrapeable).
+    /// duration in ms across cycles — the stream-creation query ONLY: the
+    /// stamp precedes `stream.collect()`, so `cycle_ms_sum -
+    /// query_ms_sum` = collect + match work (NOT pure matching; on the
+    /// Redis backend the collect is per-op store work). Same window as
+    /// the pre-existing >1s `Slow get_queued_operations query` WARN.
     #[metric(
-        help = "(#matchcycle) cumulative do_try_match get_queued_operations query ms (cycle_ms_sum - query_ms_sum = pure matcher work)"
+        help = "(#matchcycle) cumulative do_try_match get_queued_operations query ms (cycle_ms_sum - query_ms_sum = collect + match work, not pure matching — the query stamp precedes the stream collect)"
     )]
     pub do_try_match_query_ms_sum: AtomicU64,
     /// (#matchcycle) High-water mark of a single cycle's query duration in
@@ -162,7 +169,7 @@ pub struct SchedulerMetrics {
     )]
     pub do_try_match_actions_matched_max: AtomicU64,
     /// (#matchcycle) BAND COUNTER: cycles with duration <1 ms. Fixed bands
-    /// {<1, 1-10, 11-100, 101-1000, 1001-5000, >5000} ms (#calib band
+    /// {<1, 1-10, 11-100, 101-1000, 1001-4999, >=5000} ms (#calib band
     /// pattern); each cycle ticks exactly one band.
     #[metric(help = "(#matchcycle) do_try_match cycles with duration <1ms (fixed band histogram)")]
     pub do_try_match_cycle_ms_band_lt1_total: AtomicU64,
@@ -181,15 +188,19 @@ pub struct SchedulerMetrics {
         help = "(#matchcycle) do_try_match cycles with duration 101-1000ms (fixed band histogram)"
     )]
     pub do_try_match_cycle_ms_band_101_1k_total: AtomicU64,
-    /// (#matchcycle) BAND COUNTER: cycles with duration 1001-5000 ms.
+    /// (#matchcycle) BAND COUNTER: cycles with duration 1001-4999 ms
+    /// (upper edge exclusive of 5000 so every WARN-eligible cycle lands
+    /// in `gt5k`, not here).
     #[metric(
-        help = "(#matchcycle) do_try_match cycles with duration 1001-5000ms (fixed band histogram)"
+        help = "(#matchcycle) do_try_match cycles with duration 1001-4999ms (fixed band histogram)"
     )]
     pub do_try_match_cycle_ms_band_1k_5k_total: AtomicU64,
-    /// (#matchcycle) BAND COUNTER: cycles with duration >5000 ms — the
-    /// scrapeable twin of the `Slow do_try_match cycle` WARN threshold.
+    /// (#matchcycle) BAND COUNTER: cycles with duration >=5000 ms — the
+    /// scrapeable twin of the >5s `Slow do_try_match cycle` WARN: a
+    /// 5000.x ms cycle truncates to 5000 and lands HERE (the >5000ms
+    /// edge would have put a WARN-firing 5000.5ms cycle in `1k_5k`).
     #[metric(
-        help = "(#matchcycle) do_try_match cycles with duration >5000ms (fixed band histogram; twin of the >5s Slow do_try_match cycle WARN)"
+        help = "(#matchcycle) do_try_match cycles with duration >=5000ms (fixed band histogram; twin of the >5s Slow do_try_match cycle WARN)"
     )]
     pub do_try_match_cycle_ms_band_gt5k_total: AtomicU64,
 
@@ -469,9 +480,12 @@ pub struct SchedulerMetrics {
     /// I/O-queued worker is also in-band, the same dispatch-count-vs-p_load gap
     /// the `p_headroom_gate_exclusion` log acknowledges). A rough live counterpart
     /// to that exclusion log (which shows the denied side). Incremented `Relaxed`
-    /// at the single reserve point (`prepare_worker_run_action`); surfaced on
-    /// `emit_speculative_hold_counters_log` because the `SchedulerMetrics` tree is
-    /// DARK on `/metrics`.
+    /// at the single reserve point (`prepare_worker_run_action`); ALSO surfaced on
+    /// `emit_speculative_hold_counters_log` as the journalctl-visible twin. (The
+    /// `SchedulerMetrics` tree RENDERS on `/metrics` — registered under
+    /// `scheduler.{name}.worker` since #231, pinned by the render tests below; the
+    /// old "DARK" claim was an artifact of probing the mTLS-only metrics listener
+    /// over plain HTTP, refuted by live scrape 2026-08-04.)
     #[metric(
         help = "cumulative admits whose in-flight dispatch-count lands in the \
                 [p_core_count, p_core_count+e_core_count) E-core band (count \
@@ -1159,8 +1173,10 @@ pub struct SchedulerMetrics {
     // tallies make the fold OBSERVABLE. Copied once per recompute interval from
     // the `DagState` atomics in the `simple_scheduler_dag_recompute` task (the
     // enqueue/recompute paths are the live producers; these are the query seam).
-    // The same values are ALSO emitted in the `dag_recompute` INFO log because
-    // the `SchedulerMetrics` tree is DARK on `/metrics` in prod.
+    // The same values are ALSO emitted in the `dag_recompute` INFO log as the
+    // journalctl-visible twin. (The `SchedulerMetrics` tree RENDERS on
+    // `/metrics` — the old "DARK in prod" claim was a plain-HTTP probe of the
+    // mTLS-only metrics listener; see the #231 render tests below.)
     /// (#dag-criticality) Kill/keep "keep": cumulative enqueues that folded a
     /// confident band > 0 into the sort key (a criticality tie-break was applied).
     #[metric(
@@ -1242,7 +1258,12 @@ impl SchedulerMetrics {
     /// 8 relaxed atomic RMWs, no allocation, no lock (the
     /// expensive-observability-probe-in-hot-loop incident is the standing
     /// ceiling; this must stay trivial).
-    pub fn record_do_try_match_cycle(&self, cycle_ms: u64, query_ms: u64, actions_matched: u64) {
+    pub fn record_do_try_match_cycle(&self, sample: DoTryMatchCycleSample) {
+        let DoTryMatchCycleSample {
+            cycle_ms,
+            query_ms,
+            actions_matched,
+        } = sample;
         self.do_try_match_cycles_total
             .fetch_add(1, Ordering::Relaxed);
         self.do_try_match_cycle_ms_sum
@@ -1257,27 +1278,52 @@ impl SchedulerMetrics {
             .fetch_add(actions_matched, Ordering::Relaxed);
         self.do_try_match_actions_matched_max
             .fetch_max(actions_matched, Ordering::Relaxed);
-        // Fixed band histogram {<1, 1-10, 11-100, 101-1000, 1001-5000,
-        // >5000} ms — half-open integer ranges over the truncating
+        // Fixed band histogram {<1, 1-10, 11-100, 101-1000, 1001-4999,
+        // >=5000} ms — half-open integer ranges over the truncating
         // `as_millis` value, so every cycle lands in one and only one band
-        // (mirrors the #calib `rate_band_index` edges style).
+        // (mirrors the #calib `rate_band_index` edges style). The top band
+        // starts at 5000 (not 5001) so every cycle that can fire the >5s
+        // WARN — e.g. 5000.5 ms, which truncates to 5000 — lands in
+        // `gt5k`, keeping the band an honest WARN twin.
         let band = match cycle_ms {
             0 => &self.do_try_match_cycle_ms_band_lt1_total,
             1..=10 => &self.do_try_match_cycle_ms_band_1_10_total,
             11..=100 => &self.do_try_match_cycle_ms_band_11_100_total,
             101..=1_000 => &self.do_try_match_cycle_ms_band_101_1k_total,
-            1_001..=5_000 => &self.do_try_match_cycle_ms_band_1k_5k_total,
+            1_001..=4_999 => &self.do_try_match_cycle_ms_band_1k_5k_total,
             _ => &self.do_try_match_cycle_ms_band_gt5k_total,
         };
         band.fetch_add(1, Ordering::Relaxed);
     }
 }
 
+/// (#matchcycle) One completed `do_try_match` cycle's sample for
+/// [`SchedulerMetrics::record_do_try_match_cycle`]. Named fields exist so
+/// the two identically-typed durations CANNOT be swapped at a call site —
+/// a positional-argument swap (which a runtime test cannot catch: both
+/// durations are ~0 ms in tests, and in production it silently sends the
+/// `cycle_ms_sum - query_ms_sum` derivation negative) is uncompilable by
+/// construction.
+#[derive(Clone, Copy, Debug)]
+pub struct DoTryMatchCycleSample {
+    /// Full-cycle duration in ms (query + collect + match; excludes the
+    /// post-match speculative-prefetch tail).
+    pub cycle_ms: u64,
+    /// `get_queued_operations` stream-creation duration in ms (the
+    /// collect is inside `cycle_ms` but NOT here).
+    pub query_ms: u64,
+    /// Actions matched (assigned + worker notified) in this cycle.
+    pub actions_matched: u64,
+}
+
 /// (#obs-tuning) OBSERVABILITY-ONLY: emit ONE `info!` line carrying the
 /// Stage-A (speculative-prefetch) and Stage-B (speculative-hold) decision
-/// counters, so they are scrapeable from journalctl even though the
-/// `SchedulerMetrics` tree is DARK on the HTTP `/metrics` endpoint (empty on
-/// all ports in production). Mirrors the release-visibility of the sibling
+/// counters, so they are scrapeable from journalctl in addition to `/metrics`.
+/// (The `SchedulerMetrics` tree RENDERS on `/metrics` — the old "DARK / empty
+/// on all ports" claim was a plain-HTTP probe of the mTLS-only metrics
+/// listener, refuted by the #231 render tests and a live scrape 2026-08-04;
+/// this emit remains the log-based scrape surface.) Mirrors the
+/// release-visibility of the sibling
 /// `tag = "p_headroom_gate_exclusion"` info-log: MUST be `info!` (not
 /// `debug!`/`trace!`), because the release build pins `release_max_level_info`
 /// and would compile the lower levels out — leaving the soak's `T_SETUP` /
@@ -1326,8 +1372,8 @@ pub fn emit_speculative_hold_counters_log(metrics: &SchedulerMetrics) {
             .load(Ordering::Relaxed),
         // (#sched-work-conservation) Cumulative E-spill admits — the live measure
         // of how much queued work the Track-A total-core term recruits onto the
-        // E-cores of P-full workers (rides this periodic emit because the
-        // SchedulerMetrics tree is dark on /metrics).
+        // E-cores of P-full workers (rides this periodic emit as the journalctl
+        // twin; the SchedulerMetrics tree also renders on /metrics).
         e_spill_admits_total = metrics.e_spill_admits_total.load(Ordering::Relaxed),
         "stage A/B decision counters"
     );
@@ -1335,12 +1381,13 @@ pub fn emit_speculative_hold_counters_log(metrics: &SchedulerMetrics) {
 
 /// (#task-resource-profile Phase-2a) OBSERVABILITY-ONLY: emit ONE
 /// `tag = "resource_profile_counters"` info-log carrying the five profile-map
-/// counters/gauges + the two skip counters. The `SchedulerMetrics` tree is DARK
-/// on the HTTP `/metrics` endpoint in production (empty on all ports — see the
-/// sibling `emit_speculative_hold_counters_log`), so WITHOUT this periodic emit
-/// an operator could not read the profile signal at all and the whole
-/// observe-only value (SEE profiles accumulate + the baggage-reaches-prod
-/// dark-detector) would ITSELF be dark. MUST be `info!` (not `debug!`/`trace!`)
+/// counters/gauges + the two skip counters. This periodic emit is the
+/// journalctl-visible surface (the `SchedulerMetrics` tree ALSO renders on
+/// `/metrics` — the old "DARK / empty on all ports" claim was a plain-HTTP
+/// probe of the mTLS-only listener; see the sibling
+/// `emit_speculative_hold_counters_log`); without it a log-only operator could
+/// not read the profile signal (SEE profiles accumulate + the
+/// baggage-reaches-prod dark-detector) from journalctl. MUST be `info!` (not `debug!`/`trace!`)
 /// because the release build pins `release_max_level_info` and would compile the
 /// lower levels out.
 ///
@@ -1375,11 +1422,11 @@ pub fn emit_resource_profile_counters_log(metrics: &SchedulerMetrics) {
 
 /// (#task-resource-profile Phase-2b) OBSERVABILITY-ONLY: emit ONE
 /// `tag = "resource_profile_inject_observe"` info-log carrying the four
-/// inject-observe counterfactual counters. Same DARK-on-`/metrics` rationale as
-/// [`emit_resource_profile_counters_log`] (the `SchedulerMetrics` tree is not
-/// scraped in prod), so WITHOUT this periodic emit the whole Phase-2b observe
-/// signal — the accuracy data the enforce phase depends on — would ITSELF be
-/// dark. MUST be `info!` (`release_max_level_info` strips lower levels). Wired
+/// inject-observe counterfactual counters. Same journalctl-twin rationale as
+/// [`emit_resource_profile_counters_log`] (the `SchedulerMetrics` tree renders
+/// on `/metrics`; this emit serves log-based scrapes), so WITHOUT it the
+/// Phase-2b observe signal — the accuracy data the enforce phase depends on —
+/// would be invisible to a journalctl-only operator. MUST be `info!` (`release_max_level_info` strips lower levels). Wired
 /// into the SAME spawn-once periodic task that emits the aggregation counters;
 /// NEVER per-match. Reads `Relaxed`, changes no scheduling decision.
 ///
@@ -1435,9 +1482,10 @@ pub fn emit_inject_observe_counters_log(metrics: &SchedulerMetrics) {
 /// surfaced here by `predicted_tail_over_actual_{max,sum}_x100` + `predicted_tail_over_actual_samples`:
 /// `sum/samples` is the TYPICAL over-reservation, `max` the WORST, so an operator can
 /// judge whether injecting the tail would starve concurrency (cadre 2026-07-15). Same
-/// DARK-on-`/metrics` rationale as [`emit_resource_profile_counters_log`] (the
-/// `SchedulerMetrics` tree is not scraped in prod), so WITHOUT this periodic emit the
-/// accuracy signal that gates Phase-3 would ITSELF be dark. MUST be `info!`
+/// journalctl-twin rationale as [`emit_resource_profile_counters_log`] (the
+/// `SchedulerMetrics` tree renders on `/metrics`; this emit serves log-based
+/// scrapes), so WITHOUT it the accuracy signal that gates Phase-3 would be
+/// invisible to a journalctl-only operator. MUST be `info!`
 /// (`release_max_level_info` strips lower levels). Wired into the SAME spawn-once
 /// periodic task; NEVER per-match. Reads `Relaxed`, changes no scheduling decision.
 ///
@@ -5956,10 +6004,11 @@ const HOLD_MAX_K: usize = 8;
 
 /// (#obs-tuning) OBSERVABILITY-ONLY cadence for the periodic Stage-A/Stage-B
 /// decision-counter info-log (`emit_speculative_hold_counters_log`). The
-/// counters are `AtomicU64` on `SchedulerMetrics` but the metrics tree is DARK
-/// on the HTTP `/metrics` endpoint (empty on all ports in production), so a
-/// journalctl `info!` line is the only scrape surface for tuning `T_SETUP` /
-/// the hold caps against MEASURED hold success/regret. 15 s is a coarse fleet-
+/// counters are `AtomicU64` on `SchedulerMetrics`, which renders on `/metrics`
+/// (the old "DARK / empty on all ports" claim was a plain-HTTP probe of the
+/// mTLS-only metrics listener); the journalctl `info!` line is the log-based
+/// scrape surface for tuning `T_SETUP` / the hold caps against MEASURED hold
+/// success/regret. 15 s is a coarse fleet-
 /// scrape cadence — long enough that the once-per-interval emit is negligible
 /// overhead (one `info!` + eight relaxed atomic loads per tick), short enough
 /// that a soak run captures the counters at useful resolution. This is a

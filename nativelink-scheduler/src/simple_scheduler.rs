@@ -50,9 +50,9 @@ use tracing::{debug, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::api_worker_scheduler::{
-    ApiWorkerScheduler, HOLD_COUNTERS_LOG_INTERVAL_S, compute_dedup_cached_score,
-    emit_inject_observe_counters_log, emit_prediction_accuracy_counters_log,
-    emit_resource_profile_counters_log,
+    ApiWorkerScheduler, DoTryMatchCycleSample, HOLD_COUNTERS_LOG_INTERVAL_S,
+    compute_dedup_cached_score, emit_inject_observe_counters_log,
+    emit_prediction_accuracy_counters_log, emit_resource_profile_counters_log,
     emit_speculative_hold_counters_log,
 };
 use crate::awaited_action_db::{AwaitedActionDb, CLIENT_KEEPALIVE_DURATION};
@@ -1926,21 +1926,25 @@ impl SimpleScheduler {
             );
         }
 
-        // (#matchcycle) Pure matcher-work telemetry: ONE O(1) record per
-        // CYCLE (8 relaxed RMWs; never per action — the
+        // (#matchcycle) Matcher-cost telemetry: ONE O(1) record per CYCLE
+        // (8 relaxed RMWs; never per action — the
         // expensive-observability-probe-in-hot-loop incident is the
         // standing ceiling). Lands on the registered `SchedulerMetrics`
         // tree, rendering as
         // `scheduler_<name>_worker_scheduler_metrics_do_try_match_*`;
-        // matcher-only work is `cycle_ms_sum - query_ms_sum`. The >5s WARN
-        // above stays the human-readable twin.
+        // `cycle_ms_sum - query_ms_sum` = collect + match work (the query
+        // stamp above precedes `stream.collect()`). `total_elapsed` is
+        // stamped BEFORE the speculative-prefetch tail below — same
+        // window as the >5s WARN above, which stays the human-readable
+        // twin. The named-field sample makes a cycle/query argument swap
+        // uncompilable.
         self.worker_scheduler
             .get_metrics()
-            .record_do_try_match_cycle(
-                u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
-                u64::try_from(query_elapsed.as_millis()).unwrap_or(u64::MAX),
+            .record_do_try_match_cycle(DoTryMatchCycleSample {
+                cycle_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
+                query_ms: u64::try_from(query_elapsed.as_millis()).unwrap_or(u64::MAX),
                 actions_matched,
-            );
+            });
 
         // (#specprefetch, #specprefetch-rebind §2.1) Speculative prefetch backlog
         // trigger.
@@ -3287,7 +3291,9 @@ impl SimpleScheduler {
                         // (#dag-criticality §6c) Surface the kill/keep ratio + confident-node
                         // telemetry the ON default depends on (anti-dark-counter). Copy the
                         // shared `DagState` tallies into the render-reachable gauges AND emit an
-                        // INFO log (the `SchedulerMetrics` tree is DARK on `/metrics` in prod).
+                        // INFO log (journalctl twin; the `SchedulerMetrics` tree renders on
+                        // `/metrics` — the old "DARK in prod" claim was a plain-HTTP probe of
+                        // the mTLS-only metrics listener).
                         let confident_nodes = dag_state.snapshot().confident_nodes() as u64;
                         let edge_count = dag_state.edge_count() as u64;
                         let duration_count = dag_state.duration_count() as u64;
