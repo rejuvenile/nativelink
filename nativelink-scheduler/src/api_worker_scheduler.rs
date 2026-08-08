@@ -74,7 +74,7 @@ use uuid::Uuid;
 /// `#[derive(MetricsComponent)]` + the `#[metric(group =
 /// "scheduler_metrics")]` annotation on `ApiWorkerScheduler::metrics`,
 /// which makes the `RootMetricsComponent` walk
-/// (`src/bin/nativelink.rs:559-568` → `render_prometheus`) descend into
+/// (`src/bin/nativelink.rs:600-604` → `render_prometheus`) descend into
 /// these counters. Before #231 they were dark — the only operator
 /// signal was the paired `warn!`s.
 #[derive(Debug, Default, MetricsComponent)]
@@ -908,7 +908,15 @@ pub struct SchedulerMetrics {
     // extra lookup, and nothing on the match-cycle hot path (this is NOT the
     // 2026-07-06 per-cycle-probe trap).
     //
-    // PARTITION IDENTITY: `down + raise + inject + unmodified == find_worker_hits`.
+    // PARTITION IDENTITY: `down + raise + inject + unmodified == find_worker_hits`,
+    // EXACT ONLY AT QUIESCENCE. The `find_worker_hits` bump and the arm bump are two
+    // statements inside the same exclusive write guard, so a concurrent scrape can
+    // observe the gap and read `sum == hits - 1`. The write guard bounds the skew at
+    // exactly 1 (at most one thread can be between them), so any check on this
+    // identity — in a test at rest, or against a live /metrics scrape — must allow
+    // +/-1 rather than strict equality. Verified live on the deployed server via the
+    // sibling attempt-side identity: 31,880 + 332,842 + 6,595 + 1,216,971 =
+    // 1,588,288 = find_worker_calls, exact at rest.
     // `find_worker_hits` has exactly two producers — this function and
     // `ApiWorkerScheduler::find_worker_for_action`, which has NO production callers
     // (it is not on the `WorkerScheduler` trait; only tests call it), so the
@@ -952,12 +960,48 @@ pub struct SchedulerMetrics {
 
     /// (#phase3-dispatch-arms) COUNTER: reserved dispatches that took NO Phase-3
     /// override. Under the deployed config (all three enforcement flags on, a
-    /// trusted profile at one tier for essentially every dispatch) the only
-    /// materially reachable cause is the DOWN staleness gate refusing a loaded-but-
-    /// not-yet-refolded profile, so this is the staleness-suppressed dispatch count
-    /// — directly comparable to `down_opportunity_samples` and to
-    /// `find_worker_hits`. Reading it needs ONE scrape: `arm_unmodified /
-    /// find_worker_hits`.
+    /// trusted profile at one tier for essentially every dispatch) the dominant
+    /// reachable cause is the DOWN staleness gate refusing a loaded-but-not-yet-
+    /// refolded profile, so this is an UPPER BOUND on the staleness-suppressed
+    /// dispatch count — not the count. Two other exits land here: an action whose
+    /// `resource_profile_keys` is underivable (no baggage), and one with no trusted
+    /// profile at EITHER tier. Both biases push the ratio UP, so a LOW reading is
+    /// trustworthy and a high one is not, by itself, attributable to staleness.
+    ///
+    /// **READ IT AS A DELTA, NEVER AS A CUMULATIVE RATIO.** `Agg::fresh_since_load`
+    /// is set true by `fold` and cleared only at snapshot-load — it NEVER resets
+    /// within a process. So each loaded mature key suppresses at most
+    /// `T_k ~ Geometric(1/CALIB_SAMPLE_PERIOD)` dispatches for the WHOLE process
+    /// lifetime (total on the order of `CALIB_SAMPLE_PERIOD x mature_key_count`),
+    /// while `find_worker_hits` grows without bound. The numerator SATURATES and the
+    /// denominator does not, so the cumulative ratio decays toward zero and any
+    /// fixed threshold on it measures UPTIME, not the mechanism — both "kill" and
+    /// "proceed" are reachable from the same healthy system by choosing when to
+    /// scrape. Measured on the sibling completion-side arm counter: 46.8% cumulative,
+    /// 36.7% cumulative 2.41 h later on the same PID, but 19.4% over the delta.
+    ///
+    /// Correct protocol: TWO scrapes bounding a stated window, reporting
+    /// `d(arm_unmodified) / d(find_worker_hits)` alongside `(uptime, d(hits))`.
+    /// The partition `sum(4 arms) == find_worker_hits` is exact only at quiescence —
+    /// a live scrape can legitimately observe `sum == hits - 1`, so check it with a
+    /// tolerance of +/-1, never strict equality. That same check is the cheap guard
+    /// against the asymmetric failure below.
+    ///
+    /// TWO WAYS THIS READS CONFIDENTLY WRONG:
+    /// 1. **Kill-switch meaning-flip.** `phase3_down_effective_kb` clamps the p95 to
+    ///    `[ceil(declared/factor), declared]`. At `phase3_overcommit_max_factor = 1.0`
+    ///    the floor EQUALS declared, so every DOWN-territory dispatch takes the
+    ///    `effective == declared` no-op and lands HERE; `phase3_down_overcommit_enabled
+    ///    = false` does the same. Those are precisely the two documented kill-switches,
+    ///    and pulling one is exactly when somebody comes to read this counter — at
+    ///    which point it jumps to roughly the whole DOWN-territory share while every
+    ///    doc still calls it "staleness-suppressed". Check both flags before believing
+    ///    a high reading.
+    /// 2. **Denominator inflation.** `find_worker_hits` has a second producer,
+    ///    `find_worker_for_action`, which has no production callers today but is `pub`.
+    ///    A stray caller inflates the denominator and biases this ratio DOWN — toward
+    ///    a false "stop". No in-process test can catch that; the +/-1 partition check
+    ///    at scrape time can.
     #[metric(
         help = "(#phase3-dispatch-arms) reserved dispatches that took NO Phase-3 override (per-DISPATCH); under the deployed config this is the DOWN-staleness-suppressed dispatch count"
     )]
@@ -17599,7 +17643,7 @@ mod tests {
     /// This drives the SAME walk `metrics_handler` uses in prod
     /// (`nativelink-util/src/metrics_publisher.rs::render_prometheus`)
     /// against an `ApiWorkerScheduler` registered exactly the way
-    /// `src/bin/nativelink.rs:559-568` registers worker schedulers: an
+    /// `src/bin/nativelink.rs:600-604` registers worker schedulers: an
     /// `Arc<dyn MetricsComponent + Send + Sync>` upcast from
     /// `RootMetricsComponent`, under the `scheduler.<name>.worker`
     /// prefix. It asserts the LITERAL leaf names of the
