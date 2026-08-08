@@ -3951,22 +3951,47 @@ impl ApiWorkerSchedulerImpl {
             (self.phase3_starvation_clamp(p95_kb, &fine_key, "raise"), Applied::Raise)
         } else if self.phase3_down_overcommit_enabled && p95_kb <= declared_kb {
             // DOWN-overcommit (§3): the client OVER-declared (measured p95 at/under
-            // declared) → reserve p95 floored at `declared / overcommit_max_factor`, so
-            // more actions pack per worker. The physical backstop is the worker
-            // `memory_gate` free-floor NAK — this design adds NO new backstop.
+            // declared) → reserve the profiled p95, floored at
+            // `declared / overcommit_max_factor`, so more actions pack per worker.
+            //
+            // BACKSTOP (unchanged here — this is a CLARIFICATION of the pre-existing
+            // "adds NO new backstop" note, not a correction of it; `f729814a` already
+            // said "physical"). The only PHYSICAL, OOM-time limiter for a wrong-low
+            // reserve is the worker-side `memory_gate` NAK — free-floor
+            // (`FREE_FLOOR_BYTES = 1 GiB`, `local_worker.rs:1079`) plus the sustained-
+            // swapin arm (`memory_gate_swapin_confirm_rate`, armed fleet-wide at 2000);
+            // the worker never re-checks the reservation itself. The floor here, the §12
+            // staleness gate below, and the churn throttle are STATISTICAL,
+            // scheduler-side bounds, NOT physical backstops.
+            //
+            // The memory_gate is also conditional, not absolute: when EVERY capable
+            // worker is pressured and none was capacity-excluded, the fleet fail-open
+            // places anyway, damped only by `pressure_nak_cooldown_s`. Grep
+            // `capacity_excluded_healthy.get() == 0` for that predicate and
+            // `worker_matches_ignoring_pressure` for the admitting closure — deliberately
+            // named rather than line-cited, because a bare line number in this file goes
+            // stale on the next edit above it. Tighter packing pushes BOTH conjuncts
+            // toward firing (more actions fit ⇒ fewer capacity exclusions; more packed
+            // memory ⇒ more pressured workers), so the backstop is weakest exactly when
+            // packing is most aggressive. It is NEW-ADMISSION-ONLY: an already-running
+            // action under a too-low reservation is never re-evaluated.
             //
             // §12 STALENESS: a profile LOADED from a persisted snapshot is NOT trusted for
             // LOWERING until a FRESH sample has folded AND the snapshot age is within
             // `phase3_persist_max_age_secs` (live keys always pass). A stale loaded key
-            // keeps its declared reservation (over-reserve, never a stale-OOM).
-            if !resource_profile_map.lock().down_lowering_trusted(
+            // keeps its declared reservation (over-reserve, never a stale-OOM). The trust
+            // verdict AND the reserve statistic come from ONE peek of ONE agg, so they can
+            // never be read off different tiers — the precondition for making that tier
+            // selection staleness-aware (the known fallback inversion; see
+            // `.claude/audits/phase3-staleness-gate-diagnosis-2026-08-08.md` §4).
+            let Some(down_reserve_kb) = resource_profile_map.lock().down_lowering_reserve_kb(
                 &fine_key,
                 &coarse_key,
                 self.phase3_persist_max_age_secs,
-            ) {
+            ) else {
                 self.metrics.phase3_noop_ineligible.fetch_add(1, Ordering::Relaxed);
                 return None;
-            }
+            };
             // (#task-memgate-twosignal) Reactive churn-throttle: back the effective
             // overcommit factor off toward 1.0 as the fleet's compressor-churn scalar
             // rises. OFF (default) → effective_factor == the static max factor →
@@ -3984,7 +4009,7 @@ impl ApiWorkerSchedulerImpl {
                 self.phase3_overcommit_churn_throttle_enabled,
             );
             (
-                phase3_down_effective_kb(declared_kb, p95_kb, effective_factor),
+                phase3_down_effective_kb(declared_kb, down_reserve_kb, effective_factor),
                 Applied::Down,
             )
         } else {

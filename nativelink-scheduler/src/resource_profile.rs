@@ -830,18 +830,39 @@ impl ProfileMap {
         loaded
     }
 
-    /// (#task-resource-profile Phase-3 §12 staleness) Whether the DOWN-overcommit
-    /// direction may trust the tier `lookup_tiered` would resolve to for LOWERING the
-    /// reservation. Determines the chosen tier (fine ≥K, else coarse ≥K, else `false` —
-    /// DOWN needs a trusted profile), then applies that agg's staleness gate against the
-    /// loaded-snapshot age + `max_age_secs`. A LIVE key (never loaded) always passes;
-    /// RAISE + OBSERVE never call this (stale ⇒ over-reserve, never OOM).
-    pub fn down_lowering_trusted(
+    /// (#task-resource-profile Phase-3 §12 staleness) The DOWN-overcommit RESERVE
+    /// STATISTIC (window p95) for the tier `lookup_tiered` would resolve to, or `None`
+    /// when the DOWN direction may not LOWER the reservation at all.
+    ///
+    /// Determines the chosen tier (fine ≥K, else coarse ≥K, else `None` — DOWN needs a
+    /// trusted profile), applies that agg's staleness gate against the loaded-snapshot age
+    /// + `max_age_secs`, and — only if both pass — returns that SAME agg's
+    /// [`Agg::memory_p95_kb`]. A LIVE key (never loaded) always passes the staleness gate;
+    /// RAISE + INJECT + OBSERVE never call this (they reserve the fixed p95 from
+    /// `lookup_tiered`, and stale ⇒ over-reserve, never OOM).
+    ///
+    /// Returning the statistic and the verdict TOGETHER is deliberate, and it is the
+    /// reason this function exists in this shape. Previously the verdict came from here
+    /// (`down_lowering_trusted -> bool`) and the number from a SEPARATE `lookup_tiered`
+    /// peek, so the two could in principle be read off different tiers. Now they provably
+    /// come from ONE peek of ONE agg, and "DOWN may not lower" is unrepresentable as a
+    /// reservation value.
+    ///
+    /// That coupling is a PREREQUISITE, not a tidy-up: the staleness gate's known
+    /// tier-fallback inversion (a mature-but-stale FINE key is chosen and refused instead
+    /// of falling through to a fresh COARSE sibling) can only be fixed by making tier
+    /// selection staleness-aware HERE. Doing that while the statistic still came from a
+    /// separate `lookup_tiered` peek would grant trust from the coarse agg while reserving
+    /// on the fine agg's p95 — a tier mismatch. See
+    /// `.claude/audits/phase3-staleness-gate-diagnosis-2026-08-08.md` §4/§8 Option A, and
+    /// `down_lowering_reserve_kb_statistic_and_verdict_come_from_the_same_tier` which pins
+    /// the property this function is here to provide.
+    pub fn down_lowering_reserve_kb(
         &self,
         fine: &ProfileKey,
         coarse: &ProfileKey,
         max_age_secs: u64,
-    ) -> bool {
+    ) -> Option<u64> {
         let chosen = self
             .cache
             .peek(fine)
@@ -850,11 +871,11 @@ impl ProfileMap {
                 self.cache
                     .peek(coarse)
                     .filter(|agg| agg.sample_count() >= self.min_samples)
-            });
-        match chosen {
-            Some(agg) => agg.down_lowering_trusted(self.loaded_snapshot_age_secs, max_age_secs),
-            None => false,
+            })?;
+        if !chosen.down_lowering_trusted(self.loaded_snapshot_age_secs, max_age_secs) {
+            return None;
         }
+        Some(chosen.memory_p95_kb())
     }
 }
 
@@ -957,6 +978,121 @@ mod tests {
             agg.memory_p95_kb(),
             50_000,
             "p95 over 5 samples = 5th (ceil(5*19/20)=5) = 50_000"
+        );
+    }
+
+    // ── (#phase3-down-reserve) DOWN reserve statistic + verdict from ONE agg ──
+
+    /// (#phase3-down-reserve) THE property this refactor exists to provide: the DOWN
+    /// reserve statistic and the DOWN trust verdict come from the SAME tier — the one
+    /// `lookup_tiered` resolves to. Asserted as an EQUALITY against `lookup_tiered`'s own
+    /// `p95_kb` with the two tiers holding DELIBERATELY DIFFERENT distributions, so a
+    /// tier mismatch cannot hide behind equal numbers.
+    ///
+    /// This is not coverage for its own sake. The staleness gate's tier-fallback
+    /// inversion (a mature-but-stale FINE key is chosen and refused rather than falling
+    /// through to a fresh COARSE sibling) is fixed by making tier selection
+    /// staleness-aware inside `down_lowering_reserve_kb`. That fix is only SOUND while
+    /// the statistic travels with the verdict: if a future edit reintroduces the split —
+    /// reserving on `lookup_tiered`'s fine p95 while trusting a coarse agg — the fix
+    /// silently reserves the wrong tier's number. See
+    /// `.claude/audits/phase3-staleness-gate-diagnosis-2026-08-08.md` §4.
+    ///
+    /// MUTATION 1: swap the peek order in `down_lowering_reserve_kb` (coarse before fine)
+    /// → case A red-fails (returns the coarse 900_000, not the fine 190_000).
+    /// MUTATION 2: delete the `.or_else(coarse)` fallback → case B red-fails
+    /// (returns None where `lookup_tiered` resolves the coarse tier).
+    #[test]
+    fn down_lowering_reserve_kb_statistic_and_verdict_come_from_the_same_tier() {
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+
+        // ── Case A: FINE is mature (>=K) ⇒ BOTH must resolve the FINE tier. ──
+        // Fine: 20 ascending samples ⇒ p95 = 190_000. Coarse: 20 samples an order of
+        // magnitude larger ⇒ p95 = rank 19 = 855_000. The tiers CANNOT be confused by value.
+        let mut map = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 20, 200);
+        for i in 1..=20u64 {
+            map.record(fine.clone(), mem_sample(i * 10_000));
+            map.record(coarse.clone(), mem_sample(i * 45_000));
+        }
+        let TieredTail::Trusted { tier, p95_kb, .. } = map.lookup_tiered(&fine, &coarse) else {
+            panic!("both tiers are >=K, so lookup_tiered must return Trusted");
+        };
+        assert_eq!(
+            tier,
+            ProfileTier::Fine,
+            "fixture precondition: with a mature fine key lookup_tiered must resolve FINE"
+        );
+        let reserve = map.down_lowering_reserve_kb(&fine, &coarse, 1000);
+        assert_eq!(
+            reserve,
+            Some(190_000),
+            "DOWN must reserve the FINE tier's p95 (190_000) when the fine key is mature. \
+             Got {reserve:?}. A value of 855_000 means the tier PREFERENCE inverted and \
+             DOWN is reserving the coarse blend; None means the fine tier was refused."
+        );
+        assert_eq!(
+            reserve,
+            Some(p95_kb),
+            "SPLIT-TIER REGRESSION: the DOWN reserve statistic ({reserve:?}) must equal the \
+             statistic lookup_tiered resolves ({}), because arm SELECTION keys on the \
+             latter. If these diverge, the arm is chosen on one tier's p95 and the \
+             reservation taken from another's — the exact defect this function's \
+             Option<u64> shape exists to make unrepresentable, and the soundness \
+             precondition for making tier selection staleness-aware here.",
+            p95_kb
+        );
+
+        // ── Case B: FINE is BELOW K ⇒ BOTH must fall through to the COARSE tier. ──
+        let mut map_b = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 20, 200);
+        for _ in 0..3u64 {
+            map_b.record(fine.clone(), mem_sample(11_111));
+        }
+        for i in 1..=20u64 {
+            map_b.record(coarse.clone(), mem_sample(i * 45_000));
+        }
+        let TieredTail::Trusted { tier: tier_b, p95_kb: p95_kb_b, .. } =
+            map_b.lookup_tiered(&fine, &coarse)
+        else {
+            panic!("fine is <K but coarse is >=K, so lookup_tiered must return Trusted");
+        };
+        assert_eq!(
+            tier_b,
+            ProfileTier::Coarse,
+            "fixture precondition: with an under-K fine key lookup_tiered must resolve COARSE"
+        );
+        let reserve_b = map_b.down_lowering_reserve_kb(&fine, &coarse, 1000);
+        assert_eq!(
+            reserve_b,
+            Some(855_000),
+            "DOWN must fall through to the COARSE tier's p95 (855_000) when the fine key \
+             is below K. Got {reserve_b:?}. None means the coarse fallback was dropped, \
+             which would silently disable DOWN for every young key — the population that \
+             most needs it; 11_111 means an under-K fine tier was reserved on."
+        );
+        assert_eq!(
+            reserve_b,
+            Some(p95_kb_b),
+            "SPLIT-TIER REGRESSION on the coarse fallback: DOWN reserved {reserve_b:?} but \
+             lookup_tiered resolves {} — arm selection and the reservation would be read \
+             off different tiers.",
+            p95_kb_b
+        );
+    }
+
+    /// (#phase3-down-reserve) `None`, never a number, when no tier is trusted — so
+    /// "DOWN may not lower" is unrepresentable as a reservation value. A `bool` verdict
+    /// plus a separately-fetched statistic could not express this.
+    #[test]
+    fn down_lowering_reserve_kb_is_none_when_no_tier_is_trusted() {
+        let (fine, coarse) = (key("//a", "M"), coarse_key("M"));
+        let mut cold = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 20, 200);
+        cold.record(fine.clone(), mem_sample(50_000));
+        assert_eq!(
+            cold.down_lowering_reserve_kb(&fine, &coarse, 1000),
+            None,
+            "a below-K profile at BOTH tiers must yield None (DOWN may not lower), not a \
+             statistic — an untrusted number is meaningless and must be unrepresentable \
+             as a reserve"
         );
     }
 
@@ -1501,23 +1637,26 @@ mod tests {
         let mut dst = ProfileMap::new(NonZeroUsize::new(16).unwrap(), 3, 200);
         dst.load_entries(entries, 100); // snapshot age 100s at load
 
-        assert!(
-            !dst.down_lowering_trusted(&fine, &coarse, 1000),
+        assert_eq!(
+            dst.down_lowering_reserve_kb(&fine, &coarse, 1000),
+            None,
             "a LOADED key with NO fresh sample must NOT be trusted for DOWN-lowering \
              (stale distribution → over-reserve, never a stale-OOM)"
         );
 
         // Fold a fresh sample → now trusted (age 100 < max_age 1000).
         dst.record(fine.clone(), mem_sample(50_000));
-        assert!(
-            dst.down_lowering_trusted(&fine, &coarse, 1000),
+        assert_eq!(
+            dst.down_lowering_reserve_kb(&fine, &coarse, 1000),
+            Some(50_000),
             "after a FRESH sample folds AND age (100) < max_age (1000) the loaded key \
-             becomes DOWN-trusted for lowering"
+             becomes DOWN-trusted for lowering, and yields its reserve statistic"
         );
 
         // Age gate: even WITH a fresh sample, a snapshot older than max_age is refused.
-        assert!(
-            !dst.down_lowering_trusted(&fine, &coarse, 50),
+        assert_eq!(
+            dst.down_lowering_reserve_kb(&fine, &coarse, 50),
+            None,
             "a snapshot age (100) >= max_age (50) must refuse DOWN-lowering even with a \
              fresh sample — the age gate is the second staleness guard"
         );
@@ -1531,8 +1670,9 @@ mod tests {
         for _ in 0..3 {
             map.record(fine.clone(), mem_sample(50_000));
         }
-        assert!(
-            map.down_lowering_trusted(&fine, &coarse, 1),
+        assert_eq!(
+            map.down_lowering_reserve_kb(&fine, &coarse, 1),
+            Some(50_000),
             "a live (never-loaded) key is always DOWN-trusted regardless of max_age — \
              only LOADED keys carry stale-OOM risk"
         );
