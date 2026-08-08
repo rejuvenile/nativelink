@@ -888,6 +888,81 @@ pub struct SchedulerMetrics {
     )]
     pub phase3_noop_ineligible: AtomicU64,
 
+    // ── (#phase3-dispatch-arms) per-DISPATCH Phase-3 arm partition ──
+    //
+    // The four counters above (`phase3_{raise_applied,down_applied,
+    // undeclared_injected,noop_ineligible}`) sit on the per-ATTEMPT path:
+    // `phase3_compute_effective_action_info` runs BEFORE worker selection, and a
+    // queued-but-unplaceable action is re-evaluated every `do_try_match` cycle.
+    // In the 2026-08-08 production scrape 99.07% of those attempts placed nothing
+    // (`find_worker_misses = 998,555` of `find_worker_calls = 1,007,918` vs
+    // `find_worker_hits = 9,363`), so ANY rate computed on that denominator is
+    // attempt-weighted (~108x inflated) and cannot answer "what fraction of REAL
+    // placements ran under which arm".
+    //
+    // These four are the per-DISPATCH answer. They are bumped in the SAME
+    // `result.is_some()` branch that bumps `find_worker_hits`, from the ALREADY
+    // computed `phase3_arm`, via an EXHAUSTIVE match with no `_` catch-all — so a
+    // future fifth [`Phase3Arm`] variant is a compile error, never a silent
+    // mis-bucket. Cost: one relaxed `fetch_add` per reserved dispatch, no lock, no
+    // extra lookup, and nothing on the match-cycle hot path (this is NOT the
+    // 2026-07-06 per-cycle-probe trap).
+    //
+    // PARTITION IDENTITY: `down + raise + inject + unmodified == find_worker_hits`.
+    // `find_worker_hits` has exactly two producers — this function and
+    // `ApiWorkerScheduler::find_worker_for_action`, which has NO production callers
+    // (it is not on the `WorkerScheduler` trait; only tests call it), so the
+    // identity is exact in production. Pinned by
+    // `phase3_dispatch_arm_counters_partition_dispatches_not_attempts`.
+    //
+    // WHY `unmodified` IS THE INTERESTING ONE: on the DISPATCH population every
+    // other no-override exit of `phase3_compute_effective_action_info` is provably
+    // ~zero under the deployed config (all three flags on; `profile_lookup_skip`
+    // measured exactly 0 of 9,363 dispatches; `effective == declared` requires
+    // `p95 == declared` exactly). So `phase3_dispatch_arm_unmodified` on a real
+    // dispatch is, to within that residual, the count of dispatches the DOWN
+    // staleness gate refused — the quantity
+    // `.claude/audits/phase3-staleness-gate-diagnosis-2026-08-08.md` §9/§10 turns
+    // on, with a pre-declared falsifier at <2% of `find_worker_hits`.
+    /// (#phase3-dispatch-arms) COUNTER: reserved dispatches whose reservation was
+    /// stood by the Phase-3 DOWN-overcommit arm (declared lowered toward the
+    /// profiled p95). The dispatch-side analogue of `phase3_down_applied`, which
+    /// counts attempts.
+    #[metric(
+        help = "(#phase3-dispatch-arms) reserved dispatches whose reservation was stood by the Phase-3 DOWN-overcommit arm (per-DISPATCH; the dispatch-side analogue of phase3_down_applied)"
+    )]
+    pub phase3_dispatch_arm_down: AtomicU64,
+
+    /// (#phase3-dispatch-arms) COUNTER: reserved dispatches whose reservation was
+    /// stood by the Phase-3 RAISE arm (an under-declaration lifted to the profiled
+    /// p95). The dispatch-side analogue of `phase3_raise_applied`.
+    #[metric(
+        help = "(#phase3-dispatch-arms) reserved dispatches whose reservation was stood by the Phase-3 RAISE arm (per-DISPATCH; the dispatch-side analogue of phase3_raise_applied)"
+    )]
+    pub phase3_dispatch_arm_raise: AtomicU64,
+
+    /// (#phase3-dispatch-arms) COUNTER: reserved dispatches whose reservation was
+    /// stood by the Phase-3 undeclared-INJECT arm (a p95 `memory_kb` Minimum stood
+    /// where the client declared none). The dispatch-side analogue of
+    /// `phase3_undeclared_injected`.
+    #[metric(
+        help = "(#phase3-dispatch-arms) reserved dispatches whose reservation was stood by the Phase-3 undeclared-INJECT arm (per-DISPATCH; the dispatch-side analogue of phase3_undeclared_injected)"
+    )]
+    pub phase3_dispatch_arm_inject: AtomicU64,
+
+    /// (#phase3-dispatch-arms) COUNTER: reserved dispatches that took NO Phase-3
+    /// override. Under the deployed config (all three enforcement flags on, a
+    /// trusted profile at one tier for essentially every dispatch) the only
+    /// materially reachable cause is the DOWN staleness gate refusing a loaded-but-
+    /// not-yet-refolded profile, so this is the staleness-suppressed dispatch count
+    /// — directly comparable to `down_opportunity_samples` and to
+    /// `find_worker_hits`. Reading it needs ONE scrape: `arm_unmodified /
+    /// find_worker_hits`.
+    #[metric(
+        help = "(#phase3-dispatch-arms) reserved dispatches that took NO Phase-3 override (per-DISPATCH); under the deployed config this is the DOWN-staleness-suppressed dispatch count"
+    )]
+    pub phase3_dispatch_arm_unmodified: AtomicU64,
+
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose TRUE
     /// DISPATCH-TIME leave-one-out prediction — the tail-aware statistic that stood at
     /// THIS action's dispatch (peeked BEFORE its own sample folded, stashed on the
@@ -8035,6 +8110,29 @@ impl ApiWorkerScheduler {
             self.metrics
                 .find_worker_hits
                 .fetch_add(1, Ordering::Relaxed);
+            // (#phase3-dispatch-arms) Attribute this REAL placement to the Phase-3 arm
+            // that stood its reservation. Deliberately in the SAME `result.is_some()`
+            // branch as `find_worker_hits` — one branch, two increments, no early
+            // return between them — so `down + raise + inject + unmodified ==
+            // find_worker_hits` is structural rather than a property to be maintained.
+            // Placing it in the dispatch-prediction stash block below would silently
+            // undercount: that block is additionally guarded on `resource_profile_keys`
+            // being derivable AND a profile already existing, so every unprofiled or
+            // baggage-less dispatch would go untallied.
+            //
+            // EXHAUSTIVE match, no `_` catch-all: a fifth `Phase3Arm` variant must be a
+            // compile error here, never a silent mis-bucket into an existing arm — the
+            // partition is the entire reason the number is trustworthy.
+            //
+            // OBSERVE-ONLY: `phase3_arm` was already computed above for the
+            // running-action stash; this reads it and touches nothing else.
+            match phase3_arm {
+                Phase3Arm::Down => &self.metrics.phase3_dispatch_arm_down,
+                Phase3Arm::Raise => &self.metrics.phase3_dispatch_arm_raise,
+                Phase3Arm::Inject => &self.metrics.phase3_dispatch_arm_inject,
+                Phase3Arm::Unmodified => &self.metrics.phase3_dispatch_arm_unmodified,
+            }
+            .fetch_add(1, Ordering::Relaxed);
         } else {
             self.metrics
                 .find_worker_misses
@@ -17683,6 +17781,23 @@ mod tests {
         scheduler.metrics.accuracy_under_by_arm_unmodified.fetch_add(264, Ordering::Relaxed);
         scheduler.metrics.accuracy_under_distinct_keys.store(265, Ordering::Relaxed);
         scheduler.metrics.accuracy_under_offender_dump_scans.fetch_add(266, Ordering::Relaxed);
+        // (#phase3-dispatch-arms) distinctive values on the FOUR per-dispatch arm
+        // counters AND on the four pre-existing enforce-phase counters. Until this
+        // change NO render test pinned ANY `phase3_*` name, so the entire Phase-3
+        // observability surface sat in the dark-counter trap: a counter that stops
+        // rendering (renamed field, dropped `#[metric]`, mis-nested group) reads as
+        // a flat 0 on /metrics, which is indistinguishable from "the arm never
+        // fired". The whole staleness-gate decision is a single scrape of
+        // phase3_dispatch_arm_unmodified / find_worker_hits, so a dark name here
+        // silently produces the "< 2%" reading that KILLS the workstream.
+        scheduler.metrics.phase3_raise_applied.fetch_add(271, Ordering::Relaxed);
+        scheduler.metrics.phase3_down_applied.fetch_add(272, Ordering::Relaxed);
+        scheduler.metrics.phase3_undeclared_injected.fetch_add(273, Ordering::Relaxed);
+        scheduler.metrics.phase3_noop_ineligible.fetch_add(274, Ordering::Relaxed);
+        scheduler.metrics.phase3_dispatch_arm_down.fetch_add(275, Ordering::Relaxed);
+        scheduler.metrics.phase3_dispatch_arm_raise.fetch_add(276, Ordering::Relaxed);
+        scheduler.metrics.phase3_dispatch_arm_inject.fetch_add(277, Ordering::Relaxed);
+        scheduler.metrics.phase3_dispatch_arm_unmodified.fetch_add(278, Ordering::Relaxed);
         // (#dag-criticality §6c) distinctive values on the seven DAG kill/keep +
         // confident-node telemetry fields — the feature ships ON under the anti-dark-
         // counter rule, so a DARK field here re-opens the exact blind spot the fix-up
@@ -17948,6 +18063,48 @@ mod tests {
                 body.contains(&line),
                 "#dag-criticality §6c: {field} rendered the wrong value (expected {value}) — \
                  group/field routing into the DAG telemetry is wrong. body=\n{body}"
+            );
+        }
+
+        // (#phase3-dispatch-arms) The Phase-3 observability surface — the four NEW
+        // per-DISPATCH arm counters plus the four pre-existing per-ATTEMPT enforce
+        // counters, none of which any render test pinned before this change.
+        //
+        // This is the dark-counter trap in its sharpest form. The DOWN staleness
+        // gate's whole cost/benefit decision is `phase3_dispatch_arm_unmodified /
+        // find_worker_hits` read from ONE live scrape against a pre-declared "< 2%
+        // kills the workstream" falsifier. If the name stops rendering — a renamed
+        // field, a dropped `#[metric]`, a mis-nested group — the scrape returns
+        // nothing, "nothing" is read as zero, and zero passes the falsifier. The
+        // instrument would then kill the workstream by being broken. Pinning the
+        // exact emitted string with a distinctive value is the only check that
+        // separates "rendered 0 events" from "did not render".
+        for (field, value) in [
+            ("phase3_raise_applied", 271u64),
+            ("phase3_down_applied", 272),
+            ("phase3_undeclared_injected", 273),
+            ("phase3_noop_ineligible", 274),
+            ("phase3_dispatch_arm_down", 275),
+            ("phase3_dispatch_arm_raise", 276),
+            ("phase3_dispatch_arm_inject", 277),
+            ("phase3_dispatch_arm_unmodified", 278),
+        ] {
+            let leaf = format!("scheduler_metrics_{field}");
+            assert!(
+                body.contains(&leaf),
+                "#phase3-dispatch-arms: SchedulerMetrics.{field} dark on /metrics — a \
+                 Phase-3 counter that does not render reads as a flat 0 on a scrape, \
+                 which is indistinguishable from 'the arm never fired'. The staleness- \
+                 gate decision is a single scrape of this surface, so a dark name here \
+                 manufactures the '< 2%' reading that kills the workstream. body=\n{body}"
+            );
+            let line =
+                format!("\nscheduler_testsched_worker_scheduler_metrics_{field} {value}\n");
+            assert!(
+                body.contains(&line),
+                "#phase3-dispatch-arms: {field} rendered the wrong value (expected \
+                 {value}) — group/field routing into the Phase-3 counters is wrong, so \
+                 the scraped number belongs to a different field. body=\n{body}"
             );
         }
     }
@@ -19589,6 +19746,363 @@ mod b1_lock_decouple_tests {
             sched_d.metrics.phase3_raise_applied.load(Ordering::Relaxed),
             0,
             "a DOWN must NOT increment phase3_raise_applied"
+        );
+    }
+
+    // ── (#phase3-dispatch-arms) per-DISPATCH Phase-3 arm partition ──
+
+    /// (#phase3-dispatch-arms) THE partition contract: the four
+    /// `phase3_dispatch_arm_*` counters partition REAL DISPATCHES
+    /// (`find_worker_hits`) EXACTLY — one increment per reserved dispatch, and
+    /// NONE on a placement attempt that reserved nothing.
+    ///
+    /// Production composition: ONE scheduler carrying the DEPLOYED flag shape
+    /// (RAISE + DOWN + undeclared-INJECT all ON — `prod-server.json5:396-397` plus the
+    /// `phase3_reserve_undeclared_enabled` default), driven through
+    /// `find_and_reserve_worker` (the entry point `do_try_match` uses) for one
+    /// dispatch on EACH of the four arms plus ONE unplaceable attempt.
+    ///
+    /// The unplaceable attempt is the load-bearing half. It carries the SAME
+    /// baggage and declaration as the DOWN dispatch but asks for a worker `name`
+    /// nothing advertises, so `phase3_compute_effective_action_info` — which runs
+    /// BEFORE worker selection — computes and COUNTS a DOWN override while no
+    /// worker is reserved. `phase3_down_applied` therefore reads 2 where
+    /// `phase3_dispatch_arm_down` reads 1: the attempt-vs-dispatch inflation
+    /// (~108x in the 2026-08-08 scrape) that makes the pre-existing attempt-side
+    /// counters unusable for "what fraction of REAL placements took which arm",
+    /// pinned here as a contract rather than left as prose in an audit.
+    ///
+    /// Also pins the attempt-side identity over `find_worker_calls`, which nothing
+    /// in the workspace read before this test.
+    ///
+    /// MUTATION M1: move the arm-counter match out of the `result.is_some()` branch
+    /// up to just after the `phase3_arm` binding (i.e. onto the ATTEMPT path) → the
+    /// unplaceable attempt is counted → the sum reads 5 against 4 hits → red with
+    /// "arm counters are NOT on the dispatch path".
+    /// MUTATION M2: route `Phase3Arm::Down` to `phase3_dispatch_arm_unmodified` →
+    /// red with "mis-routed arm".
+    /// MUTATION M3: delete the whole increment block → every arm reads 0, the sum
+    /// reads 0 → red with "arm counters are NOT on the dispatch path".
+    #[nativelink_test]
+    async fn phase3_dispatch_arm_counters_partition_dispatches_not_attempts() {
+        use crate::resource_profile::ProfileKey;
+
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+        // The DEPLOYED shape: RAISE on, DOWN on at factor 4.0, undeclared-INJECT on.
+        scheduler.set_phase3_enforcement(true, true, 4.0, 604_800, false, 2000, 20000, true);
+        let _rx = add_worker_with_memory_and_total(&scheduler, "W", 1_000_000.0, 1_000_000).await;
+
+        // Trusted (>=K) FINE profiles, p95 = 50_000, on two distinct keys: the DOWN /
+        // INJECT key (`//foo:bar|CppCompile`, i.e. `observe_key()`) and the RAISE key.
+        let raise_key = ProfileKey::from_parts("main", "//foo:raise", "CppCompile")
+            .expect("non-empty key parts");
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+            scheduler.resource_profile_record_sample(raise_key.clone(), mem_only_sample(50_000));
+        }
+
+        // ── arm 1/4 DOWN: declared 100_000 >= p95 50_000, factor 4 → reserve 50_000 ──
+        let action_down = action_with_memory_and_baggage("W", 0xa1, 100_000.0);
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 100_000.0),
+                &OperationId::default(),
+                &action_down,
+                false,
+            )
+            .await
+            .expect("the DOWN action must reserve worker W");
+
+        // ── arm 2/4 RAISE: declared 4096 < p95 50_000 → reserve 50_000 ──
+        let mut action_raise = action_with_memory_and_baggage("W", 0xa2, 4096.0);
+        if let Some(m) = action_raise.origin_metadata.bazel_metadata.as_mut() {
+            m.target_id = "//foo:raise".to_string();
+        }
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 4096.0),
+                &OperationId::default(),
+                &action_raise,
+                false,
+            )
+            .await
+            .expect("the RAISE action must reserve worker W");
+
+        // ── arm 3/4 INJECT: no declaration + trusted profile → inject p95 50_000 ──
+        let action_inject = action_baggage(0xa3, "//foo:bar", "CppCompile");
+        scheduler
+            .find_and_reserve_worker(
+                &props_named("W"),
+                &OperationId::default(),
+                &action_inject,
+                false,
+            )
+            .await
+            .expect("the undeclared action must reserve worker W");
+
+        // ── arm 4/4 UNMODIFIED: baggage with NO profile at EITHER tier → no override ──
+        let mut action_unmod = action_with_memory_and_baggage("W", 0xa4, 4096.0);
+        if let Some(m) = action_unmod.origin_metadata.bazel_metadata.as_mut() {
+            m.target_id = "//foo:unprofiled".to_string();
+            // A distinct mnemonic so the COARSE key ("main", "", "Genrule") is
+            // unprofiled too — otherwise the coarse tier would supply a trusted p95
+            // and this dispatch would take an arm.
+            m.action_mnemonic = "Genrule".to_string();
+        }
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 4096.0),
+                &OperationId::default(),
+                &action_unmod,
+                false,
+            )
+            .await
+            .expect("the unprofiled action must still reserve worker W");
+
+        // ── the unplaceable ATTEMPT: same DOWN baggage + declaration, but a worker
+        //    `name` no worker advertises → Phase-3 computes+counts a DOWN, selection
+        //    finds nobody, nothing is reserved ──
+        let action_miss = action_with_memory_and_baggage("NOSUCH", 0xa5, 100_000.0);
+        assert!(
+            scheduler
+                .find_and_reserve_worker(
+                    &props_named_with_memory("NOSUCH", 100_000.0),
+                    &OperationId::default(),
+                    &action_miss,
+                    false,
+                )
+                .await
+                .is_none(),
+            "test setup: the NOSUCH-named action must find no worker — without a real \
+             unplaceable attempt this test cannot distinguish the dispatch path from \
+             the attempt path"
+        );
+
+        let hits = scheduler.metrics.find_worker_hits.load(Ordering::Relaxed);
+        let calls = scheduler.metrics.find_worker_calls.load(Ordering::Relaxed);
+        let misses = scheduler.metrics.find_worker_misses.load(Ordering::Relaxed);
+        assert_eq!(
+            (calls, hits, misses),
+            (5, 4, 1),
+            "test setup: expected 4 reserved dispatches + 1 unplaceable attempt; got \
+             calls={calls} hits={hits} misses={misses}"
+        );
+
+        let arm_down = scheduler
+            .metrics
+            .phase3_dispatch_arm_down
+            .load(Ordering::Relaxed);
+        let arm_raise = scheduler
+            .metrics
+            .phase3_dispatch_arm_raise
+            .load(Ordering::Relaxed);
+        let arm_inject = scheduler
+            .metrics
+            .phase3_dispatch_arm_inject
+            .load(Ordering::Relaxed);
+        let arm_unmodified = scheduler
+            .metrics
+            .phase3_dispatch_arm_unmodified
+            .load(Ordering::Relaxed);
+
+        assert_eq!(
+            arm_down + arm_raise + arm_inject + arm_unmodified,
+            hits,
+            "arm counters are NOT on the dispatch path: the four \
+             phase3_dispatch_arm_* counters must partition find_worker_hits EXACTLY \
+             (sum == {hits}), but they sum to {} \
+             (down={arm_down} raise={arm_raise} inject={arm_inject} \
+             unmodified={arm_unmodified}). A sum ABOVE hits means an increment \
+             escaped onto the per-attempt path (the ~108x-inflated denominator this \
+             instrument exists to avoid); a sum BELOW hits means a dispatch went \
+             uncounted, so any rate read off these counters is wrong",
+            arm_down + arm_raise + arm_inject + arm_unmodified
+        );
+        assert_eq!(
+            (arm_down, arm_raise, arm_inject, arm_unmodified),
+            (1, 1, 1, 1),
+            "mis-routed arm: each of the four dispatches took a DIFFERENT Phase-3 arm \
+             (down/raise/inject/unmodified in that order), so each counter must read \
+             exactly 1 — a duplicated or zero bucket means the match routes an arm to \
+             the wrong counter"
+        );
+
+        // The attempt-side counters — the SAME five calls, the OTHER denominator.
+        let down_applied = scheduler
+            .metrics
+            .phase3_down_applied
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            down_applied, 2,
+            "test premise (the reason these four counters exist): \
+             phase3_down_applied counts ATTEMPTS, so the unplaceable attempt bumps it \
+             to 2 while phase3_dispatch_arm_down stays at 1 dispatch. If this reads 1 \
+             the attempt no longer reaches the enforce path and the contrast this \
+             test pins has evaporated"
+        );
+        assert_eq!(
+            arm_down, 1,
+            "the DOWN dispatch counter must NOT follow phase3_down_applied onto the \
+             attempt path — 1 real placement took the DOWN arm"
+        );
+        let raise_applied = scheduler
+            .metrics
+            .phase3_raise_applied
+            .load(Ordering::Relaxed);
+        let injected = scheduler
+            .metrics
+            .phase3_undeclared_injected
+            .load(Ordering::Relaxed);
+        let noop = scheduler
+            .metrics
+            .phase3_noop_ineligible
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            down_applied + raise_applied + injected + noop,
+            calls,
+            "the ATTEMPT-side identity is broken: the four enforce-phase counters \
+             must partition find_worker_calls ({calls}), but they sum to {} \
+             (down={down_applied} raise={raise_applied} inject={injected} \
+             noop={noop}). Nothing in the workspace read find_worker_calls before \
+             this assertion, so a drift here would be silent and would corrupt every \
+             per-attempt rate computed from a scrape",
+            down_applied + raise_applied + injected + noop
+        );
+    }
+
+    /// (#phase3-dispatch-arms) The question the instrument exists to answer: a
+    /// dispatch whose DOWN override was refused by the §12 STALENESS gate lands in
+    /// `phase3_dispatch_arm_unmodified`, and lands in `phase3_dispatch_arm_down`
+    /// once a fresh sample folds.
+    ///
+    /// Production composition: the profile map is populated through
+    /// `resource_profile_load_entries` — the SAME call `SimpleScheduler::new` makes
+    /// on startup from the persisted snapshot (`simple_scheduler.rs:2775`) — so the
+    /// agg is `loaded` with `fresh_since_load = false`, which is the state EVERY
+    /// mature key is in for the first ~16 dispatches after every deploy.
+    ///
+    /// Both directions are proven, because a one-directional signal cannot tell
+    /// "the gate refused" from "the counter is dark": before the fresh fold the
+    /// worker's remaining `memory_kb` shows the DECLARED 100_000 was reserved (the
+    /// refusal actually happened — the attribution is not vacuous); after ONE fresh
+    /// sample the SAME action reserves the p95 50_000 and the increment moves to
+    /// `phase3_dispatch_arm_down` while `arm_unmodified` stays put.
+    ///
+    /// MUTATION M4: comment out the `down_lowering_trusted` check in
+    /// `ProfileMap::down_lowering_reserve_kb` (`resource_profile.rs:875-877`) → the
+    /// stale profile is trusted → the FIRST dispatch takes the DOWN arm → red with
+    /// "staleness-refused dispatch not counted as unmodified".
+    #[nativelink_test]
+    async fn phase3_dispatch_arm_unmodified_counts_the_staleness_refused_down() {
+        use crate::resource_profile::ProfileEntrySnapshot;
+
+        let scheduler = build_scheduler(BarrierWorkerStateManager::new());
+        // DOWN on at factor 4.0; RAISE + inject off so the ONLY arm available to
+        // this declared action is DOWN, and `Unmodified` can only mean refusal.
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000, false);
+        let _rx = add_worker_with_memory_and_total(&scheduler, "W", 1_000_000.0, 1_000_000).await;
+
+        // A MATURE (>= PROFILE_MIN_SAMPLES) fine entry restored from a persisted
+        // snapshot, 60 s old — far inside the 604_800 s max-age term, so the ONLY
+        // term that can bind is `fresh_since_load`.
+        let key = observe_key();
+        let k = crate::resource_profile::PROFILE_MIN_SAMPLES;
+        let k_len = usize::try_from(k).expect("PROFILE_MIN_SAMPLES fits usize");
+        scheduler.resource_profile_load_entries(
+            vec![ProfileEntrySnapshot {
+                instance_name: key.instance_name.clone(),
+                target_id: key.target_id.clone(),
+                action_mnemonic: key.action_mnemonic.clone(),
+                memory_samples: vec![50_000; k_len],
+                cpu_samples: vec![0; k_len],
+                disk_samples: vec![0; k_len],
+                net_samples: vec![0; k_len],
+                sample_count: k,
+            }],
+            60,
+        );
+
+        // ── stale: the DOWN gate refuses, the declared 100_000 is reserved ──
+        let action = action_with_memory_and_baggage("W", 0xb1, 100_000.0);
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 100_000.0),
+                &OperationId::default(),
+                &action,
+                false,
+            )
+            .await
+            .expect("the action must reserve worker W even with DOWN refused");
+        assert_eq!(
+            scheduler
+                .worker_min_prop(&WorkerId("W".to_string()), "memory_kb")
+                .await,
+            Some(1_000_000.0 - 100_000.0),
+            "precondition: the staleness gate must actually have REFUSED — the ledger \
+             must hold the DECLARED 100_000 (remaining 900_000), not the p95 50_000. \
+             If the DOWN applied here this test would attribute an arm that never \
+             lost its override"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .phase3_dispatch_arm_unmodified
+                .load(Ordering::Relaxed),
+            1,
+            "staleness-refused dispatch not counted as unmodified: a DOWN-territory \
+             dispatch whose loaded-but-not-yet-refolded profile was refused by the \
+             §12 staleness gate is EXACTLY what phase3_dispatch_arm_unmodified must \
+             count — it is the numerator of the <2% falsifier in \
+             .claude/audits/phase3-staleness-gate-diagnosis-2026-08-08.md §10"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .phase3_dispatch_arm_down
+                .load(Ordering::Relaxed),
+            0,
+            "a refused DOWN must NOT be counted as an applied DOWN dispatch"
+        );
+
+        // ── one fresh sample folds → the gate opens → the SAME action takes DOWN ──
+        scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(50_000));
+        let action2 = action_with_memory_and_baggage("W", 0xb2, 100_000.0);
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 100_000.0),
+                &OperationId::default(),
+                &action2,
+                false,
+            )
+            .await
+            .expect("the second action must reserve worker W");
+        assert_eq!(
+            scheduler
+                .worker_min_prop(&WorkerId("W".to_string()), "memory_kb")
+                .await,
+            Some(1_000_000.0 - 100_000.0 - 50_000.0),
+            "precondition: after a fresh fold the DOWN override must actually stand — \
+             the second reservation is the p95 50_000 (remaining 850_000)"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .phase3_dispatch_arm_down
+                .load(Ordering::Relaxed),
+            1,
+            "the signal must respond in BOTH directions: once a fresh sample unlocks \
+             the gate the dispatch must move to phase3_dispatch_arm_down. A counter \
+             that only ever reads 'unmodified' is indistinguishable from one wired to \
+             a constant"
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .phase3_dispatch_arm_unmodified
+                .load(Ordering::Relaxed),
+            1,
+            "the unlocked dispatch must NOT also bump arm_unmodified — the four arms \
+             are a partition, not overlapping tallies"
         );
     }
 
