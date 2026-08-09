@@ -106,8 +106,11 @@ pub struct DispatchPhase3 {
     /// (DOWN: `clamp(p95, declared/factor, declared)`; RAISE/INJECT: the
     /// starvation-clamped p95; Unmodified: the declaration). Rides here so the
     /// completion-side offender row can report the reservation without the
-    /// reader having to reconstruct arm-specific clamp semantics. `0` only via
-    /// `Default` on paths that never traverse the Phase-3 reserve.
+    /// reader having to reconstruct arm-specific clamp semantics. `0` is a REAL
+    /// value for an UNDECLARED action that took no inject (below-K profile or
+    /// inject disabled: nothing was reserved), as well as the `Default` on
+    /// paths that never traverse the Phase-3 reserve — a `reserved=0` offender
+    /// row means "undeclared, nothing stood", not "field unwired".
     pub reserved_kb: u64,
 }
 

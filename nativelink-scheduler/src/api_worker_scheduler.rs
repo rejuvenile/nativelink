@@ -1015,22 +1015,31 @@ pub struct SchedulerMetrics {
     /// 2026-08-09 census). Bumped in the SAME `result.is_some()` branch as the
     /// arm counters, and a pinned dispatch is BY CONSTRUCTION a `Down`-arm
     /// dispatch, so `phase3_down_floor_pinned <= phase3_dispatch_arm_down` is
-    /// structural. Read `pinned / arm_down` (as a delta) for the share of DOWN
-    /// dispatches on which a p95-quality question (staleness, drift, quantile
-    /// choice) is moot — any change to the DOWN statistic is a no-op for
-    /// exactly this population.
+    /// structural PER DISPATCH — but NOT scrape-atomic: the renderer takes no
+    /// lock and reads fields in declaration order (`arm_down` first), so a
+    /// scrape straddling the two `Relaxed` bumps can transiently read
+    /// `pinned == arm_down + 1`; check with ±1 tolerance, never strict
+    /// inequality (the d186cd16 arm-partition convention). Read
+    /// `pinned / arm_down` (as a delta) for the share of DOWN dispatches on
+    /// which any change to the VALUE of the DOWN statistic (drift, a quantile
+    /// choice) is a strict no-op — the floor, not the profile, stands. An
+    /// ELIGIBILITY change is different: the staleness gate refusing a pinned
+    /// key's DOWN moves its reservation floor → declared (a factor-× move), so
+    /// "pinned" does not mean "immune to the gate".
     #[metric(
-        help = "(#phase3-accuracy-instrument) subset of phase3_dispatch_arm_down whose reservation was pinned at the declared/factor floor (p95 below floor; the profile statistic is not what stands) — per-DISPATCH, floor_pinned <= dispatch_arm_down structurally"
+        help = "(#phase3-accuracy-instrument) subset of phase3_dispatch_arm_down whose reservation was pinned at the declared/factor floor (p95 below floor; the profile statistic is not what stands) — per-DISPATCH; floor_pinned <= dispatch_arm_down holds with ±1 scrape tolerance (two separate relaxed RMWs)"
     )]
     pub phase3_down_floor_pinned: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose TRUE
-    /// DISPATCH-TIME leave-one-out prediction — the tail-aware statistic that stood at
-    /// THIS action's dispatch (peeked BEFORE its own sample folded, stashed on the
-    /// running action, NOT re-derived at completion) — COVERED the action's ACTUAL
-    /// measured peak (`tail_at_dispatch >= peak_memory_kb`). Hindsight-free: same-key
-    /// samples that folded in AFTER dispatch cannot inflate this tail (the cadre's
-    /// completion-time-recompute bias, now fixed). A safe over-estimate at dispatch.
+    /// DISPATCH-TIME leave-one-out prediction — the statistic that stood at THIS
+    /// action's dispatch (peeked BEFORE its own sample folded, stashed on the
+    /// running action, NOT re-derived at completion; on the DOWN arm the stash is
+    /// the CLAMPED standing reservation, #phase3-accuracy-instrument) — COVERED
+    /// the action's ACTUAL measured peak (`stashed >= peak_memory_kb`).
+    /// Hindsight-free: same-key samples that folded in AFTER dispatch cannot
+    /// inflate this tail (the cadre's completion-time-recompute bias, now fixed).
+    /// A safe over-estimate at dispatch.
     #[metric(
         help = "(#task-resource-profile Phase-2c) folded samples whose dispatch-time leave-one-out tail covered the actual peak (tail >= actual; safe over-estimate)"
     )]
@@ -1060,11 +1069,13 @@ pub struct SchedulerMetrics {
     pub accuracy_predicted_covered_coarse: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) COUNTER — a Phase-3 FALSIFIER (NOT a
-    /// sufficiency gate): folded samples whose TRUE DISPATCH-TIME leave-one-out tail
-    /// UNDER-predicted the action's actual peak (`tail_at_dispatch < peak_memory_kb`) →
+    /// sufficiency gate): folded samples whose TRUE DISPATCH-TIME leave-one-out
+    /// prediction UNDER-predicted the action's actual peak (`stashed <
+    /// peak_memory_kb`; on the DOWN arm the stash is the CLAMPED standing
+    /// reservation, not the raw tail — #phase3-accuracy-instrument) →
     /// enforce would under-reserve → OOM risk. This is the hindsight-free out-of-sample
     /// under-rate (the completion-time recompute bias the cadre flagged is removed by
-    /// stashing the dispatch-time tail). SOUND direction: if this fires with any
+    /// stashing the dispatch-time value). SOUND direction: if this fires with any
     /// regularity the tail is DEFINITELY NOT a safe reservation (the Phase-3 down-override
     /// must not be enabled). UNSOUND to invert: `≈0` does NOT prove safety — the tail is a
     /// monotone max, so `under` fires only when an action exceeds the all-time bucket-max
@@ -1138,16 +1149,18 @@ pub struct SchedulerMetrics {
     /// (#calib under-attribution) COUNTER: `accuracy_predicted_under` samples whose
     /// reservation was DOWN-overridden at dispatch — the OOM-RELEVANT under
     /// population: the action ran with LESS memory reserved than the client
-    /// declared and its actual peak exceeded the dispatch p95.
+    /// declared and its actual peak exceeded the STANDING reservation.
     ///
-    /// CAVEAT (48bc07ab MINOR-C2): this OVER-counts "peak exceeded the standing
-    /// reservation". `Under` classifies against the RAW p95, but DOWN reserves
-    /// `max(p95, declared/overcommit_max_factor)` (clamped at declared) — when
-    /// the `declared/factor` floor binds, the reservation sits ABOVE the p95, so
-    /// a `by_arm_down` under may have stayed entirely inside its reservation.
-    /// To resolve, read the periodic `accuracy_under_offenders` log: its
-    /// `declared=` + `predicted=` fields recompute the effective reservation
-    /// (the deployed factor is the static 2.0; the churn throttle is OFF).
+    /// (#phase3-accuracy-instrument — supersedes the 48bc07ab MINOR-C2 caveat that
+    /// lived here): since this commit the Down-arm stash IS the clamped effective
+    /// (`max(p95, declared/factor)`, clamped at declared), so `Under` on this arm
+    /// means the peak exceeded the reservation that actually stood — no operator
+    /// recomputation from `declared=`/`predicted=` is needed (and doing the old
+    /// hand-clamp now DOUBLE-clamps); the reservation is printed verbatim in the
+    /// offender log's `reserved=` field. DEPLOY CAVEAT: counts accumulated on a
+    /// binary older than this commit scored the raw p95 and OVER-counted
+    /// (measured 60.5% n-weighted false on the 2026-08-09 live offender dump) —
+    /// compare only same-binary deltas across this deploy.
     ///
     /// The four `accuracy_under_by_arm_*` counters partition the under total:
     /// `by_arm_down + by_arm_raise + by_arm_inject + by_arm_unmodified ==
@@ -1217,8 +1230,14 @@ pub struct SchedulerMetrics {
     /// (≥K, `tail > actual`) samples. RENAMED per cadre C4: the old
     /// `accuracy_over_ratio` name misread this as `declared/actual` over-reservation;
     /// BOTH operands are MEASURED peaks (`tail` = predicted profile tail, `actual` =
-    /// `usage.peak_memory_kb`) — declared is NOT in the ratio. This is the residual
-    /// RAISE-side waste (reserving the tail is `N×` the actual), NOT the DOWN
+    /// `usage.peak_memory_kb`) — declared is NOT in the ratio.
+    /// (#phase3-accuracy-instrument) Since that commit the Down-arm stash is the
+    /// CLAMPED effective, so floor-pinned DOWN covers (reservation = the
+    /// declared/factor floor, above the p95 — 64.5% of DOWN folds in the
+    /// 2026-08-09 census, median 9.43× the p95) now feed this family too: it
+    /// reads as over-reservation of the STANDING reservation across all arms,
+    /// no longer RAISE-side-only, and the never-resetting max steps UP at that
+    /// deploy — compare only same-binary deltas. It is still NOT the DOWN
     /// opportunity (that is `down_opportunity_*` = declared/p50). What this
     /// counter is blind to: the coarse `(instance,target,mnemonic)` key blends cheap and
     /// expensive actions, so enforce would reserve the blend-MAX tail for EVERY action —
@@ -8172,13 +8191,6 @@ impl ApiWorkerScheduler {
         let phase3_down_floor_pinned = effective_action_info
             .as_ref()
             .is_some_and(|(_, _, pinned)| *pinned);
-        // (#phase3-accuracy-instrument) The `memory_kb` the ledger ACTUALLY stands
-        // for this dispatch: `sel_action_info` is the store-once effective clone
-        // when an override applied (its memory_kb IS the reserved value, by the
-        // STORE-ONCE construction) and the original action otherwise (reserved ==
-        // declared). Read once here; feeds the DOWN stash overwrite and the
-        // completion-side offender attribution below.
-        let reserved_kb = declared_memory_kb(sel_action_info);
         let mut result = inner.inner_find_and_reserve_worker(
             sel_props,
             operation_id,
@@ -8264,6 +8276,15 @@ impl ApiWorkerScheduler {
         // is ACYCLIC (the completion fold + inject-observe take resource_profile_map
         // WITHOUT holding inner). OBSERVE-ONLY: no reservation/gate/dispatch change.
         if let Some((reserved_worker_id, _, _)) = result.as_ref() {
+            // (#phase3-accuracy-instrument) The `memory_kb` the ledger ACTUALLY
+            // stands for this dispatch: `sel_action_info` is the store-once
+            // effective clone when an override applied (its memory_kb IS the
+            // reserved value, by the STORE-ONCE construction) and the original
+            // action otherwise (reserved == declared). Bound INSIDE the hit path
+            // (perf LOW-1, review 8728ef05): it is a real HashMap probe and both
+            // consumers — the DOWN stash overwrite and the offender attribution —
+            // are hit-path only, so the ~99%-miss attempt path must not pay it.
+            let reserved_kb = declared_memory_kb(sel_action_info);
             if let Some((fine_key, coarse_key)) = resource_profile_keys(action_info) {
                 // (#task-resource-profile hierarchical-key; #2497 p95 policy) The FINE→COARSE
                 // lookup resolves the tier the enforce phase WOULD have used at dispatch. Stash
@@ -21616,6 +21637,23 @@ mod b1_lock_decouple_tests {
                  leaked into by_arm_{name} — phantom enforcement attribution"
             );
         }
+        // (#phase3-accuracy-instrument, review 8728ef05 coverage gap) The
+        // Down-arm GUARD on the stash overwrite: an Unmodified dispatch must
+        // score against the RAW p95 (50_000 → ratio 131_072×100/50_000 = 262),
+        // never against the declaration. MUTATION: remove the
+        // `matches!(phase3_arm, Phase3Arm::Down)` guard in
+        // `find_and_reserve_worker` → the overwrite fires here too, the stash
+        // becomes the declared 4096 → ratio 3200 → this red-fails (the arm
+        // asserts above cannot catch it: the sample is Under either way).
+        assert_eq!(
+            scheduler.metrics.accuracy_under_ratio_max_x100.load(Ordering::Relaxed),
+            262,
+            "unguarded stash overwrite: an Unmodified-arm dispatch must be \
+             scored against the raw dispatch p95 (ratio 262), not the declared \
+             reservation (ratio 3200) — the counterfactual falsifier for \
+             untouched dispatches scores the STATISTIC, only the Down arm \
+             scores the standing reservation"
+        );
     }
 
     /// (#calib under-attribution, 48bc07ab T2) The offender-dump body itself:
