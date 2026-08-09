@@ -1003,9 +1003,26 @@ pub struct SchedulerMetrics {
     ///    a false "stop". No in-process test can catch that; the +/-1 partition check
     ///    at scrape time can.
     #[metric(
-        help = "(#phase3-dispatch-arms) reserved dispatches that took NO Phase-3 override (per-DISPATCH); under the deployed config this is the DOWN-staleness-suppressed dispatch count"
+        help = "(#phase3-dispatch-arms) reserved dispatches that took NO Phase-3 override (per-DISPATCH); an UPPER BOUND on the DOWN-staleness-suppressed dispatch count (no-baggage and no-trusted-profile dispatches also land here) — read as a delta, never a cumulative ratio"
     )]
     pub phase3_dispatch_arm_unmodified: AtomicU64,
+
+    /// (#phase3-accuracy-instrument) COUNTER: the subset of
+    /// `phase3_dispatch_arm_down` whose reservation was FLOOR-PINNED — the
+    /// profile-independent floor `ceil(declared / factor)` exceeded the window
+    /// p95, so `phase3_down_effective_kb`'s clamp stood the FLOOR and the
+    /// profile statistic is NOT what was reserved (64.5% of DOWN folds in the
+    /// 2026-08-09 census). Bumped in the SAME `result.is_some()` branch as the
+    /// arm counters, and a pinned dispatch is BY CONSTRUCTION a `Down`-arm
+    /// dispatch, so `phase3_down_floor_pinned <= phase3_dispatch_arm_down` is
+    /// structural. Read `pinned / arm_down` (as a delta) for the share of DOWN
+    /// dispatches on which a p95-quality question (staleness, drift, quantile
+    /// choice) is moot — any change to the DOWN statistic is a no-op for
+    /// exactly this population.
+    #[metric(
+        help = "(#phase3-accuracy-instrument) subset of phase3_dispatch_arm_down whose reservation was pinned at the declared/factor floor (p95 below floor; the profile statistic is not what stands) — per-DISPATCH, floor_pinned <= dispatch_arm_down structurally"
+    )]
+    pub phase3_down_floor_pinned: AtomicU64,
 
     /// (#task-resource-profile Phase-2c) COUNTER: folded samples whose TRUE
     /// DISPATCH-TIME leave-one-out prediction — the tail-aware statistic that stood at
@@ -1140,7 +1157,7 @@ pub struct SchedulerMetrics {
     /// `sum(by_arm_*) < accuracy_predicted_under` (same skew as the
     /// pre-existing fine/coarse split).
     #[metric(
-        help = "(#calib under-attribution) unders on DOWN-overridden reservations (actual peak exceeded the dispatch p95 — NOT necessarily the standing reservation, which is floored at declared/factor; recompute from the accuracy_under_offenders log declared=/predicted= fields); partitions accuracy_predicted_under with the other by_arm counters (eventually consistent across the two RMWs)"
+        help = "(#calib under-attribution; #phase3-accuracy-instrument) unders on DOWN-overridden reservations: the actual peak exceeded the STANDING reservation (the clamped effective incl. the declared/factor floor, stashed at dispatch) — the operator's DOWN revert trigger reads this directly; the reserved value is in the accuracy_under_offenders log reserved= field; partitions accuracy_predicted_under with the other by_arm counters (eventually consistent across the two RMWs)"
     )]
     pub accuracy_under_by_arm_down: AtomicU64,
 
@@ -2198,8 +2215,10 @@ enum PredictionAccuracy {
     /// `p95 < actual`: the reservation would have UNDER-reserved this action (the
     /// OOM-risk case the Phase-3 FALSIFIER watches — its firing DISPROVES safety, but its
     /// absence does not prove it; see `accuracy_predicted_under`). `ratio_x100 =
-    /// actual * 100 / p95`. (#2497) `p95` is the SAME statistic the enforce phase reserves
-    /// on, so this falsifier now falsifies the statistic we actually reserve.
+    /// actual * 100 / p95`. (#2497; #phase3-accuracy-instrument) the scored value is the
+    /// RESERVATION the enforce phase stood — on the DOWN arm the clamped effective
+    /// (`max(p95, declared/factor)`, overwritten into the stash at dispatch), the window
+    /// p95 otherwise — so this falsifier falsifies the value the ledger actually stands.
     Under {
         /// (#task-resource-profile hierarchical-key) WHICH tier the dispatch p95 came
         /// from (see [`Self::Covered`]).
@@ -2220,9 +2239,12 @@ enum PredictionAccuracy {
 /// the TRUE DISPATCH-TIME leave-one-out prediction. `dispatch_prediction` is the tiered
 /// lookup captured AT THIS ACTION'S DISPATCH (stashed on the running action), NOT a
 /// completion-time recompute: `None` when no profile existed at dispatch, else
-/// `(tier, p95_kb, prior_samples)`. The predicted value is the WINDOW p95 — the SAME
-/// statistic the enforce phase reserves on — so this falsifier scores the reservation we
-/// actually stand. `actual_kb` is this action's measured peak.
+/// `(tier, p95_kb, prior_samples)`. (#phase3-accuracy-instrument) The predicted value is
+/// the RESERVATION the enforce phase stood at dispatch: on the DOWN arm the stash is
+/// overwritten with the clamped effective (`max(p95, declared/factor)` — the floor binds
+/// on 64.5% of prod DOWN folds), on every other arm it is the window p95. Either way this
+/// falsifier scores the value the ledger actually stands, never a number nothing
+/// reserves. `actual_kb` is this action's measured peak.
 fn classify_prediction_accuracy(
     dispatch_prediction: Option<(ProfileTier, u64, u64)>,
     actual_kb: u64,
@@ -2313,10 +2335,16 @@ pub(crate) struct UnderOffender {
     pub worst_ratio_x100: u64,
     /// Client-declared `memory_kb` at the last under's dispatch (0 = undeclared).
     pub last_declared_kb: u64,
-    /// Dispatch-time p95 prediction at the last under.
+    /// Dispatch-time prediction at the last under: the reservation the enforce
+    /// phase stood (DOWN: the clamped effective; other arms: the window p95).
     pub last_predicted_kb: u64,
     /// Actual peak at the last under.
     pub last_actual_kb: u64,
+    /// (#phase3-accuracy-instrument) The `memory_kb` the ledger ACTUALLY stood at
+    /// the last under's dispatch (`DispatchPhase3::reserved_kb`) — reported
+    /// explicitly so a reader recovers the reservation without reconstructing
+    /// arm-specific clamp semantics from `declared=`/`predicted=`.
+    pub last_reserved_kb: u64,
     /// Phase-3 arm of the last under's reservation.
     pub last_arm: Phase3Arm,
 }
@@ -2336,7 +2364,7 @@ fn format_accuracy_under_offenders_top(rows: &[(ProfileKey, UnderOffender)]) -> 
         }
         let _ = write!(
             top,
-            "{}|{}: tier={:?} arm={:?} n={} worst_x100={} declared={} predicted={} actual={}",
+            "{}|{}: tier={:?} arm={:?} n={} worst_x100={} declared={} predicted={} reserved={} actual={}",
             key.target_id,
             key.action_mnemonic,
             row.tier,
@@ -2345,6 +2373,7 @@ fn format_accuracy_under_offenders_top(rows: &[(ProfileKey, UnderOffender)]) -> 
             row.worst_ratio_x100,
             row.last_declared_kb,
             row.last_predicted_kb,
+            row.last_reserved_kb,
             row.last_actual_kb,
         );
     }
@@ -4008,12 +4037,19 @@ impl ApiWorkerSchedulerImpl {
     /// override ([`Phase3Arm`]), mirrored from the applied-counter move, so the caller
     /// can stash it on the running action for the completion-side under split.
     /// OBSERVE-ONLY payload — the ledger object (the effective clone) is unchanged.
+    ///
+    /// (#phase3-accuracy-instrument) The third `Some` element is the DOWN
+    /// FLOOR-PINNED flag: `true` iff the applied move is `Down` AND the clamp stood
+    /// the profile-independent floor over the p95 (`effective > p95`, i.e. the
+    /// profile statistic is NOT what the ledger stands). Always `false` for the
+    /// other arms. OBSERVE-ONLY — read only by the `phase3_down_floor_pinned`
+    /// dispatch counter.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
     fn phase3_compute_effective_action_info(
         &self,
         action_info: &ActionInfoWithProps,
         resource_profile_map: &ParkingMutex<ProfileMap>,
-    ) -> Option<(ActionInfoWithProps, Phase3Arm)> {
+    ) -> Option<(ActionInfoWithProps, Phase3Arm, bool)> {
         // Fast path: no enforcement of ANY kind → no override, no lookup, byte-identical.
         if !self.phase3_raise_enabled
             && !self.phase3_down_overcommit_enabled
@@ -4058,16 +4094,16 @@ impl ApiWorkerSchedulerImpl {
             Undeclared,
         }
 
-        let (effective_kb, applied) = if is_undeclared {
+        let (effective_kb, applied, down_floor_pinned) = if is_undeclared {
             // UNDECLARED INJECT (#2497): reserve the profiled p95 as a NEW memory_kb
             // Minimum. Starvation-clamp (like RAISE) so the injected reservation stays
             // schedulable on the largest worker. The worker free-floor NAK is the OOM
             // backstop if p95 under-estimates.
-            (self.phase3_starvation_clamp(p95_kb, &fine_key, "inject"), Applied::Undeclared)
+            (self.phase3_starvation_clamp(p95_kb, &fine_key, "inject"), Applied::Undeclared, false)
         } else if self.phase3_raise_enabled && p95_kb > declared_kb {
             // RAISE (§7): the client under-declared vs the measured p95 → reserve p95.
             // OOM-SAFE (tightening only). Starvation-clamped to the max worker RAM.
-            (self.phase3_starvation_clamp(p95_kb, &fine_key, "raise"), Applied::Raise)
+            (self.phase3_starvation_clamp(p95_kb, &fine_key, "raise"), Applied::Raise, false)
         } else if self.phase3_down_overcommit_enabled && p95_kb <= declared_kb {
             // DOWN-overcommit (§3): the client OVER-declared (measured p95 at/under
             // declared) → reserve the profiled p95, floored at
@@ -4127,12 +4163,15 @@ impl ApiWorkerSchedulerImpl {
                 self.phase3_overcommit_churn_throttle_high,
                 self.phase3_overcommit_churn_throttle_enabled,
             );
-            (
-                phase3_down_effective_kb(declared_kb, down_reserve_kb, effective_factor),
-                Applied::Down,
-            )
+            let effective =
+                phase3_down_effective_kb(declared_kb, down_reserve_kb, effective_factor);
+            // (#phase3-accuracy-instrument) FLOOR-PINNED ⇔ the clamp raised the
+            // statistic (`effective > p95`): the declared/factor floor, not the
+            // profile, is what the ledger stands. `==` is p95-governed (the
+            // statistic stands exactly), so it is NOT pinned.
+            (effective, Applied::Down, effective > down_reserve_kb)
         } else {
-            (declared_kb, Applied::Raise) // sentinel; effective==declared → noop below
+            (declared_kb, Applied::Raise, false) // sentinel; effective==declared → noop below
         };
 
         if effective_kb == declared_kb {
@@ -4163,7 +4202,7 @@ impl ApiWorkerSchedulerImpl {
             MEMORY_KB_PROPERTY.to_string(),
             PlatformPropertyValue::Minimum(effective_kb as f64),
         );
-        Some((effective, arm))
+        Some((effective, arm, down_floor_pinned))
     }
 
     /// (#2497 p95 policy) Starvation clamp shared by RAISE + undeclared-INJECT: if NO
@@ -7459,6 +7498,7 @@ impl ApiWorkerScheduler {
                             row.last_declared_kb = dispatch_phase3.declared_kb;
                             row.last_predicted_kb = predicted_kb;
                             row.last_actual_kb = actual_kb;
+                            row.last_reserved_kb = dispatch_phase3.reserved_kb;
                             row.last_arm = dispatch_phase3.arm;
                         } else {
                             // CAPPED AT 256: `push` on the bounded LRU evicts the
@@ -7472,6 +7512,7 @@ impl ApiWorkerScheduler {
                                     last_declared_kb: dispatch_phase3.declared_kb,
                                     last_predicted_kb: predicted_kb,
                                     last_actual_kb: actual_kb,
+                                    last_reserved_kb: dispatch_phase3.reserved_kb,
                                     last_arm: dispatch_phase3.arm,
                                 },
                             );
@@ -8118,14 +8159,26 @@ impl ApiWorkerScheduler {
             inner.phase3_compute_effective_action_info(action_info, &self.resource_profile_map);
         let (sel_props, sel_action_info): (&PlatformProperties, &ActionInfoWithProps) =
             match &effective_action_info {
-                Some((eff, _arm)) => (&eff.platform_properties, eff),
+                Some((eff, _arm, _floor_pinned)) => (&eff.platform_properties, eff),
                 None => (platform_properties, action_info),
             };
         // (#calib under-attribution) The arm the ledger was actually stood under:
         // an applied override's arm, or `Unmodified` when no override applied.
         let phase3_arm = effective_action_info
             .as_ref()
-            .map_or(Phase3Arm::Unmodified, |(_, arm)| *arm);
+            .map_or(Phase3Arm::Unmodified, |(_, arm, _)| *arm);
+        // (#phase3-accuracy-instrument) Whether the DOWN clamp stood the
+        // declared/factor floor over the p95 (only ever true on the Down arm).
+        let phase3_down_floor_pinned = effective_action_info
+            .as_ref()
+            .is_some_and(|(_, _, pinned)| *pinned);
+        // (#phase3-accuracy-instrument) The `memory_kb` the ledger ACTUALLY stands
+        // for this dispatch: `sel_action_info` is the store-once effective clone
+        // when an override applied (its memory_kb IS the reserved value, by the
+        // STORE-ONCE construction) and the original action otherwise (reserved ==
+        // declared). Read once here; feeds the DOWN stash overwrite and the
+        // completion-side offender attribution below.
+        let reserved_kb = declared_memory_kb(sel_action_info);
         let mut result = inner.inner_find_and_reserve_worker(
             sel_props,
             operation_id,
@@ -8177,6 +8230,16 @@ impl ApiWorkerScheduler {
                 Phase3Arm::Unmodified => &self.metrics.phase3_dispatch_arm_unmodified,
             }
             .fetch_add(1, Ordering::Relaxed);
+            // (#phase3-accuracy-instrument) Sub-count of the Down arm: the
+            // reservation was pinned at the declared/factor floor (p95 below
+            // floor), so the profile statistic is NOT what stands. pinned ⇒
+            // arm == Down (both derive from the same
+            // `phase3_compute_effective_action_info` return, counted in this
+            // same branch), so `floor_pinned <= dispatch_arm_down` is
+            // structural, not maintained.
+            if phase3_down_floor_pinned {
+                self.metrics.phase3_down_floor_pinned.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             self.metrics
                 .find_worker_misses
@@ -8227,6 +8290,24 @@ impl ApiWorkerScheduler {
                     } => Some((tier, p95_kb, samples)),
                     TieredTail::NoProfile => None,
                 };
+                // (#phase3-accuracy-instrument) On the DOWN arm the ledger stands the
+                // CLAMPED effective — `clamp(p95, declared/factor, declared)` — NOT the
+                // raw window p95 (in prod, 64.5% of DOWN folds are floor-pinned and the
+                // median pinned key reserves 9.4× its p95). Score the reservation that
+                // actually stood: overwrite the stashed statistic with `reserved_kb`
+                // (carried out of the DOWN branch via the store-once clone, so it IS the
+                // ledger value by construction), keeping the lookup's tier and
+                // prior-sample count. Without this, `classify_prediction_accuracy`
+                // scores a number nothing reserves, most DOWN "unders" are FALSE, and
+                // the operator's DOWN revert trigger reads exactly those unders. The
+                // other arms already stash what they reserve (RAISE/INJECT stand the
+                // p95 modulo the starvation clamp, inert on the current fleet).
+                let dispatch_prediction = if matches!(phase3_arm, Phase3Arm::Down) {
+                    dispatch_prediction
+                        .map(|(tier, _raw_p95, samples)| (tier, reserved_kb, samples))
+                } else {
+                    dispatch_prediction
+                };
                 // Only walk the worker map when there is something to stash (the empty-map
                 // NoProfile case — dominant right after deploy — skips the peek_mut).
                 if dispatch_prediction.is_some() {
@@ -8245,6 +8326,7 @@ impl ApiWorkerScheduler {
                             pending.dispatch_phase3 = DispatchPhase3 {
                                 arm: phase3_arm,
                                 declared_kb: declared_memory_kb(action_info),
+                                reserved_kb,
                             };
                         }
                     }
@@ -17842,6 +17924,7 @@ mod tests {
         scheduler.metrics.phase3_dispatch_arm_raise.fetch_add(276, Ordering::Relaxed);
         scheduler.metrics.phase3_dispatch_arm_inject.fetch_add(277, Ordering::Relaxed);
         scheduler.metrics.phase3_dispatch_arm_unmodified.fetch_add(278, Ordering::Relaxed);
+        scheduler.metrics.phase3_down_floor_pinned.fetch_add(279, Ordering::Relaxed);
         // (#dag-criticality §6c) distinctive values on the seven DAG kill/keep +
         // confident-node telemetry fields — the feature ships ON under the anti-dark-
         // counter rule, so a DARK field here re-opens the exact blind spot the fix-up
@@ -18132,6 +18215,7 @@ mod tests {
             ("phase3_dispatch_arm_raise", 276),
             ("phase3_dispatch_arm_inject", 277),
             ("phase3_dispatch_arm_unmodified", 278),
+            ("phase3_down_floor_pinned", 279),
         ] {
             let leaf = format!("scheduler_metrics_{field}");
             assert!(
@@ -21066,6 +21150,265 @@ mod b1_lock_decouple_tests {
         );
     }
 
+    /// (#phase3-accuracy-instrument) THE FALSE-UNDER FIX: when the DOWN clamp's
+    /// profile-independent floor (`declared / factor`) BINDS (p95 < floor), the
+    /// ledger reserves the FLOOR, not the p95 — so the completion-side accuracy
+    /// check must score the reservation that actually stood, not the raw window
+    /// p95. Before this fix the stash carried the raw p95, and an actual peak in
+    /// `(p95, floor]` was scored `Under` — a FALSE under on a reservation that in
+    /// fact covered the action. This is not a corner: 64.5% of prod DOWN folds
+    /// are floor-pinned (median pinned key reserves 9.4× its p95), and the
+    /// operator's DOWN revert trigger is defined on `accuracy_under_by_arm_down`,
+    /// so false unders make that trigger fire on a healthy fleet.
+    ///
+    /// MUTATION: revert the DOWN-arm stash overwrite in `find_and_reserve_worker`
+    /// (stash the raw `lookup_tiered` p95 again) → actual 20_000 > p95 10_000
+    /// scores Under → red-fails at the "FALSE under" assert.
+    #[nativelink_test]
+    async fn accuracy_down_floor_pinned_scores_the_reservation_not_raw_p95() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+        // DOWN ON at factor 4.0; RAISE + undeclared-inject OFF.
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000, false);
+
+        // Trusted (>=K) profile: p95 = 10_000 — BELOW the floor 100_000/4 = 25_000.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(10_000));
+        }
+
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xf1, 100_000.0);
+        let (reserved, _tx, _msg) = scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(reserved, WorkerId("W".to_string()));
+        // Precondition: the ledger stands the FLOOR — clamp(10_000, 25_000, 100_000)
+        // = 25_000, leaving 475_000. Without the floor binding this test cannot
+        // distinguish scoring-the-reservation from scoring-the-p95.
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(475_000.0),
+            "precondition: the DOWN reservation must be FLOOR-pinned at 25_000 \
+             (500_000 − 25_000 = 475_000 remaining)"
+        );
+
+        // Actual peak 20_000: ABOVE the raw p95 (10_000) but WITHIN the floor the
+        // ledger actually reserved (25_000) — the standing reservation covered it.
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 20_000,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record_action_resource_usage must return Ok");
+
+        assert_eq!(
+            scheduler.metrics.accuracy_predicted_under.load(Ordering::Relaxed),
+            0,
+            "FALSE under: the reservation that actually stood (floor 25_000) covered \
+             the actual peak (20_000) — scoring the raw p95 (10_000) instead of the \
+             clamped reservation manufactures an under on a covered action"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_predicted_covered.load(Ordering::Relaxed),
+            1,
+            "the covered total must advance: the fold was classified (not skipped), \
+             and the standing 25_000 reservation covered the 20_000 peak"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_under_by_arm_down.load(Ordering::Relaxed),
+            0,
+            "accuracy_under_by_arm_down is the operator's DOWN revert trigger — a \
+             floor-pinned covered action must not fire it"
+        );
+        assert_eq!(
+            scheduler.metrics.accuracy_under_distinct_keys.load(Ordering::Relaxed),
+            0,
+            "no offender row may be written for a covered action"
+        );
+    }
+
+    /// (#phase3-accuracy-instrument) `phase3_down_floor_pinned` counts exactly the
+    /// Down-arm dispatches whose reservation the declared/factor floor stood
+    /// (p95 < floor) — the population for which any change to the DOWN statistic
+    /// (staleness, drift, quantile choice) is a strict no-op. BOTH directions:
+    /// dispatch 1 (p95 10_000 < floor 25_000) is pinned → counter 1; after the
+    /// window re-folds to p95 60_000 (> floor), dispatch 2 is p95-governed →
+    /// `dispatch_arm_down` advances to 2 while `floor_pinned` STAYS 1. Each
+    /// dispatch's reservation is proven in the ledger first, so neither claim can
+    /// pass vacuously.
+    ///
+    /// MUTATION: comment out the `phase3_down_floor_pinned` fetch_add in
+    /// `find_and_reserve_worker` → counter stays 0 → red-fails "floor-pinned
+    /// counter dark". Hardcode the pinned flag true in
+    /// `phase3_compute_effective_action_info`'s DOWN branch → dispatch 2 counts
+    /// too → red-fails "must NOT count a p95-governed DOWN".
+    #[nativelink_test]
+    async fn phase3_down_floor_pinned_counts_only_floor_bound_down_dispatches() {
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+        // DOWN ON at factor 4.0; RAISE + undeclared-inject OFF.
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000, false);
+
+        // Trusted profile, p95 = 10_000 < floor 100_000/4 = 25_000 → FLOOR-pinned.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(10_000));
+        }
+        let action1 = action_with_memory_and_baggage("W", 0xf2, 100_000.0);
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 100_000.0),
+                &OperationId::default(),
+                &action1,
+                false,
+            )
+            .await
+            .expect("dispatch 1 must reserve worker W");
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(475_000.0),
+            "precondition (dispatch 1): the ledger must stand the FLOOR 25_000 \
+             (500_000 − 25_000 remaining) — without the floor binding the pinned \
+             claim is vacuous"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_dispatch_arm_down.load(Ordering::Relaxed),
+            1,
+            "dispatch 1 must count as a Down-arm dispatch"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_down_floor_pinned.load(Ordering::Relaxed),
+            1,
+            "floor-pinned counter dark: a DOWN dispatch whose reservation the \
+             declared/factor floor stood (p95 10_000 < floor 25_000) must \
+             increment phase3_down_floor_pinned"
+        );
+
+        // Re-fold the window at 60_000 (PROFILE_MIN_SAMPLES == WINDOW_SIZE == 20
+        // fully displaces it): p95 60_000 > floor 25_000 → effective = p95
+        // (p95-governed, NOT pinned).
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(60_000));
+        }
+        let action2 = action_with_memory_and_baggage("W", 0xf3, 100_000.0);
+        scheduler
+            .find_and_reserve_worker(
+                &props_named_with_memory("W", 100_000.0),
+                &OperationId::default(),
+                &action2,
+                false,
+            )
+            .await
+            .expect("dispatch 2 must reserve worker W");
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(415_000.0),
+            "precondition (dispatch 2): the ledger must stand the p95 60_000 \
+             (475_000 − 60_000 remaining) — the floor must NOT bind here"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_dispatch_arm_down.load(Ordering::Relaxed),
+            2,
+            "dispatch 2 must also count as a Down-arm dispatch (the sub-count \
+             relation floor_pinned <= dispatch_arm_down needs a non-pinned Down \
+             to be non-vacuous)"
+        );
+        assert_eq!(
+            scheduler.metrics.phase3_down_floor_pinned.load(Ordering::Relaxed),
+            1,
+            "phase3_down_floor_pinned must NOT count a p95-governed DOWN \
+             (effective == p95 60_000 above the floor 25_000) — it is the \
+             floor-bound subset, not a Down-arm alias"
+        );
+    }
+
+    /// (#phase3-accuracy-instrument) A TRUE under on a floor-pinned DOWN
+    /// reservation is scored against the RESERVATION, and the offender row
+    /// reports that reservation explicitly: reserved floor 25_000 < actual
+    /// 30_000 → Under with ratio 30_000×100/25_000 = 120 (scoring the raw p95
+    /// 10_000 would read 300), `predicted=` carries the reservation, and the new
+    /// `reserved=` field carries it verbatim in both the row and the formatted
+    /// dump line.
+    ///
+    /// MUTATION: drop `reserved_kb` from the `DispatchPhase3` stash in
+    /// `find_and_reserve_worker` (leave the `Default` 0) → the row's reserved
+    /// reads 0 → red-fails "row must carry the reservation".
+    #[nativelink_test]
+    async fn accuracy_true_under_on_floor_pinned_down_scores_and_reports_reservation() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ActionResourceUsage;
+
+        let wsm = BarrierWorkerStateManager::new();
+        let scheduler = build_scheduler(wsm);
+        let _rx_w = add_worker_with_memory(&scheduler, "W", 500_000.0).await;
+        scheduler.set_phase3_enforcement(false, true, 4.0, 604_800, false, 2000, 20000, false);
+
+        // Trusted profile, p95 = 10_000 < floor 25_000 → floor-pinned reservation.
+        for _ in 0..crate::resource_profile::PROFILE_MIN_SAMPLES {
+            scheduler.resource_profile_record_sample(observe_key(), mem_only_sample(10_000));
+        }
+        let op = OperationId::default();
+        let action = action_with_memory_and_baggage("W", 0xf4, 100_000.0);
+        scheduler
+            .find_and_reserve_worker(&props_named_with_memory("W", 100_000.0), &op, &action, false)
+            .await
+            .expect("op must reserve worker W");
+        assert_eq!(
+            scheduler.worker_min_prop(&WorkerId("W".to_string()), "memory_kb").await,
+            Some(475_000.0),
+            "precondition: the ledger must stand the floor 25_000"
+        );
+
+        // Actual peak 30_000 exceeds even the floor-pinned reservation → TRUE under.
+        let usage = ActionResourceUsage {
+            peak_memory_kb: 30_000,
+            sampled: true,
+            ..Default::default()
+        };
+        scheduler
+            .record_action_resource_usage(&WorkerId("W".to_string()), &op, usage)
+            .await
+            .expect("record_action_resource_usage must return Ok");
+
+        assert_eq!(
+            scheduler.metrics.accuracy_under_by_arm_down.load(Ordering::Relaxed),
+            1,
+            "a TRUE under (actual 30_000 > standing reservation 25_000) must \
+             still fire the DOWN revert trigger — the false-under fix must not \
+             suppress real unders"
+        );
+        let offenders = scheduler.top_accuracy_under_offenders(20);
+        assert_eq!(offenders.len(), 1, "exactly one offender row expected");
+        let row = &offenders[0].1;
+        assert_eq!(
+            (
+                row.worst_ratio_x100,
+                row.last_predicted_kb,
+                row.last_reserved_kb,
+                row.last_actual_kb,
+                row.last_arm,
+            ),
+            (120, 25_000, 25_000, 30_000, Phase3Arm::Down),
+            "the under must be scored against the STANDING reservation (ratio \
+             30_000×100/25_000 = 120, predicted = the clamped 25_000 — the raw \
+             p95 10_000 would read ratio 300) and the row must carry the \
+             reservation in last_reserved_kb"
+        );
+        let line = format_accuracy_under_offenders_top(&offenders);
+        assert!(
+            line.contains("reserved=25000"),
+            "the offender dump line must report the standing reservation as an \
+             explicit reserved= field (a reader must not have to reconstruct \
+             arm-specific clamp semantics); got: {line}"
+        );
+    }
+
     /// (#calib under-attribution, PRODUCTION-COMPOSITION) An under on an action
     /// whose reservation Phase-3 DOWN-overrode must increment
     /// `accuracy_under_by_arm_down` and NONE of the other arm counters — the arm
@@ -21312,6 +21655,7 @@ mod b1_lock_decouple_tests {
         let phase3 = DispatchPhase3 {
             arm: Phase3Arm::Unmodified,
             declared_kb: 4096,
+            reserved_kb: 4096,
         };
         let pred = Some((ProfileTier::Fine, 1000, 20));
         for i in 0..21u32 {
@@ -21340,6 +21684,11 @@ mod b1_lock_decouple_tests {
             line.contains("worst_x100=900") && line.contains("declared=4096"),
             "the top row must carry the running-worst ratio (900 from the \
              9000-peak fold) and the declared kb; got: {line}"
+        );
+        assert!(
+            line.contains("reserved=4096"),
+            "(#phase3-accuracy-instrument) each row must carry the standing \
+             reservation as an explicit reserved= field; got: {line}"
         );
         assert_eq!(
             line.matches("; ").count(),
@@ -21385,6 +21734,7 @@ mod b1_lock_decouple_tests {
                 DispatchPhase3 {
                     arm: Phase3Arm::Unmodified,
                     declared_kb: 4096,
+                    reserved_kb: 4096,
                 },
             );
         }
@@ -21440,6 +21790,7 @@ mod b1_lock_decouple_tests {
         let phase3 = DispatchPhase3 {
             arm: Phase3Arm::Unmodified,
             declared_kb: 4096,
+            reserved_kb: 4096,
         };
         let pred = Some((ProfileTier::Fine, 1000, 20));
         // Key A: three unders with ratios 500, 900, 500 (worst must stick at 900,

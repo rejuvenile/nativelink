@@ -101,6 +101,14 @@ pub struct DispatchPhase3 {
     pub arm: Phase3Arm,
     /// Client-declared `memory_kb` `Minimum` at admission (`0` = undeclared).
     pub declared_kb: u64,
+    /// (#phase3-accuracy-instrument) The `memory_kb` the ledger ACTUALLY stood
+    /// at dispatch — the effective clone's `memory_kb` after any Phase-3 move
+    /// (DOWN: `clamp(p95, declared/factor, declared)`; RAISE/INJECT: the
+    /// starvation-clamped p95; Unmodified: the declaration). Rides here so the
+    /// completion-side offender row can report the reservation without the
+    /// reader having to reconstruct arm-specific clamp semantics. `0` only via
+    /// `Default` on paths that never traverse the Phase-3 reserve.
+    pub reserved_kb: u64,
 }
 
 #[derive(Debug, MetricsComponent)]
@@ -131,10 +139,13 @@ pub struct PendingActionInfoData {
     /// same-key samples that folded in AFTER this action was dispatched can never
     /// leak in (removing the hindsight bias the cadre flagged).
     ///
-    /// `Some((tier, tail_kb, prior_samples))` = the tail-aware memory reservation the
-    /// enforce phase WOULD have stood at dispatch, peeked (non-recency-bumping) from
-    /// the profile-so-far by `ApiWorkerScheduler::find_and_reserve_worker` via the
-    /// fine→coarse hierarchical lookup. `tier` records WHICH tier resolved
+    /// `Some((tier, tail_kb, prior_samples))` = the memory reservation the enforce
+    /// phase stood at dispatch: on the DOWN arm `tail_kb` is the CLAMPED effective
+    /// the ledger actually reserved (`max(p95, declared/factor)` — overwritten at
+    /// the stash site, #phase3-accuracy-instrument); on every other arm it is the
+    /// window p95, peeked (non-recency-bumping) from the profile-so-far by
+    /// `ApiWorkerScheduler::find_and_reserve_worker` via the fine→coarse
+    /// hierarchical lookup. `tier` records WHICH tier resolved
     /// ([`ProfileTier::Fine`] or [`ProfileTier::Coarse`]) so the completion-path
     /// accuracy classification (and the eventual Phase-3 down-override, which must
     /// NOT trust a coarse tail) can treat a coarse prediction conservatively.
