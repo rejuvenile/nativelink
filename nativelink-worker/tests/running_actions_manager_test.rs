@@ -1999,12 +1999,27 @@ mod tests {
                         "mkdir -p dir1/dir2 && ",
                         "echo foo > dir1/file && ",
                         "touch dir1/file2 && ",
-                        "ln -s ../file dir1/dir2/sym &&",
+                        "ln -s ../file dir1/dir2/sym && ",
+                        "ln -s dir1/file rel_sym && ",
                         "ln -s /dev/null empty_sym",
                     )
                     .to_string(),
                 ],
-                output_paths: vec!["dir1".to_string(), "empty_sym".to_string()],
+                // `dir1` exercises the directory upload path,
+                // `rel_sym` exercises the relative-symlink-preserved path,
+                // `empty_sym` exercises the absolute-symlink-resolved path
+                // against `/dev/null`. Pre-fix this test asserted `empty_sym`
+                // was kept as a `SymlinkInfo` with target `/dev/null`; that
+                // behavior is now incorrect because absolute symlinks are
+                // worker-local and must be resolved before upload. Reading
+                // `/dev/null` returns 0 bytes immediately by its character-
+                // device contract, so the worker produces an empty-file
+                // output with the canonical sha256 empty digest.
+                output_paths: vec![
+                    "dir1".to_string(),
+                    "empty_sym".to_string(),
+                    "rel_sym".to_string(),
+                ],
                 working_directory: ".".to_string(),
                 environment_variables: vec![EnvironmentVariable {
                     name: "PATH".to_string(),
@@ -2124,7 +2139,17 @@ mod tests {
         assert_eq!(
             action_result,
             ActionResult {
-                output_files: vec![],
+                // `empty_sym` was an absolute symlink — the worker resolves
+                // it and uploads the underlying (empty) file. The resulting
+                // digest is the well-known sha256 of zero bytes.
+                output_files: vec![FileInfo {
+                    name_or_path: NameOrPath::Path("empty_sym".to_string()),
+                    digest: DigestInfo::try_new(
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        0,
+                    )?,
+                    is_executable: false,
+                }],
                 stdout_digest: DigestInfo::try_new(
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                     0
@@ -2142,8 +2167,8 @@ mod tests {
                     )?,
                 }],
                 output_file_symlinks: vec![SymlinkInfo {
-                    name_or_path: NameOrPath::Path("empty_sym".to_string()),
-                    target: "/dev/null".to_string(),
+                    name_or_path: NameOrPath::Path("rel_sym".to_string()),
+                    target: "dir1/file".to_string(),
                 }],
                 output_directory_symlinks: vec![],
                 server_logs: HashMap::new(),

@@ -335,6 +335,13 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
         .simple_expect_get_finished_result(Ok(ActionResult::default()))
         .await?;
 
+    // Drain the ExecuteResult rendezvous first: `execution_response` on the
+    // mock client sends, then awaits this test's reply, and production sends it
+    // (`local_worker.rs` publish-closure step 2) BEFORE the AC write (step 5).
+    // Without this the worker parks in the un-replied rendezvous and
+    // `expect_cache_action_result` below waits forever.
+    drop(test_context.client.expect_execution_response(Ok(())).await);
+
     // Expect the action to be updated in the action cache.
     let (_stored_digest, _stored_result, digest_hasher) = test_context
         .actions_manager
@@ -455,6 +462,16 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
         .simple_expect_get_finished_result(Ok(action_result.clone()))
         .await?;
 
+    // Now our client should be notified that our runner finished.
+    // This MUST be drained before `expect_cache_action_result` below:
+    // `MockWorkerApiClient::execution_response` is a rendezvous (it sends the
+    // call, then awaits this test's reply), and the production publish closure
+    // (`local_worker.rs` step 2) sends `execution_response` BEFORE the AC write
+    // (step 5). Waiting on `cache_action_result` first therefore deadlocks —
+    // the worker is parked in the un-replied rendezvous and never reaches the
+    // AC write.
+    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
     // Expect the action to be updated in the action cache.
     let (stored_digest, stored_result, digest_hasher) = test_context
         .actions_manager
@@ -463,9 +480,6 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
     assert_eq!(stored_digest, action_digest);
     assert_eq!(stored_result, action_result.clone());
     assert_eq!(digest_hasher, DigestHasherFunc::Sha256);
-
-    // Now our client should be notified that our runner finished.
-    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
 
     // Now ensure the final results match our expectations.
     assert_eq!(
