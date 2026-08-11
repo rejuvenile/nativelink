@@ -88,18 +88,70 @@ pub const PIN_TIMEOUT_SECS: u64 = 120;
 /// it adds no `time_to_live`/`time_to_idle` to cache entries; it is a
 /// loop-driven maintenance call exactly like `expire_stale_pins`.
 const DRAIN_INTERVAL_SECS: u64 = 10;
-/// (FINDING 2 moka-eviction-wedge, 2026-07-28) Number of CONSECUTIVE
-/// drain-arm evaluations that must observe the cache STRICTLY OVER
-/// `max_bytes` with ZERO size-eviction progress (`size_evicted_items`
-/// unchanged) before the self-healing fallback evictor fires. moka
-/// 0.12.15's `evict_lru_entries` livelocks when the probation-deque
-/// front node is stale (invalidated + re-inserted key → different
-/// `EntryInfo`; `skip_updated_entry_ao` moves the MAP entry's node back
-/// but never the peeked stale front → re-peeks the same node every
-/// maintenance call, evicts 0, forever). Our pin path mints exactly that
-/// churn (`pin_key_with_mode` = `cache.invalidate`, `unpin_key` = bare
-/// `cache.insert`). Production (fleet artifact 2026-07-28): 2 of 10
-/// workers at 3.36× over a 40 GB budget with evictions FROZEN for
+/// (FINDING 2 moka-eviction-wedge, 2026-07-28; upstream fix landed
+/// 2026-08-11) Number of CONSECUTIVE drain-arm evaluations that must
+/// observe the cache STRICTLY OVER `max_bytes` with ZERO size-eviction
+/// progress (`size_evicted_items` unchanged) before the self-healing
+/// fallback evictor fires.
+///
+/// **The bug this detects (moka-rs/moka#590), in two halves.** A deque
+/// node can be ORPHANED — still linked in the probation deque, but no
+/// longer reachable from the backing concurrent hash table (CHT):
+///
+///  * **Mint.** Writes reach the policy tier asynchronously over a
+///    bounded `WriteOp` channel, so there is a window between a CHT
+///    mutation and the enqueue of its op. If a key's CHT slot is removed
+///    inside that window, the ops can drain `Remove`-then-`Upsert`; the
+///    stale `Upsert` then reached `handle_admit` via an UNGUARDED
+///    `handle_upsert` (0.12.15 `sync/base_cache.rs:1456`) and pushed a
+///    deque node for an entry that no longer exists.
+///  * **Permanence.** `evict_lru_entries` peeks the probation front and
+///    tries a guarded `remove_if`, which fails for an orphan. It falls to
+///    `skip_updated_entry_ao`, whose key-PRESENT branch calls
+///    `move_to_back_ao_in_deque` — moving the MAP entry's node, never the
+///    peeked orphan at the front. The next pass re-peeks the same node.
+///    `more_to_evict` goes false, `do_run_pending_tasks` takes its
+///    no-progress exit, and size eviction is dead for the life of the
+///    process.
+///
+/// **Two corrections to our original internal diagnosis** (both were
+/// wrong in the direction of making the bug look narrower than it is;
+/// see `docs/moka-eviction-livelock-upstream-report.md`):
+///  1. We had attributed the mint to a gen-checked `WriteOp::Remove`
+///     skipping the unlink. It is not that: `handle_remove_without_timer_wheel`
+///     branches on `is_admitted()` and unlinks by pointer, so genuine
+///     removals are clean. The mint is the unguarded `handle_admit`.
+///  2. The wedge is NOT specific to our pin path. We had concluded only
+///     invalidate-then-reinsert could mint it. The reproducer's plain
+///     `insert` mode stalls just as reliably with ZERO `invalidate` calls
+///     — size eviction removes the CHT slot and plain key reuse supplies
+///     the rest. ANY moka LRU cache with key reuse under eviction
+///     pressure is exposed; our pin path (`pin_key_with_mode` =
+///     `cache.invalidate`, `unpin_key` = bare `cache.insert`) made it
+///     more FREQUENT, not uniquely possible.
+///
+/// **Fixed upstream in 0.12.16** (moka-rs/moka#592, released 2026-08-09;
+/// we run `=0.12.16`). #592 kills the MINT: an `EntryInfo::is_retired`
+/// flag is set inside the CHT's post-CAS `with_previous_entry` callback,
+/// so it linearises with the bucket CAS that unlinked the entry, and
+/// `handle_upsert`/`handle_admit` short-circuit on a retired entry
+/// (0.12.16 `sync/base_cache.rs:1515` and `:1785`). Verified against our
+/// workload by A/B reproducer: 0.12.15 → 6/6 stalled at 185-202x cap;
+/// 0.12.16 → 6/6 converged to 1.00x.
+///
+/// **Why this sensor survives the fix, as a BACKSTOP.** #592 removed the
+/// only known minting path; it did NOT change the permanence half.
+/// `skip_updated_entry_ao` (0.12.16 `sync/base_cache.rs:2148`) and
+/// `move_to_back_ao_in_deque` (`common/concurrent/deques.rs:95`) are
+/// byte-identical to 0.12.15 — an orphan that reaches the probation
+/// front by ANY future path still wedges eviction permanently and
+/// silently. Post-bump, `eviction_wedge_selfheal_total > 0` is the ONLY
+/// signal that would tell us the upstream fix is incomplete for our
+/// workload (or that a different eviction bug exists); removing this
+/// makes that unobservable. It is cheap when not firing.
+///
+/// Production impact that motivated it (fleet artifact 2026-07-28): 2 of
+/// 10 workers at 3.36× over a 40 GB budget with evictions FROZEN for
 /// 8h 36m at scrape time (the widely-quoted 4-day figure is the
 /// disk-full/NAK duration, not the measured frozen window). The
 /// frozen-evictions requirement is what prevents false-firing during
@@ -704,13 +756,13 @@ where
             "eviction_wedge_detected",
             &eviction_wedge_detected,
             nativelink_metric::MetricKind::Default,
-            "FINDING 2: 1 while the eviction-wedge self-heal trigger condition holds (weighted size at-or-over max_bytes AND evicted_items frozen for the full trigger window); 0 otherwise. Page on sustained 1 — the built-in fallback evictor is compensating for a wedged moka evictor."
+            "FINDING 2: 1 while the eviction-wedge self-heal trigger condition holds (weighted size at-or-over max_bytes AND evicted_items frozen for the full trigger window); 0 otherwise. Page on sustained 1 — the built-in fallback evictor is compensating for a wedged moka evictor. Since the moka 0.12.16 bump (upstream fix moka-rs/moka#592) this is expected to stay 0; a sustained 1 means the upstream fix is incomplete for our workload or a different eviction bug exists."
         );
         nativelink_metric::publish!(
             "eviction_wedge_selfheal_total",
             &self.eviction_wedge_selfheal_total,
             nativelink_metric::MetricKind::Component,
-            "FINDING 2: eviction-wedge self-heal firings (CounterWithTime — emits .counter and .last_time; one increment + one warn per firing, never per evicted entry)."
+            "FINDING 2: eviction-wedge self-heal firings (CounterWithTime — emits .counter and .last_time; one increment + one warn per firing, never per evicted entry). Since the moka 0.12.16 bump this counter is the PRIMARY residual-risk signal: any non-zero value is evidence the upstream #592 fix did not fully cover our workload. Alert on first increment, not on a rate."
         );
         nativelink_metric::publish!(
             "max_bytes",
@@ -2467,7 +2519,12 @@ where
     ///     unboundedly ratcheting overshoot with a permanently dead
     ///     evictor (3.36× over budget in the incident), and moka exposes
     ///     no ordered walk. The order caveat is scoped to WEDGE RECOVERY
-    ///     — normal (non-wedged) eviction remains moka's LRU.
+    ///     — normal (non-wedged) eviction remains moka's LRU. Since the
+    ///     0.12.16 bump (moka-rs/moka#592 fixes the wedge upstream) the
+    ///     wedge-recovery ENTRY into this method is expected to be
+    ///     dormant, so this fidelity cost should now be hypothetical;
+    ///     the admission-gate caller (`check_backpressure_gate`) still
+    ///     reaches it on the normal path and is unaffected by the bump.
     ///
     /// **Concurrency.** This is a sync method. Holds no awaits. Moka's
     /// `cache.iter()` and `cache.invalidate()` are lock-free /
@@ -2670,20 +2727,54 @@ where
     /// run by BOTH background drain arms (periodic tick + NAK kick) right
     /// after `run_pending_tasks_and_drain`.
     ///
+    /// **Status: SAFETY NET, not the primary mitigation.** The bug it was
+    /// built for (moka-rs/moka#590) is FIXED upstream in moka 0.12.16 —
+    /// the version this crate pins. It is retained deliberately: #592
+    /// fixed the orphan MINT but left the livelock geometry
+    /// (`skip_updated_entry_ao`) untouched, and
+    /// `eviction_wedge_selfheal_total > 0` on 0.12.16 is our only signal
+    /// that the fix is incomplete for our workload. See
+    /// `WEDGE_FROZEN_TICKS_TRIGGER` for the full mechanism and both
+    /// corrections to the original diagnosis.
+    ///
     /// Trigger: the cache is STRICTLY OVER `max_bytes` AND
     /// `size_evicted_items` has not advanced for
-    /// `WEDGE_FROZEN_TICKS_TRIGGER` consecutive evaluations. moka
-    /// 0.12.15's `evict_lru_entries` can livelock on a stale
-    /// probation-deque front node (see `WEDGE_FROZEN_TICKS_TRIGGER`
-    /// docs); in that state `run_pending_tasks` returns normally but
-    /// evicts 0 forever while the weight ledger stays accurate — this
-    /// evaluation detects exactly that signature and re-establishes the
-    /// budget via the deque-INDEPENDENT key walk
-    /// (`evict_unpinned_lru_bytes`: `cache.iter()` scans the hash-table
-    /// segments; `cache.invalidate` removes map entries directly and its
-    /// `WriteOp::Remove` weight decrement in moka's `handle_remove`
-    /// unlinks each entry's own deque node — none of it peeks the wedged
-    /// probation front).
+    /// `WEDGE_FROZEN_TICKS_TRIGGER` consecutive evaluations. In a wedged
+    /// state `run_pending_tasks` returns normally but evicts 0 forever
+    /// while the weight ledger stays accurate — this evaluation detects
+    /// exactly that signature and re-establishes the budget via the
+    /// deque-INDEPENDENT key walk (`evict_unpinned_lru_bytes`).
+    ///
+    /// **Deque-independence chain, re-traced hop-by-hop against moka
+    /// 0.12.16** (it was originally traced through 0.12.15; every hop
+    /// still holds, and none of the four reads the probation front):
+    ///  1. SELECTION — `cache.iter()` walks the CHT segments.
+    ///     `src/sync/cache.rs` is byte-identical between 0.12.15 and
+    ///     0.12.16, so this hop is unchanged.
+    ///  2. REMOVAL — `cache.invalidate` → `invalidate_with_hash`
+    ///     (`src/sync/cache.rs:1577`) → `Inner::remove_entry`. This hop
+    ///     CHANGED SHAPE in 0.12.16: `Inner::remove_entry`
+    ///     (`sync/base_cache.rs:1106`) now unlinks via
+    ///     `remove_entry_if_and` and flips `EntryInfo::retire()` inside
+    ///     the post-CAS callback. It is still a pure CHT unlink plus a
+    ///     `WriteOp::Remove` enqueue — it reads no deque state — so
+    ///     deque-independence is PRESERVED, and the retire flag is what
+    ///     makes a heal-issued invalidate additionally immune to minting
+    ///     a fresh orphan from a racing stale `Upsert`.
+    ///  3. WEIGHT LEDGER — the `WriteOp::Remove` drain reaches
+    ///     `handle_remove_without_timer_wheel`
+    ///     (0.12.16 `sync/base_cache.rs:1891`, was `:1808`), which unlinks
+    ///     each entry's OWN node by pointer via `deqs.unlink_ao`. Body is
+    ///     unchanged; 0.12.16 only adds a debug-mode precondition assert
+    ///     that the entry is already retired (satisfied by hop 2).
+    ///  4. ORDERING — `do_run_pending_tasks`
+    ///     (0.12.16 `sync/base_cache.rs:1190`, was `:1181`) is
+    ///     BYTE-IDENTICAL: writes are still applied before
+    ///     `evict_lru_entries`, and the loop still breaks on no progress.
+    ///  5. SENSOR INPUT — `RemovalCause::Size` still reaches the eviction
+    ///     listener from the LRU path (0.12.16 `sync/base_cache.rs:2401`,
+    ///     was `:2304`), which is the only thing `size_evicted_items`
+    ///     counts.
     ///
     /// METERED (review 9fd52fc0 pair-a MAJOR-4 / pair-b P3): each
     /// invocation runs at most `WEDGE_SELFHEAL_MAX_ROUNDS_PER_INVOCATION`
@@ -5028,7 +5119,11 @@ mod tests {
     // `weighted_size()` is by construction the WEDGED state (a completed
     // moka maintenance pass either evicts to cap or is livelocked on the
     // stale probation front), which a test cannot reproduce without
-    // moka's bug. `test_inflate_wedge_observation(extra)` therefore adds
+    // moka's bug — and since the 0.12.16 bump (upstream fix
+    // moka-rs/moka#592) it cannot be reproduced against the pinned moka
+    // AT ALL, which is exactly why this seam is the only way to keep the
+    // self-heal's own logic under test as a backstop.
+    // `test_inflate_wedge_observation(extra)` therefore adds
     // a PHANTOM stuck overage on top of the REAL residency — the
     // observation falls as the heal evicts real entries, so the
     // convergence/stop logic is exercised for real — while the

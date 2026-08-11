@@ -50,15 +50,35 @@ hyper = { version = "1.6.0", default-features = false }
 hyper-util = { version = "0.1.11", default-features = false }
 dashmap = { version = "6", default-features = false }
 libc = { version = "0.2.177", default-features = false }
-# PINNED =0.12.15 (FINDING 2, review 9fd52fc0 red-team framing 3): the
-# eviction-wedge self-heal in moka_evicting_map.rs depends on VERIFIED
-# 0.12.15 internals (evict_lru_entries livelock shape; iter()/invalidate
-# deque-independence; do_run_pending_tasks apply-writes-before-evict
-# ordering + no-progress break). A silent `cargo update` to a different
-# 0.12.x must not move off the audited version — re-verify those
-# internals before bumping. Upstream livelock report + un-pin is a filed
-# follow-up (deferred_tasks.md, FINDING 2 prevention 4).
-moka = { version = "=0.12.15", features = ["sync"], default-features = false }
+# PINNED =0.12.16 (FINDING 2; bumped from =0.12.15 2026-08-11). 0.12.16
+# carries the UPSTREAM FIX for the size-eviction livelock that wedged two
+# production workers at 3.3x over budget: moka-rs/moka#590, fixed by #592,
+# released 2026-08-09. See docs/moka-eviction-livelock-upstream-report.md
+# for the diagnosis, the A/B reproducer (0.12.15 -> 6/6 stalled at
+# 185-202x cap; 0.12.16 -> 6/6 converged to 1.00x), and the un-pin
+# checklist.
+#
+# STILL AN EXACT PIN, for two reasons:
+#  1. The eviction-wedge self-heal in moka_evicting_map.rs is justified by
+#     a hop-by-hop trace through moka's PRIVATE internals (iter()/
+#     invalidate deque-independence; the weight-ledger unlink-by-pointer
+#     in handle_remove_without_timer_wheel; do_run_pending_tasks
+#     apply-writes-before-evict ordering + no-progress break). Every hop
+#     was re-traced against 0.12.16 (see the module docs in
+#     moka_evicting_map.rs), but that audit is version-scoped: a silent
+#     `cargo update` into 0.12.17+ would void it.
+#  2. #592 fixed the ORPHAN MINT (a retired-entry guard in handle_upsert /
+#     handle_admit), NOT the livelock geometry. `skip_updated_entry_ao`
+#     (0.12.16 sync/base_cache.rs:2148) and `move_to_back_ao_in_deque`
+#     (common/concurrent/deques.rs:95) are byte-identical to 0.12.15 —
+#     an orphan reaching the probation front still wedges eviction
+#     permanently. Any future upstream refactor that reopens a minting
+#     path reopens #590 exactly.
+#
+# To relax this pin, re-trace those hops against the target version and
+# update the citations in moka_evicting_map.rs, which carry file:line
+# references into moka's source.
+moka = { version = "=0.12.16", features = ["sync"], default-features = false }
 mock_instant = { version = "0.5.3", default-features = false }
 opentelemetry = { version = "0.32.0", default-features = false }
 opentelemetry-appender-tracing = { version = "0.32.0", default-features = false }
