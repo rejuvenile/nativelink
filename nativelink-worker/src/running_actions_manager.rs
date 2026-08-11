@@ -4106,12 +4106,6 @@ fn prehash_directory_tree(
             _ => return Ok(Vec::new()),
         }
 
-        let (_permit, dir_handle) = match fs::read_dir(&dir_path).await {
-            Ok(v) => v.into_inner(),
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut dir_stream = ReadDirStream::new(dir_handle);
-
         let mut file_futures: FuturesUnordered<
             BoxFuture<'static, Result<Option<(OsString, DigestInfo)>, Error>>,
         > = FuturesUnordered::new();
@@ -4119,25 +4113,58 @@ fn prehash_directory_tree(
             BoxFuture<'static, Result<Vec<(OsString, DigestInfo)>, Error>>,
         > = FuturesUnordered::new();
 
-        while let Some(entry_result) = dir_stream.next().await {
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(_) => continue,
+        {
+            let (_permit, dir_handle) = match fs::read_dir(&dir_path).await {
+                Ok(v) => v.into_inner(),
+                Err(_) => return Ok(Vec::new()),
             };
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            let full_path = OsString::from(
-                Path::new(&dir_path).join(entry.path())
-            );
-            if file_type.is_file() {
-                file_futures.push(prehash_single_file(full_path, hasher).boxed());
-            } else if file_type.is_dir() {
-                dir_futures.push(prehash_directory_tree(full_path, hasher).boxed());
+            let mut dir_stream = ReadDirStream::new(dir_handle);
+
+            // Note: Try very hard to not leave file descriptors open. Try to keep them as short
+            // lived as possible. This is why we iterate the directory and then build a bunch of
+            // futures with all the work we are wanting to do then execute it. It allows us to
+            // close the directory iterator file descriptor, then open the child files/folders.
+            //
+            // This scope is load-bearing, not cosmetic: `_permit` is a permit on the
+            // process-global `fs::OPEN_FILE_SEMAPHORE`, and every future pushed below
+            // re-acquires from that SAME pool (`prehash_single_file` for files, this
+            // function recursively for subdirectories). Polling those futures while
+            // still holding `_permit` is a re-entrant acquisition of a bounded shared
+            // resource across an await, and the recursion compounds it — one permit per
+            // directory level — so a deep enough tree (or enough concurrent actions)
+            // exhausts the pool and every holder waits forever. Dropping the permit at
+            // the end of this block, BEFORE any future is polled, keeps the upstream
+            // invariant from #816: every future needs exactly one FD at a time.
+            // Mirrors `upload_directory` below, which scopes its permit the same way.
+            //
+            // UNBOUNDED-OK: `file_futures`/`dir_futures` hold one small future per entry
+            // (an OsString path + hasher enum) for the duration of one directory level.
+            // No file contents are buffered here — `prehash_single_file` streams each
+            // file through the hasher and keeps only the 32-byte digest. The entry list
+            // is already fully materialized by `read_dir` semantics, and the peak is
+            // bounded by the action's own output tree, which the action itself wrote to
+            // local disk. Identical shape and lifetime to `upload_directory`'s
+            // `file_futures`/`dir_futures`/`symlink_futures` directly below.
+            while let Some(entry_result) = dir_stream.next().await {
+                let entry = match entry_result {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let file_type = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let full_path = OsString::from(
+                    Path::new(&dir_path).join(entry.path())
+                );
+                if file_type.is_file() {
+                    file_futures.push(prehash_single_file(full_path, hasher).boxed());
+                } else if file_type.is_dir() {
+                    dir_futures.push(prehash_directory_tree(full_path, hasher).boxed());
+                }
+                // Symlinks inside directories are uploaded as symlinks by
+                // upload_directory; skip them in the prehash walk.
             }
-            // Symlinks inside directories are uploaded as symlinks by
-            // upload_directory; skip them in the prehash walk.
         }
 
         let mut results = Vec::new();

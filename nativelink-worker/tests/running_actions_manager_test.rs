@@ -4567,6 +4567,238 @@ exit 1
         Ok(())
     }
 
+    /// Depth-compounding companion to `upload_with_single_permit`.
+    ///
+    /// `upload_with_single_permit` only builds a ONE-level output directory
+    /// (`tst/tst.txt`), so it is satisfied by a fix that releases the
+    /// `fs::read_dir` permit at the top recursion level only. The FD-permit
+    /// pool is process-global and `prehash_directory_tree` recurses, so a
+    /// permit retained at ANY level is retained once per level of tree depth
+    /// — that is the shape that scales into a production worker wedge on deep
+    /// output trees, not the single-level case.
+    ///
+    /// This test builds a 5-level nested output directory under a budget of a
+    /// single FD permit. Per the invariant established upstream in #816
+    /// ("every future requires exactly one file descriptor at a time") one
+    /// permit is sufficient for the whole action at ANY depth, so a passing
+    /// run proves every recursion level releases its `read_dir` permit before
+    /// descending. If any level holds its permit across the descent, the
+    /// deepest level finds the pool empty and blocks forever.
+    ///
+    /// The `tokio::time::timeout` is the deadlock detector: without it the
+    /// failure mode is a silent hang that wedges every other test in this
+    /// `#[serial]` module rather than a readable assertion.
+    #[nativelink_test]
+    async fn upload_deep_output_tree_with_single_permit()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+        /// Generous relative to the ~10ms this action takes when permits are
+        /// released correctly; short enough to report as a failure rather
+        /// than stalling the serial test queue.
+        const DEADLOCK_DEADLINE: Duration = Duration::from_secs(30);
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _slow_store, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        // Take all but one FD permit away, exactly as `upload_with_single_permit`
+        // does. This module is `#[serial]`, so draining the process-global
+        // semaphore cannot starve a concurrently-running sibling test.
+        let _permits = stream::iter(1..fs::OPEN_FILE_SEMAPHORE.available_permits())
+            .then(|_| fs::OPEN_FILE_SEMAPHORE.acquire())
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(1, fs::OPEN_FILE_SEMAPHORE.available_permits());
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        let action_result = {
+            // Five nested directory levels below the output path root, with the
+            // only regular file at the deepest level. `prehash_directory_tree`
+            // must recurse through all five before it reaches `leaf.txt`.
+            let arguments = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p ./deep/l1/l2/l3/l4; printf 'deep ' > ./deep/l1/l2/l3/l4/leaf.txt"
+                    .to_string(),
+            ];
+            let working_directory = "some_cwd";
+            let command = Command {
+                arguments,
+                output_paths: vec!["deep".to_string()],
+                working_directory: working_directory.to_string(),
+                environment_variables: vec![EnvironmentVariable {
+                    name: "PATH".to_string(),
+                    value: env::var("PATH").unwrap(),
+                }],
+                ..Default::default()
+            };
+            let command_digest = serialize_and_upload_message(
+                &command,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let input_root_digest = serialize_and_upload_message(
+                &Directory {
+                    directories: vec![DirectoryNode {
+                        name: working_directory.to_string(),
+                        digest: Some(
+                            serialize_and_upload_message(
+                                &Directory::default(),
+                                cas_store.as_pin(),
+                                &mut DigestHasherFunc::Sha256.hasher(),
+                            )
+                            .await?
+                            .into(),
+                        ),
+                    }],
+                    ..Default::default()
+                },
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let action = Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            };
+            let action_digest = serialize_and_upload_message(
+                &action,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+
+            let execute_request = ExecuteRequest {
+                action_digest: Some(action_digest.into()),
+                ..Default::default()
+            };
+            let operation_id = OperationId::default().to_string();
+
+            let running_action_impl = running_actions_manager
+                .create_and_add_action(
+                    WORKER_ID.to_string(),
+                    StartExecute {
+                        execute_request: Some(execute_request),
+                        operation_id,
+                        queued_timestamp: None,
+                        platform: action.platform.clone(),
+                        worker_id: WORKER_ID.to_string(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                        missing_digest_peers: Vec::new(),
+                    },
+                )
+                .await?;
+
+            tokio::time::timeout(DEADLOCK_DEADLINE, run_action(running_action_impl.clone()))
+                .await
+                .expect(
+                    "prehash_directory_tree deadlocked on the process-global FD permit pool: a \
+                     recursion level held its fs::read_dir permit across the await that descends \
+                     into subdirectories, so the deepest level of a 5-level output tree could \
+                     never acquire a permit. One permit must suffice at any depth (#816: every \
+                     future requires exactly one file descriptor at a time)",
+                )?
+        };
+
+        // The deepest file must have been walked, hashed and uploaded. Fetching
+        // its bytes back out of the CAS proves the depth-5 descent completed —
+        // an assertion on the ActionResult alone would also be satisfied by a
+        // prehash walk that silently gave up partway down.
+        let leaf_digest = DigestInfo::try_new(
+            "0d39d47e6b8d4d199d36c8d8a76023e6af6de6f03927a930b8ee4a7ab675df09",
+            5,
+        )?;
+        let leaf_content = cas_store
+            .as_ref()
+            .get_part_unchunked(leaf_digest, 0, None)
+            .await
+            .err_tip(|| {
+                "depth-5 leaf.txt is absent from the CAS: the output-tree walk did not reach \
+                 the deepest level"
+            })?;
+        assert_eq!(from_utf8(&leaf_content)?, "deep ");
+
+        // ...and the uploaded tree must describe all five directory levels.
+        assert_eq!(
+            action_result.output_folders.len(),
+            1,
+            "expected exactly one output directory ('deep')"
+        );
+        assert_eq!(action_result.output_folders[0].path, "deep");
+        let tree = get_and_decode_digest::<Tree>(
+            cas_store.as_ref(),
+            action_result.output_folders[0].tree_digest.into(),
+        )
+        .await?;
+        // `upload_directory` appends its own Directory to the child list it
+        // returns (running_actions_manager.rs:4566) and the caller then also
+        // sets it as `Tree::root`, so `children` carries every directory in the
+        // tree — the 4 nested levels l1..l4 plus the duplicated 'deep' root.
+        assert_eq!(
+            tree.children.len(),
+            5,
+            "expected 5 Directory entries (l1..l4 plus the duplicated 'deep' root); got {} — the \
+             prehash/upload walk did not descend the full tree",
+            tree.children.len()
+        );
+        // The deepest level is the only one holding a file node.
+        let leaf_dirs: Vec<_> = tree
+            .children
+            .iter()
+            .filter(|d| !d.files.is_empty())
+            .collect();
+        assert_eq!(
+            leaf_dirs.len(),
+            1,
+            "exactly one directory level (l4) should contain a file node"
+        );
+        assert_eq!(leaf_dirs[0].files[0].name, "leaf.txt");
+        assert_eq!(
+            leaf_dirs[0].files[0].digest.as_ref().map(|d| d.hash.as_str()),
+            Some("0d39d47e6b8d4d199d36c8d8a76023e6af6de6f03927a930b8ee4a7ab675df09"),
+            "leaf.txt digest in the uploaded tree must match its content digest"
+        );
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn running_actions_manager_respects_action_timeout()
     -> Result<(), Box<dyn core::error::Error>> {
