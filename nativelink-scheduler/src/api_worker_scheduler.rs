@@ -15492,50 +15492,106 @@ mod tests {
         }
     }
 
-    /// (#p1p2 histogram) A real cold resolution of KNOWN (tiny) latency lands
-    /// in the fast bucket. A MemoryStore-backed single-directory resolve
-    /// completes in well under 50ms, so the single cold miss must increment
-    /// `tree_resolution_ms_le_50` exactly once and every slower bucket must
-    /// stay 0 — proving the inline-success arm feeds the histogram.
+    /// (#p1p2 histogram) A real cold resolution feeds the histogram: the
+    /// inline-success arm of `resolve_input_tree` must classify its elapsed
+    /// into exactly one bucket. This is the WIRING test — it is the only test
+    /// that drives the production arm; the bucket-edge arithmetic is owned by
+    /// `test_record_cold_resolution_bucket_classification` (deterministic,
+    /// injected `Duration`s, every boundary).
+    ///
+    /// REMOVED (was: `assert_eq!(tree_resolution_ms_le_50, 1)`): pinning the
+    /// sample to `le_50` asserted a PERFORMANCE SLA on a shared build box, not
+    /// the wiring. Under parallel full-lib runs a MemoryStore resolve is
+    /// routinely delayed past 50ms purely by CPU scheduling, so the sample
+    /// lands in a slower bucket and the test red-failed while the mechanism
+    /// worked perfectly (reproduced 16/48 loaded runs at c897f601, always with
+    /// `le_50 == 0` and the resolve logging "inline tree resolution complete").
+    /// Widening the threshold (`le_50 + le_100`) or serializing the test would
+    /// only lower the flake RATE — nothing bounds a loaded box's scheduling
+    /// delay — so both were rejected in favour of assertions with no absolute
+    /// time constant in them at all.
+    ///
+    /// What replaces it, and why each is load-INSENSITIVE:
+    /// 1. `total == 1` across all nine buckets — proves the arm recorded, and
+    ///    recorded exactly once. True at any latency.
+    /// 2. A SELF-CALIBRATING ceiling: the production measurement window
+    ///    (`resolve_started.elapsed()` at the `record_` call) is a strict
+    ///    SUBSET of this test's own window around the `.await`, so the
+    ///    recorded elapsed can never exceed the observed elapsed. Classified
+    ///    through the SAME classifier, the recorded bucket index must be <=
+    ///    the observed one. Under load BOTH dilate together, so the bound
+    ///    holds at any load — while a wrong/stale start `Instant` threaded
+    ///    into the arm (a live hazard: `resolve_started` at the `Instant::now()`
+    ///    above the inline `timeout` is deliberately shared with the
+    ///    background continuation) reports an elapsed far larger than the
+    ///    window and red-fails. Note the old `le_50` assertion could not catch
+    ///    a too-SMALL elapsed either (`Duration::ZERO` classifies to `le_50`),
+    ///    so this strictly widens detection rather than narrowing it.
     ///
     /// Mutation step: comment out the `record_cold_resolution_bucket` call on
     /// the inline-success arm of `resolve_input_tree` and this red-fails with
-    /// "the cold inline resolution must record exactly one histogram sample".
+    /// "the inline-success arm must record exactly one histogram sample".
+    /// Swapping `resolve_elapsed` for an inflated duration red-fails the
+    /// ceiling assertion. Both verified.
     #[tokio::test]
     async fn test_cold_resolution_records_histogram_bucket() {
         let (scheduler, dir_digest) = prefetch_test_scheduler().await;
 
-        // One cold inline resolution.
+        // Snapshot the nine buckets in classifier order (fast -> slow), so a
+        // sample's bucket INDEX is comparable between two metric sets.
+        let bucket_counts = |m: &SchedulerMetrics| -> [u64; 9] {
+            [
+                m.tree_resolution_ms_le_50.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_100.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_250.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_500.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_1000.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_2000.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_5000.load(Ordering::Relaxed),
+                m.tree_resolution_ms_le_30000.load(Ordering::Relaxed),
+                m.tree_resolution_ms_gt_30000.load(Ordering::Relaxed),
+            ]
+        };
+
+        // One cold inline resolution, bracketed by this test's own clock. This
+        // window strictly CONTAINS the production measurement window.
+        let observed_started = Instant::now();
         let r = scheduler.resolve_input_tree(dir_digest).await;
+        let observed_elapsed = observed_started.elapsed();
         assert!(r.is_some(), "cold resolve should succeed inline");
 
-        // The single fast cold resolve must land in le_50 and nowhere else.
-        assert_eq!(
-            scheduler.metrics.tree_resolution_ms_le_50.load(Ordering::Relaxed),
-            1,
-            "the cold inline resolution must record exactly one histogram sample in le_50 \
-             (a sub-ms MemoryStore resolve)"
-        );
-        // Sum across all buckets must be exactly 1 — no double-count, no leak
-        // into a slower bucket.
-        let total: u64 = [
-            &scheduler.metrics.tree_resolution_ms_le_50,
-            &scheduler.metrics.tree_resolution_ms_le_100,
-            &scheduler.metrics.tree_resolution_ms_le_250,
-            &scheduler.metrics.tree_resolution_ms_le_500,
-            &scheduler.metrics.tree_resolution_ms_le_1000,
-            &scheduler.metrics.tree_resolution_ms_le_2000,
-            &scheduler.metrics.tree_resolution_ms_le_5000,
-            &scheduler.metrics.tree_resolution_ms_le_30000,
-            &scheduler.metrics.tree_resolution_ms_gt_30000,
-        ]
-        .iter()
-        .map(|a| a.load(Ordering::Relaxed))
-        .sum();
+        // (1) The arm recorded, exactly once — no absolute latency assumed.
+        let counts = bucket_counts(&scheduler.metrics);
+        let total: u64 = counts.iter().sum();
         assert_eq!(
             total, 1,
-            "exactly one cold resolution occurred — the histogram total must be 1 \
-             (no double-count, no misroute)"
+            "the inline-success arm must record exactly one histogram sample for the one \
+             cold resolution that occurred (no missing record, no double-count); \
+             buckets fast->slow were {counts:?} after a resolve observed at \
+             {observed_elapsed:?}"
+        );
+
+        // (2) Self-calibrating ceiling: classify this test's own observed
+        // elapsed through the SAME production classifier and require the
+        // recorded sample to sit no slower than it.
+        let reference = SchedulerMetrics::default();
+        reference.record_cold_resolution_bucket(observed_elapsed);
+        let reference_counts = bucket_counts(&reference);
+        let recorded_idx = counts
+            .iter()
+            .position(|&c| c == 1)
+            .expect("total == 1 was asserted above, so exactly one bucket holds the sample");
+        let ceiling_idx = reference_counts
+            .iter()
+            .position(|&c| c == 1)
+            .expect("the classifier always lands an elapsed in exactly one bucket");
+        assert!(
+            recorded_idx <= ceiling_idx,
+            "the recorded cold-resolution elapsed must not exceed the wall-clock window this \
+             test measured around the call (the production window is a SUBSET of it) — \
+             recorded landed in bucket index {recorded_idx}, but the observed \
+             {observed_elapsed:?} only reaches index {ceiling_idx}; the inline arm is timing \
+             from the wrong start Instant"
         );
     }
 
