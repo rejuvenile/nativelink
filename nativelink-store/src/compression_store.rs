@@ -226,10 +226,57 @@ impl UploadState {
     }
 }
 
-// Based off of an older Bincode config
+/// Upper bound, in BYTES, on any single sequence wincode will preallocate while
+/// DEserializing with [`WincodeConfig`].
+///
+/// Both sequences decoded under this alias — [`Footer::indexes`] here and
+/// `DedupStore`'s `DedupIndex::entries` — come out of an ordinary (evictable,
+/// corruptible) backing store, so their leading `BincodeLen` u64 count is
+/// UNTRUSTED input. With the limit disabled
+/// (`wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED`, as the bincode→wincode
+/// port `13c77abc` left it) `SeqLen::read_prealloc_check` is a NO-OP and
+/// `Vec::with_capacity` runs on that untrusted count → `capacity overflow`
+/// PANIC. bincode's `NoLimit` was NOT equivalent: its serde `Vec` visitor uses a
+/// cautious capacity hint and decodes element-by-element against the real reader,
+/// so a bogus length surfaced as a decode `Err`. A bounded limit restores that
+/// behavior — an over-long count is a graceful `Err`, which `DedupStore::has`
+/// degrades to `Ok(None)` and `get_part` maps to `Code::Internal`.
+///
+/// SIZING. The limit REJECTS rather than caps-and-grows, and wincode applies it
+/// on the WRITE path too (`SeqLen::write_bytes_needed_prealloc_check`), so a
+/// value set too low would break serialization of a legitimate large blob — a
+/// working store starting to error, worse than the panic it guards. wincode
+/// charges `len * size_of::<Elem>()` bytes; at 64 MiB:
+///
+/// * [`Footer::indexes`] is `Vec<SliceIndex>`, 4 B/elem, and
+///   `index_count = input_size / block_size + 1`. 64 MiB / 4 B = 16_777_216
+///   indexes — a 1 TiB payload at the default 64 KiB `block_size`, still 64 GiB
+///   at a 4 KiB one. (A footer that large is already a 64 MiB eager
+///   `vec![SliceIndex::default(); n]` in `UploadState::new`.)
+/// * `DedupIndex::entries` is `Vec<DigestInfo>`, 40 B/elem
+///   (`PackedHash([u8; 32])` + `u64`). FastCDC never emits a chunk below
+///   `min_size` except the final flush (`nativelink_util::fastcdc`, `:91`/`:119`),
+///   so `entries <= blob_size / min_size + 1`. 64 MiB / 40 B = 1_677_721
+///   entries — a 102 GiB blob at the default 64 KiB `min_size`, still 6.4 GiB at
+///   a 4 KiB one.
+/// * [`Header`] contains no sequence at all, so header decoding is unaffected by
+///   any value here.
+///
+/// Both envelopes sit orders of magnitude above any REAPI CAS blob, so ONE limit
+/// serves the shared alias and the two consumers do not need separate configs.
+/// The value matches the workspace's two other bounded wincode configs
+/// (`nativelink_scheduler::resource_profile_persist::SNAPSHOT_PREALLOC_LIMIT`,
+/// `nativelink_scheduler::dag_criticality::DAG_PREALLOC_LIMIT`) and is 16x
+/// wincode's own `DEFAULT_PREALLOCATION_SIZE_LIMIT` of 4 MiB.
+// CAPPED AT 64 MiB: worst-case allocation for one corrupt index/footer decode on
+// a network-reachable store path; see the sizing analysis above.
+pub const WINCODE_PREALLOC_LIMIT_BYTES: usize = 64 << 20;
+
+// Based off of an older Bincode config, but with a BOUNDED preallocation limit
+// for untrusted stored data (see [`WINCODE_PREALLOC_LIMIT_BYTES`]).
 pub type WincodeConfig = wincode::config::Configuration<
     true,
-    { wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED },
+    WINCODE_PREALLOC_LIMIT_BYTES,
     wincode::len::BincodeLen,
     wincode::int_encoding::LittleEndian,
     wincode::int_encoding::FixInt,

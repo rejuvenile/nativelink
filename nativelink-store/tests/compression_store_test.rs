@@ -26,7 +26,7 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_store::compression_store::{
     CURRENT_STREAM_FORMAT_VERSION, CompressionStore, DEFAULT_BLOCK_SIZE, FOOTER_FRAME_TYPE, Footer,
-    Lz4Config, SliceIndex, WincodeConfig,
+    Header, Lz4Config, SliceIndex, WINCODE_PREALLOC_LIMIT_BYTES, WincodeConfig,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
@@ -883,5 +883,127 @@ async fn compression_store_get_part_terminates_writer_on_multiple_corrupt_shapes
              header/frame, got: {get_res:?}"
         );
     }
+    Ok(())
+}
+
+// ─── #wincode-prealloc: the shared `WincodeConfig` alias, compression side ──
+//
+// `WincodeConfig` is SHARED with `DedupStore` (`dedup_store.rs` imports it from
+// here), so the single `WINCODE_PREALLOC_LIMIT_BYTES` has to serve both
+// consumers. On this side the sequence is `Footer.indexes: Vec<SliceIndex>` at
+// 4 bytes per element — decoded from a footer frame read out of the (untrusted,
+// corruptible) backend store. `Header` contains NO sequence at all
+// (`version: u8` + `Lz4Config { block_size: u32 }` + `UploadSizeInfo`), so header
+// decoding is unaffected by any value of the cap.
+
+/// Bytes wincode charges per `Footer.indexes` element.
+const SLICE_INDEX_WIRE_STRIDE: usize = size_of::<SliceIndex>();
+
+/// Build the raw leading `BincodeLen` (u64 LE) of a `Footer` declaring `indexes`
+/// elements, with NO element bytes following it.
+fn footer_bytes_declaring(indexes: u64) -> Vec<u8> {
+    indexes.to_le_bytes().to_vec()
+}
+
+/// #wincode-prealloc: the compression store's footer decode
+/// (`compression_store.rs`, `deserialize::<Footer, WincodeConfig>`) reads an
+/// untrusted u64 index count out of the backend blob. With the limit DISABLED —
+/// as the bincode→wincode port (`13c77abc`) left it — that count reached
+/// `Vec::with_capacity` and a corrupt footer panicked the thread with
+/// `capacity overflow`. The bounded cap turns it into a graceful decode `Err`
+/// that `get_part` maps to `Code::Internal`.
+///
+/// Mutation step: set `WINCODE_PREALLOC_LIMIT_BYTES` back to
+/// `wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED` — this red-fails with
+/// `capacity overflow`.
+#[nativelink_test]
+async fn compression_footer_decode_rejects_length_over_prealloc_cap() -> Result<(), Error> {
+    let over_cap_indexes = (WINCODE_PREALLOC_LIMIT_BYTES / SLICE_INDEX_WIRE_STRIDE) as u64 + 1;
+    let err = wincode::config::deserialize::<Footer, WincodeConfig>(
+        &footer_bytes_declaring(over_cap_indexes),
+        WincodeConfig::new(),
+    )
+    .expect_err(
+        "a Footer declaring more indexes than WINCODE_PREALLOC_LIMIT_BYTES allows must be \
+         rejected as a decode Err, not preallocated",
+    );
+    let err_dbg = format!("{err:?}");
+    assert!(
+        err_dbg.contains("PreallocationSizeLimit"),
+        "over-cap declared footer index count must be rejected by wincode's preallocation guard \
+         (ReadError::PreallocationSizeLimit); got: {err_dbg}",
+    );
+    Ok(())
+}
+
+/// #wincode-prealloc: the `Header` carries no sequence, so the shared cap can
+/// NEVER reject a legitimate header no matter how tight it is set. This pins that
+/// property — it is the load-bearing half of the "one cap can serve the shared
+/// alias" argument, and it would break the moment someone adds a `Vec`/`String`
+/// field to `Header` (at which point the alias needs re-analysis or a split).
+#[nativelink_test]
+async fn compression_header_round_trips_independent_of_prealloc_cap() -> Result<(), Error> {
+    let header = Header {
+        version: CURRENT_STREAM_FORMAT_VERSION,
+        config: Lz4Config {
+            block_size: DEFAULT_BLOCK_SIZE,
+        },
+        upload_size: UploadSizeInfo::ExactSize(u64::MAX),
+    };
+    let encoded = wincode::config::serialize(&header, WincodeConfig::new())
+        .expect("Header serialize must not depend on the preallocation cap");
+    let decoded =
+        wincode::config::deserialize::<Header, WincodeConfig>(&encoded, WincodeConfig::new())
+            .expect("Header deserialize must not depend on the preallocation cap");
+    assert_eq!(
+        decoded, header,
+        "Header must round-trip under the bounded preallocation cap — it contains no sequence, \
+         so no cap value can reject it",
+    );
+    Ok(())
+}
+
+/// #wincode-prealloc regression guard, compression side: a footer for a genuinely
+/// large payload must still serialize AND deserialize. wincode enforces
+/// `prealloc_check` on the write path too, so a cap set below the largest
+/// legitimate `index_count` would break UPLOADS of large blobs — a working store
+/// starting to error, which is worse than the panic being fixed. 2_097_152
+/// indexes is an 8 MiB footer sequence (deliberately above wincode's own 4 MiB
+/// `DEFAULT_PREALLOCATION_SIZE_LIMIT`) and corresponds to a 128 GiB payload at
+/// the default 64 KiB `block_size`.
+///
+/// Mutation step: set `WINCODE_PREALLOC_LIMIT_BYTES` absurdly low (e.g. `4096`) —
+/// this red-fails at the serialize step.
+#[nativelink_test]
+async fn compression_footer_large_but_legitimate_round_trips() -> Result<(), Error> {
+    const LARGE_INDEX_COUNT: usize = 2_097_152;
+
+    let footer = Footer {
+        indexes: vec![
+            SliceIndex {
+                position_from_prev_index: 1234,
+            };
+            LARGE_INDEX_COUNT
+        ],
+        index_count: LARGE_INDEX_COUNT as u32,
+        uncompressed_data_size: 128 * 1024 * 1024 * 1024,
+        config: Lz4Config {
+            block_size: DEFAULT_BLOCK_SIZE,
+        },
+        version: CURRENT_STREAM_FORMAT_VERSION,
+    };
+    let encoded = wincode::config::serialize(&footer, WincodeConfig::new()).expect(
+        "serializing a legitimate large Footer must succeed — wincode enforces the preallocation \
+         cap on the WRITE path too, so a cap below the largest legitimate index_count breaks \
+         uploads of large blobs",
+    );
+    let decoded =
+        wincode::config::deserialize::<Footer, WincodeConfig>(&encoded, WincodeConfig::new())
+            .expect("deserializing a legitimate large Footer must succeed");
+    assert_eq!(
+        decoded.indexes.len(),
+        LARGE_INDEX_COUNT,
+        "legitimate large footer must round-trip every index",
+    );
     Ok(())
 }

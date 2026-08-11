@@ -16,7 +16,8 @@ use nativelink_config::stores::{DedupSpec, FastSlowSpec, MemorySpec, StoreDirect
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
-use nativelink_store::dedup_store::DedupStore;
+use nativelink_store::compression_store::{WINCODE_PREALLOC_LIMIT_BYTES, WincodeConfig};
+use nativelink_store::dedup_store::{DedupIndex, DedupStore};
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
@@ -560,7 +561,6 @@ async fn dedup_store_get_part_terminates_writer_on_content_miss() -> Result<(), 
     use core::time::Duration;
 
     use bincode::serde::encode_to_vec;
-    use nativelink_store::dedup_store::DedupIndex;
     use nativelink_util::buf_channel::{DropCloserWriteHalf, make_buf_channel_pair};
     use nativelink_util::store_trait::StoreKey;
 
@@ -687,6 +687,166 @@ async fn dedup_store_get_part_terminates_writer_on_index_deserialize_err() -> Re
     assert!(
         get_res.is_err(),
         "expected dedup get_part Err on index deserialize, got: {get_res:?}"
+    );
+    Ok(())
+}
+
+// ─── #wincode-prealloc: untrusted-length preallocation guard ────────────────
+//
+// `DedupIndex` is decoded straight out of the index store, which for a
+// dedup chain is ordinary (evictable, corruptible) CAS storage — the declared
+// entry count is UNTRUSTED input. On the wire it is a `BincodeLen` u64 LE count
+// followed by that many 40-byte `DigestInfo`s, so the tests below hand-craft the
+// leading length and let wincode do the rest.
+
+/// Bytes wincode charges per `DedupIndex` entry: `DigestInfo` is
+/// `PackedHash([u8; 32])` + `size_bytes: u64`. `SeqLen::prealloc_check` compares
+/// `len * size_of::<DigestInfo>()` against the configured limit, so this factor
+/// converts the byte cap into an entry cap.
+const DIGEST_INFO_WIRE_STRIDE: usize = size_of::<DigestInfo>();
+
+/// Build the raw leading `BincodeLen` (u64 LE) of a `DedupIndex` declaring
+/// `entries` elements, with NO element bytes following it.
+fn dedup_index_bytes_declaring(entries: u64) -> Vec<u8> {
+    entries.to_le_bytes().to_vec()
+}
+
+/// #wincode-prealloc: `DedupStore::has` carries a DELIBERATE graceful arm —
+/// "index deserialize error → `Ok(None)`" (`dedup_store.rs:171`) — so a corrupt
+/// index degrades to a cache MISS instead of an error. The bincode→wincode port
+/// (`13c77abc`) set the preallocation limit to
+/// `wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED`, which makes
+/// `SeqLen::read_prealloc_check` a NO-OP, so `Vec::with_capacity` ran on the
+/// untrusted u64 length → `capacity overflow` PANIC. That made this graceful arm
+/// UNREACHABLE for oversized lengths: a corrupt index blob killed the thread
+/// rather than degrading to a miss.
+///
+/// Mutation step: set `WINCODE_PREALLOC_LIMIT_BYTES` back to
+/// `wincode::config::PREALLOCATION_SIZE_LIMIT_DISABLED` — the test must red-fail
+/// with `capacity overflow` instead of returning `Ok(None)`.
+#[nativelink_test]
+async fn dedup_store_has_degrades_to_none_on_oversized_index_length() -> Result<(), Error> {
+    use core::time::Duration;
+
+    let index_store_inner = MemoryStore::new(&MemorySpec::default());
+    let store = DedupStore::new(
+        &make_default_config(),
+        Store::new(index_store_inner.clone()),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    )?;
+
+    let outer_digest = DigestInfo::try_new(VALID_HASH1, 100).unwrap();
+    index_store_inner
+        .update_oneshot(outer_digest, dedup_index_bytes_declaring(u64::MAX).into())
+        .await?;
+
+    let has_res = tokio::time::timeout(Duration::from_secs(5), store.has(outer_digest))
+        .await
+        .expect("DedupStore::has hung on an oversized declared index length");
+
+    let maybe_size = has_res.expect(
+        "DedupStore::has must not surface an Err for a corrupt index — the deliberate graceful \
+         arm at dedup_store.rs:171 degrades a deserialize failure to a cache miss",
+    );
+    assert_eq!(
+        maybe_size, None,
+        "DedupStore::has must degrade an index declaring an impossible entry count to Ok(None) \
+         (cache miss). Reaching Vec::with_capacity with an untrusted u64 length is the \
+         capacity-overflow panic that PREALLOCATION_SIZE_LIMIT_DISABLED reintroduced in 13c77abc",
+    );
+    Ok(())
+}
+
+/// #wincode-prealloc boundary, OVER side: a declared length whose byte cost
+/// exceeds `WINCODE_PREALLOC_LIMIT_BYTES` must be REJECTED as a graceful decode
+/// `Err` naming the preallocation limit — never a panic, never a giant
+/// allocation.
+///
+/// Mutation step: set `WINCODE_PREALLOC_LIMIT_BYTES` to
+/// `PREALLOCATION_SIZE_LIMIT_DISABLED` — this red-fails with `capacity overflow`.
+#[nativelink_test]
+async fn dedup_index_decode_rejects_length_over_prealloc_cap() -> Result<(), Error> {
+    // One entry PAST the cap: `(cap / stride) + 1` entries costs more than `cap`
+    // bytes, so `prealloc_check` must reject before any allocation happens.
+    let over_cap_entries = (WINCODE_PREALLOC_LIMIT_BYTES / DIGEST_INFO_WIRE_STRIDE) as u64 + 1;
+    let err = wincode::config::deserialize::<DedupIndex, WincodeConfig>(
+        &dedup_index_bytes_declaring(over_cap_entries),
+        WincodeConfig::new(),
+    )
+    .expect_err(
+        "a DedupIndex declaring more entries than WINCODE_PREALLOC_LIMIT_BYTES allows must be \
+         rejected as a decode Err, not preallocated",
+    );
+    let err_dbg = format!("{err:?}");
+    assert!(
+        err_dbg.contains("PreallocationSizeLimit"),
+        "over-cap declared length must be rejected by wincode's preallocation guard \
+         (ReadError::PreallocationSizeLimit); got: {err_dbg}",
+    );
+    Ok(())
+}
+
+/// #wincode-prealloc boundary, UNDER side: a declared length whose byte cost is
+/// exactly AT the cap must pass the preallocation gate and then fail on the
+/// truncated element bytes — proving the boundary sits where
+/// `WINCODE_PREALLOC_LIMIT_BYTES` says it does, and that the guard rejects only
+/// what it is supposed to reject.
+///
+/// Mutation step: set `WINCODE_PREALLOC_LIMIT_BYTES` an order of magnitude lower
+/// — this red-fails because the at-cap length now trips the preallocation guard.
+#[nativelink_test]
+async fn dedup_index_decode_admits_length_at_prealloc_cap() -> Result<(), Error> {
+    let at_cap_entries = (WINCODE_PREALLOC_LIMIT_BYTES / DIGEST_INFO_WIRE_STRIDE) as u64;
+    let err = wincode::config::deserialize::<DedupIndex, WincodeConfig>(
+        &dedup_index_bytes_declaring(at_cap_entries),
+        WincodeConfig::new(),
+    )
+    .expect_err("no element bytes follow the length, so the decode must still fail");
+    let err_dbg = format!("{err:?}");
+    assert!(
+        !err_dbg.contains("PreallocationSizeLimit"),
+        "a declared length costing exactly WINCODE_PREALLOC_LIMIT_BYTES must be ADMITTED by the \
+         preallocation guard and fail on the truncated payload instead; the guard rejecting it \
+         means the cap is lower than the constant claims. got: {err_dbg}",
+    );
+    Ok(())
+}
+
+/// #wincode-prealloc regression guard: the cap REJECTS rather than caps-and-grows,
+/// so a cap set too tight silently breaks a WORKING store — a legitimate large
+/// index would start erroring on both serialize and deserialize (wincode runs
+/// `prealloc_check` on the write path too, via
+/// `SeqLen::write_bytes_needed_prealloc_check`). 1_048_576 entries is a 40 MiB
+/// index: at the production default `min_size` of 64 KiB that is a 64 GiB blob,
+/// and 8 GiB even at this test config's 8 KiB `min_size`.
+///
+/// Mutation step: set `WINCODE_PREALLOC_LIMIT_BYTES` absurdly low (e.g. `4096`) —
+/// this red-fails at the serialize step.
+#[nativelink_test]
+async fn dedup_index_large_but_legitimate_round_trips() -> Result<(), Error> {
+    const LARGE_ENTRY_COUNT: usize = 1_048_576;
+
+    let index = DedupIndex {
+        entries: vec![DigestInfo::try_new(VALID_HASH2, 4096).unwrap(); LARGE_ENTRY_COUNT],
+    };
+    let encoded = wincode::config::serialize(&index, WincodeConfig::new()).expect(
+        "serializing a legitimate large DedupIndex must succeed — wincode enforces the \
+         preallocation cap on the WRITE path too, so a cap below the largest legitimate index \
+         breaks uploads, which is worse than the panic it guards against",
+    );
+    let decoded =
+        wincode::config::deserialize::<DedupIndex, WincodeConfig>(&encoded, WincodeConfig::new())
+            .expect("deserializing a legitimate large DedupIndex must succeed");
+
+    assert_eq!(
+        decoded.entries.len(),
+        LARGE_ENTRY_COUNT,
+        "legitimate large index must round-trip every entry",
+    );
+    assert_eq!(
+        decoded.entries.last(),
+        index.entries.last(),
+        "legitimate large index must round-trip entry contents",
     );
     Ok(())
 }
