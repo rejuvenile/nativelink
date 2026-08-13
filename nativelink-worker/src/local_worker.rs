@@ -6976,8 +6976,8 @@ pub fn register_execution_store_metrics(
 /// actions, to reap CONTENDER dirs (`<FIXED_PREFIX>/<targetkey>.<uuid>`)
 /// orphaned by a prior worker run that crashed before Drop cold-discarded them.
 ///
-/// INERT when the feature is off: `portable_incr` is `None` on the entire fleet,
-/// so no `spawn_blocking` is paid. The sweep itself is BLOCKING (readdir/unlink),
+/// INERT when the feature is off (`portable_incr` is `None`): no
+/// `spawn_blocking` is paid. The sweep itself is BLOCKING (readdir/unlink),
 /// so it runs under `spawn_blocking`. A sweep failure is logged and swallowed —
 /// it must never block worker startup.
 pub async fn portable_incr_startup_sweep(
@@ -7024,8 +7024,8 @@ pub async fn new_local_worker(
     ac_store_name: Option<String>,
     historical_store: Store,
     // FL-1383 (design §6.1/§6.3): the fleet-shared `incr_seed_index` store, resolved
-    // by the caller from `config.portable_incr_seed_index_store`. `None` (the fleet
-    // default / unset) leaves the seed fetch+publish path INERT.
+    // by the caller from `config.portable_incr_seed_index_store`. `None` (unset in
+    // config) leaves the seed fetch+publish path INERT.
     incr_seed_index_store: Option<Store>,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     // (#37 re-enable follow-up) Set the memory gate enable flag from config
@@ -7121,8 +7121,7 @@ pub async fn new_local_worker(
     )
     .await;
     // FL-1383 chunk 2b: `Some` ONLY when the feature is enabled AND every §12
-    // assert passed — `None` on the entire live fleet (the INERT gate). Installed
-    // on the manager below.
+    // assert passed; `None` is the INERT gate. Installed on the manager below.
     let portable_incr_context = crate::portable_incr::PortableIncrContext::from_provision(
         portable_incr_provision,
         config.portable_incr.clone(),
@@ -7130,9 +7129,9 @@ pub async fn new_local_worker(
     // FL-1383 §8 wiring: reap CONTENDER dirs orphaned by a prior worker run that
     // crashed before Drop cold-discarded them. Runs ONCE here — after FIXED_PREFIX
     // is provisioned and BEFORE any action plans an execroot (no contender is live
-    // yet). Cloned so the context is still installed on the manager below. INERT on
-    // the fleet (`None` ⇒ no `spawn_blocking`); a sweep failure is logged and
-    // swallowed so it can never block worker startup.
+    // yet). Cloned so the context is still installed on the manager below. INERT
+    // when the gate is off (`None` ⇒ no `spawn_blocking`); a sweep failure is
+    // logged and swallowed so it can never block worker startup.
     portable_incr_startup_sweep(portable_incr_context.clone()).await;
 
     let entrypoint = if config.entrypoint.is_empty() {
@@ -7478,12 +7477,12 @@ pub async fn new_local_worker(
             cas_endpoint: running_actions_cas_endpoint,
             deferred_output_uploads_enabled: config.deferred_output_uploads_enabled,
         })?;
-    // FL-1383 chunk 2b: install the portable-incr context (INERT `None` on the
-    // fleet) BEFORE Arc-wrapping so the ~55 Args construction sites stay
-    // untouched. See `RunningActionsManagerImpl::set_portable_incr`.
+    // FL-1383 chunk 2b: install the portable-incr context (`None` ⇒ INERT)
+    // BEFORE Arc-wrapping so the ~55 Args construction sites stay untouched.
+    // See `RunningActionsManagerImpl::set_portable_incr`.
     running_actions_manager_impl.set_portable_incr(portable_incr_context);
     // FL-1383 (design §6.1/§6.3): install the fleet-shared `incr_seed_index` store
-    // handle (INERT `None` on the fleet), same pre-Arc pattern as above. The worker
+    // handle (`None` ⇒ INERT), same pre-Arc pattern as above. The worker
     // fetches the `-incr` seed from it before rustc and publishes to it after a
     // successful allowlisted build.
     running_actions_manager_impl.set_incr_seed_index_store(incr_seed_index_store);

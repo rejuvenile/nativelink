@@ -36,10 +36,10 @@
 //! inert.
 //!
 //! ★ DEPLOYMENT STATE IS NOT A PROPERTY OF THIS CODE — DO NOT ASSERT IT HERE.
-//! Every doc in this module and in `running_actions_manager` used to claim the
-//! gate was `None` "on the entire live fleet". That was true when written and is
-//! now FALSE: as of 2026-08-13 the feature is ENABLED on all 10 workers
-//! (`worker.json5` `portable_incr.enabled: true`, `fixed_prefix`
+//! Docs across this module, `running_actions_manager` and `local_worker` used to
+//! claim the gate was `None` "on the entire live fleet". That was true when
+//! written and is now FALSE: as of 2026-08-13 the feature is ENABLED on all 10
+//! workers (`worker.json5` `portable_incr.enabled: true`, `fixed_prefix`
 //! `/Volumes/CrowAgent/fl-incr-execroots`), and the live logs show it running —
 //! 3588 `execroot full-empty ensure+wipe`, 1710 `seed fetch complete`, and 1863
 //! eviction passes that logged. Those stale claims sat in the source for weeks
@@ -48,12 +48,17 @@
 //! `Some`/`None`) and let the deployed config answer where it is on — a comment
 //! cannot track a config field, and one that tries will rot silently.
 //!
+//! If you need to re-run the sweep that found these, note that a LINE-oriented
+//! grep CANNOT: the phrases wrap across line breaks inside `///` blocks
+//! (`` `None` on `` / `` the fleet ``), which is exactly how the first sweep
+//! missed 15 of them. Join contiguous comment lines first, then match.
+//!
 //! DURABILITY: no `fsync`/`O_SYNC`/sync-write primitive appears here (CLAUDE.md
 //! hard rule). All filesystem syscalls are BLOCKING and MUST run inside
 //! `spawn_blocking`; [`provision_and_assert`] and the chunk-2b execution-path
 //! caller both do exactly that so the tokio worker is never blocked.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -455,15 +460,36 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-// UNBOUNDED-OK: machine-local, in-process ownership set keyed by the OWNER
+/// Who is holding an entry in [`EXECROOT_OWNERSHIP`].
+///
+/// ★ THESE TWO ARE NOT INTERCHANGEABLE AND MUST NOT SHARE A BARE SET. Both mean
+/// "do not evict this path right now", but they imply OPPOSITE things about the
+/// path's BYTES: a live owner's bytes are staying on disk, whereas an eviction
+/// sentinel means a peer pass is at this moment `remove_dir_all`-ing the tree,
+/// so those bytes are leaving. A `HashSet` cannot tell them apart, and the
+/// eviction loop consequently treated a peer pass's victim as "bytes stay" and
+/// evicted an EXTRA LRU dir to cover a shortfall that was already being covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipHolder {
+    /// An in-flight portable action owns this execroot (§5 lease). Its bytes are
+    /// staying — never subtract them.
+    LiveOwner,
+    /// An eviction pass has claimed this path and is deleting it. Its bytes are
+    /// on their way off disk — subtract them, but do NOT credit them to this
+    /// pass's `dirs_evicted`/`bytes_freed`.
+    EvictionSentinel,
+}
+
+// UNBOUNDED-OK: machine-local, in-process ownership registry keyed by the OWNER
 // execroot path (`<FIXED_PREFIX>/<targetkey>`). Holds at most one entry per
-// DISTINCT targetkey currently OWNED by an in-flight portable action on THIS
-// machine; each entry is removed on the owning action's Drop (RAII, via
-// `OwnershipLeaseGuard`). Bounded by concurrent portable-action count
-// (allowlisted crates only) — never a network-driven buffer, no owned bytes,
-// not a durability/data path. This is the §5 machine-local lease registry.
-static EXECROOT_OWNERSHIP: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+// DISTINCT targetkey currently owned by an in-flight portable action OR claimed
+// by an in-flight eviction discard on THIS machine; each entry is removed on the
+// holder's Drop (RAII, via `OwnershipLeaseGuard`). Bounded by (concurrent
+// portable-action count + concurrent eviction passes), allowlisted crates only —
+// never a network-driven buffer, no owned bytes, not a durability/data path.
+// This is the §5 machine-local lease registry.
+static EXECROOT_OWNERSHIP: LazyLock<Mutex<HashMap<PathBuf, OwnershipHolder>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Worker-side portable-incr execution context. Present (`Some`) ONLY when the
 /// worker gate is enabled AND the chunk-2a §12 startup asserts passed — the
@@ -532,7 +558,20 @@ impl PortableIncrContext {
         let mut owned = EXECROOT_OWNERSHIP
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (execroot, role, lease) = if owned.insert(canonical.clone()) {
+        // Vacant-only insert. An entry held by EITHER holder means this action
+        // must NOT take the canonical dir: a live owner is using it, and an
+        // eviction sentinel means it is being deleted right now. Both cases
+        // become a CONTENDER, exactly as the previous `HashSet::insert` bool did
+        // — this is a preserved behaviour, not a new one.
+        let claimed_canonical =
+            match owned.entry(canonical.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(OwnershipHolder::LiveOwner);
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            };
+        let (execroot, role, lease) = if claimed_canonical {
             (
                 canonical.clone(),
                 ExecrootRole::Owner,
@@ -738,10 +777,12 @@ pub fn ensure_and_wipe_execroot_at(execroot: &Path, fixed_prefix: &Path) -> Resu
     wipe_all_contents(execroot, fixed_prefix)
 }
 
-/// RAII §5 ownership lease. An Owner holds `Some(canonical execroot)` and, on
-/// Drop, releases it from [`EXECROOT_OWNERSHIP`] so the next same-`targetkey`
-/// action can reuse the warm dir. A Contender holds `None` and releases
-/// nothing (its isolated dir is discarded by cleanup, not here).
+/// RAII §5 ownership lease. A holder (a live Owner, or an eviction pass's
+/// delete-sentinel) keeps `Some(path)` and, on Drop, releases it from
+/// [`EXECROOT_OWNERSHIP`] so the next same-`targetkey` action can reuse the warm
+/// dir. A Contender holds `None` and releases nothing (its isolated dir is
+/// discarded by cleanup, not here). The guard is holder-kind agnostic: the tag
+/// lives in the registry value, and removal is keyed on the path alone.
 #[derive(Debug)]
 struct OwnershipLeaseGuard {
     owned: Option<PathBuf>,
@@ -768,7 +809,7 @@ impl Drop for OwnershipLeaseGuard {
 /// `Ok` variant the caller must handle explicitly, while an escape remains
 /// unrepresentable as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Containment {
+pub(crate) enum Containment {
     /// `path` canonicalizes STRICTLY under `fixed_prefix` — safe to delete.
     Confined,
     /// `path` does not exist (ENOENT). Containment is neither satisfied nor
@@ -809,6 +850,27 @@ pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error
     }
 }
 
+/// The ONLY error an eviction pass may treat as "the object is gone": ENOENT.
+/// Every other errno is a REAL FAULT and must abort the pass.
+///
+/// ★ FUNNELLED DELIBERATELY — do not re-open-code this test. It previously
+/// appeared inline at SIX call sites, and a review mutation proved FIVE of them
+/// could be widened to swallow EVERY errno with the entire 234-test lib suite
+/// still green: the tolerance was actually tested at exactly ONE site (the
+/// size-walk `read_dir`, the only one a `chmod 000` fixture can reach).
+///
+/// The gap had a DIRECTION, which is what made it dangerous: every unguarded arm
+/// fails toward silently skipping or under-counting, so the disk-growth guard
+/// fails OPEN. `<FIXED_PREFIX>` lives on an external volume
+/// (`/Volumes/CrowAgent`), where **EIO** is the realistic errno — and an EIO
+/// storm would have read as "every candidate vanished, the pool is empty,
+/// nothing to do" while the disk filled. One predicate with one test over
+/// constructed `io::Error`s (`errno_classification_tests`) is testable where
+/// six inline copies were not, and the copies can no longer drift apart.
+fn is_vanished(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
 /// Confinement gate (design §9) for callers that RACE a concurrent remover: same
 /// containment guarantee as [`assert_under_prefix`], but a target that has
 /// already been removed (ENOENT) reports [`Containment::Vanished`] instead of
@@ -819,7 +881,7 @@ pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error
 /// corrupted root, never a benign race) and every other errno on the target
 /// (EACCES from a permissions regression, ELOOP, ENOTDIR, EIO …) still abort.
 /// BLOCKING (canonicalize).
-pub fn check_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<Containment, Error> {
+pub(crate) fn check_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<Containment, Error> {
     check_under_prefix_impl(path, fixed_prefix, MissingPath::IsVanished)
 }
 
@@ -843,16 +905,22 @@ fn check_under_prefix_impl(
     })?;
     let canon_path = match std::fs::canonicalize(path) {
         Ok(canon_path) => canon_path,
-        Err(e) if missing == MissingPath::IsVanished && e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Containment::Vanished);
-        }
-        Err(e) => {
-            return Err(make_err!(
-                Code::Internal,
-                "portable_incr: cannot canonicalize discard target {} for containment: {e}",
-                path.display()
-            ));
-        }
+        // Matched EXHAUSTIVELY on `MissingPath` (no `_` arm, no `==`): a future
+        // third variant must fail to compile here rather than silently inherit
+        // the hard-error path. Every other enum in this module is matched the
+        // same way.
+        Err(e) => match missing {
+            MissingPath::IsVanished if is_vanished(&e) => {
+                return Ok(Containment::Vanished);
+            }
+            MissingPath::IsVanished | MissingPath::IsError => {
+                return Err(make_err!(
+                    Code::Internal,
+                    "portable_incr: cannot canonicalize discard target {} for containment: {e}",
+                    path.display()
+                ));
+            }
+        },
     };
     if !canon_path.starts_with(&canon_prefix) || canon_path == canon_prefix {
         return Err(make_err!(
@@ -924,14 +992,79 @@ pub struct EvictionOutcome {
     /// so a fail-soft is not a silent one — a pass that skips everything and a
     /// pass that had nothing to do are otherwise indistinguishable.
     ///
+    /// ★ WHO THE "SOMEONE ELSE" IS: overwhelmingly THIS WORKER. `cleanup()`
+    /// spawns an independent full-pool pass per portable action with no
+    /// pass-level serialization, so passes routinely overlap (9 eviction events
+    /// in one second were observed on one host). The decisive evidence that the
+    /// remover is us and not an external actor: after the 20→40 GiB budget raise
+    /// the ENOENT rate fell to 0 across 117 invocations, exactly when evictions
+    /// stopped — an external remover would not stop when we do. Tolerance is
+    /// still required for the removers we do NOT control (an out-of-repo reaper
+    /// is armed against this same pool, plus crash recovery and manual
+    /// cleanup), but the load-bearing fix is single-flight; see
+    /// `#fl1383-eviction-single-flight`.
+    ///
     /// NOT credited to `dirs_evicted`/`bytes_freed`: this pass did not free
     /// those bytes.
     pub vanished_skipped: usize,
+    /// Candidates skipped because a CONCURRENT EVICTION PASS on this worker had
+    /// already claimed them and was deleting them. Distinct from
+    /// `leased_skipped` (a live owner, whose bytes STAY) because a peer pass's
+    /// bytes are LEAVING: they are subtracted from `bytes_remaining` but, like
+    /// `vanished_skipped`, are NOT credited to `dirs_evicted`/`bytes_freed`.
+    ///
+    /// This is also the direct signal for "how concurrent is eviction on this
+    /// worker" — `cleanup()` spawns an independent full-pool pass per portable
+    /// action with no pass-level serialization, so passes routinely overlap.
+    /// A persistently non-zero value is the evidence for adding a single-flight
+    /// guard (see `#fl1383-eviction-single-flight`).
+    pub peer_pass_skipped: usize,
     /// `true` iff the pool is STILL over budget after evicting every non-leased
     /// candidate (every remaining dir is leased → refuse, don't evict a live
     /// one). A diagnostic for the operator: the static reservation is too small
     /// for the concurrent live-owner working set.
     pub still_over_budget: bool,
+}
+
+/// Which log arm an [`EvictionOutcome`] selects in
+/// `RunningActionImpl::maybe_evict_warm_dirs_post_action`.
+///
+/// ★ THIS EXISTS TO MAKE THE LOG CONDITION TESTABLE. It used to be an `if/else
+/// if` chain inline at the call site, and a review mutation deleted the
+/// `vanished_skipped` reader from it with the entire 234-test lib suite still
+/// green — the exact "computed-and-unread signal" the field's own doc warns
+/// about. A log line cannot be asserted on cheaply; a pure function returning
+/// this enum can, so the arm selection is decided here and merely rendered
+/// there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvictionLogArm {
+    /// Still over budget with every remaining candidate leased — operator `warn!`.
+    Backpressure,
+    /// This pass actually removed dirs.
+    Evicted,
+    /// This pass removed NOTHING: its candidates vanished under it, or a
+    /// concurrent pass on this worker had already claimed them. Deliberately a
+    /// DISTINCT arm from `Evicted` so "eviction is working" keeps meaning
+    /// something.
+    FreedNothing,
+    /// Pool within budget, nothing to do — `debug!` (compiled out in release).
+    WithinBudget,
+}
+
+impl EvictionOutcome {
+    /// Select the log arm. Pure; see [`EvictionLogArm`] for why this is not
+    /// inline at the call site.
+    pub(crate) fn log_arm(&self) -> EvictionLogArm {
+        if self.still_over_budget {
+            EvictionLogArm::Backpressure
+        } else if self.dirs_evicted > 0 {
+            EvictionLogArm::Evicted
+        } else if self.vanished_skipped > 0 || self.peer_pass_skipped > 0 {
+            EvictionLogArm::FreedNothing
+        } else {
+            EvictionLogArm::WithinBudget
+        }
+    }
 }
 
 /// Whether `name` is a CONTENDER dir name `<64-hex-targetkey>.<32-hex-uuid>` (as
@@ -1000,7 +1133,8 @@ fn sweep_stale_contender_dirs_at(fixed_prefix: &Path) -> Result<usize, Error> {
     Ok(removed)
 }
 
-/// TEST-ONLY seam. The §8 eviction races a concurrent remover at several
+/// TEST-ONLY seam. The §8 eviction races a concurrent remover — usually another
+/// eviction pass on THIS worker — at several
 /// distinct points, and the only honest way to prove each ENOENT branch is
 /// load-bearing is to make the vanish happen at exactly that point rather than
 /// sleeping and hoping. `#[cfg(test)]` on a library target: this does not exist
@@ -1014,7 +1148,20 @@ enum ProbePoint {
     BeforeRemoveDirAll,
     /// Immediately before a size-walk child's `lstat` (the longest window).
     BeforeChildLstat,
+    /// After the ENTIRE enumeration loop has finished (every candidate read,
+    /// lstat'ed and sized) and before the discard loop takes its first
+    /// [`EXECROOT_OWNERSHIP`] claim. This is a RENDEZVOUS point, not a vanish
+    /// point: it exists so a test can know the pass has actually enumerated,
+    /// instead of sleeping and hoping it has.
+    AfterEnumeration,
 }
+
+/// Rendezvous for [`ProbePoint::AfterEnumeration`]. `Mutex::new`/`Condvar::new`
+/// are both `const`, so these need no `LazyLock`.
+#[cfg(test)]
+static ENUMERATION_DONE: Mutex<bool> = Mutex::new(false);
+#[cfg(test)]
+static ENUMERATION_DONE_CV: std::sync::Condvar = std::sync::Condvar::new();
 
 #[cfg(test)]
 static VANISH_PROBE: Mutex<Option<fn(ProbePoint, &Path)>> = Mutex::new(None);
@@ -1077,7 +1224,13 @@ fn evict_warm_dirs_over_budget_at(
             // exists is the END STATE THIS PASS IS TRYING TO REACH, reached by
             // someone else — skip the candidate and keep going. Before this,
             // one such dir aborted the whole pass with `Code::Internal`.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            //
+            // The window here is NOT the microseconds between this dirent and
+            // this lstat: it is the whole preceding SIZE WALK of every earlier
+            // candidate — seconds. That is why this is the largest observed
+            // shape (405 of 722 fleet aborts) even though the syscall pair looks
+            // adjacent.
+            Err(e) if is_vanished(&e) => {
                 vanished_skipped += 1;
                 continue;
             }
@@ -1104,6 +1257,9 @@ fn evict_warm_dirs_over_budget_at(
         candidates.push((path, size, mtime));
     }
 
+    #[cfg(test)]
+    fire_vanish_probe(ProbePoint::AfterEnumeration, fixed_prefix);
+
     let mut outcome = EvictionOutcome {
         bytes_remaining: total,
         vanished_skipped,
@@ -1119,19 +1275,41 @@ fn evict_warm_dirs_over_budget_at(
         if total <= budget_bytes {
             break;
         }
-        // Atomic claim via the §5 lease set: `insert` returns `true` only when
-        // the dir is NOT currently leased by a live owner. This closes the
-        // TOCTOU with `plan`: a concurrent same-`targetkey` action sees our
-        // sentinel and becomes an isolated CONTENDER (its own dir) rather than
-        // racing the delete of this warm dir.
-        let claimed = EXECROOT_OWNERSHIP
+        // Atomic claim via the §5 lease registry: we proceed ONLY if the slot is
+        // vacant. This closes the TOCTOU with `plan`: a concurrent
+        // same-`targetkey` action sees our sentinel and becomes an isolated
+        // CONTENDER (its own dir) rather than racing the delete of this warm dir.
+        let existing_holder = match EXECROOT_OWNERSHIP
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.clone());
-        if !claimed {
-            // Leased by a live owner — never evict a live warm dir (backpressure).
-            outcome.leased_skipped += 1;
-            continue;
+            .entry(path.clone())
+        {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(OwnershipHolder::EvictionSentinel);
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(held) => Some(*held.get()),
+        };
+        match existing_holder {
+            None => {}
+            // Never evict a live warm dir (§5 backpressure). Its bytes are
+            // STAYING, so they correctly remain in `total`.
+            Some(OwnershipHolder::LiveOwner) => {
+                outcome.leased_skipped += 1;
+                continue;
+            }
+            // ★ A PEER EVICTION PASS is mid-`remove_dir_all` on this exact dir.
+            // Its bytes are LEAVING, so they must leave `total` too — otherwise
+            // this pass believes it is still short and evicts an EXTRA live LRU
+            // dir to cover a shortfall the peer is already covering. This is the
+            // same reasoning `AlreadyGone` gets below; before the holder tag
+            // existed, a bare `HashSet` made this indistinguishable from a live
+            // owner and it silently took the "bytes stay" branch.
+            Some(OwnershipHolder::EvictionSentinel) => {
+                total = total.saturating_sub(size);
+                outcome.peer_pass_skipped += 1;
+                continue;
+            }
         }
         // RAII: releases our delete-sentinel from the lease set on drop, even if
         // `discard_dir_tree_confined` errors.
@@ -1186,10 +1364,24 @@ fn discard_dir_tree_confined(path: &Path, fixed_prefix: &Path) -> Result<Discard
     }
     #[cfg(test)]
     fire_vanish_probe(ProbePoint::BeforeRemoveDirAll, path);
+    // ★ THE REMOVAL DELIBERATELY USES `path`, NOT `canon_path`, AND ITS SAFETY
+    // AGAINST A POST-GATE SYMLINK SWAP COMES FROM std, NOT FROM THIS CODE.
+    // There is a real window between the containment gate above and this call.
+    // It is closed only because Rust's unix `remove_dir_all` `lstat`s first and
+    // UNLINKS a top-level symlink rather than following it, then descends with
+    // `openat(… O_NOFOLLOW | O_DIRECTORY)` so interior components cannot be
+    // swapped either (`library/std/src/sys/fs/unix.rs`). A reviewer verified the
+    // property empirically by swapping the candidate for a symlink-to-outside in
+    // exactly this gap: the outside tree survived.
+    //
+    // CONSEQUENCE: switching to `remove_dir_all(&canon_path)` or to a
+    // hand-rolled recursive walker would SILENTLY delete this guarantee. If you
+    // change this line, the airtight form is one `openat` fd used for both the
+    // containment check and the removal.
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(DiscardOutcome::Removed),
         // Removed between the containment gate and here — same benign race.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DiscardOutcome::AlreadyGone),
+        Err(e) if is_vanished(&e) => Ok(DiscardOutcome::AlreadyGone),
         Err(e) => Err(make_err!(
             Code::Internal,
             "portable_incr: discard dir tree {}: {e}",
@@ -1219,7 +1411,7 @@ fn dir_apparent_size_bytes(dir: &Path) -> Result<Option<u64>, Error> {
     let mut total: u64 = 0;
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if is_vanished(&e) => return Ok(None),
         Err(e) => {
             return Err(make_err!(
                 Code::Internal,
@@ -1232,7 +1424,7 @@ fn dir_apparent_size_bytes(dir: &Path) -> Result<Option<u64>, Error> {
         let entry = match entry {
             Ok(entry) => entry,
             // The directory (or the entry) went away mid-iteration.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if is_vanished(&e) => continue,
             Err(e) => {
                 return Err(make_err!(
                     Code::Internal,
@@ -1247,7 +1439,7 @@ fn dir_apparent_size_bytes(dir: &Path) -> Result<Option<u64>, Error> {
         let md = match std::fs::symlink_metadata(&path) {
             Ok(md) => md,
             // Unlinked between readdir and lstat — contributes 0.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if is_vanished(&e) => continue,
             Err(e) => {
                 return Err(make_err!(
                     Code::Internal,
@@ -1507,6 +1699,31 @@ mod eviction_toctou_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        // ★ RENDEZVOUS, NOT A SLEEP. This test used to `sleep(250ms)` here and
+        // claimed "correctness does not depend on this sleep — the mutex does".
+        // That was WRONG, and a reviewer proved it by deleting the sleep: the
+        // test failed with `vanished_skipped: 0`. The barrier guarantees no
+        // DISCARD precedes the removal; it does NOT guarantee the pass thread has
+        // reached `read_dir`. On a loaded box — exactly where CI runs — the
+        // candidate could be removed before it was ever enumerated, so it never
+        // appeared as a dirent and nothing was counted. CLAUDE.md forbids
+        // sleep-as-synchronization; this waits for the pass to SAY it has
+        // finished enumerating.
+        *ENUMERATION_DONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(|point, _path: &Path| {
+                if point == ProbePoint::AfterEnumeration {
+                    *ENUMERATION_DONE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                    ENUMERATION_DONE_CV.notify_all();
+                }
+            });
+
         let root_for_pass = root.clone();
         let pass = std::thread::spawn(move || {
             // Budget 40 < any single dir (50), so the loop consumes ALL
@@ -1514,10 +1731,31 @@ mod eviction_toctou_tests {
             evict_warm_dirs_over_budget_at(&root_for_pass, 40)
         });
 
-        // Let the pass reach the barrier (or at least start). Correctness does
-        // not depend on this sleep — the mutex does; the sleep only steers
-        // which of the three ENOENT sites observes the vanish.
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        // Wait until every candidate (including key_a) has been read, lstat'ed
+        // and sized. The deadline is a DEADLOCK DETECTOR with a specific
+        // message, not a synchronisation device — it can only fire if the pass
+        // never reaches the end of enumeration.
+        {
+            let mut done = ENUMERATION_DONE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*done {
+                let (guard, timeout) = ENUMERATION_DONE_CV
+                    .wait_timeout(done, std::time::Duration::from_secs(30))
+                    .unwrap_or_else(|e| e.into_inner());
+                done = guard;
+                assert!(
+                    !timeout.timed_out() || *done,
+                    "the eviction pass never reached the end of enumeration within 30s \
+                     — it is wedged, most likely on the EXECROOT_OWNERSHIP barrier \
+                     moving above the enumeration loop"
+                );
+            }
+        }
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
         std::fs::remove_dir_all(root.join(&key_a)).expect("remove candidate mid-pass");
         drop(barrier);
 
@@ -1538,8 +1776,18 @@ mod eviction_toctou_tests {
             outcome.bytes_freed, 100,
             "only the two dirs WE removed are credited; the vanished one is not"
         );
-        assert_eq!(outcome.bytes_remaining, 0);
-        assert_eq!(outcome.leased_skipped, 0);
+        assert_eq!(
+            outcome.bytes_remaining, 0,
+            "★ the vanished candidate's bytes must LEAVE the running total — they \
+             are really off disk, and not subtracting them makes the pass believe \
+             it is still over budget and evict LIVE dirs to cover an imaginary \
+             shortfall"
+        );
+        assert_eq!(
+            outcome.leased_skipped, 0,
+            "no candidate was leased by a live owner in this fixture — a non-zero \
+             count here means the vanish was misclassified as a lease"
+        );
         assert!(!root.join(&key_b).exists(), "surviving candidate B evicted");
         assert!(!root.join(&key_c).exists(), "surviving candidate C evicted");
     }
@@ -1589,6 +1837,12 @@ mod eviction_toctou_tests {
             },
             ProbePoint::BeforeChildLstat => {
                 unreachable!("the size-walk probe is installed inline by its own test")
+            }
+            ProbePoint::AfterEnumeration => {
+                unreachable!(
+                    "AfterEnumeration is a RENDEZVOUS point, not a vanish point; \
+                     it is installed inline by the mid-pass test"
+                )
             }
         };
         *VANISH_PROBE
@@ -1810,6 +2064,339 @@ mod eviction_toctou_tests {
             dir_apparent_size_bytes(&root.join("absent")).expect("missing root is not an error"),
             None,
             "a candidate that vanished has no size to contribute"
+        );
+    }
+
+    /// ★ THE T1 GUARD. The tolerance predicate is one function precisely so it
+    /// can be tested against CONSTRUCTED errors, which is the only way to cover
+    /// errnos the filesystem will not hand us on demand: you cannot provoke
+    /// EACCES at an enumeration `lstat` without first breaking the `read_dir`
+    /// that precedes it, and you cannot provoke EIO at all without a failing
+    /// volume. Before the funnel, five of the six sites could be widened to
+    /// swallow EVERY errno with the whole suite green.
+    #[test]
+    fn only_enoent_is_tolerated_as_vanished() {
+        use std::io::Error;
+
+        assert!(
+            is_vanished(&Error::from_raw_os_error(libc::ENOENT)),
+            "★ ENOENT is the ONLY tolerated errno — the object is gone, which is \
+             the postcondition every tolerant call site is establishing"
+        );
+
+        // Every one of these means the object may still BE there. Tolerating any
+        // of them makes the disk-growth guard fail OPEN: the pass under-counts
+        // the pool and silently declines to evict.
+        for (errno, name) in [
+            (libc::EACCES, "EACCES (a permissions regression)"),
+            (libc::EIO, "EIO (the realistic errno on the external /Volumes/CrowAgent)"),
+            (libc::ELOOP, "ELOOP (symlink cycle)"),
+            (libc::ENOTDIR, "ENOTDIR (a path component is not a directory)"),
+            (libc::EPERM, "EPERM"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+        ] {
+            let err = Error::from_raw_os_error(errno);
+            assert!(
+                !is_vanished(&err),
+                "★ {name} MUST abort the pass, never be classified as vanished — \
+                 an {name} storm would otherwise read as \"every candidate \
+                 vanished, the pool is empty, nothing to do\" while the disk fills \
+                 (got kind {:?})",
+                err.kind()
+            );
+        }
+    }
+
+    /// Run `body` with `dir` at `mode`, restoring 0o755 afterwards. Returns
+    /// `false` (and skips) when the euid defeats the permission bit — running as
+    /// root must not turn a safety test into a passing falsehood.
+    fn with_dir_mode(dir: &Path, mode: u32, body: impl FnOnce()) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        // `r` without `x`: readdir succeeds, but resolving any CHILD needs search
+        // permission and yields EACCES. This is the fixture that reaches the
+        // enumeration `lstat` and the size-walk child `lstat`, which a review
+        // judged unreachable ("you cannot produce EACCES at an enumeration lstat
+        // without breaking the read_dir before it") — you can, by removing `x`
+        // from the PARENT and leaving `r`.
+        let effective = std::fs::read_dir(dir).is_ok()
+            && std::fs::symlink_metadata(dir.join("probe-nonexistent"))
+                .err()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        if effective {
+            body();
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).ok();
+        if !effective {
+            eprintln!("skipping: euid defeats the permission bit on {} (root?)", dir.display());
+        }
+        effective
+    }
+
+    /// ★ PER-SITE T1 COVERAGE, site 1 of 3: the ENUMERATION `lstat`.
+    ///
+    /// The funnel (`is_vanished`) stops the six copies drifting apart, but a
+    /// SITE that bypasses the predicate entirely (`Err(e) if true`) is only
+    /// caught by driving a non-ENOENT errno through that exact site. This is the
+    /// largest fleet shape (405 of 722), so it is the one that most needs it.
+    #[test]
+    fn enumeration_lstat_aborts_on_eacces_not_treated_as_vanished() {
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_td, root) = canonical_tempdir();
+        make_warm_dir(&root, &hex64('a'), 50);
+        make_warm_dir(&root, &hex64('b'), 50);
+
+        with_dir_mode(&root, 0o600, || {
+            let err = evict_warm_dirs_over_budget_at(&root, 40)
+                .expect_err("★ EACCES at the enumeration lstat MUST abort the pass");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("lstat warm dir"),
+                "expected the ENUMERATION lstat to propagate, got: {msg}"
+            );
+            assert!(
+                !msg.contains("os error 2"),
+                "★ the aborting error must not be an ENOENT — that would mean the \
+                 fixture missed the site it is aiming at, got: {msg}"
+            );
+        });
+    }
+
+    /// ★ PER-SITE T1 COVERAGE, site 2 of 3: the SIZE-WALK CHILD `lstat`
+    /// (the `lstat … for sizing` fleet shape).
+    #[test]
+    fn size_walk_child_lstat_aborts_on_eacces_not_treated_as_vanished() {
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_td, root) = canonical_tempdir();
+        let key = hex64('a');
+        make_warm_dir(&root, &key, 50);
+        let candidate = root.join(&key);
+
+        // The PREFIX stays traversable, so enumeration succeeds and the failure
+        // lands inside the size walk of this candidate.
+        with_dir_mode(&candidate, 0o600, || {
+            let err = evict_warm_dirs_over_budget_at(&root, 10)
+                .expect_err("★ EACCES inside the size walk MUST abort the pass");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("for sizing"),
+                "expected the SIZE-WALK error to propagate, got: {msg}"
+            );
+            assert!(
+                !msg.contains("os error 2"),
+                "★ the aborting error must not be an ENOENT, got: {msg}"
+            );
+        });
+    }
+
+    /// ★ PER-SITE T1 COVERAGE: the DISCARD (`remove_dir_all`).
+    ///
+    /// Fixture: strip `w` from the PREFIX but keep `r-x`. Enumeration, the size
+    /// walk and the containment gate all still succeed (they only read and
+    /// traverse); only the final `rmdir` needs write permission on the parent,
+    /// so EACCES lands on exactly this site and nowhere earlier.
+    #[test]
+    fn discard_aborts_on_eacces_not_treated_as_already_gone() {
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_td, root) = canonical_tempdir();
+        make_warm_dir(&root, &hex64('a'), 50);
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        // Confirm the fixture actually bites before asserting on it (root defeats
+        // it). The probe must be NON-DESTRUCTIVE: a `remove_dir_all` probe would
+        // unlink the candidate's contents before failing at the final `rmdir`,
+        // destroying the very fixture under test. Creating a directory needs the
+        // same `w` on the parent and leaves the candidate untouched.
+        let probe = root.join("probe-write");
+        let effective = std::fs::read_dir(&root).is_ok()
+            && std::fs::create_dir(&probe)
+                .err()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        if effective {
+            let err = evict_warm_dirs_over_budget_at(&root, 10)
+                .expect_err("★ EACCES at the discard MUST abort the pass");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("discard dir tree"),
+                "expected the DISCARD error to propagate, got: {msg}"
+            );
+            assert!(
+                !msg.contains("os error 2"),
+                "★ an undeletable dir must never be classified AlreadyGone — its \
+                 bytes are still on disk and would be subtracted from the pool, \
+                 got: {msg}"
+            );
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).ok();
+        if !effective {
+            eprintln!("skipping: euid defeats the write bit (root?)");
+        }
+    }
+
+    /// ★ PER-SITE T1 COVERAGE, site 3 of 3: the CONTAINMENT GATE's canonicalize.
+    /// A target that cannot be resolved because of a PERMISSION fault is not
+    /// "vanished" — the tree may well still be there, and calling it gone makes
+    /// the disk-growth guard fail open.
+    #[test]
+    fn containment_gate_aborts_on_eacces_not_treated_as_vanished() {
+        let (_td, root) = canonical_tempdir();
+        let prefix = root.join("fp");
+        std::fs::create_dir_all(prefix.join("child")).expect("mk child");
+
+        with_dir_mode(&prefix, 0o600, || {
+            let err = check_under_prefix(&prefix.join("child"), &prefix).expect_err(
+                "★ EACCES at the containment gate MUST be a hard error, never Vanished",
+            );
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("cannot canonicalize discard target"),
+                "expected the containment gate to propagate, got: {msg}"
+            );
+            assert!(
+                !msg.contains("os error 2"),
+                "★ must not be reported as ENOENT, got: {msg}"
+            );
+        });
+    }
+
+    /// ★ THE T3 GUARD: the log arm is the feature's ONLY interface (964 metric
+    /// series on the endpoint, 0 matching `portable_incr`), and deleting the
+    /// `vanished_skipped` reader from it previously passed all 234 lib tests.
+    #[test]
+    fn log_arm_distinguishes_freed_nothing_from_evicted() {
+        let evicted = EvictionOutcome {
+            dirs_evicted: 2,
+            bytes_freed: 100,
+            ..EvictionOutcome::default()
+        };
+        assert_eq!(evicted.log_arm(), EvictionLogArm::Evicted);
+
+        // ★ The shape the distinct arm exists for: nothing evicted, candidates
+        // vanished under the pass.
+        let all_vanished = EvictionOutcome {
+            vanished_skipped: 3,
+            ..EvictionOutcome::default()
+        };
+        assert_eq!(
+            all_vanished.log_arm(),
+            EvictionLogArm::FreedNothing,
+            "★ a pass that freed NOTHING must not report as 'evicted warm dirs' — \
+             that is the false credit the accounting discipline exists to prevent"
+        );
+
+        // Same for a pass whose candidates were all claimed by a peer pass.
+        let all_peer = EvictionOutcome {
+            peer_pass_skipped: 2,
+            ..EvictionOutcome::default()
+        };
+        assert_eq!(
+            all_peer.log_arm(),
+            EvictionLogArm::FreedNothing,
+            "★ peer_pass_skipped must also have a READER, or it is another \
+             computed-and-unread signal"
+        );
+
+        // A silent pass stays silent (this arm is `debug!`, compiled out in release).
+        assert_eq!(
+            EvictionOutcome::default().log_arm(),
+            EvictionLogArm::WithinBudget
+        );
+
+        // Backpressure outranks everything.
+        let wedged = EvictionOutcome {
+            still_over_budget: true,
+            vanished_skipped: 1,
+            dirs_evicted: 1,
+            ..EvictionOutcome::default()
+        };
+        assert_eq!(
+            wedged.log_arm(),
+            EvictionLogArm::Backpressure,
+            "the operator's only warn! must win over the info! arms"
+        );
+    }
+
+    /// ★ THE D2 GUARD. `EXECROOT_OWNERSHIP` holds two holder kinds that mean
+    /// OPPOSITE things about a path's bytes. A live owner's bytes are staying;
+    /// an eviction sentinel means a peer pass is deleting the tree right now, so
+    /// those bytes are leaving. When one bare `HashSet` conflated them, the
+    /// eviction loop took the "bytes stay" branch for a peer's victim and evicted
+    /// an EXTRA live LRU dir to cover a shortfall already being covered.
+    ///
+    /// The two cases are driven through the SAME production function with the
+    /// same fixture; only the holder tag differs, and the outcomes must diverge.
+    #[test]
+    fn peer_eviction_sentinel_subtracts_but_a_live_owner_does_not() {
+        // Returns the TempDir so it is cleaned up on drop (no `mem::forget`);
+        // this test asserts only on the outcome, never on on-disk state.
+        fn run_with_holder(holder: OwnershipHolder) -> (tempfile::TempDir, EvictionOutcome) {
+            let (td, root) = canonical_tempdir();
+            for key in [hex64('a'), hex64('b'), hex64('c')] {
+                make_warm_dir(&root, &key, 50);
+            }
+            let held = root.join(hex64('a'));
+            EXECROOT_OWNERSHIP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(held.clone(), holder);
+            // Budget 40 < any single dir (50), so the loop consumes ALL
+            // candidates and the assertions do not depend on LRU order.
+            let outcome = evict_warm_dirs_over_budget_at(&root, 40).expect("pass must succeed");
+            EXECROOT_OWNERSHIP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&held);
+            (td, outcome)
+        }
+
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // A LIVE OWNER: its 50 bytes are STAYING, so they must remain in the
+        // total and the pool is correctly still over budget.
+        let (_owner_td, owner) = run_with_holder(OwnershipHolder::LiveOwner);
+        assert_eq!(owner.leased_skipped, 1, "the live owner is skipped");
+        assert_eq!(owner.peer_pass_skipped, 0);
+        assert_eq!(owner.dirs_evicted, 2);
+        assert_eq!(
+            owner.bytes_remaining, 50,
+            "★ a LIVE owner's bytes must STAY in the total — they are still on disk"
+        );
+        assert!(
+            owner.still_over_budget,
+            "★ and the pool is genuinely still over budget, which is the §5 \
+             backpressure signal the operator's only warn! keys on"
+        );
+
+        // A PEER EVICTION PASS: the same 50 bytes are LEAVING, so they must go.
+        let (_peer_td, peer) = run_with_holder(OwnershipHolder::EvictionSentinel);
+        assert_eq!(
+            peer.peer_pass_skipped, 1,
+            "a peer pass's victim is counted separately from a live-owner lease"
+        );
+        assert_eq!(peer.leased_skipped, 0, "★ a peer pass is NOT a live-owner lease");
+        assert_eq!(
+            peer.dirs_evicted, 2,
+            "the peer's dir is not credited to us; we evicted the other two"
+        );
+        assert_eq!(
+            peer.bytes_remaining, 0,
+            "★ a peer pass's bytes must LEAVE the total — otherwise this pass \
+             believes it is still short and evicts an EXTRA live LRU dir to cover \
+             a shortfall the peer is already covering"
+        );
+        assert!(
+            !peer.still_over_budget,
+            "★ and it must NOT raise backpressure: the pool is not over budget \
+             once the peer's delete lands"
         );
     }
 
