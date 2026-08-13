@@ -784,16 +784,34 @@ pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error
 // reservation carve-out bounded by this module's own LRU under a static cap.
 // ---------------------------------------------------------------------------
 
-// CAPPED AT 20 GiB: the design v4 §6.5 sizing proof bounds the materialized
-// warm-dir pool at the full-CI-widen worst case of 27×400 MB = 10.9 GB
-// (one-crate = 0.46 GB); a 20 GiB static reservation leaves ≥9 GiB headroom and
-// equals the FL-688 pin-budget ceiling the §8 carve-out is sized against.
+// CAPPED AT 40 GiB (raised from 20 GiB 2026-08-13, FL-1383 T92).
+// ★ THE ORIGINAL SIZING PROOF IS SUPERSEDED, AND THAT IS WHY THIS MOVED. Design v4
+// §6.5 bounded the materialized warm-dir pool at a full-CI-widen worst case of
+// 27×400 MB = 10.9 GB (one-crate = 0.46 GB), and 20 GiB was chosen to leave ≥9 GiB
+// headroom over THAT number. The measured publish generation once RustcLink enters
+// the portable scope is ~27 GB — 768 targetkeys (194 RustcLink targets × 4
+// incremental lanes) at ~35 MB each — i.e. 2.5× the figure the 20 GiB was sized
+// against, and ~1.26× the 21.47 GB the old cap actually is. The pool would have been
+// OVER BUDGET BY CONSTRUCTION on day one of the widening.
+// ★ WHAT THIS COSTS, stated because the old comment's second clause no longer holds:
+// 20 GiB was not arbitrary — it EQUALLED the FL-688 pin-budget ceiling the §8
+// carve-out is sized against. 40 GiB deliberately breaks that equality. The carve-out
+// is a STATIC reservation with no shared disk-budget authority between the
+// FilesystemStore and DirectoryCache budgets (see the block above), so raising it
+// takes 20 GiB of headroom from whatever else shares the volume rather than from a
+// negotiated pool. That is the trade being made: over-budget-by-construction churn
+// on every portable action, against 20 GiB of unreserved disk.
+// ★ WHY OVER-BUDGET WAS NOT MERELY WASTEFUL: `evict_warm_dirs_over_budget_at`
+// recursively size-walks every hex64 dir on every call, post-action for every
+// portable action — a trigger count the widening multiplies ~5.6× — and the LRU has
+// NO mnemonic partition, so RustcLink pressure would evict Rustc dirs. Eviction is
+// functionally safe (an evicted key cold-starts and re-fetches) but not free.
 // Over-budget → LRU-evict cold (safe: an evicted `targetkey` cold-starts +
 // re-fetches, design §8), never grows unbounded at CI-widen. The wiring agent
 // passes this (or a future config value) to `evict_warm_dirs_over_budget`.
 /// Default static on-disk budget (bytes) for the materialized-`-incr` execroot
 /// pool at `<FIXED_PREFIX>` — the design v4 §8 static-reservation carve-out.
-pub const DEFAULT_WARM_DIR_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_WARM_DIR_BUDGET_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
 /// Outcome of one [`PortableIncrContext::evict_warm_dirs_over_budget`] pass. The
 /// wiring agent turns these into the design §12 counters; this module performs

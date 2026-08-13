@@ -842,15 +842,18 @@ async fn sweep_and_eviction_are_no_op_when_flag_off() {
     );
 }
 
-/// The static budget default equals the design v4 §8 carve-out ceiling (20 GiB)
+/// The static budget default is 40 GiB (raised from 20 GiB 2026-08-13, FL-1383 T92:
+/// the ~27 GB measured RustcLink-widened publish generation put the pool over the
+/// old cap by construction). NOTE it no longer equals the FL-688 pin-budget ceiling —
+/// that equality was deliberately broken; see the declaration-site comment.
 /// verified at the DECLARATION site — a doc-comment/metric could carry any
 /// number; only this literal is authoritative.
 #[nativelink_test]
-async fn default_warm_dir_budget_is_20_gib() {
+async fn default_warm_dir_budget_is_40_gib() {
     assert_eq!(
         DEFAULT_WARM_DIR_BUDGET_BYTES,
-        20 * 1024 * 1024 * 1024,
-        "design v4 §8 static reservation = 20 GiB (≥9 GiB over the 10.9 GB full-CI-widen worst case)"
+        40 * 1024 * 1024 * 1024,
+        "static reservation = 40 GiB (headroom over the ~27 GB RustcLink-widened generation)"
     );
 }
 
