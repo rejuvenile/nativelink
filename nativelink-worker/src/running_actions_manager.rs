@@ -4645,7 +4645,7 @@ async fn do_cleanup(
     // cold-discard (design §9), paired with FIXED_PREFIX for the containment
     // gate. `None` for a normal action AND for a portable OWNER (whose warm
     // `<FIXED_PREFIX>/<targetkey>` is PRESERVED across builds — never deleted by
-    // cleanup). On the fleet this is always `None` → cleanup is unchanged.
+    // cleanup). `None` → cleanup is unchanged.
     portable_discard: Option<(PathBuf, PathBuf)>,
 ) -> Result<(), Error> {
     // Mark this operation as being cleaned up
@@ -4710,7 +4710,7 @@ async fn do_cleanup(
     // §9). Confined to a subtree of FIXED_PREFIX FIRST (`assert_under_prefix`),
     // then deleted through the same bounded-delete throttle as the action
     // directory (`CLEANUP_DELETE_INFLIGHT_CAP`) so it cannot escape the prefix
-    // nor saturate the blocking pool. `None` on the fleet → skipped entirely.
+    // nor saturate the blocking pool. `None` → skipped entirely.
     // An OWNER's warm dir is NEVER here, so it is never deleted.
     let portable_discard_result = if let Some((isolated_dir, fixed_prefix)) = portable_discard {
         // S1: a Contender can be PLANNED (its `<targetkey>.<uuid>` dir chosen and
@@ -4886,15 +4886,15 @@ struct RunningActionImplState {
     /// `Command.output_paths` at the portable-incr seed-fetch site (verified
     /// equal to the carrier), stashed so the post-execution publish site can key
     /// the `incr_seed_index` write without re-fetching the Command. `Some` only
-    /// for an enabled+allowlisted portable-incr action; `None` on the fleet
-    /// (INERT) and for every non-portable action.
+    /// for an enabled+allowlisted portable-incr action; `None` for every
+    /// non-portable action and whenever the gate is off.
     portable_targetkey: Option<TargetKey>,
     /// FL-1383 ask #4: `true` iff the out-of-band `-incr` seed fetch resolved to
     /// [`SeedOutcome::Materialized`] for this action (a seed was actually placed
     /// at the destination). Set at the seed-fetch site in `inner_prepare_action`
     /// and read at the child-env build site in `inner_execute`, where it gates
-    /// the `NL_PORTABLE_INCR_SEEDED=1` carrier. `false` on the fleet (INERT), for
-    /// every non-portable action, and for any COLD outcome
+    /// the `NL_PORTABLE_INCR_SEEDED=1` carrier. `false` whenever the gate is off,
+    /// for every non-portable action, and for any COLD outcome
     /// (`NoSeed`/`Collision`/`TimedOut`) — a false positive would make
     /// `process_wrapper` skip a seed that is not present.
     portable_incr_seeded: bool,
@@ -4967,7 +4967,7 @@ pub struct RunningActionImpl {
     tree_proto_cache: Mutex<HashMap<DigestInfo, ProtoTree>>,
     /// FL-1383 chunk 2b: the byte-identical portable execroot plan for this
     /// action (design §4/§5). `Some` ONLY for an enabled+allowlisted
-    /// portable-incr action (so `None` on the entire fleet — INERT). When
+    /// portable-incr action (`None` otherwise — inert). When
     /// `Some`, `work_directory` is the execroot itself (NO `/work` segment) and
     /// the input materialise wipes-preserving-`-incr` instead of `create_dir`.
     /// Holds the §5 ownership lease (released on this action's Drop) and drives
@@ -4984,12 +4984,20 @@ impl RunningActionImpl {
     /// eviction; a dir currently LEASED by a live owner is never evicted). The
     /// call site passes [`crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES`].
     ///
-    /// Doubly gated so it is INERT on the fleet with no `spawn_blocking` cost:
+    /// Doubly gated, and when either gate is off it costs no `spawn_blocking`:
     /// this action must have been portable (`portable_execroot.is_some()`) AND a
-    /// live [`crate::portable_incr::PortableIncrContext`] must be installed on the
-    /// manager (`None` on the entire fleet). The eviction is BLOCKING
-    /// (readdir/lstat/unlink) so it runs under `spawn_blocking`. Any eviction
-    /// failure is logged and swallowed — it must never fail the action.
+    /// live [`crate::portable_incr::PortableIncrContext`] must be installed on
+    /// the manager. Both gates are OPEN on the current fleet, so this runs after
+    /// every portable action. The eviction is BLOCKING (readdir/lstat/unlink) so
+    /// it runs under `spawn_blocking`. Any eviction failure is logged and
+    /// swallowed — it must never fail the action.
+    ///
+    /// ★ COST NOTE (measured 2026-08-13, not addressed here): the pass
+    /// recursively size-walks EVERY warm dir before it compares against the
+    /// budget, so the walk is unconditional and scales with the RETAINED pool,
+    /// not with the number of evictions. Raising the budget therefore trades
+    /// unlink work away for MORE walk work. See the FL-1383 backlog entry
+    /// `#fl1383-eviction-sizewalk-unconditional`.
     pub async fn maybe_evict_warm_dirs_post_action(&self, budget_bytes: u64) {
         if self.portable_execroot.is_none() {
             return;
@@ -5106,7 +5114,7 @@ impl RunningActionImpl {
             // #O3/O13 per-action Tree-proto cache: lifetime = this action.
             // Drop fires on every termination path so no leak class exists.
             tree_proto_cache: Mutex::new(HashMap::new()),
-            // FL-1383 chunk 2b: `None` on the fleet (INERT); `Some` holds the
+            // FL-1383 chunk 2b: `None` when the gate is off; `Some` holds the
             // §5 ownership lease for the action's lifetime.
             portable_execroot,
         }
@@ -5362,7 +5370,7 @@ impl RunningActionImpl {
             // of FIXED_PREFIX (design §9). The Command was fetched above, so we
             // FIRST integrity-verify the worker-derived targetkey against the
             // carrier (design §11 item 1); a mismatch fails loud (the carrier
-            // does not describe this Command's outputs). `None` on the fleet →
+            // does not describe this Command's outputs). `None` →
             // the plain `create_dir` path below, byte-for-byte unchanged.
             if let Some(plan) = self.portable_execroot.as_ref() {
                 plan.verify_against_command_outputs(&cmd.output_paths)
@@ -5517,8 +5525,9 @@ impl RunningActionImpl {
         // clonefile fast path fired. The CONTENT comes from the fleet-shared
         // index; any non-`Materialized` outcome (miss/collision/timeout/evicted)
         // proceeds with a COLD build; the whole fetch is bounded (§6.2: GrpcStore
-        // `timeout=0`, so a slow/absent index must not stall). INERT on the fleet
-        // (portable_targetkey is `None` unless a portable execroot was planned).
+        // `timeout=0`, so a slow/absent index must not stall). INERT whenever
+        // `portable_targetkey` is `None` — i.e. unless a portable execroot was
+        // planned for this action.
         let portable_targetkey = self.state.lock().portable_targetkey.clone();
         if let (Some(index_store), Some(targetkey)) = (
             self.running_actions_manager.incr_seed_index_store.as_ref(),
@@ -7226,8 +7235,8 @@ impl RunningAction for RunningActionImpl {
                 self.did_cleanup.store(true, Ordering::Release);
                 // FL-1383 §8: after a PORTABLE action's cleanup, bound the warm-dir
                 // pool at the static budget. Doubly gated (portable action AND a
-                // live context) → INERT on the fleet; failures log + continue, never
-                // failing the action.
+                // live context) → inert unless both hold; failures log + continue,
+                // never failing the action.
                 self.maybe_evict_warm_dirs_post_action(
                     crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES,
                 )
@@ -8049,9 +8058,9 @@ pub struct RunningActionsManagerImpl {
     deferred_output_uploads_enabled: bool,
     /// FL-1383 chunk 2b: worker-side portable rustc-incremental context. `Some`
     /// ONLY when the worker gate is enabled AND the chunk-2a §12 startup asserts
-    /// passed (set via [`Self::set_portable_incr`] from `new_local_worker`), so
-    /// it is `None` on the entire live fleet — the single INERT gate for the
-    /// execroot rewire. When `None`, `plan_portable_execroot` returns `None` and
+    /// passed (set via [`Self::set_portable_incr`] from `new_local_worker`) — the
+    /// single gate for the execroot rewire. When `None`,
+    /// `plan_portable_execroot` returns `None` and
     /// every action takes the byte-identical current path.
     portable_incr: Option<crate::portable_incr::PortableIncrContext>,
     /// FL-1383 (design §6.1/§6.3): the fleet-shared `incr_seed_index` store —
@@ -8144,8 +8153,8 @@ impl RunningActionsManagerImpl {
     /// FL-1383 chunk 2b: install the worker-side portable rustc-incremental
     /// context (design §4/§5/§7). Called once from `new_local_worker` BEFORE the
     /// manager is `Arc`-wrapped. `ctx` is `Some` only when the feature is enabled
-    /// AND the chunk-2a §12 asserts passed; `None` (the fleet default) leaves the
-    /// execroot rewire fully INERT.
+    /// AND the chunk-2a §12 asserts passed; `None` (the config default) leaves
+    /// the execroot rewire fully INERT.
     pub fn set_portable_incr(
         &mut self,
         ctx: Option<crate::portable_incr::PortableIncrContext>,
@@ -8156,8 +8165,8 @@ impl RunningActionsManagerImpl {
     /// FL-1383 (design §6.1/§6.3): install the fleet-shared `incr_seed_index`
     /// store handle. Called once from `new_local_worker` BEFORE the manager is
     /// `Arc`-wrapped. `Some` only when the worker config named a
-    /// `portable_incr_seed_index_store` that resolved; `None` (the fleet default)
-    /// leaves the seed fetch/publish path fully INERT.
+    /// `portable_incr_seed_index_store` that resolved; `None` (the config
+    /// default) leaves the seed fetch/publish path fully INERT.
     pub fn set_incr_seed_index_store(&mut self, store: Option<Store>) {
         self.incr_seed_index_store = store;
     }
@@ -9487,7 +9496,7 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 }
                 // FL-1383 chunk 2b: plan the byte-identical execroot from the
                 // carrier Platform properties (available in `action_info` before
-                // the Command is fetched). `None` on the fleet → NORMAL path.
+                // the Command is fetched). `None` → NORMAL path.
                 // Computed BEFORE `action_info` is moved into the action.
                 let portable_execroot = self.plan_portable_execroot(&action_info);
                 let running_action = Arc::new(RunningActionImpl::new(

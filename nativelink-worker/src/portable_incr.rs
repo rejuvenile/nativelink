@@ -29,11 +29,24 @@
 //!   nothing on-disk is preserved), and confine every delete to FIXED_PREFIX
 //!   (§9). The `running_actions_manager` execution path consumes these.
 //!
-//! INERT: everything is gated on a `Some` [`PortableIncrContext`], which is
+//! GATE: everything is gated on a `Some` [`PortableIncrContext`], which is
 //! `None` unless the worker gate
 //! ([`nativelink_config::cas_server::LocalWorkerConfig::portable_incr`]) is
-//! enabled AND every §12 assert passed — so it is `None` on the entire live
-//! fleet and both chunks are fully inert there.
+//! enabled AND every §12 assert passed. When `None`, both chunks are fully
+//! inert.
+//!
+//! ★ DEPLOYMENT STATE IS NOT A PROPERTY OF THIS CODE — DO NOT ASSERT IT HERE.
+//! Every doc in this module and in `running_actions_manager` used to claim the
+//! gate was `None` "on the entire live fleet". That was true when written and is
+//! now FALSE: as of 2026-08-13 the feature is ENABLED on all 10 workers
+//! (`worker.json5` `portable_incr.enabled: true`, `fixed_prefix`
+//! `/Volumes/CrowAgent/fl-incr-execroots`), and the live logs show it running —
+//! 3588 `execroot full-empty ensure+wipe`, 1710 `seed fetch complete`, and 1863
+//! eviction passes that logged. Those stale claims sat in the source for weeks
+//! and read as "this code cannot run in production", which is exactly the
+//! premise a reviewer would rely on. Describe the GATE (what makes it
+//! `Some`/`None`) and let the deployed config answer where it is on — a comment
+//! cannot track a config field, and one that tries will rot silently.
 //!
 //! DURABILITY: no `fsync`/`O_SYNC`/sync-write primitive appears here (CLAUDE.md
 //! hard rule). All filesystem syscalls are BLOCKING and MUST run inside
@@ -414,8 +427,9 @@ pub fn create_file_exclusive_no_follow(path: &Path, mode: u32) -> Result<OwnedFd
 // Chunk 2b: the byte-identical execroot machinery (design §4/§5/§7/§9/§11).
 //
 // EVERYTHING below is gated on a live [`PortableIncrContext`], which is `Some`
-// only when the feature is enabled AND the chunk-2a §12 startup asserts passed
-// — so it is `None` on the entire live fleet and this whole path is INERT.
+// only when the feature is enabled AND the chunk-2a §12 startup asserts passed.
+// When `None`, this whole path is INERT. (Where the gate is currently ON is a
+// deployed-config question — see the module doc; do not restate it here.)
 // ---------------------------------------------------------------------------
 
 /// Action Platform property carrying the fleet-agreed `targetkey` (64 lowercase
@@ -452,8 +466,8 @@ static EXECROOT_OWNERSHIP: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Worker-side portable-incr execution context. Present (`Some`) ONLY when the
-/// worker gate is enabled AND the chunk-2a §12 startup asserts passed, so it is
-/// `None` on the entire live fleet — the single INERT gate for chunk 2b.
+/// worker gate is enabled AND the chunk-2a §12 startup asserts passed — the
+/// single gate for chunk 2b; `None` makes the whole rewire inert.
 #[derive(Debug, Clone)]
 pub struct PortableIncrContext {
     fixed_prefix: PathBuf,
