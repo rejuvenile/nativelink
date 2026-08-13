@@ -5005,13 +5005,22 @@ impl RunningActionImpl {
                     warn!(
                         dirs_evicted = outcome.dirs_evicted,
                         leased_skipped = outcome.leased_skipped,
+                        vanished_skipped = outcome.vanished_skipped,
                         bytes_remaining = outcome.bytes_remaining,
                         "FL-1383 portable_incr: warm-dir pool over budget with every remaining candidate leased — backpressure"
                     );
-                } else if outcome.dirs_evicted > 0 {
+                // `vanished_skipped > 0` also logs: those passes previously
+                // emitted `error!` (722 of the 1863 passes visible in the live
+                // fleet logs at 2026-08-13T18:30Z, all ENOENT), and dropping them
+                // to `debug!` would replace a false alarm with a blind spot. The
+                // field must have a READER or it is just another
+                // computed-and-unread signal.
+                } else if outcome.dirs_evicted > 0 || outcome.vanished_skipped > 0 {
                     info!(
                         dirs_evicted = outcome.dirs_evicted,
                         bytes_freed = outcome.bytes_freed,
+                        vanished_skipped = outcome.vanished_skipped,
+                        leased_skipped = outcome.leased_skipped,
                         bytes_remaining = outcome.bytes_remaining,
                         "FL-1383 portable_incr: evicted warm dirs over budget"
                     );

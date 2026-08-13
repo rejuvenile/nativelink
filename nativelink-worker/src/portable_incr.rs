@@ -744,11 +744,82 @@ impl Drop for OwnershipLeaseGuard {
     }
 }
 
+/// Result of the §9 confinement gate for a delete target.
+///
+/// ★ THE TWO NON-`Confined` OUTCOMES ARE NOT THE SAME EVENT AND MUST NEVER BE
+/// COLLAPSED. A path that cannot be canonicalized because it NO LONGER EXISTS is
+/// benign — the delete we were about to perform has already happened. A path
+/// that canonicalizes OUTSIDE the prefix is a CONTAINMENT FAILURE and stays a
+/// hard `Err` on every path through this module. `Vanished` is therefore an
+/// `Ok` variant the caller must handle explicitly, while an escape remains
+/// unrepresentable as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containment {
+    /// `path` canonicalizes STRICTLY under `fixed_prefix` — safe to delete.
+    Confined,
+    /// `path` does not exist (ENOENT). Containment is neither satisfied nor
+    /// violated: there is nothing left to delete. NOT a containment failure.
+    Vanished,
+}
+
+/// Whether a non-existent `path` is an error for a given caller of the
+/// confinement gate. Private: the choice is made by which public entry point is
+/// called, never by the caller passing a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingPath {
+    /// ENOENT on `path` is a hard error ([`assert_under_prefix`]).
+    IsError,
+    /// ENOENT on `path` yields [`Containment::Vanished`] ([`check_under_prefix`]).
+    IsVanished,
+}
+
 /// Confinement gate (design §9): assert `path` canonicalizes STRICTLY under
 /// `fixed_prefix` before any recursive delete of it. Callers (the contender
 /// cold-discard in `do_cleanup`) MUST call this before deleting so a wipe/discard
 /// can never escape the machine-local prefix. BLOCKING (canonicalize).
+///
+/// A path that does not exist is an ERROR here. Callers that race a concurrent
+/// remover want [`check_under_prefix`] instead; this entry point is for callers
+/// that require the target to exist.
 pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error> {
+    match check_under_prefix_impl(path, fixed_prefix, MissingPath::IsError)? {
+        Containment::Confined => Ok(()),
+        // Unreachable: `MissingPath::IsError` turns ENOENT into `Err` above.
+        // Represented rather than `unreachable!()` so a future edit to the impl
+        // cannot silently convert a missing path into a successful delete.
+        Containment::Vanished => Err(make_err!(
+            Code::Internal,
+            "portable_incr: confinement gate returned Vanished under MissingPath::IsError for {}",
+            path.display()
+        )),
+    }
+}
+
+/// Confinement gate (design §9) for callers that RACE a concurrent remover: same
+/// containment guarantee as [`assert_under_prefix`], but a target that has
+/// already been removed (ENOENT) reports [`Containment::Vanished`] instead of
+/// erroring.
+///
+/// ★ ONLY `std::io::ErrorKind::NotFound` on the TARGET is tolerated. A `FIXED_PREFIX`
+/// that cannot be canonicalized (including ENOENT — an unprovisioned or
+/// corrupted root, never a benign race) and every other errno on the target
+/// (EACCES from a permissions regression, ELOOP, ENOTDIR, EIO …) still abort.
+/// BLOCKING (canonicalize).
+pub fn check_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<Containment, Error> {
+    check_under_prefix_impl(path, fixed_prefix, MissingPath::IsVanished)
+}
+
+/// Shared implementation of the §9 confinement gate. The ESCAPE branch and its
+/// error text are deliberately shared by both public entry points so the two can
+/// never drift; `missing` selects ONLY the disposition of ENOENT on the target.
+fn check_under_prefix_impl(
+    path: &Path,
+    fixed_prefix: &Path,
+    missing: MissingPath,
+) -> Result<Containment, Error> {
+    // The PREFIX must always resolve. A FIXED_PREFIX that cannot be
+    // canonicalized is an unprovisioned or corrupted root — never a benign
+    // race — so ENOENT here stays HARD for every caller.
     let canon_prefix = std::fs::canonicalize(fixed_prefix).map_err(|e| {
         make_err!(
             Code::Internal,
@@ -756,13 +827,19 @@ pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error
             fixed_prefix.display()
         )
     })?;
-    let canon_path = std::fs::canonicalize(path).map_err(|e| {
-        make_err!(
-            Code::Internal,
-            "portable_incr: cannot canonicalize discard target {} for containment: {e}",
-            path.display()
-        )
-    })?;
+    let canon_path = match std::fs::canonicalize(path) {
+        Ok(canon_path) => canon_path,
+        Err(e) if missing == MissingPath::IsVanished && e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Containment::Vanished);
+        }
+        Err(e) => {
+            return Err(make_err!(
+                Code::Internal,
+                "portable_incr: cannot canonicalize discard target {} for containment: {e}",
+                path.display()
+            ));
+        }
+    };
     if !canon_path.starts_with(&canon_prefix) || canon_path == canon_prefix {
         return Err(make_err!(
             Code::Internal,
@@ -771,7 +848,7 @@ pub fn assert_under_prefix(path: &Path, fixed_prefix: &Path) -> Result<(), Error
             canon_prefix.display()
         ));
     }
-    Ok(())
+    Ok(Containment::Confined)
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +904,15 @@ pub struct EvictionOutcome {
     /// Over-budget candidates SKIPPED because they were LEASED by a live owner
     /// (the §5 backpressure signal — a live warm dir is never evicted).
     pub leased_skipped: usize,
+    /// Candidates that VANISHED under this pass (ENOENT) — removed concurrently
+    /// between enumeration and eviction, at the lstat, the size walk, or the
+    /// discard. Benign: the desired end state, reached by someone else. Counted
+    /// so a fail-soft is not a silent one — a pass that skips everything and a
+    /// pass that had nothing to do are otherwise indistinguishable.
+    ///
+    /// NOT credited to `dirs_evicted`/`bytes_freed`: this pass did not free
+    /// those bytes.
+    pub vanished_skipped: usize,
     /// `true` iff the pool is STILL over budget after evicting every non-leased
     /// candidate (every remaining dir is leased → refuse, don't evict a live
     /// one). A diagnostic for the operator: the static reservation is too small
@@ -889,10 +975,44 @@ fn sweep_stale_contender_dirs_at(fixed_prefix: &Path) -> Result<usize, Error> {
         }
         // Cold-discard the whole isolated contender dir (it holds no `-incr`
         // seed to preserve), confined to a subtree of FIXED_PREFIX (§9).
-        discard_dir_tree_confined(&path, fixed_prefix)?;
-        removed += 1;
+        // This sweep runs at startup before any action can plan an execroot, so
+        // nothing should race it; `AlreadyGone` is nonetheless not a removal and
+        // is not counted as one.
+        match discard_dir_tree_confined(&path, fixed_prefix)? {
+            DiscardOutcome::Removed => removed += 1,
+            DiscardOutcome::AlreadyGone => {}
+        }
     }
     Ok(removed)
+}
+
+/// TEST-ONLY seam. The §8 eviction races a concurrent remover at several
+/// distinct points, and the only honest way to prove each ENOENT branch is
+/// load-bearing is to make the vanish happen at exactly that point rather than
+/// sleeping and hoping. `#[cfg(test)]` on a library target: this does not exist
+/// in the shipped worker.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePoint {
+    /// Immediately before a candidate's enumeration `lstat`.
+    BeforeEnumLstat,
+    /// After the §9 containment gate passed, immediately before `remove_dir_all`.
+    BeforeRemoveDirAll,
+    /// Immediately before a size-walk child's `lstat` (the longest window).
+    BeforeChildLstat,
+}
+
+#[cfg(test)]
+static VANISH_PROBE: Mutex<Option<fn(ProbePoint, &Path)>> = Mutex::new(None);
+
+#[cfg(test)]
+fn fire_vanish_probe(point: ProbePoint, path: &Path) {
+    let probe = *VANISH_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(probe) = probe {
+        probe(point, path);
+    }
 }
 
 /// Free-function form of [`PortableIncrContext::evict_warm_dirs_over_budget`].
@@ -918,6 +1038,9 @@ fn evict_warm_dirs_over_budget_at(
     // no owned payload bytes, off the durability/data path.
     let mut candidates: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
     let mut total: u64 = 0;
+    // Candidates that disappeared under us at ANY point in this pass (§5 TOCTOU
+    // with a concurrent remover). Counted, not fatal — see `vanished_skipped`.
+    let mut vanished_skipped: usize = 0;
     for entry in entries {
         let entry = entry.map_err(|e| {
             make_err!(
@@ -932,13 +1055,34 @@ fn evict_warm_dirs_over_budget_at(
             continue;
         }
         let path = entry.path();
-        let md = std::fs::symlink_metadata(&path).map_err(|e| {
-            make_err!(Code::Internal, "lstat warm dir {}: {e}", path.display())
-        })?;
+        #[cfg(test)]
+        fire_vanish_probe(ProbePoint::BeforeEnumLstat, &path);
+        let md = match std::fs::symlink_metadata(&path) {
+            Ok(md) => md,
+            // ★ VANISHED between readdir and lstat. A warm dir that no longer
+            // exists is the END STATE THIS PASS IS TRYING TO REACH, reached by
+            // someone else — skip the candidate and keep going. Before this,
+            // one such dir aborted the whole pass with `Code::Internal`.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                vanished_skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                return Err(make_err!(
+                    Code::Internal,
+                    "lstat warm dir {}: {e}",
+                    path.display()
+                ));
+            }
+        };
         if !md.file_type().is_dir() {
             continue;
         }
-        let size = dir_apparent_size_bytes(&path)?;
+        // Vanished during its own size walk — same disposition as above.
+        let Some(size) = dir_apparent_size_bytes(&path)? else {
+            vanished_skipped += 1;
+            continue;
+        };
         // The dir's own mtime is the LRU signal: the §7 wipe adds/removes direct
         // children every build, so a recently-built warm dir has a recent mtime.
         let mtime = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -948,6 +1092,7 @@ fn evict_warm_dirs_over_budget_at(
 
     let mut outcome = EvictionOutcome {
         bytes_remaining: total,
+        vanished_skipped,
         ..EvictionOutcome::default()
     };
     if total <= budget_bytes {
@@ -979,10 +1124,22 @@ fn evict_warm_dirs_over_budget_at(
         let _sentinel = OwnershipLeaseGuard {
             owned: Some(path.clone()),
         };
-        discard_dir_tree_confined(&path, fixed_prefix)?;
-        total = total.saturating_sub(size);
-        outcome.dirs_evicted += 1;
-        outcome.bytes_freed = outcome.bytes_freed.saturating_add(size);
+        match discard_dir_tree_confined(&path, fixed_prefix)? {
+            DiscardOutcome::Removed => {
+                total = total.saturating_sub(size);
+                outcome.dirs_evicted += 1;
+                outcome.bytes_freed = outcome.bytes_freed.saturating_add(size);
+            }
+            // ★ Removed by someone else between enumeration and here. The bytes
+            // ARE off the disk, so they leave the running total (not doing so
+            // would over-evict live dirs to make up an imaginary shortfall), but
+            // we did NOT free them, so `dirs_evicted`/`bytes_freed` — the
+            // "eviction is working" signal — are not credited.
+            DiscardOutcome::AlreadyGone => {
+                total = total.saturating_sub(size);
+                outcome.vanished_skipped += 1;
+            }
+        }
     }
 
     outcome.bytes_remaining = total;
@@ -990,42 +1147,110 @@ fn evict_warm_dirs_over_budget_at(
     Ok(outcome)
 }
 
-/// Recursively remove `path` after asserting it canonicalizes STRICTLY under
+/// Outcome of one confined discard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscardOutcome {
+    /// The tree existed and this call removed it.
+    Removed,
+    /// The tree was already gone (ENOENT) — the desired end state, reached by a
+    /// concurrent remover. NOT an error, and NOT credited as our removal.
+    AlreadyGone,
+}
+
+/// Recursively remove `path` after checking it canonicalizes STRICTLY under
 /// `fixed_prefix` (§9 containment). Used by both the startup sweep (contender
-/// discard) and eviction (cold warm-dir removal). BLOCKING.
-fn discard_dir_tree_confined(path: &Path, fixed_prefix: &Path) -> Result<(), Error> {
-    assert_under_prefix(path, fixed_prefix)?;
-    std::fs::remove_dir_all(path).map_err(|e| {
-        make_err!(
+/// discard) and eviction (cold warm-dir removal).
+///
+/// ENOENT — at the containment gate or at the removal itself — is
+/// [`DiscardOutcome::AlreadyGone`], because "this tree does not exist" is
+/// exactly the postcondition this function is asked to establish. A containment
+/// violation and every other errno remain hard errors. BLOCKING.
+fn discard_dir_tree_confined(path: &Path, fixed_prefix: &Path) -> Result<DiscardOutcome, Error> {
+    match check_under_prefix(path, fixed_prefix)? {
+        Containment::Vanished => return Ok(DiscardOutcome::AlreadyGone),
+        Containment::Confined => {}
+    }
+    #[cfg(test)]
+    fire_vanish_probe(ProbePoint::BeforeRemoveDirAll, path);
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(DiscardOutcome::Removed),
+        // Removed between the containment gate and here — same benign race.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DiscardOutcome::AlreadyGone),
+        Err(e) => Err(make_err!(
             Code::Internal,
             "portable_incr: discard dir tree {}: {e}",
             path.display()
-        )
-    })
+        )),
+    }
 }
 
 /// Apparent on-disk size (sum of regular-file lengths) of the tree rooted at
 /// `dir`, NOT following symlinks (a symlink child contributes its own small link
 /// length, never its target). Apparent size slightly OVER-counts hardlinked
 /// inputs vs physical blocks, so the budget errs toward evicting sooner — the
-/// conservative direction for a disk-growth guard. BLOCKING.
-fn dir_apparent_size_bytes(dir: &Path) -> Result<u64, Error> {
+/// conservative direction for a disk-growth guard.
+///
+/// Returns `Ok(None)` iff `dir` ITSELF no longer exists (ENOENT) — the candidate
+/// vanished and has no size to contribute.
+///
+/// ★ THIS WALK IS THE LONGEST-LIVED RACE WINDOW IN AN EVICTION PASS: it descends
+/// the whole tree of EVERY candidate, including dirs a live owner is actively
+/// building into (the §7 wipe and rustc both add and remove children under
+/// `bazel-out/` continuously), and it runs before the lease check that would
+/// exclude them. A child that disappears mid-walk therefore contributes 0 and
+/// the walk CONTINUES: the total is an estimate feeding a budget heuristic, and
+/// an under-count by one already-deleted file is strictly better than aborting
+/// the pass. Every non-ENOENT error still aborts. BLOCKING.
+fn dir_apparent_size_bytes(dir: &Path) -> Result<Option<u64>, Error> {
     let mut total: u64 = 0;
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| make_err!(Code::Internal, "read dir {} for sizing: {e}", dir.display()))?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(make_err!(
+                Code::Internal,
+                "read dir {} for sizing: {e}",
+                dir.display()
+            ));
+        }
+    };
     for entry in entries {
-        let entry = entry
-            .map_err(|e| make_err!(Code::Internal, "read dir entry in {} for sizing: {e}", dir.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            // The directory (or the entry) went away mid-iteration.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(make_err!(
+                    Code::Internal,
+                    "read dir entry in {} for sizing: {e}",
+                    dir.display()
+                ));
+            }
+        };
         let path = entry.path();
-        let md = std::fs::symlink_metadata(&path)
-            .map_err(|e| make_err!(Code::Internal, "lstat {} for sizing: {e}", path.display()))?;
+        #[cfg(test)]
+        fire_vanish_probe(ProbePoint::BeforeChildLstat, &path);
+        let md = match std::fs::symlink_metadata(&path) {
+            Ok(md) => md,
+            // Unlinked between readdir and lstat — contributes 0.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(make_err!(
+                    Code::Internal,
+                    "lstat {} for sizing: {e}",
+                    path.display()
+                ));
+            }
+        };
         if md.file_type().is_dir() {
-            total = total.saturating_add(dir_apparent_size_bytes(&path)?);
+            // A subtree that vanished mid-descent contributes 0; the parent is
+            // still being sized, so this is NOT propagated as `None`.
+            total = total.saturating_add(dir_apparent_size_bytes(&path)?.unwrap_or(0));
         } else {
             total = total.saturating_add(md.len());
         }
     }
-    Ok(total)
+    Ok(Some(total))
 }
 
 /// Create the execroot dir (mode 0755) if absent; a pre-existing dir (Owner
@@ -1186,4 +1411,429 @@ fn path_to_cstring(path: &Path) -> Result<CString, Error> {
 fn path_to_cstring_io(path: &Path) -> std::io::Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
+// ---------------------------------------------------------------------------
+// §8 eviction TOCTOU unit tests.
+//
+// These live in-module (not in `tests/portable_incr_execroot_test.rs`) because
+// they drive the PRIVATE `evict_warm_dirs_over_budget_at` and the PRIVATE
+// `EXECROOT_OWNERSHIP` lease mutex. That mutex is what makes the mid-pass
+// vanish DETERMINISTIC rather than a sleep-and-hope race: the eviction loop
+// must acquire it before it can discard ANY candidate, so a test holding it has
+// an airtight guarantee that no discard has yet occurred when it removes a
+// candidate from underneath the pass.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod eviction_toctou_tests {
+    use super::*;
+
+    /// A warm OWNER dir at `<root>/<key>` whose apparent size is exactly
+    /// `filler_bytes` (one regular file; the dir itself contributes nothing).
+    fn make_warm_dir(root: &Path, key: &str, filler_bytes: usize) {
+        let d = root.join(key);
+        std::fs::create_dir_all(&d).expect("mk warm dir");
+        std::fs::write(d.join("filler"), vec![0u8; filler_bytes]).expect("filler");
+    }
+
+    fn hex64(c: char) -> String {
+        std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// A canonicalized temp root (macOS `/var` -> `/private/var`), so the
+    /// containment comparison is against a stable prefix.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(td.path()).expect("canonicalize tempdir");
+        (td, root)
+    }
+
+    /// ★ THE REGRESSION THIS FILE EXISTS FOR.
+    ///
+    /// Measured 2026-08-13T18:30Z over the LIVE `~/Library/Logs/nativelink-worker.log`
+    /// on all 10 workers: 722 eviction passes aborted vs 1141 that evicted
+    /// something — 38.8% — and 722/722 of the aborts were `os error 2` (ENOENT).
+    /// Zero other errnos fleet-wide. Including the rotated `.gz` logs the counts
+    /// are 12082 vs 16298 (42.6%), so the RATE is stable across windows even
+    /// though the absolute counts depend on which window you read.
+    ///
+    /// NOTE the denominator: a pass that finds the pool WITHIN budget logs at
+    /// `debug!`, which `release_max_level_info` compiles out of the shipped
+    /// worker. So this is the failure rate among passes that DID work, not among
+    /// all passes — the true per-invocation rate is lower and is not observable
+    /// from the logs at all (see the eviction-observability gap, FL-1383 §12).
+    ///
+    /// A candidate removed BETWEEN enumeration and eviction must be skipped and
+    /// the pass must CONTINUE to evict the remaining candidates. Before the fix
+    /// this returned `Err(Code::Internal)` and the whole pass was lost.
+    ///
+    /// Determinism: the test holds `EXECROOT_OWNERSHIP` across the removal, and
+    /// the eviction loop cannot discard anything without it. The removal is
+    /// therefore guaranteed to land before any discard. Whether the pass sees
+    /// the vanish at the enumeration lstat, at the size walk, or at the discard
+    /// containment gate depends on how far it got before blocking — ALL THREE
+    /// ARE THE FIX, and the budget below is chosen so all three produce
+    /// identical asserted outcomes.
+    #[test]
+    fn eviction_continues_when_a_candidate_vanishes_mid_pass() {
+        // Shares the serialization of the probe tests: their probe is a GLOBAL
+        // and would otherwise fire against this test's candidates too.
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_td, root) = canonical_tempdir();
+        let (key_a, key_b, key_c) = (hex64('a'), hex64('b'), hex64('c'));
+        for key in [&key_a, &key_b, &key_c] {
+            make_warm_dir(&root, key, 50);
+        }
+
+        // Barrier: taken BEFORE the pass starts, released only after key_a is
+        // gone. No discard can occur in between.
+        let barrier = EXECROOT_OWNERSHIP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let root_for_pass = root.clone();
+        let pass = std::thread::spawn(move || {
+            // Budget 40 < any single dir (50), so the loop consumes ALL
+            // candidates regardless of LRU order.
+            evict_warm_dirs_over_budget_at(&root_for_pass, 40)
+        });
+
+        // Let the pass reach the barrier (or at least start). Correctness does
+        // not depend on this sleep — the mutex does; the sleep only steers
+        // which of the three ENOENT sites observes the vanish.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::fs::remove_dir_all(root.join(&key_a)).expect("remove candidate mid-pass");
+        drop(barrier);
+
+        let outcome = pass
+            .join()
+            .expect("eviction thread must not panic")
+            .expect("★ a vanished candidate must NOT abort the pass");
+
+        assert_eq!(
+            outcome.vanished_skipped, 1,
+            "the vanished candidate must be COUNTED, not silently dropped"
+        );
+        assert_eq!(
+            outcome.dirs_evicted, 2,
+            "★ the pass must CONTINUE and evict the two surviving candidates"
+        );
+        assert_eq!(
+            outcome.bytes_freed, 100,
+            "only the two dirs WE removed are credited; the vanished one is not"
+        );
+        assert_eq!(outcome.bytes_remaining, 0);
+        assert_eq!(outcome.leased_skipped, 0);
+        assert!(!root.join(&key_b).exists(), "surviving candidate B evicted");
+        assert!(!root.join(&key_c).exists(), "surviving candidate C evicted");
+    }
+
+    /// Serializes the tests that install the global [`VANISH_PROBE`].
+    static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Probe body: makes candidate `aaa…` vanish at whichever point is armed.
+    /// A plain `fn` pointer (no captures), so it needs to recognise its target
+    /// from the path it is handed.
+    fn vanish_candidate_a(_point: ProbePoint, path: &Path) {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("aaaa"))
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    /// Installs the probe, runs an eviction over three 50-byte candidates with a
+    /// budget of 40 (so the loop must consume ALL of them, making the assertions
+    /// independent of LRU/readdir order), and returns the outcome.
+    /// Returns the `TempDir` so the CALLER keeps it alive for its on-disk
+    /// assertions and it is still cleaned up on drop. (It was previously
+    /// `mem::forget`-ed to extend its life, which leaked one temp tree per run.)
+    fn evict_with_probe_at(point: ProbePoint) -> (tempfile::TempDir, PathBuf, EvictionOutcome) {
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (td, root) = canonical_tempdir();
+        for key in [hex64('a'), hex64('b'), hex64('c')] {
+            make_warm_dir(&root, &key, 50);
+        }
+        // The probe fires at every point; it is armed for one by construction
+        // (each test installs it for the site it is exercising).
+        let armed: fn(ProbePoint, &Path) = match point {
+            ProbePoint::BeforeEnumLstat => |p, path| {
+                if p == ProbePoint::BeforeEnumLstat {
+                    vanish_candidate_a(p, path);
+                }
+            },
+            ProbePoint::BeforeRemoveDirAll => |p, path| {
+                if p == ProbePoint::BeforeRemoveDirAll {
+                    vanish_candidate_a(p, path);
+                }
+            },
+            ProbePoint::BeforeChildLstat => {
+                unreachable!("the size-walk probe is installed inline by its own test")
+            }
+        };
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(armed);
+        let result = evict_warm_dirs_over_budget_at(&root, 40);
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let outcome = result.expect("★ a vanished candidate must NOT abort the pass");
+        (td, root, outcome)
+    }
+
+    /// ★ THE LARGEST FLEET SHAPE: `lstat warm dir <path>` — 405 of the 722
+    /// aborts in the live-log window above (the three shapes were 405 + 274 + 43,
+    /// summing to exactly 722, which is how we know these are the ONLY shapes).
+    /// The candidate disappears between `read_dir` returning its dirent and the
+    /// `lstat` of it.
+    #[test]
+    fn eviction_continues_when_a_candidate_vanishes_before_its_lstat() {
+        let (_td, root, outcome) = evict_with_probe_at(ProbePoint::BeforeEnumLstat);
+        assert_eq!(outcome.vanished_skipped, 1, "vanished candidate counted");
+        assert_eq!(
+            outcome.dirs_evicted, 2,
+            "★ the pass CONTINUES and evicts the two survivors"
+        );
+        assert_eq!(outcome.bytes_freed, 100);
+        assert_eq!(outcome.bytes_remaining, 0);
+        assert!(!root.join(hex64('b')).exists());
+        assert!(!root.join(hex64('c')).exists());
+    }
+
+    /// The narrowest window: the candidate survives the containment gate and is
+    /// removed before `remove_dir_all`. Unobserved on the fleet (0 of 722 — it
+    /// has no distinct message, so an occurrence would have surfaced as the
+    /// `discard dir tree` text, which appears zero times) but the same race, and
+    /// its tolerance must not rot untested.
+    #[test]
+    fn eviction_continues_when_a_candidate_vanishes_before_removal() {
+        let (_td, root, outcome) = evict_with_probe_at(ProbePoint::BeforeRemoveDirAll);
+        assert_eq!(
+            outcome.vanished_skipped, 1,
+            "the vanished candidate must be COUNTED, not silently dropped"
+        );
+        assert_eq!(
+            outcome.dirs_evicted, 2,
+            "★ AlreadyGone must NOT be credited as an eviction: only the two dirs \
+             THIS pass removed count, or `dirs_evicted` stops meaning \
+             'eviction is working' and a pool that is being emptied by someone \
+             else looks identical to one we are keeping under budget"
+        );
+        assert_eq!(
+            outcome.bytes_freed, 100,
+            "the concurrently-removed dir is NOT credited to this pass"
+        );
+        assert_eq!(
+            outcome.bytes_remaining, 0,
+            "★ AlreadyGone bytes must still LEAVE the running total — they are \
+             really off disk, and not subtracting them makes the pass believe it \
+             is still over budget and evict LIVE dirs to cover an imaginary shortfall"
+        );
+        assert!(!root.join(hex64('b')).exists());
+        assert!(!root.join(hex64('c')).exists());
+    }
+
+    /// The counterweight: a NON-ENOENT failure must still abort the whole pass.
+    /// An unreadable candidate (EACCES from the size walk) is a real fault —
+    /// a permissions regression — and must never be swallowed as "vanished".
+    #[test]
+    fn eviction_still_aborts_on_a_non_enoent_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // This test runs a real eviction pass, so the GLOBAL [`VANISH_PROBE`]
+        // fires against ITS candidates too — and its EACCES fixture is named
+        // `aaaa…`, exactly what the probe body targets. Without this lock a
+        // concurrently-installed probe could delete the fixture out from under
+        // the assertion and turn the safety check green for the wrong reason.
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_td, root) = canonical_tempdir();
+        let (key_a, key_b) = (hex64('a'), hex64('b'));
+        make_warm_dir(&root, &key_a, 50);
+        make_warm_dir(&root, &key_b, 50);
+
+        let denied = root.join(&key_a);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        // Running as root defeats the permission bit; skip rather than assert a
+        // falsehood.
+        if std::fs::read_dir(&denied).is_ok() {
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).ok();
+            eprintln!("skipping: euid can read a 0o000 dir (root?)");
+            return;
+        }
+
+        let err = evict_warm_dirs_over_budget_at(&root, 40)
+            .expect_err("★ EACCES is a real fault and MUST abort the pass");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("for sizing"),
+            "expected the size-walk error to propagate, got: {msg}"
+        );
+        assert!(
+            !msg.contains("os error 2"),
+            "the aborting error must NOT be an ENOENT, got: {msg}"
+        );
+
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    /// The safety distinction the fix must NOT collapse: a target that is gone
+    /// is benign; a target that resolves OUTSIDE the prefix is a containment
+    /// failure and stays hard — including when it is reached through a symlink,
+    /// which is the only way ENOENT-tolerance could have opened a hole.
+    #[test]
+    fn containment_separates_vanished_from_escaped() {
+        let (_td, root) = canonical_tempdir();
+        let prefix = root.join("fp");
+        std::fs::create_dir_all(prefix.join("child")).expect("mk child");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("mk outside");
+
+        // Benign: simply not there.
+        assert_eq!(
+            check_under_prefix(&prefix.join("gone"), &prefix).expect("ENOENT is not an error"),
+            Containment::Vanished
+        );
+        // ...and the strict entry point is UNCHANGED for its existing callers
+        // (`wipe_all_contents`, and the contender discard in
+        // `running_actions_manager`), down to the error it produces. Pinning the
+        // text keeps `assert_under_prefix` from being quietly re-pointed at the
+        // ENOENT-tolerant policy.
+        let strict = assert_under_prefix(&prefix.join("gone"), &prefix)
+            .expect_err("assert_under_prefix must still treat a missing target as an error");
+        assert!(
+            format!("{strict:?}").contains("cannot canonicalize discard target"),
+            "the strict entry point must still fail AT THE CANONICALIZE, got: {strict:?}"
+        );
+
+        // Containment failures stay hard through BOTH entry points. NOTE both
+        // targets must EXIST, or they would (correctly) report `Vanished` —
+        // "not there" is decided before "not contained", and a path that does
+        // not exist is never deleted either way.
+        let sibling = root.join("fp-evil");
+        std::fs::create_dir_all(&sibling).expect("mk sibling");
+        // Assert on the ERROR TEXT, not merely `is_err()`: these must fail as
+        // CONTAINMENT violations. A bare `is_err()` would also be satisfied by
+        // the gate erroring for some unrelated reason, which is how an escape
+        // check rots into a check of something else.
+        let self_err = check_under_prefix(&prefix, &prefix)
+            .expect_err("the prefix itself is not STRICTLY under the prefix");
+        assert!(
+            format!("{self_err:?}").contains("escapes FIXED_PREFIX"),
+            "the prefix itself must be refused AS AN ESCAPE, got: {self_err:?}"
+        );
+        let sibling_err = check_under_prefix(&sibling, &prefix)
+            .expect_err("a string-prefix sibling is not under the prefix");
+        assert!(
+            format!("{sibling_err:?}").contains("escapes FIXED_PREFIX"),
+            "★ `fp-evil` shares the STRING prefix `fp` but is not under it; this \
+             must be an escape, got: {sibling_err:?}"
+        );
+
+        // ★ The hole ENOENT-tolerance could have opened: a symlink INSIDE the
+        // prefix pointing at a real directory OUTSIDE it. `canonicalize`
+        // resolves it, so this must be an ESCAPE, never `Vanished`.
+        let escape = prefix.join("escape");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink");
+        let err = check_under_prefix(&escape, &prefix)
+            .expect_err("★ a symlink out of the prefix is a containment failure");
+        assert!(
+            format!("{err:?}").contains("escapes FIXED_PREFIX"),
+            "must be reported as an escape, got: {err:?}"
+        );
+
+        // And the discard helper refuses it, leaving the outside dir intact.
+        assert!(discard_dir_tree_confined(&escape, &prefix).is_err());
+        assert!(outside.exists(), "★ the out-of-prefix dir must NOT be deleted");
+
+        // A dangling symlink is ENOENT at canonicalize -> Vanished, and since
+        // nothing is deleted, that is safe.
+        let dangling = prefix.join("dangling");
+        std::os::unix::fs::symlink(root.join("nope"), &dangling).expect("symlink");
+        assert_eq!(
+            check_under_prefix(&dangling, &prefix).expect("dangling is ENOENT"),
+            Containment::Vanished
+        );
+        assert_eq!(
+            discard_dir_tree_confined(&dangling, &prefix).expect("no error"),
+            DiscardOutcome::AlreadyGone
+        );
+
+        // A FIXED_PREFIX that does not exist is a corrupted root, NOT a race.
+        assert!(
+            check_under_prefix(&prefix.join("child"), &root.join("no-such-prefix")).is_err(),
+            "a missing FIXED_PREFIX must stay a hard error"
+        );
+    }
+
+    /// The size walk is the longest race window (it descends every candidate,
+    /// including dirs a live owner is actively building into). A child removed
+    /// mid-walk contributes 0 and the walk continues; a missing ROOT is `None`.
+    #[test]
+    fn size_walk_tolerates_enoent_but_reports_a_missing_root() {
+        let (_td, root) = canonical_tempdir();
+        let d = root.join("tree");
+        std::fs::create_dir_all(d.join("sub")).expect("mk");
+        std::fs::write(d.join("a"), vec![0u8; 10]).expect("a");
+        std::fs::write(d.join("sub").join("b"), vec![0u8; 7]).expect("b");
+        assert_eq!(
+            dir_apparent_size_bytes(&d).expect("walk"),
+            Some(17),
+            "regular files summed across the tree"
+        );
+
+        assert_eq!(
+            dir_apparent_size_bytes(&root.join("absent")).expect("missing root is not an error"),
+            None,
+            "a candidate that vanished has no size to contribute"
+        );
+    }
+
+    /// The observed `lstat <path> for sizing` shape: a CHILD unlinked between
+    /// the parent's `readdir` and the child's `lstat`. This is the common case
+    /// in production, because the size walk descends dirs a live owner is
+    /// actively building into. The child contributes 0 and the walk CONTINUES.
+    #[test]
+    fn size_walk_skips_a_child_unlinked_mid_walk() {
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_td, root) = canonical_tempdir();
+        let d = root.join("tree");
+        std::fs::create_dir_all(&d).expect("mk");
+        std::fs::write(d.join("keep_a"), vec![0u8; 10]).expect("keep_a");
+        std::fs::write(d.join("vanishing_child"), vec![0u8; 1000]).expect("vanishing");
+        std::fs::write(d.join("keep_b"), vec![0u8; 7]).expect("keep_b");
+
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(|point, path: &Path| {
+                if point == ProbePoint::BeforeChildLstat
+                    && path.file_name().and_then(|n| n.to_str()) == Some("vanishing_child")
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+            });
+        let size = dir_apparent_size_bytes(&d);
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        assert_eq!(
+            size.expect("★ an unlinked child must NOT abort the size walk"),
+            Some(17),
+            "the vanished 1000-byte child contributes 0 and BOTH survivors are still summed"
+        );
+    }
 }
