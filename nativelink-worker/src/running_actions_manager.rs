@@ -4720,22 +4720,30 @@ async fn do_cleanup(
         // `assert_under_prefix` would `canonicalize` an absent path → ENOENT → a
         // spurious `Code::Internal` cleanup error. Treat a non-existent target as
         // a no-op (delete-nothing is the correct outcome).
-        match tokio::fs::try_exists(&isolated_dir).await {
-            Ok(false) => Ok(()),
-            _ => match crate::portable_incr::assert_under_prefix(&isolated_dir, &fixed_prefix) {
-                Ok(()) => {
-                    let dir_str = isolated_dir.to_string_lossy();
-                    bounded_remove_dir_all(&dir_str).await.err_tip(|| {
-                        format!(
-                            "FL-1383 portable_incr contender discard {}",
-                            isolated_dir.display()
-                        )
-                    })
-                }
-                Err(err) => {
-                    Err(err).err_tip(|| "FL-1383 portable_incr contender discard containment")
-                }
-            },
+        // `check_under_prefix` classifies that ENOENT as `Vanished` AT THE
+        // SYSCALL, where the errno is still intact. It replaces an ad-hoc
+        // `try_exists` pre-check that was ITSELF an instance of the TOCTOU this
+        // module fixed elsewhere: the dir could vanish between the probe and the
+        // `canonicalize`, producing exactly the spurious `Code::Internal` the
+        // probe existed to prevent. A containment ESCAPE and every non-ENOENT
+        // errno remain hard errors, unchanged.
+        //
+        // Residual (unchanged by this migration, narrower than the one removed):
+        // the dir can still vanish between the gate and `bounded_remove_dir_all`.
+        // That path keeps the throttled delete (`CLEANUP_DELETE_INFLIGHT_CAP`)
+        // deliberately, so it is not routed through `discard_dir_tree_confined`.
+        match crate::portable_incr::check_under_prefix(&isolated_dir, &fixed_prefix) {
+            Ok(crate::portable_incr::Containment::Vanished) => Ok(()),
+            Ok(crate::portable_incr::Containment::Confined) => {
+                let dir_str = isolated_dir.to_string_lossy();
+                bounded_remove_dir_all(&dir_str).await.err_tip(|| {
+                    format!(
+                        "FL-1383 portable_incr contender discard {}",
+                        isolated_dir.display()
+                    )
+                })
+            }
+            Err(err) => Err(err).err_tip(|| "FL-1383 portable_incr contender discard containment"),
         }
     } else {
         Ok(())
@@ -4987,8 +4995,7 @@ impl RunningActionImpl {
     /// Doubly gated, and when either gate is off it costs no `spawn_blocking`:
     /// this action must have been portable (`portable_execroot.is_some()`) AND a
     /// live [`crate::portable_incr::PortableIncrContext`] must be installed on
-    /// the manager. Both gates are OPEN on the current fleet, so this runs after
-    /// every portable action. The eviction is BLOCKING (readdir/lstat/unlink) so
+    /// the manager. The eviction is BLOCKING (readdir/lstat/unlink) so
     /// it runs under `spawn_blocking`. Any eviction failure is logged and
     /// swallowed — it must never fail the action.
     ///
@@ -5009,34 +5016,54 @@ impl RunningActionImpl {
             .await
         {
             Ok(Ok(outcome)) => {
-                if outcome.still_over_budget {
-                    warn!(
+                // Arm selection lives in `EvictionOutcome::log_arm` so it can be
+                // unit-tested; this site only renders. See `EvictionLogArm`.
+                use crate::portable_incr::EvictionLogArm;
+                match outcome.log_arm() {
+                    EvictionLogArm::Backpressure => warn!(
                         dirs_evicted = outcome.dirs_evicted,
                         leased_skipped = outcome.leased_skipped,
                         vanished_skipped = outcome.vanished_skipped,
+                        peer_pass_skipped = outcome.peer_pass_skipped,
                         bytes_remaining = outcome.bytes_remaining,
                         "FL-1383 portable_incr: warm-dir pool over budget with every remaining candidate leased — backpressure"
-                    );
-                // `vanished_skipped > 0` also logs: those passes previously
-                // emitted `error!` (722 of the 1863 passes visible in the live
-                // fleet logs at 2026-08-13T18:30Z, all ENOENT), and dropping them
-                // to `debug!` would replace a false alarm with a blind spot. The
-                // field must have a READER or it is just another
-                // computed-and-unread signal.
-                } else if outcome.dirs_evicted > 0 || outcome.vanished_skipped > 0 {
-                    info!(
+                    ),
+                    EvictionLogArm::Evicted => info!(
                         dirs_evicted = outcome.dirs_evicted,
                         bytes_freed = outcome.bytes_freed,
                         vanished_skipped = outcome.vanished_skipped,
+                        peer_pass_skipped = outcome.peer_pass_skipped,
                         leased_skipped = outcome.leased_skipped,
                         bytes_remaining = outcome.bytes_remaining,
                         "FL-1383 portable_incr: evicted warm dirs over budget"
-                    );
-                } else {
-                    debug!(
+                    ),
+                // ★ DISTINCT MESSAGE, ON PURPOSE. This pass evicted NOTHING; its
+                // candidates were removed by someone else (`vanished_skipped`) or
+                // were already being deleted by a concurrent pass on this worker
+                // (`peer_pass_skipped`). Reusing the "evicted warm dirs" text
+                // here would undo the accounting discipline the struct enforces:
+                // `AlreadyGone` is deliberately NOT credited to `dirs_evicted` so
+                // that "eviction is working" keeps meaning something, and a
+                // shared log string would hand exactly that false credit back to
+                // anyone grepping the message. This feature has ZERO metric
+                // series (964 on the endpoint, 0 matching `portable_incr`), so
+                // the log line IS the interface and its wording is load-bearing.
+                //
+                // It still logs at `info!` rather than `debug!`: these passes
+                // previously emitted `error!` (722 of the 1863 passes visible in
+                // the live fleet logs at 2026-08-13T18:30Z, all ENOENT), and
+                // demoting them would replace a false alarm with a blind spot.
+                    EvictionLogArm::FreedNothing => info!(
+                        vanished_skipped = outcome.vanished_skipped,
+                        peer_pass_skipped = outcome.peer_pass_skipped,
+                        leased_skipped = outcome.leased_skipped,
+                        bytes_remaining = outcome.bytes_remaining,
+                        "FL-1383 portable_incr: warm-dir eviction pass freed nothing — every candidate vanished or was claimed by a concurrent pass"
+                    ),
+                    EvictionLogArm::WithinBudget => debug!(
                         bytes_remaining = outcome.bytes_remaining,
                         "FL-1383 portable_incr: warm-dir pool within budget, nothing evicted"
-                    );
+                    ),
                 }
             }
             Ok(Err(err)) => {
@@ -5065,8 +5092,8 @@ impl RunningActionImpl {
     ) -> Self {
         // FL-1383 chunk 2b: an allowlisted portable-incr action drops the
         // `/work` segment — its build cwd IS the byte-identical execroot
-        // `<FIXED_PREFIX>/<targetkey>` (design §4). Every other action (the whole
-        // fleet) keeps the current `<action_directory>/work` work dir, unchanged.
+        // `<FIXED_PREFIX>/<targetkey>` (design §4). Every OTHER action keeps the
+        // current `<action_directory>/work` work dir, unchanged.
         let work_directory = match &portable_execroot {
             Some(plan) => plan.execroot().to_string_lossy().into_owned(),
             None => format!("{}/{}", action_directory, "work"),
@@ -5252,8 +5279,9 @@ impl RunningActionImpl {
         // NORMAL (non-direct-use) path — direct-use symlinks `work_directory`
         // into the DirectoryCache, but a portable action's `work_directory` IS
         // the real byte-identical execroot that rustc realpaths (design §7:
-        // "direct_use OFF by construction for allowlisted actions"). `None` on
-        // the fleet → this conjunct is a no-op and `is_direct_use` is unchanged.
+        // "direct_use OFF by construction for allowlisted actions"). `None` for a
+        // non-portable action → this conjunct is a no-op and `is_direct_use` is
+        // unchanged.
         let is_direct_use = self.portable_execroot.is_none()
             && self
                 .running_actions_manager
@@ -5741,7 +5769,7 @@ impl RunningActionImpl {
             //     `process_wrapper` gracefully skip its local setup instead of
             //     running it off an empty PathBuf → ENOENT → cold build.
             // Scoped to portable actions (`portable_targetkey.is_some()`) so a
-            // non-portable action's child env is byte-UNCHANGED — fleet-INERT, as
+            // non-portable action's child env is byte-UNCHANGED, as
             // `portable_targetkey` is `None` for every non-portable action.
             if portable_targetkey.is_some()
                 && (is_reserved_incr_env(&environment_variable.name)
@@ -6402,8 +6430,9 @@ impl RunningActionImpl {
         // targetkey member. Content `0` (cold) — the common case — bumps nothing
         // (implicit in `materialized − reuse`). Best-effort: an absent/unreadable/
         // malformed marker LOGS and leaves the counter at 0; it NEVER fails the
-        // action. Portable-gated (`portable_targetkey` is `None` for every fleet
-        // action), so off-fleet this whole block is byte-identical INERT.
+        // action. Portable-gated (`portable_targetkey` is `None` for every
+        // non-portable action), so for those this whole block is byte-identical
+        // INERT.
         let is_portable = self.state.lock().portable_targetkey.is_some();
         if is_portable {
             if let Some(marker_rel) = output_paths
@@ -6992,8 +7021,8 @@ impl Drop for RunningActionImpl {
         // sync Drop releases the cache ref_count when do_cleanup completes.
         let direct_use_pin = self.state.lock().direct_use_pin.take();
         // FL-1383 chunk 2b: a portable-incr CONTENDER's isolated execroot to
-        // cold-discard (design §9); `None` for an OWNER (preserved) and on the
-        // whole fleet. The ownership lease itself releases when `self` (holding
+        // cold-discard (design §9); `None` for an OWNER (preserved) and for a
+        // non-portable action. The ownership lease releases when `self` (holding
         // `portable_execroot`) finishes dropping.
         let portable_discard = self
             .portable_execroot
@@ -7217,8 +7246,8 @@ impl RunningAction for RunningActionImpl {
             .wrap(async move {
                 let direct_use_pin = self.state.lock().direct_use_pin.take();
                 // FL-1383 chunk 2b: cold-discard a CONTENDER's isolated execroot
-                // (design §9); `None` for an OWNER (warm dir preserved) and on
-                // the whole fleet.
+                // (design §9); `None` for an OWNER (warm dir preserved) and for
+                // a non-portable action.
                 let portable_discard = self
                     .portable_execroot
                     .as_ref()
@@ -8068,9 +8097,9 @@ pub struct RunningActionsManagerImpl {
     /// FETCHES the `-incr` seed from before rustc and PUBLISHES to after a
     /// successful allowlisted build. `Some` only when the worker config names a
     /// `portable_incr_seed_index_store` that resolved (set via
-    /// [`Self::set_incr_seed_index_store`] from `new_local_worker`); `None` on the
-    /// fleet — the whole seed path is then INERT (no fetch, no publish; a
-    /// cold-but-correct fallback), independently of `portable_incr` being `Some`.
+    /// [`Self::set_incr_seed_index_store`] from `new_local_worker`); `None` makes
+    /// the whole seed path INERT (no fetch, no publish; a cold-but-correct
+    /// fallback), independently of `portable_incr` being `Some`.
     incr_seed_index_store: Option<Store>,
 }
 
@@ -8173,8 +8202,8 @@ impl RunningActionsManagerImpl {
 
     /// FL-1383 chunk 2b: plan the byte-identical execroot for one action from
     /// its carrier Platform properties (design §4/§5). Returns `None` — the
-    /// NORMAL path, byte-for-byte today's behavior — when the feature is INERT
-    /// (`portable_incr` is `None`, the whole fleet) or the action is not an
+    /// NORMAL path, byte-for-byte the non-portable behavior — when the feature is
+    /// INERT (`portable_incr` is `None`) or the action is not an
     /// enabled+allowlisted portable-incr action. No filesystem work here.
     fn plan_portable_execroot(
         &self,
