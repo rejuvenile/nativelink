@@ -1239,9 +1239,13 @@ pub struct EvictionActor {
     /// wedged pool logs on the TRANSITION rather than once per portable action.
     /// Two-state (cleared when liveness returns), never a latch.
     reported_not_live: Arc<AtomicBool>,
-    /// Unix-millis at spawn — the reference for "overdue" before any pass has
-    /// completed, so a wedged FIRST pass is detectable too.
-    spawned_ms: u64,
+    /// The MONOTONIC origin every liveness timestamp is measured against.
+    ///
+    /// ★ NOT `SystemTime`. An earlier version of this used unix-millis, which the
+    /// delta attest correctly flagged: a backward wall-clock step (ntp, a VM
+    /// resume) DELAYS detection by exactly its size, and this detector exists for
+    /// the case where nothing else will notice. `Instant` cannot step backwards.
+    spawn_instant: std::time::Instant,
     /// How long since the last completed pass before a still-running actor is
     /// reported overdue ([`ACTOR_OVERDUE_AFTER_TICKS`] × the tick it was spawned
     /// with, so a test's short tick gets a proportionally short threshold).
@@ -1279,8 +1283,12 @@ pub(crate) enum ActorLiveness {
 /// is table-testable without timing: a liveness detector that can only be
 /// exercised by waiting is a detector nobody checks in both directions.
 ///
-/// `last_pass_ms == 0` means "no pass has completed yet", which is normal at
-/// startup, so the reference is the spawn time until the first pass lands.
+/// All three timestamps are MILLISECONDS ON ONE MONOTONIC ORIGIN (the actor's
+/// spawn `Instant`), never wall-clock: a backward wall-clock step would delay
+/// detection by exactly its size, in the one situation where nothing else is
+/// watching. `last_pass_ms == 0` means "no pass has completed yet", which is
+/// normal at startup, so the reference falls back to `spawned_ms` — which the
+/// live caller passes as 0, the origin itself.
 pub(crate) fn actor_liveness_from(
     task_finished: bool,
     last_pass_ms: u64,
@@ -1309,10 +1317,9 @@ pub(crate) fn actor_liveness_from(
 /// wolf on a merely busy box.
 const ACTOR_OVERDUE_AFTER_TICKS: u32 = 3;
 
-fn unix_millis_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// Milliseconds elapsed since `origin`, on the MONOTONIC clock.
+fn monotonic_millis_since(origin: std::time::Instant) -> u64 {
+    u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 impl EvictionActor {
@@ -1330,10 +1337,15 @@ impl EvictionActor {
     /// fire" are indistinguishable, which is how a review found both mutants
     /// surviving.
     #[must_use]
-    pub fn spawn_with_tick(ctx: PortableIncrContext, budget_bytes: u64, tick: Duration) -> Self {
+    pub(crate) fn spawn_with_tick(
+        ctx: PortableIncrContext,
+        budget_bytes: u64,
+        tick: Duration,
+    ) -> Self {
         let notify = Arc::new(Notify::new());
         let requests = Arc::new(AtomicU64::new(0));
         let last_pass_completed_ms = Arc::new(AtomicU64::new(0));
+        let spawn_instant = std::time::Instant::now();
         let task = tokio::spawn(eviction_actor_loop(
             ctx,
             budget_bytes,
@@ -1341,14 +1353,20 @@ impl EvictionActor {
             Arc::clone(&notify),
             Arc::clone(&requests),
             Arc::clone(&last_pass_completed_ms),
+            spawn_instant,
         ));
         Self {
             notify,
             requests,
             last_pass_completed_ms,
             reported_not_live: Arc::new(AtomicBool::new(false)),
-            spawned_ms: unix_millis_now(),
-            overdue_after: tick * ACTOR_OVERDUE_AFTER_TICKS,
+            spawn_instant,
+            // `Duration::mul` PANICS on overflow; a caller-supplied tick near
+            // `Duration::MAX` must degrade to "never overdue", not abort the
+            // worker.
+            overdue_after: tick
+                .checked_mul(ACTOR_OVERDUE_AFTER_TICKS)
+                .unwrap_or(Duration::MAX),
             task,
         }
     }
@@ -1358,8 +1376,10 @@ impl EvictionActor {
         actor_liveness_from(
             self.task.is_finished(),
             self.last_pass_completed_ms.load(Ordering::Relaxed),
-            self.spawned_ms,
-            unix_millis_now(),
+            // Both are ms since `spawn_instant`, so "no pass yet" (0) is also the
+            // origin and needs no separate reference.
+            0,
+            monotonic_millis_since(self.spawn_instant),
             self.overdue_after,
         )
     }
@@ -1437,6 +1457,7 @@ async fn eviction_actor_loop(
     notify: Arc<Notify>,
     requests: Arc<AtomicU64>,
     last_pass_completed_ms: Arc<AtomicU64>,
+    spawn_instant: std::time::Instant,
 ) {
     let mut requests_at_last_pass: u64 = 0;
     loop {
@@ -1474,7 +1495,7 @@ async fn eviction_actor_loop(
         // being kept alive is "this actor is still turning", not "a pass
         // succeeded". A pass that errors is loud on its own arm above; an actor
         // that stopped turning is what nothing else can see.
-        last_pass_completed_ms.store(unix_millis_now(), Ordering::Relaxed);
+        last_pass_completed_ms.store(monotonic_millis_since(spawn_instant), Ordering::Relaxed);
     }
 }
 
@@ -1842,10 +1863,18 @@ fn ensure_owner_lock_file(execroot: &Path) -> Result<(), Error> {
 /// "No record" means "nobody created one *that still has this name*", which is
 /// not the same as "no holder".
 ///
-/// So this is the ONE path in this module that can mint a FRESH INODE at a name a
-/// live holder's open file description is still locked to — the two-holders shape
-/// (FL-1383 red-team B1) that the `NoRecord` arm deliberately refuses to create at
-/// eviction time. The real precondition:
+/// So creating a record can mint a FRESH INODE at a name a live holder's open
+/// file description is still locked to — the two-holders shape (FL-1383 red-team
+/// B1) that the `NoRecord` arm deliberately refuses to create at eviction time.
+///
+/// ★ AND THIS IS NOT THE ONLY PATH THAT DOES IT — an earlier version of this
+/// comment said "the ONE path in this module", which was itself an overclaim
+/// written while correcting an overclaim. [`ensure_owner_lock_file`] is called
+/// with the same `O_CREAT` from [`ensure_and_wipe_execroot_at`] on EVERY portable
+/// owner action. What is specific to the backfill is only that it does so in BULK
+/// and for dirs no action is touching; the create-on-use path does it one dir at a
+/// time, for the dir the calling action is about to build in. Both inherit the
+/// same precondition:
 ///
 /// > The backfill is safe iff no other process is building against this prefix.
 /// > It is unsafe after any actor unlinks a `.lock` while a holder lives — which
@@ -3727,6 +3756,29 @@ mod eviction_toctou_tests {
         PASS_RV_CV.notify_all();
     }
 
+    /// Release any parked pass and wait until NONE is in flight.
+    ///
+    /// ★ REQUIRED BEFORE DROPPING `PROBE_LOCK` IN ANY ACTOR TEST. `drop(actor)`
+    /// calls `JoinHandle::abort()`, which cannot cancel a pass already inside
+    /// `spawn_blocking` — that pass runs to completion and fires the GLOBAL
+    /// probe, so without this it lands in the NEXT test's counters and fails an
+    /// assertion in a test that did nothing wrong. Observed exactly that: a stray
+    /// pass from the tick test parked in the single-flight test's rendezvous
+    /// (which sets `release = false`) and blew its 30 s deadlock detector.
+    fn drain_in_flight_passes() {
+        {
+            let mut st = PASS_RV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.release = true;
+            PASS_RV_CV.notify_all();
+        }
+        assert!(
+            wait_for_pass_state(|st| st.in_flight == 0, Duration::from_secs(30)),
+            "a pass was still in flight 30s after the actor was dropped"
+        );
+    }
+
     /// Block until `pred` holds, or the deadline passes. Returns whether it held.
     fn wait_for_pass_state(pred: impl Fn(&PassRendezvous) -> bool, deadline: Duration) -> bool {
         let mut st = PASS_RV
@@ -3888,6 +3940,7 @@ mod eviction_toctou_tests {
         );
 
         drop(actor);
+        drain_in_flight_passes();
         *VANISH_PROBE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -3957,26 +4010,52 @@ mod eviction_toctou_tests {
             "★ and it must have been the TICK, not a stray request"
         );
 
-        // ★ THE DETECTOR'S FALSE-POSITIVE DIRECTION, on a really-running actor.
-        // `overdue_after` here is 3 × 20 ms = 60 ms, so by the 4th tick a
-        // `last_pass_completed_ms` that is never REFRESHED would already read
-        // `PassOverdue` — i.e. this fails if the timestamp is written once (or
-        // not at all) instead of after every pass. The correct code keeps
-        // refreshing it every 20 ms, so scheduling delay cannot make this flake:
-        // a stall produces MORE passes, not fewer.
+        // ★ THE REFRESH ITSELF, ASSERTED AS MONOTONE PROGRESS RATHER THAN
+        // AGAINST A THRESHOLD. The first version of this compared `liveness()`
+        // against a 3 × 20 ms = 60 ms window and carried the comment "scheduling
+        // delay cannot make this flake". The delta attest REFUTED that by running
+        // it under CPU starvation — 8 failures in 60, `since_ms` 63–100 against
+        // the 60 ms threshold — and confirmed the cause with a single-variable
+        // control (widen the threshold to 50 ticks → 0/40). That is the second
+        // time on this feature that a "correctness does not depend on this
+        // timing" comment has been falsified by someone actually running it.
+        //
+        // What the mutation needs is that the timestamp ADVANCES per pass, which
+        // is what `last_pass_completed_ms` being written once (or never) breaks.
+        // Monotone progress has no threshold, so no amount of load can perturb
+        // it — a stall produces a LARGER delta, never a failure.
         assert!(
-            wait_for_pass_state(|st| st.started >= 4, Duration::from_secs(30)),
+            wait_for_pass_state(|st| st.started >= 2, Duration::from_secs(30)),
             "the actor stopped ticking"
         );
-        assert_eq!(
-            actor.liveness(),
-            ActorLiveness::Live,
-            "★ a healthy, actively-ticking actor must NOT report overdue — a \
-             liveness detector that cries wolf on a working worker gets muted, \
-             and then it is not a detector at all"
+        let first = actor.last_pass_completed_ms.load(Ordering::Relaxed);
+        assert!(
+            first > 0,
+            "★ a completed pass must REFRESH the liveness timestamp — left at 0 \
+             the actor reads as never having run, and the detector that exists to \
+             notice a dead actor would fire on a healthy one"
+        );
+        let started_then = PASS_RV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .started;
+        assert!(
+            wait_for_pass_state(
+                move |st| st.started >= started_then + 2,
+                Duration::from_secs(30)
+            ),
+            "the actor stopped ticking"
+        );
+        assert!(
+            actor.last_pass_completed_ms.load(Ordering::Relaxed) > first,
+            "★ the timestamp must advance on EVERY pass, not be written once — \
+             residue ('a pass ran at some point') is a one-way latch that reads \
+             healthy forever after the actor dies, which is the exact regression \
+             this detector exists to catch"
         );
 
         drop(actor);
+        drain_in_flight_passes();
         *VANISH_PROBE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -4043,6 +4122,85 @@ mod eviction_toctou_tests {
             ActorLiveness::Live,
             "a backwards clock saturates to 0 elapsed, never to a huge one"
         );
+    }
+
+    /// ★ THE WIRING BETWEEN THE DETECTOR AND ITS ONLY OUTPUT, WHICH WAS THE ONE
+    /// PART NOT COVERED. A delta attest replaced the whole `match self.liveness()`
+    /// block in `request()` with `let _ = (…, self.liveness());` and the entire
+    /// suite — 254 lib + 37 integration — STAYED GREEN. With that block gone the
+    /// actor is silently a single point of failure again and CI cannot tell,
+    /// which is verbatim the shape this same commit fixed one file over (a review
+    /// stubbed `ctx.ensure_owner_lock_files()` and 37/37 stayed green).
+    ///
+    /// A pure function nobody calls and an accessor nobody reads are not a
+    /// detector. This asserts on the ONLY thing an operator ever sees.
+    #[tracing_test::traced_test]
+    #[test]
+    fn request_reports_a_dead_actor_once_on_the_transition() {
+        let (_td, root) = canonical_tempdir();
+        let ctx = PortableIncrContext {
+            fixed_prefix: root.clone(),
+            config: PortableIncrConfig {
+                enabled: true,
+                action_output_allowlist: vec![],
+            },
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _enter = rt.enter();
+        let actor = EvictionActor::spawn_with_tick(ctx, u64::MAX, Duration::from_secs(3600));
+
+        // A healthy actor must stay SILENT: a detector that reports on every
+        // request is one an operator mutes, and then it is not a detector.
+        actor.request();
+        assert!(
+            !logs_contain("the warm-dir eviction actor is not running"),
+            "★ a live actor must not be reported — this fires once per portable \
+             action, so a false positive is a log storm"
+        );
+
+        actor.task.abort();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !actor.task.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        actor.request();
+        assert!(
+            logs_contain("the warm-dir eviction actor is not running"),
+            "★ `request()` MUST report a dead actor. Without this line the pool is \
+             no longer bounded and NOTHING says so: the only arm that would have \
+             fired is `WithinBudget`, which is `debug!` and compiled out of the \
+             release worker, so 'actor alive' and 'actor dead' are \
+             indistinguishable in production"
+        );
+        assert!(
+            logs_contain("NO LONGER BOUNDED"),
+            "the message must say what it COSTS, not merely that something is off"
+        );
+
+        // ...and it must not repeat on every subsequent action.
+        actor.request();
+        actor.request();
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| l.contains("the warm-dir eviction actor is not running"))
+                .count();
+            if n == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "★ the report must fire ONCE, on the TRANSITION, not per \
+                     request — 9 portable actions a second were observed on one \
+                     host, and a line each would bury the one that matters; saw \
+                     {n} across 3 requests against a dead actor"
+                ))
+            }
+        });
     }
 
     /// The live-state half of the same detector: an actor whose task has actually
