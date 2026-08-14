@@ -6976,27 +6976,70 @@ pub fn register_execution_store_metrics(
 /// actions, to reap CONTENDER dirs (`<FIXED_PREFIX>/<targetkey>.<uuid>`)
 /// orphaned by a prior worker run that crashed before Drop cold-discarded them.
 ///
+/// It ALSO backfills the A3 cross-process lease records
+/// ([`crate::portable_incr::PortableIncrContext::ensure_owner_lock_files`]): the
+/// §8 eviction fails CLOSED on a warm dir with no `<targetkey>.lock`, and the
+/// dirs that lack one are exactly the least-recently-used ones the eviction most
+/// wants — the create-on-use path never reaches a dir that is never used again.
+/// Without the backfill the disk-growth guard would be inert on any pool that
+/// predates the lease adoption.
+///
 /// INERT when the feature is off (`portable_incr` is `None`): no
-/// `spawn_blocking` is paid. The sweep itself is BLOCKING (readdir/unlink),
-/// so it runs under `spawn_blocking`. A sweep failure is logged and swallowed —
-/// it must never block worker startup.
+/// `spawn_blocking` is paid. Both steps are BLOCKING (readdir/unlink/open),
+/// so they run under one `spawn_blocking`. A failure in either is logged and
+/// swallowed — neither may block worker startup.
 pub async fn portable_incr_startup_sweep(
     portable_incr: Option<crate::portable_incr::PortableIncrContext>,
 ) {
     let Some(ctx) = portable_incr else {
         return;
     };
-    match tokio::task::spawn_blocking(move || ctx.sweep_stale_contender_dirs()).await {
-        Ok(Ok(removed)) => {
-            if removed > 0 {
-                info!(
-                    removed,
-                    "FL-1383 portable_incr: startup sweep removed stale contender dirs"
-                );
+    match tokio::task::spawn_blocking(move || {
+        // Two INDEPENDENT results, deliberately not `?`-chained: a contender
+        // sweep failure must not skip the lease backfill (or vice versa) — they
+        // repair different actors, and one being broken says nothing about the
+        // other.
+        (
+            ctx.sweep_stale_contender_dirs(),
+            ctx.ensure_owner_lock_files(),
+        )
+    })
+    .await
+    {
+        Ok((sweep, backfill)) => {
+            match sweep {
+                Ok(removed) => {
+                    if removed > 0 {
+                        info!(
+                            removed,
+                            "FL-1383 portable_incr: startup sweep removed stale contender dirs"
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        "FL-1383 portable_incr: startup contender sweep failed; continuing"
+                    );
+                }
             }
-        }
-        Ok(Err(err)) => {
-            error!(?err, "FL-1383 portable_incr: startup contender sweep failed; continuing");
+            match backfill {
+                Ok(created) => {
+                    if created > 0 {
+                        info!(
+                            created,
+                            "FL-1383 portable_incr: startup backfill created missing warm-dir lease records"
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        "FL-1383 portable_incr: startup lease-record backfill failed; continuing — \
+                         eviction will fail closed on warm dirs that still have no record"
+                    );
+                }
+            }
         }
         Err(err) => {
             error!(
@@ -7480,7 +7523,10 @@ pub async fn new_local_worker(
     // FL-1383 chunk 2b: install the portable-incr context (`None` ⇒ INERT)
     // BEFORE Arc-wrapping so the ~55 Args construction sites stay untouched.
     // See `RunningActionsManagerImpl::set_portable_incr`.
-    running_actions_manager_impl.set_portable_incr(portable_incr_context);
+    running_actions_manager_impl.set_portable_incr(
+        portable_incr_context,
+        crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES,
+    );
     // FL-1383 (design §6.1/§6.3): install the fleet-shared `incr_seed_index` store
     // handle (`None` ⇒ INERT), same pre-Arc pattern as above. The worker
     // fetches the `-incr` seed from it before rustc and publishes to it after a
