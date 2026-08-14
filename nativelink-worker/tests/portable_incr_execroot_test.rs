@@ -880,12 +880,36 @@ async fn startup_sweep_wiring_reaps_contender_when_context_present() {
     let contender = root.join(format!("{}.{}", "a".repeat(64), "b".repeat(32)));
     fs::create_dir_all(contender.join("junk")).expect("mk contender");
 
+    // ★ A pre-A3 warm dir: it exists with NO `<key>.lock`, which is the on-disk
+    // shape of every warm dir on the fleet today. Created by hand, deliberately
+    // NOT via `make_warm_dir`, because that goes through the production creator
+    // and would lay the record down for us.
+    let stale = "c".repeat(64);
+    fs::create_dir_all(root.join(&stale)).expect("mk pre-A3 warm dir");
+    assert!(
+        !root.join(format!("{stale}.lock")).exists(),
+        "fixture precondition: the pre-A3 warm dir starts with no lease record"
+    );
+
     // The exact call `new_local_worker` makes once at startup.
     portable_incr_startup_sweep(Some(ctx)).await;
 
     assert!(
         !contender.exists(),
         "startup wiring MUST invoke the sweep when a live context is installed"
+    );
+    // ★ THE SECOND HALF OF THE SAME STARTUP CALL, AND IT WAS UNCOVERED. A review
+    // replaced `ctx.ensure_owner_lock_files()` in `portable_incr_startup_sweep`
+    // with a stub and all 37 integration tests stayed green — on the change the
+    // commit itself calls "the part that must not be dropped". Without the
+    // backfill the §8 eviction fails closed on every dir that predates A3, i.e.
+    // on exactly the least-recently-used ones it exists to evict, and the
+    // disk-growth guard is inert on any pool that predates this change.
+    assert!(
+        root.join(format!("{stale}.lock")).exists(),
+        "★ startup wiring MUST also backfill the lease record for a pre-A3 warm \
+         dir — otherwise eviction refuses it forever and the guard never bounds \
+         an existing pool"
     );
 }
 

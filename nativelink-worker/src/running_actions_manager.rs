@@ -8150,11 +8150,18 @@ impl RunningActionsManagerImpl {
         warm_dir_budget_bytes: u64,
     ) {
         // Drop any prior actor BEFORE spawning the replacement, so a repeated
-        // install can never leave two actors racing the same pool.
+        // install can never leave two actor LOOPS racing the same pool.
+        //
+        // Precisely: `EvictionActor::drop` calls `JoinHandle::abort()`, which
+        // cannot cancel a pass already inside `spawn_blocking` — so a double
+        // install can still overlap two PASSES for the duration of the in-flight
+        // one, just never two loops. Production installs exactly once, before the
+        // manager is `Arc`-wrapped; and were it ever to happen, the overlap is
+        // exactly what `peer_pass_skipped` was kept to detect.
         self.warm_dir_eviction = None;
-        self.warm_dir_eviction = ctx.clone().map(|ctx| {
-            crate::portable_incr::EvictionActor::spawn(ctx, warm_dir_budget_bytes)
-        });
+        self.warm_dir_eviction = ctx
+            .clone()
+            .map(|ctx| crate::portable_incr::EvictionActor::spawn(ctx, warm_dir_budget_bytes));
         self.portable_incr = ctx;
     }
 
