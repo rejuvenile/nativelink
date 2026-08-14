@@ -4137,6 +4137,18 @@ mod eviction_toctou_tests {
     #[tracing_test::traced_test]
     #[test]
     fn request_reports_a_dead_actor_once_on_the_transition() {
+        // ★ THIS TEST RUNS A PASS (via `request()`), so it must hold the probe
+        // lock like every other test that does. Without it, its pass fires the
+        // GLOBAL `VANISH_PROBE` and lands in the single-flight test's rendezvous
+        // counters — which made THAT test fail, in the full suite only, on an
+        // assertion about a pass it never started. A test that produces passes
+        // is a probe-touching test even when it never installs a probe.
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *VANISH_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let (_td, root) = canonical_tempdir();
         let ctx = PortableIncrContext {
             fixed_prefix: root.clone(),
@@ -4210,6 +4222,13 @@ mod eviction_toctou_tests {
     /// dead task.
     #[test]
     fn liveness_observes_a_really_aborted_task() {
+        // Holds the probe lock for the same reason as the test above: it spawns a
+        // real actor, and any pass that actor runs would fire the global probe.
+        // It requests nothing today, so it runs none — the lock is what keeps
+        // that from becoming a silent dependency on a detail of this test.
+        let _serial = PROBE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_td, root) = canonical_tempdir();
         let ctx = PortableIncrContext {
             fixed_prefix: root.clone(),
