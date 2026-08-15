@@ -2261,23 +2261,37 @@ impl ByteStreamServer {
             maybe_get_part_result: None,
             bytes_sent_in_blob: read_offset_u64,
             digest_size: digest.size_bytes(),
-            get_part_fut: Box::pin(async move {
-                // Propagate the worker/non-worker distinction into the store
-                // layer so WorkerProxyStore can decide whether to proxy or
-                // redirect.
-                IS_WORKER_REQUEST
-                    .scope(is_worker, async {
-                        store
-                            .get_part(
-                                digest,
-                                tx,
-                                read_offset_u64,
-                                read_limit,
-                            )
-                            .await
-                    })
-                    .await
-            }),
+            // `read`/`zero_copy_read` resolve the client's digest function and
+            // call us inside `.with_context(make_ctx_for_hash_func(..))`, but
+            // this future is only POLLED later, when the returned stream is
+            // driven — by which time that scope is long gone. Capture the
+            // context HERE (where it is still correct) and re-attach it for
+            // the poll, otherwise `VerifyStore::get_part` reads
+            // `Context::current()`, finds nothing, and hash-verifies every
+            // read with the process-wide default instead of the function the
+            // client actually named.
+            get_part_fut: Box::pin(
+                async move {
+                    // Propagate the worker/non-worker distinction into the store
+                    // layer so WorkerProxyStore can decide whether to proxy or
+                    // redirect.
+                    IS_WORKER_REQUEST
+                        .scope(is_worker, async {
+                            store
+                                .get_part(
+                                    digest,
+                                    tx,
+                                    read_offset_u64,
+                                    read_limit,
+                                )
+                                .await
+                        })
+                        .await
+                }
+                // NB: `Context` in this file is `core::task::Context`; the
+                // OTel context must be named in full.
+                .with_context(opentelemetry::Context::current()),
+            ),
         });
 
         let read_stream_span = error_span!("read_stream");
