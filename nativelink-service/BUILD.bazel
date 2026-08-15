@@ -66,6 +66,7 @@ rust_test_suite(
         "tests/bytestream_server_test.rs",
         "tests/capabilities_server_test.rs",
         "tests/cas_server_test.rs",
+        "tests/digest_func_proving_advertised_set_test.rs",
         "tests/execution_server_test.rs",
         "tests/fastcdc_conformance_test.rs",
         "tests/fetch_server_test.rs",
@@ -130,6 +131,69 @@ rust_test(
         "@crates//:hyper-util",
         "@crates//:pretty_assertions",
         "@crates//:prost-types",
+    ],
+)
+
+# `#fl1786-server-side-digest-function-proving` chunked-site tests. Both
+# require `chunked_fast_slow` (file-level `#![cfg(...)]`) and `test-utils`
+# (the `new_with_state_and_chunk_size_for_test` / `v2_metrics_for_test`
+# accessors). As with `mirror_durability_test` in nativelink-store/BUILD.bazel
+# and the nativelink-worker mirror tests, the DEPENDED-ON library target is
+# not itself built with those features under Bazel, so the authoritative
+# coverage is the cargo CI step (`.github/workflows/native-cargo.yaml`,
+# `cargo test --features chunked_fast_slow,test-utils`); these entries make
+# the files visible to Bazel and surface them if/when feature plumbing lands.
+# Listed explicitly (no glob) to match the suites above.
+rust_test(
+    name = "server_digest_func_proving_chunked_test",
+    timeout = "short",
+    srcs = ["tests/server_digest_func_proving_chunked_test.rs"],
+    crate_features = [
+        "chunked_fast_slow",
+        "test-utils",
+    ],
+    proc_macro_deps = [
+        "//nativelink-macro",
+        "@crates//:async-trait",
+    ],
+    deps = [
+        "//nativelink-config",
+        "//nativelink-error",
+        "//nativelink-proto",
+        "//nativelink-service",
+        "//nativelink-store",
+        "//nativelink-util",
+        "@crates//:bytes",
+        "@crates//:futures",
+        "@crates//:pretty_assertions",
+        "@crates//:prost",
+        "@crates//:rand",
+        "@crates//:tokio",
+        "@crates//:tokio-stream",
+        "@crates//:tonic",
+        "@crates//:tonic-prost",
+    ],
+)
+
+rust_test(
+    name = "chunked_write_handler_metrics_render_test",
+    timeout = "short",
+    srcs = ["tests/chunked_write_handler_metrics_render_test.rs"],
+    crate_features = [
+        "chunked_fast_slow",
+        "test-utils",
+    ],
+    proc_macro_deps = [
+        "//nativelink-macro",
+        "@crates//:async-trait",
+    ],
+    deps = [
+        "//nativelink-config",
+        "//nativelink-service",
+        "//nativelink-store",
+        "//nativelink-util",
+        "@crates//:rand",
+        "@crates//:tokio",
     ],
 )
 

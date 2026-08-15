@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use core::pin::Pin;
+use core::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use opentelemetry::context::Context;
-use tracing::error;
+use tracing::{error, warn};
 
 use nativelink_config::stores::VerifySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -26,9 +27,10 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
-use nativelink_util::common::PackedHash;
+use nativelink_util::common::{DigestInfo, PackedHash};
 use nativelink_util::digest_hasher::{
-    DigestHasher, DigestHasherFunc, default_digest_hasher_func, digest_hasher_func_from_context,
+    DigestFuncProver, DigestHasher, DigestHasherFunc, default_digest_hasher_func,
+    digest_hasher_func_from_context,
 };
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
@@ -37,6 +39,26 @@ use nativelink_util::store_trait::{
     StoreKey, StoreLike,
     UploadSizeInfo,
 };
+
+/// `#fl1786`: sampling period for the per-proven-write `warn!`. Emit the
+/// FIRST occurrence and every Nth thereafter, with the always-incremented
+/// `digest_func_proven` counter carried on each emitted line as `cumulative`
+/// so the true rate stays readable.
+///
+/// 64 matches `V2_LIFECYCLE_LOG_SAMPLE_PERIOD` in
+/// `nativelink-service/src/chunked_write_handler_v2.rs`, established by
+/// `34a18cda` ("#perf: rate-limit hot-path per-request info logs") for the
+/// same failure mode: an un-rate-limited per-request line under a build
+/// burst backs up the nonblocking log writer, and this server has a standing
+/// write-burst-stall incident.
+pub const DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD: u64 = 64;
+
+/// Whether to EMIT the proven-write `warn!` at cumulative occurrence `count`
+/// (1-based). Pure and deterministic so it can be pinned directly.
+#[must_use]
+pub const fn digest_func_proven_log_decision(count: u64) -> bool {
+    count == 1 || count % DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD == 0
+}
 
 /// Hash- and size-verifying wrapper. Re-hashes incoming/outgoing streams
 /// and rejects values where `H(bytes) != key`.
@@ -66,12 +88,48 @@ pub struct VerifyStore {
     size_verification_failures: CounterWithTime,
     #[metric(help = "Number of failures the verification store had due to hash mismatches")]
     hash_verification_failures: CounterWithTime,
+    /// `#fl1786-server-side-digest-function-proving` ENGAGED-MECHANISM
+    /// signal. Bumped once per write whose bytes did NOT reproduce the
+    /// declared digest under the function the write was LABELLED with, but
+    /// DID reproduce it under another advertised function — i.e. a write
+    /// that was rejected forever before this fix.
+    ///
+    /// NOT a data-integrity signal on the WRITE side:
+    /// `hash_verification_failures` keeps that role and is deliberately NOT
+    /// bumped for a proven write. (`hash_verification_failures` is also
+    /// bumped by the READ-side mismatch in `get_part`, which after
+    /// `810ef707` is the client-digest-function read check — so it already
+    /// carries two roles and an operator cannot tell a rejected corrupt
+    /// write from a failed read by that counter alone. Pre-existing; stated
+    /// here because this field's doc used to claim otherwise.)
+    ///
+    /// This counter is the TRUE rate: the accompanying `warn!` is sampled
+    /// (`digest_func_proven_log_decision`), so the log undercounts by design
+    /// and this does not.
+    #[metric(
+        help = "Writes accepted only after PROVING the digest function from the blob's own bytes (declared digest did not reproduce under the labelled function but did under another advertised one). Do NOT alert — non-zero is mislabelled traffic being rescued rather than latched."
+    )]
+    digest_func_proven: CounterWithTime,
 }
 
 impl VerifyStore {
     /// Returns a reference to the wrapped inner store.
     pub fn inner_store(&self) -> &Store {
         &self.inner_store
+    }
+
+    /// Writes accepted only after proving the digest function from the
+    /// blob's own bytes. See the `digest_func_proven` field.
+    pub fn digest_func_proven_count(&self) -> u64 {
+        self.digest_func_proven.counter.load(Ordering::Acquire)
+    }
+
+    /// Writes rejected because no advertised digest function reproduced the
+    /// declared digest — the data-integrity alarm.
+    pub fn hash_verification_failure_count(&self) -> u64 {
+        self.hash_verification_failures
+            .counter
+            .load(Ordering::Acquire)
     }
 
     pub fn new(spec: &VerifySpec, inner_store: Store) -> Arc<Self> {
@@ -81,17 +139,65 @@ impl VerifyStore {
             verify_hash: spec.verify_hash,
             size_verification_failures: CounterWithTime::default(),
             hash_verification_failures: CounterWithTime::default(),
+            digest_func_proven: CounterWithTime::default(),
         })
     }
 
-    async fn inner_check_update<D: DigestHasher>(
+    /// `#fl1786-server-side-digest-function-proving`: when `verify_hash` is
+    /// on, `maybe_prover` carries a [`DigestFuncProver`] plus the function
+    /// the write was LABELLED with (the resource name's digest-function
+    /// segment, or the process default when the segment was omitted).
+    ///
+    /// The label is a CLAIM by the writer. The digest is a CHECKABLE one, and
+    /// this function is holding the bytes, so at EOF acceptance is decided by
+    /// "do these bytes reproduce the declared digest under ANY advertised
+    /// function", not by "do they reproduce it under the claimed one".
+    ///
+    /// Unlike the chunked-commit site, proving here CANNOT be gated on the
+    /// mismatch: the stream is consumed as it is forwarded to the inner
+    /// store, so there is nothing to re-read on the rejection path. Buffering
+    /// it to enable a retry would be an unbounded in-process buffer on a
+    /// network path, and letting the inner write commit first so it could be
+    /// re-read would open a window where an unverified blob is readable. So
+    /// every candidate is folded in during the one pass.
+    ///
+    /// **Cost: one extra hash over the same bytes.** Measured on buildcache
+    /// (EPYC 7302, `-C target-cpu=native`, load avg 2.3-2.7, two runs):
+    /// BLAKE3 3.08-3.18 GB/s, SHA-256 1.611 GB/s single-thread, so the added
+    /// SHA-256 pass is **+0.65 ms per MiB**. Sized against the server's real
+    /// write-size distribution rather than a blob COUNT, because hashing cost
+    /// is proportional to BYTES: the CAS chain's `SizePartitioning` splits at
+    /// 16 KiB and the >16 KiB partition carries **99.92% of written bytes**
+    /// (mean ~2.31 MiB, so ~1.5 ms of added CPU per mean blob), while the
+    /// ≤16 KiB partition is 50% by count but **0.077% by bytes** (mean
+    /// ~1.8 KiB, ~1.2 µs). At the measured 2.33 MB/s average server ingest
+    /// that is ~0.0015 of one core; even at `eth0`'s 40 GbE line rate — which
+    /// CAS ingest cannot reach, being bounded by 10 Mac workers and a SATA
+    /// RAIDZ1 `tank` — it is ~3.1 of 64 cores. The choice is insensitive to
+    /// the ingest-rate assumption over three orders of magnitude, which is
+    /// why there is no size gate and no request-class gate.
+    ///
+    /// Do NOT re-import the "8 KiB blobs are 73% of traffic" figure from
+    /// `nativelink-util/src/fs.rs:475-476`: that is a READ-path comment about
+    /// the WORKER's unpartitioned local store, it never says 8 KiB, and
+    /// `deferred_tasks.md:518` exists specifically to correct this
+    /// substitution.
+    ///
+    /// The per-poll consequence, which the per-core framing hides: the
+    /// deployed listeners set `experimental_http2_max_frame_size: 4194304`
+    /// (`buildcache-native.json5:474/574/687`), so a single non-yielding
+    /// `prover.update()` over a 4 MiB frame goes from ~1.4 ms (blake3 only)
+    /// to ~4.1 ms. That is a fairness cost on the tokio worker, not a new
+    /// CPU total.
+    async fn inner_check_update(
         &self,
         mut tx: DropCloserWriteHalf,
         mut rx: DropCloserReadHalf,
         maybe_expected_digest_size: Option<u64>,
-        original_hash: &PackedHash,
-        mut maybe_hasher: Option<&mut D>,
+        digest: &DigestInfo,
+        mut maybe_prover: Option<(DigestFuncProver, DigestHasherFunc)>,
     ) -> Result<(), Error> {
+        let original_hash = digest.packed_hash();
         // Writer-termination contract for `tokio::join!(update_fut, check_fut)`:
         // `update_fut` (= `inner_store.update(digest, rx, ...)`) reads from
         // `rx`. If `inner_check_update` returns Err WITHOUT terminating
@@ -167,14 +273,93 @@ impl VerifyStore {
                         )));
                     }
                 }
-                if let Some(hasher) = maybe_hasher.as_mut() {
-                    let digest = hasher.finalize_digest();
-                    let hash_result = digest.packed_hash();
-                    if original_hash != hash_result {
-                        self.hash_verification_failures.inc();
-                        return Err(tx_guard.fail(make_input_err!(
-                            "Hashes do not match, got: {original_hash} but digest hash was {hash_result}",
-                        )));
+                if let Some((prover, labelled_func)) = maybe_prover.take() {
+                    // `#fl1786`: one finalize of every candidate. A match is
+                    // unambiguous — two functions both reproducing a
+                    // well-formed digest would be a hash collision — and the
+                    // comparison is over the WHOLE `DigestInfo` (hash AND
+                    // size), so a truncated or extended body proves nothing.
+                    let candidates = prover.finalize_all();
+                    // Match on the HASH alone, then check the size
+                    // SEPARATELY. `verify_hash: true` + `verify_size: false`
+                    // is a reachable configuration — both fields are
+                    // `#[serde(default)]` and the `verify_hash` doc names no
+                    // coupling — and in it the earlier size checks are
+                    // skipped, so a blob whose bytes hash correctly but whose
+                    // DECLARED size is wrong lands here. Comparing the whole
+                    // `DigestInfo` folded that into the hash verdict and
+                    // produced "Hashes do not match, got: X but digest hash
+                    // was X" (identical hashes — nonsense to an operator)
+                    // while charging a size-declaration bug to the
+                    // data-integrity alarm. Both faults are still REJECTED;
+                    // only the attribution changes.
+                    match candidates
+                        .iter()
+                        .find(|(_, computed)| computed.packed_hash() == original_hash)
+                    {
+                        Some((_, computed)) if computed.size_bytes() != digest.size_bytes() => {
+                            self.size_verification_failures.inc();
+                            return Err(tx_guard.fail(make_input_err!(
+                                "Expected size {} but got size {} on insert",
+                                digest.size_bytes(),
+                                computed.size_bytes()
+                            )));
+                        }
+                        Some((proven_func, _)) if *proven_func == labelled_func => {}
+                        Some((proven_func, _)) => {
+                            // The label was wrong but the bytes are intact.
+                            // Pre-proving this write was rejected, the
+                            // producer re-solicited, and it failed
+                            // identically forever.
+                            self.digest_func_proven.inc();
+                            // SAMPLED. Proving SUCCEEDING is what makes this
+                            // hot: pre-fix a `--digest_function=sha256`
+                            // client was rejected on every blob so it could
+                            // not sustain traffic; post-fix it WORKS and one
+                            // build uploads tens of thousands of blobs, each
+                            // one landing here. `warn!` is NOT compiled out
+                            // in release (`release_max_level_info`). The
+                            // always-incremented counter carries the true
+                            // rate; `cumulative` puts it on every emitted
+                            // line. Same shape and constant as the
+                            // WriteChunkedV2 lifecycle logs (`34a18cda`).
+                            let cumulative = self.digest_func_proven_count();
+                            if digest_func_proven_log_decision(cumulative) {
+                                warn!(
+                                    %original_hash,
+                                    %labelled_func,
+                                    %proven_func,
+                                    cumulative,
+                                    "accepted a write whose digest function was PROVEN from its \
+                                     own bytes; the declared digest does not reproduce under the \
+                                     function the write was labelled with. The producer \
+                                     mislabelled (or omitted) the function"
+                                );
+                            }
+                        }
+                        None => {
+                            // FAIL-CLOSED: no advertised function reproduces
+                            // the declared digest, so the bytes are CORRUPT
+                            // rather than mislabelled. Report the hash under
+                            // the LABELLED function so the message is
+                            // byte-identical to the pre-proving one — it is
+                            // pinned by operators, dashboards and
+                            // `zero_copy_write_corruption_test`.
+                            self.hash_verification_failures.inc();
+                            let hash_result = candidates
+                                .iter()
+                                .find(|(func, _)| *func == labelled_func)
+                                // `PROVABLE_DIGEST_FUNCS` is the FULL
+                                // `DigestHasherFunc` set (see its doc), so the
+                                // labelled function is always a candidate;
+                                // these fallbacks only keep the expression
+                                // total.
+                                .or_else(|| candidates.first())
+                                .map_or(*original_hash, |(_, computed)| *computed.packed_hash());
+                            return Err(tx_guard.fail(make_input_err!(
+                                "Hashes do not match, got: {original_hash} but digest hash was {hash_result}",
+                            )));
+                        }
                     }
                 }
                 tx_guard
@@ -186,8 +371,8 @@ impl VerifyStore {
             // This will allows us to hash while sending data to another thread.
             let write_future = (*tx_guard).send(chunk.clone());
 
-            if let Some(hasher) = maybe_hasher.as_mut() {
-                hasher.update(chunk.as_ref());
+            if let Some((prover, _)) = maybe_prover.as_mut() {
+                prover.update(chunk.as_ref());
             }
 
             if let Err(err) = write_future
@@ -353,8 +538,12 @@ impl StoreDriver for VerifyStore {
             ));
         }
 
-        let mut hasher = if self.verify_hash {
-            Some(digest_hasher_func_from_context().hasher())
+        // `#fl1786`: the labelled function is snapshotted here (as the single
+        // hasher used to be) and carried alongside the prover so the
+        // rejection message can still name the hash under the label the
+        // writer claimed.
+        let maybe_prover = if self.verify_hash {
+            Some((DigestFuncProver::new(), digest_hasher_func_from_context()))
         } else {
             None
         };
@@ -367,13 +556,8 @@ impl StoreDriver for VerifyStore {
         let (tx, rx) = make_buf_channel_pair_with_size(256);
 
         let update_fut = self.inner_store.update(digest, rx, size_info);
-        let check_fut = self.inner_check_update(
-            tx,
-            reader,
-            maybe_digest_size,
-            digest.packed_hash(),
-            hasher.as_mut(),
-        );
+        let check_fut =
+            self.inner_check_update(tx, reader, maybe_digest_size, &digest, maybe_prover);
 
         let (update_res, check_res) = tokio::join!(update_fut, check_fut);
 

@@ -316,3 +316,23 @@ name = "bytestream_zombie_write_reaper_test"
 # `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a
 # custom `OverdeliveringStore` and runs without `test-utils` because
 # the at-rest unfold cap does not depend on any `_for_test` accessor.
+
+# `#fl1786-server-side-digest-function-proving`: real-tonic-boundary
+# `WriteChunkedV2` proving tests. The file body is
+# `#![cfg(feature = "chunked_fast_slow")]` and it uses the `test-utils`-gated
+# `new_with_state_and_chunk_size_for_test` / `v2_metrics_for_test` accessors.
+# Without this declaration a plain `cargo test -p nativelink-service` compiles
+# the file to nothing and reports `running 0 tests ... ok` (VACUOUS GREEN,
+# observed), while `--features chunked_fast_slow` alone fails to compile it.
+# Run with:
+#   `cargo test -p nativelink-service --features chunked_fast_slow,test-utils \
+#       --test server_digest_func_proving_chunked_test`
+[[test]]
+name = "server_digest_func_proving_chunked_test"
+required-features = ["chunked_fast_slow", "test-utils"]
+
+# `#fl1786`: `ChunkedWriteHandlerMetrics` render + registration-wiring
+# guard. Same feature situation as the entry above.
+[[test]]
+name = "chunked_write_handler_metrics_render_test"
+required-features = ["chunked_fast_slow", "test-utils"]

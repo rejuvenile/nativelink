@@ -342,3 +342,191 @@ impl DigestHasher for DigestHasherImpl {
         }
     }
 }
+
+/// The digest functions a holder of a blob's BYTES can PROVE a digest against.
+///
+/// Ordered BLAKE3-first so the fleet-common function is the first candidate
+/// checked; the order is a readability nicety only — [`DigestFuncProver`]
+/// hashes every candidate in one pass regardless.
+///
+/// This is deliberately the full [`DigestHasherFunc`] set rather than a
+/// configured subset: proving is an identity check against the blob's own
+/// declared digest, so a wrong candidate simply fails to match. Narrowing the
+/// set can only turn a provable blob into an unprovable one.
+///
+/// **Widening it is a THROUGHPUT change, so size it.** Each candidate is one
+/// additional full inline hash of every byte of every CAS write at
+/// `verify_store.rs::inner_check_update` (which cannot be mismatch-gated —
+/// see its doc), on the tokio worker thread. At the measured single-thread
+/// rates on buildcache (BLAKE3 ~3.1 GB/s, SHA-256 ~1.61 GB/s) a third candidate
+/// costs another ~0.3-0.65 ms per MiB of ingest, and the deployed 4 MiB HTTP/2
+/// frame size makes it another ~1.3-2.7 ms of non-yielding work per poll.
+/// REAPI's `SHA256TREE` is also 32 bytes and currently absent; adding it, or
+/// SHA-512, is not a free correctness win.
+pub const PROVABLE_DIGEST_FUNCS: [DigestHasherFunc; 2] =
+    [DigestHasherFunc::Blake3, DigestHasherFunc::Sha256];
+
+/// Compile-time link between [`DigestHasherFunc`] and
+/// [`PROVABLE_DIGEST_FUNCS`]: every variant must name the SLOT it occupies
+/// in the array.
+///
+/// Adding a variant makes this match non-exhaustive (E0004) — unlike a bare
+/// `NewVariant => {}` arm, which is what the previous form got wrong: it
+/// silenced the error with the array still at 2 and the length assert still
+/// true, leaving the new function silently NOT a proving candidate.
+///
+/// **What each half actually guarantees, stated precisely because two
+/// stronger claims made here were refuted by review mutation
+/// (`.claude/reviews/3847750f/`, M-EXH-b and M-EXH-c):**
+/// - COMPILE TIME, for the mechanical fix. `NewVariant =>
+///   PROVABLE_DIGEST_FUNCS[2]` is rejected by `deny(unconditional_panic)`
+///   ("this operation will panic at runtime … index out of bounds: the
+///   length is 2 but the index is 2"). That is a deny-BY-DEFAULT LINT, not a
+///   const-eval error, so it is suppressible with one `#[allow]` — a
+///   deliberate act, not a sweep.
+/// - RUNTIME, for everything else. `=> PROVABLE_DIGEST_FUNCS[0]` (claiming
+///   BLAKE3's slot) and `=> DigestHasherFunc::Blake3` (not indexing the array
+///   at all — the earlier claim that indexing was "the only way to satisfy
+///   it" was false, and returning the variant directly is the MORE natural
+///   mechanical fix) both compile clean. Both are caught by
+///   `digest_func_prover_test::every_wire_reachable_digest_function_is_provable`,
+///   which sweeps the proto enum through `DigestHasherFunc::try_from` and
+///   needs no variant enumeration: a new variant is only reachable by a
+///   client once it is added to those conversions, and the sweep reds the
+///   moment it is. Review re-performed that kill on the `=> Blake3` form.
+///
+/// Why any of this matters: a variant that is not a candidate re-opens the
+/// FL-1786 latch for exactly that function — blobs keyed with it that arrive
+/// under any other label are rejected forever with nothing able to rescue
+/// them. `digest_func_proving_advertised_set_test` covers the third surface
+/// (advertised ⊆ provable).
+const fn provable_slot(func: DigestHasherFunc) -> DigestHasherFunc {
+    match func {
+        DigestHasherFunc::Blake3 => PROVABLE_DIGEST_FUNCS[0],
+        DigestHasherFunc::Sha256 => PROVABLE_DIGEST_FUNCS[1],
+    }
+}
+
+const _: () = {
+    // Drive the round-trip from the array so each declared slot is checked
+    // to hold the variant that claims it.
+    let mut i = 0;
+    while i < PROVABLE_DIGEST_FUNCS.len() {
+        let func = PROVABLE_DIGEST_FUNCS[i];
+        assert!(
+            matches!(
+                (provable_slot(func), func),
+                (DigestHasherFunc::Blake3, DigestHasherFunc::Blake3)
+                    | (DigestHasherFunc::Sha256, DigestHasherFunc::Sha256)
+            ),
+            "PROVABLE_DIGEST_FUNCS and provable_slot disagree about which slot a \
+             DigestHasherFunc variant occupies"
+        );
+        i += 1;
+    }
+};
+
+/// Determines which digest function a blob was keyed with, from the blob's
+/// bytes plus its declared digest.
+///
+/// A blob's digest function is not recorded anywhere in this system — the CAS
+/// is keyed by hash BYTES (`DigestInfo` is hash + size, no function) and
+/// `UploadMissingBlobsRequest` carries only digests. But a digest is a
+/// *checkable* claim: the function is exactly the one whose hash of the bytes
+/// reproduces the declared digest. A party holding the bytes can therefore
+/// determine the function with certainty, without any protocol, provenance
+/// record, or configuration.
+///
+/// Feeds every candidate in [`PROVABLE_DIGEST_FUNCS`] from one pass over the
+/// data, so the caller reads the blob once regardless of how many candidates
+/// exist. State is O(1) in the blob size — the hashers hold their own fixed
+/// working state and the bytes are never retained.
+///
+/// See `#fl1732-backfill-mislabel-latch`: the worker answering a server
+/// `UploadMissingBlobs` had no ambient digest function, stamped the process
+/// default (blake3) onto SHA-256-keyed blobs, and the server rejected every
+/// upload forever.
+#[derive(Debug)]
+pub struct DigestFuncProver {
+    // CAPPED AT PROVABLE_DIGEST_FUNCS.len(): exactly one hasher per candidate
+    // digest function, allocated once at construction. Each hasher holds fixed
+    // internal state (Sha256 ~112 B, boxed Blake3 ~1.3 KiB); NO blob bytes are
+    // buffered here — `update` folds each chunk in and drops it.
+    hashers: Vec<(DigestHasherFunc, DigestHasherImpl)>,
+}
+
+impl Default for DigestFuncProver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DigestFuncProver {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hashers: PROVABLE_DIGEST_FUNCS
+                .iter()
+                .map(|func| (*func, func.hasher()))
+                .collect(),
+        }
+    }
+
+    /// Folds the next chunk of the blob into every candidate hasher.
+    pub fn update(&mut self, chunk: &[u8]) {
+        for (_, hasher) in &mut self.hashers {
+            DigestHasher::update(hasher, chunk);
+        }
+    }
+
+    /// Returns the candidate whose hash of the fed bytes equals `expected`, or
+    /// `None` when no candidate reproduces it.
+    ///
+    /// The comparison is against the WHOLE [`DigestInfo`] — hash and size —
+    /// because `finalize_digest` carries the byte count it hashed. A truncated
+    /// or over-long local copy therefore proves nothing, which is the correct
+    /// answer: that blob is corrupt, not mislabeled.
+    ///
+    /// `None` is a real outcome and callers MUST handle it without fabricating
+    /// a label. Two distinct functions cannot both match a well-formed digest
+    /// (that would be a hash collision), so a match is unambiguous.
+    #[must_use]
+    pub fn prove(self, expected: &DigestInfo) -> Option<DigestHasherFunc> {
+        self.finalize_all()
+            .into_iter()
+            .find(|(_, digest)| digest == expected)
+            .map(|(func, _)| func)
+    }
+
+    /// Finalizes every candidate and returns its `(function, digest)` pair, in
+    /// [`PROVABLE_DIGEST_FUNCS`] order.
+    ///
+    /// [`prove`](Self::prove) is the common case and callers should prefer it.
+    /// This exists for the one caller that must ALSO report a specific
+    /// candidate's computed hash when nothing matches: `VerifyStore`'s
+    /// rejection message (`verify_store.rs`, "Hashes do not match, got: {…}
+    /// but digest hash was {…}") names the hash under the function the write
+    /// was LABELLED with, and that message is pinned by operators, dashboards
+    /// and `zero_copy_write_corruption_test`. Recomputing it would mean a
+    /// second pass over the blob on the rejection path.
+    #[must_use]
+    pub fn finalize_all(mut self) -> Vec<(DigestHasherFunc, DigestInfo)> {
+        self.hashers
+            .iter_mut()
+            // `finalize_digest` takes `&mut self` and resets; `self` is
+            // consumed by this call so no hasher is observed after
+            // finalization.
+            .map(|(func, hasher)| (*func, DigestHasher::finalize_digest(hasher)))
+            .collect()
+    }
+}
+
+/// One-shot [`DigestFuncProver`] for a blob already buffered in memory.
+///
+/// See [`DigestFuncProver`] for the semantics of `None`.
+#[must_use]
+pub fn prove_digest_func(expected: &DigestInfo, bytes: &[u8]) -> Option<DigestHasherFunc> {
+    let mut prover = DigestFuncProver::new();
+    prover.update(bytes);
+    prover.prove(expected)
+}
