@@ -40,6 +40,16 @@
 //! The CAS chain is `VerifyStore { verify_hash, verify_size } -> MemoryStore`,
 //! matching production's `cas_STORE` seam: `VerifyStore` is the layer that
 //! re-hashes the served bytes and raises `Hash mismatch on read`.
+//!
+//! **Every case here has TWO halves, and the second one is load-bearing.**
+//! Since `#fl1786-read-half` (`fc317cca`) `VerifyStore::get_part` RESCUES a
+//! read that hashed under the wrong function, by re-reading the blob and
+//! proving it against every advertised digest function. A bytes-out assertion
+//! therefore cannot see a dropped context any more — the bytes come back
+//! either way. So each case also asserts
+//! `digest_func_proven_on_read_count() == 0`
+//! ([`assert_read_was_not_rescued_by_proving`]): the read must have succeeded
+//! on the FIRST pass, under the function the client named.
 
 use std::sync::Arc;
 
@@ -97,8 +107,8 @@ fn digest_of(func: DigestHasherFunc, data: &[u8]) -> DigestInfo {
     hasher.finalize_digest()
 }
 
-/// Returns the server plus a DIRECT handle to the leaf `MemoryStore` behind
-/// `VerifyStore`.
+/// Returns the server, a DIRECT handle to the leaf `MemoryStore` behind
+/// `VerifyStore`, and the `VerifyStore` itself.
 ///
 /// Tests seed the LEAF, not `VerifyStore`: a test-side `VerifyStore` write
 /// carries no request context, so it would hash with the process default
@@ -106,18 +116,23 @@ fn digest_of(func: DigestHasherFunc, data: &[u8]) -> DigestInfo {
 /// to do with the code under test. Seeding the leaf models "the blob is at rest
 /// in the CAS" and keeps the assertion pointed at the server's propagation of
 /// the client's digest function.
-fn make_server() -> (ByteStreamServer, Store) {
+///
+/// The `Arc<VerifyStore>` is returned so every case can assert
+/// `digest_func_proven_on_read_count() == 0` — see
+/// [`assert_read_was_not_rescued_by_proving`]. Without it these tests are
+/// structurally unable to observe the property they exist to guard.
+fn make_server() -> (ByteStreamServer, Store, Arc<VerifyStore>) {
     let store_manager = Arc::new(StoreManager::new());
     let mem = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let verify = Store::new(VerifyStore::new(
+    let verify_store = VerifyStore::new(
         &VerifySpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
             verify_size: true,
             verify_hash: true,
         },
         mem.clone(),
-    ));
-    store_manager.add_store("main_cas", verify);
+    );
+    store_manager.add_store("main_cas", Store::new(verify_store.clone()));
 
     let config = vec![WithInstanceName {
         instance_name: INSTANCE_NAME.to_string(),
@@ -131,7 +146,43 @@ fn make_server() -> (ByteStreamServer, Store) {
     (
         ByteStreamServer::new(&config, store_manager.as_ref(), None).expect("server"),
         mem,
+        verify_store,
     )
+}
+
+/// **This is what re-arms every guard in this file.**
+///
+/// `#fl1786-read-half` (`fc317cca`) gave `VerifyStore::get_part` a proving
+/// re-read: a read whose bytes do not reproduce the declared digest under the
+/// function resolved from the reader's context is re-read, folded against every
+/// advertised function, and served `Ok` if any of them reproduces the digest.
+/// That rescue makes a DROPPED digest-function context *invisible to a
+/// bytes-out assertion* — the read still returns the right bytes, just by a
+/// different route and at the cost of a second full pass through the store
+/// chain.
+///
+/// Measured, not reasoned (`.claude/reviews/fc317cca/pair-b.md` T1, reproduced
+/// here before this assertion was added): with the `810ef707` fix at
+/// `bytestream_server.rs:2293` reverted, the two `explicit_sha256_*` cases
+/// below went from `2/3 FAIL` at `55e9940d` to `3/3 PASS` at `fc317cca`. They
+/// certified context propagation while being structurally unable to observe it.
+///
+/// `digest_func_proven_on_read` is the ENGAGED-MECHANISM counter for that
+/// rescue, so `== 0` is the direct statement of "this read succeeded on the
+/// FIRST pass, under the function the client named" — which is the property
+/// `810ef707` establishes and this file exists to hold.
+fn assert_read_was_not_rescued_by_proving(verify_store: &VerifyStore, entry_point: &str) {
+    assert_eq!(
+        verify_store.digest_func_proven_on_read_count(),
+        0,
+        "#fl1786-read-half: the {entry_point} read returned the right bytes, but only because \
+         `VerifyStore`'s proving re-read RESCUED it — `digest_func_proven_on_read` ticked, which \
+         happens exactly when the first pass hashed under the WRONG function. That is the \
+         `810ef707` regression this file guards, now silent at the bytes-out level: the digest \
+         function the client named did not reach `VerifyStore::get_part`, and the only remaining \
+         signature is this counter plus a doubled read of the blob through the whole CAS chain \
+         (ExistenceCache -> SizePartitioning -> {{Memory/Redis, FastSlow}}) on every such read"
+    );
 }
 
 /// Read resource name WITH an explicit `{digest_function}` segment.
@@ -298,7 +349,7 @@ async fn explicit_sha256_zero_copy_read_verifies_with_client_digest_function() {
     pin_production_blake3_default();
     let data = b"read-side digest-function context, zero-copy entry point";
     let digest = digest_of(DigestHasherFunc::Sha256, data);
-    let (server, leaf) = make_server();
+    let (server, leaf, verify_store) = make_server();
     leaf.update_oneshot(digest, Bytes::copy_from_slice(data))
         .await
         .expect("seed blob into the leaf MemoryStore");
@@ -314,6 +365,7 @@ async fn explicit_sha256_zero_copy_read_verifies_with_client_digest_function() {
          so `VerifyStore::get_part` reads an empty `Context::current()` and \
          falls back to the process default (blake3 here, as deployed)"
     );
+    assert_read_was_not_rescued_by_proving(&verify_store, "zero-copy");
 }
 
 /// Same bug, tonic `read` entry point — the second call site of `inner_read`.
@@ -324,7 +376,7 @@ async fn explicit_sha256_tonic_read_verifies_with_client_digest_function() {
     pin_production_blake3_default();
     let data = b"read-side digest-function context, tonic entry point";
     let digest = digest_of(DigestHasherFunc::Sha256, data);
-    let (server, leaf) = make_server();
+    let (server, leaf, verify_store) = make_server();
     leaf.update_oneshot(digest, Bytes::copy_from_slice(data))
         .await
         .expect("seed blob into the leaf MemoryStore");
@@ -338,6 +390,7 @@ async fn explicit_sha256_tonic_read_verifies_with_client_digest_function() {
          `inner_read`'s future resolves, long before the returned stream polls \
          `get_part_fut`"
     );
+    assert_read_was_not_rescued_by_proving(&verify_store, "tonic");
 }
 
 /// The fleet's actual traffic: an explicit `blake3` segment, which coincides
@@ -349,7 +402,7 @@ async fn explicit_blake3_zero_copy_read_is_unchanged() {
     pin_production_blake3_default();
     let data = b"the digest function every deployed client actually sends";
     let digest = digest_of(DigestHasherFunc::Blake3, data);
-    let (server, leaf) = make_server();
+    let (server, leaf, verify_store) = make_server();
     leaf.update_oneshot(digest, Bytes::copy_from_slice(data))
         .await
         .expect("seed blob into the leaf MemoryStore");
@@ -361,4 +414,8 @@ async fn explicit_blake3_zero_copy_read_is_unchanged() {
         "regression guard: an explicit blake3 read is what the deployed fleet \
          sends on every request and must keep working byte-for-byte"
     );
+    // The fleet path must also cost nothing: with the client's function equal
+    // to the process default, proving can never be needed, so a tick here
+    // would mean the mismatch gate itself regressed on 100% of live traffic.
+    assert_read_was_not_rescued_by_proving(&verify_store, "fleet-shape blake3");
 }

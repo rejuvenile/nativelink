@@ -683,9 +683,13 @@ impl VerifyStore {
         }
 
         // FAIL-CLOSED. Counter, log and error are all byte-identical to the
-        // pre-proving ones except for the added `proving` attribution: 20
-        // pre-existing cases match on the message string and operators grep
-        // it.
+        // pre-proving ones except for the added `proving` attribution: FOUR
+        // pre-existing assertions match on the message string
+        // (`verify_store_test.rs:429/566/818/826`) and operators grep it.
+        // (The "20 pre-existing cases in two files" figure this comment
+        // carried until 2026-08-16 was `verify_store_test.rs`'s total test
+        // count; the two `bytestream_read_digest_context_test.rs` hits are
+        // doc-comments, not assertions. pair-a T-6.)
         self.hash_verification_failures.inc();
         self.hash_verification_failures_on_read.inc();
         let reread_err = match &proof {
@@ -722,6 +726,32 @@ impl VerifyStore {
     /// `get_fut` has finished and its `tx` has been dropped. This is a plain
     /// sequential second read of the same key — what any two concurrent
     /// clients of a CAS do — not a nested read inside a live one.
+    ///
+    /// **But it is NOT side-effect-free on the chain below, in both
+    /// directions.** Deployed, this store is `cas_STORE` and `inner_store` is
+    /// `cas_INNER`, an `ExistenceCacheStore` (`buildcache-native.json5:183-190`
+    /// / `:220-236`), whose `get_part` mutates cache state on BOTH arms:
+    ///
+    /// - **`Unprovable`** (the blob really is corrupt): the digest is
+    ///   re-inserted and its LRU recency refreshed
+    ///   (`existence_cache_store.rs:884-892`) once per pass, so a failed read
+    ///   now refreshes it TWICE. `VerifyStore` sits ABOVE the cache, so the
+    ///   `DataLoss` it mints one frame up can never reach the eviction arm —
+    ///   the read latch is self-reinforcing, and this doubles the rate for
+    ///   exactly the population that should be evicted. Not a capacity
+    ///   concern at `max_count: 50000000`; a correctness-of-signal one
+    ///   (`has()` keeps answering present, harder).
+    /// - **`Unreadable`** (the blob vanished between the passes): this is the
+    ///   FIRST mechanism in this chain that CAN clear a stale entry. The
+    ///   re-read's `NotFound` comes from BELOW the cache, so
+    ///   `existence_cache_store.rs:893` (`is_unrecoverable_read_error`,
+    ///   `:68`) fires and the stale entry is removed. The single-read path
+    ///   could never do that.
+    ///
+    /// Pass 2 also re-enters `FastSlowStore::get_part` for the >16 KiB
+    /// partition, which spawns or dedups onto a populate producer on a
+    /// fast-tier miss (`fast_slow_store.rs:7767`). Like the extra store I/O,
+    /// none of this amortises — nothing records the proven function.
     ///
     /// [`PROVABLE_DIGEST_FUNCS`]: nativelink_util::digest_hasher::PROVABLE_DIGEST_FUNCS
     async fn reread_and_prove(

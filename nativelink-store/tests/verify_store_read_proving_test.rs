@@ -87,7 +87,9 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::memory_store::MemoryStore;
-use nativelink_store::verify_store::VerifyStore;
+use nativelink_store::verify_store::{
+    DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD, VerifyStore, digest_func_proven_log_decision,
+};
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{
@@ -150,6 +152,66 @@ fn verify_store_over(inner: Store) -> Arc<VerifyStore> {
         },
         inner,
     )
+}
+
+/// The three reachable `ReadProof::reason()` strings, as they land on the
+/// failure `error!`'s `proving` field.
+///
+/// These are OPERATOR-TRIAGE strings and they are the stated reason
+/// `ReadProof` is a type rather than an `Option`: a `DataLoss` is one
+/// indistinguishable line unless it says whether the blob is corrupt,
+/// unreadable, or unstable — three faults with three different responses
+/// (re-upload the blob / look at the store below / declare a storage-integrity
+/// incident). Nothing pinned them, so swapping `Unreadable`'s for
+/// `Inconsistent`'s reddened no test while pointing an operator at the wrong
+/// investigation (`.claude/reviews/fc317cca/pair-b.md` T3).
+///
+/// The fourth variant's string, `Proven(_) => "proven"`, is deliberately NOT
+/// pinned: the `Proven` arm returns before the `error!` is reached, so that
+/// string is unreachable in a correct build. pair-b observed it printed only
+/// under a mutation that removed the rescue (C3).
+const REASON_UNPROVABLE: &str = "no advertised digest function reproduces the declared digest";
+const REASON_UNREADABLE: &str = "the proving re-read of the inner store failed";
+const REASON_INCONSISTENT: &str =
+    "the proving re-read returned different bytes than the pass that was served";
+
+/// Assert the failure `error!` names EXACTLY `expected` in its `proving` field.
+///
+/// Checks the other two strings are absent as well, so this fails on a SWAP and
+/// not merely on a deletion — a swap is the realistic regression (the strings
+/// are adjacent match arms) and is the one that misdirects triage rather than
+/// silencing it.
+fn assert_proving_reason(lines: &[&str], expected: &str) -> Result<(), String> {
+    let failures: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.contains("hash mismatch on read in verify store"))
+        .copied()
+        .collect();
+    if failures.len() != 1 {
+        return Err(format!(
+            "#fl1786-read-half: expected exactly ONE `hash mismatch on read in verify store` \
+             error line, saw {}. All captured lines:\n{}",
+            failures.len(),
+            lines.join("\n")
+        ));
+    }
+    let line = failures[0];
+    let wrong: Vec<&str> = [REASON_UNPROVABLE, REASON_UNREADABLE, REASON_INCONSISTENT]
+        .into_iter()
+        .filter(|r| *r != expected && line.contains(r))
+        .collect();
+    if !line.contains(expected) || !wrong.is_empty() {
+        return Err(format!(
+            "#fl1786-read-half: the failure line's `proving` field must carry \
+             `ReadProof::reason()`'s string for THIS path, verbatim.\n  expected: {expected}\n  \
+             other reasons wrongly present: {wrong:?}\n  line: {line}\nThese strings are what an \
+             operator triages a DataLoss by — corrupt blob vs unreadable inner store vs a store \
+             serving different bytes for one key are three different incidents. A swapped or \
+             widened string sends the investigation to the wrong layer and no other assertion \
+             notices"
+        ));
+    }
+    Ok(())
 }
 
 /// Inner store that COUNTS `get_part` calls and can be made to vanish the
@@ -398,11 +460,16 @@ async fn internal_no_context_read_through_a_bare_tokio_spawn_round_trips() -> Re
 // ---------------------------------------------------------------------------
 
 /// A genuinely corrupt blob must still be rejected, with the `Code` and the
-/// message BYTE-IDENTICAL to the pre-proving ones. Twenty pre-existing cases
-/// in `verify_store_test.rs` and `bytestream_read_digest_context_test.rs`
-/// match on the `"Hash mismatch on read"` string; widening the message would
-/// break operator greps and dashboards as surely as widening the verdict
-/// would break integrity.
+/// message BYTE-IDENTICAL to the pre-proving ones. FOUR pre-existing
+/// assertions — `verify_store_test.rs:429/566/818/826` — match on the
+/// `"Hash mismatch on read"` string; widening the message would break operator
+/// greps and dashboards as surely as widening the verdict would break
+/// integrity.
+///
+/// (This doc-comment said "twenty pre-existing cases in two files" until
+/// 2026-08-16. That was `verify_store_test.rs`'s total TEST COUNT, and the two
+/// `bytestream_read_digest_context_test.rs` hits are doc-comments rather than
+/// assertions — pair-a T-6, recomputed by `grep -rn "Hash mismatch on read"`.)
 #[nativelink_test]
 async fn corrupt_blob_on_read_is_still_dataloss_with_the_unchanged_message() -> Result<(), Error> {
     pin_production_default_blake3();
@@ -430,9 +497,8 @@ async fn corrupt_blob_on_read_is_still_dataloss_with_the_unchanged_message() -> 
     assert!(
         err.to_string().contains("Hash mismatch on read"),
         "#fl1786-read-half: the unprovable-read message must remain byte-identical to the \
-         pre-proving one — 20 pre-existing cases in verify_store_test.rs and \
-         bytestream_read_digest_context_test.rs match on this substring, and operators grep it. \
-         got={err:?}"
+         pre-proving one — four pre-existing assertions (verify_store_test.rs:429/566/818/826) \
+         match on this substring, and operators grep it. got={err:?}"
     );
     assert!(
         err.to_string().contains(BLAKE3_OF_VALUE),
@@ -440,6 +506,7 @@ async fn corrupt_blob_on_read_is_still_dataloss_with_the_unchanged_message() -> 
          CONTEXT-RESOLVED function (blake3 here), not a prover candidate. Reporting a different \
          candidate's hash would change a string operators and dashboards read. got={err:?}"
     );
+    logs_assert(|lines: &[&str]| assert_proving_reason(lines, REASON_UNPROVABLE));
     Ok(())
 }
 
@@ -479,6 +546,10 @@ async fn blob_evicted_between_the_two_reads_fails_closed() -> Result<(), Error> 
          failed, so the verdict an operator sees does not depend on which of two internal passes \
          hit the fault. got={err:?}"
     );
+    // The VERDICT is deliberately identical to the corrupt-blob one, so the
+    // log's `proving` field is the ONLY thing that tells an operator the inner
+    // store faulted rather than the bytes being bad.
+    logs_assert(|lines: &[&str]| assert_proving_reason(lines, REASON_UNREADABLE));
     Ok(())
 }
 
@@ -518,6 +589,11 @@ async fn a_re_read_that_returns_different_bytes_does_not_license_the_served_ones
         Code::DataLoss,
         "#fl1786-read-half: an inconsistent re-read must fail closed as DataLoss. got={err:?}"
     );
+    // A store that serves different bytes for one key is a storage-integrity
+    // incident of a different severity from a corrupt blob — and this project
+    // has an open MemoryStore partial-write corruption issue. The `proving`
+    // field is the only place that distinction survives.
+    logs_assert(|lines: &[&str]| assert_proving_reason(lines, REASON_INCONSISTENT));
     Ok(())
 }
 
@@ -672,5 +748,220 @@ async fn read_side_counters_separate_the_rescued_from_the_rejected() -> Result<(
         1,
         "#fl1786-read-half: an unprovable read bumped the RESCUED counter"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LOG VOLUME — the read side is the HOTTER of the two proving sites.
+// ---------------------------------------------------------------------------
+
+/// The sampler the read call site consumes, pinned as a pure function.
+///
+/// Its write-side twin `proven_write_log_is_sampled_first_then_every_64th`
+/// (`verify_store_digest_func_proving_test.rs:354`) makes the identical
+/// assertions; this is deliberate duplication and its marginal mutation-kill
+/// power over that twin is ZERO. It is here for one reason: the two proving
+/// sites share ONE sampler, that sharing is what the
+/// `DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD` doc-comment claims ("the two proving
+/// sites emit at the same rate"), and this file is where a reader of the read
+/// half looks. The assertion that actually kills the read-side mutation is
+/// `sixty_five_proven_reads_emit_two_warns_and_count_sixty_five` below.
+#[nativelink_test]
+async fn read_proving_warn_is_sampled_first_then_every_64th() {
+    assert_eq!(
+        DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD, 64,
+        "#fl1786-read-half: the read site must sample at the SAME period as the write site — \
+         both call `digest_func_proven_log_decision`, and the doc-comment on the constant tells \
+         an operator the two proving sites emit at one rate"
+    );
+    assert!(
+        digest_func_proven_log_decision(1),
+        "#fl1786-read-half: the FIRST rescued read must always emit; it is the operator's entry \
+         point into a mislabelling incident"
+    );
+    assert!(
+        !digest_func_proven_log_decision(2),
+        "#fl1786-read-half: occurrence 2 must be SUPPRESSED"
+    );
+    assert!(
+        digest_func_proven_log_decision(DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD),
+        "#fl1786-read-half: occurrence {DIGEST_FUNC_PROVEN_LOG_SAMPLE_PERIOD} must emit — a \
+         sampler that only ever emits once makes a sustained mislabelling reader invisible"
+    );
+}
+
+/// And pin that the READ CALL SITE honours the sampler, against the real store.
+///
+/// **This is the assertion that was missing.** Mutating
+/// `if digest_func_proven_log_decision(cumulative)` to `if true` in
+/// `prove_read_or_fail` left all 37 tests in this chain green
+/// (`.claude/reviews/fc317cca/pair-b.md` T2) — the exact failure mode the write
+/// half's own test comment names: *"Asserting only the pure function would
+/// leave an unconditional `warn!` at the call site perfectly green."* The write
+/// half carries both pins; the read half carried neither, on the hotter path.
+///
+/// ONE mislabelled blob, read 65 times — which is also the non-amortisation
+/// property stated in `reread_and_prove`'s doc-comment: nothing records the
+/// proven function, so every read of that blob proves again and emits again.
+/// The rescued readers in production are the scheduler's prefetch / cache-warm
+/// / tree-resolution tasks, which walk WHOLE DIRECTORY TREES, and `warn!` is
+/// not compiled out in release (`release_max_level_info`) on a server with a
+/// standing write-burst-stall incident.
+///
+/// The filter is the READ-side message. The seeding write is itself a proven
+/// write and emits the write-side `warn!`, whose text is "accepted a write
+/// whose digest function was PROVEN…"; matching the shared fragment "digest
+/// function was PROVEN" would silently count it.
+// NOTE: no explicit `#[tracing_test::traced_test]` — `#[nativelink_test]`
+// already applies it (`nativelink-macro/src/lib.rs`), and applying it twice
+// nests two capture buffers so `logs_assert` reads an EMPTY one.
+#[nativelink_test]
+async fn sixty_five_proven_reads_emit_two_warns_and_count_sixty_five() -> Result<(), Error> {
+    pin_production_default_blake3();
+    let store = verify_store_over(Store::new(MemoryStore::new(&MemorySpec::default())));
+    let digest = DigestInfo::try_new(SHA256_OF_VALUE, VALUE.len() as u64)?;
+
+    store
+        .update_oneshot(digest, VALUE.into())
+        .instrument(info_span!("mislabelled_write"))
+        .with_context(make_ctx_for_hash_func(DigestHasherFunc::Blake3)?)
+        .await
+        .expect("#fl1786-read-half: PRECONDITION FAILED — the write side must admit this blob");
+
+    for i in 0..65_u32 {
+        store.get_part_unchunked(digest, 0, None).await.expect(
+            "#fl1786-read-half: every read of a mislabelled-but-intact blob must be rescued; a \
+             failure here means the round trip regressed and the log-volume assertion below \
+             would be measuring nothing",
+        );
+        assert_eq!(
+            store.digest_func_proven_on_read_count(),
+            u64::from(i) + 1,
+            "#fl1786-read-half: read {i} did not take the proving path. Every read pays proving \
+             because nothing records the proven function; if some read is served without it, the \
+             65 below are not 65 rescues and the emitted-line count means nothing"
+        );
+    }
+
+    assert_eq!(
+        store.digest_func_proven_on_read_count(),
+        65,
+        "#fl1786-read-half: the COUNTER must carry the true rate — it is what the sampled log \
+         gives up precision for, and the /metrics contract the read half's observability rests on"
+    );
+    logs_assert(|lines: &[&str]| {
+        let emitted = lines
+            .iter()
+            .filter(|l| l.contains("served a read whose digest function was PROVEN"))
+            .count();
+        if emitted == 2 {
+            Ok(())
+        } else {
+            Err(format!(
+                "#fl1786-read-half: 65 rescued reads must emit exactly 2 warns (occurrences 1 \
+                 and 64); emitted {emitted}. 65 means the read call site ignores \
+                 digest_func_proven_log_decision and is back to one un-rate-limited warn per \
+                 rescued read — on the HOTTER of the two proving sites, where a single \
+                 context-less scheduler task walking a directory tree emits one line per blob, \
+                 and where warn! survives release_max_level_info. 0 means the read half's only \
+                 log signal is gone entirely"
+            ))
+        }
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// THE READER'S OWN FUNCTION — proving must compare across the passes using the
+// function THIS READER resolved, not the process default.
+// ---------------------------------------------------------------------------
+
+/// A reader that correctly names a NON-DEFAULT digest function, reading a blob
+/// keyed under the OTHER advertised one.
+///
+/// Every other test in this file resolves the process default (blake3) for the
+/// read, so `labelled_func` and `default_digest_hasher_func()` are the same
+/// value everywhere and the plumbing of the reader-resolved function from
+/// `get_part` -> `prove_read_or_fail` -> `reread_and_prove` is never exercised
+/// with a value that could distinguish them. Mutating the cross-pass
+/// consistency check's `find(|(func, _)| *func == labelled_func)` to
+/// `*func == default_digest_hasher_func()` left all 37 tests green
+/// (`.claude/reviews/fc317cca/pair-b.md` T4).
+///
+/// The uncovered failure is precisely INVERTED from the one this change fixes:
+/// pass 1's hash is computed under the READER's function, so comparing it
+/// against pass 2's DEFAULT-function hash can never match, giving
+/// `Inconsistent` -> `DataLoss` for every read whose reader correctly names a
+/// non-default function. The fix would break for exactly the population that
+/// gets the label right — an `ac_server.rs:487`-style caller, or any REAPI
+/// client that sends the `{digest_function}` segment.
+#[nativelink_test]
+async fn a_reader_naming_a_non_default_function_is_still_rescued() -> Result<(), Error> {
+    pin_production_default_blake3();
+    let store = verify_store_over(Store::new(MemoryStore::new(&MemorySpec::default())));
+
+    // The blob at rest is BLAKE3-keyed and was admitted cleanly: the process
+    // default reproduces its digest, so the write never touched proving.
+    let digest = DigestInfo::try_new(BLAKE3_OF_VALUE, VALUE.len() as u64)?;
+    store.update_oneshot(digest, VALUE.into()).await.expect(
+        "#fl1786-read-half: PRECONDITION FAILED — a correctly-labelled blake3 write must be \
+         admitted without proving",
+    );
+    assert_eq!(
+        store.digest_func_proven_count(),
+        0,
+        "#fl1786-read-half: PRECONDITION FAILED — the seeding write must NOT have been proven; \
+         if it was, the blob is not the clean blake3-keyed blob this case needs"
+    );
+
+    // The reader names SHA-256 — not the process default, and not the function
+    // the blob is keyed under. Pass 1 hashes with SHA-256, mismatches the
+    // declared BLAKE3 digest, and proving must rescue it.
+    let got = store
+        .get_part_unchunked(digest, 0, None)
+        .with_context(make_ctx_for_hash_func(DigestHasherFunc::Sha256)?)
+        .await;
+
+    let bytes = got.expect(
+        "#fl1786-read-half: a reader that CORRECTLY names a non-default digest function cannot \
+         retrieve a blob keyed under the other advertised one. Proving must compare the two \
+         passes under the function THIS READER resolved — pass 1's hash was computed under it, \
+         so comparing pass 2 under the process default instead can never agree and yields \
+         `Inconsistent` -> DataLoss. That fails the fix for exactly the population that names \
+         its digest function correctly, which is the inverse of the bug being fixed",
+    );
+    assert_eq!(
+        bytes,
+        VALUE.as_bytes(),
+        "#fl1786-read-half: the non-default-reader read returned the wrong bytes"
+    );
+    assert_eq!(
+        store.digest_func_proven_on_read_count(),
+        1,
+        "#fl1786-read-half: this case must go through the PROVING path — if the read matched on \
+         pass 1 the reader's SHA-256 context never reached `get_part` and the assertion above \
+         passed without exercising anything"
+    );
+    logs_assert(|lines: &[&str]| {
+        let rescued: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("served a read whose digest function was PROVEN"))
+            .copied()
+            .collect();
+        match rescued.as_slice() {
+            [line]
+                if line.contains("labelled_func=SHA256") && line.contains("proven_func=BLAKE3") =>
+            {
+                Ok(())
+            }
+            _ => Err(format!(
+                "#fl1786-read-half: the rescue line must attribute labelled_func=SHA256 (what \
+                 THIS reader resolved, a non-default) and proven_func=BLAKE3 (what the blob is \
+                 actually keyed under). Anything else means the two functions were confused \
+                 somewhere between `get_part` and `reread_and_prove`, which is invisible in \
+                 every test where they are equal. lines: {rescued:?}"
+            )),
+        }
+    });
     Ok(())
 }
