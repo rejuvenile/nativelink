@@ -143,6 +143,7 @@ rust_test_suite(
         "tests/size_partitioning_store_test.rs",
         "tests/verify_store_digest_func_proving_test.rs",
         "tests/verify_store_metrics_render_test.rs",
+        "tests/verify_store_read_proving_test.rs",
         "tests/verify_store_test.rs",
     ],
     compile_data = [

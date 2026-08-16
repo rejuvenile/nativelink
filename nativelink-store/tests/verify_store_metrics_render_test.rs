@@ -82,6 +82,10 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "nativelink_cas_STORE_hash_verification_failures_last_time",
     "nativelink_cas_STORE_digest_func_proven_counter",
     "nativelink_cas_STORE_digest_func_proven_last_time",
+    "nativelink_cas_STORE_digest_func_proven_on_read_counter",
+    "nativelink_cas_STORE_digest_func_proven_on_read_last_time",
+    "nativelink_cas_STORE_hash_verification_failures_on_read_counter",
+    "nativelink_cas_STORE_hash_verification_failures_on_read_last_time",
 ];
 
 fn pin_production_default_blake3() {
@@ -106,31 +110,38 @@ fn register_as_production_does(store: Arc<VerifyStore>) -> MetricsRegistry {
     registry
 }
 
-fn verify_store() -> Arc<VerifyStore> {
-    VerifyStore::new(
+/// Returns the store AND its inner handle, so a test can plant bytes BELOW
+/// the verification layer (the only way to produce a genuinely-corrupt READ,
+/// since the write side would reject the same blob).
+fn verify_store_with_inner() -> (Arc<VerifyStore>, Arc<MemoryStore>) {
+    let inner = MemoryStore::new(&MemorySpec::default());
+    let store = VerifyStore::new(
         &VerifySpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
             // Production values: buildcache-native.json5:190-191.
             verify_size: true,
             verify_hash: true,
         },
-        Store::new(MemoryStore::new(&MemorySpec::default())),
-    )
+        Store::new(inner.clone()),
+    );
+    (store, inner)
+}
+
+fn verify_store() -> Arc<VerifyStore> {
+    verify_store_with_inner().0
 }
 
 #[nativelink_test]
 async fn verify_store_counters_render_under_the_production_prefix() -> Result<(), Error> {
     pin_production_default_blake3();
-    let store = verify_store();
+    let (store, inner) = verify_store_with_inner();
 
     // Drive the counters through the REAL write path, not a setter: one
     // proven write (sha256-keyed blob labelled blake3 — the live FL-1786
     // shape) and one genuine corruption.
+    let proven_digest = DigestInfo::try_new(SHA256_OF_VALUE, VALUE.len() as u64)?;
     store
-        .update_oneshot(
-            DigestInfo::try_new(SHA256_OF_VALUE, VALUE.len() as u64)?,
-            VALUE.into(),
-        )
+        .update_oneshot(proven_digest, VALUE.into())
         .instrument(info_span!("proven_write"))
         .with_context(make_ctx_for_hash_func(DigestHasherFunc::Blake3)?)
         .await
@@ -143,6 +154,18 @@ async fn verify_store_counters_render_under_the_production_prefix() -> Result<()
         .instrument(info_span!("corrupt_write"))
         .with_context(make_ctx_for_hash_func(DigestHasherFunc::Blake3)?)
         .await;
+
+    // `#fl1786-read-half`: and the same for the READ side — one read rescued
+    // by proving (no ambient context, so blake3 is resolved against a
+    // sha256-keyed blob) and one genuinely corrupt read. The corrupt bytes go
+    // straight to the inner store because the write side would reject them.
+    store
+        .get_part_unchunked(proven_digest, 0, None)
+        .await
+        .expect("#fl1786-read-half: the proving read must succeed; else its counter renders 0");
+    let corrupt_digest = DigestInfo::try_new(SHA256_OF_OTHER, VALUE.len() as u64)?;
+    inner.update_oneshot(corrupt_digest, VALUE.into()).await?;
+    let _ = store.get_part_unchunked(corrupt_digest, 0, None).await;
 
     let body = render_prometheus(&register_as_production_does(store));
 
@@ -167,11 +190,28 @@ async fn verify_store_counters_render_under_the_production_prefix() -> Result<()
          rests on it. body=\n{body}"
     );
     assert!(
-        body.contains("\nnativelink_cas_STORE_hash_verification_failures_counter 1\n"),
-        "#fl1786: `hash_verification_failures_counter` must render the LIVE value (exactly one genuinely \
-         corrupt write above). It is the data-integrity alarm and proving must not silence it; \
-         if it renders 0 here the fail-closed path stopped being attributable on /metrics. \
-         body=\n{body}"
+        body.contains("\nnativelink_cas_STORE_hash_verification_failures_counter 2\n"),
+        "#fl1786: `hash_verification_failures_counter` must render the LIVE value (one genuinely \
+         corrupt WRITE plus one genuinely corrupt READ above — it is the AGGREGATE and the \
+         read-side split is a decomposition of it, not a move). It is the data-integrity alarm \
+         and proving must not silence it; if it renders 0 or 1 here the fail-closed path stopped \
+         being attributable on /metrics. body=\n{body}"
+    );
+    assert!(
+        body.contains("\nnativelink_cas_STORE_digest_func_proven_on_read_counter 1\n"),
+        "#fl1786-read-half: `digest_func_proven_on_read_counter` must render the LIVE value \
+         (exactly one read was rescued by proving above). This is the ONLY engaged-mechanism \
+         signal for the read half — a rescued read is by construction indistinguishable from an \
+         ordinary successful read everywhere else — so a dark counter here means the read half's \
+         entire safety argument rests on something nobody can observe. body=\n{body}"
+    );
+    assert!(
+        body.contains("\nnativelink_cas_STORE_hash_verification_failures_on_read_counter 1\n"),
+        "#fl1786-read-half: `hash_verification_failures_on_read_counter` must render the LIVE \
+         value (exactly one unprovable read above). Without it `hash_verification_failures` \
+         carries two roles and an operator cannot tell a rejected corrupt WRITE from a failed \
+         READ — which is why the falsifier both review rounds proposed for this class was not \
+         implementable. body=\n{body}"
     );
     Ok(())
 }

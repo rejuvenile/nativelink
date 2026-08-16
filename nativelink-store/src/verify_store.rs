@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use opentelemetry::context::Context;
 use tracing::{error, warn};
 
 use nativelink_config::stores::VerifySpec;
@@ -29,8 +28,7 @@ use nativelink_util::buf_channel::{
 };
 use nativelink_util::common::{DigestInfo, PackedHash};
 use nativelink_util::digest_hasher::{
-    DigestFuncProver, DigestHasher, DigestHasherFunc, default_digest_hasher_func,
-    digest_hasher_func_from_context,
+    DigestFuncProver, DigestHasher, DigestHasherFunc, digest_hasher_func_from_context,
 };
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
@@ -110,6 +108,100 @@ pub struct VerifyStore {
         help = "Writes accepted only after PROVING the digest function from the blob's own bytes (declared digest did not reproduce under the labelled function but did under another advertised one). Do NOT alert — non-zero is mislabelled traffic being rescued rather than latched."
     )]
     digest_func_proven: CounterWithTime,
+
+    /// `#fl1786-read-half` ENGAGED-MECHANISM signal for the READ side, the
+    /// mirror of `digest_func_proven`. Bumped once per read whose served
+    /// bytes did NOT reproduce the declared digest under the function
+    /// resolved from the READER's context, but DID reproduce it under
+    /// another advertised function on the proving re-read.
+    ///
+    /// This is the one signal that distinguishes "the read half never
+    /// fires" from "the read half is rescuing traffic". Without it, the
+    /// falsifier both review rounds asked for is unimplementable: a read
+    /// rescued by proving leaves no trace anywhere else, because by
+    /// construction it now looks exactly like a successful read.
+    ///
+    /// Like its write-side twin this is the TRUE rate; the accompanying
+    /// `warn!` is sampled by `digest_func_proven_log_decision`.
+    #[metric(
+        help = "Reads served only after PROVING the digest function from the blob's own bytes on a re-read (the served bytes did not reproduce the declared digest under the function resolved from the reader's context, but did under another advertised one). Do NOT alert — non-zero is a mislabelled blob being served rather than latched behind DataLoss."
+    )]
+    digest_func_proven_on_read: CounterWithTime,
+
+    /// `#fl1786-read-half`: the READ-side share of
+    /// `hash_verification_failures`, which carries TWO roles — the write-side
+    /// reject (`inner_check_update`'s no-candidate arm) and the read-side
+    /// unprovable mismatch. An operator alerting on the aggregate could not
+    /// tell a rejected corrupt WRITE from a failed READ, and both review
+    /// rounds proposed a falsifier that depended on telling them apart.
+    ///
+    /// This is a DECOMPOSITION, not a move: the aggregate still ticks on
+    /// every read failure, so every pre-existing alert and dashboard keeps
+    /// working, and `hash_verification_failures - hash_verification_failures_on_read`
+    /// is the write-side reject count.
+    ///
+    /// Bumped only when proving has ALREADY FAILED, so a rescued read never
+    /// touches the integrity alarm.
+    #[metric(
+        help = "The READ-side share of hash_verification_failures: reads that failed hash verification AND could not be rescued by proving the digest function. Subtract from hash_verification_failures to get the write-side reject count."
+    )]
+    hash_verification_failures_on_read: CounterWithTime,
+}
+
+/// Why a proving re-read did not rescue a read. Kept as a type rather than a
+/// bare `Option` so the failure `error!` can name WHICH of three very
+/// different things happened — an operator triaging a `DataLoss` needs to
+/// know whether the blob is corrupt, unreadable, or unstable, and all three
+/// otherwise collapse into one indistinguishable log line.
+#[derive(Debug)]
+enum ReadProof {
+    /// A candidate reproduced the declared digest. The blob was mislabelled,
+    /// not corrupt.
+    Proven(DigestHasherFunc),
+    /// The re-read succeeded and NO advertised function reproduced the
+    /// declared digest. The bytes are genuinely corrupt.
+    Unprovable,
+    /// The re-read itself failed (the blob was evicted between the two
+    /// passes, or the inner store faulted). Proving did not RUN, so it did
+    /// not find anything — and "could not look" must fail closed exactly
+    /// like "looked and found nothing".
+    Unreadable(Error),
+    /// The re-read returned DIFFERENT bytes than the pass that was streamed
+    /// to the caller: the labelled function's hash over pass 2 does not
+    /// equal its hash over pass 1. Whatever pass 2 proves says nothing about
+    /// the bytes the caller already holds, so this must fail closed. Only
+    /// reachable if the inner store is non-deterministic for one key, which
+    /// is itself a corruption.
+    Inconsistent,
+}
+
+impl ReadProof {
+    /// Operator-facing reason, attached to the failure `error!`.
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::Proven(_) => "proven",
+            Self::Unprovable => "no advertised digest function reproduces the declared digest",
+            Self::Unreadable(_) => "the proving re-read of the inner store failed",
+            Self::Inconsistent => {
+                "the proving re-read returned different bytes than the pass that was served"
+            }
+        }
+    }
+}
+
+/// Outcome of the streaming verification pass in [`inner_check_get_part`].
+///
+/// [`inner_check_get_part`]: VerifyStore::inner_check_get_part
+#[derive(Debug)]
+enum ReadVerifyOutcome {
+    /// Verified, or verification disabled. The writer HAS been terminated
+    /// (EOF) and the read is finished.
+    Verified,
+    /// The served bytes did not reproduce the declared hash under the
+    /// function resolved from the reader's context. The writer has
+    /// deliberately NOT been terminated — see
+    /// [`VerifyStore::inner_check_get_part`].
+    HashMismatch { computed: PackedHash },
 }
 
 impl VerifyStore {
@@ -132,6 +224,22 @@ impl VerifyStore {
             .load(Ordering::Acquire)
     }
 
+    /// Reads served only after proving the digest function from the blob's
+    /// own bytes. See the `digest_func_proven_on_read` field.
+    pub fn digest_func_proven_on_read_count(&self) -> u64 {
+        self.digest_func_proven_on_read
+            .counter
+            .load(Ordering::Acquire)
+    }
+
+    /// The READ-side share of `hash_verification_failures`. See the
+    /// `hash_verification_failures_on_read` field.
+    pub fn hash_verification_failure_on_read_count(&self) -> u64 {
+        self.hash_verification_failures_on_read
+            .counter
+            .load(Ordering::Acquire)
+    }
+
     pub fn new(spec: &VerifySpec, inner_store: Store) -> Arc<Self> {
         Arc::new(Self {
             inner_store,
@@ -140,6 +248,8 @@ impl VerifyStore {
             size_verification_failures: CounterWithTime::default(),
             hash_verification_failures: CounterWithTime::default(),
             digest_func_proven: CounterWithTime::default(),
+            digest_func_proven_on_read: CounterWithTime::default(),
+            hash_verification_failures_on_read: CounterWithTime::default(),
         })
     }
 
@@ -423,7 +533,7 @@ impl VerifyStore {
         maybe_expected_size: Option<u64>,
         original_hash: &PackedHash,
         mut maybe_hasher: Option<&mut D>,
-    ) -> Result<(), Error> {
+    ) -> Result<ReadVerifyOutcome, Error> {
         let mut sum_size: u64 = 0;
         loop {
             let chunk = rx
@@ -461,19 +571,26 @@ impl VerifyStore {
                     let digest = hasher.finalize_digest();
                     let hash_result = digest.packed_hash();
                     if original_hash != hash_result {
-                        self.hash_verification_failures.inc();
-                        error!(
-                            %original_hash,
-                            %hash_result,
-                            "hash mismatch on read in verify store"
-                        );
-                        let err = make_err!(
-                            Code::DataLoss,
-                            "Hash mismatch on read: expected {original_hash} but got {hash_result}",
-                        );
-                        // #336 P1: see size-mismatch branch above.
-                        writer.send_error(err.clone());
-                        return Err(err);
+                        // `#fl1786-read-half`: do NOT decide here, do NOT
+                        // count, and above all do NOT terminate the writer.
+                        //
+                        // Every payload byte has already been forwarded and
+                        // the writer is still un-terminated (neither
+                        // `send_eof` nor `send_error` has run), which is
+                        // exactly the state the happy path is in three lines
+                        // below. That is what makes a LATE `Ok` representable
+                        // at all: `send_error` sets `terminal_error` (a
+                        // `OnceLock`) and `eof_sent`
+                        // (`buf_channel.rs:390-403`), both one-way, so a
+                        // verdict published here could never be revised by
+                        // the proving pass.
+                        //
+                        // The bytes are also not the problem — a mislabelled
+                        // blob's bytes are CORRECT and are already correctly
+                        // in the caller's hands. Only the label was wrong.
+                        return Ok(ReadVerifyOutcome::HashMismatch {
+                            computed: *hash_result,
+                        });
                     }
                 }
                 writer
@@ -495,7 +612,190 @@ impl VerifyStore {
                 .await
                 .err_tip(|| "Failed to forward chunk to writer in verify store get_part")?;
         }
-        Ok(())
+        Ok(ReadVerifyOutcome::Verified)
+    }
+
+    /// `#fl1786-read-half`: MISMATCH-GATED proving for the read path.
+    ///
+    /// Re-reads the blob from the inner store and folds every advertised
+    /// candidate over it in ONE pass, then publishes the verdict on the
+    /// still-un-terminated writer: `send_eof` when a candidate reproduces the
+    /// declared digest, the unchanged structured `DataLoss` when none does.
+    ///
+    /// **Why mismatch-gated and not always-prove.** Reads dominate this
+    /// system (writes measured at 2.33 MB/s average), so the happy path pays
+    /// NOTHING: one hasher, one inner read, byte-for-byte the pre-change
+    /// code. This mirrors the chunked-commit site, which re-reads `.holding`
+    /// only after pass 1 mismatched. The write site could not do this — it
+    /// consumes its stream as it forwards it, with nothing to re-read — but
+    /// the read side has a re-readable source by construction, which is what
+    /// makes the cheaper shape available here.
+    ///
+    /// **The cost that IS paid, stated plainly.** On the proving path this is
+    /// one extra FULL read of the blob through the whole inner chain
+    /// (ExistenceCache → SizePartitioning → {Memory/Redis, FastSlow}), which
+    /// is more expensive per event than the write side's extra hash pass. And
+    /// it is not a one-off: a mislabelled blob read repeatedly by a
+    /// context-less reader pays it on EVERY read, because nothing records the
+    /// proven function anywhere. That is the standing argument for recording
+    /// the digest function beside the blob instead of re-deriving it at each
+    /// boundary. It is still strictly better than the status quo, where those
+    /// reads simply fail.
+    ///
+    /// **Fail-closed in every direction.** An unreadable re-read, an
+    /// inconsistent re-read, and a re-read that proves nothing all produce
+    /// the SAME `DataLoss` with the SAME message. "Could not look" is never
+    /// "looked and found nothing".
+    async fn prove_read_or_fail(
+        &self,
+        digest: DigestInfo,
+        writer: &mut DropCloserWriteHalf,
+        labelled_func: DigestHasherFunc,
+        computed: &PackedHash,
+    ) -> Result<(), Error> {
+        let original_hash = digest.packed_hash();
+        let proof = self.reread_and_prove(digest, labelled_func, computed).await;
+
+        if let ReadProof::Proven(proven_func) = proof {
+            self.digest_func_proven_on_read.inc();
+            // SAMPLED, for the same reason as the write side: proving
+            // SUCCEEDING is what makes this hot. A context-less internal
+            // reader (e.g. the scheduler's prefetch / cache-warm / tree
+            // resolution tasks, which cross a bare `tokio::spawn` and so
+            // lose the ambient function) walks whole directory trees, and
+            // `warn!` is NOT compiled out in release
+            // (`release_max_level_info`). The counter carries the true rate.
+            let cumulative = self.digest_func_proven_on_read_count();
+            if digest_func_proven_log_decision(cumulative) {
+                warn!(
+                    %original_hash,
+                    %labelled_func,
+                    %proven_func,
+                    cumulative,
+                    "served a read whose digest function was PROVEN from the blob's own bytes; \
+                     the declared digest does not reproduce under the function this reader \
+                     resolved. The blob was admitted under a different advertised function"
+                );
+            }
+            return writer
+                .send_eof()
+                .err_tip(|| "In verify_store::prove_read_or_fail sending eof");
+        }
+
+        // FAIL-CLOSED. Counter, log and error are all byte-identical to the
+        // pre-proving ones except for the added `proving` attribution: 20
+        // pre-existing cases match on the message string and operators grep
+        // it.
+        self.hash_verification_failures.inc();
+        self.hash_verification_failures_on_read.inc();
+        let reread_err = match &proof {
+            ReadProof::Unreadable(err) => Some(err.to_string()),
+            _ => None,
+        };
+        error!(
+            %original_hash,
+            hash_result = %computed,
+            proving = proof.reason(),
+            ?reread_err,
+            "hash mismatch on read in verify store"
+        );
+        let err = make_err!(
+            Code::DataLoss,
+            "Hash mismatch on read: expected {original_hash} but got {computed}",
+        );
+        // #336 P1: terminate the OUTER writer with the structured DataLoss so
+        // any wrapping caller that joins on the writer's tx/rx pair sees the
+        // specific code instead of deadlocking on an un-EOF'd writer.
+        writer.send_error(err.clone());
+        Err(err)
+    }
+
+    /// One extra read of the blob, folding every [`PROVABLE_DIGEST_FUNCS`]
+    /// candidate in a single pass.
+    ///
+    /// `PROVABLE_DIGEST_FUNCS` is exactly the set the server advertises in
+    /// its Capabilities response, so this can only accept a blob under a rule
+    /// the server has announced.
+    ///
+    /// **Why this is re-entrancy-safe.** The first read is FULLY COMPLETE
+    /// when this runs: `get_part`'s `tokio::join!` has already returned, so
+    /// `get_fut` has finished and its `tx` has been dropped. This is a plain
+    /// sequential second read of the same key — what any two concurrent
+    /// clients of a CAS do — not a nested read inside a live one.
+    ///
+    /// [`PROVABLE_DIGEST_FUNCS`]: nativelink_util::digest_hasher::PROVABLE_DIGEST_FUNCS
+    async fn reread_and_prove(
+        &self,
+        digest: DigestInfo,
+        labelled_func: DigestHasherFunc,
+        first_pass_hash: &PackedHash,
+    ) -> ReadProof {
+        // 4 slots: the prover folds at memory speed, so the channel never
+        // needs depth. Same figure and reasoning as `get_part`'s.
+        let (tx, rx) = make_buf_channel_pair_with_size(4);
+        let read_fut = async move {
+            let mut tx = tx;
+            let mut tx_guard = WriteHalfGuard::new(&mut tx);
+            let res = self
+                .inner_store
+                .get_part(digest, &mut *tx_guard, 0, None)
+                .await;
+            match &res {
+                Ok(()) => tx_guard.commit_delegated_if_ok(&res),
+                Err(err) => {
+                    let _ = tx_guard.fail(err.clone());
+                }
+            }
+            res
+        };
+        let prove_fut = async move {
+            let mut rx = rx;
+            let mut prover = DigestFuncProver::new();
+            loop {
+                let chunk = rx
+                    .recv()
+                    .await
+                    .err_tip(|| "Failed to read chunk in verify_store::reread_and_prove")?;
+                if chunk.is_empty() {
+                    break;
+                }
+                prover.update(chunk.as_ref());
+            }
+            Ok::<_, Error>(prover)
+        };
+        let (read_res, prove_res) = tokio::join!(read_fut, prove_fut);
+
+        if let Err(err) = read_res {
+            return ReadProof::Unreadable(err);
+        }
+        let prover = match prove_res {
+            Ok(prover) => prover,
+            Err(err) => return ReadProof::Unreadable(err),
+        };
+        let candidates = prover.finalize_all();
+
+        // The two passes must have seen the SAME bytes. The caller already
+        // holds pass 1's bytes; a proof over pass 2's bytes says nothing
+        // about them unless they are identical, and comparing the LABELLED
+        // candidate's hash across the passes is an exact, free check —
+        // `finalize_all` computed it anyway. Without this, a store that
+        // served corrupt bytes once and intact bytes the next time would have
+        // its corrupt read certified `Ok`.
+        let same_bytes = candidates
+            .iter()
+            .find(|(func, _)| *func == labelled_func)
+            .is_some_and(|(_, pass2)| pass2.packed_hash() == first_pass_hash);
+        if !same_bytes {
+            return ReadProof::Inconsistent;
+        }
+
+        // Whole-`DigestInfo` equality (hash AND size), the same comparison
+        // `DigestFuncProver::prove` makes: a truncated or over-long copy
+        // proves nothing, which is the correct answer.
+        candidates
+            .into_iter()
+            .find(|(_, candidate)| *candidate == digest)
+            .map_or(ReadProof::Unprovable, |(func, _)| ReadProof::Proven(func))
     }
 }
 
@@ -590,13 +890,23 @@ impl StoreDriver for VerifyStore {
             unreachable!("checked above");
         };
 
+        // `#fl1786-read-half`: the function this READER resolved — the
+        // resource name's digest-function segment when one was parsed into
+        // the context, else the process default. Snapshotted (as the single
+        // hasher used to be) and carried alongside it, because the proving
+        // pass needs to name it in the rescue log and to cross-check that
+        // both passes read the same bytes.
+        //
+        // It is a CLAIM about somebody else's blob, and a weak one: REAPI
+        // says a SHA-256 client MUST OMIT the segment
+        // (`remote_execution.proto:235-240`), and a bare `tokio::spawn` drops
+        // the ambient context entirely (unlike `nativelink_util::task::spawn!`,
+        // which re-attaches it at `task.rs:104-111`) — which is how the
+        // scheduler's prefetch, cache-warm and tree-resolution reads reach
+        // this store with nothing but the process default.
+        let labelled_func = digest_hasher_func_from_context();
         let mut hasher = if self.verify_hash {
-            Some(
-                Context::current()
-                    .get::<DigestHasherFunc>()
-                    .map_or_else(default_digest_hasher_func, |v| *v)
-                    .hasher(),
-            )
+            Some(labelled_func.hasher())
         } else {
             None
         };
@@ -672,7 +982,19 @@ impl StoreDriver for VerifyStore {
 
         let (get_res, check_res) = tokio::join!(get_fut, check_fut);
 
-        get_res.merge(check_res)
+        // `#fl1786-read-half`: the join has RETURNED, so the first read is
+        // fully complete and its `tx` is dropped. Proving therefore happens
+        // strictly after it — a sequential second read, not a nested one.
+        // This is also the only point at which the writer's verdict can still
+        // go either way.
+        match check_res {
+            Ok(ReadVerifyOutcome::Verified) => get_res,
+            Ok(ReadVerifyOutcome::HashMismatch { computed }) => get_res.merge(
+                self.prove_read_or_fail(digest, writer, labelled_func, &computed)
+                    .await,
+            ),
+            Err(err) => get_res.merge(Err(err)),
+        }
     }
 
     /// Delegates directly to the inner store **without** hash or size
