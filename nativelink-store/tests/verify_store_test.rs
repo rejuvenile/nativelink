@@ -209,7 +209,20 @@ async fn verify_sha256_hash_true_fails_on_update() -> Result<(), Error> {
 
     let digest = DigestInfo::try_new(HASH, 3).unwrap();
     let result = store.update_oneshot(digest, VALUE.into()).await;
-    let err = result.unwrap_err().to_string();
+    // `expect_err`, not `unwrap_err`: this is a genuine FAIL-OPEN guard —
+    // under a mutation that lets VerifyStore accept an unprovable blob it is
+    // one of the assertions that fires, and a bare `unwrap_err()`-on-`Ok`
+    // panic says only "called Result::unwrap_err() on an Ok value: ()",
+    // which names neither the contract nor the consequence.
+    let err = result
+        .expect_err(
+            "VerifyStore FAIL-CLOSED: a blob whose bytes do not reproduce its declared digest \
+             under the labelled digest function (SHA-256 here) must be REJECTED. This write was \
+             ACCEPTED, which means hash verification degraded into 'accept anyway' — a fail-open \
+             bypass of the CAS integrity contract that lets arbitrary bytes land under an \
+             attacker-chosen digest",
+        )
+        .to_string();
     let expected_err =
         format!("Hashes do not match, got: {HASH} but digest hash was {ACTUAL_HASH}");
     assert!(
@@ -283,7 +296,17 @@ async fn verify_blake3_hash_true_fails_on_update() -> Result<(), Error> {
         .await;
 
     // let result = store.update_oneshot(digest, VALUE.into()).await;
-    let err = result.unwrap_err().to_string();
+    // `expect_err`, not `unwrap_err` — same fail-open guard duty as
+    // `verify_sha256_hash_true_fails_on_update` above, one function over.
+    let err = result
+        .expect_err(
+            "VerifyStore FAIL-CLOSED: a blob whose bytes do not reproduce its declared digest \
+             under the labelled digest function (BLAKE3 here) must be REJECTED. This write was \
+             ACCEPTED, which means hash verification degraded into 'accept anyway' — a fail-open \
+             bypass of the CAS integrity contract that lets arbitrary bytes land under an \
+             attacker-chosen digest",
+        )
+        .to_string();
     let expected_err =
         format!("Hashes do not match, got: {HASH} but digest hash was {ACTUAL_HASH}");
     assert!(

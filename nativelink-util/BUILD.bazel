@@ -101,6 +101,7 @@ rust_test_suite(
         "tests/buf_channel_test.rs",
         "tests/channel_body_for_tests_test.rs",
         "tests/common_test.rs",
+        "tests/digest_func_prover_test.rs",
 
         "tests/fastcdc_test.rs",
         "tests/moka_evicting_map_test.rs",

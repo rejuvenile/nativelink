@@ -1186,8 +1186,21 @@ async fn inner_main(
                 fss.chunked_in_flight_digests_handle(),
                 fss.in_flight_empty_notify_handle(),
             );
-            chunked_write_handlers.insert(
-                store_name.clone(),
+            // `#fl1786`: install + register in ONE call. Until this change
+            // `ChunkedWriteHandlerMetrics` was constructed per-handler and
+            // NEVER handed to the metrics registry, so every counter on it —
+            // `sha256_e2e_mismatches_total`, `chunks_committed_total`,
+            // `commit_watchdog_fires_total`, … — was DARK on `/metrics` (the
+            // worker-metrics-exposure trap that
+            // `cas_server::register_chunking_metrics` was written to avoid
+            // for the OTHER chunking counters). `install_chunked_write_handler`
+            // makes "in the dispatch map but unregistered" unrepresentable,
+            // and is what `chunked_write_handler_metrics_render_test` drives;
+            // do NOT go back to a bare `.insert(..)` here.
+            nativelink_service::chunked_write_handler::install_chunked_write_handler(
+                &mut chunked_write_handlers,
+                &metrics_registry,
+                store_name,
                 Arc::new(handler),
             );
             info!(

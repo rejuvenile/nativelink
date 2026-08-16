@@ -91,6 +91,7 @@ use nativelink_store::fast_slow_store::ChunkedInFlightMap;
 use nativelink_store::filesystem_store::{FileEntry, FileEntryImpl, FilesystemStore};
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
+use nativelink_util::metrics_publisher::MetricsRegistry;
 
 /// Backoff hint suggested to the client on global-budget exhaustion.
 /// Matches the design §13.1.1 retry-after default for the global axis.
@@ -719,6 +720,29 @@ pub struct ChunkedWriteHandlerMetrics {
         help = "WriteChunked: end-to-end SHA-256 verify mismatches (assembled blob does not match digest)"
     )]
     pub sha256_e2e_mismatches_total: AtomicU64,
+    /// `#fl1786-server-side-digest-function-proving` ENGAGED-MECHANISM
+    /// signal. Bumped once per commit where the assembled blob did NOT
+    /// reproduce its declared digest under the process-global digest
+    /// function but DID reproduce it under another advertised one — i.e.
+    /// a commit that was rejected forever before this fix.
+    ///
+    /// This counter is ALSO the fast-path guard: it stays at zero for
+    /// every correctly-labelled blob, so a non-zero value on a fleet with
+    /// no mislabelling means the extra full read + N-way hash is running
+    /// on the hot write path.
+    ///
+    /// NOT a data-integrity signal — `sha256_e2e_mismatches_total` keeps
+    /// that role and deliberately does NOT tick for a proven blob. An I/O
+    /// error during the proving read is reported as `Code::Internal` and
+    /// bumps NEITHER of those two: only `commit_failures_total`, which is
+    /// cause-agnostic. `v2_record_e2e_verify_failure` is the single place
+    /// that decides this, and it discriminates on `err.code` — the arm used
+    /// to bump the alarm unconditionally, so this doc described the intent
+    /// rather than the code.
+    #[metric(
+        help = "WriteChunkedV2: commits accepted only after PROVING the digest function from the blob's own bytes (declared digest did not reproduce under the process default but did under another advertised function). Do NOT alert — non-zero is the fix working. Zero on a fleet logging 'end-to-end SHA-256 mismatch' means proving is NOT firing."
+    )]
+    pub digest_func_proven_total: AtomicU64,
     #[metric(help = "WriteChunked: rejections from another in-flight stream owning the same digest")]
     pub concurrent_same_digest_rejections_total: AtomicU64,
     #[metric(help = "WriteChunked: per-blob mpsc full rejections (PER_BLOB_MPSC_FULL signal)")]
@@ -1242,6 +1266,23 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     /// #494-v3 Phase 2: pub-in-crate accessor for the metrics Arc.
     pub(crate) fn metrics_for_v2(&self) -> Arc<ChunkedWriteHandlerMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Accessor for the aggregate handler metrics, so the binary can hand
+    /// the SAME Arc the handler bumps to the process `MetricsRegistry`.
+    ///
+    /// `#fl1786`: before this existed nothing outside the crate could reach
+    /// the struct, nothing registered it, and every counter on it was DARK on
+    /// `/metrics` for the handler's entire life — the same
+    /// per-instance-tree-never-registered trap that
+    /// `cas_server::register_chunking_metrics` exists to avoid for the
+    /// sibling chunking counters.
+    ///
+    /// Prefer [`install_chunked_write_handler`] over calling this directly:
+    /// registering and installing separately is what left the struct dark.
+    #[must_use]
+    pub fn metrics_component(&self) -> &Arc<ChunkedWriteHandlerMetrics> {
+        &self.metrics
     }
 
     /// #494-v3 Phase 2: pub-in-crate accessor for `chunk_size`.
@@ -3920,6 +3961,57 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
             }
         }
     }
+}
+
+/// The metric prefix a `ChunkedWriteHandler`'s counters render under, given
+/// the CAS store the handler serves. Per-CAS-store because the handler map is
+/// keyed that way and two CAS stores would otherwise publish colliding names.
+///
+/// A `pub` function rather than an inline `format!` at the call site so the
+/// wiring test and the production binary cannot drift on the prefix — the
+/// rendered names (`chunked_write_<store>_…`) are a contract with every
+/// dashboard that reads them.
+#[must_use]
+pub fn chunked_write_metrics_prefix(store_name: &str) -> String {
+    format!("chunked_write.{store_name}")
+}
+
+/// Install a `ChunkedWriteHandler` into the per-CAS-store dispatch map AND
+/// register its metrics with the process `MetricsRegistry` — as ONE
+/// operation, deliberately.
+///
+/// `#fl1786`: the two halves are inseparable because separating them is the
+/// bug. `ChunkedWriteHandlerMetrics` was constructed per-handler and never
+/// handed to any registry, so every counter on it —
+/// `sha256_e2e_mismatches_total`, `chunks_committed_total`,
+/// `commit_watchdog_fires_total`, … — was DARK on `/metrics` for the
+/// handler's entire life: computed, bumped, unreadable. A handler reachable
+/// by the write path whose counters nobody can read is exactly the state
+/// this function exists to make unrepresentable, so the binary must not
+/// insert into the map by hand.
+///
+/// **Residual, and it is NOT closed.** Nothing can force the BINARY to call
+/// this at all: `src/bin/nativelink.rs:1200` is the only production call
+/// site, it lives in the ROOT crate, and `cargo test -p nativelink-service`
+/// never compiles that crate — so deleting the CALL reds nothing. What this
+/// function buys is narrower: deleting the registration now also deletes the
+/// map insert, which takes `CasExtensionsServer` routing with it instead of
+/// silently darkening 22 counters. That routing consequence is read off
+/// `chunked_write_handler.rs:2009`/`:2034` (map miss -> no
+/// `CasExtensionsServer` -> a worker's chunked stream gets
+/// `Code::Unimplemented`); it is an argument from the source, NOT a tested
+/// property, and it should not be cited as though a gate enforced it.
+pub fn install_chunked_write_handler<Fe: FileEntry>(
+    handlers: &mut HashMap<String, Arc<ChunkedWriteHandler<Fe>>>,
+    metrics_registry: &MetricsRegistry,
+    store_name: &str,
+    handler: Arc<ChunkedWriteHandler<Fe>>,
+) {
+    metrics_registry.register(
+        chunked_write_metrics_prefix(store_name),
+        handler.metrics_component().clone(),
+    );
+    handlers.insert(store_name.to_string(), handler);
 }
 
 /// #212 fixup S1: production wiring helper. Constructs a fresh

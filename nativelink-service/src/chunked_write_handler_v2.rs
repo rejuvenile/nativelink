@@ -69,7 +69,7 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
-use nativelink_error::{Code, Error, make_err, make_input_err};
+use nativelink_error::{Code, Error, ResultExt as _, make_err, make_input_err};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     WriteChunk, WriteChunkedAck, WriteChunkedFrame, WriteChunkedResponse, watchdog_timeout_signal,
     write_chunked_ack, write_chunked_frame,
@@ -82,7 +82,9 @@ use nativelink_store::chunked_signal::encode_watchdog_timeout_signal_any;
 use nativelink_store::filesystem_store::FileEntry;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::cpu_pool::cpu_pool;
-use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
+use nativelink_util::digest_hasher::{
+    DigestFuncProver, DigestHasher, DigestHasherFunc, default_digest_hasher_func,
+};
 
 use crate::chunked_write_handler::{
     CHUNKED_COMMIT_SOFT_WARN_SECS, CHUNKED_COMMIT_WATCHDOG_SECS, ChunkedWriteHandler,
@@ -938,6 +940,114 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // already relinquish. This handles error paths uniformly.
     }
 
+    /// Stage 2 of the commit path: the end-to-end verify of the `.holding`
+    /// file, its failure cleanup, and the METRIC ATTRIBUTION of the outcome.
+    ///
+    /// **Why this is a named function and not four inline statements.**
+    /// Review found both halves of the attribution pinned and their JOIN
+    /// not: `.claude/reviews/3847750f/pair-a.md` A-1 showed that replacing
+    /// the record call with the two unconditional `fetch_add`s it replaced
+    /// left all six tests in `server_digest_func_proving_chunked_test` green,
+    /// because nothing drove the commit path's `Err` arm. Reproduced here
+    /// before the fix (`/tmp/svrprove-final-mut-A1-pre.log`, 6 passed).
+    /// The whole chain — real verify → real fault discriminant → real
+    /// counters — is now reachable from a test through
+    /// `v2_verify_and_attribute_for_test`, driven by a REAL vanished
+    /// `.holding` file (the `#256` duplicate-commit guard at
+    /// `filesystem_store.rs:2394` unlinks exactly that file and its own
+    /// comment anticipates "a sibling concurrent caller already unlinked
+    /// it") and by a REAL unprovable one.
+    ///
+    /// Returns the proven digest function when pass 2 rescued the commit,
+    /// `None` on the fast path. Behaviour is byte-identical to the inline
+    /// form it replaces except for the site-A log sampling noted below.
+    async fn v2_verify_and_attribute(
+        self: &Arc<Self>,
+        digest: &DigestInfo,
+        holding_path: &std::path::Path,
+        expected_size: u64,
+    ) -> Result<Option<DigestHasherFunc>, Error> {
+        // #538/#539 probe: cfg-gated; see the Stage 1 block in
+        // `v2_run_commit_path`.
+        #[cfg(feature = "bench-trace")]
+        let _w3_probe_verify_start = std::time::Instant::now();
+        #[cfg(feature = "bench-trace")]
+        info!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            "v2_verify_e2e_hash enter"
+        );
+        let verify_result = v2_verify_e2e_hash(holding_path, digest, expected_size).await;
+        #[cfg(feature = "bench-trace")]
+        info!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            elapsed_us = _w3_probe_verify_start.elapsed().as_micros() as u64,
+            ok = verify_result.is_ok(),
+            "v2_verify_e2e_hash exit"
+        );
+        let maybe_proven_func = match verify_result {
+            Err(fault) => {
+                // Verify failed: unlink the holding file + discard the
+                // partial entry. Surface the error.
+                let _ = self.filesystem_store_for_v2().unlink_holding(digest).await;
+                let _ = self.filesystem_store_for_v2().discard_chunked(digest).await;
+                v2_record_e2e_verify_failure(&self.metrics_for_v2(), &fault);
+                return Err(fault.into_error());
+            }
+            Ok(maybe_proven_func) => maybe_proven_func,
+        };
+        // `#fl1786`: `Some` means the declared digest did NOT reproduce under
+        // the process-global digest function but DID under `proven_func` —
+        // a commit that was rejected forever before proving existed.
+        // Deliberately does NOT touch `sha256_e2e_mismatches_total`: that
+        // counter is the corrupt-blob alarm and a proven blob is intact.
+        if let Some(proven_func) = maybe_proven_func {
+            // SAMPLED, same period and same helper as the two lifecycle
+            // lines above. Proving SUCCEEDING is what makes this reachable
+            // at rate: pre-fix a mislabelling producer was rejected on every
+            // blob so it could not sustain traffic; post-fix it works and
+            // keeps running, and `warn!` is NOT compiled out in release
+            // (`release_max_level_info`). `v2_lifecycle_log_decision` does
+            // the counter's `fetch_add` AND the sampling decision in ONE
+            // RMW against the metric itself, so the counter still carries
+            // the TRUE rate, `cumulative` is exact under concurrency, and
+            // no new state is introduced.
+            let metrics = self.metrics_for_v2();
+            let (cumulative, should_log) =
+                v2_lifecycle_log_decision(&metrics.digest_func_proven_total);
+            if should_log {
+                warn!(
+                    target: "nativelink_service::chunked_write_handler_v2",
+                    ?digest,
+                    proven_digest_function = %proven_func,
+                    process_default_digest_function = %default_digest_hasher_func(),
+                    cumulative,
+                    "WriteChunkedV2: blob accepted by PROVING its digest function from its own \
+                     bytes; the declared digest does not reproduce under the process default. \
+                     The producer mislabelled (or omitted) the function and this commit would \
+                     have been rejected on every retry",
+                );
+            }
+        }
+        Ok(maybe_proven_func)
+    }
+
+    /// Test-only shim for [`Self::v2_verify_and_attribute`] — the SEAM where
+    /// a real verify outcome becomes a counter. Separate compilation unit,
+    /// same `_for_test` pattern as `v2_metrics_for_test`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn v2_verify_and_attribute_for_test(
+        self: &Arc<Self>,
+        digest: &DigestInfo,
+        holding_path: &std::path::Path,
+        expected_size: u64,
+    ) -> Result<Option<DigestHasherFunc>, Error> {
+        self.v2_verify_and_attribute(digest, holding_path, expected_size)
+            .await
+    }
+
     /// Run the commit path: commit_to_holding (rename .partial →
     /// .holding + length validation), end-to-end BLAKE3 hash verify
     /// against .holding, finalize_holding (rename .holding → canonical
@@ -994,40 +1104,11 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             "commit_chunked_to_holding exit"
         );
 
-        // Stage 2: end-to-end hash verify against the .holding file.
+        // Stage 2: end-to-end hash verify against the .holding file,
+        // its failure cleanup, and the attribution of the outcome.
         let holding_path = self.filesystem_store_for_v2().holding_content_path(digest);
-        // #538/#539 probe: cfg-gated; see Stage 1 block above.
-        #[cfg(feature = "bench-trace")]
-        let _w3_probe_verify_start = std::time::Instant::now();
-        #[cfg(feature = "bench-trace")]
-        info!(
-            target: "nativelink_service::w3_probe",
-            ?digest,
-            "v2_verify_e2e_hash enter"
-        );
-        let verify_result =
-            v2_verify_e2e_hash(&holding_path, digest, expected_size).await;
-        #[cfg(feature = "bench-trace")]
-        info!(
-            target: "nativelink_service::w3_probe",
-            ?digest,
-            elapsed_us = _w3_probe_verify_start.elapsed().as_micros() as u64,
-            ok = verify_result.is_ok(),
-            "v2_verify_e2e_hash exit"
-        );
-        if let Err(err) = verify_result {
-            // Hash mismatch: unlink the holding file + discard the
-            // partial entry. Surface the error.
-            let _ = self.filesystem_store_for_v2().unlink_holding(digest).await;
-            let _ = self.filesystem_store_for_v2().discard_chunked(digest).await;
-            self.metrics_for_v2()
-                .sha256_e2e_mismatches_total
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics_for_v2()
-                .commit_failures_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(err);
-        }
+        self.v2_verify_and_attribute(digest, &holding_path, expected_size)
+            .await?;
 
         // Stage 3: finalize_holding (rename .holding → canonical +
         // chmod + index insert).
@@ -1200,69 +1281,257 @@ async fn compute_sha256_blocking_v2(bytes: Bytes) -> Result<[u8; 32], Error> {
     })
 }
 
+/// The VERDICT half of a failed end-to-end verify, carried separately from
+/// the `Error` that goes to the client.
+///
+/// `#fl1786` fix-up. Attribution used to be INFERRED from the error's code
+/// (`err.code == Code::InvalidArgument` meant "corrupt"). That made the
+/// corrupt-blob alarm a function of a value any `make_err!` or `map_err`
+/// inside [`v2_verify_e2e_hash`]'s closure is free to choose, and a review
+/// mutation proved it was not hypothetical: appending
+/// `.map_err(|e| make_err!(Code::InvalidArgument, "{e:?}"))` to the pass-2
+/// re-read re-filed a pass-2 `ENOENT` under the corruption alarm with the
+/// whole suite green (`.claude/reviews/3847750f/pair-b.md`, M13).
+///
+/// The counter decision now reads this DISCRIMINANT, so the code cannot
+/// forge the verdict. Both `Corrupt` construction sites are explicit and
+/// both are statements about the BYTES; everything that reaches a `?` — i.e.
+/// every error either `v2_fold_holding_file` pass can produce — becomes
+/// `Io` through the [`From`] impl below and can never become `Corrupt` by
+/// choosing a code.
+enum V2VerifyFault {
+    /// INTEGRITY VERDICT: the bytes on disk DISPROVE the declared digest.
+    /// Either no advertised digest function reproduces the declared hash, or
+    /// the assembled length disagrees with the declared `size_bytes` —
+    /// `DigestInfo` identity is hash AND size, so a length disagreement
+    /// disproves the blob under every function.
+    Corrupt(Error),
+    /// The verify could not COMPLETE. Proves NOTHING in either direction —
+    /// the blob was neither proven nor disproven.
+    Io(Error),
+}
+
+impl V2VerifyFault {
+    /// The error to propagate to the client. Unchanged from base at every
+    /// site: the wire code is a separate concern from the attribution.
+    fn into_error(self) -> Error {
+        match self {
+            Self::Corrupt(err) | Self::Io(err) => err,
+        }
+    }
+
+    /// Whether this fault is a statement about the BYTES rather than about
+    /// the server's ability to read them.
+    const fn is_integrity_verdict(&self) -> bool {
+        matches!(self, Self::Corrupt(_))
+    }
+}
+
+/// Every `Error` that propagates out of a verify fold via `?` is an I/O
+/// fault. This impl is the load-bearing half of the M13 fix: it is why the
+/// integrity verdict has only the two explicit `V2VerifyFault::Corrupt(..)`
+/// construction sites and why no `Code` chosen inside the folds can reach
+/// the corrupt-blob alarm.
+impl From<Error> for V2VerifyFault {
+    fn from(err: Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// File a FAILED end-to-end verify under the right counter.
+///
+/// `#fl1786`: `sha256_e2e_mismatches_total` is the CORRUPT-BLOB alarm — its
+/// own help text tells the operator a non-zero value means the assembled
+/// blob does not match its digest. Only [`V2VerifyFault::Corrupt`] is that
+/// verdict.
+///
+/// An [`V2VerifyFault::Io`] proves NOTHING in either direction — the blob was
+/// neither proven nor disproven. Filing those under the alarm is not
+/// hypothetical: the pass-2 proving re-read opens `.holding` a SECOND time,
+/// and that file has live concurrent unlinkers — `filesystem_store.rs:2394`
+/// (the `#256` duplicate-commit guard in `finalize_holding`, whose own
+/// comment reads "covers the case where a sibling concurrent caller already
+/// unlinked it") plus the `#497` owner-drop class — so an `ENOENT` between
+/// the two passes is reachable, on exactly the mislabelled digests the
+/// proving pass exists to rescue. An operator would see the corruption alarm
+/// fire on intact blobs. (This also repairs the PRE-EXISTING mis-filing of
+/// pass-1 open/read faults, which the arm has had since the counter was
+/// introduced.)
+///
+/// `commit_failures_total` is unconditional: a failed commit is a failed
+/// commit whatever the cause, and it is what keeps an I/O-fault storm
+/// visible somewhere.
+fn v2_record_e2e_verify_failure(metrics: &Arc<ChunkedWriteHandlerMetrics>, fault: &V2VerifyFault) {
+    if fault.is_integrity_verdict() {
+        metrics
+            .sha256_e2e_mismatches_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    metrics.commit_failures_total.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Test-only shim for [`v2_verify_e2e_hash`], so the I/O-fault error SHAPE
+/// (`Code::Internal`, never `Code::InvalidArgument`) can be pinned against a
+/// real vanished `.holding` file rather than asserted from the source. The
+/// verdict discriminant is deliberately NOT exposed — a test asserts the
+/// verdict through the counters it produces at the real seam
+/// (`v2_verify_and_attribute_for_test`), never by reading a shape the
+/// production consumer does not read.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn v2_verify_e2e_hash_for_test(
+    holding_path: &std::path::Path,
+    digest: &DigestInfo,
+    expected_size: u64,
+) -> Result<Option<DigestHasherFunc>, Error> {
+    v2_verify_e2e_hash(holding_path, digest, expected_size)
+        .await
+        .map_err(V2VerifyFault::into_error)
+}
+
+/// Fold the whole `.holding` file through `sink`, returning the byte count.
+///
+/// Reads in `READ_CHUNK`-sized bites so a multi-hundred-MiB blob never lands
+/// in RAM at once. Shared by both passes of [`v2_verify_e2e_hash`] so the
+/// second pass cannot drift from the first in buffer size or error shape.
+fn v2_fold_holding_file(
+    path: &std::path::Path,
+    sink: &mut impl FnMut(&[u8]),
+) -> Result<u64, Error> {
+    // Sized to ZFS `recordsize=1M` on `fast/nativelink/work`.
+    const READ_CHUNK: usize = 1024 * 1024;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "WriteChunkedV2: open .holding for e2e verify failed: {e:?} (path: {})",
+            path.display()
+        )
+    })?;
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "WriteChunkedV2: read .holding for e2e verify failed: {e:?}"
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        sink(&buf[..n]);
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 /// Re-read the `.holding` file from disk and compute the end-to-end
 /// hash; verify it equals the digest's hash. Catches the lying-producer
 /// case AND the cross-writer race case where two writers' chunks at
 /// different offsets somehow disagree (impossible with the
 /// position-based chunker invariant, but the e2e verify is the
 /// load-bearing safety net).
+///
+/// `#fl1786-server-side-digest-function-proving`. `WriteChunk`
+/// (`worker_api.proto:1463-1475`) carries no digest-function field and the
+/// producer of a backfill upload has no ambient one either, so the function
+/// used here USED TO BE the process-global `default_digest_hasher_func()` —
+/// a GUESS about somebody else's blob. When the guess was wrong the commit
+/// was rejected, the server stayed missing the blob, and the next
+/// `BlobsAvailable` tick re-solicited it: a latch, not a retry.
+///
+/// A digest is a CHECKABLE CLAIM and this function is holding the bytes, so
+/// it determines the function instead of guessing. Two passes:
+///
+/// 1. the process-global function, byte-identical to before — one read, one
+///    hash. A correctly-labelled blob pays NOTHING extra and returns
+///    `Ok(None)`. This is the 99.99% path.
+/// 2. ONLY when pass 1 mismatches — i.e. only on commits that would
+///    otherwise be REJECTED outright — re-read the file and fold it through
+///    every candidate in `PROVABLE_DIGEST_FUNCS` in one pass.
+///    `Ok(Some(func))` means the blob genuinely hashes to its declared
+///    digest under `func`.
+///
+/// Gating pass 2 on the mismatch is what keeps the hot write path free: the
+/// extra full read + N-way hash is paid only where the alternative is a
+/// permanent rejection, so its cost is bounded by the mislabelled-traffic
+/// rate rather than by total ingest.
+///
+/// **Fail-closed.** Acceptance still requires a genuine hash match:
+/// `DigestFuncProver::prove` compares the WHOLE `DigestInfo` (hash AND
+/// size), so a truncated or extended body proves nothing. When no candidate
+/// reproduces the declared digest the blob is CORRUPT, not mislabelled, and
+/// the unchanged `InvalidArgument` mismatch error is returned. An I/O
+/// failure during either pass is [`V2VerifyFault::Io`] and is NOT a
+/// data-integrity verdict — it must never be reported as "unprovable".
 async fn v2_verify_e2e_hash(
     holding_path: &std::path::Path,
     digest: &DigestInfo,
     expected_size: u64,
-) -> Result<(), Error> {
+) -> Result<Option<DigestHasherFunc>, V2VerifyFault> {
     let holding_path_owned = holding_path.to_path_buf();
     let digest_for_blocking = *digest;
-    let (tx, rx) = oneshot::channel::<Result<(), Error>>();
+    let (tx, rx) = oneshot::channel::<Result<Option<DigestHasherFunc>, V2VerifyFault>>();
     cpu_pool().spawn(move || {
-        // Read the file in chunks to avoid loading large blobs into
-        // RAM all at once.
-        const READ_CHUNK: usize = 1024 * 1024;
-        let mut hasher = default_digest_hasher_func().hasher();
-        let result = (|| -> Result<(), Error> {
-            use std::io::Read;
-            let mut file = std::fs::File::open(&holding_path_owned).map_err(|e| {
-                make_err!(
-                    Code::Internal,
-                    "WriteChunkedV2: open .holding for e2e verify failed: {e:?} (path: {})",
-                    holding_path_owned.display()
-                )
-            })?;
-            let mut buf = vec![0u8; READ_CHUNK];
-            let mut total: u64 = 0;
-            loop {
-                let n = file.read(&mut buf).map_err(|e| {
-                    make_err!(
-                        Code::Internal,
-                        "WriteChunkedV2: read .holding for e2e verify failed: {e:?}"
-                    )
-                })?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                total += n as u64;
-            }
+        let result = (|| -> Result<Option<DigestHasherFunc>, V2VerifyFault> {
+            // Pass 1: the process-global function, exactly as before.
+            let mut hasher = default_digest_hasher_func().hasher();
+            let total =
+                v2_fold_holding_file(&holding_path_owned, &mut |c| hasher.update(c))?;
             if total != expected_size {
-                return Err(make_err!(
-                    Code::Internal,
+                // INTEGRITY VERDICT, not an I/O fault. `expected_size` is
+                // `digest.size_bytes()` (`v2_run_commit_path`), and
+                // `v2_fold_holding_file` reads to EOF, so `total` IS the
+                // file's length: a disagreement says the assembled blob is
+                // not the declared blob under EVERY digest function, because
+                // `DigestInfo` identity is hash AND size. An earlier version
+                // of this code called it an I/O fault and demoted it out of
+                // the corrupt-blob alarm; that was wrong in the fail-OPEN
+                // direction and is `pair-a` T-1. `Code::InvalidArgument`
+                // matches the stage-1 sibling that rejects the identical
+                // fault before the rename
+                // (`chunked_filesystem.rs:1397-1408`, "chunked commit length
+                // mismatch"), which is also what makes it correctly
+                // non-retryable to the client.
+                return Err(V2VerifyFault::Corrupt(make_err!(
+                    Code::InvalidArgument,
                     "WriteChunkedV2: .holding length {total} != declared size {expected_size} \
                      for digest {digest_for_blocking}"
-                ));
+                )));
             }
             let info = hasher.finalize_digest();
             let computed: &[u8; 32] = info.packed_hash();
             let declared: &[u8; 32] = &digest_for_blocking.packed_hash();
-            if computed != declared {
-                return Err(make_err!(
-                    Code::InvalidArgument,
-                    "WriteChunkedV2: end-to-end SHA-256 mismatch for digest {digest_for_blocking} \
-                     (computed {:?} != declared {:?})",
-                    computed,
-                    declared
-                ));
+            if computed == declared {
+                return Ok(None);
             }
-            Ok(())
+
+            // Pass 2 (#fl1786): the process default did not reproduce the
+            // declared digest. Before rejecting — which is a PERMANENT
+            // verdict, because the producer will re-solicit and fail
+            // identically forever — prove the function from the bytes.
+            let mut prover = DigestFuncProver::new();
+            v2_fold_holding_file(&holding_path_owned, &mut |c| prover.update(c)).err_tip(
+                || {
+                    "WriteChunkedV2: re-read of .holding for digest-function proving \
+                     (#fl1786). This is an I/O fault, NOT a data-integrity verdict — the \
+                     blob was neither proven nor disproven"
+                },
+            )?;
+            if let Some(proven_func) = prover.prove(&digest_for_blocking) {
+                return Ok(Some(proven_func));
+            }
+
+            Err(V2VerifyFault::Corrupt(make_err!(
+                Code::InvalidArgument,
+                "WriteChunkedV2: end-to-end SHA-256 mismatch for digest {digest_for_blocking} \
+                 (computed {:?} != declared {:?}); no advertised digest function reproduces \
+                 the declared digest from these bytes, so the blob is CORRUPT rather than \
+                 mislabelled",
+                computed,
+                declared
+            )))
         })();
         let _ = tx.send(result);
     });
@@ -1464,6 +1733,79 @@ const _ASSERT_CHUNKER_INVARIANT: () = {
         "WriteChunkedV2 per-chunk dedup safety relies on position-based chunker",
     );
 };
+
+#[cfg(test)]
+mod v2_verify_fault_attribution_tests {
+    use nativelink_error::{Code, make_err};
+
+    use super::V2VerifyFault;
+
+    /// **The M13 class, closed at the type level.** Attribution used to read
+    /// `err.code == Code::InvalidArgument`, so any `make_err!` or `map_err`
+    /// inside `v2_verify_e2e_hash`'s closure could forge the corrupt-blob
+    /// verdict; a review mutation appending one `map_err` to the pass-2
+    /// re-read did exactly that with the whole suite green (pair-b M13,
+    /// reproduced at `/tmp/svrprove-final-mut-M13-pre.log`).
+    ///
+    /// Every error either fold pass produces reaches the fault type through
+    /// this `From` impl, via `?`. It must yield `Io` for EVERY code — that is
+    /// what leaves the integrity verdict with only its two explicit
+    /// `V2VerifyFault::Corrupt(..)` construction sites.
+    #[test]
+    fn no_error_code_can_forge_the_integrity_verdict() {
+        for code in [
+            Code::Internal,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::DataLoss,
+            Code::Aborted,
+            Code::Unknown,
+        ] {
+            let fault: V2VerifyFault = make_err!(code, "simulated verify-fold failure").into();
+            assert!(
+                !fault.is_integrity_verdict(),
+                "#fl1786 M13: an Error propagating out of a verify fold must convert to \
+                 V2VerifyFault::Io regardless of its Code, so the corrupt-blob alarm keeps \
+                 exactly the two construction sites that are statements about the BYTES. \
+                 Code::{code:?} produced an integrity verdict, which re-opens M13: one map_err \
+                 inside either fold would again re-file an unread blob as CAS corruption"
+            );
+        }
+    }
+
+    /// The other direction, so the assertion above cannot be satisfied by a
+    /// discriminant that is never `Corrupt`.
+    #[test]
+    fn an_explicit_corrupt_verdict_is_an_integrity_verdict() {
+        let fault = V2VerifyFault::Corrupt(make_err!(Code::InvalidArgument, "no candidate"));
+        assert!(
+            fault.is_integrity_verdict(),
+            "#fl1786: V2VerifyFault::Corrupt MUST read as an integrity verdict — otherwise the \
+             corrupt-blob alarm never fires and a lying producer is indistinguishable from a \
+             mislabelled one"
+        );
+    }
+
+    /// The wire error survives the classification unchanged: the fault type
+    /// carries the verdict, it does not rewrite what the client sees.
+    #[test]
+    fn classification_does_not_rewrite_the_client_facing_error() {
+        let io = V2VerifyFault::Io(make_err!(Code::Internal, "open .holding failed"));
+        assert_eq!(
+            io.into_error().code,
+            Code::Internal,
+            "#fl1786: splitting the verdict from the code must not change what the client sees; \
+             an I/O fault stays Code::Internal on the wire"
+        );
+        let corrupt = V2VerifyFault::Corrupt(make_err!(Code::InvalidArgument, "no candidate"));
+        assert_eq!(
+            corrupt.into_error().code,
+            Code::InvalidArgument,
+            "#fl1786: an integrity verdict stays Code::InvalidArgument on the wire — permanent, \
+             not retryable"
+        );
+    }
+}
 
 #[cfg(test)]
 mod v2_lifecycle_log_sampling_tests {
