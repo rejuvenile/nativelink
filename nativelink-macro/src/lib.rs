@@ -15,7 +15,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenTree;
 use quote::{format_ident, quote};
-use syn::{ItemFn, parse_macro_input};
+use syn::{Error, ItemFn, parse_macro_input};
 
 // Helper function for debugging. Add prettyplease as dependency
 //
@@ -37,6 +37,37 @@ use syn::{ItemFn, parse_macro_input};
 pub fn nativelink_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr = proc_macro2::TokenStream::from(attr);
     let input_fn = parse_macro_input!(item as ItemFn);
+
+    // Reject a stacked `#[traced_test]`. This macro already applies
+    // `#[::tracing_test::traced_test]` below, and a second application is
+    // SILENT: it compiles, runs, and reports green while turning every
+    // `logs_assert` / `logs_contain` in the test into a no-op. `tracing-test`
+    // hands the second application of a given fn name a DIFFERENT scope
+    // (`foo` -> `foo2`, see tracing-test-macro's `get_free_scope`) and filters
+    // captured lines on the literal `" <scope>:"`. With two applications the
+    // rendered span prefix is ` foo2:foo: `, so the inner scope never sits in
+    // that leading-space position and the test's own `logs_assert` receives
+    // ZERO lines — assertions of log ABSENCE then pass vacuously.
+    //
+    // Only the `#[nativelink_test]`-first ordering is visible here; writing
+    // `#[traced_test]` ABOVE `#[nativelink_test]` expands it before this macro
+    // runs, so it cannot be caught. That ordering is equally vacuous.
+    if let Some(dup) = input_fn.attrs.iter().find(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "traced_test")
+    }) {
+        return Error::new_spanned(
+            dup,
+            "`#[nativelink_test]` already applies `#[tracing_test::traced_test]`; stacking a \
+             second one silently empties this test's log capture, so `logs_assert` sees ZERO \
+             lines and every log-absence assertion passes vacuously — delete this attribute",
+        )
+        .to_compile_error()
+        .into();
+    }
+
     let mut maybe_crate_ident: Option<proc_macro2::TokenStream> = None;
     let mut maybe_tokio_attrs: Option<proc_macro2::TokenStream> = None;
 
@@ -73,6 +104,10 @@ pub fn nativelink_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             reason = "`tokio::test` uses `tokio::runtime::Runtime::block_on`"
         )]
         #[tokio::test(#tokio_attrs)]
+        // Every `#[nativelink_test]` is a traced test: this is what puts
+        // `logs_contain` / `logs_assert` in scope in the test body. Do NOT
+        // also write the attribute at the call site — see the stacking guard
+        // above for why that silently voids the test's log assertions.
         #[::tracing_test::traced_test]
         async fn #fn_name(#fn_inputs) #fn_output {
             #crate_ident::__tracing::error_span!(stringify!(#fn_name))

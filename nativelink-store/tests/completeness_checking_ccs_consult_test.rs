@@ -58,6 +58,9 @@
 //!   "liveness-skip: dead-endpoint rescue must NOT fire — consult must
 //!    re-check endpoint liveness"
 //!
+//! - Demote either "ActionResult incomplete" `warn!` to `debug!`: test (ii)
+//!   red-fails with "dead-endpoint path must EMIT the incomplete warn".
+//!
 //! - Skip the counter increment:
 //!   test (i) red-fails with:
 //!   "counter-skip: ccs_pending_registry_rescues_total must be 1 after rescue"
@@ -72,6 +75,18 @@
 //! - Wire the registry into the CAS layer's has():
 //!   test (vi) red-fails with:
 //!   "registry leaked into CAS-plane has() — upload short-circuit trap"
+//!
+//! # Why (ii) asserts the warn is PRESENT
+//!
+//! The three `logs_assert` calls in this file are assertions of log ABSENCE,
+//! which are satisfied by the capture buffer being empty. Test (ii) runs the
+//! IDENTICAL line predicate with the opposite expectation on the one path that
+//! must emit the warn, so a dead capture buffer reddens (ii) instead of
+//! silently greening the other three. Do NOT write
+//! `#[tracing_test::traced_test]` on these tests: `#[nativelink_test]` already
+//! applies it, and stacking a second application rescopes the buffer so
+//! `logs_assert` receives zero lines (`nativelink-macro/src/lib.rs` rejects
+//! this at compile time).
 
 use core::time::Duration;
 use std::collections::HashSet;
@@ -178,9 +193,9 @@ async fn write_dangling_ar(
 /// Counter mutation: skip the increment →
 ///   "counter-skip: ccs_pending_registry_rescues_total must be 1 after rescue"
 ///
-/// No "ActionResult incomplete" warn may fire (test uses `tracing_test`).
+/// No "ActionResult incomplete" warn may fire (log capture comes from
+/// `#[nativelink_test]`, which already applies `traced_test` — do not add it).
 #[nativelink_test]
-#[tracing_test::traced_test]
 async fn has_with_results_rescues_registry_resident_digest() -> Result<(), Error> {
     let (ccs, _cas_store, registry) = build_ccs_with_registry(&[LIVE_EP]);
     let ccs_store = Store::new(ccs.clone());
@@ -252,7 +267,6 @@ async fn has_with_results_rescues_registry_resident_digest() -> Result<(), Error
 ///
 /// Over-action guard: AC entry must NOT be deleted after a rescued get_part.
 #[nativelink_test]
-#[tracing_test::traced_test]
 async fn get_part_rescues_registry_resident_digest_and_no_delete() -> Result<(), Error> {
     let (ccs, _cas_store, registry) = build_ccs_with_registry(&[LIVE_EP]);
 
@@ -334,7 +348,6 @@ async fn get_part_rescues_registry_resident_digest_and_no_delete() -> Result<(),
 ///   "liveness-skip: dead-endpoint rescue must NOT fire — consult must
 ///    re-check endpoint liveness"
 #[nativelink_test]
-#[tracing_test::traced_test]
 async fn dead_endpoint_no_rescue() -> Result<(), Error> {
     // Build CCS where DEAD_EP is NOT live.
     let (ccs, _cas_store, registry) = build_ccs_with_registry(&[LIVE_EP]);
@@ -387,6 +400,35 @@ async fn dead_endpoint_no_rescue() -> Result<(), Error> {
         "counter-skip (dead ep): rescue counter must remain 0 when endpoint is dead; \
          got {rescues}",
     );
+
+    // The incomplete warn MUST fire here — this is the one consult test whose
+    // documented behavior (ii) includes it. Dual purpose:
+    //   1. Asserts the warn half of (ii), which was never asserted before.
+    //   2. LIVE-CAPTURE CONTROL for the three absence assertions in this file.
+    //      Those are assertions of absence, which are satisfied by the capture
+    //      never producing anything. This one uses the IDENTICAL predicate with
+    //      the opposite expectation, so any change that empties the capture
+    //      buffer (e.g. re-stacking `#[tracing_test::traced_test]` on top of
+    //      `#[nativelink_test]`, which silently rescopes the buffer and yields
+    //      zero lines) turns THIS test red instead of turning all three of them
+    //      vacuously green.
+    logs_assert(|lines: &[&str]| {
+        let n = lines
+            .iter()
+            .filter(|l| l.contains(" WARN ") && l.contains("ActionResult incomplete"))
+            .count();
+        if n == 0 {
+            Err(
+                "dead-endpoint path must EMIT the incomplete warn (behavior (ii)) — \
+                 zero matching WARN lines captured. Either the warn regressed/was \
+                 demoted below WARN, or this test's log capture is empty, which \
+                 would also render the three absence assertions in this file vacuous"
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        }
+    });
 
     Ok(())
 }
@@ -498,7 +540,6 @@ async fn present_cas_no_registry_consult() -> Result<(), Error> {
 /// Production composition: real CompletenessCheckingStore + real AcPinRegistry
 /// + real liveness checker. No mocks.
 #[nativelink_test]
-#[tracing_test::traced_test]
 async fn composite_invariant_no_delete_on_registry_rescue() -> Result<(), Error> {
     let (ccs, _cas_store, registry) = build_ccs_with_registry(&[LIVE_EP]);
 
