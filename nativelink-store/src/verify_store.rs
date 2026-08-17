@@ -448,12 +448,16 @@ impl VerifyStore {
                             }
                         }
                         None => {
-                            // FAIL-CLOSED: no advertised function reproduces
-                            // the declared digest, so the bytes are CORRUPT
-                            // rather than mislabelled. Report the hash under
-                            // the LABELLED function so the message is
-                            // byte-identical to the pre-proving one — it is
-                            // pinned by operators, dashboards and
+                            // FAIL-CLOSED: no PROVABLE_DIGEST_FUNCS candidate
+                            // reproduces the declared digest, so the bytes are
+                            // CORRUPT rather than mislabelled. ("Candidate",
+                            // not "advertised": since `#single-digest`
+                            // `GetCapabilities` advertises only the configured
+                            // default, while proving deliberately tries the
+                            // wider set — see PROVABLE_DIGEST_FUNCS' doc.)
+                            // Report the hash under the LABELLED function so
+                            // the message is byte-identical to the pre-proving
+                            // one — it is pinned by operators, dashboards and
                             // `zero_copy_write_corruption_test`.
                             self.hash_verification_failures.inc();
                             let hash_result = candidates

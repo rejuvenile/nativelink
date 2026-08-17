@@ -354,6 +354,25 @@ impl DigestHasher for DigestHasherImpl {
 /// declared digest, so a wrong candidate simply fails to match. Narrowing the
 /// set can only turn a provable blob into an unprovable one.
 ///
+/// **★ This set is deliberately WIDER than what `GetCapabilities` advertises,
+/// and the two must not be re-coupled.** Since `#single-digest`,
+/// `capabilities_server.rs::advertised_digest_functions()` publishes exactly
+/// the configured `global.default_digest_hash_function` — `[Blake3]` under
+/// every deployed config — so `advertised ⊊ PROVABLE_DIGEST_FUNCS`. That is
+/// the intended shape, not drift: the advertisement says which function we
+/// want clients to USE going forward, while this array says which functions a
+/// blob ALREADY IN THE FLEET may have been keyed under and must still be
+/// admissible under. Tightening this array to `[Blake3]` "to match what we
+/// advertise" deletes the only mechanism that lets the sha256-keyed blobs
+/// resident in the CAS converge: a worker holding one advertises it, the
+/// server finds it absent and solicits a re-upload, the worker labels the
+/// re-upload with ITS default (`blake3/`), and without a Sha256 candidate the
+/// write is rejected — forever, on every restart. That is the unconverging
+/// backfill loop measured at 1,365 rejections in 5 s on 2026-08-16 and ended
+/// by proving, not by removal (`deferred_tasks.md`,
+/// `#sha256-blob-eviction`). Retire a candidate only when the population it
+/// rescues is proven empty, never because the advertisement shrank.
+///
 /// **Widening it is a THROUGHPUT change, so size it.** Each candidate is one
 /// additional full inline hash of every byte of every CAS write at
 /// `verify_store.rs::inner_check_update` (which cannot be mismatch-gated —
