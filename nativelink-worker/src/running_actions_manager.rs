@@ -4985,97 +4985,34 @@ pub struct RunningActionImpl {
 
 impl RunningActionImpl {
     /// FL-1383 §8 post-action warm-dir eviction — the worker-side wiring for
-    /// [`crate::portable_incr::PortableIncrContext::evict_warm_dirs_over_budget`].
+    /// [`crate::portable_incr::EvictionActor`].
     ///
-    /// Invoked from [`RunningAction::cleanup`] after a PORTABLE action finishes,
-    /// to bound the on-disk warm-dir pool at `budget_bytes` (LRU whole-dir
-    /// eviction; a dir currently LEASED by a live owner is never evicted). The
-    /// call site passes [`crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES`].
+    /// Invoked from [`RunningAction::cleanup`] after a PORTABLE action finishes.
+    /// Doubly gated: this action must have been portable
+    /// (`portable_execroot.is_some()`) AND a live actor must be installed on the
+    /// manager (which happens iff a live
+    /// [`crate::portable_incr::PortableIncrContext`] was installed).
     ///
-    /// Doubly gated, and when either gate is off it costs no `spawn_blocking`:
-    /// this action must have been portable (`portable_execroot.is_some()`) AND a
-    /// live [`crate::portable_incr::PortableIncrContext`] must be installed on
-    /// the manager. The eviction is BLOCKING (readdir/lstat/unlink) so
-    /// it runs under `spawn_blocking`. Any eviction failure is logged and
-    /// swallowed — it must never fail the action.
+    /// ★ THIS IS NOW A NON-BLOCKING REQUEST, AND THAT IS THE POINT. It used to
+    /// `spawn_blocking` a WHOLE-POOL eviction pass and `.await` it, per portable
+    /// action — and that pass recursively size-walks every warm dir BEFORE it
+    /// compares against the budget, so the cost scales with the RETAINED pool,
+    /// not with the number of evictions. Every portable action paid a full
+    /// recursive walk of the pool on its own cleanup path. It now stores at most
+    /// one wakeup for the single long-lived actor and returns: eviction has left
+    /// the action's critical path entirely. See `EvictionActor::request` for the
+    /// arrival policy (coalesce; never queue, never silently skip).
     ///
-    /// ★ COST NOTE (measured 2026-08-13, not addressed here): the pass
-    /// recursively size-walks EVERY warm dir before it compares against the
-    /// budget, so the walk is unconditional and scales with the RETAINED pool,
-    /// not with the number of evictions. Raising the budget therefore trades
-    /// unlink work away for MORE walk work. See the FL-1383 backlog entry
-    /// `#fl1383-eviction-sizewalk-unconditional`.
-    pub async fn maybe_evict_warm_dirs_post_action(&self, budget_bytes: u64) {
+    /// Not `async` and cannot fail: there is nothing to await and nothing to
+    /// report. Pass outcomes are logged by the actor.
+    pub fn request_warm_dir_eviction(&self) {
         if self.portable_execroot.is_none() {
             return;
         }
-        let Some(ctx) = self.running_actions_manager.portable_incr.clone() else {
+        let Some(actor) = self.running_actions_manager.warm_dir_eviction.as_ref() else {
             return;
         };
-        match tokio::task::spawn_blocking(move || ctx.evict_warm_dirs_over_budget(budget_bytes))
-            .await
-        {
-            Ok(Ok(outcome)) => {
-                // Arm selection lives in `EvictionOutcome::log_arm` so it can be
-                // unit-tested; this site only renders. See `EvictionLogArm`.
-                use crate::portable_incr::EvictionLogArm;
-                match outcome.log_arm() {
-                    EvictionLogArm::Backpressure => warn!(
-                        dirs_evicted = outcome.dirs_evicted,
-                        leased_skipped = outcome.leased_skipped,
-                        vanished_skipped = outcome.vanished_skipped,
-                        peer_pass_skipped = outcome.peer_pass_skipped,
-                        bytes_remaining = outcome.bytes_remaining,
-                        "FL-1383 portable_incr: warm-dir pool over budget with every remaining candidate leased — backpressure"
-                    ),
-                    EvictionLogArm::Evicted => info!(
-                        dirs_evicted = outcome.dirs_evicted,
-                        bytes_freed = outcome.bytes_freed,
-                        vanished_skipped = outcome.vanished_skipped,
-                        peer_pass_skipped = outcome.peer_pass_skipped,
-                        leased_skipped = outcome.leased_skipped,
-                        bytes_remaining = outcome.bytes_remaining,
-                        "FL-1383 portable_incr: evicted warm dirs over budget"
-                    ),
-                // ★ DISTINCT MESSAGE, ON PURPOSE. This pass evicted NOTHING; its
-                // candidates were removed by someone else (`vanished_skipped`) or
-                // were already being deleted by a concurrent pass on this worker
-                // (`peer_pass_skipped`). Reusing the "evicted warm dirs" text
-                // here would undo the accounting discipline the struct enforces:
-                // `AlreadyGone` is deliberately NOT credited to `dirs_evicted` so
-                // that "eviction is working" keeps meaning something, and a
-                // shared log string would hand exactly that false credit back to
-                // anyone grepping the message. This feature has ZERO metric
-                // series (964 on the endpoint, 0 matching `portable_incr`), so
-                // the log line IS the interface and its wording is load-bearing.
-                //
-                // It still logs at `info!` rather than `debug!`: these passes
-                // previously emitted `error!` (722 of the 1863 passes visible in
-                // the live fleet logs at 2026-08-13T18:30Z, all ENOENT), and
-                // demoting them would replace a false alarm with a blind spot.
-                    EvictionLogArm::FreedNothing => info!(
-                        vanished_skipped = outcome.vanished_skipped,
-                        peer_pass_skipped = outcome.peer_pass_skipped,
-                        leased_skipped = outcome.leased_skipped,
-                        bytes_remaining = outcome.bytes_remaining,
-                        "FL-1383 portable_incr: warm-dir eviction pass freed nothing — every candidate vanished or was claimed by a concurrent pass"
-                    ),
-                    EvictionLogArm::WithinBudget => debug!(
-                        bytes_remaining = outcome.bytes_remaining,
-                        "FL-1383 portable_incr: warm-dir pool within budget, nothing evicted"
-                    ),
-                }
-            }
-            Ok(Err(err)) => {
-                error!(?err, "FL-1383 portable_incr: warm-dir eviction failed; continuing");
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    "FL-1383 portable_incr: warm-dir eviction task join failed; continuing"
-                );
-            }
-        }
+        actor.request();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7262,14 +7199,12 @@ impl RunningAction for RunningActionImpl {
                 .await;
                 self.has_manager_entry.store(false, Ordering::Release);
                 self.did_cleanup.store(true, Ordering::Release);
-                // FL-1383 §8: after a PORTABLE action's cleanup, bound the warm-dir
-                // pool at the static budget. Doubly gated (portable action AND a
-                // live context) → inert unless both hold; failures log + continue,
-                // never failing the action.
-                self.maybe_evict_warm_dirs_post_action(
-                    crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES,
-                )
-                .await;
+                // FL-1383 §8: after a PORTABLE action's cleanup, ask the
+                // single-flight eviction actor to bound the warm-dir pool at the
+                // static budget. Doubly gated (portable action AND a live actor)
+                // → inert unless both hold. Non-blocking: cleanup no longer waits
+                // on a full-pool recursive walk.
+                self.request_warm_dir_eviction();
                 result.map(move |()| self)
             })
             .await;
@@ -8092,6 +8027,14 @@ pub struct RunningActionsManagerImpl {
     /// `plan_portable_execroot` returns `None` and
     /// every action takes the byte-identical current path.
     portable_incr: Option<crate::portable_incr::PortableIncrContext>,
+    /// FL-1383 §8 (design A2): the process's ONE long-lived warm-dir eviction
+    /// actor. `Some` exactly when `portable_incr` is `Some` (both are installed
+    /// by [`Self::set_portable_incr`]).
+    ///
+    /// OWNED HERE SO IT DIES WITH THE MANAGER — `EvictionActor`'s `Drop` aborts
+    /// the task. It holds a clone of the context, not a handle back to the
+    /// manager, so there is no reference cycle keeping either alive.
+    warm_dir_eviction: Option<crate::portable_incr::EvictionActor>,
     /// FL-1383 (design §6.1/§6.3): the fleet-shared `incr_seed_index` store —
     /// the AC-shaped mutable index (behind CompletenessCheckingStore) the worker
     /// FETCHES the `-incr` seed from before rustc and PUBLISHES to after a
@@ -8172,6 +8115,9 @@ impl RunningActionsManagerImpl {
             // construction sites — all in tests — stay untouched and remain
             // INERT). See FL-1383 chunk 2b.
             portable_incr: None,
+            // Spawned by `set_portable_incr` alongside the context it evicts for;
+            // `None` here means no actor and no eviction, matching `portable_incr`.
+            warm_dir_eviction: None,
             // INERT by default; the production path sets this via
             // `set_incr_seed_index_store` from `new_local_worker` (same reason as
             // `portable_incr` — keep the many test Args sites untouched). FL-1383.
@@ -8184,11 +8130,53 @@ impl RunningActionsManagerImpl {
     /// manager is `Arc`-wrapped. `ctx` is `Some` only when the feature is enabled
     /// AND the chunk-2a §12 asserts passed; `None` (the config default) leaves
     /// the execroot rewire fully INERT.
+    ///
+    /// FL-1383 §8 (design A2): this is also where the process's ONE warm-dir
+    /// eviction actor is spawned, so its lifetime is exactly the manager's.
+    /// `warm_dir_budget_bytes` is the §8 static reservation the actor bounds the
+    /// pool at; the production caller passes
+    /// [`crate::portable_incr::DEFAULT_WARM_DIR_BUDGET_BYTES`]. It is a parameter
+    /// rather than a constant read inside because the budget is now an ACTOR
+    /// property (one actor serves every action, so there is no per-call site left
+    /// to name it) and a call site that cannot name it also cannot be tested
+    /// against a pool smaller than 40 GiB.
+    ///
+    /// REQUIRES A TOKIO RUNTIME CONTEXT when `ctx` is `Some` (it `tokio::spawn`s).
+    /// The production caller `new_local_worker` is `async`, and so is every test
+    /// that installs a context.
     pub fn set_portable_incr(
         &mut self,
         ctx: Option<crate::portable_incr::PortableIncrContext>,
+        warm_dir_budget_bytes: u64,
     ) {
+        // Drop any prior actor BEFORE spawning the replacement, so a repeated
+        // install can never leave two actor LOOPS racing the same pool.
+        //
+        // Precisely: `EvictionActor::drop` calls `JoinHandle::abort()`, which
+        // cannot cancel a pass already inside `spawn_blocking` — so a double
+        // install can still overlap two PASSES for the duration of the in-flight
+        // one, just never two loops. Production installs exactly once, before the
+        // manager is `Arc`-wrapped; and were it ever to happen, the overlap is
+        // exactly what `peer_pass_skipped` was kept to detect.
+        self.warm_dir_eviction = None;
+        self.warm_dir_eviction = ctx
+            .clone()
+            .map(|ctx| crate::portable_incr::EvictionActor::spawn(ctx, warm_dir_budget_bytes));
         self.portable_incr = ctx;
+    }
+
+    /// FL-1383 §8 test/introspection accessor: how many eviction passes have been
+    /// REQUESTED of the actor since it was spawned. `None` when no actor is
+    /// installed (the INERT gate).
+    ///
+    /// A request is fire-and-forget by design, so this counter is the only
+    /// observable the `cleanup()` wiring has — it is what pins "a portable action
+    /// asks, a non-portable one does not".
+    #[must_use]
+    pub fn warm_dir_eviction_requests(&self) -> Option<u64> {
+        self.warm_dir_eviction
+            .as_ref()
+            .map(crate::portable_incr::EvictionActor::requests)
     }
 
     /// FL-1383 (design §6.1/§6.3): install the fleet-shared `incr_seed_index`

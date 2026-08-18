@@ -649,7 +649,12 @@ async fn assert_under_prefix_rejects_prefix_itself_and_siblings() {
 /// `filler_bytes` bytes (so its apparent size is deterministic).
 fn make_warm_dir(root: &Path, key: &str, filler_bytes: usize) {
     let d = root.join(key);
-    fs::create_dir_all(&d).expect("mk warm dir");
+    // Built with the PRODUCTION creator, which also lays down the sibling
+    // `<key>.lock` lease record. The §8 eviction refuses to delete a warm dir
+    // with no record (nothing would prove it unowned), so a hand-rolled
+    // `create_dir_all` fixture would silently be un-evictable and every
+    // eviction assertion below would test the refusal path instead.
+    ensure_and_wipe_execroot_at(&d, root).expect("ensure warm execroot");
     fs::write(d.join("filler"), vec![0u8; filler_bytes]).expect("filler");
 }
 
@@ -875,12 +880,36 @@ async fn startup_sweep_wiring_reaps_contender_when_context_present() {
     let contender = root.join(format!("{}.{}", "a".repeat(64), "b".repeat(32)));
     fs::create_dir_all(contender.join("junk")).expect("mk contender");
 
+    // ★ A pre-A3 warm dir: it exists with NO `<key>.lock`, which is the on-disk
+    // shape of every warm dir on the fleet today. Created by hand, deliberately
+    // NOT via `make_warm_dir`, because that goes through the production creator
+    // and would lay the record down for us.
+    let stale = "c".repeat(64);
+    fs::create_dir_all(root.join(&stale)).expect("mk pre-A3 warm dir");
+    assert!(
+        !root.join(format!("{stale}.lock")).exists(),
+        "fixture precondition: the pre-A3 warm dir starts with no lease record"
+    );
+
     // The exact call `new_local_worker` makes once at startup.
     portable_incr_startup_sweep(Some(ctx)).await;
 
     assert!(
         !contender.exists(),
         "startup wiring MUST invoke the sweep when a live context is installed"
+    );
+    // ★ THE SECOND HALF OF THE SAME STARTUP CALL, AND IT WAS UNCOVERED. A review
+    // replaced `ctx.ensure_owner_lock_files()` in `portable_incr_startup_sweep`
+    // with a stub and all 37 integration tests stayed green — on the change the
+    // commit itself calls "the part that must not be dropped". Without the
+    // backfill the §8 eviction fails closed on every dir that predates A3, i.e.
+    // on exactly the least-recently-used ones it exists to evict, and the
+    // disk-growth guard is inert on any pool that predates this change.
+    assert!(
+        root.join(format!("{stale}.lock")).exists(),
+        "★ startup wiring MUST also backfill the lease record for a pre-A3 warm \
+         dir — otherwise eviction refuses it forever and the guard never bounds \
+         an existing pool"
     );
 }
 
@@ -900,45 +929,55 @@ async fn startup_sweep_wiring_is_inert_when_context_none() {
 }
 
 /// Install `ctx` on a freshly-built manager, mirroring `new_local_worker`
-/// (which calls `set_portable_incr` before Arc-wrapping the manager).
+/// (which calls `set_portable_incr` before Arc-wrapping the manager). The
+/// budget is the one the actor spawned here will enforce.
 async fn setup_manager_with_portable(
     ctx: Option<PortableIncrContext>,
+    warm_dir_budget_bytes: u64,
 ) -> Arc<RunningActionsManagerImpl> {
     let mut manager = setup_manager().await;
     Arc::get_mut(&mut manager)
         .expect("freshly-built manager is uniquely owned")
-        .set_portable_incr(ctx);
+        .set_portable_incr(ctx, warm_dir_budget_bytes);
     manager
 }
 
+// -- §8 A2: `cleanup()` REQUESTS a pass; it no longer runs one ----------------
+//
+// The wiring's observable changed with the mechanism. `cleanup()` used to
+// `spawn_blocking` a whole-pool pass and `.await` it, so the test could read the
+// eviction's effect directly. It now stores at most one wakeup for the single
+// long-lived actor and returns — which is the entire win (a full recursive
+// size-walk of the pool left the action's critical path) — so what these pin is
+// the DOUBLE GATE on the request. The actor's own behaviour (exactly one pass in
+// flight, arrivals coalesced, the pool actually shrinking) is pinned
+// deterministically in `portable_incr.rs`'s in-module tests, which can drive the
+// probe seam these cannot see.
+
 #[nativelink_test]
-async fn post_action_evict_wiring_fires_for_portable_action() {
+async fn post_action_evict_wiring_requests_a_pass_for_a_portable_action() {
     let (_td, root) = canonical_tempdir();
     let ctx = enabled_context(&root, &["evict-wire/"]);
-    // Two warm owner dirs; A is the LRU.
-    let (key_a, _) = carrier_props("evict-wire/uniq-a/libfoo.rlib");
-    let (key_b, _) = carrier_props("evict-wire/uniq-b/libfoo.rlib");
-    make_warm_dir(&root, &key_a, 50);
-    make_warm_dir(&root, &key_b, 50);
-    set_dir_mtime(&root.join(&key_a), epoch_plus(100));
-    set_dir_mtime(&root.join(&key_b), epoch_plus(200));
 
-    // A portable action on a manager carrying the live context.
-    let manager = setup_manager_with_portable(Some(ctx.clone())).await;
+    let manager = setup_manager_with_portable(Some(ctx.clone()), 60).await;
+    assert_eq!(
+        manager.warm_dir_eviction_requests(),
+        Some(0),
+        "a freshly-installed actor has been asked for nothing"
+    );
+
     let (_key, props) = carrier_props("evict-wire/uniq-live/libbar.rlib");
     let plan = ctx.plan(&props).expect("allowlisted ⇒ portable");
-    let action = make_action(manager, &rand_temp("action_dir"), Some(plan));
+    let action = make_action(manager.clone(), &rand_temp("action_dir"), Some(plan));
 
-    // total 100 > budget 60 → the post-action wiring evicts exactly the LRU (A).
-    action.maybe_evict_warm_dirs_post_action(60).await;
+    action.request_warm_dir_eviction();
 
-    assert!(
-        !root.join(&key_a).exists(),
-        "post-action wiring MUST invoke eviction for a portable action (LRU warm dir removed)"
-    );
-    assert!(
-        root.join(&key_b).exists(),
-        "the newer warm dir stays within budget"
+    assert_eq!(
+        manager.warm_dir_eviction_requests(),
+        Some(1),
+        "★ the post-action wiring MUST ask the actor for a pass when a PORTABLE \
+         action finishes — this is the only thing `cleanup()` still does for \
+         eviction, so if it is dropped the pool is never bounded again"
     );
 }
 
@@ -946,19 +985,18 @@ async fn post_action_evict_wiring_fires_for_portable_action() {
 async fn post_action_evict_wiring_skips_non_portable_action() {
     let (_td, root) = canonical_tempdir();
     let ctx = enabled_context(&root, &["evict-skip/"]);
-    let (key_w, _) = carrier_props("evict-skip/uniq-w/libfoo.rlib");
-    make_warm_dir(&root, &key_w, 5_000);
 
     // A NON-portable action (portable_execroot = None) on a portable-enabled
-    // manager: the `portable_execroot.is_some()` gate MUST skip eviction.
-    let manager = setup_manager_with_portable(Some(ctx)).await;
-    let action = make_action(manager, &rand_temp("action_dir"), None);
+    // manager: the `portable_execroot.is_some()` gate MUST skip the request.
+    let manager = setup_manager_with_portable(Some(ctx), 1).await;
+    let action = make_action(manager.clone(), &rand_temp("action_dir"), None);
 
-    action.maybe_evict_warm_dirs_post_action(1).await;
+    action.request_warm_dir_eviction();
 
-    assert!(
-        root.join(&key_w).exists(),
-        "a NON-portable action must NOT trigger warm-dir eviction even over budget"
+    assert_eq!(
+        manager.warm_dir_eviction_requests(),
+        Some(0),
+        "a NON-portable action must NOT request a warm-dir eviction pass"
     );
 }
 
@@ -969,17 +1007,70 @@ async fn post_action_evict_wiring_is_inert_when_context_none() {
     let (key_w, _) = carrier_props("evict-none/uniq-w/libfoo.rlib");
     make_warm_dir(&root, &key_w, 5_000);
 
-    // A portable action, but the manager carries NO context (the fleet default).
-    let manager = setup_manager_with_portable(None).await;
+    // A portable action, but the manager carries NO context: no actor exists.
+    let manager = setup_manager_with_portable(None, 1).await;
     let (_key, props) = carrier_props("evict-none/uniq-live/libbar.rlib");
     let plan = ctx.plan(&props).expect("plan");
-    let action = make_action(manager, &rand_temp("action_dir"), Some(plan));
+    let action = make_action(manager.clone(), &rand_temp("action_dir"), Some(plan));
 
-    action.maybe_evict_warm_dirs_post_action(1).await;
+    action.request_warm_dir_eviction();
 
+    assert_eq!(
+        manager.warm_dir_eviction_requests(),
+        None,
+        "context None ⇒ NO actor is spawned at all (not merely an idle one)"
+    );
     assert!(
         root.join(&key_w).exists(),
-        "context None (fleet default) ⇒ no eviction even for a portable action over budget"
+        "context None ⇒ no eviction even for a portable action over budget"
+    );
+}
+
+/// ★ THE COMPOSED PATH, end to end: `set_portable_incr` must spawn an actor over
+/// THE INSTALLED CONTEXT, and a request from a real `RunningActionImpl` must
+/// reach it and bound THAT prefix. Nothing else covers the wiring between the
+/// manager's context and the actor's — a request counter increments just as
+/// happily for an actor pointed at the wrong pool.
+///
+/// The wait is a DEADLINE DETECTOR, not synchronisation: a request is
+/// fire-and-forget by design, so there is no completion to await. It is the only
+/// polling wait in this feature's tests; the pass's own determinism is pinned in
+/// the in-module tests via the probe seam.
+#[nativelink_test]
+async fn installed_actor_evicts_the_installed_prefix() {
+    let (_td, root) = canonical_tempdir();
+    let ctx = enabled_context(&root, &["evict-e2e/"]);
+    let (key_a, _) = carrier_props("evict-e2e/uniq-a/libfoo.rlib");
+    let (key_b, _) = carrier_props("evict-e2e/uniq-b/libfoo.rlib");
+    make_warm_dir(&root, &key_a, 50);
+    make_warm_dir(&root, &key_b, 50);
+    set_dir_mtime(&root.join(&key_a), epoch_plus(100));
+    set_dir_mtime(&root.join(&key_b), epoch_plus(200));
+
+    // total 100 > budget 60 → the actor must evict exactly the LRU (A).
+    let manager = setup_manager_with_portable(Some(ctx.clone()), 60).await;
+    let (_key, props) = carrier_props("evict-e2e/uniq-live/libbar.rlib");
+    let plan = ctx.plan(&props).expect("allowlisted ⇒ portable");
+    let action = make_action(manager.clone(), &rand_temp("action_dir"), Some(plan));
+
+    action.request_warm_dir_eviction();
+
+    let lru = root.join(&key_a);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while lru.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "★ the LRU warm dir was still present 10s after a portable action \
+         requested a pass — the actor is not wired to the installed context's \
+         prefix, or the request never reached it",
+    );
+
+    assert!(
+        root.join(&key_b).exists(),
+        "the newer warm dir stays: the pass stops as soon as it is under budget"
     );
 }
 
@@ -1039,7 +1130,9 @@ async fn setup_portable_manager_with_index(
     let (mut manager, cas) = setup_manager_and_cas().await;
     {
         let m = Arc::get_mut(&mut manager).expect("freshly-built manager is uniquely owned");
-        m.set_portable_incr(Some(ctx));
+        // These tests exercise the §6 seed fetch/publish path, not §8: the real
+        // 40 GiB budget keeps the actor idle so it cannot perturb them.
+        m.set_portable_incr(Some(ctx), DEFAULT_WARM_DIR_BUDGET_BYTES);
         m.set_incr_seed_index_store(Some(index_store));
     }
     (manager, cas)
