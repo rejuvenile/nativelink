@@ -64,6 +64,7 @@ rust_test_suite(
         "tests/ac_server_test.rs",
         "tests/bep_server_test.rs",
         "tests/bytestream_server_test.rs",
+        "tests/capabilities_advertisement_follows_configured_default_test.rs",
         "tests/capabilities_server_test.rs",
         "tests/cas_server_test.rs",
         "tests/digest_func_proving_advertised_set_test.rs",

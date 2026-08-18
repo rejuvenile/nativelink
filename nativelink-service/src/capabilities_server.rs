@@ -22,7 +22,6 @@ use nativelink_error::{Error, ResultExt};
 use nativelink_proto::build::bazel::remote::execution::v2::capabilities_server::{
     Capabilities, CapabilitiesServer as Server,
 };
-use nativelink_proto::build::bazel::remote::execution::v2::digest_function::Value as DigestFunction;
 use nativelink_proto::build::bazel::remote::execution::v2::priority_capabilities::PriorityRange;
 use nativelink_proto::build::bazel::remote::execution::v2::symlink_absolute_path_strategy::Value as SymlinkAbsolutePathStrategy;
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -38,6 +37,54 @@ use tracing::{Level, instrument, warn};
 use crate::wire_compression::RemoteCacheCompressionInstances;
 
 const MAX_BATCH_TOTAL_SIZE: i64 = 64 * 1024;
+
+/// The digest functions advertised to REAPI clients — exactly one, and it is
+/// the one we want clients to key their blobs under.
+///
+/// `digest_functions` is an invitation: a conforming client reads it, picks an
+/// entry, and keys every blob of a build under that function. So it should
+/// name exactly the configured `global.default_digest_hash_function` (blake3
+/// on every deployed config) — the function the rest of the fleet is keyed
+/// under and the one this server assumes when a client states none
+/// (`bytestream_server.rs:3988-3995`). A second advertised entry invites a
+/// client to key a whole build under a function nothing else here uses, for no
+/// benefit: those blobs are then invisible to every lookup by the blake3
+/// clients that share the cache, and they linger as residue that only a worker
+/// re-upload can converge (`deferred_tasks.md`,
+/// `#sha256-blob-eviction`).
+///
+/// **This list is deliberately NARROWER than what the server ACCEPTS, and it
+/// is not an admission control.** Two live paths still admit a
+/// non-advertised function, and neither is touched by this list:
+///
+/// 1. An upload whose resource name explicitly carries `sha256/` is hashed
+///    with the CLIENT's function — `bytestream_server.rs:3988-3995` resolves
+///    the segment via `DigestHasherFunc::try_from` and installs it in the
+///    request context, and `verify_store.rs:880` reads it back out.
+/// 2. An upload that omits the segment, or labels it wrongly, is still
+///    admitted whenever its declared digest reproduces under ANY
+///    [`nativelink_util::digest_hasher::PROVABLE_DIGEST_FUNCS`] entry:
+///    `VerifyStore::inner_update` (`verify_store.rs:386-478`, `#fl1786`)
+///    finalizes every candidate in one pass and accepts on a match.
+///
+/// Narrowing the advertisement therefore removes the INVITATION, not the
+/// door. Closing the door is a separate operator decision — see
+/// `#single-digest-sha256-ingress-door` in `deferred_tasks.md` — and it must
+/// NOT be taken by tightening `PROVABLE_DIGEST_FUNCS` to match this list:
+/// proving is the only mechanism that lets the sha256-keyed blobs already
+/// resident in the fleet converge when a worker re-uploads them.
+///
+/// Derived from the configured default rather than hardcoded so the
+/// advertisement cannot drift from the value it names: whatever the operator
+/// configures is what gets advertised. This is the same source the
+/// (REAPI-deprecated) singular `digest_function` field already uses, which
+/// keeps the two renderings from disagreeing. That derivation is pinned by
+/// `capabilities_advertisement_follows_configured_default_test`, which runs in
+/// its own process under a SHA-256 default — the only shape that can tell a
+/// derived list from a hardcoded `[BLAKE3]`.
+fn advertised_digest_functions() -> Vec<i32> {
+    vec![default_digest_hasher_func().proto_digest_func().into()]
+}
 
 #[derive(Debug, Default)]
 pub struct CapabilitiesServer {
@@ -146,10 +193,7 @@ impl Capabilities for CapabilitiesServer {
                     }],
                 }),
                 supported_node_properties: props_for_instance.clone(),
-                digest_functions: vec![
-                    DigestFunction::Sha256.into(),
-                    DigestFunction::Blake3.into(),
-                ],
+                digest_functions: advertised_digest_functions(),
             });
 
         // Compression advertisement is forced OFF post-merge: the zstd
@@ -175,10 +219,7 @@ impl Capabilities for CapabilitiesServer {
         let chunking_params = self.chunking_params_for_instance.get(&instance_name);
         let resp = ServerCapabilities {
             cache_capabilities: Some(CacheCapabilities {
-                digest_functions: vec![
-                    DigestFunction::Sha256.into(),
-                    DigestFunction::Blake3.into(),
-                ],
+                digest_functions: advertised_digest_functions(),
                 action_cache_update_capabilities: Some(ActionCacheUpdateCapabilities {
                     update_enabled: true,
                 }),

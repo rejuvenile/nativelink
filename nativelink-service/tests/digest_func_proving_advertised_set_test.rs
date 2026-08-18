@@ -12,23 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `#fl1786-server-side-digest-function-proving`: the candidate set is the
+//! `#fl1786-server-side-digest-function-proving`: the candidate set COVERS the
 //! ADVERTISED set, verified at runtime rather than asserted from memory.
 //!
 //! Proving is only as complete as its candidate list. `PROVABLE_DIGEST_FUNCS`
-//! is a compile-time array; the set the server tells clients it accepts comes
-//! out of the live `GetCapabilities` RPC (`capabilities_server.rs`,
-//! `CacheCapabilities.digest_functions` and
-//! `ExecutionCapabilities.digest_functions`). Those are two independent
-//! declarations of the same fact and nothing else makes them agree.
+//! is a compile-time array; what the server tells clients to key their blobs
+//! under comes out of the live `GetCapabilities` RPC
+//! (`capabilities_server.rs`, `CacheCapabilities.digest_functions` and
+//! `ExecutionCapabilities.digest_functions`). Nothing else makes them agree.
 //!
-//! The failure this pins is asymmetric, and silent in one direction:
+//! **They are NOT two renderings of one fact, and this test does not claim
+//! they are.** Since `#single-digest` the advertisement is exactly the
+//! configured `global.default_digest_hash_function` — one entry — while
+//! `PROVABLE_DIGEST_FUNCS` stays the full `DigestHasherFunc` set, so
+//! `advertised ⊊ provable` is the intended steady state. The advertisement
+//! names what clients should use GOING FORWARD; the candidate array names what
+//! a blob ALREADY IN THE FLEET may have been keyed under. Anyone reading a
+//! one-element advertisement next to a two-element array and "fixing" the
+//! array to match would delete the only rescue for the resident sha256
+//! population — see the ★ paragraph on `PROVABLE_DIGEST_FUNCS` itself
+//! (`digest_hasher.rs`) for the mechanism and the incident.
+//!
+//! The failure this pins is therefore one-directional, and silent:
 //!
 //! - A function ADVERTISED but not PROVABLE re-opens the latch. Clients are
 //!   told "you may key blobs with this", they do, and any such write whose
 //!   label is wrong is rejected forever with no candidate able to rescue it.
-//! - A function PROVABLE but not advertised is harmless — a candidate that
-//!   simply never matches.
+//! - A function PROVABLE but not advertised is the DESIGNED state — a
+//!   candidate that rescues history without inviting new traffic.
 //!
 //! So the assertion is directional: `advertised ⊆ provable`. It reads the
 //! RPC's actual response rather than the `vec![...]` literal in the handler,

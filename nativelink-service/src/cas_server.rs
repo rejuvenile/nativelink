@@ -1500,8 +1500,14 @@ impl CasServer {
     /// Returns the digest function explicitly requested by the client, or
     /// `None` when the field was left unset. REAPI's length-based inference
     /// cannot be used as a fallback here: SHA256 and BLAKE3 digests are both
-    /// 32 bytes, and `NativeLink` announces support for both. Notably Bazel
-    /// (9.1.1) leaves this field unset even when running with
+    /// 32 bytes, so length discriminates nothing between the two functions
+    /// this server still admits. (Since `#single-digest` we ANNOUNCE only the
+    /// configured default, which would make the REAPI recipe — infer from the
+    /// length plus the announced set — resolve to BLAKE3 unambiguously; that
+    /// makes the recipe usable, not correct, because an explicitly-labelled
+    /// `sha256/` upload and a `#fl1786`-proven one are both still accepted, so
+    /// inferring BLAKE3 would mislabel exactly the blobs that need naming.)
+    /// Notably Bazel (9.1.1) leaves this field unset even when running with
     /// `--digest_function=blake3`.
     fn explicit_hasher_func(digest_function_value: i32) -> Option<DigestHasherFunc> {
         digest_function::Value::try_from(digest_function_value)
