@@ -1,0 +1,774 @@
+{
+  "stores": [
+    // --- Redis backing stores ---
+    {
+      "name": "REDIS_AC_STORE",
+      "redis_store": {
+        "addresses": ["redis+unix:///run/valkey/valkey.sock?db=0"],
+        "key_prefix": "ac:",
+        "command_timeout_ms": 60000,
+        "connection_timeout_ms": 3000,
+        "max_client_permits": 16384,
+        "connection_pool_size": 64
+      }
+    },
+    {
+      "name": "REDIS_CAS_SMALL_STORE",
+      "redis_store": {
+        "addresses": ["redis+unix:///run/valkey/valkey.sock?db=1"],
+        "key_prefix": "cas:",
+        "command_timeout_ms": 60000,
+        "connection_timeout_ms": 3000,
+        "max_client_permits": 16384,
+        "connection_pool_size": 64,
+        // Match the URL's `db=1` so the keyspace-notifications subscriber
+        // listens on the SAME db that PUT/GET commands target.  Without
+        // this, the subscriber listens on db=0 and never receives evictions
+        // for cas: keys → ECS stale-positive invalidation silently broken.
+        // #100 BLOCKER 1 fix (nativelink eb5c15e6) fail-fasts on this
+        // mismatch instead of degrading silently.
+        "keyspace_notifications_db": 1
+      }
+    },
+
+    // --- AC store chain ---
+    // AC_MAIN_STORE → AC_BACKEND_CACHED (FastSlow Memory→Redis)
+    //   CCS dropped 2026-06-17; the AC-side ExistenceCacheStore (AC_INNER) dropped
+    //   2026-06-19 — write-only dead weight post-CCS (zero AC has() callers; get_part
+    //   only inserts, never reads). Cadre-verified safe; see AC_MAIN_STORE below.
+    // AC_BACKEND_CACHED puts an in-memory cache in front of Redis to absorb
+    // repeated AC reads/writes. Without it, AC ops pipeline to Redis and queue
+    // behind the single multiplexed ConnectionManager (observed 47K WARN + 30K
+    // ERROR for slow Redis pipelined ops in a 39-min window).
+    {
+      "name": "AC_BACKEND_CACHED",
+      "fast_slow": {
+        "fast": {
+          "memory": {
+            "eviction_policy": {
+              "max_bytes": 4000000000,
+              "max_count": 500000
+            }
+          }
+        },
+        "slow": {
+          "ref_store": {
+            "name": "REDIS_AC_STORE"
+          }
+        }
+      }
+    },
+    // (AC-side ExistenceCacheStore / AC_INNER removed 2026-06-19 — write-only dead
+    //  weight post-CCS; #366's stale-positive-invalidation protected CCS's has-cache,
+    //  which vanished with CCS. Cadre-verified safe. Re-add with any CCS revert.)
+    {
+      "name": "AC_MAIN_STORE",
+      // CCS dropped 2026-06-17; AC-side ExistenceCacheStore (AC_INNER) dropped 2026-06-19.
+      // With CCS gone there are zero AC-chain has() callers, so the existence cache was
+      // write-only dead weight — cadre-verified safe (assumption-auditor + distsys +
+      // red-team, .claude/reviews/ac-ecs-drop-design-2026-06-19/). AC_MAIN_STORE now
+      // delegates straight to AC_BACKEND_CACHED. The CompletenessCheckingStore code stays
+      // in-tree (matches upstream) but is never instantiated — no spec references it.
+      // ROLLBACK: if CCS is reverted-to-upstream, re-add AC_INNER in the SAME change
+      // (CCS reintroduces AC has() calls that would otherwise hit Redis uncached).
+      "ref_store": {
+        "name": "AC_BACKEND_CACHED"
+      }
+    },
+
+    // --- CAS store chain ---
+    // Large CAS blobs (>16KB): MemoryStore(32GB) + FilesystemStore
+    {
+      "name": "cas_FAST_SLOW_STORE",
+      "fast_slow": {
+        "fast": {
+          "memory": {
+            "eviction_policy": {
+              // 2026-05-12: 48 GB → 16 GB. Recurring OOMs at 65-70 GiB
+              // anon-RSS (5 kills 2026-05-05 → 2026-05-12, all global oom
+              // triggered by co-resident pressure with kernel selecting
+              // nativelink due to oom_score_adj=1000) traced to this
+              // MemoryStore + mimalloc retention overhead. Slow tier is
+              // local FilesystemStore on the tank pool with ZFS ARC
+              // 66-106 GiB absorbing displaced hits — cache-hit-ratio
+              // impact bounded by the ARC's hot working set rather than
+              // this cap.
+              //
+              // 2026-05-13: Added evict_bytes: 4.5 GB (= pin_cap 4 GB +
+              // 0.5 GB margin for max admission size). Shrinks moka's
+              // effective max_capacity to 11.5 GB, leveraging moka's
+              // built-in strict-LRU eviction (EvictionPolicy::lru() set
+              // at moka_evicting_map.rs:375). With pinned_bytes ≤ pin_cap
+              // = max_bytes × 0.25 = 4 GB and weighted_size ≤ 11.5 GB,
+              // total ≤ 15.5 GB < max_bytes = 16 GB; gate at
+              // memory_store.rs:check_backpressure_gate never fires
+              // false-positive on at-cap regardless of admission size up
+              // to 0.5 GB. Restores explicit-eviction corner of the
+              // gate/pin/evict composability triangle (CLAUDE.md).
+              // Falsifies Finding-5-C sweeper proposal (1617 LoC, 4
+              // reviewer BLOCKs) — moka's built-in strict-LRU is the
+              // load-bearing mechanism; sweeper's iter()-based eviction
+              // is "arbitrary order, NOT LRU" per moka docs. Verified by
+              // red-team R1 + moka source audit at
+              // .claude/reviews/463-c-sweeper/.
+              "max_bytes": 16000000000,
+              "evict_bytes": 4500000000,
+              "max_count": 1000000
+            },
+            // #212 Phase 2.6 emit BackpressureSignal::MemoryStoreAtCapacity
+            // instead of silent eviction at capacity.
+            // Production sign-off 2026-05-02.
+            "emit_backpressure_enabled": true
+          }
+        },
+        "slow": {
+          "filesystem": {
+            "content_path": "/srv/casdata/nativelink/stores/content_path-cas",
+            "temp_path": "/srv/casdata/nativelink/stores/tmp_path-cas",
+            "eviction_policy": {
+              // 2026-06-10 dangling-AC fix bundle 1 (§1, design:
+              // nativelink .claude/audits/dangling-ac-design-2026-06-10.md):
+              // 800GB → 2.4TB. CAS median blob lifetime ~3.7d at the
+              // high-rate window vs AC re-query horizon 5-27d → ~95% of AC
+              // entries dangled (19:1 AC:CAS, verified live). 2.4TB covers
+              // the dominant 5-9d re-query wave at both observed eviction
+              // rates (3.7-9 GB/h). tank stores AVAIL 5.2T. Side effects
+              // (reviewed): pin_cap auto-raises 200G→600G (25% fraction;
+              // pinned_bytes stays BIS-bounded); moka index ≈462MB RSS at
+              // saturation (~3.4M entries); startup scan grows linearly;
+              // no over-cap drain at deploy (cap goes UP).
+              // 2026-07-11: 2.4TB → 4.8TB (DOUBLED). The cache was PEGGED at the
+              // 2.4TB logical cap (weighted_size == max_bytes, 424K entries) and
+              // LRU-evicting the working set under load; with build-without-the-bytes
+              // (--remote_download_outputs=toplevel) an evicted intermediate is fatal.
+              // `--config=opt` cache-discard re-requested a batch of evicted blobs →
+              // 162 missing-blob NotFounds → build failure (same root as the 83
+              // tree-resolution timeouts). Physical headroom is huge: 2.4TB logical
+              // = 918G physical at 2.52x lz4, so 4.8TB ≈ 1.83T physical vs ~4.4T tank
+              // free. Linear side effects: pin_cap ceiling 600G→1.2T (pinned stays
+              // BIS-bounded), moka index RSS ~462MB→~924MB, ~2x startup scan. Cap
+              // goes UP ⇒ no over-cap drain/loss at deploy.
+              "max_bytes": 4800000000000
+            },
+            // CAS is content-addressed: identical key ⇒ identical content,
+            // so a duplicate write is a no-op. Skipping it avoids the
+            // tempfile + rename + index-update churn under upload bursts.
+            // SAFE only for CAS; NEVER set on AC (same key can hold
+            // different content).
+            "content_is_immutable": true
+          }
+        },
+        // #212 Phase 2.5 chunked-read cascade pin lookup. Activates
+        // the design §6.3 step 2 read cascade against the
+        // ChunkedReadRegistry installed at server startup.
+        // Production sign-off 2026-05-02.
+        "chunked_reads_enabled": true,
+        // #334 Fix B: per-FastSlowStore in_flight_slow_writes cap.
+        // Default in nativelink-config is 0 = uncapped (red-team #1 —
+        // workers MUST inherit "uncapped" since this on a 16-32 GiB
+        // worker is too large a fraction of host RAM); server
+        // explicitly opts in.
+        // 2026-05-12: 8 GiB → 12 GiB. Paired with the 48 GB → 16 GB
+        // MemoryStore reduction above: less fast-tier cache means more
+        // writes hit the slow tier, so the in-flight buffer needs more
+        // headroom to absorb burst before backpressure fires. 12 GiB ≈
+        // 9.6 s of unrelieved slow-tier pressure at 10 GbE line rate;
+        // net config delta is -28 GiB peak (-32 fast +4 in-flight).
+        "slow_writes_in_flight_max_bytes": 12884901888
+      }
+    },
+    // cas_VERIFY → VerifyStore (reject uploads where content hash ≠ digest)
+    //   → cas_INNER (ExistenceCacheStore → SizePartitioningStore)
+    {
+      "name": "cas_STORE",
+      "verify": {
+        "backend": {
+          "ref_store": {
+            "name": "cas_INNER"
+          }
+        },
+        "verify_size": true,
+        "verify_hash": true
+      }
+    },
+    // MemoryStore cache in front of Redis for small CAS blobs.
+    // Absorbs repeated reads (directory protos, small source files)
+    // that would otherwise flood Redis with individual GETRANGE calls.
+    // 4GB / 500K entries — small blobs are ≤16KB, so 4GB holds ~250K+.
+    {
+      "name": "SMALL_CAS_CACHED",
+      "fast_slow": {
+        "fast": {
+          "memory": {
+            "eviction_policy": {
+              "max_bytes": 4000000000,
+              "max_count": 500000
+            }
+          }
+        },
+        "slow": {
+          "ref_store": {
+            "name": "REDIS_CAS_SMALL_STORE"
+          }
+        }
+      }
+    },
+    // cas_INNER → ExistenceCacheStore(50M) → SizePartitioningStore:
+    //   ≤16KB → SMALL_CAS_CACHED (MemoryStore → Redis)
+    //   >16KB → cas_FAST_SLOW_STORE (MemoryStore → FilesystemStore)
+    {
+      "name": "cas_INNER",
+      "existence_cache": {
+        "backend": {
+          "size_partitioning": {
+            "size": 16384,
+            "lower_store": {
+              "ref_store": {
+                "name": "SMALL_CAS_CACHED"
+              }
+            },
+            "upper_store": {
+              "ref_store": {
+                "name": "cas_FAST_SLOW_STORE"
+              }
+            }
+          }
+        },
+        "eviction_policy": {
+          "max_count": 50000000
+        }
+      }
+    },
+    // FL-1383 (#2497): the mutable targetkey->-incr index. AC-shaped, keyed by
+    // hash(targetkey), behind completeness_checking so a dangling entry (its
+    // -incr content evicted from cas_STORE) resolves to NotFound => cold build,
+    // never a live-digest-to-nowhere.
+    // FL-1406 (#2497) 2026-07-20: durable-on-disk backend (was memory). The
+    // memory backend discarded the whole targetkey->tree_digest pointer map on
+    // every nativelink restart (10 today), losing cross-lifetime reuse:
+    // targetkey is stable per crate-target and recurs across restarts, but each
+    // restart wiped the map while the -incr content survived on cas_STORE
+    // (present_but_cold=0) => post-restart fetches missed and rebuilt cold
+    // (fleet fetch-hit 0.13% aggregate-across-restarts = 2/1670; the durable index
+    // targets THAT number — the within-one-lifetime ceiling is 3.4% = 4/109, a
+    // key-fragmentation residual durability does NOT fix). FilesystemStore rebuilds its index from /srv/bulk on
+    // startup + integrity-scans, so the pointer survives the restart and
+    // re-finds the still-present CAS content. Redis rejected: RedisSpec has no
+    // TTL/eviction field and valkey maxmemory is instance-wide (would evict live
+    // cas:/ac: keys). DoS-cap (design §9) preserved via eviction_policy:
+    // max_count 200000 (binding), max_bytes 128MB, max_seconds 604800 (7d,
+    // matches the ~5d cas content-survival horizon).
+    // REVERT: swap the filesystem backend for the memory block below.
+    //   "memory": { "eviction_policy": { "max_bytes": 64000000, "max_count": 200000 } }
+    {
+      "name": "INCR_SEED_INDEX_STORE",
+      "completeness_checking": {
+        "backend": {
+          "filesystem": {
+            "content_path": "/srv/casdata/nativelink/stores/content_path-incr_index",
+            "temp_path": "/srv/casdata/nativelink/stores/tmp_path-incr_index",
+            "eviction_policy": {
+              "max_bytes": 128000000,
+              "max_count": 200000,
+              "max_seconds": 604800
+            }
+          }
+        },
+        "cas_store": {
+          "ref_store": {
+            "name": "cas_STORE"
+          }
+        }
+      }
+    }
+  ],
+  "schedulers": [
+    {
+      "name": "MAIN_SCHEDULER",
+      "simple": {
+        "cas_store": "cas_STORE",
+        // #m1 rebalance gate ENABLED 2026-07-01 (dispatch-count P-headroom
+        // overflow gate; caps a worker at its P-core count and spreads the
+        // surplus to P-headroom peers instead of piling onto a saturated
+        // cache-holder). Enabled after a live demonstration fixed the G3
+        // sole-holder over-concentration: M1 OFF showed forget at 949% CPU /
+        // 283-of-290 (97.6%) dispatches to ONE worker while 7 idled; M1 ON
+        // excluded it at running_actions==p_core_count (p_load=54%, a legit
+        // exclusion) and spread the overflow — no over-exclusion, no wedge.
+        // TLA+-proven (I1-I5, no-wedge), 7+4-reviewer cleared, default-OFF flag.
+        // FOLLOW-UP: a clean measured-makespan soak (R5) was NOT completed
+        // (both arms lost to interruptions); run one when a macOS bench client
+        // is reachable. Revert = remove this line + `just deploy-server-config
+        // restart-server`.
+        // #p2p-prefetch CANARY 2026-07-04: flag ON to measure realized peer-fetch
+        // offload under 3-concurrent benchmark load. REVERT to false + restart-server
+        // after measurement (this is fleet-wide, not scoped to one worker).
+        "enable_p2p_input_prefetch": true,
+        // #speculative-prefetch ENABLE 2026-07-06: master gate ON — the scheduler
+        // emits tag-15 PrefetchInputs on a backlog of >=3 queued actions to
+        // pre-CONSTRUCT the next action's input tree on an idle worker (clonefile
+        // HIT at dispatch). No-preempt guaranteed at the pin layer (disjoint 5%
+        // speculative sub-budget, TLC-proven NoStarve). Requires the f85f2e1c
+        // binary deployed; the gate is scheduler-side only.
+        "enable_speculative_prefetch": true,
+        // #sched-decision-trace DIAGNOSTIC 2026-07-15: dump every dispatch decision's
+        // per-candidate variables (running, p/e cores, has_p_headroom, memory_kb reservation
+        // is_satisfied_by, first_failing_predicate) at INFO, rate-limited ≤1/s. DIAGNOSIS DONE
+        // 2026-07-15: confirmed the memory_kb=4000000 reservation caps workers at 4/worker
+        // (rust_link_caps.bzl 108a18d1030 mnemonic-blind exec_properties leaking the RustcLink
+        // 4GB cap onto Rustc compiles). CONFIRMED FIXED 2026-07-15: trace showed Rustc compiles
+        // with NO memory_kb (uncapped → spill to E-cores), RustcLink at the halved 2GB, sanitizer
+        // at 4GB; all 10 workers P-pegged + E-active under the cold rebuild. Flag OFF; code stays.
+        // TEMPORARILY ON 2026-08-06 for the phase3 factor-4.0 CEILING VERIFICATION. Same use as
+        // the 2026-07-15 diagnosis: the dump carries the EFFECTIVE (post-Phase-3-override)
+        // memory_kb Minimum, because api_worker_scheduler.rs:7975-7986 passes `sel_props` (the
+        // phase3_compute_effective_action_info result) into inner_find_and_reserve_worker, which
+        // hands it to emit_decision_trace. That makes it a DIRECT read of the reservation rather
+        // than an inference from running-counts: at factor 2.0 the declared/factor FLOOR bound
+        // RustcLink at 1,000,000 KB; at 4.0 the floor is 500,000 KB, BELOW the measured p95
+        // (~611-689 MB), so the p95 should now govern. Expect ~611-689k KB, NOT 1,000,000.
+        // Both-directions signal: the old value is known, so a null result is readable.
+        // RUN COMPLETE 2026-08-06, REVERTED. Result: the mechanism is engaged (floor observed
+        // at exactly 500,000 KB = declared 2,000,000 / 4.0; DOWN applied 158x; p95-governed
+        // reservations observed at 656k-925k KB) but the CEILING question was NOT answered --
+        // demand was insufficient (one of two client builds cache-hit 87.5%) and the resource-
+        // profile map was cold (accuracy_predicted_covered=76). Re-enable for the heavier
+        // re-run; see deferred_tasks #phase3-ceiling. Heavy re-run DONE 2026-08-06 (6 concurrent
+        // macOS invocations via distinct OUTPUT_BASE, 1,954 remote actions, 0 cache hits):
+        // per-worker ceiling stayed 16 with minmem->0, unchanged from the factor-2.0 era, because
+        // ~47% of sampled dispatches take NO down-override and still reserve the declared 2 GB.
+        // Coverage, not the cap, is the lever. Reverted.
+        "scheduler_decision_trace_enabled": false,
+        "p_headroom_gate_enabled": true,
+        // #cpu-first-placement ENABLE 2026-07-16 (user-directed). CpuIdleFirst places each
+        // task on the lowest (synthetic-compensated) p-core-load worker first, spilling to
+        // E-cores only when P is full; falls back to decile-bucketed subtree-cache tiebreak
+        // ONLY when ALL viable workers' p-load rounds >= 90%. LAYERS over eligibility
+        // (byte-identical to CacheAffinityFirst when off). Full Tier-3 cadre + fix-up +
+        // verify (.claude/reviews/cpu-first-cbc8c50d/). WATCH (pre-enable follow-ups): (1) the
+        // CpuIdleFirst-vs-CacheAffinityFirst throughput delta is UNMEASURED (cache-affinity
+        // benefit ~10ms post-clonefile); (2) I/O-BOUND-PHASE MIS-STEER — a fetch-stalled worker
+        // shows LOW p_load (P idle on network I/O, NOT spare capacity), so CpuIdleFirst may pile
+        // work onto it AND drop cache affinity → deepen the input-fetch queue (the throughput
+        // lever). One shared MAIN_SCHEDULER, two build phases. KILL-SWITCH: set back to
+        // "cache_affinity_first" + restart-server if makespan regresses or CAS/network fetch deepens.
+        "placement_mode": "cpu_idle_first",
+        // #pcore-first p_idle override CANARY 2026-07-07: activates clause 3 of
+        // worker_has_p_headroom — an I/O-BOUND worker (p_core_load_pct < 50) that is
+        // dispatch-saturated (running >= p_core_count) is STILL admitted up to
+        // p_core_count × override_factor(2) before pcore-first excludes it. At 0 (prior)
+        // clause 3 was dead (p_core_load_pct < 0 impossible on u32). Also shrinks Stage B's
+        // hold-candidate set (shared p_gated_excluded). WATCH per-worker action-concentration;
+        // depends on p_core_load_pct calibration (proc_pidinfo mach-timebase).
+        "p_idle_threshold_pct": 50,
+        // 2026-07-11: p_headroom_override_factor 2 → 4 (default was 2). The p_load
+        // override was capping I/O-bound workers at p_core_count×2 = 8 in-flight —
+        // 7253 of 8746 p-headroom exclusions/hr were I/O-bound workers hitting THAT
+        // ceiling (not genuine P-saturation). VERIFIED that p_core_load_pct is
+        // reliable — it is a host_processor_info per-CPU tick RATIO (busy/total,
+        // unit-independent), sampled every 100ms; the "proc_pidinfo mach-timebase"
+        // caveat above is a MISATTRIBUTION (that ~40x bug was the #64 per-ACTION
+        // classifier, a different measurement). So admitting idle-P-core workers to
+        // 4×p_core = 16 in-flight is safe: the fresh-count ceiling still bounds any
+        // ≤100ms-stale reading (invariant I5_Bounded), and I6 ranking keeps a
+        // genuinely-free P-slot worker PREFERRED over an override-admit (override is
+        // last-resort). WATCH per-worker action-concentration; kill = revert to 2.
+        "p_headroom_override_factor": 4,
+        // #task-resource-profile Phase-3 ENABLE 2026-07-16 (option A, user-directed): RAISE +
+        // DOWN-overcommit ARMED. RAISE = reserve max(declared,tail); monotone-safe (over-reserves,
+        // no OOM), ~inert on opt where declared≈tail. DOWN-overcommit = reserve p50×(1+variance-margin),
+        // floored at declared/factor(2.0) — BELOW declared → packs more. HONEST OOM NOTE
+        // (FL-1383 9-panel 2026-07-21, red-team×2 + perf flagged, OPERATOR-ACCEPTED; de-risk FL-1420):
+        // free-floor (memory_gate_enabled:true fleet-wide, 15h-canary-validated, live 10/10 workers
+        // 2026-07-16) is an ADMISSION-TIME gate (available<1GiB) and is fail-OPEN fleet-wide — it
+        // throttles the NEXT admit and CANNOT reclaim from already-admitted under-reserved actions at
+        // their concurrent peak, which is exactly DOWN-overcommit's failure mode. The two RUNTIME OOM
+        // detectors that WOULD catch that peak (worker memory_gate_refault/_swapin_confirm_rate) are
+        // BOTH u32::MAX = OFF during the first soak. UPDATE 2026-07-29: the swapin detector is
+        // now ARMED at a measured 2000 pages/s (worker.json5 memory_gate_swapin_confirm_rate,
+        // #calib restart-fresh benchmark calibration) — the runaway-peak backstop is a designed
+        // mechanism, no longer only the kernel OOM-killer. refault stays retired. Compounds
+        // with p_headroom_override_factor(4). Armed build-ahead for asan/tsan high-variance links;
+        // ~inert on opt (declared≈tail → little to lower). WATCH: worker OOM / mirror-drop /
+        // memory_gate free-floor NAK rate / down_opportunity_* + accuracy_predicted_under_{fine,coarse}.
+        // KILL-SWITCH: set phase3_down_overcommit_enabled false (or phase3_overcommit_max_factor 1.0)
+        // + restart-server. RAISE alone stays safe.
+        "phase3_raise_enabled": true,
+        "phase3_down_overcommit_enabled": true,
+        // 2026-07-29 operator: 2.0 -> 4.0, armed TOGETHER with the swapin gate. At 4.0 the
+        // floor (declared/4; RustcLink 500MB) sits cleanly below every measured p95 (links
+        // ~611MB) so the p95 governs reservations; the floor remains the proactive bound on
+        // CORRELATED under-prediction (fine-tier under 31%, worst single miss 21x; free-floor
+        // is admission-time only). Full floorless deferred until under-attribution data
+        // accumulates + churn throttle calibrated. Lifts the fleet link ceiling ~160 -> ~260.
+        "phase3_overcommit_max_factor": 4.0,
+        // #task-resource-profile Phase-3 Stage-4 PERSISTENCE 2026-07-16: persist the
+        // learned resource-profile map across server restarts (removes the re-warm-to-
+        // all-skip tax so DOWN-overcommit can engage sooner). Advisory/observe path:
+        // atomic tmp+rename, NEVER fsync'd, missing/corrupt snapshot logs warn + starts
+        // fresh (never crashes startup). interval/max_age left explicit at defaults.
+        "resource_profile_persist_path": "/srv/nativelink/resource_profile.snapshot",
+        "resource_profile_persist_interval_secs": 300,
+        "resource_profile_persist_max_age_secs": 604800,
+        // #specprefetch-rebind Stage B ENABLE 2026-07-07: temporal hold-vs-rebind.
+        // Holds a queued op for a P-saturated pre-built holder W expected to regain a
+        // P-slot within T_SETUP (3s) rather than reconstruct on a cold peer. Gated on
+        // p_gate_active (fires only when pcore-first excludes W). WATCH hold_regret
+        // (bimodal-fleet p99 detector); this flag is the kill-switch if it regresses.
+        "enable_speculative_hold": true,
+        "supported_platform_properties": {
+          "cpu_count": "minimum",
+          "memory_kb": "minimum",
+          "network_kbps": "minimum",
+          "disk_read_iops": "minimum",
+          "disk_read_bps": "minimum",
+          "disk_write_iops": "minimum",
+          "disk_write_bps": "minimum",
+          "shm_size": "minimum",
+          "gpu_count": "minimum",
+          "gpu_model": "exact",
+          "cpu_vendor": "exact",
+          "cpu_arch": "exact",
+          "cpu_model": "exact",
+          "kernel_version": "exact",
+          "OSFamily": "exact",
+          "container-image": "priority",
+          "lre-rs": "priority",
+          // Bazel >= 9.0 attaches these automatically on persistent-
+          // worker-eligible actions. Scheduler commit 8f52b8aa promoted
+          // unknown properties from silently-dropped to terminal
+          // FailedPrecondition; without an explicit ignore here every
+          // such action gets rejected and Bazel surfaces them as
+          // "Unknown platform property 'persistentWorkerProtocol'".
+          // We don't dispatch on these; mark ignore so the scheduler
+          // accepts the action and matches purely on the cpu/os/etc.
+          // properties above. (Production outage 2026-05-12.)
+          "persistentWorkerProtocol": "ignore",
+          "persistentWorkerKey": "ignore",
+          // FL-1383 (#2497): the client attaches these carrier props on
+          // allowlisted rustc actions. The server reads+STRIPS them at
+          // ingestion (execution_server) so they never reach here, but declare
+          // ignore as defense-in-depth against the 2026-05-12 unknown-property
+          // terminal-FailedPrecondition outage class.
+          "nl_incr_targetkey": "ignore",
+          "nl_incr_primary_output": "ignore"
+        }
+      }
+    }
+  ],
+  "workers": [],
+  "servers": [
+    {
+      "name": "public",
+      // #58 directive-2: quiesce Bazel REAPI on graceful shutdown. The :50051
+      // public HTTP/2 listener is the SOLE Bazel endpoint; flagging it here makes
+      // the shutdown sequence stop accepting new REAPI before the unbounded
+      // fast->slow flush + worker-pull, so acked-but-not-yet-durable blobs drain.
+      // Set on :50051 ONLY -- the worker_api (:50061) and worker-facing CAS
+      // (:50071/:50072) listeners MUST stay up to carry the worker-pull.
+      "quiesce_on_shutdown": true,
+      "listener": {
+        "http": {
+          "socket_address": "[::]:50051",
+          "advanced_http": {
+            "experimental_http2_max_frame_size": 4194304,
+            // Bazel clients send bursts of >20 RST_STREAM on TLS reconnect
+            // (cancelling stale ByteStream reads from the prior session).
+            // The h2 default of 20 trips ENHANCE_YOUR_CALM GoAway, severing
+            // the connection mid-stream and leaving the scheduler in a
+            // wedged state (observed twice on 2026-04-22). Bumped to 256.
+            "experimental_http2_max_pending_accept_reset_streams": 256,
+            // h2 keepalive (seconds). Without these, hyper sends NO PING
+            // frames and dead-client detection falls to TCP keepalive
+            // (Linux default 7200s = 2h). 30s interval = server sends PING
+            // after 30s of no inbound activity (active uploads reset the
+            // counter, so PING never fires mid-stream). 20s timeout = if
+            // PING goes unacknowledged for 20s, server tears down the
+            // connection. Bounded dead-client detection at ~50s. Matches
+            // gRPC's recommended KEEPALIVE_TIME_MS=30000 /
+            // KEEPALIVE_TIMEOUT_MS=20000 defaults.
+            "http2_keep_alive_interval": 30,
+            "experimental_http2_keep_alive_timeout": 20,
+            // #394 (chunked-write admission p99): hyper defaults to a fixed
+            // 16 MiB h2 stream-level INITIAL_WINDOW_SIZE with no eager
+            // WINDOW_UPDATE pacing. Bazel uploading 50-118 MiB blobs over
+            // 1 ms RTT 10 GbE exhausts the window after the first 16 MiB and
+            // then waits 5-7 s for WINDOW_UPDATE, producing the
+            // `buf_channel.rs:671` "slow producer (>5s wait)" WARNs at
+            // bytes_received = 16 MiB exactly. Effective rate ~11-16 MiB/s
+            // = ~1% of link. Enabling adaptive_window switches hyper to
+            // dynamic BDP-based sizing (up to 64 MiB cap) and eager
+            // WINDOW_UPDATE emission. Per-listener change; same setting is
+            // mirrored on worker_cas and private_workers_servers below.
+            // See `.claude/audits/394-admission-p99-investigation-20260512.md`.
+            // Reversible: delete the line + restart.
+            "experimental_http2_adaptive_window": true
+          },
+          // 64 MiB — some Rust crate actions (regex-syntax, serde_core) produce
+          // gRPC messages >4 MiB, exceeding the tonic default of 4 MiB.
+          "max_decoding_message_size": 67108864,
+"require_tls": true,
+          "tls": {
+            "cert_file": "/srv/gitforge/custom/https/fullchain.pem",
+            "key_file": "/srv/gitforge/custom/https/privkey.pem",
+            "client_ca_file": "/srv/casdata/nativelink/tls/ca.crt"          }
+        }
+      },
+      "services": {
+        "cas": {
+          "main": {
+            "cas_store": "cas_STORE"
+          }
+        },
+        "ac": {
+          "main": {
+            "ac_store": "AC_MAIN_STORE"
+          },
+          // FL-1383 (#2497): the build-agent incr_seed_index tool connects to
+          // this CLIENT endpoint (:50051, same as bazel remote_cache) and does
+          // GetActionResult(instance_name="incr_seed_index"). Without this
+          // mapping the cross-machine seed fetch returns 'instance_name not
+          // configured' -> cold. mTLS-gated like the main AC already here.
+          "incr_seed_index": {
+            "ac_store": "INCR_SEED_INDEX_STORE"
+          }
+        },
+        "execution": {
+          "main": {
+            "cas_store": "cas_STORE",
+            "scheduler": "MAIN_SCHEDULER",
+            // FL-1383 (#2497): read the client carrier (nl_incr_targetkey /
+            // nl_incr_primary_output) at ingestion for allowlisted rustc
+            // actions and thread the targetkey into ActionInfo. Fail-closed:
+            // only actions whose primary output matches the allowlist opt in.
+            "portable_incr": {
+              "enabled": true,
+              "action_output_allowlist": ["bazel-out/"]
+            }
+          }
+        },
+        "capabilities": {
+          "main": {
+            "remote_execution": {
+              "scheduler": "MAIN_SCHEDULER"
+            }
+          }
+        },
+        "bytestream": {
+          "cas_stores": {
+            "main": "cas_STORE"
+          },
+          "streaming_read_while_write": true
+        }
+      }
+    },
+    {
+      // Worker-facing CAS/AC/bytestream on a separate port with a higher
+      // encoding limit.  Bazel's Java gRPC client needs ≤4 MiB responses,
+      // but NativeLink workers accept up to 256 MiB.
+      "name": "worker_cas",
+      "listener": {
+        "http": {
+          "socket_address": "[::]:50071",
+          "advanced_http": {
+            "experimental_http2_max_frame_size": 4194304,
+            // Bazel clients send bursts of >20 RST_STREAM on TLS reconnect
+            // (cancelling stale ByteStream reads from the prior session).
+            // The h2 default of 20 trips ENHANCE_YOUR_CALM GoAway, severing
+            // the connection mid-stream and leaving the scheduler in a
+            // wedged state (observed twice on 2026-04-22). Bumped to 256.
+            "experimental_http2_max_pending_accept_reset_streams": 256,
+            // h2 keepalive (seconds). See public:50051 for full rationale.
+            // 30s interval / 20s timeout = ~50s dead-connection detection
+            // for the worker CAS path; without these we rely on TCP
+            // keepalive (Linux default 2h).
+            "http2_keep_alive_interval": 30,
+            "experimental_http2_keep_alive_timeout": 20,
+            // #394 (chunked-write admission p99): see public:50051 for full
+            // rationale. Worker CAS uploads share the same h2 window
+            // mechanism; 16 MiB fixed window starves throughput on
+            // worker->server CAS PUTs in the same way. Enable adaptive
+            // window sizing here too.
+            // See `.claude/audits/394-admission-p99-investigation-20260512.md`.
+            "experimental_http2_adaptive_window": true
+          },
+          "max_decoding_message_size": 67108864,
+          // 64 MiB — workers set max_decoding to 256 MiB, so 64 MiB
+          // encoding is safe and avoids the 4 MiB Bazel constraint.
+          "max_encoding_message_size": 67108864,
+          // Zstd compression for worker<->server traffic. Source files
+          // compress ~4:1, saving 10-80ms per action on 10GbE. Workers'
+          // M4 Mac Mini CPUs decompress zstd at ~3GB/s (negligible overhead).
+          "compression": {
+            "send_compression_algorithm": "zstd",
+            "accepted_compression_algorithms": ["zstd"]
+          },
+"require_tls": true,
+          "tls": {
+            "cert_file": "/srv/gitforge/custom/https/fullchain.pem",
+            "key_file": "/srv/gitforge/custom/https/privkey.pem",
+            "client_ca_file": "/srv/casdata/nativelink/tls/ca.crt"          }
+        }
+      },
+      "services": {
+        "cas": {
+          "main": {
+            "cas_store": "cas_STORE"
+          }
+        },
+        "ac": {
+          "main": {
+            "ac_store": "AC_MAIN_STORE"
+          },
+          // FL-1383 (#2497): the mutable targetkey->-incr index, reached by the
+          // worker's INCR_SEED_INDEX_STORE grpc (instance_name incr_seed_index)
+          // over this worker-facing listener. GetActionResult/UpdateActionResult
+          // on hash(targetkey) fetch/publish the seed pointer.
+          "incr_seed_index": {
+            "ac_store": "INCR_SEED_INDEX_STORE"
+          }
+        },
+        "bytestream": {
+          "cas_stores": {
+            "main": "cas_STORE"
+          },
+          "streaming_read_while_write": true
+        }
+      }
+    },
+    {
+      // Worker-facing CAS/AC/bytestream over QUIC/HTTP3 (UDP).
+      // Same services as worker_cas but using QUIC for lower latency
+      // and better multiplexing on the 10 GbE LAN.
+      "name": "worker_cas_quic",
+      "listener": {
+        "http3": {
+          "socket_address": "[::]:50072",
+          "cert_file": "/srv/nativelink/certs/server.crt",
+          "key_file": "/srv/nativelink/certs/server.key",
+          "client_ca_file": "/srv/casdata/nativelink/tls/ca.crt",
+          "max_decoding_message_size": 67108864,
+          "max_encoding_message_size": 67108864
+        }
+      },
+      "services": {
+        "cas": {
+          "main": {
+            "cas_store": "cas_STORE"
+          }
+        },
+        "ac": {
+          "main": {
+            "ac_store": "AC_MAIN_STORE"
+          },
+          // FL-1383 (#2497): the mutable targetkey->-incr index, reached by the
+          // worker's INCR_SEED_INDEX_STORE grpc (instance_name incr_seed_index)
+          // over this worker-facing listener. GetActionResult/UpdateActionResult
+          // on hash(targetkey) fetch/publish the seed pointer.
+          "incr_seed_index": {
+            "ac_store": "INCR_SEED_INDEX_STORE"
+          }
+        },
+        "bytestream": {
+          "cas_stores": {
+            "main": "cas_STORE"
+          },
+          "streaming_read_while_write": true
+        }
+      }
+    },
+    {
+      "name": "private_workers_servers",
+      "listener": {
+        "http": {
+          "socket_address": "[::]:50061",
+          "max_encoding_message_size": 67108864,
+          "advanced_http": {
+            "experimental_http2_max_frame_size": 4194304,
+            // Bazel clients send bursts of >20 RST_STREAM on TLS reconnect
+            // (cancelling stale ByteStream reads from the prior session).
+            // The h2 default of 20 trips ENHANCE_YOUR_CALM GoAway, severing
+            // the connection mid-stream and leaving the scheduler in a
+            // wedged state (observed twice on 2026-04-22). Bumped to 256.
+            "experimental_http2_max_pending_accept_reset_streams": 256,
+            // h2 keepalive (seconds). See public:50051 for full rationale.
+            // Worker API connections are long-lived; without keepalive a
+            // dead worker socket lingers up to TCP keepalive's 2h. 30s
+            // interval / 20s timeout caps detection at ~50s.
+            "http2_keep_alive_interval": 30,
+            "experimental_http2_keep_alive_timeout": 20,
+            // #394 (chunked-write admission p99): see public:50051 for full
+            // rationale. The worker_api listener carries scheduler RPCs and
+            // is less sensitive to large-blob window starvation, but the
+            // setting is harmless and keeps all three h2 listeners aligned
+            // (every stream on every hyper listener inherits the same
+            // window-sizing config).
+            // See `.claude/audits/394-admission-p99-investigation-20260512.md`.
+            "experimental_http2_adaptive_window": true
+          },
+          "require_tls": true,
+          "tls": {
+            "cert_file": "/srv/gitforge/custom/https/fullchain.pem",
+            "key_file": "/srv/gitforge/custom/https/privkey.pem",
+            "client_ca_file": "/srv/casdata/nativelink/tls/ca.crt"          }
+        }
+      },
+      "services": {
+        // Note: This should be served on a different port, because it has
+        // a different permission set than the other services.
+        // In other words, this service is a backend api. The ones above
+        // are a frontend api.
+        "worker_api": {
+          "scheduler": "MAIN_SCHEDULER"
+        },
+        "admin": {},
+        "health": {},
+        // RE-ENABLED 2026-05-15 after `a169e482` (2026-05-13 18:39 PDT)
+        // fixed the blanket-impl wedge — that commit added try_*_lock
+        // skip-on-contention to all four `MetricsComponent for
+        // {std,parking_lot,tokio::sync,async_lock}::{Mutex,RwLock}<T>`
+        // blankets, so a metrics scrape that races a scheduler writer
+        // publishes a default Component for the contended subtree
+        // instead of parking the tokio worker on the FIFO event_listener
+        // queue. Commit message explicitly states: "Re-enabling
+        // services.metrics: {} in production after this commit ships
+        // will no longer wedge the server." Confirmed live on origin/main
+        // 2026-05-15 12:37 PDT (PID 1867529). Original wedge-2026-05-13
+        // RCA at .claude/audits/wedge-2026-05-13-postmortem.md.
+        // Worker API (50061) is mTLS-narrowed to internal fleet (per
+        // memory `remote_workers_are_trusted`), so /metrics scrape
+        // audience is operator + the internal worker / crow-agent /
+        // buildbuddy / user cert holders only.
+        "metrics": {}
+      }
+    }
+  ],
+  "global": {
+    "max_open_files": 524288,
+    default_digest_hash_function: "blake3",
+    pprof_port: 6060,
+    // TLS config for server → worker CAS connections (port 40081).
+    // The CA that signed the worker certificates.
+    worker_proxy_tls_ca_file: "/srv/casdata/nativelink/tls/ca.crt",
+    // Server's client cert/key for mTLS to workers.
+    worker_proxy_tls_cert_file: "/srv/gitforge/custom/https/fullchain.pem",
+    worker_proxy_tls_key_file: "/srv/gitforge/custom/https/privkey.pem",
+    // #212 Phase 2.7 Bazel-facing internal-chunking kill-switch.
+    // When ON, FastSlowStore::update for blobs >= CHUNK_SIZE (1 MiB)
+    // dispatches via the per-blob ChunkedDriver machinery (β
+    // async-commit semantics) instead of the legacy single-stream
+    // path. Process-wide AtomicBool consulted by every FSS that
+    // has a BazelChunkedDispatcher installed.
+    // Production sign-off 2026-05-02.
+    bazel_facing_internal_chunking_enabled: true,
+    // #168 SmallBlobDispatcher kill-switch. RE-ENABLED 2026-05-06
+    // (10:00am PDT) after the v2-canary "rollback" investigation
+    // exonerated v2: the original "sent too much data" errors were
+    // a Bazel-side cache corruption (LF/CRLF or similar 79-byte drift
+    // on `scopeguard-1.2.0/src/lib.rs`) that persisted across the v2
+    // → af8c0b53 server-binary rollback. Server was correctly
+    // rejecting an invalid upload; user cleared Bazel cache to fix.
+    // v2 binary is healthy; turning the canary flag back on.
+    small_blob_mirror_enabled: true
+  }
+}

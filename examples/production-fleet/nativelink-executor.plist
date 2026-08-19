@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.nativelink-worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/user/src/nativelink/target/release/nativelink</string>
+        <string>/Users/user/worker.json5</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/user/Work</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/user/Library/Logs/nativelink-worker.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/user/Library/Logs/nativelink-worker.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>Stack</key>
+        <integer>67108864</integer>
+    </dict>
+</dict>
+</plist>

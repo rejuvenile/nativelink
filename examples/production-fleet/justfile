@@ -1,0 +1,1267 @@
+worker_list := "../worker_macs.txt"
+ci_list := "../ci_hosts.txt"
+server := "buildcache"
+src_dir_server := "/home/user/src/nativelink"
+src_dir_worker := "/Users/user/src/nativelink"
+worker_config := "/Users/user/worker.json5"
+worker_config_src := justfile_directory() / "worker.json5"
+worker_log := "/Users/user/Library/Logs/nativelink-worker.log"
+worker_err := "/Users/user/Library/Logs/nativelink-worker.err"
+bundle_script := justfile_directory() / "bundle-worker.sh"
+app_binary := "/Users/user/Applications/NativeLink.app/Contents/MacOS/nativelink"
+launchd_plist_src := justfile_directory() / "com.example.nativelink-worker.plist"
+launchd_label := "com.example.nativelink-worker"
+launchd_plist_daemon := "/Library/LaunchDaemons/com.example.nativelink-worker.plist"
+launchd_plist_agent := "~/Library/LaunchAgents/com.example.nativelink-worker.plist"
+
+# Worker log rotation: copy-and-truncate via the in-repo
+# packaging/macos/rotate-log.sh + paired plist. NEVER point newsyslog at
+# the worker's launchd-managed log files: without the pid_file+sig_num
+# columns AND a SIGHUP handler in the binary, newsyslog renames the
+# active log out from under the daemon's open fd 1, orphaning all
+# subsequent stdout/stderr (#180, 2026-04-27). The script + plist live
+# in the nativelink repo (already on each worker after `just pull`); we
+# install them into stable system paths below.
+rotate_log_script_src := src_dir_worker / "packaging/macos/rotate-log.sh"
+rotate_log_script_dest := "/usr/local/bin/nativelink-rotate-log.sh"
+rotate_log_plist_src := src_dir_worker / "packaging/macos/com.tracemachina.nativelink.rotate-log.plist"
+rotate_log_plist_dest := "/Library/LaunchDaemons/com.tracemachina.nativelink.rotate-log.plist"
+rotate_log_plist_label := "com.tracemachina.nativelink.rotate-log"
+# The legacy newsyslog conf at this path is the bug behind #180. We
+# proactively remove it on every setup-logrotate run so a stale install
+# can never silently re-orphan the worker's fd 1.
+legacy_newsyslog_conf := "/etc/newsyslog.d/nativelink-worker.conf"
+
+# Default: full deploy (pull, build, restart) on server + all workers
+default: deploy
+
+# Full deploy: push, pull, build, install-server-binary, bundle, sign, push-config, deploy-server-config, restart everything
+deploy: push pull build install-server-binary bundle sign push-config deploy-server-config restart
+
+# Like `deploy` but flushes Redis (and clears in-memory caches via the
+# server restart) before bringing workers back. Use after a fix that
+# cleans up stale AC/CAS state — flushing forces Bazel to re-upload +
+# re-execute, eliminating phantom-blob references.
+#
+# Ordering preserves both invariants:
+# (a) **Workers first** (per `restart` recipe rationale): workers
+#     restart with the new code BEFORE the server-side change observes
+#     them, so a server with its workaround removed only ever talks to
+#     peers that have the source-side fix.
+# (b) **Atomic flush+restart**: Redis FLUSHALL must be followed
+#     IMMEDIATELY by a server restart, with NO live-server window in
+#     between — otherwise the server's in-memory ExistenceCache (50M
+#     entries) and AC_BACKEND_CACHED (4GB) keep returning "blob
+#     present" for blobs that have just been flushed. Workers querying
+#     in that gap see exactly the FAILED_PRECONDITION class this recipe
+#     exists to prevent.
+# Composition: workers restart → atomic flush+restart-server (the
+# `flush-redis` recipe runs FLUSHALL then immediately invokes
+# `just restart-server` from a single shell body, with no live-server
+# window between the flush and the restart).
+deploy-flush: push pull build install-server-binary bundle sign push-config deploy-server-config restart-workers flush-redis
+
+# Push local commits to gitforge before deploying
+push:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{src_dir_server}}
+    echo "=== Pushing to gitforge ==="
+    git push origin main 2>&1
+    echo "=== Pushed ==="
+
+# Git pull on server + all workers in parallel
+# Pull on server + all workers in parallel.
+#
+# Each pull's full stderr+stdout is teed to /tmp/pull-<host>.log on the
+# orchestrator. Per-host exit codes are captured from `wait $pid`; if
+# any worker's git pull fails (remote/auth/conflict), abort the recipe
+# loudly with a per-host summary. SSH-unreachable workers warn only
+# (common — workers go offline); server pull failure is always fatal.
+#
+# Pre-#559, this recipe used bare `wait` + `git pull ... | tail -1` +
+# `&&` chain — silently swallowed both ssh-side and git-side failures.
+# `build` was hardened against the same anti-pattern on 2026-05-04
+# (see line ~91); pull wasn't, so the chained `bundle: pull build
+# bundle-only` was only as robust as the weakest prereq. Red-team
+# caught it during #559 review (2026-05-19); pull now matches build's
+# hardness, so the bundle chain's "always-pull + always-build by
+# construction" guarantee actually holds.
+pull:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Pulling on {{server}} ==="
+    declare -A pids
+    rm -f /tmp/pull-*.log
+    run_on_server 'cd {{src_dir_server}} && git pull origin main' \
+        > /tmp/pull-{{server}}.log 2>&1 &
+    pids[{{server}}]=$!
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+            'cd {{src_dir_worker}} && git pull origin main && git submodule update --init' \
+            > "/tmp/pull-${host}.log" 2>&1 &
+        pids[$host]=$!
+    done < {{worker_list}}
+    # Distinguish ssh-unreachable workers (warn — common, workers go
+    # offline) from real git-side failures (abort — silent-stale-source
+    # is what bit #558 and motivated #559). Mirrors the build recipe's
+    # triage pattern (line ~118-160).
+    server_failed=0
+    worker_git_failed=()
+    worker_unreachable=()
+    for host in "${!pids[@]}"; do
+        if wait "${pids[$host]}"; then
+            continue
+        fi
+        if [[ "$host" == "{{server}}" ]]; then
+            server_failed=1
+            continue
+        fi
+        # A git-side failure leaves git error markers in the log
+        # (fatal: ... or error: ...). Absence = ssh-side failure
+        # (timeout, auth, disconnect, no-route, host-down).
+        if grep -qE "^(fatal|error):" "/tmp/pull-${host}.log"; then
+            worker_git_failed+=("$host")
+        else
+            worker_unreachable+=("$host")
+        fi
+    done
+    if (( ${#worker_unreachable[@]} )); then
+        echo "=== ssh-unreachable workers (skipped, source will be stale on these — re-deploy when back): ${worker_unreachable[*]} ===" >&2
+    fi
+    if (( server_failed || ${#worker_git_failed[@]} )); then
+        echo "=== PULL FAILED — abort deploy ===" >&2
+        if (( server_failed )); then
+            echo "----- server ({{server}}) pull failed: last 30 lines of /tmp/pull-{{server}}.log -----" >&2
+            tail -30 "/tmp/pull-{{server}}.log" >&2
+        fi
+        for host in "${worker_git_failed[@]}"; do
+            echo "----- worker $host pull failed: last 30 lines of /tmp/pull-${host}.log -----" >&2
+            tail -30 "/tmp/pull-${host}.log" >&2
+            echo "" >&2
+        done
+        exit 1
+    fi
+    echo "=== All reachable hosts pulled (full logs at /tmp/pull-*.log) ==="
+
+# Build on server + ONE designated builder worker, then scp the worker
+# binary fan-out to every other reachable worker.
+#
+# Workers are macOS aarch64 — every worker's release binary is byte-
+# identical. The old recipe ran cargo on the server AND all 10 workers
+# (11 parallel cargo invocations). Workers are power-limited; 9 of those
+# cargo runs were pure waste. New shape:
+#
+#   Phase A (parallel): server cargo + builder-worker cargo. Both stream
+#     to /tmp/build-<host>.log. Failure semantics unchanged from old
+#     recipe (server fail = hard abort; builder cargo fail = hard abort;
+#     builder ssh-unreachable = hard abort — per design, no auto-fallback
+#     to a different builder; operator picks a different builder by
+#     reordering bld/infra/worker_macs.txt and reruns).
+#   Wait for builder. (Server keeps building concurrently.)
+#   Phase B (parallel): scp builder's freshly-built
+#     target/release/nativelink to every other reachable worker, landing
+#     it at the same path so the existing `bundle` recipe finds it.
+#     Per-host scp output → /tmp/scp-<host>.log. Classifier matches the
+#     Phase-A pattern: ssh-unreachable → warn-only; anything past ssh
+#     (cp / disk-full / perms) → abort.
+#   Wait for all scps + the server build to finish before returning.
+#
+# Net invocation count: 11 cargo → 2 cargo + 9 scp.
+#
+# Builder selection: the first non-blank line of {{worker_list}}.
+# Deterministic; rotate the builder by reordering the worker list.
+#
+# Each build's full stderr+stdout is teed to /tmp/build-<host>.log on the
+# orchestrator. Per-host exit codes are captured from `wait $pid`; if any
+# exits non-zero, this recipe fails loudly with a per-host summary table
+# (vs the old `2>&1 | tail -3` + `wait` (no args) pattern, which silently
+# hid compile failures and returned only the LAST background job's exit).
+#
+# **Hardware-homogeneity premise (load-bearing).** nativelink's
+# .cargo/config.toml sets `-C target-cpu=native` for release builds.
+# The builder's CPU therefore picks the codegen target for the WHOLE
+# fleet via this recipe. As long as worker_macs.txt is uniformly M4
+# (current state), the produced binary runs on every recipient. If
+# anyone ever adds an M3/M2/M1 worker without first pinning a
+# floor-CPU target in nativelink/.cargo/config.toml, the scp'd binary
+# will SIGILL at launch on that worker. The post-scp verify loop below
+# (`<bin> --version`) catches this at deploy time rather than at next
+# launchctl restart.
+#
+# **Post-scp verify.** After each scp succeeds, the recipe ssh's into
+# the recipient and asserts (a) shasum-256 matches the builder's
+# (catches transfer truncation / stale binary not replaced) AND (b)
+# `<bin> --version` exits 0 (catches SIGILL on hw-target mismatch).
+# A mismatch demotes the host to scp_send_failed → hard-abort. This
+# substitutes for the old per-worker cargo's implicit "binary works
+# on this hardware" health check.
+build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    rm -f /tmp/build-*.log /tmp/scp-*.log /tmp/scp-verify-*.log
+    # Pick the builder: first non-blank line of the worker list.
+    # Deterministic — rotate by reordering the file.
+    builder="$(grep -m1 -E '\S' {{worker_list}} || true)"
+    builder="${builder%$'\r'}"
+    if [[ -z "$builder" ]]; then
+        echo "=== BUILD FAILED — no builder worker resolved ({{worker_list}} empty) ===" >&2
+        exit 1
+    fi
+    echo "=== Building on {{server}} (server) + ${builder} (worker builder) — started $(date) ==="
+    # Phase A: launch server build + builder cargo build in parallel.
+    declare -A build_pids
+    run_on_server 'cd {{src_dir_server}} && cargo build --bin nativelink --release --features quic,pprof,chunked_fast_slow' \
+        > /tmp/build-{{server}}.log 2>&1 &
+    build_pids[{{server}}]=$!
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$builder" \
+        'export PATH="$HOME/.cargo/bin:$PATH" && cd {{src_dir_worker}} && cargo build --bin nativelink --release --features quic,pprof,chunked_fast_slow' \
+        > "/tmp/build-${builder}.log" 2>&1 &
+    build_pids[$builder]=$!
+    # Wait for the BUILDER first (server keeps running). We need the
+    # builder's binary before Phase B can start.
+    builder_failed=0
+    if ! wait "${build_pids[$builder]}"; then
+        builder_failed=1
+    fi
+    if (( builder_failed )); then
+        # Classify the builder failure the same way as a non-builder
+        # worker would have been classified, but the verdict is always
+        # hard-abort regardless of class (per design — no auto-fallback).
+        if grep -qE "^error\[E[0-9]+\]|^error: could not compile|^error: aborting due to" "/tmp/build-${builder}.log"; then
+            echo "=== BUILD FAILED — builder ${builder} cargo failed; abort deploy ===" >&2
+            echo "----- builder ${builder} compile failed: last 30 lines of /tmp/build-${builder}.log -----" >&2
+        else
+            echo "=== BUILD FAILED — builder ${builder} unreachable (ssh/auth/timeout/host-down); abort deploy ===" >&2
+            echo "----- builder ${builder} ssh failed: last 30 lines of /tmp/build-${builder}.log -----" >&2
+        fi
+        tail -30 "/tmp/build-${builder}.log" >&2 || true
+        echo "    Pick a different builder by reordering bld/infra/worker_macs.txt and rerunning." >&2
+        # Best-effort: terminate the local ssh client wrapping the
+        # server cargo. Note: when {{server}} build runs via ssh (i.e.,
+        # the operator is NOT on buildcache), kill signals the local ssh
+        # process — sshd does not propagate SIGTERM to the remote
+        # process group, so the remote cargo on {{server}} may
+        # continue to completion. The resulting binary is unused but
+        # harmless. When run directly on buildcache, kill works as
+        # expected on the local cargo PID.
+        kill "${build_pids[{{server}}]}" 2>/dev/null || true
+        exit 1
+    fi
+    echo "=== Builder ${builder} finished; distributing binary to other workers ==="
+    # Phase B: scp the builder's freshly-built binary to every other
+    # reachable worker. Server cargo is still running in the background;
+    # we'll join it at the end.
+    builder_bin="{{src_dir_worker}}/target/release/nativelink"
+    # Capture builder's shasum once for post-scp verification (Fix 2).
+    # Failure here is itself a hard-abort: if we can't read the binary
+    # we just built, the deploy is broken regardless.
+    BUILDER_SHA=$(ssh -o ConnectTimeout=5 "$builder" "shasum -a 256 '${builder_bin}' | awk '{print \$1}'") || {
+        echo "=== BUILD FAILED — could not shasum builder ${builder}'s freshly-built binary at ${builder_bin}; abort deploy ===" >&2
+        kill "${build_pids[{{server}}]}" 2>/dev/null || true
+        exit 1
+    }
+    if [[ -z "$BUILDER_SHA" || ${#BUILDER_SHA} -ne 64 ]]; then
+        echo "=== BUILD FAILED — builder ${builder} shasum invalid ('${BUILDER_SHA}'); abort deploy ===" >&2
+        kill "${build_pids[{{server}}]}" 2>/dev/null || true
+        exit 1
+    fi
+    echo "=== Builder binary shasum: ${BUILDER_SHA} ==="
+    declare -A scp_pids
+    declare -a scp_recipients=()
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        host="${host%$'\r'}"
+        [[ "$host" == "$builder" ]] && continue
+        # Use scp with a remote ssh into the builder, fanning binaries
+        # builder→target. `scp -3` would also work but proxies through
+        # the orchestrator and wastes WAN bandwidth; using ssh-from-
+        # builder keeps the bytes on the worker LAN.
+        # BatchMode=yes: a backgrounded ssh/scp that hits a host-key or
+        # auth-fallback prompt writes it to /dev/tty (NOT stdin) and hangs the
+        # `wait` below regardless of shell; BatchMode fails fast instead.
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$builder" \
+            "scp -qo BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new '${builder_bin}' '${host}:${builder_bin}'" \
+            > "/tmp/scp-${host}.log" 2>&1 &
+        scp_pids[$host]=$!
+        scp_recipients+=("$host")
+    done < {{worker_list}}
+    # Wait on all scps. Classifier mirrors Phase A: ssh-side failure
+    # (host offline, auth, timeout, no-route) → warn-only; anything past
+    # ssh (cp / disk-full / perms on receive side) → hard abort.
+    scp_send_failed=()
+    scp_unreachable=()
+    for host in "${scp_recipients[@]}"; do
+        if wait "${scp_pids[$host]}"; then
+            continue
+        fi
+        # ssh + scp ssh-side classifier — these strings come from
+        # openssh/scp when ssh layer fails; anything else implies the
+        # ssh channel opened and the cp itself failed (disk full,
+        # permission denied, no such directory, etc.) which is fatal.
+        if grep -qiE "connection timed out|connection refused|no route to host|host is down|connection closed|permission denied \(publickey|could not resolve hostname|operation timed out|kex_exchange_identification" "/tmp/scp-${host}.log"; then
+            scp_unreachable+=("$host")
+        else
+            scp_send_failed+=("$host")
+        fi
+    done
+    # All-workers-unreachable guard (Fix 3). If EVERY recipient ended up
+    # in scp_unreachable, the likely cause is a builder-side outage (the
+    # builder's sshd dropped between Phase A and Phase B, or the
+    # builder's outbound LAN partitioned) — not N simultaneous worker
+    # outages. Surface as hard-abort so the deploy doesn't proceed with
+    # zero workers updated and then silently ship stale binaries via
+    # bundle/restart.
+    if (( ${#scp_recipients[@]} > 0 && ${#scp_unreachable[@]} == ${#scp_recipients[@]} )); then
+        echo "=== BUILD FAILED — every non-builder worker (${#scp_unreachable[@]}/${#scp_recipients[@]}) scp_unreachable. Almost certainly a builder-side outage (${builder} sshd dropped post-cargo or builder LAN partitioned), not simultaneous worker outages. Investigate ${builder} before retrying. ===" >&2
+        echo "----- sample log from first unreachable recipient (${scp_unreachable[0]}): last 30 lines of /tmp/scp-${scp_unreachable[0]}.log -----" >&2
+        tail -30 "/tmp/scp-${scp_unreachable[0]}.log" >&2 || true
+        kill "${build_pids[{{server}}]}" 2>/dev/null || true
+        exit 1
+    fi
+    # Post-scp verify loop (Fixes 1+2). For every recipient that scp
+    # succeeded for, assert (a) shasum-256 of the landed binary matches
+    # the builder's, AND (b) the binary actually launches (`--version`
+    # exits 0). (a) catches transfer truncation, stale binary not
+    # replaced, builder-source drift. (b) catches `-C target-cpu=native`
+    # SIGILL on heterogeneous hardware (e.g. someone added an M3 to an
+    # M4-only fleet without pinning a floor target). Either failure
+    # demotes the host to scp_send_failed → hard-abort.
+    declare -A verify_pids
+    for host in "${scp_recipients[@]}"; do
+        skip=0
+        for u in "${scp_unreachable[@]}"; do [[ "$u" == "$host" ]] && skip=1 && break; done
+        for f in "${scp_send_failed[@]}"; do [[ "$f" == "$host" ]] && skip=1 && break; done
+        (( skip )) && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+            "sha=\$(shasum -a 256 '${builder_bin}' 2>/dev/null | awk '{print \$1}') && [[ \"\$sha\" == \"${BUILDER_SHA}\" ]] && '${builder_bin}' --version >/dev/null 2>&1" \
+            > "/tmp/scp-verify-${host}.log" 2>&1 &
+        verify_pids[$host]=$!
+    done
+    for host in "${!verify_pids[@]}"; do
+        if ! wait "${verify_pids[$host]}"; then
+            scp_send_failed+=("$host")
+            echo "----- worker $host post-scp verify failed (shasum mismatch OR binary won't launch — could be transfer corruption, SIGILL on hw-target mismatch, or stale binary): /tmp/scp-verify-${host}.log -----" >&2
+        fi
+    done
+    # Now join the server build.
+    server_failed=0
+    if ! wait "${build_pids[{{server}}]}"; then
+        server_failed=1
+    fi
+    if (( ${#scp_unreachable[@]} )); then
+        echo "=== ssh-unreachable workers (skipped scp, will need a per-host re-deploy when back): ${scp_unreachable[*]} ===" >&2
+    fi
+    if (( server_failed || ${#scp_send_failed[@]} )); then
+        echo "=== BUILD FAILED — abort deploy ===" >&2
+        if (( server_failed )); then
+            echo "----- server ({{server}}) compile failed: last 30 lines of /tmp/build-{{server}}.log -----" >&2
+            tail -30 "/tmp/build-{{server}}.log" >&2
+        fi
+        for host in "${scp_send_failed[@]}"; do
+            echo "----- worker $host scp failed (post-ssh; cp/perm/disk-full likely): last 30 lines of /tmp/scp-${host}.log -----" >&2
+            tail -30 "/tmp/scp-${host}.log" >&2
+            echo "" >&2
+        done
+        exit 1
+    fi
+    distributed=${#scp_recipients[@]}
+    reachable=$(( distributed - ${#scp_unreachable[@]} ))
+    echo "=== Built (server + ${builder}) + Distributed (${reachable}/${distributed} workers) — full logs at /tmp/build-*.log /tmp/scp-*.log ==="
+
+# Install freshly-built server binary into a stable location outside the
+# build tree. Without this step the systemd unit relies on
+# `~/src/nativelink/target/release/nativelink` being intact for every
+# restart — a `cargo clean`, accidental `rm`, or build-stage ENOSPC will
+# break it and put the service into a hard crash loop (observed
+# 2026-04-26: ExecStartPre cp failed for 4+ hours with no recovery).
+#
+# /srv/nativelink/ is the canonical install location: ZFS-backed,
+# owned by the `nativelink` service user, separate lifecycle from the
+# build tree. Atomic mv ensures the previously-installed binary stays
+# valid until the new one is fully written.
+install-server-binary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Installing server binary ==="
+    SRC="{{src_dir_server}}/target/release/nativelink"
+    STAGE="/srv/nativelink/nativelink.new"
+    DST="/srv/nativelink/nativelink"
+    run_on_server "test -f '$SRC' || { echo 'source binary missing: $SRC' >&2; exit 1; }"
+    # The `build` recipe (above) is the canonical guard against silent
+    # build failures: it captures per-host stderr to /tmp/build-*.log
+    # and aborts loudly on any cargo error. If we reach here, the
+    # build either succeeded or was a no-op (HEAD already built). An
+    # mtime-based freshness check is unreliable: a cargo no-op (HEAD
+    # unchanged since last build, or pull was a no-op) leaves mtime
+    # untouched, so it would false-positive on every back-to-back deploy.
+    # /srv/nativelink is owned by `nativelink` so writes need root.
+    # Requires NOPASSWD sudo (run `just setup-sudoers` once if missing).
+    run_on_server "sudo -n install -o nativelink -g nativelink -m 0755 '$SRC' '$STAGE' && sudo -n mv '$STAGE' '$DST'"
+    run_on_server "sudo -n ls -la '$DST'"
+    echo "=== Server binary installed at $DST ==="
+
+# Create .app bundle on all workers (preserves macOS Local Network permission).
+#
+# Chains on `pull build` so a standalone `just bundle` cannot silently
+# package an out-of-date binary on a worker whose source checkout is
+# stale (#559, 2026-05-19). The chain is the mechanism — always-pull +
+# always-build eliminates the stale-checkout class by construction. Both
+# `pull` (hardened in #559 to match build's pattern) and `build` abort
+# loudly on git-side or compile-side failures while warning on
+# ssh-unreachable workers. A script-side binary-mtime check was
+# attempted and rejected: red-team showed it false-positives on every
+# docs-only / CLAUDE.md / empty commit because cargo's no-op rebuild
+# leaves the binary mtime unchanged while HEAD advances.
+#
+# `just` deduplicates prerequisites per-invocation, so calling `bundle`
+# from `deploy` does NOT re-run pull/build (verified against the
+# `deploy` recipe at line 39).
+#
+# If an operator genuinely wants to re-bundle without pulling or
+# rebuilding (rare — typically only after editing the bundle-worker.sh
+# script itself), use `bundle-only` instead.
+bundle: pull build bundle-only
+
+# Escape hatch for re-bundling an existing binary without pull/build.
+# Use sparingly — the typical operator surface is `just bundle` which
+# chains pull+build by design.
+bundle-only:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Bundling workers ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        scp -qo BatchMode=yes -o ConnectTimeout=5 {{bundle_script}} "$host":/tmp/bundle-worker.sh &
+    done < {{worker_list}}
+    wait
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'bash /tmp/bundle-worker.sh' &
+    done < {{worker_list}}
+    wait
+    echo "=== All bundled ==="
+
+# Sign .app bundles via FL signing server (Developer ID).
+# TCC Local Network permission persists across binary hash changes.
+sign:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SIGN_CLIENT="/home/user/fl/target/release/fl_codesign_client"
+    # FL-1049: pass the cred FILE PATHS (not the values); fl_codesign_client reads
+    # the files. The secret token never enters this recipe's env/memory. user owns
+    # /srv/casdata/signing_server/auth-token (mode 640 user:fl-signing) so it is
+    # read directly — no `sudo cat` of the plaintext into a shell var.
+    AUTH_TOKEN_FILE="/srv/casdata/signing_server/auth-token"
+    CA_CERT_FILE="/home/user/fl/signing_server/infra/signing-server-ca.pem"
+    SIGN_TMP="/tmp/nativelink-sign"
+    rm -rf "$SIGN_TMP"
+    mkdir -p "$SIGN_TMP"
+
+    # Retry the sign client to absorb transient sign-server unavailability:
+    # systemd's RestartSec=5 after an OOM-kill is a 5-6s window of refused
+    # connections, and a cold-start PKCS#11 init enumerates the HSM for
+    # ~40s during which the listener accepts but never responds. 12 attempts
+    # x 8s = 96s of retry budget covers both windows comfortably. Subshells
+    # below inherit this function. Stderr is muted on intermediate failures
+    # so the success-case output stays clean.
+    sign_with_retry() {
+        local target="$1"
+        local attempt
+        for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if FL_CODESIGN_AUTH_TOKEN_FILE="$AUTH_TOKEN_FILE" FL_CODESIGN_CA_CERT_FILE="$CA_CERT_FILE" \
+                "$SIGN_CLIENT" "$target" 2>/tmp/sign-err.$$.log; then
+                rm -f /tmp/sign-err.$$.log
+                return 0
+            fi
+            local err
+            err="$(cat /tmp/sign-err.$$.log 2>/dev/null || true)"
+            rm -f /tmp/sign-err.$$.log
+            if [[ "$attempt" -lt 12 ]]; then
+                echo "sign attempt $attempt/12 failed for $target: ${err##*$'\n'} -- retrying in 8s..." >&2
+                sleep 8
+            else
+                echo "sign FAILED after 12 attempts for $target: $err" >&2
+                return 1
+            fi
+        done
+    }
+    export -f sign_with_retry
+    export SIGN_CLIENT AUTH_TOKEN_FILE CA_CERT_FILE
+
+    echo "=== Signing worker bundles ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        (
+            WORKER_TMP="$SIGN_TMP/$host"
+            mkdir -p "$WORKER_TMP"
+            scp -rqo BatchMode=yes -o ConnectTimeout=5 "$host":/Users/user/Applications/NativeLink.app "$WORKER_TMP/NativeLink.app"
+            sign_with_retry "$WORKER_TMP/NativeLink.app"
+            ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'rm -rf /Users/user/Applications/NativeLink.app'
+            scp -rqo BatchMode=yes -o ConnectTimeout=5 "$WORKER_TMP/NativeLink.app" "$host":/Users/user/Applications/NativeLink.app
+            echo "Signed: $host"
+        ) &
+    done < {{worker_list}}
+    wait
+    rm -rf "$SIGN_TMP"
+    echo "=== All signed ==="
+
+# Push worker config to all workers
+push-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Pushing worker config ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        scp -o BatchMode=yes -o ConnectTimeout=5 {{worker_config_src}} "$host":{{worker_config}} &
+    done < {{worker_list}}
+    wait
+    echo "=== Config pushed ==="
+
+# Deploy server config to buildcache
+deploy-server-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Deploying server config ==="
+    CONFIG_SRC="{{justfile_directory()}}/prod-server.json5"
+    CONFIG_DST="/srv/nativelink/buildcache-native.json5"
+    # CONFIG_DST is owned by user `nativelink` (the systemd service user) so
+    # cp/scp needs root to overwrite. Requires NOPASSWD sudo for the deploying
+    # user; run `just setup-sudoers` once if missing.
+    if [[ "$(hostname -s)" == "{{server}}" ]]; then
+        sudo -n cp "$CONFIG_SRC" "$CONFIG_DST"
+    else
+        scp -o ConnectTimeout=5 "$CONFIG_SRC" {{server}}:/tmp/buildcache-native.json5.deploy
+        ssh {{server}} "sudo -n cp /tmp/buildcache-native.json5.deploy '$CONFIG_DST' && rm -f /tmp/buildcache-native.json5.deploy"
+    fi
+    echo "=== Server config deployed ==="
+
+# Restart server + all workers, gating worker restart on a real
+# server-ready probe. Simultaneous restart is the dominant cause of
+# cluster-wide blob loss: nativelink server's MemoryStore is non-durable,
+# in-flight slow-tier writes are SIGTERM'd on restart, and workers
+# reconnecting before the server has finished startup can't re-broadcast
+# their BlobsAvailable cleanly.
+#
+# This recipe REDUCES the window during which the bug fires by waiting
+# for the server's worker_cas port to actually accept connections before
+# bringing workers back (via `restart-server`'s built-in dependency on
+# `wait-server-ready`). It does not ELIMINATE the bug — that requires
+# a graceful drain on SIGTERM (drain in-flight writes before exit) or
+# a durable store. Tracked as a YouTrack follow-up; this stagger is the
+# operator-side mitigation in the meantime.
+#
+# WORKERS FIRST: workers restart BEFORE the server. This is required when
+# a deploy ships a behavior change that depends on workers having the new
+# code BEFORE the server starts using it. Concrete example (2026-04-25):
+# the source-side mirror_blobs/in_flight size invariant + 0-byte stream
+# guards (commits 7e114ce5 + the FilesystemStore + try_read_from_worker
+# guards). If the new server talks to old workers (which still emit
+# Ok+0-byte streams for the unguarded case), the new server's removed
+# workaround would silently propagate the empty stream. Workers-first
+# guarantees that by the time the server restarts with the workaround
+# removed, peers already have the source-side fix and will return
+# NotFound (not Ok+EOF). The brief workers-up + server-down window is
+# tolerated by worker reconnect logic.
+restart: restart-workers restart-server
+
+# Wait until the nativelink server's worker-facing CAS port is bound
+# and accepting TCP connections (i.e., the server is past startup and
+# routing). Polls every 1s until ready or MAX_WAIT expires; on timeout,
+# emits diagnostic state (systemctl status + last 20 journal lines) and
+# exits non-zero so the operator notices instead of silently proceeding
+# against a half-started server. The probe tests the actual invariant
+# ("worker_cas accepts connections") rather than a magic-number duration,
+# so it correctly waits longer on a slow boot and proceeds quickly on a
+# fast one. Composed by `restart-server` (and therefore by every
+# recipe that calls it: `restart`, `flush-redis`, `deploy`,
+# `deploy-flush`).
+wait-server-ready:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # MAX_WAIT=120s = ~4× observed worst-case server startup (~30s with
+    # current cache size); raise if startup grows past ~60s observed.
+    MAX_WAIT=120
+    # Probes the worker_cas TCP port (50071, HTTP/2). NOTE: this verifies
+    # kernel listener readiness, not TLS handshake or gRPC service
+    # readiness. There is a small window where the listener is bound but
+    # TLS/gRPC haven't finished initializing — workers in that window
+    # will hit handshake errors and retry. A TLS-aware probe (curl
+    # against /grpc.health.v1.Health/Check via mTLS) would tighten this.
+    # Tracked in DEFERRED_ISSUES.md. Also: the QUIC listener at :50072
+    # (UDP/HTTP3) is NOT probed — readers using QUIC connect to a
+    # different port and may race independently.
+    PORT=50071
+    START=$(date +%s)
+    DEADLINE=$((START + MAX_WAIT))
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Waiting up to ${MAX_WAIT}s for nativelink server worker_cas:${PORT} to accept connections ==="
+    while [[ $(date +%s) -lt $DEADLINE ]]; do
+        if run_on_server "systemctl is-active nativelink >/dev/null 2>&1 && bash -c 'exec 3<>/dev/tcp/localhost/${PORT}' 2>/dev/null"; then
+            echo "=== nativelink server is ready ($(( $(date +%s) - START ))s) ==="
+            exit 0
+        fi
+        sleep 1
+    done
+    echo "ERROR: nativelink server did not become ready within ${MAX_WAIT}s — refusing to restart workers against a half-started server" >&2
+    echo "       Diagnostic state on {{server}}:" >&2
+    run_on_server 'systemctl status nativelink --no-pager | head -10' >&2 || true
+    run_on_server "sudo journalctl -u nativelink --since '${MAX_WAIT} seconds ago' --no-pager | tail -20" >&2 || true
+    exit 1
+
+# Restart nativelink server on buildcache via systemd, waiting for the
+# server to be back up + accepting worker connections before returning.
+# Standalone callers (`just restart-server`) get the same readiness
+# guarantee as the chained callers (`restart`, `flush-redis`); without
+# this, an operator running `restart-server` then `restart-workers` in
+# two separate invocations reproduces the simultaneous-restart blob
+# loss documented on `restart`.
+restart-server: _restart-server-only wait-server-ready
+
+# Internal: restart only, no readiness wait. The public `restart-server`
+# composes this with `wait-server-ready` so callers always get a "server
+# is accepting connections" guarantee on return.
+_restart-server-only:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Restarting server on {{server}} ==="
+    run_on_server 'sudo systemctl restart nativelink'
+
+# Kill and restart nativelink workers on all Mac Minis via launchctl.
+# Uses LaunchDaemon (system domain) so nativelink starts at boot without user login.
+# Requires NOPASSWD sudo — run `just setup-sudoers` first (one-time, interactive).
+#
+# `setup-logrotate` runs as a dependency so every deploy refreshes the
+# rotate-log script + plist from the freshly-pulled nativelink repo and
+# proactively removes the legacy newsyslog conf (root cause of #180,
+# 2026-04-27). Idempotent on subsequent runs.
+restart-workers: setup-logrotate
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Deploying LaunchDaemon ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        scp -qo BatchMode=yes -o ConnectTimeout=5 {{launchd_plist_src}} "$host":/tmp/com.example.nativelink-worker.plist &
+    done < {{worker_list}}
+    wait
+    echo "=== Restarting workers ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+            # Remove old LaunchAgent if present
+            launchctl bootout gui/$(id -u)/com.example.nativelink-worker 2>/dev/null || true
+            launchctl unload ~/Library/LaunchAgents/com.example.nativelink-worker.plist 2>/dev/null || true
+            rm -f ~/Library/LaunchAgents/com.example.nativelink-worker.plist
+            # Stop existing daemon GRACEFULLY (F5): bootout removes KeepAlive
+            # supervision (so the worker is not respawned) AND sends SIGTERM,
+            # blocking until the process exits or the installed plist ExitTimeOut
+            # (the running worker drains its C2* mirror-spill to local disk in
+            # that window and prints "shutdown mirror-spill complete:"). Capture
+            # the PID first so we can confirm exit. The new plist below raises
+            # ExitTimeOut to 300s for future restarts.
+            PRE_PID=$(pgrep -f "nativelink.*worker.json5" | head -1)
+            sudo launchctl bootout system/com.example.nativelink-worker 2>/dev/null || true
+            # Best-effort bounded confirmation that the graceful spill ran (bootout
+            # already waited; this only polls in case it returned early). Never
+            # gate-hangs: 120s ceiling, and breaks the instant the pid is gone.
+            if [ -n "$PRE_PID" ]; then
+                for _ in $(seq 1 60); do
+                    kill -0 "$PRE_PID" 2>/dev/null || break
+                    sleep 2
+                done
+            fi
+            if tail -200 ~/Library/Logs/nativelink-worker.log 2>/dev/null | grep -q "shutdown mirror-spill complete:"; then
+                echo "$(hostname): mirror-spill ran"
+            fi
+            # Backstop for any stray (the graceful exit already happened above).
+            sudo pkill -9 -f nativelink 2>/dev/null || true
+            sleep 1
+            # Install new LaunchDaemon
+            sudo cp /tmp/com.example.nativelink-worker.plist {{launchd_plist_daemon}}
+            sudo chown root:wheel {{launchd_plist_daemon}}
+            sudo chmod 644 {{launchd_plist_daemon}}
+            sudo launchctl bootstrap system {{launchd_plist_daemon}}
+            sleep 2
+            PID=$(pgrep -f nativelink | head -1)
+            printf "%-25s PID=%-6s OK\n" "$(hostname)" "$PID"
+        ' &
+    done < {{worker_list}}
+    wait
+    echo "=== All workers restarted ==="
+
+# One-time migration: remove the legacy 1-min cron respawn entry on all
+# workers and ensure the LaunchDaemon is the sole supervisor.
+#
+# Background: workers were originally restarted by a per-minute cron rule:
+#     * * * * * pgrep -f "nativelink.*worker.json5" >/dev/null \
+#         || nohup /Users/user/src/nativelink/target/release/nativelink \
+#                  /Users/user/Work/worker.json5 \
+#                  >> ~/Library/Logs/nativelink-worker.log 2>&1 &
+# That rule is dormant while a launchd-spawned worker is alive, but during
+# the brief gap after a crash and before launchd respawns within
+# ThrottleInterval=5 it can fire and start a NON-bundled, NON-codesigned
+# binary at the wrong path, racing with the next launchd respawn. With
+# `KeepAlive=true` + `ThrottleInterval=5` in the plist, launchd handles
+# respawn correctly on its own and the cron rule is pure liability.
+#
+# This recipe:
+#   1. Removes the cron entry that spawns nativelink (any line containing
+#      "nativelink").
+#   2. Kills any worker process whose ppid is NOT 1 — i.e. cron-spawned
+#      processes (launchd-spawned workers have ppid=1 because launchd is
+#      pid 1 on macOS).
+#   3. Bootstraps the LaunchDaemon if it isn't already loaded so launchd
+#      takes over supervision; the existing `restart-workers` recipe is
+#      still the right thing for full deploys.
+#
+# Run once per worker fleet, then never again.
+migrate-workers-to-launchd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Deploying LaunchDaemon plist (in case it is missing) ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        scp -qo BatchMode=yes -o ConnectTimeout=5 {{launchd_plist_src}} "$host":/tmp/com.example.nativelink-worker.plist &
+    done < {{worker_list}}
+    wait
+    echo "=== Migrating each worker from cron to launchd ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+            set -u
+            HOSTNAME=$(hostname)
+            # 1. Snapshot existing crontab and strip any nativelink lines.
+            BEFORE=$(crontab -l 2>/dev/null || true)
+            if printf "%s\n" "$BEFORE" | grep -q "nativelink"; then
+                printf "%s\n" "$BEFORE" | grep -v "nativelink" | crontab -
+                echo "$HOSTNAME: removed cron nativelink respawn entry"
+            else
+                echo "$HOSTNAME: no cron nativelink entry to remove"
+            fi
+            # 2. Kill cron-spawned workers (parent != launchd pid 1).
+            #    Leave launchd-spawned workers (ppid=1) running so the
+            #    fleet stays serving load during migration. We pkill each
+            #    rogue PID individually because /usr/bin/pkill is in the
+            #    NOPASSWD allowlist (see setup-sudoers) but /bin/kill is
+            #    not.
+            ROGUE=$(ps -ax -o pid,ppid,command \
+                    | awk "/nativelink.*worker.json5/ && \$1 != \"\" && \$2 != \"1\" && !/awk/ {print \$1}")
+            if [ -n "$ROGUE" ]; then
+                echo "$HOSTNAME: killing rogue cron-spawned PIDs: $ROGUE"
+                for pid in $ROGUE; do
+                    sudo pkill -9 -P "$pid" 2>/dev/null || true
+                    # pkill -P kills children; also kill the rogue itself
+                    # via a pid-precise pgrep+pkill match.
+                    sudo pkill -9 -f "/Users/user/src/nativelink/target/release/nativelink.*worker.json5" 2>/dev/null || true
+                done
+            fi
+            # 3. Bootstrap LaunchDaemon if not already loaded.
+            if ! sudo launchctl list 2>/dev/null | grep -q com.example.nativelink-worker; then
+                # Remove any stale per-user LaunchAgent left over from
+                # the historical setup.
+                launchctl bootout gui/$(id -u)/com.example.nativelink-worker 2>/dev/null || true
+                rm -f ~/Library/LaunchAgents/com.example.nativelink-worker.plist
+                sudo cp /tmp/com.example.nativelink-worker.plist {{launchd_plist_daemon}}
+                sudo chown root:wheel {{launchd_plist_daemon}}
+                sudo chmod 644 {{launchd_plist_daemon}}
+                sudo launchctl bootstrap system {{launchd_plist_daemon}}
+                echo "$HOSTNAME: bootstrapped LaunchDaemon"
+            else
+                echo "$HOSTNAME: LaunchDaemon already loaded"
+            fi
+            sleep 1
+            PID=$(pgrep -f "nativelink.*worker.json5" | head -1)
+            printf "%s: PID=%s\n" "$HOSTNAME" "${PID:-NONE}"
+        ' &
+    done < {{worker_list}}
+    wait
+    echo "=== Migration complete ==="
+
+# One-time setup: install NOPASSWD sudoers rule for launchctl on all workers.
+# Runs sequentially with -t for interactive sudo password prompt.
+setup-sudoers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SUDOERS_RULE='user ALL=(root) NOPASSWD: /bin/launchctl, /bin/cp, /bin/chmod, /usr/sbin/chown, /usr/bin/pkill, /usr/sbin/DevToolsSecurity, /usr/sbin/spctl'
+    echo "=== Setting up NOPASSWD sudo on all workers ==="
+    echo "You will be prompted for the sudo password on each machine."
+    while IFS= read -r host <&3 || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        echo "--- $host ---"
+        ssh -t -o ConnectTimeout=5 "$host" \
+            "echo '$SUDOERS_RULE' | sudo tee /etc/sudoers.d/nativelink >/dev/null && sudo chmod 440 /etc/sudoers.d/nativelink && echo OK" \
+            || echo "FAILED: $host"
+    done 3< {{worker_list}}
+    echo "=== Done ==="
+
+# One-time setup: enable worker-to-worker SSH by trusting the existing
+# `nativelink-deploy` ed25519 key (already present on every worker as
+# `~/.ssh/nativelink-deploy`, comment `nativelink-workers@buildcache`) in
+# every worker's `authorized_keys`, and configuring the SSH client to use
+# it for `*.local` connections.
+#
+# Why: the `build` recipe (build-once-and-scp) needs the builder worker
+# (first non-blank line of {{worker_list}}) to scp the freshly-built
+# binary to peer workers — `ssh $builder 'scp bin peer:bin'`. Workers
+# previously had only inbound keys (`authorized_keys`) populated, no
+# outbound identity trusted by peers, so the builder-side ssh failed
+# with "Permission denied" and the build recipe correctly hard-aborted
+# via its all-workers-unreachable guard. This recipe closes the gap.
+#
+# Idempotent: re-running has no effect once the key + ssh-config block
+# are in place. Verifies post-setup by ssh-ing from the first worker
+# to the second.
+#
+# Trust model: per `feedback_remote_workers_are_trusted` — all workers
+# are mutually trusted entities; adding their pre-existing shared key
+# to peer authorized_keys does not weaken the trust boundary.
+setup-worker-peer-ssh:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Setting up worker-to-worker SSH on all workers ==="
+    # Extract the public key from any worker (all 10 share the same
+    # private key per nativelink-workers@buildcache distribution).
+    BUILDER="$(grep -m1 -E '\S' {{worker_list}} || true)"
+    BUILDER="${BUILDER%$'\r'}"
+    if [[ -z "$BUILDER" ]]; then
+        echo "ERROR: {{worker_list}} is empty" >&2
+        exit 1
+    fi
+    PUBKEY=$(ssh -o ConnectTimeout=5 "$BUILDER" "ssh-keygen -y -f ~/.ssh/nativelink-deploy 2>/dev/null" 2>/dev/null)
+    if [[ -z "$PUBKEY" || ! "$PUBKEY" == ssh-ed25519* ]]; then
+        echo "ERROR: could not extract ed25519 public key from $BUILDER:~/.ssh/nativelink-deploy" >&2
+        echo "  (this recipe assumes nativelink-deploy is already distributed; if it isn't, that's a separate provisioning gap)" >&2
+        exit 1
+    fi
+    # Anchor for the appended ssh-config block so we can detect idempotency.
+    MARKER="# nativelink worker-to-worker (added by setup-worker-peer-ssh)"
+    echo "Source: $BUILDER ; pubkey comment: $(echo "$PUBKEY" | awk '{print $3}')"
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        host="${host%$'\r'}"
+        echo "--- $host ---"
+        ssh -n -o ConnectTimeout=5 "$host" "
+            set -e
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            touch ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            if ! grep -qxF '$PUBKEY' ~/.ssh/authorized_keys; then
+                echo '$PUBKEY' >> ~/.ssh/authorized_keys
+                echo '  appended pubkey to authorized_keys'
+            else
+                echo '  pubkey already in authorized_keys (skipped)'
+            fi
+            touch ~/.ssh/config
+            chmod 600 ~/.ssh/config
+            if ! grep -qF '$MARKER' ~/.ssh/config; then
+                printf '\n%s\nHost *.local\n  IdentityFile ~/.ssh/nativelink-deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' '$MARKER' >> ~/.ssh/config
+                echo '  added Host *.local block to ssh config'
+            else
+                echo '  ssh config already has the block (skipped)'
+            fi
+        " || { echo "FAILED: $host" >&2; exit 1; }
+    done < {{worker_list}}
+    echo ""
+    echo "=== Verifying worker-to-worker SSH ==="
+    # Pick the first two workers and try ssh-ing between them.
+    FIRST=$(grep -m1 -E '\S' {{worker_list}})
+    FIRST="${FIRST%$'\r'}"
+    SECOND=$(grep -E '\S' {{worker_list}} | sed -n '2p')
+    SECOND="${SECOND%$'\r'}"
+    if [[ -z "$SECOND" ]]; then
+        echo "  only one worker in {{worker_list}}; skipping peer-ssh verification"
+    else
+        OUT=$(ssh -o ConnectTimeout=5 "$FIRST" "ssh -o ConnectTimeout=5 -o BatchMode=yes '$SECOND' 'echo verify-ok'" 2>&1 || echo "FAILED")
+        if echo "$OUT" | grep -q "^verify-ok$"; then
+            echo "  OK: $FIRST → $SECOND ssh works"
+        else
+            echo "  FAILED: $FIRST → $SECOND ssh test did not return 'verify-ok'" >&2
+            echo "  output:" >&2
+            echo "$OUT" | sed 's/^/    /' >&2
+            exit 1
+        fi
+    fi
+    echo "=== Done ==="
+
+# Show status of server + all workers
+status:
+    #!/usr/bin/env bash
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Server ({{server}}) ==="
+    run_on_server 'systemctl status nativelink | head -6' 2>&1
+    echo ""
+    echo "=== Workers ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+            PID=$(pgrep -f nativelink | head -1)
+            if [ -n "$PID" ]; then
+                START=$(ps -p $PID -o lstart= 2>/dev/null)
+                printf "%-25s PID=%-6s started=%s\n" "$(hostname)" "$PID" "$START"
+            else
+                printf "%-25s NOT RUNNING\n" "$(hostname)"
+            fi
+        ' &
+    done < {{worker_list}}
+    wait
+
+# Tail logs from a specific worker (e.g., just worker host=worker-01.local)
+logs host:
+    ssh {{host}} 'tail -100f {{worker_log}}'
+
+# Scrape /metrics from all workers and aggregate the #547 Phase 0 worker-side
+# family (phase0_worker_*). Each worker process holds its own MetricsRegistry,
+# so the headline metric (worker_pin_release_latency_after_tonic_ok_*) is
+# observable only by hitting each worker individually. This recipe SSHes to
+# each Mac in worker_macs.txt, curls localhost:50061/metrics, and prints the
+# raw phase0_worker_* lines per worker plus a simple fleet-wide sum.
+# Requires the `metrics: {}` service mounted on the private_workers_servers
+# listener (worker.json5 #556 edit).
+scrape-all-workers-phase0:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "=== Scraping phase0_worker_* from all workers ==="
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        (
+            OUT="$TMPDIR/$host.txt"
+            # /metrics on plain HTTP via the worker's private_workers_servers
+            # listener (admin/health/worker_api/metrics are all unauthenticated
+            # on 0.0.0.0:50061 — internal LAN only).
+            if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" 'curl -sS --max-time 10 http://localhost:50061/metrics' > "$OUT" 2>"$OUT.err"; then
+                COUNT=$(grep -cE '^phase0_worker_' "$OUT" || true)
+                printf "%-25s phase0_worker_ lines=%s\n" "$host" "$COUNT"
+            else
+                printf "%-25s SCRAPE FAILED: %s\n" "$host" "$(head -1 "$OUT.err" 2>/dev/null || echo unknown)"
+            fi
+        ) &
+    done < {{worker_list}}
+    wait
+    echo ""
+    echo "=== Fleet-wide phase0_worker_ counter sums (count-type metrics only) ==="
+    # Aggregate by metric name: take counter-shaped lines (suffix _count,
+    # _sum_ms, _le_*_ms, _le_*_bytes, and the bare gauge variants), sum
+    # numeric values across all workers per metric name.
+    awk '
+        /^phase0_worker_/ {
+            # extract leading metric name (before any { or space)
+            name = $1
+            sub(/[{ ].*/, "", name)
+            val = $NF
+            if (val ~ /^[0-9.]+$/) {
+                sum[name] += val
+                cnt[name] += 1
+            }
+        }
+        END {
+            for (n in sum) printf "%-90s sum=%-15s workers=%d\n", n, sum[n], cnt[n]
+        }
+    ' "$TMPDIR"/*.txt 2>/dev/null | sort
+    echo ""
+    echo "=== Headline metric (worker_pin_release_latency_after_tonic_ok) per worker ==="
+    for f in "$TMPDIR"/*.txt; do
+        h=$(basename "$f" .txt)
+        cnt=$(grep -E '^phase0_worker_worker_pin_release_latency_after_tonic_ok_count' "$f" 2>/dev/null | awk '{print $NF}')
+        sum=$(grep -E '^phase0_worker_worker_pin_release_latency_after_tonic_ok_sum_ms' "$f" 2>/dev/null | awk '{print $NF}')
+        if [[ -n "${cnt:-}" && -n "${sum:-}" && "$cnt" != "0" ]]; then
+            mean=$(awk -v s="$sum" -v c="$cnt" 'BEGIN{printf "%.2f", s/c}')
+            printf "%-25s count=%-8s sum_ms=%-10s mean_ms=%s\n" "$h" "$cnt" "$sum" "$mean"
+        else
+            printf "%-25s count=0 (no chunked-upload Ok yet on this worker)\n" "$h"
+        fi
+    done
+    echo "=== Done ==="
+
+# Enable macOS Developer Tools on all workers to bypass XProtect throttling.
+# Unsigned child processes (rustc, clang) get scanned by XProtect on every exec,
+# causing ~1s delay per invocation. DevToolsSecurity + developer-mode exempts them.
+# Requires DevToolsSecurity and spctl in the NOPASSWD sudoers list — run
+# `just setup-sudoers` first if those were not already added.
+setup-devtools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Enabling Developer Tools on all workers ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+            echo "--- $(hostname) ---"
+            sudo DevToolsSecurity -enable 2>&1
+            sudo spctl developer-mode enable-terminal 2>&1
+            # Verify
+            STATUS=$(DevToolsSecurity -status 2>&1)
+            echo "  $STATUS"
+        ' &
+    done < {{worker_list}}
+    wait
+    echo "=== Done ==="
+
+# Deploy worker log rotation: install rotate-log.sh + plist, load the
+# launchd timer, and remove the legacy newsyslog conf that orphans the
+# worker's fd 1 (#180, 2026-04-27). Idempotent — safe to run on every
+# deploy. Source-of-truth lives in the nativelink repo
+# (packaging/macos/{rotate-log.sh, com.tracemachina.nativelink.rotate-log.plist}),
+# already on each worker after `just pull`.
+#
+# Why a daemon plist + UserName=user rather than a per-user LaunchAgent:
+# the worker itself is a system LaunchDaemon (see {{launchd_plist_daemon}}),
+# so its log files at ~/Library/Logs/nativelink-worker.{log,err} are
+# launchd-owned with user as the runtime user. A daemon-domain rotate
+# plist matches that lifecycle (runs whether user is logged in or not).
+# UserName=user + EnvironmentVariables.HOME=/Users/user in the plist
+# ensure the script's ~ resolves correctly under the system domain.
+#
+# Why we proactively `rm -f` the newsyslog conf: even after the source
+# file is removed from this repo, an old conf installed in 2026-03-25
+# can still be sitting at /etc/newsyslog.d/ on every worker. Until that
+# file is gone, newsyslog will keep racing the in-app copy-and-truncate
+# (rename-and-create vs truncate-in-place) and the orphan-fd bug recurs.
+# Requires sudo (cp, install, launchctl, rm) in NOPASSWD sudoers — run
+# `just setup-sudoers` first.
+setup-logrotate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Deploying worker log rotation ==="
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+            set -euo pipefail
+            HOSTNAME=$(hostname)
+
+            # 1. Neutralise the legacy newsyslog conf (root cause of
+            #    #180). The setup-sudoers allowlist does NOT include
+            #    /bin/rm; truncating the file to zero bytes via
+            #    `sudo cp /dev/null` is equally effective since
+            #    newsyslog ignores empty conf files. cp + chmod are in
+            #    the allowlist.
+            if [ -s {{legacy_newsyslog_conf}} ]; then
+                sudo cp /dev/null {{legacy_newsyslog_conf}}
+                sudo chmod 644 {{legacy_newsyslog_conf}}
+                echo "$HOSTNAME: zeroed legacy {{legacy_newsyslog_conf}}"
+            fi
+
+            # 2. Install the rotate-log script from the in-tree
+            #    packaging/macos/ source.
+            sudo cp {{rotate_log_script_src}} {{rotate_log_script_dest}}
+            sudo chown root:wheel {{rotate_log_script_dest}}
+            sudo chmod 755 {{rotate_log_script_dest}}
+
+            # 3. Install the rotate-log launchd plist. Bootout any
+            #    previously-loaded copy first so the new plist is read
+            #    (launchd caches plist contents on bootstrap).
+            sudo cp {{rotate_log_plist_src}} {{rotate_log_plist_dest}}
+            sudo chown root:wheel {{rotate_log_plist_dest}}
+            sudo chmod 644 {{rotate_log_plist_dest}}
+            sudo launchctl bootout system/{{rotate_log_plist_label}} 2>/dev/null || true
+            sudo launchctl bootstrap system {{rotate_log_plist_dest}}
+
+            # 4. Verify install — both the launchctl entry and the
+            #    deployed script existing under their expected paths.
+            if sudo launchctl list 2>/dev/null | grep -q {{rotate_log_plist_label}}; then
+                printf "%-25s rotate-log loaded (script=%s)\n" "$HOSTNAME" "{{rotate_log_script_dest}}"
+            else
+                echo "$HOSTNAME: ERROR — rotate-log plist not loaded after bootstrap" >&2
+                exit 1
+            fi
+        ' &
+    done < {{worker_list}}
+    wait
+    echo "=== Worker log rotation deployed ==="
+
+# Atomic flush + server restart. MUST be done together — flushing
+# Redis without restarting leaves stale entries in the in-memory
+# ExistenceCache (50M entries, no TTL) and AC_BACKEND_CACHED (4GB).
+# Those caches report blobs as "present" even after they've been
+# flushed from Redis, causing FindMissingBlobs to return false
+# positives and Bazel to skip uploading blobs it thinks already exist.
+# Result: deterministic FAILED_PRECONDITION errors for actions whose
+# input tree references the phantom blobs.
+#
+# Composition rule: callers that need workers to restart FIRST
+# (`deploy-flush`, future deploys with similar coordination needs)
+# place their `restart-workers` step BEFORE this recipe — never
+# between the flush and the restart. The flush+restart pair stays
+# atomic from the server's perspective.
+flush-redis:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    echo "=== Flushing Redis ==="
+    run_on_server 'sudo valkey-cli -s /run/valkey/valkey.sock FLUSHALL'
+    echo "=== Restarting NativeLink server (clears in-memory caches atomically with the flush) ==="
+    # cd into this justfile's directory + use the same just binary so
+    # the inner invocation always resolves to THIS recipe set,
+    # regardless of where the operator invoked us from.
+    cd {{ justfile_directory() }} && {{ just_executable() }} restart-server
+
+# Nuke worker-local Bazel state on every nativelink worker: rotates the bazel-state subdirs
+# under ~/crow-agent/home/ (`bob/`, `Library/`, `Work/`) and the shared
+# ~/Work/bazel-cache disk cache. Repository cache is preserved (independent
+# of server CAS state).
+#
+# Critically PRESERVES dotfiles + secrets at the top of ~/crow-agent/home/
+# (.bazelrc, .ssh, .cargo, .gitconfig, fl-client.crt, etc.) — an earlier
+# version of this recipe renamed the entire ~/crow-agent/home/ wholesale
+# and destroyed CI auth state. The bazel state lives in three known subdirs
+# only; touch only those.
+#
+# Atomic-rename trick: the targeted subdirs are renamed into ~/.nuked-<ts>/
+# in O(1), then ~/crow-agent/home keeps its dotfiles intact and crow-agent
+# can immediately spawn fresh builds. The actual rm runs detached — the ssh
+# session returns instantly without waiting for tens of GB of small bazel
+# files to be unlinked.
+#
+# OPERATOR CONTRACT: the server CAS holds VALID accumulated blobs
+# that you want the next build to use. This recipe clears only the
+# workers' local Bazel state (output bases, disk cache, per-worker
+# "I already uploaded that" bookkeeping) so that after, say, a worker
+# OS upgrade or a stuck/leaked bazel server, the workers can rejoin
+# the cluster cleanly and the first build reads back from the server
+# instead of re-uploading everything.
+#
+# DO NOT use this recipe after `flush-redis` or any other operation
+# that drops the SERVER-side CAS. The marker this recipe pre-creates
+# suppresses `bazel_ci.sh`'s "remote cache possibly poisoned" bypass
+# path, which is only safe when the server cache is trustworthy. If
+# the server was flushed, you want the bypass to fire so the first
+# build re-executes all actions against an empty server cache and
+# re-populates it with clean entries — skip this recipe, or split it
+# into a second recipe that omits the marker touch.
+#
+# Bazel 9.0.1 lacks rewind_lost_inputs (PR #28958, in 9.1.0+), so it
+# cannot recover from a server-side blob nuke without local state
+# being cleared — but that recovery path is handled by bazel_ci.sh's
+# bypass, NOT by this recipe.
+nuke-worker-caches:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "=== Nuking worker-local Bazel state on all nativelink workers ==="
+    # NUKE_CMD: rename-and-detach. We deliberately do NOT pkill bazel —
+    # `pkill -f bazel` matches its own NUKE_CMD argv (which contains the
+    # literal word "bazel"), killing the bash that's running it. Orphaned
+    # bazel fds into the renamed dirs are harmless: writes land in
+    # deleted-but-still-open inodes that get reclaimed when bazel exits or
+    # when the background rm catches up.
+    NUKE_CMD='
+        TS=$(date +%s)-$$
+        DOOMED="$HOME/.nuked-$TS"
+        mkdir -p "$DOOMED"
+        # Move ONLY the bazel-state subdirs. Anything else at the top of
+        # ~/crow-agent/home/ — .bazelrc, .ssh, .cargo, fl-client.crt, etc. —
+        # stays put.
+        for sub in bob Library Work; do
+            if [[ -d "$HOME/crow-agent/home/$sub" ]]; then
+                mv "$HOME/crow-agent/home/$sub" "$DOOMED/$sub" 2>/dev/null || true
+            fi
+        done
+        mv "$HOME/Work/bazel-cache" "$DOOMED/bazel-cache" 2>/dev/null || true
+        # CONTRACT: this recipe clears ONLY worker-local state on the
+        # assumption that the nativelink server CAS holds valid blobs —
+        # i.e., the operator has judged that what got out of sync is the
+        # worker's local "I already uploaded that" set, not the server's
+        # stored blobs.  As of the bazel_ci.sh edit that lands alongside
+        # this comment update, the post-nuke "bypass path" in
+        # bazel_ci.sh no longer disables remote/disk caches — commit
+        # b7094ebf eliminated the non-deterministic .rmeta bytes that
+        # justified the historical bypass.  The CACHE_REFRESH_MARKER
+        # branch in bazel_ci.sh is now purely diagnostic (logs a "first
+        # build after nuke" echo, no flag changes).
+        #
+        # The marker touch below is retained as a backstop in case the
+        # bazel_ci.sh marker contract is ever restored to load-bearing
+        # behavior; today the touch has no functional effect beyond
+        # the diagnostic echo.  See bld/bazel_ci.sh lines ~500-540.
+        mkdir -p "$HOME/crow-agent/home/bob" "$HOME/crow-agent/home/Library" "$HOME/crow-agent/home/Work"
+        # Discover the current marker name from the agent's own copy of
+        # bazel_ci.sh so version bumps (.cleaned_all_bases_v21 → _v22 → …)
+        # don'\''t require touching this recipe.
+        SCRIPT="$HOME/crow-agent/workspace/bld/bazel_ci.sh"
+        if [[ -f "$SCRIPT" ]]; then
+            MARKER=$(grep -oE '\''\.cleaned_all_bases_v[0-9]+'\'' "$SCRIPT" | head -1)
+            if [[ -n "$MARKER" ]]; then
+                touch "$HOME/crow-agent/home/bob/$MARKER"
+            else
+                echo "  WARNING: could not extract cleanup marker name from $SCRIPT — bazel_ci.sh will re-nuke on first build (the cache-bypass it used to do here was retired — see bazel_ci.sh:505)" >&2
+            fi
+        else
+            echo "  WARNING: $SCRIPT not found — cannot pre-create cleanup marker; bazel_ci.sh will re-nuke on first build (the cache-bypass it used to do here was retired — see bazel_ci.sh:505)" >&2
+        fi
+        nohup rm -rf "$DOOMED" </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        printf "%-30s rotated state to %s (rm running detached)\n" "$(hostname -s)" "$DOOMED"
+    '
+    while IFS= read -r host || [[ -n "$host" ]]; do
+        [[ -z "$host" ]] && continue
+        # Strip user@ prefix to compare against local hostname.
+        bare="${host##*@}"
+        if [[ "$(hostname -s)" == "${bare%%.*}" ]]; then
+            bash -c "$NUKE_CMD" &
+        else
+            ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "$NUKE_CMD" &
+        fi
+    done < {{ci_list}}
+    wait
+    echo "=== All CI caches rotated. Next build starts cold. ==="
+
+# Tail server logs on buildcache
+server-logs:
+    #!/usr/bin/env bash
+    run_on_server() { if [[ "$(hostname -s)" == "{{server}}" ]]; then bash -c "$1"; else ssh {{server}} "$1"; fi; }
+    run_on_server 'sudo journalctl -u nativelink -f --since now'
+
+# Capture a CPU profile from the server's pprof endpoint.
+# Usage: just capture-pprof [seconds] [format]
+#   seconds — sampling window (default 30)
+#   format  — "pb" for pprof protobuf (default; analyse with `go tool pprof`)
+#             or "svg" for a pre-rendered flamegraph
+# Saves to /tmp/nl-pprof-YYYYmmdd-HHMMSS.{prof,svg} on the local machine.
+#
+# Why a recipe rather than a raw curl: the pprof URL contains a `?` and `&`
+# which zsh glob-expands / parses as background-job operators by default,
+# silently producing a 0-byte file or splitting the command when an
+# operator runs `ssh buildcache 'curl ... ?seconds=10'` interactively. The
+# body below single-quotes the URL on the remote side via a here-doc so
+# the metacharacters survive both shells. The interpolations
+# `{{seconds}}` and `{{format}}` are just expansion and are safe even
+# under restrictive shell options.
+#
+# The server's /debug/pprof/profile endpoint defaults to SVG flamegraph;
+# we explicitly pass `format=pb` so the captured file is a real pprof
+# protobuf usable with `go tool pprof` for top-N / call-graph / web views.
+# Pass `svg` as the second arg if you only want the flamegraph image.
+capture-pprof seconds="30" format="pb":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{format}}" in
+        pb)  ext=prof ;;
+        svg) ext=svg ;;
+        *)   echo "ERROR: format must be 'pb' or 'svg', got '{{format}}'" >&2; exit 2 ;;
+    esac
+    OUT=/tmp/nl-pprof-$(date +%Y%m%d-%H%M%S).${ext}
+    echo "Capturing {{seconds}}s CPU profile (format={{format}}) from {{server}}:6060 ..."
+    ssh {{server}} "curl -sf 'http://localhost:6060/debug/pprof/profile?seconds={{seconds}}&format={{format}}' -o /tmp/nl-pprof-remote.${ext}"
+    scp -q {{server}}:/tmp/nl-pprof-remote.${ext} "$OUT"
+    ssh {{server}} "rm -f /tmp/nl-pprof-remote.${ext}"
+    SIZE=$(stat -c %s "$OUT")
+    if (( SIZE < 1024 )); then
+        echo "WARNING: profile is only $SIZE bytes — likely capture failed (server idle? or pprof handler not registered?)" >&2
+        exit 1
+    fi
+    echo "Saved: $OUT ($SIZE bytes)"
+    echo ""
+    if [[ "{{format}}" == "pb" ]]; then
+        echo "View with one of:"
+        echo "  go tool pprof -top \"$OUT\" | head -30           # top functions by samples"
+        echo "  go tool pprof -web \"$OUT\"                       # interactive flamegraph in browser"
+        echo "  pprof -top \"$OUT\" | head -30                    # if 'pprof' Rust crate binary is in PATH"
+    else
+        echo "View with: open \"$OUT\"  # SVG flamegraph in browser"
+    fi

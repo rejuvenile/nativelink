@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.nativelink-sysctl</string>
+    <!-- Same M4-tolerant pattern as com.example.fl.proclimit.plist: a raw
+         `sysctl -w` ProgramArguments fails non-zero on M4 16GB hosts where XNU
+         clamps kern.maxfiles below 524288, marking the LaunchDaemon as failed
+         and never propagating to launchctl soft limits. The /bin/sh -c form
+         tolerates kernel rejection (`|| true`), reads back the post-write
+         value, and applies it via `launchctl limit` so processes see the new
+         soft cap. `set -u` (no `set -e`) — same rationale as the other plist. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -u; SYSCTL=/usr/sbin/sysctl; LCTL=/bin/launchctl; "$SYSCTL" -w kern.maxfiles=524288 2>/dev/null || true; "$SYSCTL" -w kern.maxfilesperproc=524288 2>/dev/null || true; KMAX_FILES=$("$SYSCTL" -n kern.maxfiles); KMAX_FPP=$("$SYSCTL" -n kern.maxfilesperproc); "$LCTL" limit maxfiles "$KMAX_FPP" "$KMAX_FILES"; echo "applied: kern.maxfiles=$KMAX_FILES kern.maxfilesperproc=$KMAX_FPP"</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>LaunchOnlyOnce</key>
+    <true/>
+</dict>
+</plist>

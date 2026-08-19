@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.nativelink-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/user/Applications/NativeLink.app/Contents/MacOS/nativelink</string>
+        <string>/Users/user/worker.json5</string>
+    </array>
+    <key>UserName</key>
+    <string>user</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/user/Work</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/user/Library/Logs/nativelink-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/user/Library/Logs/nativelink-worker.err</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>LowPriorityIO</key>
+    <false/>
+    <key>LowPriorityBackgroundIO</key>
+    <false/>
+    <key>LegacyTimers</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <!-- F5: give graceful shutdown time to spill RAM-only C2* mirror blobs to
+         local disk before launchd SIGKILLs. Default ExitTimeOut is 20s; a large
+         C2* spill can exceed it. Bounds the SIGTERM->SIGKILL window at 300s. -->
+    <key>ExitTimeOut</key>
+    <integer>300</integer>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>524288</integer>
+    </dict>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>524288</integer>
+    </dict>
+</dict>
+</plist>
